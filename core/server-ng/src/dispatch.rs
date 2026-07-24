@@ -185,10 +185,10 @@ where
 {
     let shard_handle = Rc::clone(shard_handle);
     // Runs synchronously on the shard pump (see `process_lifecycle` ->
-    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
-    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
-    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
-    // poll replies here without spawning. See the `poll_plan` module docs.
+    // `on_partition_read`). `build_poll_snapshot` takes a pump-only `&mut`
+    // partition borrow (synchronous, so no sibling task can realloc under it) and
+    // returns an owned `PollPlan`; only owned data crosses into `spawn_poll_io`. A
+    // fully-resident poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;

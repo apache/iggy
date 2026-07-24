@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice},
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -519,8 +519,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         // One decode feeds both the offset/timestamp index (keyed on
         // `origin_timestamp`) and the surfaced accounting meta (`base_timestamp`,
         // size, count); the two timestamps are distinct fields, do not conflate.
+        // Trusted (no batch-hash): every entry reaching append was just stamped
+        // by `stamp_prepare_for_persistence` (its checksum recomputed over this
+        // exact blob) or re-appended from an already-validated resident entry,
+        // so re-hashing the ~1 MiB blob here only to read the header is waste.
         let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
-            match decode_prepare_slice(entry.as_slice()) {
+            match decode_prepare_slice_trusted(entry.as_slice()) {
                 Ok(batch) if batch.message_count() != 0 => {
                     let message_count = batch.message_count();
                     let meta = RetainedBatchMeta {
@@ -854,7 +858,10 @@ fn try_push_resident_entry(
     if header.operation != Operation::SendMessages {
         return;
     }
-    let Ok(batch) = decode_prepare_slice(prepare.as_slice()) else {
+    // Resident entries were locally stamped in `append_messages` or validated
+    // at repair ingress, so a validating re-decode would only re-hash our own
+    // write. See the invariant note at the committed-prefix flush walk.
+    let Ok(batch) = decode_prepare_slice_trusted(prepare.as_slice()) else {
         return;
     };
     let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {

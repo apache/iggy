@@ -668,8 +668,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # - numa settings:
 #     + "numa:auto": Use all available numa node, cores
 #     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
-# TODO(hubcio): revert to "numa:auto" once multi-shard server-ng is stable.
-cpu_allocation = 1
+cpu_allocation = "numa:auto"
 
 # Whether shard threads are pinned to dedicated CPU cores (default: true).
 # Pinned cores are drawn from the process's allowed CPU set (affinity/cpuset

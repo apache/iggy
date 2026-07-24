@@ -1432,7 +1432,7 @@ where
 /// Size of the in-storage (`IggyMessage2`) per-message header inside a
 /// `SendMessages2` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
 /// + `timestamp_delta`(4) + `user_headers_length`(4) + `payload_length`(4)
-/// + reserved(8). See `server_common::send_messages2::from_legacy_request`.
+/// + reserved(8). See `server_common::send_messages2::SendMessages2Owned::from_messages`.
 const STORED_MESSAGE_HEADER_SIZE: usize = 48;
 
 /// Build the `PolledMessages` reply body from the owning shard's poll

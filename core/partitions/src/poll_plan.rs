@@ -24,11 +24,15 @@
 //! synchronously under the borrow into the owned types here, drops the borrow,
 //! then [`PollPlan::execute`] runs the disk read + the in-memory auto-commit
 //! apply on owned data alone: consumer offsets are already `Arc`, the journal
-//! tail is a point-in-time `Frozen` snapshot, and segment files are re-opened
-//! by path. No value in this module holds a partition reference, so executing a
-//! plan is sound on a detached task concurrently with the pump's own writes.
+//! tail is a point-in-time `Frozen` snapshot, and each sealed segment carries a
+//! shared [`SealedSegmentReadState`] handle (a plain `Rc`, not a partition
+//! reference) whose read fd + sparse index the read reuses or fills on a miss.
+//! No value in this module holds a partition reference, so executing a plan is
+//! sound on a detached task concurrently with the pump's own writes.
 
 use crate::PollFragments;
+use crate::iggy_index::IggyIndexCache;
+use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{MessageLookup, push_selected_batch_fragments, select_batch_slice};
 use compio::io::AsyncReadAtExt;
 use iggy_common::{
@@ -36,14 +40,39 @@ use iggy_common::{
 };
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages2::{COMMAND_HEADER_SIZE, decode_batch_slice};
+use std::cell::RefCell;
 use std::hash::Hash;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::warn;
 
-/// Owned, borrow-free inputs for the disk tier of a poll (see module docs).
-/// Segment files are re-opened by path because sealed segments drop their
-/// writer at rotation.
+/// Per-sealed-segment read state, shared as a cheap `Rc` handle between the
+/// owning partition and the off-borrow [`DiskReadPlan`] (a plain `Rc`, never a
+/// partition reference, so the read runs off the pump). Both slots fill lazily
+/// on the first sealed poll and are reused after. The pump drops its handle
+/// when the segment is retired, so the state frees once any in-flight poll
+/// holding a clone finishes (a cached fd meanwhile reads the unlinked inode,
+/// which is fine). The active segment is never cached.
+#[derive(Debug, Default)]
+pub struct SealedSegmentReadState {
+    /// Read-only descriptor; compio `File` clones share the kernel fd, so a hit
+    /// avoids the per-poll `openat` (an `io_uring` op prone to io-wq punts) and
+    /// preserves kernel readahead. `None` until the first sealed poll opens it.
+    pub(crate) fd: RefCell<Option<compio::fs::File>>,
+    /// Sparse offset/timestamp index reloaded from the `.index` file the
+    /// segment dropped at rotation, so a poll resolves the start byte in
+    /// O(log n) instead of scanning the whole segment from byte 0 (the stall).
+    /// `None` until the first sealed poll loads it.
+    pub(crate) index: RefCell<Option<IggyIndexCache>>,
+}
+
+pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
+
+/// Owned, borrow-free inputs for the disk tier of a poll (see module docs). A
+/// sealed segment reuses its cached [`SealedSegmentReadState`] (read fd + sparse
+/// index); the active segment (and any cache miss) opens by path and resolves
+/// from its resident index, because sealed segments drop both at rotation.
 pub struct DiskReadPlan {
     pub(crate) partition_dir: Option<String>,
     /// Segments to walk, snapshotted from the poll's starting segment onward
@@ -57,6 +86,10 @@ pub struct DiskReadPlan {
 pub struct DiskSegment {
     pub(crate) start_offset: u64,
     pub(crate) persisted: u64,
+    /// Shared read state, cloned from the owning partition at plan time for a
+    /// SEALED segment; `None` for the active segment, which always opens fresh
+    /// and resolves from its resident index. See [`SealedSegmentReadState`].
+    pub(crate) read_state: Option<SealedSegmentHandle>,
 }
 
 /// Owned auto-commit input, applied off the partition borrow after a poll (see
@@ -406,7 +439,21 @@ impl DiskReadPlan {
 
         // `start_position` applies to the first snapshotted segment; each later
         // segment is walked from byte 0 (reset at the end of every iteration).
-        let mut position = self.start_position;
+        //
+        // A sealed first segment dropped its resident index at rotation, so
+        // `disk_poll_start` fell back to byte 0. Reload the sparse index (once,
+        // then cached) and resolve the start byte so the walk skips straight to
+        // the target instead of scanning the whole segment - the poll stall. A
+        // miss or load failure keeps `start_position` (the pre-existing
+        // full-scan fallback). The active segment carries no read state, so its
+        // resident-index-resolved `start_position` is left untouched.
+        let mut position = match self.segments.first() {
+            Some(first) => self
+                .resolve_sealed_start(first, query, partition_dir)
+                .await
+                .unwrap_or(self.start_position),
+            None => self.start_position,
+        };
         let mut fragments = PollFragments::new();
         let mut last_matching_offset = None;
         let mut matched: u32 = 0;
@@ -427,7 +474,7 @@ impl DiskReadPlan {
                 continue;
             }
             let path = format!("{partition_dir}/{:0>20}.log", segment.start_offset);
-            let Some(file) = self.open_segment_with_retry(&path).await else {
+            let Some(file) = self.resolve_segment_file(segment, &path).await else {
                 // Open exhausted retries: the segment may hold present-but-
                 // unreadable data. Stop here rather than walking past it.
                 faulted = true;
@@ -483,6 +530,94 @@ impl DiskReadPlan {
             DiskReadOutcome::Faulted
         } else {
             DiskReadOutcome::Empty
+        }
+    }
+
+    /// Resolve the read-only descriptor for `segment`'s file. A sealed segment
+    /// clones its cached fd on a hit (sharing the kernel fd, no syscall) and, on
+    /// a miss, opens by path and stores the fd back so later polls skip the
+    /// `openat`. The active segment (no cache slot) always opens fresh. Returns
+    /// `None` only when the open exhausts its retries (the caller fails closed).
+    async fn resolve_segment_file(
+        &self,
+        segment: &DiskSegment,
+        path: &str,
+    ) -> Option<compio::fs::File> {
+        let Some(handle) = &segment.read_state else {
+            return self.open_segment_with_retry(path).await;
+        };
+        // Borrow only to clone the `Option<File>` out, never across the await.
+        if let Some(cached) = handle.fd.borrow().clone() {
+            return Some(cached);
+        }
+        let file = self.open_segment_with_retry(path).await?;
+        // Benign race: a concurrent poll of the same segment may have filled the
+        // slot while this open was in flight; overwriting with an equivalent fd
+        // (same inode) is harmless.
+        *handle.fd.borrow_mut() = Some(file.clone());
+        Some(file)
+    }
+
+    /// Resolve the start byte for the poll's target segment from its sparse
+    /// index, loading the `.index` file on the first sealed poll and caching it
+    /// on the shared handle. Returns `None` (keep the byte-0 fallback) for the
+    /// active segment (no handle), a below-range query, or a load failure.
+    async fn resolve_sealed_start(
+        &self,
+        segment: &DiskSegment,
+        query: MessageLookup,
+        partition_dir: &str,
+    ) -> Option<u64> {
+        // TODO: a per-consumer cursor hint (the previous sealed poll's resolved
+        // position) could seed this so a sequentially advancing consumer skips
+        // the sparse-index lookup on repeated polls of the same segment.
+        let handle = segment.read_state.as_ref()?;
+        // Cache hit: resolve under a short borrow, never across the await.
+        let cached = handle
+            .index
+            .borrow()
+            .as_ref()
+            .map(|index| resolve_index_position(index, query));
+        if let Some(resolved) = cached {
+            return resolved;
+        }
+        let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
+        let index = self.load_sealed_index(&path).await?;
+        let resolved = resolve_index_position(&index, query);
+        *handle.index.borrow_mut() = Some(index);
+        resolved
+    }
+
+    /// Load a sealed segment's sparse index from its `.index` file. `None` on a
+    /// missing/unreadable file so the caller falls back to a byte-0 scan (the
+    /// pre-existing behavior); the load is retried on the next poll.
+    async fn load_sealed_index(&self, path: &str) -> Option<IggyIndexCache> {
+        match IggyIndexReader::new(path).await {
+            Ok(reader) => match reader.load_all().await {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.namespace_raw,
+                        path,
+                        %error,
+                        "disk poll: failed to read sparse index; scanning from segment start"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace_raw,
+                    path,
+                    %error,
+                    "disk poll: failed to open sparse index; scanning from segment start"
+                );
+                None
+            }
         }
     }
 
@@ -542,6 +677,18 @@ impl DiskReadPlan {
         }
         None
     }
+}
+
+/// Byte position of the sparse-index entry at or below the query's offset /
+/// timestamp, or `None` when the query is below the first indexed entry (the
+/// caller then scans from the segment start). Mirrors `disk_poll_start`'s
+/// resident-index resolution for the sealed, off-pump path.
+fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<u64> {
+    match query {
+        MessageLookup::Offset { offset, .. } => index.offset_lower_bound(offset),
+        MessageLookup::Timestamp { timestamp, .. } => index.timestamp_lower_bound(timestamp),
+    }
+    .map(|entry| entry.position)
 }
 
 impl AutoCommitCtx {
