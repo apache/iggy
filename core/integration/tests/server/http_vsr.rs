@@ -18,7 +18,7 @@
 //! HTTP data-plane gate for server-ng: produce, poll, and consumer-offset
 //! routes exercised over raw `reqwest` (not the SDK HTTP client) so the wire
 //! contract itself is under test - exact status codes, the
-//! `x-iggy-durability` header, the body-size cap, and cross-request isolation
+//! `iggy-durability` header, the body-size cap, and cross-request isolation
 //! of concurrent produces on one login session.
 
 use crate::server::http_client::HttpClient;
@@ -44,7 +44,7 @@ const PARTITION_ID: u32 = 0;
 /// (`Consumer::default()` would carry numeric id 0, not 1).
 const CONSUMER_ID: u32 = 1;
 
-const DURABILITY_HEADER: &str = "x-iggy-durability";
+const DURABILITY_HEADER: &str = "iggy-durability";
 const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
 const DURABILITY_NONE: &str = "none";
 

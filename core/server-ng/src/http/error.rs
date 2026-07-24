@@ -84,7 +84,19 @@ impl IntoResponse for CustomError {
                     }
                     _ => StatusCode::BAD_REQUEST,
                 };
-                (status_code, Json(ErrorResponse::from_error(&error)))
+                let response =
+                    (status_code, Json(ErrorResponse::from_error(&error))).into_response();
+                // Transient 503s are retryable, so the advisory Retry-After hint
+                // rides along, matching the other transient 503 bodies
+                // (`service_unavailable`, `server_busy`).
+                if matches!(
+                    error,
+                    IggyError::TransientNotCommitted | IggyError::TransientNotAccepted
+                ) {
+                    with_retry_after(response)
+                } else {
+                    response
+                }
             }
             Self::ResourceNotFound => (
                 StatusCode::NOT_FOUND,
@@ -94,9 +106,9 @@ impl IntoResponse for CustomError {
                     reason: "Resource not found".to_string(),
                     field: None,
                 }),
-            ),
+            )
+                .into_response(),
         }
-        .into_response()
     }
 }
 
@@ -138,8 +150,15 @@ impl ErrorResponse {
 /// body every other route error uses), while a VSR session that cannot be
 /// established right now is a transient server condition (503) and must never
 /// masquerade as an auth failure.
-pub enum AuthError {
+pub(in crate::http) enum AuthError {
     Unauthenticated(IggyError),
+    /// The Register provably never entered the consensus pipeline (not
+    /// primary, not caught up, or the prepare queue was full), so the request
+    /// is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
+    /// body so a forwarding follower recognizes it as retryable against a
+    /// re-resolved primary; a plain client sees the same retryable 503 either
+    /// way.
+    SessionNotAccepted,
     SessionUnavailable,
 }
 
@@ -158,11 +177,15 @@ impl IntoResponse for AuthError {
             // JWT middleware (empty body), so this is deliberately richer, not
             // byte-identical to legacy.
             Self::Unauthenticated(error) => CustomError::from(error).into_response(),
-            // A fresh session could not be established: the Register did not
-            // commit (no caught-up primary, pipeline full, or a view-change
-            // cancel), or the session table is at `MAX_HTTP_SESSIONS` and
-            // refused the fresh registration. Transient server condition -> 503,
-            // retryable.
+            Self::SessionNotAccepted => {
+                CustomError::from(IggyError::TransientNotAccepted).into_response()
+            }
+            // A fresh session could not be established: the Register was
+            // canceled with its commit outcome unknown, or the session table
+            // is at `MAX_HTTP_SESSIONS` and refused the fresh registration.
+            // Transient server condition -> 503, retryable by the CLIENT only
+            // (a forwarder must not re-issue an unknown-outcome Register under
+            // this node's session budget on the caller's behalf).
             Self::SessionUnavailable => service_unavailable(),
         }
     }
@@ -276,7 +299,7 @@ fn partition_write_timeout_response(operation: Operation) -> Response {
 const RETRY_AFTER_SECONDS: u64 = 1;
 
 /// Attach the advisory [`RETRY_AFTER_SECONDS`] hint to a retryable 429/503.
-fn with_retry_after(mut response: Response) -> Response {
+pub(in crate::http) fn with_retry_after(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
@@ -286,7 +309,7 @@ fn with_retry_after(mut response: Response) -> Response {
 /// Render an `ErrorResponse` body for `status`, tagged with `code` / `reason`
 /// and no field, so every hand-built HTTP error the routes return parses as the
 /// one error schema clients already handle.
-fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
+pub(in crate::http) fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -301,9 +324,9 @@ fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
 
 /// Shared 504 rendering for an in-band request the partition plane did not
 /// answer in time, shaped like every other HTTP error (`ErrorResponse`) so
-/// clients parse one error schema. Consumed by the partition-write reply wait
-/// and the partition reads ([`ReadError::Timeout`]).
-fn gateway_timeout_response(code: &str, reason: &str) -> Response {
+/// clients parse one error schema. Consumed by the partition-write reply wait,
+/// the partition reads ([`ReadError::Timeout`]), and the forward attempt bound.
+pub(in crate::http) fn gateway_timeout_response(code: &str, reason: &str) -> Response {
     error_response(StatusCode::GATEWAY_TIMEOUT, code, reason)
 }
 
@@ -465,26 +488,38 @@ fn primary_redirect_response(location: &str) -> Response {
 }
 
 /// Build the `Location` for a 307 redirect of a linearizable read to the VSR
-/// primary: `http://<host>:<http-port><path_and_query>`. `None` when the roster
-/// has no node at `primary_index`, that node exposes no HTTP port, or its `ip`
-/// is not a valid address, so the caller fails closed to a 503 rather than
-/// pointing at an unreachable target. Formats through [`SocketAddr`] so an IPv6
-/// host is bracketed (`http://[::1]:8080/...`) rather than left ambiguous. Pure
-/// (no consensus or axum dependency) so the redirect target is unit-tested in
-/// isolation.
+/// primary: `<scheme>://<host>:<http-port><path_and_query>`. The scheme is the
+/// redirecting node's own listener scheme (uniform cluster HTTP config, same
+/// assumption the forward hop makes). `None` when the primary does not resolve
+/// from the roster, so the caller fails closed to a 503 rather than pointing at
+/// an unreachable target. Pure (no consensus or axum dependency) so the
+/// redirect target is unit-tested in isolation.
 pub(in crate::http) fn primary_redirect_location(
     roster: &ClusterRoster,
     primary_index: u8,
+    scheme: &str,
     path_and_query: &str,
 ) -> Option<String> {
+    let socket = primary_http_socket(roster, primary_index)?;
+    Some(format!("{scheme}://{socket}{path_and_query}"))
+}
+
+/// Resolve the VSR primary's HTTP socket from the static roster: the node
+/// whose `replica_id` equals `primary_index`, its `ports.http`, and its `ip`
+/// parsed strictly. `None` on any miss so callers fail closed. Formatting the
+/// returned [`SocketAddr`] brackets an IPv6 host (`[::1]:8080`) rather than
+/// leaving it ambiguous.
+pub(in crate::http) fn primary_http_socket(
+    roster: &ClusterRoster,
+    primary_index: u8,
+) -> Option<SocketAddr> {
     let node = roster
         .nodes
         .iter()
         .find(|node| node.replica_id == primary_index)?;
     let http_port = node.ports.http?;
     let ip = node.ip.parse::<IpAddr>().ok()?;
-    let socket = SocketAddr::new(ip, http_port);
-    Some(format!("http://{socket}{path_and_query}"))
+    Some(SocketAddr::new(ip, http_port))
 }
 
 #[cfg(test)]
@@ -529,35 +564,74 @@ mod tests {
             node(1, "10.0.0.2", Some(8090)),
         ]);
         assert_eq!(
-            primary_redirect_location(&roster, 1, READ_PATH),
+            primary_redirect_location(&roster, 1, "http", READ_PATH),
             Some("http://10.0.0.2:8090/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_uses_the_listener_scheme() {
+        let roster = roster(vec![node(0, "10.0.0.1", Some(8080))]);
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            Some("https://10.0.0.1:8080/streams?consistency=linearizable".to_owned())
         );
     }
 
     #[test]
     fn primary_redirect_location_is_none_when_no_node_matches_primary_index() {
         let roster = roster(vec![node(0, "10.0.0.1", Some(8080))]);
-        assert_eq!(primary_redirect_location(&roster, 2, READ_PATH), None);
+        assert_eq!(
+            primary_redirect_location(&roster, 2, "http", READ_PATH),
+            None
+        );
     }
 
     #[test]
     fn primary_redirect_location_is_none_when_primary_has_no_http_port() {
         let roster = roster(vec![node(0, "10.0.0.1", None)]);
-        assert_eq!(primary_redirect_location(&roster, 0, READ_PATH), None);
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "http", READ_PATH),
+            None
+        );
     }
 
     #[test]
     fn primary_redirect_location_is_none_for_empty_roster() {
         let roster = roster(Vec::new());
-        assert_eq!(primary_redirect_location(&roster, 0, READ_PATH), None);
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "http", READ_PATH),
+            None
+        );
     }
 
     #[test]
     fn primary_redirect_location_brackets_ipv6_host() {
         let roster = roster(vec![node(0, "::1", Some(8080))]);
         assert_eq!(
-            primary_redirect_location(&roster, 0, READ_PATH),
+            primary_redirect_location(&roster, 0, "http", READ_PATH),
             Some("http://[::1]:8080/streams?consistency=linearizable".to_owned())
         );
+    }
+
+    #[test]
+    fn transient_not_committed_renders_503_with_retry_after() {
+        let response = CustomError::from(IggyError::TransientNotCommitted).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[test]
+    fn transient_not_accepted_renders_503_with_retry_after() {
+        let response = CustomError::from(IggyError::TransientNotAccepted).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[test]
+    fn business_error_renders_without_retry_after() {
+        let response = CustomError::from(IggyError::UserAlreadyExists).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
     }
 }
