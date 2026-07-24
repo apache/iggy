@@ -19,9 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{
-        COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice, decode_prepare_slice_trusted,
-    },
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -860,7 +858,10 @@ fn try_push_resident_entry(
     if header.operation != Operation::SendMessages {
         return;
     }
-    let Ok(batch) = decode_prepare_slice(prepare.as_slice()) else {
+    // Resident entries were locally stamped in `append_messages` or validated
+    // at repair ingress, so a validating re-decode would only re-hash our own
+    // write. See the invariant note at the committed-prefix flush walk.
+    let Ok(batch) = decode_prepare_slice_trusted(prepare.as_slice()) else {
         return;
     };
     let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {

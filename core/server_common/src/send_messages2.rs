@@ -520,7 +520,7 @@ pub fn encrypt_batch_request(
 
 /// Whether the legacy transcode stamps a batch checksum onto its output.
 ///
-/// The recompute is a full-blob `XxHash3` pass, needed only when a reader
+/// The recompute is an `XxHash3` batch-checksum pass, needed only when a reader
 /// validates the transcoded batch before [`stamp_prepare_for_persistence`]
 /// recomputes it: the encrypt ingest path re-decodes the canonicalized batch
 /// (`encrypt_batch_request`'s validating decode, then the second `convert` its
@@ -529,7 +529,7 @@ pub fn encrypt_batch_request(
 /// zero until stamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumMode {
-    /// Compute the batch checksum over the transcoded blob.
+    /// Compute the batch checksum for the transcoded batch.
     Compute,
     /// Leave the batch checksum zero; `stamp_prepare_for_persistence` fills it.
     Skip,
@@ -664,9 +664,9 @@ fn transcode_legacy_request(
     Message::try_from(buffer).map_err(|_| IggyError::InvalidCommand)
 }
 
-/// Decode one batch slice (`[256B command header][blob]`), validating the
-/// batch checksum. The persisted segment-file record and the request slice
-/// share this layout, so both decode through here.
+/// Decode one batch slice (`[256B command header][blob]`), validating the batch
+/// checksum and every per-message checksum. The persisted segment-file record
+/// and the request slice share this layout, so both decode through here.
 pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
     if body.len() < COMMAND_HEADER_SIZE {
         return Err(IggyError::InvalidCommand);
@@ -679,7 +679,8 @@ pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError
     }
 
     let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
-    let expected_checksum = calculate_batch_checksum(&header, blob);
+    let batch = SendMessages2Ref { header, blob };
+    let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
     if header.batch_checksum != expected_checksum {
         return Err(IggyError::InvalidBatchChecksum(
             header.batch_checksum,
@@ -688,11 +689,11 @@ pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError
         ));
     }
 
-    Ok(SendMessages2Ref { header, blob })
+    Ok(batch)
 }
 
 /// Decode a `Prepare` message from a slice of bytes, validating the batch
-/// checksum.
+/// checksum and every per-message checksum.
 ///
 /// `bytes` must be 16-byte aligned (`PrepareHeader` has `u128` fields). Source
 /// from `Frozen<MESSAGE_ALIGN>` / `Owned<MESSAGE_ALIGN>` / `Message<H>`.
@@ -700,15 +701,17 @@ pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError
 ///
 /// # Errors
 ///
-/// `IggyError::InvalidCommand` on: short buffer, bad bit pattern, `size`
-/// outside `[header_size, bytes.len()]`, short/checksum-mismatched body.
+/// `IggyError::InvalidCommand` on a short buffer, bad bit pattern, `size`
+/// outside `[header_size, bytes.len()]`, or frames that do not tile the batch;
+/// `InvalidBatchChecksum` / `InvalidMessageChecksum` on an integrity mismatch.
 pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
     decode_prepare_slice_inner(bytes, true)
 }
 
-/// Like [`decode_prepare_slice`] but skips the full-blob batch-checksum
-/// recomputation, extracting only the header meta. Every cheap structural check
-/// (length, 16-byte alignment, `size` bounds, blob length) is still enforced.
+/// Like [`decode_prepare_slice`] but skips the per-message checksum
+/// verification and batch-checksum recompute, extracting only the header meta.
+/// Every cheap structural check (length, 16-byte alignment, `size` bounds, blob
+/// length) is still enforced.
 ///
 /// INVARIANT: `bytes` MUST be node-local self-stamped -
 /// [`stamp_prepare_for_persistence`] recomputed the batch checksum over the
@@ -718,14 +721,14 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyEr
 /// gated per-message on receipt by [`verify_received_send_messages`], and a
 /// repaired prepare is validated via [`decode_prepare_slice`]; both run BEFORE
 /// the bytes reach any trusted decode. NEVER call this on unvalidated network
-/// bytes - it would let a corrupted blob pass undetected. The `XxHash3` pass
-/// over a ~1 MiB blob dominates produce-path CPU, so trusted call sites that
-/// only read header meta skip it.
+/// bytes - it would let a corrupted blob pass undetected. The full-body
+/// per-message checksum pass dominates produce-path CPU, so trusted call sites
+/// that only read header meta skip it.
 ///
 /// # Errors
 ///
 /// Same structural errors as [`decode_prepare_slice`], minus
-/// `InvalidBatchChecksum`.
+/// `InvalidBatchChecksum` and `InvalidMessageChecksum`.
 pub fn decode_prepare_slice_trusted(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
     decode_prepare_slice_inner(bytes, false)
 }
@@ -770,8 +773,9 @@ fn decode_prepare_slice_inner(
     }
 
     let blob = &blob[..blob_len];
+    let batch = SendMessages2Ref { header, blob };
     if validate_checksum {
-        let expected_checksum = calculate_batch_checksum(&header, blob);
+        let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
         if header.batch_checksum != expected_checksum {
             return Err(IggyError::InvalidBatchChecksum(
                 header.batch_checksum,
@@ -781,7 +785,7 @@ fn decode_prepare_slice_inner(
         }
     }
 
-    Ok(SendMessages2Ref { header, blob })
+    Ok(batch)
 }
 
 pub fn stamp_prepare_for_persistence(
@@ -815,11 +819,14 @@ pub fn stamp_prepare_for_persistence(
 /// prepare; on a mismatch the caller fails closed (drop, no `PrepareOk`) and the
 /// primary retransmits on prepare-timeout.
 ///
-/// The decode is structural only (no batch-checksum recompute). Each message's
-/// stored checksum is recomputed over its stamp-invariant cover
+/// The stored `batch_checksum` is not consulted (a received prepare is
+/// pre-stamp, `base_offset` / `base_timestamp` zero): integrity rests on the
+/// per-message checksums, recomputed over the stamp-invariant cover
 /// (`header[8..48] || payload || user_headers`), which excludes the 256B command
-/// header, so it holds whether or not this node has stamped `base_offset` /
-/// `base_timestamp` yet (a received prepare is pre-stamp).
+/// header, so it holds whether or not this node has stamped yet. Shares the
+/// frame walk with the validating decoders via
+/// [`verify_and_recompute_batch_checksum`], discarding its recomputed batch
+/// value.
 ///
 /// # Errors
 ///
@@ -828,27 +835,7 @@ pub fn stamp_prepare_for_persistence(
 /// [`IggyError::InvalidMessageChecksum`] on the first per-message mismatch.
 pub fn verify_received_send_messages(bytes: &[u8]) -> Result<(), IggyError> {
     let batch = decode_prepare_slice_trusted(bytes)?;
-    let blob = batch.blob();
-    let mut verified = 0u32;
-    let mut covered = 0usize;
-    for framed in batch.iter_with_offsets() {
-        // Cover (`header[8..48] || payload || user_headers`) hashed raw from
-        // the blob, not rebuilt from decoded fields, so it is byte-exact with
-        // the encoder's.
-        let expected = XxHash3_64::oneshot(&blob[framed.start + 8..framed.end]);
-        if expected != framed.message.header.checksum {
-            return Err(IggyError::InvalidMessageChecksum(
-                framed.message.header.checksum,
-                expected,
-                batch.header.base_offset + u64::from(framed.message.header.offset_delta),
-            ));
-        }
-        verified += 1;
-        covered = framed.end;
-    }
-    if verified != batch.message_count() || covered != blob.len() {
-        return Err(IggyError::InvalidCommand);
-    }
+    verify_and_recompute_batch_checksum(&batch)?;
     Ok(())
 }
 
@@ -919,16 +906,84 @@ impl<'a> LegacyMessageRef<'a> {
     }
 }
 
+/// Batch checksum v2: streaming `XxHash3_64` over the six batch header meta
+/// fields followed by each message's stored 8-byte checksum field in message
+/// order - NOT the message bodies.
+///
+/// Bodies are bound only transitively: each per-message checksum already covers
+/// `header[8..48] || payload || user_headers`, so hashing the checksum fields
+/// binds every body byte IFF a reader also re-verifies the per-message
+/// checksums. Stamp (produce) hashes `N * 8` bytes instead of the whole blob;
+/// validating decoders pay the one body pass as the per-message verify in
+/// [`verify_and_recompute_batch_checksum`], which hashes the checksum-field
+/// bytes in the same order so its recompute matches a compute here.
+///
+/// Assumes a well-formed blob whose frames tile exactly; every compute site
+/// builds the blob and satisfies this.
 fn calculate_batch_checksum(header: &SendMessages2Header, blob: &[u8]) -> u64 {
     let mut hasher = XxHash3_64::new();
+    write_batch_header_fields(&mut hasher, header);
+    let batch = SendMessages2Ref {
+        header: *header,
+        blob,
+    };
+    for framed in batch.iter_with_offsets() {
+        hasher.write(&blob[framed.start..framed.start + 8]);
+    }
+    hasher.finish()
+}
+
+fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &SendMessages2Header) {
     hasher.write(&header.partition_id.to_le_bytes());
     hasher.write(&header.base_offset.to_le_bytes());
     hasher.write(&header.base_timestamp.to_le_bytes());
     hasher.write(&header.origin_timestamp.to_le_bytes());
     hasher.write(&header.batch_length.to_le_bytes());
     hasher.write(&header.message_count.to_le_bytes());
-    hasher.write(blob);
-    hasher.finish()
+}
+
+/// Verify every per-message checksum in `batch` and return the recomputed v2
+/// batch checksum (see [`calculate_batch_checksum`]) from a single frame walk.
+///
+/// The per-message pass is the equal-integrity half of v2: the batch value
+/// binds bodies only through the checksum fields, so a validating decode must
+/// re-verify each message here or body corruption that leaves the checksum
+/// field intact would pass. This is the one full-body pass a validating decode
+/// pays; the caller then compares the returned value against the stored
+/// `batch_checksum`.
+///
+/// # Errors
+///
+/// [`IggyError::InvalidMessageChecksum`] on the first per-message mismatch;
+/// [`IggyError::InvalidCommand`] if the frames do not tile `message_count`
+/// exactly.
+fn verify_and_recompute_batch_checksum(batch: &SendMessages2Ref<'_>) -> Result<u64, IggyError> {
+    let blob = batch.blob();
+    let mut hasher = XxHash3_64::new();
+    write_batch_header_fields(&mut hasher, &batch.header);
+    let mut verified = 0u32;
+    let mut covered = 0usize;
+    for framed in batch.iter_with_offsets() {
+        // Cover (`header[8..48] || payload || user_headers`) hashed raw from the
+        // blob, byte-exact with the encoder's, so a flipped body byte fails even
+        // when the stored checksum field is left intact.
+        let stored = framed.message.header.checksum;
+        let expected = XxHash3_64::oneshot(&blob[framed.start + 8..framed.end]);
+        if expected != stored {
+            return Err(IggyError::InvalidMessageChecksum(
+                stored,
+                expected,
+                batch.header.base_offset + u64::from(framed.message.header.offset_delta),
+            ));
+        }
+        hasher.write(&blob[framed.start..framed.start + 8]);
+        verified += 1;
+        covered = framed.end;
+    }
+    if verified != batch.message_count() || covered != blob.len() {
+        return Err(IggyError::InvalidCommand);
+    }
+    Ok(hasher.finish())
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IggyError> {
@@ -971,39 +1026,48 @@ mod tests {
         owned
     }
 
-    /// A checksum-consistent `Prepare`: `[PrepareHeader][256B batch header][blob]`
-    /// with `batch_checksum` stamped over the final header fields + `blob`.
-    fn valid_prepare_bytes(blob: &[u8]) -> Owned<MESSAGE_ALIGN> {
+    /// Assemble an already-stamped batch into a `Prepare`:
+    /// `[PrepareHeader][256B batch header][blob]`, copying `owned`'s header and
+    /// blob verbatim. Shared by every real-batch fixture.
+    fn prepare_from_owned(owned: &SendMessages2Owned) -> Owned<MESSAGE_ALIGN> {
         let header_size = std::mem::size_of::<PrepareHeader>();
-        let batch_length = COMMAND_HEADER_SIZE + blob.len();
-        let total = header_size + batch_length;
-        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(total);
+        let total = header_size + owned.header.total_size();
+        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
         {
             let prepare: &mut PrepareHeader =
-                bytemuck::checked::try_from_bytes_mut(&mut owned.as_mut_slice()[..header_size])
+                bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
                     .expect("zeroed bytes form a valid PrepareHeader");
             prepare.command = Command2::Prepare;
             prepare.size = u32::try_from(total).expect("prepare size fits u32");
         }
-
-        let mut command = SendMessages2Header::new(7, 123, batch_length as u64, 3);
-        command.base_offset = 10;
-        command.base_timestamp = 20;
-        command.batch_checksum = command.checksum_for_blob(blob);
-
-        let bytes = owned.as_mut_slice();
-        command.encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
-        bytes[header_size + COMMAND_HEADER_SIZE..].copy_from_slice(blob);
+        let bytes = buffer.as_mut_slice();
         owned
+            .header
+            .encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
+        bytes[PREPARE_SPLIT_POINT..PREPARE_SPLIT_POINT + owned.blob.len()]
+            .copy_from_slice(&owned.blob);
+        buffer
+    }
+
+    /// A checksum-consistent STAMPED `Prepare` carrying real per-message records,
+    /// stamped at a non-zero `base_offset` / `base_timestamp` with a v2
+    /// `batch_checksum` over the final header fields + per-message checksum fields.
+    fn valid_prepare_bytes() -> Owned<MESSAGE_ALIGN> {
+        let namespace = IggyNamespace::new(1, 1, 7);
+        let mut owned = SendMessages2Owned::from_messages(namespace, &sample_messages())
+            .expect("build send batch");
+        owned.header.base_offset = 10;
+        owned.header.base_timestamp = 20;
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+        prepare_from_owned(&owned)
     }
 
     #[test]
     fn decode_prepare_slice_trusted_matches_validating_for_valid_batch() {
         // The trusted variant must surface byte-identical header meta to the
-        // validating decode for a checksum-consistent batch; only the full-blob
-        // hash pass is skipped.
-        let blob = vec![0x5Au8; 4096];
-        let owned = valid_prepare_bytes(&blob);
+        // validating decode for a checksum-consistent batch; only the
+        // per-message and batch-checksum passes are skipped.
+        let owned = valid_prepare_bytes();
 
         let validated = decode_prepare_slice(owned.as_slice()).expect("valid batch decodes");
         let trusted =
@@ -1026,12 +1090,11 @@ mod tests {
 
     #[test]
     fn decode_prepare_slice_trusted_skips_batch_checksum() {
-        // A blob mutated after stamping fails the validating decode but passes
-        // the trusted one: exactly why the trusted variant is confined to
-        // locally-produced bytes (see its doc invariant).
-        let blob = vec![0x11u8; 512];
-        let mut owned = valid_prepare_bytes(&blob);
-        let corrupt_index = owned.as_slice().len() - 1;
+        // A stored batch_checksum mutated after stamping fails the validating
+        // decode but passes the trusted one: exactly why the trusted variant is
+        // confined to locally-produced bytes (see its doc invariant).
+        let mut owned = valid_prepare_bytes();
+        let corrupt_index = std::mem::size_of::<PrepareHeader>() + BATCH_CHECKSUM_OFFSET;
         owned.as_mut_slice()[corrupt_index] ^= 0xFF;
 
         assert!(
@@ -1039,7 +1102,7 @@ mod tests {
                 decode_prepare_slice(owned.as_slice()),
                 Err(IggyError::InvalidBatchChecksum(..))
             ),
-            "validating decode must reject a corrupted blob",
+            "validating decode must reject a mutated batch checksum",
         );
         assert!(
             decode_prepare_slice_trusted(owned.as_slice()).is_ok(),
@@ -1108,23 +1171,7 @@ mod tests {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
             SendMessages2Owned::from_messages(namespace, messages).expect("build send batch");
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        let total = header_size + owned.header.total_size();
-        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
-        {
-            let prepare: &mut PrepareHeader =
-                bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid PrepareHeader");
-            prepare.command = Command2::Prepare;
-            prepare.size = u32::try_from(total).expect("prepare size fits u32");
-        }
-        let bytes = buffer.as_mut_slice();
-        owned
-            .header
-            .encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
-        bytes[PREPARE_SPLIT_POINT..PREPARE_SPLIT_POINT + owned.blob.len()]
-            .copy_from_slice(&owned.blob);
-        buffer
+        prepare_from_owned(&owned)
     }
 
     #[test]
@@ -1202,6 +1249,100 @@ mod tests {
                 user_headers.len(),
             );
         }
+    }
+
+    #[test]
+    fn batch_checksum_v2_pins_header_fields_then_message_checksum_fields() {
+        // Formula pin for batch checksum v2: XxHash3-64 (default seed) streaming
+        // over the six batch header meta fields (LE, in field order) then each
+        // message's stored 8-byte checksum field in message order - never the
+        // bodies. This reference walks the blob by the KNOWN input message sizes,
+        // independent of the production frame decoder, and must equal what the
+        // encoder stamped, or a stamp will not verify against a read-back
+        // recompute.
+        let namespace = IggyNamespace::new(1, 1, 7);
+        let messages = sample_messages();
+        let mut owned =
+            SendMessages2Owned::from_messages(namespace, &messages).expect("build batch");
+        owned.header.base_offset = 100;
+        owned.header.base_timestamp = 200;
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+
+        let mut hasher = XxHash3_64::new();
+        hasher.write(&owned.header.partition_id.to_le_bytes());
+        hasher.write(&owned.header.base_offset.to_le_bytes());
+        hasher.write(&owned.header.base_timestamp.to_le_bytes());
+        hasher.write(&owned.header.origin_timestamp.to_le_bytes());
+        hasher.write(&owned.header.batch_length.to_le_bytes());
+        hasher.write(&owned.header.message_count.to_le_bytes());
+        let mut frame_start = 0usize;
+        for message in messages.iter() {
+            hasher.write(&owned.blob[frame_start..frame_start + 8]);
+            let user_headers = message.user_headers.as_deref().unwrap_or_default();
+            frame_start += MESSAGE_HEADER_SIZE + message.payload.len() + user_headers.len();
+        }
+        let reference = hasher.finish();
+
+        assert_eq!(
+            frame_start,
+            owned.blob.len(),
+            "reference walk must consume the whole blob",
+        );
+        assert_eq!(
+            owned.header.batch_checksum, reference,
+            "v2 batch checksum must equal hash(6 header fields || per-message checksum fields)",
+        );
+    }
+
+    #[test]
+    fn decode_batch_slice_rejects_body_corruption_with_intact_checksum_field() {
+        // Equal-integrity: v2 binds bodies only through the per-message checksum
+        // fields, so a flipped body byte that leaves the 8-byte checksum field
+        // intact keeps the batch value matching. The validating decode must still
+        // reject it via the per-message verify - the sole at-rest read-back check
+        // (the poll disk walk) decodes through here.
+        let namespace = IggyNamespace::new(1, 1, 7);
+        let owned =
+            SendMessages2Owned::from_messages(namespace, &sample_messages()).expect("build batch");
+        let mut body = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
+        owned.header.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+        body[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
+
+        decode_batch_slice(&body).expect("the clean batch decodes");
+
+        // First payload byte sits right after the command header and the first
+        // message's 48B frame header, leaving that frame's checksum field intact.
+        let payload_index = COMMAND_HEADER_SIZE + MESSAGE_HEADER_SIZE;
+        body[payload_index] ^= 0xFF;
+        assert!(
+            matches!(
+                decode_batch_slice(&body),
+                Err(IggyError::InvalidMessageChecksum(..))
+            ),
+            "body corruption with an intact checksum field must fail the per-message verify",
+        );
+    }
+
+    #[test]
+    fn decode_prepare_slice_rejects_body_corruption_with_intact_checksum_field() {
+        // The same equal-integrity guarantee at the resident/repair validating
+        // decode, plus proof that the batch value alone is blind to it.
+        let mut owned = prepare_with_messages(&sample_messages());
+        decode_prepare_slice(owned.as_slice()).expect("the clean prepare decodes");
+
+        let payload_index = PREPARE_SPLIT_POINT + MESSAGE_HEADER_SIZE;
+        owned.as_mut_slice()[payload_index] ^= 0xFF;
+        assert!(
+            matches!(
+                decode_prepare_slice(owned.as_slice()),
+                Err(IggyError::InvalidMessageChecksum(..))
+            ),
+            "body corruption with an intact checksum field must fail the per-message verify",
+        );
+        assert!(
+            decode_prepare_slice_trusted(owned.as_slice()).is_ok(),
+            "the intact checksum field leaves the batch value matching, so trusted still passes",
+        );
     }
 
     /// Legacy `SendMessages` request body: `[metadata_len=4][message_count]`
