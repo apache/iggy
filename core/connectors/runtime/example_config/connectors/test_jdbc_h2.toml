@@ -1,0 +1,44 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "jdbc_h2_test"
+enabled = true
+version = 0
+name = "JDBC H2 Test Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
+
+[plugin_config]
+jdbc_url = "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;INIT=CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(100), email VARCHAR(100), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);INSERT INTO users (name, email) SELECT 'User ' || x, 'user' || x || '@test.com' FROM SYSTEM_RANGE(1, 100) WHERE NOT EXISTS (SELECT 1 FROM users);"
+driver_class = "org.h2.Driver"
+driver_jar_path = "/tmp/jdbc-drivers/h2-2.2.224.jar"
+username = "sa"
+password = ""
+query = "SELECT * FROM users WHERE id > {last_offset} ORDER BY id"
+poll_interval = "5s"
+batch_size = 10
+tracking_column = "id"
+initial_offset = "0"
+mode = "incremental"
+snake_case_columns = true
+include_metadata = true
+
+[[streams]]
+stream = "test"
+topic = "users"
+schema = "json"
