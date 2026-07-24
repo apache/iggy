@@ -27,7 +27,7 @@ use iggy::prelude::{
     ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyDuration,
     IggyError, ReceivedMessage,
 };
-use pyo3::exceptions::PyStopAsyncIteration;
+use pyo3::exceptions::{PyStopAsyncIteration, PyValueError};
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
 use pyo3::prelude::*;
@@ -429,25 +429,27 @@ pub enum AutoCommit {
     After(AutoCommitAfter),
 }
 
-impl From<&AutoCommit> for RustAutoCommit {
-    fn from(val: &AutoCommit) -> RustAutoCommit {
-        match val {
+impl TryFrom<&AutoCommit> for RustAutoCommit {
+    type Error = PyErr;
+
+    fn try_from(val: &AutoCommit) -> PyResult<RustAutoCommit> {
+        Ok(match val {
             AutoCommit::Disabled() => RustAutoCommit::Disabled,
             AutoCommit::Interval(delta) => {
-                let duration = py_delta_to_iggy_duration(delta);
+                let duration = py_delta_to_iggy_duration(delta)?;
                 RustAutoCommit::Interval(duration)
             }
             AutoCommit::IntervalOrWhen(delta, when) => {
-                let duration = py_delta_to_iggy_duration(delta);
+                let duration = py_delta_to_iggy_duration(delta)?;
                 RustAutoCommit::IntervalOrWhen(duration, when.into())
             }
             AutoCommit::IntervalOrAfter(delta, after) => {
-                let duration = py_delta_to_iggy_duration(delta);
+                let duration = py_delta_to_iggy_duration(delta)?;
                 RustAutoCommit::IntervalOrAfter(duration, after.into())
             }
             AutoCommit::When(when) => RustAutoCommit::When(when.into()),
             AutoCommit::After(after) => RustAutoCommit::After(after.into()),
-        }
+        })
     }
 }
 
@@ -517,11 +519,19 @@ impl PyStubType for AutoCommitAfter {
     }
 }
 
-pub fn py_delta_to_iggy_duration(delta1: &Py<PyDelta>) -> IggyDuration {
+pub fn py_delta_to_iggy_duration(delta1: &Py<PyDelta>) -> PyResult<IggyDuration> {
     Python::attach(|py| {
         let delta = delta1.bind(py);
-        let seconds = (delta.get_days() * 60 * 60 * 24 + delta.get_seconds()) as u64;
+        let total_seconds = i64::from(delta.get_days()) * 86_400 + i64::from(delta.get_seconds());
+        if total_seconds < 0 {
+            return Err(PyValueError::new_err(
+                "duration must not be negative".to_string(),
+            ));
+        }
         let nanos = (delta.get_microseconds() * 1_000) as u32;
-        IggyDuration::new(Duration::new(seconds, nanos))
+        Ok(IggyDuration::new(Duration::new(
+            total_seconds as u64,
+            nanos,
+        )))
     })
 }

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// - `current_offset`: the current offset of the partition.
 /// - `size_bytes`: the size of the partition in bytes.
 /// - `messages_count`: the number of messages in the partition.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partition {
     /// Unique identifier of the partition.
     pub id: u32,
