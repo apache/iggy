@@ -34,6 +34,7 @@ use crate::consumer::{
     IggyConsumer, py_delta_to_iggy_duration,
 };
 use crate::identifier::PyIdentifier;
+use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
@@ -171,19 +172,18 @@ impl IggyClient {
 
     /// Create a new user.
     ///
-    /// The user is created without permissions.
-    ///
     /// Args:
     ///     username: Username as `str`.
     ///     password: Password as `str`.
     ///     status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+    ///     permissions: Permissions as `Permissions | None`; the user has none when `None`.
     ///
     /// Returns:
     ///     An awaitable that resolves to the created `UserInfoDetails`.
     ///
     /// Raises:
     ///     PyRuntimeError: If an argument is invalid or the request fails.
-    #[pyo3(signature = (username, password, status=None))]
+    #[pyo3(signature = (username, password, status=None, permissions=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails]", imports=("collections.abc")))]
     fn create_user<'a>(
         &self,
@@ -191,13 +191,17 @@ impl IggyClient {
         username: String,
         password: String,
         #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let status = status.map_or(UserStatus::Active, UserStatus::from);
+        let permissions = permissions.map(|permissions| permissions.inner);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             let user = inner
-                .create_user(&username, &password, status, None)
+                .create_user(&username, &password, status, permissions)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(PyUserInfoDetails::from(user))
@@ -258,6 +262,97 @@ impl IggyClient {
         future_into_py(py, async move {
             inner
                 .delete_user(&user_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Update the permissions of a user by unique ID or username.
+    ///
+    /// This is a full replacement: the given permissions overwrite the previous
+    /// ones, and `None` removes them entirely.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     permissions: New permissions as `Permissions | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the permissions are updated.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[pyo3(signature = (user_id, permissions=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_permissions<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let permissions = permissions.map(|permissions| permissions.inner);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_permissions(&user_id, permissions)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Change the password of a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     current_password: Current password as `str`.
+    ///     new_password: New password as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the password is changed.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the current password is wrong or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn change_password<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        current_password: String,
+        new_password: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .change_password(&user_id, &current_password, &new_password)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Log out the currently authenticated user.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is logged out.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn logout_user<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .logout_user()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())

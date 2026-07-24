@@ -21,6 +21,8 @@ use iggy::prelude::{
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 
+use crate::permissions::Permissions;
+
 /// The status of a user account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[gen_stub_pyclass_enum]
@@ -127,5 +129,12 @@ impl UserInfoDetails {
     #[getter]
     pub fn username(&self) -> String {
         self.inner.username.to_string()
+    }
+
+    /// The permissions of the user, or `None` when the user has none assigned.
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "Permissions | None"))]
+    pub fn permissions(&self) -> Option<Permissions> {
+        self.inner.permissions.clone().map(Permissions::from)
     }
 }
