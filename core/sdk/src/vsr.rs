@@ -184,7 +184,12 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
                 return Err(IggyError::InvalidCommand);
             }
             if let Some(error) = read_reply_status(header_bytes) {
-                return Err(error);
+                let body = if total_size > HEADER_SIZE {
+                    &response[HEADER_SIZE..total_size.min(response.len())]
+                } else {
+                    &[]
+                };
+                return Err(IggyError::from_code_with_payload(error.as_code(), body));
             }
             let operation = read_operation(header_bytes)?;
             split_metadata_result(operation, response.slice(HEADER_SIZE..total_size))
@@ -214,7 +219,12 @@ pub(crate) fn decode_response_split(
                 return Err(IggyError::InvalidCommand);
             }
             if let Some(error) = read_reply_status(header_bytes) {
-                return Err(error);
+                let payload = if expected_body > 0 {
+                    &body[..expected_body.min(body.len())]
+                } else {
+                    &[]
+                };
+                return Err(IggyError::from_code_with_payload(error.as_code(), payload));
             }
             let operation = read_operation(header_bytes)?;
             split_metadata_result(operation, body.slice(..expected_body))
@@ -591,6 +601,59 @@ mod tests {
         buf.copy_from_slice(bytemuck::bytes_of(&header));
         let result = decode_response_split(&buf, Bytes::new());
         assert!(matches!(result, Err(IggyError::Unauthorized)));
+    }
+
+    #[test]
+    fn reply_with_nonzero_data_bearing_code_reconstructs_from_payload() {
+        let code =
+            IggyError::PartitionNotFound(5, Default::default(), Default::default()).as_code();
+        // partition_id=5, topic_id=1 (numeric), stream_id=2 (numeric)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&5u64.to_le_bytes());
+        payload.push(0); // IdKind::Numeric
+        payload.push(4);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0); // IdKind::Numeric
+        payload.push(4);
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        let body = Bytes::from(payload);
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            size: (HEADER_SIZE + body.len()) as u32,
+            status: code,
+            ..Default::default()
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        buf.copy_from_slice(bytemuck::bytes_of(&header));
+        let result = decode_response_split(&buf, body);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.as_code(), code);
+        assert!(matches!(&err, IggyError::PartitionNotFound(
+            5,
+            topic_id,
+            stream_id
+        ) if topic_id.value == 1u32.to_le_bytes().to_vec()
+          && stream_id.value == 2u32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn reply_with_nonzero_data_bearing_code_falls_back_when_body_is_empty() {
+        let code =
+            IggyError::PartitionNotFound(5, Default::default(), Default::default()).as_code();
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            size: HEADER_SIZE as u32,
+            status: code,
+            ..Default::default()
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        buf.copy_from_slice(bytemuck::bytes_of(&header));
+        let result = decode_response_split(&buf, Bytes::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.as_code(), code);
+        assert!(matches!(err, IggyError::PartitionNotFound(..)));
     }
 
     #[test]

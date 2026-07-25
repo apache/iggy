@@ -395,8 +395,8 @@ class TestMessageOperations:
         with pytest.raises(
             RuntimeError,
             match=(
-                r"Partition with ID: 0 for topic with ID: 0 "
-                r"for stream with ID: 0 was not found\."
+                r"Partition with ID: 1 for topic with ID: \d+ "
+                r"for stream with ID: \d+ was not found\."
             ),
         ):
             await iggy_client.poll_messages(

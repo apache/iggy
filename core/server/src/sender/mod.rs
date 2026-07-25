@@ -203,7 +203,8 @@ pub(crate) async fn send_error_response<T>(
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    send_response(stream, &error.as_code().to_le_bytes(), &[]).await
+    let payload = error.write_payload();
+    send_response(stream, &error.as_code().to_le_bytes(), &payload).await
 }
 
 pub(crate) async fn send_response<T>(

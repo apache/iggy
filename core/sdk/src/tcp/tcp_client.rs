@@ -327,6 +327,11 @@ impl TcpClient {
         stream: &mut ConnectionStreamKind,
     ) -> Result<Bytes, IggyError> {
         if status != 0 {
+            let mut body = BytesMut::new();
+            if length > 0 {
+                body.put_bytes(0, length as usize);
+                stream.read(&mut body).await?;
+            }
             // TEMP: See https://github.com/apache/iggy/pull/604 for context.
             if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
                 || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
@@ -347,7 +352,7 @@ impl TcpClient {
                 );
             }
 
-            return Err(IggyError::from_code(status));
+            return Err(IggyError::from_code_with_payload(status, &body));
         }
 
         trace!("Status: OK. Response length: {}", length);
@@ -1332,6 +1337,45 @@ mod tests {
         let mut stream = make_dummy_stream(&[1u8; 10]).await;
         let tcp_client = TcpClient::handle_response(1, 0, &mut stream).await;
         assert!(tcp_client.is_err());
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_reconstruct_data_bearing_error_from_payload_when_body_is_non_empty() {
+        let code: u32 = 3007; // PartitionNotFound
+        // partition_id=5, topic_id=1 (numeric), stream_id=2 (numeric)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&5u64.to_le_bytes()); // partition_id as u64
+        payload.push(0); // IdKind::Numeric
+        payload.push(4); // length
+        payload.extend_from_slice(&1u32.to_le_bytes()); // topic_id = 1
+        payload.push(0); // IdKind::Numeric
+        payload.push(4); // length
+        payload.extend_from_slice(&2u32.to_le_bytes()); // stream_id = 2
+        let mut stream = make_dummy_stream(&payload).await;
+        let result = TcpClient::handle_response(code, payload.len() as u32, &mut stream).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.as_code(), code);
+        assert!(matches!(&err, IggyError::PartitionNotFound(
+            5,
+            topic_id,
+            stream_id
+        ) if topic_id.value == 1u32.to_le_bytes().to_vec()
+          && stream_id.value == 2u32.to_le_bytes().to_vec()));
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_fallback_to_default_error_when_error_body_is_empty() {
+        let mut stream = make_dummy_stream(&[]).await;
+        let code: u32 = 3007; // PartitionNotFound
+        let result = TcpClient::handle_response(code, 0, &mut stream).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.as_code(), code);
+        // Fallback: old server sends no body, so from_code produces Default fields.
+        assert!(matches!(err, IggyError::PartitionNotFound(..)));
     }
 
     #[cfg(not(feature = "vsr"))]

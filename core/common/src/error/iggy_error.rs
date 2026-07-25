@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::Identifier;
 use crate::utils::topic_size::MaxTopicSize;
+use crate::{IdKind, Identifier};
 use crate::{IggyMessage, utils::byte_size::IggyByteSize};
+use std::mem::size_of;
 use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
@@ -533,6 +534,152 @@ pub enum IggyError {
     IncompatibleProtocolVersion(u32, u32, u32) = 14003,
 }
 
+/// Trait for serializing/deserializing individual [`IggyError`] payload fields.
+trait ErrorPayloadField: Sized {
+    fn write(&self, buf: &mut Vec<u8>);
+    fn read(buf: &[u8], pos: usize) -> (Self, usize);
+}
+
+impl ErrorPayloadField for usize {
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(*self as u64).to_le_bytes());
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        let bytes: [u8; size_of::<u64>()] = buf[pos..pos + size_of::<u64>()]
+            .try_into()
+            .expect("invalid usize payload");
+        (u64::from_le_bytes(bytes) as usize, pos + size_of::<u64>())
+    }
+}
+
+impl ErrorPayloadField for u32 {
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        let bytes: [u8; size_of::<Self>()] = buf[pos..pos + size_of::<Self>()]
+            .try_into()
+            .expect("invalid u32 payload");
+        (Self::from_le_bytes(bytes), pos + size_of::<Self>())
+    }
+}
+
+impl ErrorPayloadField for u64 {
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        let bytes: [u8; size_of::<Self>()] = buf[pos..pos + size_of::<Self>()]
+            .try_into()
+            .expect("invalid u64 payload");
+        (Self::from_le_bytes(bytes), pos + size_of::<Self>())
+    }
+}
+
+impl ErrorPayloadField for u16 {
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        let bytes: [u8; size_of::<Self>()] = buf[pos..pos + size_of::<Self>()]
+            .try_into()
+            .expect("invalid u16 payload");
+        (Self::from_le_bytes(bytes), pos + size_of::<Self>())
+    }
+}
+
+impl ErrorPayloadField for u8 {
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.push(*self);
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        (buf[pos], pos + 1)
+    }
+}
+
+impl ErrorPayloadField for Identifier {
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.push(self.kind as u8);
+        buf.push(self.length);
+        buf.extend_from_slice(&self.value);
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        let kind = match buf[pos] {
+            0 => IdKind::Numeric,
+            _ => IdKind::String,
+        };
+        let length = buf[pos + 1] as usize;
+        let value = buf[pos + 2..pos + 2 + length].to_vec();
+        (
+            Identifier {
+                kind,
+                length: length as u8,
+                value,
+            },
+            pos + 2 + length,
+        )
+    }
+}
+
+impl ErrorPayloadField for String {
+    fn write(&self, buf: &mut Vec<u8>) {
+        let len = self.len() as u32;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(self.as_bytes());
+    }
+    fn read(buf: &[u8], pos: usize) -> (Self, usize) {
+        let len = u32::from_le_bytes(
+            buf[pos..pos + size_of::<u32>()]
+                .try_into()
+                .expect("invalid string length payload"),
+        ) as usize;
+        let data_start = pos + size_of::<u32>();
+        let data = String::from_utf8_lossy(&buf[data_start..data_start + len]).into_owned();
+        (data, data_start + len)
+    }
+}
+
+macro_rules! implement_error_payload {
+    ($($variant:ident($($field:ident: $ty:ty),* $(,)?)),* $(,)?) => {
+        /// Serialize the fields of a data-bearing error variant into a binary
+        /// payload. Returns an empty vector for unit variants and unhandled
+        /// variants.
+        pub fn write_payload(&self) -> Vec<u8> {
+            let mut buf = Vec::new();
+            match self {
+                $(IggyError::$variant($($field),*) => {
+                    $(ErrorPayloadField::write($field, &mut buf);)*
+                })*
+                _ => {}
+            }
+            buf
+        }
+
+        /// Reconstruct an [`IggyError`] from a server-provided code and a
+        /// structured binary payload. Falls back to [`IggyError::from_code`]
+        /// when the payload is empty or the code maps to a unit variant or
+        /// an unrecognized variant.
+        pub fn from_code_with_payload(code: u32, payload: &[u8]) -> Self {
+            if payload.is_empty() {
+                return IggyError::from_code(code);
+            }
+            let Some(disc) = IggyErrorDiscriminants::from_repr(code) else {
+                return IggyError::from_code(code);
+            };
+            let mut cursor: usize = 0;
+            match disc {
+                $(IggyErrorDiscriminants::$variant => {
+                    $(let ($field, off) = <$ty as ErrorPayloadField>::read(payload, cursor);
+                      cursor = off;)*
+                    let _ = cursor;
+                    IggyError::$variant($($field),*)
+                })*
+                _ => IggyError::from_code(code),
+            }
+        }
+    };
+}
+
 impl IggyError {
     pub fn as_code(&self) -> u32 {
         // SAFETY: SdkError specifies #[repr(u32)] representation.
@@ -552,6 +699,108 @@ impl IggyError {
         IggyErrorDiscriminants::from_repr(code)
             .map(|discriminant| discriminant.into())
             .unwrap_or("unknown error code")
+    }
+
+    implement_error_payload! {
+        PartitionNotFound(partition_id: usize, topic_id: Identifier, stream_id: Identifier),
+        StreamIdNotFound(stream_id: Identifier),
+        TopicIdNotFound(stream_id: Identifier, topic_id: Identifier),
+        InvalidOffset(offset: u64),
+        ClientNotFound(client_id: u32),
+        CannotDeleteUser(user_id: u32),
+        CannotChangePermissions(user_id: u32),
+        ConsumerOffsetNotFound(offset: usize),
+        NoPartitions(topic_id: Identifier, stream_id: Identifier),
+        TopicFull(topic_id: Identifier, stream_id: Identifier),
+        ConsumerGroupIdNotFound(group_id: Identifier, topic_id: Identifier),
+        ConsumerGroupMemberNotFound(client_id: u32, group_id: Identifier, topic_id: Identifier),
+        ConsumerGroupPartitionNotOwned(client_id: u32, partition_id: u32),
+        CannotDeletePartitionDirectory(partition_id: usize, stream_id: usize, topic_id: usize),
+        CannotCreateConsumerGroupInfo(id: usize, topic_id: Identifier, stream_id: Identifier),
+        CannotDeleteConsumerGroupInfo(id: usize, topic_id: Identifier, stream_id: Identifier),
+        ConsumerGroupNameNotFound(name: String, topic_id: Identifier),
+        ConsumerGroupNameAlreadyExists(name: String, topic_id: Identifier),
+        InvalidReservedField(value: u64),
+        // Single-field String variants.
+        InvalidVersion(info: String),
+        CannotCreateBaseDirectory(path: String),
+        CannotCreateRuntimeDirectory(path: String),
+        CannotRemoveRuntimeDirectory(path: String),
+        CannotCreateStateDirectory(path: String),
+        CannotOpenDatabase(path: String),
+        ResourceNotFound(key: String),
+        CannotCloseWebSocketConnection(reason: String),
+        HttpError(info: String),
+        InvalidApiUrl(url: String),
+        InvalidJwtAlgorithm(alg: String),
+        CannotFetchJwks(url: String),
+        CannotParseHeaderKind(info: String),
+        CannotCreateStreamsDirectory(path: String),
+        StreamNameNotFound(name: String),
+        StreamDirectoryNotFound(path: String),
+        StreamNameAlreadyExists(name: String),
+        TopicDirectoryNotFound(path: String),
+        CannotDeleteConsumerOffsetsDirectory(path: String),
+        CannotDeleteConsumerOffsetFile(path: String),
+        CannotCreateConsumerOffsetsDirectory(path: String),
+        CannotReadConsumerOffsets(path: String),
+        CannotOpenConsumerOffsetsFile(path: String),
+        CannotCreateSegmentLogFile(path: String),
+        CannotCreateSegmentIndexFile(path: String),
+        CannotCreateSegmentTimeIndexFile(path: String),
+        CommandLengthError(info: String),
+        CannotBindToSocket(info: String),
+        IoError(info: String),
+        // Remaining compatible data-bearing variants.
+        InvalidStateEntryChecksum(a: u64, b: u64, c: u64),
+        InvalidIpAddress(ip: String, info: String),
+        HttpResponseError(status: u16, body: String),
+        PersonalAccessTokenAlreadyExists(token: String, user_id: u32),
+        PersonalAccessTokensLimitReached(user_id: u32, limit: u32),
+        PersonalAccessTokenExpired(token: String, user_id: u32),
+        CannotCreateStream(s: u32),
+        CannotCreateStreamDirectory(stream_id: u32, path: String),
+        CannotCreateStreamInfo(s: u32),
+        CannotUpdateStreamInfo(s: u32),
+        CannotOpenStreamInfo(s: u32),
+        CannotReadStreamInfo(s: u32),
+        CannotDeleteStream(s: u32),
+        CannotDeleteStreamDirectory(s: u32),
+        CannotCreateTopicsDirectory(stream_id: Identifier, path: String),
+        CannotCreateTopicDirectory(stream_id: usize, topic_id: usize, path: String),
+        CannotCreateTopic(stream_id: u32, topic_id: u32),
+        CannotCreateTopicInfo(stream_id: u32, topic_id: u32),
+        CannotDeleteTopic(stream_id: u32, topic_id: u32),
+        CannotDeleteTopicDirectory(stream_id: u32, topic_id: u32, path: String),
+        CannotOpenTopicInfo(stream_id: u32, topic_id: u32),
+        CannotReadTopicInfo(stream_id: u32, topic_id: u32),
+        CannotReadTopics(stream_id: u32),
+        CannotUpdateTopicInfo(stream_id: u32, topic_id: u32),
+        CannotCreatePartition(partition_id: usize, stream_id: usize, topic_id: usize),
+        CannotCreatePartitionDirectory(partition_id: usize, stream_id: usize, topic_id: usize),
+        CannotCreatePartitionsDirectory(stream_id: usize, topic_id: usize),
+        CannotDeletePartition(partition_id: usize, stream_id: Identifier, topic_id: Identifier),
+        InvalidBatchChecksum(a: u64, b: u64, c: u64),
+        InvalidHeaderKind(kind: u8),
+        InvalidIndexesByteSize(size: u32),
+        InvalidIndexesCount(count: u32, max: u32),
+        InvalidMessageChecksum(a: u64, b: u64, c: u64),
+        InvalidMessageTimestampDelta(delta: u64),
+        InvalidMessagesSize(size: u32, max: u32),
+        InvalidSegmentSize(size: u64),
+        InvalidSegmentsCount(count: u32),
+        InvalidSession(session: u64),
+        MissingIndex(index: u32),
+        NonZeroOffset(offset: u64, partition_id: u32),
+        NonZeroTimestamp(timestamp: u64, partition_id: u32),
+        NotResolvedConsumer(consumer_id: Identifier),
+        SegmentClosed(offset: u64, partition_id: usize),
+        ShardNotFound(shard_id: usize, topic_id: usize, stream_id: usize),
+        TimestampOutOfRange(timestamp: u64),
+        TooSmallMessage(size: u32, min: u32),
+        TopicNameAlreadyExists(name: String, topic_id: Identifier),
+        TopicNameNotFound(name: String, topic_id: String),
+        UnknownReplicatedCommand(code: u32),
     }
 }
 
@@ -593,5 +842,96 @@ mod tests {
             IggyError::InvalidConsumerGroupName.as_string(),
             IggyError::from_code_as_string(GROUP_NAME_ERROR_CODE)
         )
+    }
+
+    #[test]
+    fn from_code_reconstructs_unit_variant_preserving_code() {
+        let err = IggyError::from_code(IggyError::Unauthorized.as_code());
+        assert_eq!(err.as_code(), IggyError::Unauthorized.as_code());
+        assert!(matches!(err, IggyError::Unauthorized));
+    }
+
+    #[test]
+    fn from_code_fills_data_bearing_variant_with_default_fields() {
+        let code: u32 = 3007; // PartitionNotFound
+        let err = IggyError::from_code(code);
+        assert_eq!(err.as_code(), code);
+        // from_repr uses Default for data fields: partition 0, zeroed identifiers.
+        assert!(matches!(err, IggyError::PartitionNotFound(..)));
+        let error_string = err.to_string();
+        assert!(error_string.contains("Partition with ID: 0"));
+    }
+
+    #[test]
+    fn payload_round_trip_reconstructs_partition_not_found_with_real_fields() {
+        let original = IggyError::PartitionNotFound(
+            5,
+            crate::Identifier::numeric(1).unwrap(),
+            crate::Identifier::numeric(2).unwrap(),
+        );
+        let payload = original.write_payload();
+        assert!(!payload.is_empty());
+        let reconstructed = IggyError::from_code_with_payload(original.as_code(), &payload);
+        assert_eq!(reconstructed.as_code(), original.as_code());
+        assert!(matches!(&reconstructed, IggyError::PartitionNotFound(
+            5,
+            topic_id,
+            stream_id
+        ) if topic_id.value == 1u32.to_le_bytes().to_vec()
+          && stream_id.value == 2u32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn payload_round_trip_reconstructs_stream_id_not_found_with_real_fields() {
+        let original = IggyError::StreamIdNotFound(crate::Identifier::numeric(42).unwrap());
+        let payload = original.write_payload();
+        assert!(!payload.is_empty());
+        let reconstructed = IggyError::from_code_with_payload(original.as_code(), &payload);
+        assert_eq!(reconstructed.as_code(), original.as_code());
+        assert!(
+            matches!(&reconstructed, IggyError::StreamIdNotFound(id) if id.value == 42u32.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn payload_round_trip_reconstructs_invalid_offset_with_real_fields() {
+        let original = IggyError::InvalidOffset(123456);
+        let payload = original.write_payload();
+        assert!(!payload.is_empty());
+        let reconstructed = IggyError::from_code_with_payload(original.as_code(), &payload);
+        assert_eq!(reconstructed.as_code(), original.as_code());
+        assert!(matches!(reconstructed, IggyError::InvalidOffset(123456)));
+    }
+
+    #[test]
+    fn payload_round_trip_reconstructs_client_not_found_with_real_fields() {
+        let original = IggyError::ClientNotFound(99);
+        let payload = original.write_payload();
+        assert!(!payload.is_empty());
+        let reconstructed = IggyError::from_code_with_payload(original.as_code(), &payload);
+        assert_eq!(reconstructed.as_code(), original.as_code());
+        assert!(matches!(reconstructed, IggyError::ClientNotFound(99)));
+    }
+
+    #[test]
+    fn payload_round_trip_unit_variant_produces_empty_payload() {
+        let original = IggyError::Unauthorized;
+        let payload = original.write_payload();
+        assert!(payload.is_empty());
+        let reconstructed = IggyError::from_code_with_payload(original.as_code(), &payload);
+        assert_eq!(reconstructed, original);
+    }
+
+    #[test]
+    fn from_code_with_payload_falls_back_to_from_code_when_payload_is_empty() {
+        let code = IggyError::Unauthenticated.as_code();
+        let err = IggyError::from_code_with_payload(code, &[]);
+        assert_eq!(err, IggyError::Unauthenticated);
+    }
+
+    #[test]
+    fn from_code_unknown_code_falls_back_to_error_variant() {
+        let err = IggyError::from_code(0xDEAD_BEEF);
+        assert_eq!(err, IggyError::Error);
     }
 }

@@ -829,6 +829,11 @@ impl WebSocketClient {
             );
 
             if status != 0 {
+                let mut body = vec![];
+                if length > 0 {
+                    body.resize(length, 0);
+                    stream.read(&mut body).await?;
+                }
                 // TEMP: See https://github.com/apache/iggy/pull/604 for context.
                 if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
                     || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
@@ -849,7 +854,7 @@ impl WebSocketClient {
                     );
                 }
 
-                return Err(IggyError::from_code(status));
+                return Err(IggyError::from_code_with_payload(status, &body));
             }
 
             if length == 0 {
