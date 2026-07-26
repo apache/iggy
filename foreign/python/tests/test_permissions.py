@@ -549,6 +549,54 @@ class TestChangePassword:
 
         await iggy_client.delete_user(created.id)
 
+    @pytest.mark.asyncio
+    async def test_user_with_manage_users_can_change_other_password(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user granted manage_users can change another user's password."""
+        actor_username, actor_password = unique_credentials(unique_name)
+        actor = await iggy_client.create_user(
+            actor_username,
+            actor_password,
+            permissions=Permissions(
+                global_permissions=GlobalPermissions(manage_users=True)
+            ),
+        )
+        target_username, target_password = unique_credentials(unique_name)
+        target = await iggy_client.create_user(target_username, target_password)
+        new_password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
+
+        actor_client = await login_fresh_client(actor_username, actor_password)
+        await actor_client.change_password(target.id, target_password, new_password)
+
+        relogin = await login_fresh_client(target_username, new_password)
+        await relogin.ping()
+
+        await iggy_client.delete_user(actor.id)
+        await iggy_client.delete_user(target.id)
+
+    @pytest.mark.asyncio
+    async def test_failed_password_change_leaves_target_credentials_valid(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user lacking manage_users is denied and old credentials stay valid."""
+        actor_username, actor_password = unique_credentials(unique_name)
+        actor = await iggy_client.create_user(actor_username, actor_password)
+        target_username, target_password = unique_credentials(unique_name)
+        target = await iggy_client.create_user(target_username, target_password)
+
+        actor_client = await login_fresh_client(actor_username, actor_password)
+        with pytest.raises(RuntimeError):
+            await actor_client.change_password(
+                target.id, target_password, unique_name(max_bytes=MAX_PASSWORD_BYTES)
+            )
+
+        target_client = await login_fresh_client(target_username, target_password)
+        await target_client.ping()
+
+        await iggy_client.delete_user(actor.id)
+        await iggy_client.delete_user(target.id)
+
     @pytest.mark.parametrize(
         "new_password",
         ["a" * (MIN_PASSWORD_BYTES - 1), "a" * (MAX_PASSWORD_BYTES + 1)],
