@@ -989,7 +989,8 @@ class Permissions:
             global_permissions: Global permissions as `GlobalPermissions | None`;
                 defaults to all denied.
             streams: Per-stream permissions keyed by stream ID as
-                `dict[int, StreamPermissions] | None`.
+                `dict[int, StreamPermissions] | None`; an empty dict is
+                treated as `None`.
         """
 
 class PollingStrategy:
@@ -1153,7 +1154,8 @@ class StreamPermissions:
             poll_messages: Allow polling messages from the stream.
             send_messages: Allow sending messages to the stream.
             topics: Per-topic permissions keyed by topic ID as
-                `dict[int, TopicPermissions] | None`.
+                `dict[int, TopicPermissions] | None`; an empty dict is
+                treated as `None`.
         """
 
 @typing.final

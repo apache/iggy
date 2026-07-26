@@ -138,6 +138,13 @@ class TestPermissionsModel:
         assert streams[42].manage_stream is True
         assert streams[42].topics is None
 
+    def test_empty_permission_dicts_normalize_to_none(self):
+        """Test empty stream and topic dicts are equivalent to None."""
+        assert Permissions(streams={}).streams is None
+        assert Permissions(streams={}) == Permissions()
+        assert StreamPermissions(topics={}).topics is None
+        assert StreamPermissions(topics={}) == StreamPermissions()
+
     def test_stream_id_above_u32_is_rejected(self):
         """Test dict keys outside the u32 wire range fail at construction."""
         with pytest.raises(OverflowError):
@@ -173,7 +180,8 @@ class TestCreateUserWithPermissions:
         """Test global permissions set at creation come back from get_user."""
         username, password = unique_credentials(unique_name)
         permissions = Permissions(
-            global_permissions=GlobalPermissions(read_users=True, read_streams=True)
+            global_permissions=GlobalPermissions(read_users=True, read_streams=True),
+            streams={},
         )
 
         created = await iggy_client.create_user(
@@ -183,7 +191,10 @@ class TestCreateUserWithPermissions:
 
         fetched = await iggy_client.get_user(created.id)
         assert fetched is not None
-        assert fetched.permissions == permissions
+        fetched_permissions = fetched.permissions
+        assert fetched_permissions is not None
+        assert fetched_permissions == permissions
+        assert fetched_permissions.streams is None
 
         await iggy_client.delete_user(created.id)
 

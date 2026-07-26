@@ -47,7 +47,8 @@ impl Permissions {
     ///     global_permissions: Global permissions as `GlobalPermissions | None`;
     ///         defaults to all denied.
     ///     streams: Per-stream permissions keyed by stream ID as
-    ///         `dict[int, StreamPermissions] | None`.
+    ///         `dict[int, StreamPermissions] | None`; an empty dict is
+    ///         treated as `None`.
     #[new]
     #[pyo3(signature = (global_permissions=None, streams=None))]
     fn new(
@@ -61,12 +62,16 @@ impl Permissions {
                 global: global_permissions
                     .map(|global| global.inner)
                     .unwrap_or_default(),
-                streams: streams.map(|streams| {
-                    streams
-                        .into_iter()
-                        .map(|(stream_id, stream)| (stream_id as usize, stream.inner))
-                        .collect()
-                }),
+                // The wire format encodes an empty map the same as no map, so
+                // normalize here to keep round-trip equality.
+                streams: streams
+                    .filter(|streams| !streams.is_empty())
+                    .map(|streams| {
+                        streams
+                            .into_iter()
+                            .map(|(stream_id, stream)| (stream_id as usize, stream.inner))
+                            .collect()
+                    }),
             },
         }
     }
@@ -249,7 +254,8 @@ impl StreamPermissions {
     ///     poll_messages: Allow polling messages from the stream.
     ///     send_messages: Allow sending messages to the stream.
     ///     topics: Per-topic permissions keyed by topic ID as
-    ///         `dict[int, TopicPermissions] | None`.
+    ///         `dict[int, TopicPermissions] | None`; an empty dict is
+    ///         treated as `None`.
     #[new]
     #[pyo3(signature = (
         manage_stream=false,
@@ -279,7 +285,9 @@ impl StreamPermissions {
                 read_topics,
                 poll_messages,
                 send_messages,
-                topics: topics.map(|topics| {
+                // The wire format encodes an empty map the same as no map, so
+                // normalize here to keep round-trip equality.
+                topics: topics.filter(|topics| !topics.is_empty()).map(|topics| {
                     topics
                         .into_iter()
                         .map(|(topic_id, topic)| (topic_id as usize, topic.inner))
