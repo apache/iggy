@@ -44,21 +44,23 @@ impl Permissions {
     /// Create permissions from global permissions and optional per-stream permissions.
     ///
     /// Args:
-    ///     global_: Global permissions as `GlobalPermissions | None`; defaults to all denied.
+    ///     global_permissions: Global permissions as `GlobalPermissions | None`;
+    ///         defaults to all denied.
     ///     streams: Per-stream permissions keyed by stream ID as
     ///         `dict[int, StreamPermissions] | None`.
     #[new]
-    #[pyo3(signature = (global_=None, streams=None))]
+    #[pyo3(signature = (global_permissions=None, streams=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "GlobalPermissions | None"))] global_: Option<
-            GlobalPermissions,
-        >,
+        #[gen_stub(override_type(type_repr = "GlobalPermissions | None"))]
+        global_permissions: Option<GlobalPermissions>,
         #[gen_stub(override_type(type_repr = "dict[int, StreamPermissions] | None"))]
         streams: Option<BTreeMap<u32, StreamPermissions>>,
     ) -> Self {
         Self {
             inner: RustPermissions {
-                global: global_.map(|global| global.inner).unwrap_or_default(),
+                global: global_permissions
+                    .map(|global| global.inner)
+                    .unwrap_or_default(),
                 streams: streams.map(|streams| {
                     streams
                         .into_iter()
@@ -71,7 +73,7 @@ impl Permissions {
 
     /// The global permissions, applied to all streams.
     #[getter]
-    fn global_(&self) -> GlobalPermissions {
+    fn global_permissions(&self) -> GlobalPermissions {
         GlobalPermissions {
             inner: self.inner.global.clone(),
         }

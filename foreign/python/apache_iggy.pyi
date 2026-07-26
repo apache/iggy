@@ -967,7 +967,7 @@ class Permissions:
     optionally extended by per-stream permissions.
     """
     @property
-    def global_(self) -> GlobalPermissions:
+    def global_permissions(self) -> GlobalPermissions:
         r"""
         The global permissions, applied to all streams.
         """
@@ -979,14 +979,15 @@ class Permissions:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __new__(
         cls,
-        global_: GlobalPermissions | None = None,
+        global_permissions: GlobalPermissions | None = None,
         streams: dict[int, StreamPermissions] | None = None,
     ) -> Permissions:
         r"""
         Create permissions from global permissions and optional per-stream permissions.
 
         Args:
-            global_: Global permissions as `GlobalPermissions | None`; defaults to all denied.
+            global_permissions: Global permissions as `GlobalPermissions | None`;
+                defaults to all denied.
             streams: Per-stream permissions keyed by stream ID as
                 `dict[int, StreamPermissions] | None`.
         """

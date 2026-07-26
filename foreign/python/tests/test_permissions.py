@@ -75,7 +75,7 @@ class TestPermissionsModel:
         permissions = Permissions()
 
         assert permissions.streams is None
-        global_permissions = permissions.global_
+        global_permissions = permissions.global_permissions
         assert global_permissions.manage_servers is False
         assert global_permissions.read_servers is False
         assert global_permissions.manage_users is False
@@ -115,7 +115,7 @@ class TestPermissionsModel:
     def test_nested_stream_and_topic_permissions_are_preserved(self):
         """Test stream and topic permission dicts survive construction."""
         permissions = Permissions(
-            global_=GlobalPermissions(read_servers=True),
+            global_permissions=GlobalPermissions(read_servers=True),
             streams={
                 1: StreamPermissions(
                     read_stream=True,
@@ -148,14 +148,16 @@ class TestPermissionsModel:
     def test_permissions_equality(self):
         """Test structurally identical Permissions compare equal."""
         first = Permissions(
-            global_=GlobalPermissions(read_streams=True),
+            global_permissions=GlobalPermissions(read_streams=True),
             streams={3: StreamPermissions(poll_messages=True)},
         )
         second = Permissions(
-            global_=GlobalPermissions(read_streams=True),
+            global_permissions=GlobalPermissions(read_streams=True),
             streams={3: StreamPermissions(poll_messages=True)},
         )
-        different = Permissions(global_=GlobalPermissions(manage_streams=True))
+        different = Permissions(
+            global_permissions=GlobalPermissions(manage_streams=True)
+        )
 
         assert first == second
         assert first != different
@@ -171,7 +173,7 @@ class TestCreateUserWithPermissions:
         """Test global permissions set at creation come back from get_user."""
         username, password = unique_credentials(unique_name)
         permissions = Permissions(
-            global_=GlobalPermissions(read_users=True, read_streams=True)
+            global_permissions=GlobalPermissions(read_users=True, read_streams=True)
         )
 
         created = await iggy_client.create_user(
@@ -234,7 +236,9 @@ class TestCreateUserWithPermissions:
     ):
         """Test a granted global permission is enforced for the new user."""
         username, password = unique_credentials(unique_name)
-        permissions = Permissions(global_=GlobalPermissions(manage_streams=True))
+        permissions = Permissions(
+            global_permissions=GlobalPermissions(manage_streams=True)
+        )
         created = await iggy_client.create_user(
             username, password, permissions=permissions
         )
@@ -304,7 +308,9 @@ class TestUpdatePermissions:
         created = await iggy_client.create_user(username, password)
         assert created.permissions is None
 
-        permissions = Permissions(global_=GlobalPermissions(read_streams=True))
+        permissions = Permissions(
+            global_permissions=GlobalPermissions(read_streams=True)
+        )
         await iggy_client.update_permissions(created.id, permissions)
 
         fetched = await iggy_client.get_user(created.id)
@@ -320,11 +326,13 @@ class TestUpdatePermissions:
         """Test update_permissions overwrites instead of merging."""
         username, password = unique_credentials(unique_name)
         initial = Permissions(
-            global_=GlobalPermissions(read_streams=True, read_users=True)
+            global_permissions=GlobalPermissions(read_streams=True, read_users=True)
         )
         created = await iggy_client.create_user(username, password, permissions=initial)
 
-        replacement = Permissions(global_=GlobalPermissions(read_servers=True))
+        replacement = Permissions(
+            global_permissions=GlobalPermissions(read_servers=True)
+        )
         await iggy_client.update_permissions(created.id, replacement)
 
         fetched = await iggy_client.get_user(created.id)
@@ -332,8 +340,8 @@ class TestUpdatePermissions:
         fetched_permissions = fetched.permissions
         assert fetched_permissions is not None
         assert fetched_permissions == replacement
-        assert fetched_permissions.global_.read_streams is False
-        assert fetched_permissions.global_.read_users is False
+        assert fetched_permissions.global_permissions.read_streams is False
+        assert fetched_permissions.global_permissions.read_users is False
 
         await iggy_client.delete_user(created.id)
 
@@ -343,7 +351,9 @@ class TestUpdatePermissions:
     ):
         """Test update_permissions with None removes existing permissions."""
         username, password = unique_credentials(unique_name)
-        permissions = Permissions(global_=GlobalPermissions(read_streams=True))
+        permissions = Permissions(
+            global_permissions=GlobalPermissions(read_streams=True)
+        )
         created = await iggy_client.create_user(
             username, password, permissions=permissions
         )
@@ -369,7 +379,8 @@ class TestUpdatePermissions:
             await denied_client.create_stream(unique_name(prefix="before-grant-"))
 
         await iggy_client.update_permissions(
-            created.id, Permissions(global_=GlobalPermissions(manage_streams=True))
+            created.id,
+            Permissions(global_permissions=GlobalPermissions(manage_streams=True)),
         )
 
         granted_client = await login_fresh_client(username, password)
@@ -392,7 +403,8 @@ class TestUpdatePermissions:
         actor_client = await login_fresh_client(actor_username, actor_password)
         with pytest.raises(RuntimeError):
             await actor_client.update_permissions(
-                target.id, Permissions(global_=GlobalPermissions(read_streams=True))
+                target.id,
+                Permissions(global_permissions=GlobalPermissions(read_streams=True)),
             )
 
         await iggy_client.delete_user(actor.id)
@@ -407,12 +419,14 @@ class TestUpdatePermissions:
         actor = await iggy_client.create_user(
             actor_username,
             actor_password,
-            permissions=Permissions(global_=GlobalPermissions(manage_users=True)),
+            permissions=Permissions(
+                global_permissions=GlobalPermissions(manage_users=True)
+            ),
         )
         target_username, target_password = unique_credentials(unique_name)
         target = await iggy_client.create_user(target_username, target_password)
 
-        granted = Permissions(global_=GlobalPermissions(read_streams=True))
+        granted = Permissions(global_permissions=GlobalPermissions(read_streams=True))
         actor_client = await login_fresh_client(actor_username, actor_password)
         await actor_client.update_permissions(target.id, granted)
 
@@ -431,7 +445,7 @@ class TestUpdatePermissions:
         actor_username, actor_password = unique_credentials(unique_name)
         actor = await iggy_client.create_user(actor_username, actor_password)
         target_username, target_password = unique_credentials(unique_name)
-        initial = Permissions(global_=GlobalPermissions(read_users=True))
+        initial = Permissions(global_permissions=GlobalPermissions(read_users=True))
         target = await iggy_client.create_user(
             target_username, target_password, permissions=initial
         )
@@ -439,7 +453,8 @@ class TestUpdatePermissions:
         actor_client = await login_fresh_client(actor_username, actor_password)
         with pytest.raises(RuntimeError):
             await actor_client.update_permissions(
-                target.id, Permissions(global_=GlobalPermissions(manage_servers=True))
+                target.id,
+                Permissions(global_permissions=GlobalPermissions(manage_servers=True)),
             )
 
         fetched = await iggy_client.get_user(target.id)
@@ -457,7 +472,7 @@ class TestUpdatePermissions:
         with pytest.raises(RuntimeError):
             await iggy_client.update_permissions(
                 unique_name(max_bytes=MAX_USERNAME_BYTES),
-                Permissions(global_=GlobalPermissions(read_streams=True)),
+                Permissions(global_permissions=GlobalPermissions(read_streams=True)),
             )
 
 
@@ -569,7 +584,9 @@ class TestLogoutUser:
         created = await iggy_client.create_user(
             username,
             password,
-            permissions=Permissions(global_=GlobalPermissions(read_users=True)),
+            permissions=Permissions(
+                global_permissions=GlobalPermissions(read_users=True)
+            ),
         )
 
         client = await login_fresh_client(username, password)
@@ -605,7 +622,9 @@ class TestLogoutUser:
         created = await iggy_client.create_user(
             username,
             password,
-            permissions=Permissions(global_=GlobalPermissions(read_users=True)),
+            permissions=Permissions(
+                global_permissions=GlobalPermissions(read_users=True)
+            ),
         )
 
         client = await login_fresh_client(username, password)

@@ -561,7 +561,9 @@ class TestDeleteUser:
         created = await iggy_client.create_user(
             username,
             password,
-            permissions=Permissions(global_=GlobalPermissions(read_users=True)),
+            permissions=Permissions(
+                global_permissions=GlobalPermissions(read_users=True)
+            ),
         )
 
         host, port = get_server_config()
