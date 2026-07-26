@@ -131,6 +131,7 @@ impl GlobalPermissions {
     ///     send_messages: Allow sending messages to all streams.
     #[new]
     #[pyo3(signature = (
+        *,
         manage_servers=false,
         read_servers=false,
         manage_users=false,
@@ -258,6 +259,7 @@ impl StreamPermissions {
     ///         treated as `None`.
     #[new]
     #[pyo3(signature = (
+        *,
         manage_stream=false,
         read_stream=false,
         manage_topics=false,
@@ -374,6 +376,7 @@ impl TopicPermissions {
     ///     send_messages: Allow sending messages to the topic.
     #[new]
     #[pyo3(signature = (
+        *,
         manage_topic=false,
         read_topic=false,
         poll_messages=false,

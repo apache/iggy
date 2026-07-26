@@ -369,6 +369,7 @@ class GlobalPermissions:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __new__(
         cls,
+        *,
         manage_servers: builtins.bool = False,
         read_servers: builtins.bool = False,
         manage_users: builtins.bool = False,
@@ -515,9 +516,7 @@ class IggyClient:
             PyRuntimeError: If the request fails.
         """
     def update_permissions(
-        self,
-        user_id: builtins.str | builtins.int,
-        permissions: Permissions | None = None,
+        self, user_id: builtins.str | builtins.int, permissions: Permissions | None
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update the permissions of a user by unique ID or username.
@@ -1135,6 +1134,7 @@ class StreamPermissions:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __new__(
         cls,
+        *,
         manage_stream: builtins.bool = False,
         read_stream: builtins.bool = False,
         manage_topics: builtins.bool = False,
@@ -1242,6 +1242,7 @@ class TopicPermissions:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __new__(
         cls,
+        *,
         manage_topic: builtins.bool = False,
         read_topic: builtins.bool = False,
         poll_messages: builtins.bool = False,

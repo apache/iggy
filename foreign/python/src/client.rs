@@ -283,7 +283,7 @@ impl IggyClient {
     /// Raises:
     ///     PyValueError: If a string identifier is invalid.
     ///     PyRuntimeError: If the request fails.
-    #[pyo3(signature = (user_id, permissions=None))]
+    #[pyo3(signature = (user_id, permissions))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_permissions<'a>(
         &self,

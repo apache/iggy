@@ -369,7 +369,7 @@ class TestUpdatePermissions:
             username, password, permissions=permissions
         )
 
-        await iggy_client.update_permissions(created.id)
+        await iggy_client.update_permissions(created.id, None)
 
         fetched = await iggy_client.get_user(created.id)
         assert fetched is not None

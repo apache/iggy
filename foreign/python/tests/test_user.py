@@ -630,7 +630,7 @@ async def test_user_management_requires_connection_and_auth(method_name, unique_
         "create_user": (username, "secret"),
         "update_user": (username,),
         "delete_user": (username,),
-        "update_permissions": (username,),
+        "update_permissions": (username, None),
         "change_password": (username, "secret", "secret2"),
         "logout_user": (),
     }
