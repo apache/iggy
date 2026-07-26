@@ -339,7 +339,8 @@ class GlobalPermissions:
     @property
     def manage_streams(self) -> builtins.bool:
         r"""
-        Whether managing all streams is allowed; includes `manage_topics`.
+        Whether managing all streams is allowed; includes `read_streams` and
+        `manage_topics`.
         """
     @property
     def read_streams(self) -> builtins.bool:
@@ -349,17 +350,20 @@ class GlobalPermissions:
     @property
     def manage_topics(self) -> builtins.bool:
         r"""
-        Whether managing all topics is allowed; includes `read_topics`.
+        Whether managing all topics is allowed; includes `read_topics` and
+        `send_messages`.
         """
     @property
     def read_topics(self) -> builtins.bool:
         r"""
-        Whether reading all topics and consumer groups is allowed.
+        Whether reading all topics and managing consumer groups is allowed;
+        includes `poll_messages`.
         """
     @property
     def poll_messages(self) -> builtins.bool:
         r"""
-        Whether polling messages from all streams is allowed.
+        Whether polling messages from all streams and managing consumer
+        offsets is allowed.
         """
     @property
     def send_messages(self) -> builtins.bool:
@@ -384,16 +388,25 @@ class GlobalPermissions:
         r"""
         Create global permissions. Every flag defaults to `False`.
 
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_streams` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
         Args:
             manage_servers: Allow managing servers; includes `read_servers`.
             read_servers: Allow reading server info (stats, clients).
             manage_users: Allow managing users; includes `read_users`.
             read_users: Allow reading user info.
-            manage_streams: Allow managing all streams; includes `manage_topics`.
+            manage_streams: Allow managing all streams; includes `read_streams`
+                and `manage_topics`.
             read_streams: Allow reading all streams; includes `read_topics`.
-            manage_topics: Allow managing all topics; includes `read_topics`.
-            read_topics: Allow reading all topics and consumer groups.
-            poll_messages: Allow polling messages from all streams.
+            manage_topics: Allow managing all topics; includes `read_topics`
+                and `send_messages`.
+            read_topics: Allow reading all topics and managing consumer groups
+                (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from all streams and managing
+                consumer offsets.
             send_messages: Allow sending messages to all streams.
         """
 
@@ -1099,7 +1112,8 @@ class StreamPermissions:
     @property
     def manage_stream(self) -> builtins.bool:
         r"""
-        Whether managing the stream is allowed; includes `read_stream`.
+        Whether managing the stream is allowed; includes `read_stream` and
+        `manage_topics`.
         """
     @property
     def read_stream(self) -> builtins.bool:
@@ -1109,17 +1123,20 @@ class StreamPermissions:
     @property
     def manage_topics(self) -> builtins.bool:
         r"""
-        Whether managing the stream topics is allowed; includes `read_topics`.
+        Whether managing the stream topics is allowed; includes `read_topics`
+        and `send_messages`.
         """
     @property
     def read_topics(self) -> builtins.bool:
         r"""
-        Whether reading the stream topics and consumer groups is allowed.
+        Whether reading the stream topics and managing their consumer groups
+        is allowed; includes `poll_messages`.
         """
     @property
     def poll_messages(self) -> builtins.bool:
         r"""
-        Whether polling messages from the stream is allowed.
+        Whether polling messages from the stream and managing its consumer
+        offsets is allowed.
         """
     @property
     def send_messages(self) -> builtins.bool:
@@ -1146,12 +1163,22 @@ class StreamPermissions:
         r"""
         Create stream permissions. Every flag defaults to `False`.
 
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_stream` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
         Args:
-            manage_stream: Allow managing the stream; includes `read_stream`.
+            manage_stream: Allow managing the stream; includes `read_stream`
+                and `manage_topics`.
             read_stream: Allow reading the stream; includes `read_topics`.
-            manage_topics: Allow managing the stream topics; includes `read_topics`.
-            read_topics: Allow reading the stream topics and consumer groups.
-            poll_messages: Allow polling messages from the stream.
+            manage_topics: Allow managing the stream topics; includes
+                `read_topics` and `send_messages`.
+            read_topics: Allow reading the stream topics and managing their
+                consumer groups (including create and delete); includes
+                `poll_messages`.
+            poll_messages: Allow polling messages from the stream and managing
+                its consumer offsets.
             send_messages: Allow sending messages to the stream.
             topics: Per-topic permissions keyed by topic ID as
                 `dict[int, TopicPermissions] | None`; an empty dict is
@@ -1218,21 +1245,25 @@ class TopicDetails:
 class TopicPermissions:
     r"""
     Permissions for a specific topic of a stream. The lowest level of permissions.
+    They extend the stream and global permissions, they do not override them.
     """
     @property
     def manage_topic(self) -> builtins.bool:
         r"""
-        Whether managing the topic is allowed; includes `read_topic`.
+        Whether managing the topic is allowed; includes `read_topic` and
+        `send_messages`.
         """
     @property
     def read_topic(self) -> builtins.bool:
         r"""
-        Whether reading the topic and its consumer groups is allowed.
+        Whether reading the topic and managing its consumer groups is allowed;
+        includes `poll_messages`.
         """
     @property
     def poll_messages(self) -> builtins.bool:
         r"""
-        Whether polling messages from the topic is allowed.
+        Whether polling messages from the topic and managing its consumer
+        offsets is allowed.
         """
     @property
     def send_messages(self) -> builtins.bool:
@@ -1251,10 +1282,18 @@ class TopicPermissions:
         r"""
         Create topic permissions. Every flag defaults to `False`.
 
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_topic` includes
+        `read_topic` and `send_messages`, and through `read_topic` also
+        `poll_messages`.
+
         Args:
-            manage_topic: Allow managing the topic; includes `read_topic`.
-            read_topic: Allow reading the topic and its consumer groups.
-            poll_messages: Allow polling messages from the topic.
+            manage_topic: Allow managing the topic; includes `read_topic` and
+                `send_messages`.
+            read_topic: Allow reading the topic and managing its consumer
+                groups (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from the topic and managing
+                its consumer offsets.
             send_messages: Allow sending messages to the topic.
         """
 
