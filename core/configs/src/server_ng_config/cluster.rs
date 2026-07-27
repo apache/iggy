@@ -477,7 +477,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             // cluster metadata and redirect URLs, so a bad one poisons them
             // all. The roster `ip` predates this check and is only validated
             // as non-empty (Docker service names with underscores exist in
-            // the wild), so when it backs the client endpoints an unparseable
+            // the wild), so when it backs the client endpoints an unparsable
             // value falls back to raw-string comparison instead of failing
             // boot.
             let client_address = match node.advertised_address.as_deref() {

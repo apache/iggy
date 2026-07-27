@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_metadata_passes_unparseable_replica_ip_verbatim() {
+    fn cluster_metadata_passes_unparsable_replica_ip_verbatim() {
         let mut cluster_roster = roster(None);
         cluster_roster.nodes[0].ip = "iggy_node".to_owned();
 
