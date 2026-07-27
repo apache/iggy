@@ -309,7 +309,7 @@ static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 # Pinned to 2 because darling 0.23 still emits syn 2 types.
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 sysinfo = "0.39.6"
 system_stats = { path = "core/system_stats" }
 tempfile = "3.27.0"
