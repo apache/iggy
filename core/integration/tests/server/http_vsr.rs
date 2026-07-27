@@ -615,6 +615,17 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
         StatusCode::PAYLOAD_TOO_LARGE,
         "oversized body must be rejected"
     );
+    // The cap rejects the body unread, so the connection cannot be reused: the
+    // reply must say so, or the client pools a socket the server stopped
+    // reading and the next request on it fails on a clean EOF.
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close"),
+        "a 413 must close the connection rather than let the client pool it"
+    );
 
     // The rejection must not poison the listener: a normal produce still commits.
     let normal = text_message(1, "small-after-large".to_string());
