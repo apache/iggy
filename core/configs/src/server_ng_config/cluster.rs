@@ -29,6 +29,7 @@ use configs::ConfigEnv;
 use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// The primary heartbeats roughly every second (`PING_TICKS`); a window at
@@ -144,9 +145,14 @@ pub struct ClusterTlsConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterNodeConfig {
     pub name: String,
     pub ip: String,
+    /// Optional client-facing address. Replica traffic continues to use
+    /// [`Self::ip`].
+    #[serde(default)]
+    pub advertised_address: Option<String>,
     /// Numeric replica ID for VSR consensus (0-based).
     ///
     /// Must be unique across [`ClusterConfig::nodes`] and strictly less than
@@ -226,6 +232,8 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
         let mut used_endpoints = std::collections::HashSet::new();
+        let mut used_advertised_endpoints = std::collections::HashSet::new();
+        let mut used_raw_advertised_endpoints = std::collections::HashSet::new();
 
         for node in &self.nodes {
             if node.name.trim().is_empty() {
@@ -265,17 +273,17 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            let port_list = [
+            let client_ports = [
                 ("TCP", node.ports.tcp),
                 ("QUIC", node.ports.quic),
                 ("HTTP", node.ports.http),
                 ("WebSocket", node.ports.websocket),
-                ("TCP_REPLICA", node.ports.tcp_replica),
             ];
+            let replica_port = ("TCP_REPLICA", node.ports.tcp_replica);
 
-            for (name, port_opt) in &port_list {
+            for (name, port_opt) in client_ports.into_iter().chain([replica_port]) {
                 if let Some(port) = port_opt {
-                    if *port == 0 {
+                    if port == 0 {
                         eprintln!(
                             "Invalid cluster configuration: {} port cannot be 0 for node '{}'",
                             name, node.name
@@ -287,6 +295,47 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                     if !used_endpoints.insert(endpoint.clone()) {
                         eprintln!(
                             "Invalid cluster configuration: port conflict - {endpoint} is already bound (node '{}', transport {name})",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                }
+            }
+
+            // Strict for now; the String type leaves room to accept hostnames
+            // later without breaking existing configs.
+            let client_ip = match node.advertised_address.as_deref() {
+                Some(advertised_address) => match advertised_address.parse::<IpAddr>() {
+                    Ok(ip) => Some(ip),
+                    Err(_) => {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_address '{advertised_address}' is not a valid IP address for node '{}'",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                },
+                None => node.ip.parse::<IpAddr>().ok(),
+            };
+
+            let client_address = node.advertised_address.as_deref().unwrap_or(&node.ip);
+            for (name, port) in &client_ports {
+                if let Some(port) = port {
+                    let (endpoint, inserted) = client_ip.map_or_else(
+                        || {
+                            let endpoint = format!("{client_address}:{port}");
+                            let inserted = used_raw_advertised_endpoints.insert(endpoint.clone());
+                            (endpoint, inserted)
+                        },
+                        |ip| {
+                            let endpoint = SocketAddr::new(ip, *port);
+                            let inserted = used_advertised_endpoints.insert(endpoint);
+                            (endpoint.to_string(), inserted)
+                        },
+                    );
+                    if !inserted {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised client endpoint conflict - {endpoint} is already used (node '{}', transport {name})",
                             node.name
                         );
                         return Err(ConfigurationError::InvalidConfigurationValue);
@@ -380,6 +429,27 @@ mod tests {
             "shared_secret field present in serialized config: {serialized}"
         );
     }
+
+    #[test]
+    fn cluster_node_rejects_unknown_fields() {
+        let error = serde_json::from_str::<ClusterNodeConfig>(
+            r#"{
+                "name": "node-0",
+                "ip": "10.0.0.1",
+                "advertised_addres": "203.0.113.1",
+                "replica_id": 0,
+                "ports": {}
+            }"#,
+        )
+        .expect_err("misspelled advertised_address must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `advertised_addres`"),
+            "unexpected deserialization error: {error}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +460,7 @@ mod cluster_validate_tests {
         ClusterNodeConfig {
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
+            advertised_address: None,
             replica_id: id,
             ports: TransportPorts::default(),
         }
@@ -511,6 +582,73 @@ mod cluster_validate_tests {
         };
         let c = cfg(vec![n1, n2]);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_advertised_client_endpoint() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("203.0.113.1".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = n1.advertised_address.clone();
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_equivalent_ipv6_advertised_client_endpoints() {
+        for equivalent_address in ["2001:DB8::1", "2001:db8:0:0:0:0:0:1"] {
+            let mut n1 = node("n1", 0);
+            n1.ip = "10.0.0.1".to_owned();
+            n1.advertised_address = Some("2001:db8::1".to_owned());
+            n1.ports.tcp = Some(8090);
+            let mut n2 = node("n2", 1);
+            n2.ip = "10.0.0.2".to_owned();
+            n2.advertised_address = Some(equivalent_address.to_owned());
+            n2.ports.tcp = Some(8090);
+
+            assert!(
+                cfg(vec![n1, n2]).validate().is_err(),
+                "{equivalent_address} must conflict with 2001:db8::1"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_equivalent_ipv6_client_endpoints_from_node_ip() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "2001:db8::1".to_owned();
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "2001:db8:0:0:0:0:0:1".to_owned();
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_distinct_advertised_client_endpoints() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("203.0.113.1".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("203.0.113.2".to_owned());
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_ip_advertised_address() {
+        let mut n1 = node("n1", 0);
+        n1.advertised_address = Some("iggy-node-1.example.com".to_owned());
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_err());
     }
 
     #[test]

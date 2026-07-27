@@ -639,6 +639,12 @@ ca_file = ""
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
+#
+# Each node may also set 'advertised_address': the client-facing address
+# handed out in cluster metadata and leader redirects. Set it when 'ip' is
+# a private replica-network address unreachable by clients (Docker,
+# Kubernetes, NAT). Must be a literal IP address for now. Replica-to-replica
+# traffic always uses 'ip'. Unset = clients get 'ip'.
 [[cluster.nodes]]
 name = "iggy-node-1"
 ip = "127.0.0.1"
@@ -655,6 +661,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
+# advertised_address = "203.0.113.10"
 # replica_id = 2
 # ports = { tcp = 8092, http = 3002, tcp_replica = 9092 }
 

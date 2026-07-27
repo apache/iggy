@@ -106,7 +106,10 @@ impl ClusterRoster {
                 .iter()
                 .map(|node| ClusterNode {
                     name: node.name.clone(),
-                    ip: node.ip.clone(),
+                    ip: node
+                        .advertised_address
+                        .clone()
+                        .unwrap_or_else(|| node.ip.clone()),
                     endpoints: ports_to_endpoints(&node.ports),
                     role: role_for(primary_index, node.replica_id),
                     status: ClusterNodeStatus::Healthy,
@@ -149,4 +152,40 @@ fn ports_to_endpoints(ports: &TransportPorts) -> TransportEndpoints {
         ports.http.unwrap_or(0),
         ports.websocket.unwrap_or(0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roster(advertised_address: Option<String>) -> ClusterRoster {
+        ClusterRoster {
+            enabled: true,
+            name: "test-cluster".to_owned(),
+            nodes: vec![ClusterNodeConfig {
+                name: "node-0".to_owned(),
+                ip: "10.0.0.1".to_owned(),
+                advertised_address,
+                replica_id: 0,
+                ports: TransportPorts::default(),
+            }],
+            self_ip: "127.0.0.1".to_owned(),
+            self_ports: TransportPorts::default(),
+            metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
+        }
+    }
+
+    #[test]
+    fn cluster_metadata_uses_advertised_address_when_configured() {
+        let metadata = roster(Some("203.0.113.10".to_owned())).cluster_metadata(Some(0));
+
+        assert_eq!(metadata.nodes[0].ip, "203.0.113.10");
+    }
+
+    #[test]
+    fn cluster_metadata_falls_back_to_replica_ip() {
+        let metadata = roster(None).cluster_metadata(Some(0));
+
+        assert_eq!(metadata.nodes[0].ip, "10.0.0.1");
+    }
 }
