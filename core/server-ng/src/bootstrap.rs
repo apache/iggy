@@ -1755,6 +1755,12 @@ fn restore_metadata_consensus(
     if replica_count > 1 && restored_op > 0 {
         consensus.init_as_backup();
         consensus.begin_view_probe();
+        // Restart in a cluster: replace snapshot-shaped metadata state
+        // (snapshot + client table) from the live primary the probe finds,
+        // then journal-repair the tail. If the probe exhausts instead --
+        // full-cluster bootstrap, nobody live to fetch from -- the election
+        // fallback clears the stage and this local recovery stands.
+        consensus.begin_state_transfer_await();
     } else {
         consensus.init();
     }

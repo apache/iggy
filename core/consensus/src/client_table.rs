@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::ReplyHeader;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use iggy_binary_protocol::{GenericHeader, ReplyHeader};
+use server_common::{
+    MESSAGE_ALIGN, Message,
+    iobuf::{Frozen, Owned},
+};
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hasher;
 use std::mem::size_of;
 use tracing::trace;
+use twox_hash::XxHash3_64;
 
 /// Refcounted wrapper around a committed reply.
 ///
@@ -183,10 +188,12 @@ pub enum RequestStatus {
 /// `commit_register` in the apply path, so every replica of the group
 /// derives an identical table from the committed log.
 ///
-/// ## Known gaps
+/// ## Serialization
 ///
-/// - **Serialization**: encode/decode for rejoin slice-fetch and state
-///   transfer TODO (IGGY-137).
+/// [`Self::encode`] / [`Self::decode`] carry the table across state transfer
+/// (a cluster-restart rejoin replaces its table with the primary's copy).
+/// Deterministic: slot-order walk over apply-derived state, so every
+/// caught-up replica encodes identical bytes.
 #[derive(Debug)]
 pub struct ClientTable {
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
@@ -565,6 +572,191 @@ impl ClientTable {
     }
 }
 
+/// Failure decoding an encoded client table (state transfer install path).
+#[derive(Debug)]
+pub enum ClientTableCodecError {
+    /// Byte stream ended mid-field.
+    Truncated,
+    /// Leading magic is not [`CLIENT_TABLE_MAGIC`].
+    BadMagic,
+    /// Trailing hash does not match the content.
+    ChecksumMismatch { expected: u64, actual: u64 },
+    /// Encoded entry count exceeds this table's capacity.
+    TooManyEntries { count: u32, max: usize },
+    /// A cached reply's bytes do not parse as a valid reply message.
+    InvalidReply,
+    /// An entry carries an empty reply ring (violates the never-empty
+    /// invariant registration establishes).
+    EmptyRing,
+}
+
+impl std::fmt::Display for ClientTableCodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "encoded client table truncated"),
+            Self::BadMagic => write!(f, "encoded client table has wrong magic"),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "client table checksum mismatch: expected {expected:#018x}, actual {actual:#018x}"
+            ),
+            Self::TooManyEntries { count, max } => {
+                write!(f, "encoded client table holds {count} entries, max {max}")
+            }
+            Self::InvalidReply => write!(f, "encoded client table holds an invalid cached reply"),
+            Self::EmptyRing => write!(f, "encoded client table entry has an empty reply ring"),
+        }
+    }
+}
+
+impl std::error::Error for ClientTableCodecError {}
+
+/// Format tag for [`ClientTable::encode`]; bump on layout change.
+pub const CLIENT_TABLE_MAGIC: [u8; 4] = *b"ICT1";
+
+impl ClientTable {
+    /// Encode the table for state transfer.
+    ///
+    /// Layout (all little-endian): `magic(4) count(u32)` then per entry in
+    /// slot order `client(u128) epoch(u64) user_id(u32) watermark(u64)
+    /// watermark_checksum(u128) ring_len(u8) [reply_len(u32) reply_bytes]*`,
+    /// terminated by an `XxHash3_64(8)` over everything before it.
+    ///
+    /// Slot order makes the bytes deterministic across caught-up replicas:
+    /// slots are apply-derived state.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 * self.index.len() + 16);
+        out.extend_from_slice(&CLIENT_TABLE_MAGIC);
+        out.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
+        for (slot_idx, slot) in self.slots.iter().enumerate() {
+            let Some(entry) = slot else { continue };
+            let client = entry.latest().header().client;
+            debug_assert_eq!(self.index.get(&client), Some(&slot_idx));
+            out.extend_from_slice(&client.to_le_bytes());
+            out.extend_from_slice(&entry.epoch.to_le_bytes());
+            out.extend_from_slice(&entry.user_id.to_le_bytes());
+            out.extend_from_slice(&entry.watermark.to_le_bytes());
+            out.extend_from_slice(&entry.watermark_checksum.to_le_bytes());
+            out.push(entry.ring.len() as u8);
+            for reply in &entry.ring {
+                let bytes = reply.bytes.as_slice();
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+        let mut hasher = XxHash3_64::new();
+        hasher.write(&out);
+        out.extend_from_slice(&hasher.finish().to_le_bytes());
+        out
+    }
+
+    /// Decode a table encoded by [`Self::encode`] into a fresh table of
+    /// `max_clients` capacity.
+    ///
+    /// # Errors
+    /// [`ClientTableCodecError`] on truncation, magic/checksum mismatch,
+    /// capacity overflow, or an undecodable cached reply.
+    ///
+    /// # Panics
+    /// Unreachable: slice-to-array conversions are length-checked first.
+    pub fn decode(bytes: &[u8], max_clients: usize) -> Result<Self, ClientTableCodecError> {
+        const TRAILER: usize = size_of::<u64>();
+        let content_len = bytes
+            .len()
+            .checked_sub(TRAILER)
+            .ok_or(ClientTableCodecError::Truncated)?;
+        let (content, trailer) = bytes.split_at(content_len);
+        let expected = u64::from_le_bytes(trailer.try_into().expect("trailer is 8 bytes"));
+        let mut hasher = XxHash3_64::new();
+        hasher.write(content);
+        let actual = hasher.finish();
+        if expected != actual {
+            return Err(ClientTableCodecError::ChecksumMismatch { expected, actual });
+        }
+
+        let mut reader = CodecReader { bytes: content };
+        if reader.take(CLIENT_TABLE_MAGIC.len())? != CLIENT_TABLE_MAGIC {
+            return Err(ClientTableCodecError::BadMagic);
+        }
+        let count = reader.u32()?;
+        if count as usize > max_clients {
+            return Err(ClientTableCodecError::TooManyEntries {
+                count,
+                max: max_clients,
+            });
+        }
+
+        let mut table = Self::new(max_clients);
+        for slot_idx in 0..count as usize {
+            let client = reader.u128()?;
+            let epoch = reader.u64()?;
+            let user_id = reader.u32()?;
+            let watermark = reader.u64()?;
+            let watermark_checksum = reader.u128()?;
+            let ring_len = reader.u8()?;
+            if ring_len == 0 {
+                return Err(ClientTableCodecError::EmptyRing);
+            }
+            let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
+            for _ in 0..ring_len {
+                let reply_len = reader.u32()? as usize;
+                let reply_bytes = reader.take(reply_len)?;
+                let owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(reply_bytes);
+                let message = Message::<GenericHeader>::try_from(owned)
+                    .map_err(|_| ClientTableCodecError::InvalidReply)?
+                    .try_into_typed::<ReplyHeader>()
+                    .map_err(|_| ClientTableCodecError::InvalidReply)?;
+                ring.push_back(CachedReply::from_message(message));
+            }
+            table.slots[slot_idx] = Some(ClientEntry {
+                epoch,
+                user_id,
+                watermark,
+                watermark_checksum,
+                ring,
+            });
+            table.index.insert(client, slot_idx);
+        }
+        if !reader.bytes.is_empty() {
+            return Err(ClientTableCodecError::Truncated);
+        }
+        Ok(table)
+    }
+}
+
+/// Little-endian cursor over the encoded table content.
+struct CodecReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> CodecReader<'a> {
+    const fn take(&mut self, len: usize) -> Result<&'a [u8], ClientTableCodecError> {
+        if self.bytes.len() < len {
+            return Err(ClientTableCodecError::Truncated);
+        }
+        let (head, tail) = self.bytes.split_at(len);
+        self.bytes = tail;
+        Ok(head)
+    }
+
+    fn u8(&mut self) -> Result<u8, ClientTableCodecError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, ClientTableCodecError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4B")))
+    }
+
+    fn u64(&mut self) -> Result<u64, ClientTableCodecError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8B")))
+    }
+
+    fn u128(&mut self) -> Result<u128, ClientTableCodecError> {
+        Ok(u128::from_le_bytes(self.take(16)?.try_into().expect("16B")))
+    }
+}
+
 impl ClientEntry {
     /// Latest committed reply (register or app op).
     ///
@@ -603,6 +795,7 @@ mod tests {
     /// assert on it (see `register_stores_user_id` for the accessor check).
     const TEST_USER_ID: u32 = 7;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn make_register_reply(client: u128, commit: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
         let mut msg = Message::<ReplyHeader>::new(header_size);
@@ -614,6 +807,8 @@ mod tests {
             client,
             request: REGISTER_REQUEST_ID,
             commit,
+            // Real size so codec-roundtripped replies re-parse.
+            size: header_size as u32,
             command: Command2::Reply,
             operation: Operation::Register,
             ..ReplyHeader::default()
@@ -625,6 +820,7 @@ mod tests {
         make_reply_with_checksum(client, request, commit, 0)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn make_reply_with_checksum(
         client: u128,
         request: u64,
@@ -642,6 +838,8 @@ mod tests {
             request,
             commit,
             request_checksum,
+            // Real size so codec-roundtripped replies re-parse.
+            size: header_size as u32,
             command: Command2::Reply,
             operation: Operation::SendMessages,
             ..ReplyHeader::default()
@@ -1148,6 +1346,88 @@ mod tests {
         let (mut table, epoch) = table_with_client();
         table.commit_reply(1, epoch, make_reply_for(1, 5, 15));
         table.commit_reply(1, epoch, make_reply_for(1, 3, 16));
+    }
+
+    // Codec tests
+
+    // State transfer ships the table as bytes; the decoded table must answer
+    // every dedup question identically to the original.
+    #[test]
+    fn encode_decode_roundtrip_preserves_dedup_state() {
+        let mut table = ClientTable::new(10);
+        table.commit_register(1, 11, make_register_reply(1, 10), no_in_flight());
+        table.commit_reply(1, 1, make_reply_with_checksum(1, 1, 11, 0xAA));
+        table.commit_reply(1, 1, make_reply_for(1, 2, 12));
+        // Rebind: epoch 2, watermark preserved.
+        table.commit_register(1, 22, make_register_reply(1, 20), no_in_flight());
+        table.commit_register(2, 33, make_register_reply(2, 30), no_in_flight());
+
+        let encoded = table.encode();
+        let decoded = ClientTable::decode(&encoded, 10).expect("roundtrip decodes");
+
+        assert_eq!(decoded.count(), 2);
+        assert_eq!(decoded.get_epoch(1), Some(2));
+        assert_eq!(decoded.get_user_id(1), Some(22));
+        assert_eq!(decoded.get_watermark(1), Some(2));
+        assert_eq!(decoded.get_epoch(2), Some(1));
+        match decoded.check_request(1, 2, 2, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 2, "latest reply survives");
+                assert_eq!(cached.header().commit, 12, "original bytes survive");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        match decoded.check_request(1, 2, 1, 0xBB) {
+            RequestStatus::ChecksumMismatch { request } => {
+                assert_eq!(request, 1, "watermark checksum survives");
+            }
+            // Request 1 is below the watermark, so the stored checksum only
+            // fences at the watermark itself; a ring duplicate is also fine.
+            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 1),
+            other => panic!("expected duplicate-or-mismatch, got {other:?}"),
+        }
+        assert!(matches!(
+            decoded.check_request(1, 1, 1, 0),
+            RequestStatus::Fenced { .. }
+        ));
+
+        // Deterministic bytes: encoding the decoded table reproduces them.
+        assert_eq!(decoded.encode(), encoded);
+    }
+
+    #[test]
+    fn decode_rejects_corruption() {
+        let mut table = ClientTable::new(4);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
+        let encoded = table.encode();
+
+        // Flipped content byte -> checksum mismatch.
+        let mut flipped = encoded.clone();
+        flipped[8] ^= 0xFF;
+        assert!(matches!(
+            ClientTable::decode(&flipped, 4),
+            Err(ClientTableCodecError::ChecksumMismatch { .. })
+        ));
+
+        // Truncation.
+        assert!(matches!(
+            ClientTable::decode(&encoded[..encoded.len() - 1], 4),
+            Err(ClientTableCodecError::ChecksumMismatch { .. } | ClientTableCodecError::Truncated)
+        ));
+
+        // Capacity overflow.
+        assert!(matches!(
+            ClientTable::decode(&encoded, 0),
+            Err(ClientTableCodecError::TooManyEntries { .. })
+        ));
+
+        let empty = ClientTable::new(4).encode();
+        assert_eq!(
+            ClientTable::decode(&empty, 4)
+                .expect("empty table decodes")
+                .count(),
+            0
+        );
     }
 
     #[test]

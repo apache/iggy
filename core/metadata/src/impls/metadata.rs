@@ -18,7 +18,9 @@
 use crate::MuxStateMachine;
 use crate::stm::authz::gated_apply;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
-use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
+use crate::stm::snapshot::{
+    FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
+};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
@@ -243,6 +245,16 @@ impl<M> SnapshotCoordinator<M> {
     ///
     /// # Errors
     /// Returns `SnapshotError` if snapshotting, persistence, or drain fails.
+    /// On-disk location of the persisted snapshot; also the artifact state
+    /// transfer serves and installs.
+    #[must_use]
+    pub fn snapshot_path(&self) -> std::path::PathBuf {
+        self.data_dir.join(super::METADATA_DIR).join("snapshot.bin")
+    }
+
+    /// # Errors
+    /// Returns `SnapshotError` if snapshotting, persistence, or the journal
+    /// drain fails.
     #[allow(clippy::future_not_send)]
     pub async fn checkpoint<J>(
         &self,
@@ -255,7 +267,7 @@ impl<M> SnapshotCoordinator<M> {
         J: JournalHandle,
     {
         let snapshot = (self.create_snapshot)(stm, last_op, created_at)?;
-        let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
+        let path = self.snapshot_path();
         snapshot.persist(&path)?;
 
         let _ = journal
@@ -502,6 +514,11 @@ pub struct IggyMetadata<C, J, S, M> {
     /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
     /// Defaults to never-expire, matching the shipped server config.
     default_message_expiry: Cell<u64>,
+    /// Client-table mutations at or below this op are already reflected in a
+    /// state-transferred table, so the tail-repair commit walk must skip
+    /// them (re-running `commit_register` would double-bump epochs). `0`
+    /// outside state transfer (no op is skipped). Monotone per install.
+    client_table_frontier: Cell<u64>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -535,6 +552,7 @@ where
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
             default_message_expiry: Cell::new(u64::MAX),
+            client_table_frontier: Cell::new(0),
         }
     }
 }
@@ -550,9 +568,19 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     /// Install the client table rebuilt by WAL-replay recovery
     /// ([`crate::impls::recovery::recover`]). Boot-time only, on the owning
     /// shard, before it serves traffic - replacing a live table would drop
-    /// committed session state.
+    /// committed session state. (State transfer replaces a LIVE table via
+    /// [`IggyMetadata::install_state_transfer`], which also stamps the
+    /// frontier.)
     pub fn install_client_table(&self, client_table: ClientTable) {
         *self.client_table.borrow_mut() = client_table;
+    }
+
+    /// Client-table mutations at or below the frontier are already in the
+    /// state-transferred table; the commit walk skips them (re-running
+    /// `commit_register` would double-bump epochs). STM effects still apply
+    /// -- the frontier fences the TABLE only.
+    const fn client_table_mutation_allowed(&self, op: u64) -> bool {
+        op > self.client_table_frontier.get()
     }
 
     /// Install the resolved byte value used for `MaxTopicSize::ServerDefault`.
@@ -970,6 +998,26 @@ where
     }
 }
 
+/// One state-transfer serving payload.
+///
+/// The on-disk snapshot bytes plus the live client table, both
+/// frontier-stamped. Built by [`IggyMetadata::state_transfer_offer`] on the
+/// serving primary; the shard caches it per requester and serves chunks
+/// from it.
+pub struct StateTransferOffer {
+    /// Serving primary's applied frontier when the offer was built; the
+    /// receiver's tail repair targets past this.
+    pub commit_op: u64,
+    /// `sequence_number` of the offered snapshot bytes.
+    pub snapshot_seq: u64,
+    pub snapshot: Vec<u8>,
+    /// [`ClientTable::encode`] output.
+    pub table: Vec<u8>,
+    /// Client-table mutations at or below this op are in `table` already;
+    /// the receiver's commit walk skips them.
+    pub table_frontier: u64,
+}
+
 impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
 where
     B: MessageBus,
@@ -982,6 +1030,123 @@ where
             Error = iggy_common::IggyError,
         >,
 {
+    /// Build a state-transfer offer for a restarted peer, or `None` when
+    /// this replica cannot serve one right now: not a caught-up primary
+    /// (table reads would not be authoritative), or no snapshot has ever
+    /// been persisted (the WAL then still holds the full history and the
+    /// requester's journal repair covers the whole gap).
+    ///
+    /// The snapshot is served as the on-disk bytes verbatim -- possibly
+    /// stale, which costs nothing: the receiver journal-repairs
+    /// `(snapshot_seq, commit_max]` afterwards through the existing repair
+    /// machinery. The table is encoded live at this instant; both frontier
+    /// stamps read `commit_min` inside one synchronous region, so they are
+    /// mutually consistent.
+    #[must_use]
+    pub fn state_transfer_offer(&self) -> Option<StateTransferOffer> {
+        let consensus = self.consensus.as_ref()?;
+        if !is_caught_up_primary(consensus) {
+            return None;
+        }
+        let coordinator = self.coordinator.as_ref()?;
+        let snapshot = std::fs::read(coordinator.snapshot_path()).ok()?;
+        let snapshot_seq = IggySnapshot::decode(&snapshot).ok()?.sequence_number();
+        let commit_op = consensus.commit_min();
+        let table = self.client_table.borrow().encode();
+        Some(StateTransferOffer {
+            commit_op,
+            snapshot_seq,
+            snapshot,
+            table,
+            table_frontier: commit_op,
+        })
+    }
+
+    /// Install a fetched state transfer: persist + restore the snapshot,
+    /// replace the client table, and jump the commit state to the snapshot
+    /// floor so the tail repair takes over from there.
+    ///
+    /// Ordering: persist FIRST (a crash mid-install must reboot from the
+    /// transferred state, not the pre-transfer one), then the in-place STM
+    /// restore (readers observe it on their next read), then the table +
+    /// frontier, then journal/commit bookkeeping.
+    ///
+    /// The partition plane is deliberately untouched: partitions load
+    /// whatever their disks hold at boot and repair through their own
+    /// consensus groups. Topology changes the snapshot carries below the
+    /// receiver's old frontier (topics created/deleted while it was down)
+    /// fire no commit notifier -- convergence rests on the partition
+    /// reconciler's periodic full diff against the committed STM, which
+    /// reads the restored state on its next tick.
+    ///
+    /// Returns the installed snapshot sequence (the receiver's new applied
+    /// frontier).
+    ///
+    /// # Errors
+    /// [`SnapshotError`] when the snapshot bytes do not decode, the persist
+    /// fails, or the in-place restore is rejected.
+    ///
+    /// # Panics
+    /// If called on a shard without consensus (state transfer is a shard-0
+    /// concern).
+    pub fn install_state_transfer(
+        &self,
+        snapshot_bytes: &[u8],
+        client_table: ClientTable,
+        table_frontier: u64,
+        commit_op: u64,
+    ) -> Result<u64, SnapshotError>
+    where
+        M: RestoreSnapshotInPlace<MetadataSnapshot>,
+    {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("install_state_transfer: consensus only exists on shard 0");
+
+        let snapshot = IggySnapshot::decode(snapshot_bytes)?;
+        let snapshot_seq = snapshot.sequence_number();
+
+        if let Some(coordinator) = &self.coordinator {
+            snapshot.persist(&coordinator.snapshot_path())?;
+        } else {
+            tracing::warn!(
+                snapshot_seq,
+                "installing state transfer without a snapshot coordinator; \
+                 the transferred state will not survive a further restart"
+            );
+        }
+
+        self.mux_stm
+            .restore_snapshot_in_place(snapshot.snapshot())?;
+
+        *self.client_table.borrow_mut() = client_table;
+        self.client_table_frontier.set(table_frontier);
+
+        // Entries at or below the installed floor are superseded by the
+        // snapshot; without this the journal's wrap-eviction assert trips
+        // on pre-transfer residents the next time slots recycle.
+        if let Some(journal) = &self.journal {
+            let handle = journal.handle();
+            if snapshot_seq > handle.snapshot_op() {
+                handle.set_snapshot_op(snapshot_seq);
+            }
+        }
+
+        // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
+        // frontier (this is the op-jump the tail repair resumes from) and
+        // let the announced commit point pull the walk target forward.
+        if snapshot_seq > consensus.commit_min() {
+            consensus.set_commit_floor(snapshot_seq);
+        }
+        consensus.advance_commit_max(commit_op);
+        if snapshot_seq > consensus.sequencer().current_sequence() {
+            consensus.sequencer().set_sequence(snapshot_seq);
+        }
+
+        Ok(snapshot_seq)
+    }
+
     /// Submit `Register` from in-process, await commit. Wire reply still fires
     /// via `message_bus.send_to_client`; subscriber is additive.
     ///
@@ -1021,7 +1186,7 @@ where
 
         // Wrong node: waiting or queueing cannot fix that, the client must
         // re-route to the primary.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Err(MetadataSubmitError::NotPrimary);
         }
 
@@ -1159,7 +1324,7 @@ where
         // logout-vs-logout race. It simply pipelines behind the in-flight
         // batch and commits with it, so a one-shot client's session
         // teardown is latency, never an error.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Err(MetadataSubmitError::NotPrimary);
         }
 
@@ -1273,7 +1438,7 @@ where
         // client submits compete for.
         if !is_caught_up_primary(consensus) {
             return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
                     MetadataSubmitError::NotCaughtUp
                 } else {
                     MetadataSubmitError::NotPrimary
@@ -1355,7 +1520,7 @@ where
         // deletion on its next sweep.
         if !is_caught_up_primary(consensus) {
             return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
                     MetadataSubmitError::NotCaughtUp
                 } else {
                     MetadataSubmitError::NotPrimary
@@ -1452,7 +1617,7 @@ where
         // simply pipelines behind the in-flight batch (the wire path has
         // always done this); the register-specific invariant is guarded in
         // `submit_register_in_process` / `register_preflight`.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
@@ -1644,7 +1809,7 @@ where
         let Some(consensus) = self.consensus.as_ref() else {
             return;
         };
-        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_syncing() {
+        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
             return;
         }
         let Some(journal) = self.journal.as_ref() else {
@@ -1812,23 +1977,31 @@ where
             let reply = if prepare_header.operation == Operation::Register {
                 // Register: commit_register creates session, no SM.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
-                self.client_table.borrow_mut().commit_register(
-                    prepare_header.client,
-                    prepare_header.user_id,
-                    reply.clone(),
-                    in_flight,
-                );
+                if self.client_table_mutation_allowed(prepare_header.op) {
+                    let in_flight =
+                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
+                    self.client_table.borrow_mut().commit_register(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        reply.clone(),
+                        in_flight,
+                    );
+                }
                 reply
             } else if prepare_header.operation == Operation::Logout {
                 // Logout unregisters the VSR client session on every replica.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                self.client_table
-                    .borrow_mut()
-                    .remove_client(prepare_header.client);
+                if self.client_table_mutation_allowed(prepare_header.op) {
+                    self.client_table
+                        .borrow_mut()
+                        .remove_client(prepare_header.client);
+                }
                 // Drop the disconnected client from every consumer group it
                 // joined and rebalance. Deterministic side-effect of the
-                // Logout commit, applied identically on every replica.
+                // Logout commit, applied identically on every replica. Runs
+                // regardless of the table frontier: the STM was restored at
+                // the snapshot floor, so ops above it still owe their STM
+                // effects even where the table already reflects them.
                 self.mux_stm.streams().remove_consumer_group_member(
                     prepare_header.client,
                     iggy_common::IggyTimestamp::from(prepare_header.timestamp),
@@ -1856,7 +2029,9 @@ where
                 // prepare and commit: skip cache (`commit_reply` no-ops),
                 // wire reply still ships.
                 let epoch = self.client_table.borrow().get_epoch(prepare_header.client);
-                if let Some(epoch) = epoch {
+                if !self.client_table_mutation_allowed(prepare_header.op) {
+                    // Already reflected in the state-transferred table.
+                } else if let Some(epoch) = epoch {
                     self.client_table.borrow_mut().commit_reply(
                         prepare_header.client,
                         epoch,
@@ -1949,7 +2124,7 @@ where
         let Some(consensus) = self.consensus.as_ref() else {
             return;
         };
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return;
         }
         let stranded_commits = consensus.commit_min() < consensus.commit_max();
@@ -2038,7 +2213,10 @@ where
             // at enqueue time resolves on this prepare's commit.
             assert!(!consensus.is_follower(), "promotion: primary only");
             assert!(consensus.is_normal(), "promotion: status must be normal");
-            assert!(!consensus.is_syncing(), "promotion: must not be syncing");
+            assert!(
+                !consensus.is_transferring(),
+                "promotion: must not be syncing"
+            );
             consensus.verify_pipeline();
             match reply_sender {
                 Some(sender) => {
@@ -2343,18 +2521,25 @@ where
             // mutation and counter bump.
             if header.operation == Operation::Register {
                 // Register: commit_register creates session, no SM.
-                let reply = build_reply_message(&header, &bytes::Bytes::new());
-                let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
-                self.client_table.borrow_mut().commit_register(
-                    header.client,
-                    header.user_id,
-                    reply,
-                    in_flight,
-                );
+                if self.client_table_mutation_allowed(header.op) {
+                    let reply = build_reply_message(&header, &bytes::Bytes::new());
+                    let in_flight =
+                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
+                    self.client_table.borrow_mut().commit_register(
+                        header.client,
+                        header.user_id,
+                        reply,
+                        in_flight,
+                    );
+                }
             } else if header.operation == Operation::Logout {
-                self.client_table.borrow_mut().remove_client(header.client);
+                if self.client_table_mutation_allowed(header.op) {
+                    self.client_table.borrow_mut().remove_client(header.client);
+                }
                 // Mirror the on_ack path: drop the disconnected client from
-                // every consumer group it joined and rebalance.
+                // every consumer group it joined and rebalance. Not fenced by
+                // the table frontier: the STM was restored at the snapshot
+                // floor and still owes this effect.
                 self.mux_stm.streams().remove_consumer_group_member(
                     header.client,
                     iggy_common::IggyTimestamp::from(header.timestamp),
@@ -2377,7 +2562,9 @@ where
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
                 let epoch = self.client_table.borrow().get_epoch(header.client);
-                if let Some(epoch) = epoch {
+                if !self.client_table_mutation_allowed(header.op) {
+                    // Already reflected in the state-transferred table.
+                } else if let Some(epoch) = epoch {
                     self.client_table
                         .borrow_mut()
                         .commit_reply(header.client, epoch, reply);

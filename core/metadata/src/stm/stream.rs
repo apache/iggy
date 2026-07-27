@@ -1807,6 +1807,16 @@ impl Snapshotable for Streams {
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        Ok(StreamsInner::inner_from_snapshot(snapshot).into())
+    }
+}
+
+impl StreamsInner {
+    /// Build a complete `StreamsInner` from a snapshot section. Shared by
+    /// wrapper construction ([`Snapshotable::from_snapshot`]) and the
+    /// in-place restore command (state transfer), which absorbs it on both
+    /// left-right buffers.
+    pub(crate) fn inner_from_snapshot(snapshot: StreamsSnapshot) -> Self {
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
         let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
         // Register restored stats in the shared registry so both left-right
@@ -1900,7 +1910,7 @@ impl Snapshotable for Streams {
         }
 
         let items: Slab<Stream> = stream_entries.into_iter().collect();
-        let mut inner = StreamsInner {
+        let mut inner = Self {
             index,
             items,
             revision: snapshot.revision,
@@ -1910,7 +1920,7 @@ impl Snapshotable for Streams {
             stats_registry,
         };
         inner.recompute_pending_revocations_count();
-        Ok(inner.into())
+        inner
     }
 }
 

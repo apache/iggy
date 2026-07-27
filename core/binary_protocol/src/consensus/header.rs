@@ -1250,6 +1250,288 @@ impl ConsensusHeader for RepairRangeReplyHeader {
     }
 }
 
+// State transfer (metadata plane): descriptor + chunk pull frames.
+
+/// Artifact id for the metadata snapshot bytes (`snapshot.bin` content).
+pub const STATE_TRANSFER_ARTIFACT_SNAPSHOT: u8 = 0;
+/// Artifact id for the encoded client table.
+pub const STATE_TRANSFER_ARTIFACT_TABLE: u8 = 1;
+
+// RequestStateTransferHeader - restarted replica -> current primary
+
+/// Ask the current primary for a state-transfer target descriptor.
+///
+/// Answered with `StateTransferTarget`. Sent by a restarted replica after it
+/// adopts a view from a live primary; `nonce` correlates the whole transfer
+/// session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestStateTransferHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub namespace: u64,
+    pub reserved: [u8; 104],
+}
+const _: () = {
+    assert!(size_of::<RequestStateTransferHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestStateTransferHeader, nonce)
+            == offset_of!(RequestStateTransferHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(
+        offset_of!(RequestStateTransferHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE
+    );
+};
+
+impl ConsensusHeader for RequestStateTransferHeader {
+    const COMMAND: Command2 = Command2::RequestStateTransfer;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestStateTransfer {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestStateTransfer,
+                found: self.command,
+            });
+        }
+        Ok(())
+    }
+}
+
+// StateTransferTargetHeader - serving primary -> requester
+
+/// The transfer target descriptor.
+///
+/// Carries artifact lengths + checksums and the frontiers the receiver
+/// installs at. `available == 0` means the serving peer cannot serve right
+/// now (not a caught-up primary, or it has never checkpointed, so the
+/// requester's journal repair can cover the whole gap); every other field is
+/// meaningful only when `available == 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct StateTransferTargetHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    /// Serving primary's applied frontier (`commit_min`) when the descriptor
+    /// was built. The receiver's tail repair targets past this.
+    pub commit_op: u64,
+    /// `sequence_number` of the offered snapshot; the receiver's applied
+    /// frontier after install.
+    pub snapshot_seq: u64,
+    pub snapshot_len: u64,
+    /// `XxHash3_64` over the snapshot bytes.
+    pub snapshot_checksum: u64,
+    /// Client-table mutations at or below this op are already reflected in
+    /// the offered table; the receiver's commit walk skips them.
+    pub table_frontier: u64,
+    pub table_len: u64,
+    /// `XxHash3_64` over the encoded table bytes.
+    pub table_checksum: u64,
+    pub namespace: u64,
+    pub available: u8,
+    pub reserved: [u8; 47],
+}
+const _: () = {
+    assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(StateTransferTargetHeader, nonce)
+            == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 47]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for StateTransferTargetHeader {
+    const COMMAND: Command2 = Command2::StateTransferTarget;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::StateTransferTarget {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::StateTransferTarget,
+                found: self.command,
+            });
+        }
+        if self.available > 1 {
+            return Err(ConsensusError::InvalidField(
+                "available must be 0 or 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// RequestStateChunkHeader - requester -> serving primary
+
+/// Pull one bounded chunk of an artifact.
+///
+/// Lockstep per artifact: the requester keeps at most one chunk in flight,
+/// so the bounded per-peer bus queue can never drop a burst tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestStateChunkHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub offset: u64,
+    pub namespace: u64,
+    pub len: u32,
+    /// [`STATE_TRANSFER_ARTIFACT_SNAPSHOT`] or [`STATE_TRANSFER_ARTIFACT_TABLE`].
+    pub artifact: u8,
+    pub reserved: [u8; 91],
+}
+const _: () = {
+    assert!(size_of::<RequestStateChunkHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestStateChunkHeader, nonce)
+            == offset_of!(RequestStateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RequestStateChunkHeader, reserved) + size_of::<[u8; 91]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RequestStateChunkHeader {
+    const COMMAND: Command2 = Command2::RequestStateChunk;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestStateChunk {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestStateChunk,
+                found: self.command,
+            });
+        }
+        if self.len == 0 {
+            return Err(ConsensusError::InvalidField(
+                "chunk len must be non-zero".to_string(),
+            ));
+        }
+        if self.artifact > STATE_TRANSFER_ARTIFACT_TABLE {
+            return Err(ConsensusError::InvalidField(
+                "unknown state transfer artifact".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// StateChunkHeader - serving primary -> requester (carries payload)
+
+/// One chunk of artifact bytes at `offset`.
+///
+/// The payload rides the body (`size` spans header + payload). Transit
+/// integrity is checked at the artifact level (descriptor checksums), not
+/// per chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct StateChunkHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub offset: u64,
+    pub namespace: u64,
+    /// [`STATE_TRANSFER_ARTIFACT_SNAPSHOT`] or [`STATE_TRANSFER_ARTIFACT_TABLE`].
+    pub artifact: u8,
+    pub reserved: [u8; 95],
+}
+const _: () = {
+    assert!(size_of::<StateChunkHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(StateChunkHeader, nonce)
+            == offset_of!(StateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(StateChunkHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for StateChunkHeader {
+    const COMMAND: Command2 = Command2::StateChunk;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::StateChunk {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::StateChunk,
+                found: self.command,
+            });
+        }
+        if (self.size as usize) < HEADER_SIZE {
+            return Err(ConsensusError::InvalidField(
+                "state chunk size below header size".to_string(),
+            ));
+        }
+        if self.artifact > STATE_TRANSFER_ARTIFACT_TABLE {
+            return Err(ConsensusError::InvalidField(
+                "unknown state transfer artifact".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 // Tests
 
 #[cfg(test)]

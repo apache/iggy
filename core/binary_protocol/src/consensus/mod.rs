@@ -48,8 +48,9 @@ pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader, EvictionReason,
     GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN,
     RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
-    RequestStartViewHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
-    read_size_field,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader, SIZE_FIELD_OFFSET,
+    STATE_TRANSFER_ARTIFACT_SNAPSHOT, STATE_TRANSFER_ARTIFACT_TABLE, StartViewChangeHeader,
+    StartViewHeader, StateChunkHeader, StateTransferTargetHeader, read_size_field,
 };
 pub use operation::Operation;
 pub use reply_result::{RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len};

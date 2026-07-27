@@ -243,6 +243,27 @@ pub trait RestoreSnapshot<S>: Sized {
     fn restore_snapshot(snapshot: &S) -> Result<Self, SnapshotError>;
 }
 
+/// Restore a LIVE state machine from a snapshot without reconstructing it.
+///
+/// [`RestoreSnapshot`] builds a fresh instance -- boot-time only, because a
+/// running system shares read handles (left-right factories) across shards
+/// that a swap would orphan. This variant replaces the state THROUGH the
+/// existing write handle (an absorbed `RestoreSnapshot` command), so every
+/// reader observes the restored state on its next read. State transfer
+/// installs with this.
+#[allow(clippy::missing_errors_doc)]
+pub trait RestoreSnapshotInPlace<S> {
+    /// Replace this state machine's contents from the snapshot.
+    fn restore_snapshot_in_place(&self, snapshot: &S) -> Result<(), SnapshotError>;
+}
+
+/// Base case for the recursive tuple pattern - unit type terminates the recursion.
+impl<S> RestoreSnapshotInPlace<S> for () {
+    fn restore_snapshot_in_place(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+}
+
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
 impl<S> FillSnapshot<S> for () {
     fn fill_snapshot(&self, _snapshot: &mut S) -> Result<(), SnapshotError> {
@@ -296,6 +317,32 @@ macro_rules! impl_fill_restore {
                     )))
                 })?;
                 Self::from_snapshot(snap)
+            }
+        }
+
+        impl $crate::stm::snapshot::RestoreSnapshotInPlace<$crate::stm::snapshot::MetadataSnapshot>
+            for $wrapper
+        {
+            fn restore_snapshot_in_place(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                paste::paste! {
+                    let snap = snapshot.$field.clone().ok_or_else(|| {
+                        SnapshotError::Deserialize(rmp_serde::decode::Error::custom(
+                            format_args!("Snapshot Restore Error: {}", stringify!($field)),
+                        ))
+                    })?;
+                    self.inner
+                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap))
+                        .map_err(|err| {
+                            SnapshotError::Io(std::io::Error::other(format!(
+                                "in-place restore on a reader-only state machine: {err}"
+                            )))
+                        })
+                }
             }
         }
     };

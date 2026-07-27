@@ -3227,6 +3227,7 @@ dependencies = [
  "rand_xoshiro",
  "server_common",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -12018,6 +12019,7 @@ dependencies = [
  "server_common",
  "thiserror 2.0.19",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]

@@ -184,10 +184,18 @@ impl ServerHandle {
     /// a late joiner that misses early ops.
     #[must_use]
     pub fn replica_mesh_complete(&self) -> bool {
+        self.stdout_contains("replica mesh complete")
+    }
+
+    /// True once this node's stdout log contains `marker`. Spec tests use
+    /// this to pin server-side behavior that has no client-visible effect on
+    /// this node (e.g. a follower completing a state transfer).
+    #[must_use]
+    pub fn stdout_contains(&self, marker: &str) -> bool {
         self.stdout_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .is_some_and(|log| log.contains("replica mesh complete"))
+            .is_some_and(|log| log.contains(marker))
     }
 
     /// Returns a `ClientBuilder` using the test transport.

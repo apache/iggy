@@ -89,6 +89,22 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
             let h = *m.header();
             (h.operation(), h.namespace, m.into_generic())
         }
+        MessageBag::RequestStateTransfer(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StateTransferTarget(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestStateChunk(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StateChunk(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
     }
 }
 
@@ -289,7 +305,10 @@ where
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
-            > + StreamsFrontend,
+            > + StreamsFrontend
+            + metadata::stm::snapshot::RestoreSnapshotInPlace<
+                metadata::stm::snapshot::MetadataSnapshot,
+            >,
     {
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
@@ -420,7 +439,10 @@ where
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
-            > + StreamsFrontend,
+            > + StreamsFrontend
+            + metadata::stm::snapshot::RestoreSnapshotInPlace<
+                metadata::stm::snapshot::MetadataSnapshot,
+            >,
     {
         match frame {
             ShardFrame::Consensus { message, .. } => {

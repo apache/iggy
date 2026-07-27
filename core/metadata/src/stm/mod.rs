@@ -396,6 +396,12 @@ macro_rules! collect_handlers {
                 $(
                     $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
                 )*
+                /// Replace the whole state from a snapshot section, in place.
+                /// Never parsed off the wire (state transfer installs it via
+                /// `RestoreSnapshotInPlace`); absorbed on both left-right
+                /// buffers like any op, which is what makes an in-place
+                /// restore sound under the double-apply contract.
+                RestoreSnapshot([<$state Snapshot>]),
             }
 
             impl $crate::stm::Command for [<$state Inner>] {
@@ -434,6 +440,10 @@ macro_rules! collect_handlers {
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
+                        [<$state Command>]::RestoreSnapshot(snapshot) => {
+                            *self = Self::inner_from_snapshot(snapshot.clone());
+                            $crate::stm::result::ApplyReply::default()
+                        },
                     });
                 }
             }

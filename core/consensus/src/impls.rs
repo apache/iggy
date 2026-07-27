@@ -654,6 +654,47 @@ pub enum Status {
     Recovering,
 }
 
+/// State-transfer progress, orthogonal to [`Status`].
+///
+/// A transferring replica stays a normal protocol participant (it adopts
+/// views, votes, answers probes) but withholds `PrepareOk` and ignores live
+/// prepares (`replicate_preflight` / `send_prepare_ok` gate on
+/// [`Consensus::is_transferring`]) -- it must not vouch for state it is
+/// about to replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateTransferStage {
+    /// No transfer in progress.
+    Idle,
+    /// Restarted into a cluster: waiting for the view probe to find a live
+    /// primary to fetch from. The probe-exhausted election fallback proves
+    /// full-cluster bootstrap instead and abandons the transfer (local
+    /// recovery is then authoritative).
+    AwaitingTarget,
+    /// Target descriptor accepted; pulling artifact chunks.
+    Fetching,
+    /// Artifacts verified; installing.
+    Installing,
+}
+
+impl StateTransferStage {
+    /// Legal stage transitions; [`VsrConsensus::set_state_transfer_stage`]
+    /// asserts against this so a mis-sequenced handler fails loudly instead
+    /// of corrupting the install.
+    #[must_use]
+    pub const fn valid_transition(from: Self, to: Self) -> bool {
+        matches!(
+            (from, to),
+            (Self::Idle, Self::AwaitingTarget)
+                | (Self::AwaitingTarget, Self::Fetching | Self::Idle)
+                | (
+                    Self::Fetching,
+                    Self::Installing | Self::AwaitingTarget | Self::Idle
+                )
+                | (Self::Installing, Self::Idle)
+        )
+    }
+}
+
 /// What a received `Commit` heartbeat did, so the caller knows whether to
 /// drain the journal or correct a stale peer.
 #[derive(Debug, Clone, Copy)]
@@ -792,6 +833,11 @@ where
     /// legitimately (`StartView` adoption, DVC completion).
     ceded_primaryship: Cell<bool>,
     status: Cell<Status>,
+    /// See [`StateTransferStage`]. Set to `AwaitingTarget` by a cluster
+    /// restart boot (`begin_state_transfer_await`), driven through
+    /// `Fetching`/`Installing` by the shard's transfer session, cleared by
+    /// the probe-exhausted election fallback (full-cluster bootstrap).
+    state_transfer_stage: Cell<StateTransferStage>,
 
     /// Highest op number that has been locally executed (state machine applied,
     /// client table updated). Advances one-by-one in `commit_journal` (backup)
@@ -906,6 +952,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             recovery_barrier: Cell::new(0),
             ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
+            state_transfer_stage: Cell::new(StateTransferStage::Idle),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
             commit_max: Cell::new(0),
@@ -1437,6 +1484,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     let attempts = self.probe_attempts.get() + 1;
                     self.probe_attempts.set(attempts);
                     if attempts >= PROBE_ATTEMPTS_MAX {
+                        // Nobody answered: full-cluster bootstrap, so there
+                        // is no live primary to fetch state from. Local
+                        // recovery is authoritative; abandon the transfer
+                        // and elect on recovered logs.
+                        if self.state_transfer_stage.get() != StateTransferStage::Idle {
+                            tracing::info!(
+                                replica = self.replica,
+                                namespace_raw = self.namespace,
+                                "view probe exhausted; abandoning state transfer (cluster bootstrap)"
+                            );
+                            self.set_state_transfer_stage(StateTransferStage::Idle);
+                        }
                         self.finish_view_probe();
                         actions.extend(
                             self.start_election(plane, ViewChangeReason::ViewProbeUnanswered),
@@ -2077,6 +2136,40 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         timeouts.start(TimeoutKind::RequestStartViewMessage);
     }
 
+    /// Arm state transfer for a cluster restart: the replica will replace
+    /// its snapshot-shaped state from the live primary the view probe finds
+    /// (the shard's transfer session drives the stage from there). If the
+    /// probe exhausts instead -- full-cluster bootstrap, nobody to fetch
+    /// from -- the election fallback clears the stage and local recovery
+    /// stands.
+    pub fn begin_state_transfer_await(&self) {
+        self.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+    }
+
+    #[must_use]
+    pub const fn state_transfer_stage(&self) -> StateTransferStage {
+        self.state_transfer_stage.get()
+    }
+
+    /// # Panics
+    /// On an illegal stage transition (see
+    /// [`StateTransferStage::valid_transition`]).
+    pub fn set_state_transfer_stage(&self, to: StateTransferStage) {
+        let from = self.state_transfer_stage.get();
+        assert!(
+            StateTransferStage::valid_transition(from, to),
+            "state transfer stage transition {from:?} -> {to:?} is illegal"
+        );
+        tracing::info!(
+            replica = self.replica,
+            namespace_raw = self.namespace,
+            ?from,
+            ?to,
+            "state transfer stage"
+        );
+        self.state_transfer_stage.set(to);
+    }
+
     /// Peer side of the probe (sent by a Recovering replica at boot, or by
     /// a `ViewChange` backup whose copy of the concluding `StartView` was
     /// lost). Only the current view's PRIMARY answers, with a `StartView`;
@@ -2487,9 +2580,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Ignore if syncing
-        if self.is_syncing() {
+        if self.is_transferring() {
             return PrepareOkOutcome::Ignored {
-                reason: IgnoreReason::Syncing,
+                reason: IgnoreReason::StateTransfer,
             };
         }
 
@@ -2709,9 +2802,8 @@ where
         self.status() == Status::Normal
     }
 
-    fn is_syncing(&self) -> bool {
-        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
-        false
+    fn is_transferring(&self) -> bool {
+        self.state_transfer_stage.get() != StateTransferStage::Idle
     }
 }
 
@@ -3049,5 +3141,84 @@ mod timestamp_clamp_tests {
             100_000,
             "a clock ahead of the log must stamp real time, not floor + 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod state_transfer_stage_tests {
+    use super::*;
+
+    #[test]
+    fn stage_transitions_follow_the_machine() {
+        use StateTransferStage::{AwaitingTarget, Fetching, Idle, Installing};
+        let legal = [
+            (Idle, AwaitingTarget),
+            (AwaitingTarget, Fetching),
+            (AwaitingTarget, Idle),
+            (Fetching, Installing),
+            (Fetching, AwaitingTarget),
+            (Fetching, Idle),
+            (Installing, Idle),
+        ];
+        for (from, to) in legal {
+            assert!(
+                StateTransferStage::valid_transition(from, to),
+                "{from:?} -> {to:?} must be legal"
+            );
+        }
+        let illegal = [
+            (Idle, Fetching),
+            (Idle, Installing),
+            (AwaitingTarget, Installing),
+            (Installing, Fetching),
+            (Installing, AwaitingTarget),
+            (Idle, Idle),
+        ];
+        for (from, to) in illegal {
+            assert!(
+                !StateTransferStage::valid_transition(from, to),
+                "{from:?} -> {to:?} must be illegal"
+            );
+        }
+    }
+
+    /// Bus stub: stage plumbing never touches the wire.
+    struct StageNoopBus;
+
+    impl MessageBus for StageNoopBus {
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+    }
+
+    #[test]
+    fn is_transferring_tracks_stage() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(!consensus.is_transferring());
+        consensus.begin_state_transfer_await();
+        assert!(consensus.is_transferring());
+        consensus.set_state_transfer_stage(StateTransferStage::Fetching);
+        consensus.set_state_transfer_stage(StateTransferStage::Installing);
+        assert!(consensus.is_transferring());
+        consensus.set_state_transfer_stage(StateTransferStage::Idle);
+        assert!(!consensus.is_transferring());
     }
 }

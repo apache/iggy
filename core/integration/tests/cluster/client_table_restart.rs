@@ -150,7 +150,7 @@ async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
     resume_request(&addrs, session, 2, &create_stream_payload("iggy137-second")).await;
 }
 
-fn tcp_addr(harness: &TestHarness) -> SocketAddr {
+pub(super) fn tcp_addr(harness: &TestHarness) -> SocketAddr {
     harness
         .server()
         .tcp_addr()
@@ -161,7 +161,7 @@ fn tcp_addr(harness: &TestHarness) -> SocketAddr {
 /// way a leader-aware SDK re-routes: after a node restart in a cluster the
 /// primary may be any survivor, and only the primary commits (or answers
 /// dedup for) replicated requests.
-fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
+pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
     (0..harness.cluster_size())
         .map(|node| {
             harness
@@ -172,7 +172,7 @@ fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn create_stream_payload(name: &str) -> Bytes {
+pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
     }
@@ -205,7 +205,7 @@ fn request_header(
 /// so the pre-restart request must reuse the returned stream. Replays on
 /// transient rejections: right after boot the single node may not have
 /// elected itself yet.
-async fn register(addr: SocketAddr) -> (TcpStream, u64) {
+pub(super) async fn register(addr: SocketAddr) -> (TcpStream, u64) {
     let body = LoginRegisterRequest {
         version_info: ClientVersionInfo {
             protocol_version: IGGY_PROTOCOL_VERSION,
@@ -239,7 +239,12 @@ async fn register(addr: SocketAddr) -> (TcpStream, u64) {
 
 /// Send one replicated metadata request on the registered connection and
 /// require a committed success within `COMMIT_BUDGET`.
-async fn commit_request(stream: &mut TcpStream, session: u64, request: u64, body: &Bytes) {
+pub(super) async fn commit_request(
+    stream: &mut TcpStream,
+    session: u64,
+    request: u64,
+    body: &Bytes,
+) {
     let header = request_header(Operation::CreateStream, session, request, body.len());
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
@@ -259,7 +264,7 @@ async fn commit_request(stream: &mut TcpStream, session: u64, request: u64, body
 /// old one died with the node and so an unanswered frame cannot desync the
 /// next attempt. Panics with the last observed failure mode when the budget
 /// runs out.
-async fn resume_request(addrs: &[SocketAddr], session: u64, request: u64, body: &Bytes) {
+pub(super) async fn resume_request(addrs: &[SocketAddr], session: u64, request: u64, body: &Bytes) {
     let header = request_header(Operation::CreateStream, session, request, body.len());
     let deadline = Instant::now() + RESUME_BUDGET;
     let mut last_failure = "the listener never came back".to_string();

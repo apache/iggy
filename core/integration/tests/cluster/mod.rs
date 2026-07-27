@@ -16,3 +16,4 @@
 // under the License.
 
 mod client_table_restart;
+mod metadata_state_transfer;

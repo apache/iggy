@@ -109,7 +109,7 @@ pub trait Consensus: Sized {
 
     fn is_follower(&self) -> bool;
     fn is_normal(&self) -> bool;
-    fn is_syncing(&self) -> bool;
+    fn is_transferring(&self) -> bool;
 }
 
 /// Shared consensus lifecycle interface for control/data planes.

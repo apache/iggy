@@ -339,7 +339,7 @@ fn submit_auto_commit<B, MJ, S>(
         .partitions()
         .with_partition(&namespace, |partition| {
             let consensus = partition.consensus();
-            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
                 AutoCommitGate::NotPrimary
             } else if partition.is_auto_commit_offset_covered(
                 applied.kind,

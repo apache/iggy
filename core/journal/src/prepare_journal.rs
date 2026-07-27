@@ -413,6 +413,11 @@ impl PrepareJournal {
         self.last_op.get()
     }
 
+    /// Current snapshot watermark: entries at or below it are evictable.
+    pub const fn snapshot_op(&self) -> u64 {
+        self.snapshot_op.get()
+    }
+
     /// Advance the snapshot watermark. The caller must ensure `op` is
     /// monotonically increasing and corresponds to a durable snapshot.
     ///
@@ -523,6 +528,14 @@ impl Journal<FileStorage> for PrepareJournal {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a> = Ref<'a, PrepareHeader>;
+
+    fn snapshot_op(&self) -> u64 {
+        Self::snapshot_op(self)
+    }
+
+    fn set_snapshot_op(&self, op: u64) {
+        Self::set_snapshot_op(self, op);
+    }
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = self.headers.borrow();
