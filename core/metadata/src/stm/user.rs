@@ -205,6 +205,18 @@ impl UsersInner {
         tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
         tokens
     }
+
+    /// Count of live personal access tokens for one user.
+    ///
+    /// Single-map read for the ingress-side create cap; the sibling
+    /// `personal_access_tokens_of` allocates and sorts, too heavy for a
+    /// per-request check.
+    #[must_use]
+    pub fn pat_count_of(&self, user_id: UserId) -> usize {
+        self.personal_access_tokens
+            .get(&user_id)
+            .map_or(0, |user_tokens| user_tokens.len())
+    }
 }
 
 impl Users {
@@ -948,6 +960,32 @@ mod tests {
 
         assert!(users.personal_access_tokens[&5].is_empty());
         assert!(users.personal_access_token_index.is_empty());
+    }
+
+    #[test]
+    fn pat_count_of_tracks_create_and_delete() {
+        let mut users = UsersInner::new();
+        assert_eq!(users.pat_count_of(9), 0);
+
+        for (name, hash_byte) in [("first", b'a'), ("second", b'b')] {
+            CreatePersonalAccessTokenRequest {
+                user_id: 9,
+                name: WireName::new(name).unwrap(),
+                expiry: 0,
+                token_hash: [hash_byte; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, IggyTimestamp::now());
+        }
+        assert_eq!(users.pat_count_of(9), 2);
+        assert_eq!(users.pat_count_of(1), 0, "count is scoped per user");
+
+        DeletePersonalAccessTokenRequest {
+            user_id: 9,
+            name: WireName::new("first").unwrap(),
+            only_if_expired: false,
+        }
+        .apply(&mut users, IggyTimestamp::now());
+        assert_eq!(users.pat_count_of(9), 1);
     }
 
     #[test]

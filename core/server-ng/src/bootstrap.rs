@@ -185,6 +185,7 @@ pub fn wire_shell_handlers<B, MJ, S>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> ShellHandlers
 where
     B: ShellBus,
@@ -200,6 +201,7 @@ where
             shard_handle,
             &sessions,
             system_config,
+            max_tokens_per_user,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
@@ -1256,8 +1258,12 @@ async fn shard_main(
             boot_view,
             shard.plane.metadata().client_table.borrow().client_ids(),
         );
-        let on_client_request =
-            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
+        let on_client_request = make_client_request_handler(
+            &shard,
+            &sessions,
+            Arc::clone(&config.system),
+            config.personal_access_token.max_tokens_per_user,
+        );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -1685,7 +1691,12 @@ async fn build_shard_for_thread(
         on_list_clients,
         on_partition_read,
         sessions,
-    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
+    } = wire_shell_handlers(
+        &bus,
+        &shard_handle,
+        Arc::clone(&config.system),
+        config.personal_access_token.max_tokens_per_user,
+    );
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -2464,6 +2475,7 @@ async fn start_tcp_runtime(
             http_addr,
             &config.http,
             config.metadata.clients_table_max,
+            config.personal_access_token.max_tokens_per_user,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
