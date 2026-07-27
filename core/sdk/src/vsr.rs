@@ -47,11 +47,10 @@ const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 // the retry from the current ConsensusSession. If disconnect created a fresh VSR
 // client/session, the retried request gets a new (client_id, request_id) tuple, so
 // server-side deduplication cannot match a mutation that may already have committed
-// before the transport failure. TigerBeetle avoids session resume and relies on
-// idempotency for requests retried from a new client session. For Iggy, either stop
-// transparent retries for replicated mutations after VSR session reset, add explicit
-// session resume/rebind semantics, or add a protocol-level idempotency key that is
-// independent of (client_id, request_id).
+// before the transport failure. The server now rebinds a transport that presents
+// its old (client, session) identity (`try_resume_session`), so the fix here is
+// to keep the ConsensusSession across reconnects and retry replicated writes
+// under the same (client_id, request_id) instead of re-registering fresh.
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,

@@ -71,15 +71,17 @@ impl CachedReply {
 /// Real requests start at 1 (header validation enforces `request > 0`).
 pub const REGISTER_REQUEST_ID: u64 = 0;
 
-/// Displaced replies retained per entry for below-watermark duplicate hits.
+/// Committed replies retained per entry, newest at the back.
 ///
+/// The back is the latest committed reply and is structurally safe:
+/// eviction pops the front, and only pushing a newer reply triggers it.
 /// The SDK enforces one request in flight per session, so the only reply a
 /// live client can be waiting for is its latest (`request == watermark`).
-/// The ring answers old retransmits and post-rebind stragglers with the
-/// original bytes instead of a bare "already applied"; losing an entry
+/// Older entries answer old retransmits and post-rebind stragglers with the
+/// original bytes instead of a bare "already applied"; losing one
 /// degrades the answer, never correctness. In-memory only: ring contents are
 /// refcount bumps and are never persisted or transferred.
-const REPLY_RING_CAPACITY: usize = 4;
+const REPLY_RING_CAPACITY: usize = 5;
 
 /// Per-session entry: fence epoch + committed-request watermark + replies.
 ///
@@ -105,11 +107,11 @@ pub struct ClientEntry {
     /// a request id for a different operation. Zero when unstamped (integrity
     /// fields are zeroed on the wire today), which disables the comparison.
     watermark_checksum: u128,
-    /// Latest committed reply (register or app op).
-    reply: CachedReply,
-    /// Displaced app replies, oldest at front, bounded by
-    /// [`REPLY_RING_CAPACITY`]. Register replies never enter (their
-    /// `request == REGISTER_REQUEST_ID` can never match a lookup).
+    /// Committed replies, oldest at front, latest at back; never empty
+    /// (registration seeds the register reply). Bounded by
+    /// [`REPLY_RING_CAPACITY`]. Request numbers are unique: same-request
+    /// recommits replace in place, and a rebind drops the previous
+    /// register reply before pushing the new one.
     ring: VecDeque<CachedReply>,
 }
 
@@ -162,9 +164,9 @@ pub enum RequestStatus {
 /// - **Watermark, not contiguity.** A request above the watermark executes
 ///   (gaps allowed); at or below is a duplicate. There is no `RequestGap`:
 ///   a client that jumps its counter loses nothing but the skipped ids.
-/// - **Replies are volatile.** Latest reply plus a small ring of displaced
-///   ones, all in-memory refcounts. A duplicate whose reply aged out is
-///   still refused execution ([`RequestStatus::AlreadyApplied`]).
+/// - **Replies are volatile.** A small per-entry ring of recent replies
+///   (latest at the back), all in-memory refcounts. A duplicate whose reply
+///   aged out is still refused execution ([`RequestStatus::AlreadyApplied`]).
 ///
 /// ## Plane
 ///
@@ -284,7 +286,7 @@ impl ClientTable {
         let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
         RequestStatus::AlreadyRegistered {
             epoch: entry.epoch,
-            cached_reply: entry.reply.clone(),
+            cached_reply: entry.latest().clone(),
         }
     }
 
@@ -293,9 +295,10 @@ impl ClientTable {
     ///
     /// The epoch is minted HERE, in apply order, so it is deterministic
     /// across replicas without reading any commit number. A rebind refreshes
-    /// `user_id` (the bind re-authenticated), replaces the latest reply with
-    /// the register reply (the displaced app reply moves into the ring), and
-    /// preserves the watermark - session resume keeps dedup history.
+    /// `user_id` (the bind re-authenticated), pushes the register reply as
+    /// the latest (cached app replies stay put; the previous register reply
+    /// is dropped), and preserves the watermark - session resume keeps dedup
+    /// history.
     ///
     /// Full table evicts oldest commit; `in_flight` protects pipeline
     /// holders, see [`Self::evict_oldest`].
@@ -326,27 +329,34 @@ impl ClientTable {
             let entry = self.slots[slot_idx].as_mut().expect("index/slot mismatch");
             entry.epoch += 1;
             entry.user_id = user_id;
-            let displaced = std::mem::replace(&mut entry.reply, cached);
-            entry.push_ring(displaced);
+            // Drop the previous register reply (if still retained) before
+            // pushing the new one: only the newest rebind's reply is
+            // replayable, and two request-0 entries would break the ring's
+            // unique-request invariant.
+            entry
+                .ring
+                .retain(|stored| stored.header().request != REGISTER_REQUEST_ID);
+            entry.push_latest(cached);
         } else {
             if self.index.len() >= self.slots.len() {
                 self.evict_oldest(&in_flight);
             }
             let slot_idx = self.first_free_slot().expect("eviction must free a slot");
+            let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
+            ring.push_back(cached);
             self.slots[slot_idx] = Some(ClientEntry {
                 epoch: 1,
                 user_id,
                 watermark: REGISTER_REQUEST_ID,
                 watermark_checksum: 0,
-                reply: cached,
-                ring: VecDeque::with_capacity(REPLY_RING_CAPACITY),
+                ring,
             });
             self.index.insert(client_id, slot_idx);
         }
     }
 
-    /// Record a committed reply: advance the watermark, cache the reply,
-    /// move the displaced one into the ring.
+    /// Record a committed reply: advance the watermark, push the reply into
+    /// the ring (evicting the oldest when full).
     ///
     /// `epoch` is asserted against the entry to guard a mis-attributed apply
     /// from clobbering a rebound session's state.
@@ -398,7 +408,7 @@ impl ClientTable {
              entry={}, prepare={epoch}",
             entry.epoch
         );
-        let latest_commit = entry.reply.header().commit;
+        let latest_commit = entry.latest().header().commit;
         assert!(
             new_commit >= latest_commit,
             "commit_reply: commit regression for client {client_id}: {latest_commit} -> {new_commit}",
@@ -413,12 +423,19 @@ impl ClientTable {
         let cached = CachedReply::from_message(reply);
         if new_request == entry.watermark {
             // Same request re-committed (WAL replay shape): replace in
-            // place, never push the stale twin into the ring - two cached
-            // replies for one request number would make lookups ambiguous.
-            entry.reply = cached;
+            // place, never push a stale twin - two cached replies for one
+            // request number would make lookups ambiguous.
+            if let Some(stored) = entry
+                .ring
+                .iter_mut()
+                .find(|stored| stored.header().request == new_request)
+            {
+                *stored = cached;
+            } else {
+                entry.push_latest(cached);
+            }
         } else {
-            let displaced = std::mem::replace(&mut entry.reply, cached);
-            entry.push_ring(displaced);
+            entry.push_latest(cached);
             entry.watermark = new_request;
         }
         entry.watermark_checksum = new_checksum;
@@ -477,8 +494,9 @@ impl ClientTable {
 
         for (idx, slot) in self.slots.iter().enumerate() {
             let Some(entry) = slot else { continue };
-            let commit = entry.reply.header().commit;
-            let client_id = entry.reply.header().client;
+            let latest = entry.latest().header();
+            let commit = latest.commit;
+            let client_id = latest.client;
             let target = if in_flight(client_id) {
                 &mut fallback
             } else {
@@ -496,7 +514,7 @@ impl ClientTable {
         let pick = evictee.or(fallback);
         if let Some((slot_idx, _)) = pick {
             let entry = self.slots[slot_idx].take().expect("evictee must exist");
-            let client_id = entry.reply.header().client;
+            let client_id = entry.latest().header().client;
             self.index.remove(&client_id);
             trace!(client_id, "evict_oldest: removed client from session table");
         }
@@ -513,7 +531,7 @@ impl ClientTable {
     #[must_use]
     pub fn get_reply(&self, client_id: u128) -> Option<&CachedReply> {
         let &slot_idx = self.index.get(&client_id)?;
-        self.slots[slot_idx].as_ref().map(|entry| &entry.reply)
+        self.slots[slot_idx].as_ref().map(ClientEntry::latest)
     }
 
     /// Fence epoch for a registered client. This is the u64 the register
@@ -548,29 +566,31 @@ impl ClientTable {
 }
 
 impl ClientEntry {
-    /// Cached reply whose `request` matches, latest first then the ring
-    /// (newest displaced entries sit at the back; scan order is irrelevant
+    /// Latest committed reply (register or app op).
+    ///
+    /// # Panics
+    /// Unreachable: registration seeds the ring and pops happen only when
+    /// displaced by a newer push.
+    fn latest(&self) -> &CachedReply {
+        self.ring
+            .back()
+            .expect("ring is never empty after registration")
+    }
+
+    /// Cached reply whose `request` matches (scan order is irrelevant
     /// because request numbers in the ring are unique).
     fn find_cached(&self, request: u64) -> Option<&CachedReply> {
-        if self.reply.header().request == request {
-            return Some(&self.reply);
-        }
         self.ring
             .iter()
             .find(|cached| cached.header().request == request)
     }
 
-    /// Retain a displaced reply for below-watermark duplicates. Register
-    /// replies never enter: `request == REGISTER_REQUEST_ID` can never match
-    /// a `check_request` lookup (wire validation enforces `request > 0`).
-    fn push_ring(&mut self, displaced: CachedReply) {
-        if displaced.header().request == REGISTER_REQUEST_ID {
-            return;
-        }
+    /// Push the newest committed reply, evicting the oldest when full.
+    fn push_latest(&mut self, cached: CachedReply) {
         if self.ring.len() == REPLY_RING_CAPACITY {
             self.ring.pop_front();
         }
-        self.ring.push_back(displaced);
+        self.ring.push_back(cached);
     }
 }
 
@@ -670,8 +690,8 @@ mod tests {
         );
         assert_eq!(table.count(), 1);
 
-        // The displaced app reply moved into the ring: the watermark request
-        // still answers with its original bytes under the new epoch.
+        // The app reply stays cached across the rebind: the watermark
+        // request still answers with its original bytes under the new epoch.
         match table.check_request(1, 2, 5, 0) {
             RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 5),
             other => panic!("expected Duplicate from ring, got {other:?}"),
@@ -847,7 +867,8 @@ mod tests {
     fn check_request_below_watermark_past_ring_is_already_applied() {
         let (mut table, epoch) = table_with_client();
         // Requests 1..=6: request 1's reply is displaced beyond the ring
-        // (capacity 4 holds 2,3,4,5 once 6 is latest).
+        // (capacity 5 holds 2..=6 once 6 commits; the register reply and
+        // request 1 aged out first).
         for request in 1..=6u64 {
             table.commit_reply(1, epoch, make_reply_for(1, request, 10 + request));
         }

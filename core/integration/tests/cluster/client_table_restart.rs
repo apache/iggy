@@ -47,10 +47,16 @@
 //! retry replicated writes only under the same identity) is the remaining
 //! client half.
 //!
-//! Single-node topology on purpose: the raw client pins one address, and a
-//! follower cannot commit replicated TCP writes (no follower forwarding for
-//! TCP yet), so post-failover resume against a 3-node cluster is future
-//! work alongside that forwarding.
+//! The topology matrix covers two distinct recovery paths:
+//!
+//! - **1 node**: the restarted node rebuilds the table from its own WAL and
+//!   the client resumes against it (restart recovery).
+//! - **3 nodes**: `restart_server` reboots node 0 only; the survivors elect
+//!   a new primary, whose table was maintained by its own `commit_journal`
+//!   applies all along. The client resumes against whichever node answers
+//!   as primary — a follower cannot commit replicated TCP writes (no
+//!   follower forwarding for TCP yet), so the continuation loop probes
+//!   every node the way a leader-aware SDK re-routes (failover resume).
 //!
 //! These tests pin the implicit-rebind contract: a resumed client simply
 //! keeps sending under its old `(client, session)` on a fresh connection and
@@ -101,7 +107,7 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-#[iggy_harness(cluster_nodes = 1)]
+#[iggy_harness(cluster_nodes = [1, 3])]
 async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     harness: &mut TestHarness,
 ) {
@@ -116,11 +122,11 @@ async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     // The reply for request 1 was already delivered, but the client cannot
     // know that in the crash window; retrying the same id must converge on
     // the cached reply, never on a second apply or a silent drop.
-    let addr = tcp_addr(harness);
-    resume_request(addr, session, 1, &create_stream).await;
+    let addrs = tcp_addrs(harness);
+    resume_request(&addrs, session, 1, &create_stream).await;
 }
 
-#[iggy_harness(cluster_nodes = 1)]
+#[iggy_harness(cluster_nodes = [1, 3])]
 async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
     harness: &mut TestHarness,
 ) {
@@ -140,8 +146,8 @@ async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
     // Continuation, not retry: the session advances to the next id. A node
     // that forgot the watermark sees request 2 on an unknown session and
     // either drops it as a gap or bounces the session entirely.
-    let addr = tcp_addr(harness);
-    resume_request(addr, session, 2, &create_stream_payload("iggy137-second")).await;
+    let addrs = tcp_addrs(harness);
+    resume_request(&addrs, session, 2, &create_stream_payload("iggy137-second")).await;
 }
 
 fn tcp_addr(harness: &TestHarness) -> SocketAddr {
@@ -149,6 +155,21 @@ fn tcp_addr(harness: &TestHarness) -> SocketAddr {
         .server()
         .tcp_addr()
         .expect("server must expose a TCP address")
+}
+
+/// Every node's TCP address. The continuation loop probes all of them the
+/// way a leader-aware SDK re-routes: after a node restart in a cluster the
+/// primary may be any survivor, and only the primary commits (or answers
+/// dedup for) replicated requests.
+fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
+    (0..harness.cluster_size())
+        .map(|node| {
+            harness
+                .node(node)
+                .tcp_addr()
+                .expect("every node must expose a TCP address")
+        })
+        .collect()
 }
 
 fn create_stream_payload(name: &str) -> Bytes {
@@ -232,16 +253,20 @@ async fn commit_request(stream: &mut TcpStream, session: u64, request: u64, body
     }
 }
 
-/// Post-restart continuation: keep presenting the old identity until the
-/// server commits (or serves the cached reply for) the request. Every
-/// attempt uses a fresh connection, both because the old one died with the
-/// node and so an unanswered frame cannot desync the next attempt. Panics
-/// with the last observed failure mode when the budget runs out.
-async fn resume_request(addr: SocketAddr, session: u64, request: u64, body: &Bytes) {
+/// Post-restart continuation: keep presenting the old identity, round-robin
+/// across every node, until some node commits (or serves the cached reply
+/// for) the request. Every attempt uses a fresh connection, both because the
+/// old one died with the node and so an unanswered frame cannot desync the
+/// next attempt. Panics with the last observed failure mode when the budget
+/// runs out.
+async fn resume_request(addrs: &[SocketAddr], session: u64, request: u64, body: &Bytes) {
     let header = request_header(Operation::CreateStream, session, request, body.len());
     let deadline = Instant::now() + RESUME_BUDGET;
     let mut last_failure = "the listener never came back".to_string();
+    let mut attempt = 0usize;
     while Instant::now() < deadline {
+        let addr = addrs[attempt % addrs.len()];
+        attempt += 1;
         let Ok(mut stream) = TcpStream::connect(addr).await else {
             sleep(RETRY_PAUSE).await;
             continue;
@@ -259,21 +284,21 @@ async fn resume_request(addr: SocketAddr, session: u64, request: u64, body: &Byt
             }
             Verdict::NoResultSection => {
                 last_failure = format!(
-                    "request {request} got the unbound-transport empty Reply: the \
-                     restarted node does not recognize session {session}"
+                    "request {request} got the unbound-transport empty Reply on \
+                     {addr}: that node does not recognize session {session}"
                 );
             }
             Verdict::Ignored => {
                 last_failure = format!(
                     "request {request} on session {session} was silently ignored for \
-                     {REPLY_WAIT:?} (RequestGap-style drop: the restarted node lost \
-                     the request watermark)"
+                     {REPLY_WAIT:?} (RequestGap-style drop: the node lost the \
+                     request watermark)"
                 );
             }
             Verdict::Evicted(reason) => {
                 last_failure = format!(
                     "session {session} was evicted with reason {reason} instead of \
-                     being rebound from the persisted table"
+                     being rebound from the recovered table"
                 );
             }
         }
