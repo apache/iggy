@@ -17,7 +17,7 @@
 
 use iggy_binary_protocol::ReplyHeader;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 use tracing::trace;
 
@@ -71,19 +71,46 @@ impl CachedReply {
 /// Real requests start at 1 (header validation enforces `request > 0`).
 pub const REGISTER_REQUEST_ID: u64 = 0;
 
-/// Per-client entry (VR paper §4, Fig. 2): session + latest committed reply.
+/// Displaced replies retained per entry for below-watermark duplicate hits.
 ///
-/// `session` is assigned at registration and fixed for the entry's lifetime.
+/// The SDK enforces one request in flight per session, so the only reply a
+/// live client can be waiting for is its latest (`request == watermark`).
+/// The ring answers old retransmits and post-rebind stragglers with the
+/// original bytes instead of a bare "already applied"; losing an entry
+/// degrades the answer, never correctness. In-memory only: ring contents are
+/// refcount bumps and are never persisted or transferred.
+const REPLY_RING_CAPACITY: usize = 4;
+
+/// Per-session entry: fence epoch + committed-request watermark + replies.
+///
+/// The key (`client_id` today, the stable `session_id` once SDK identity
+/// stability lands) is client-supplied; `epoch` is the server-minted fence
+/// that orders rebinds of that key.
 #[derive(Debug)]
 pub struct ClientEntry {
-    /// Session number = commit op of the register. Monotonic across
-    /// registrations; new register always gets a higher session.
-    pub session: u64,
-    /// Acting user id captured at register. Fixed for the entry's lifetime;
-    /// lets every replica resolve session -> user without a metadata lookup.
-    pub user_id: u32,
-    /// Cached reply for client's latest committed request.
-    pub reply: CachedReply,
+    /// Fence epoch: 1 at first register, +1 per committed re-register.
+    /// Minted here, in apply order, so every replica derives the same value.
+    /// Requests stamped with an older epoch are zombies and get fenced;
+    /// a newer epoch than minted is a protocol violation.
+    epoch: u64,
+    /// Acting user id captured at register (re-register refreshes it: the
+    /// rebind re-authenticated). Lets every replica resolve session -> user
+    /// without a metadata lookup.
+    user_id: u32,
+    /// Highest committed request number. `REGISTER_REQUEST_ID` (0) until the
+    /// first app op commits. Survives re-register: a resumed session keeps
+    /// its dedup history.
+    watermark: u64,
+    /// `request_checksum` of the watermark request; catches a client reusing
+    /// a request id for a different operation. Zero when unstamped (integrity
+    /// fields are zeroed on the wire today), which disables the comparison.
+    watermark_checksum: u128,
+    /// Latest committed reply (register or app op).
+    reply: CachedReply,
+    /// Displaced app replies, oldest at front, bounded by
+    /// [`REPLY_RING_CAPACITY`]. Register replies never enter (their
+    /// `request == REGISTER_REQUEST_ID` can never match a lookup).
+    ring: VecDeque<CachedReply>,
 }
 
 /// Result of checking a request against the client table.
@@ -93,49 +120,71 @@ pub struct ClientEntry {
 /// committed state.
 #[derive(Debug)]
 pub enum RequestStatus {
-    /// Not seen; proceed with consensus.
+    /// Above the watermark; proceed with consensus. Jumps are allowed: the
+    /// watermark records the highest committed request, not a contiguous
+    /// sequence, so `watermark + k` for any `k >= 1` is new.
     New,
-    /// Exact request already committed; re-send cached reply.
+    /// At or below the watermark with the original reply still cached;
+    /// re-send it.
     Duplicate(CachedReply),
-    /// Older than client's latest committed request; drop silently.
-    Stale,
-    /// No session for this client; must register first.
+    /// At or below the watermark, original reply no longer cached. Applied
+    /// once already; must not re-execute, nothing to replay.
+    AlreadyApplied { request: u64, watermark: u64 },
+    /// Request number matches the watermark but its `request_checksum`
+    /// differs: the client reused a request id for a different operation.
+    /// Returning the cached reply would answer the wrong request.
+    ChecksumMismatch { request: u64 },
+    /// No entry for this client; must register first.
     NoSession,
-    /// Session number doesn't match the entry.
-    SessionMismatch { expected: u64, received: u64 },
-    /// Request != `committed + 1`. Skipped numbers would be lost permanently.
-    RequestGap { expected: u64, received: u64 },
-    /// Client already has a session. From `check_register`.
+    /// Stamped epoch is older than the entry's: a zombie holdover from
+    /// before a re-register. Terminal for that holder.
+    Fenced { current: u64, received: u64 },
+    /// Stamped epoch is newer than any this table minted: client bug
+    /// (epochs are only handed out by register replies).
+    EpochAhead { current: u64, received: u64 },
+    /// Client already has an entry. From `check_register`.
     AlreadyRegistered {
-        session: u64,
+        epoch: u64,
         cached_reply: CachedReply,
     },
 }
 
-/// VSR client-table: durable per-client session state.
+/// VSR client table: per-session fence epoch + request-watermark dedup.
 ///
 /// Fixed-size slot array (source of truth) + `HashMap` index (O(1) lookup).
 ///
-/// ## Plane: metadata-only
+/// ## Semantics (v2)
 ///
-/// Backs Register session, request contiguity, metadata-retry dedup, and
-/// `NoSession`/`SessionTooLow` eviction. Partition plane is at-least-once;
-/// `SendMessages` retries can re-commit at a new offset and consumers
-/// dedup via message ID (`server_common::MessageDeduplicator`).
+/// - **Epoch, not commit.** Session identity is the client-supplied key;
+///   the entry's `epoch` is a plain counter minted at `commit_register`
+///   (1, then +1 per rebind). No field derives from a commit op number, so
+///   the same table logic serves any consensus group.
+/// - **Watermark, not contiguity.** A request above the watermark executes
+///   (gaps allowed); at or below is a duplicate. There is no `RequestGap`:
+///   a client that jumps its counter loses nothing but the skipped ids.
+/// - **Replies are volatile.** Latest reply plus a small ring of displaced
+///   ones, all in-memory refcounts. A duplicate whose reply aged out is
+///   still refused execution ([`RequestStatus::AlreadyApplied`]).
 ///
-/// Do not add per-partition `ClientTable` or `(client_id, request)` dedup
-/// on the partition side, that flips iggy's contract toward at-most-once.
-/// See project memory `project_vsr_clients_table_integration`.
+/// ## Plane
+///
+/// Metadata-plane today. The design spans planes (one logical table,
+/// group-resident slices); partition-plane integration arrives once
+/// partition prepares carry real `(session_id, request)` instead of the
+/// transport id (data-plane request numbering, IGGY-137). Until then the
+/// partition plane stays at-least-once with no dedup.
 ///
 /// ## Tracking
 ///
-/// Committed state only, latest reply per client. In-flight state
-/// (acks, subscribers, in-progress dedup) lives on [`crate::PipelineEntry`].
-/// Updated by `commit_reply` / `commit_register`.
+/// Committed state only. In-flight state (acks, subscribers, in-progress
+/// dedup) lives on [`crate::PipelineEntry`]. Updated by `commit_reply` /
+/// `commit_register` in the apply path, so every replica of the group
+/// derives an identical table from the committed log.
 ///
 /// ## Known gaps
 ///
-/// - **Checkpoint serialization**: slot layout deterministic, encode/decode TODO.
+/// - **Serialization**: encode/decode for rejoin slice-fetch and state
+///   transfer TODO (IGGY-137).
 #[derive(Debug)]
 pub struct ClientTable {
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
@@ -156,52 +205,70 @@ impl ClientTable {
         }
     }
 
-    /// Check request against table. Session first, then request progression.
-    /// For Register, use [`check_register`].
+    /// Check a request against the table. Epoch fence first, then the
+    /// watermark. For Register, use [`Self::check_register`].
+    ///
+    /// `request_checksum` is the request's integrity stamp; zero (unstamped)
+    /// disables the reuse check.
     ///
     /// # Panics
     /// If index points to empty slot (invariant violation).
     #[must_use]
-    pub fn check_request(&self, client_id: u128, session: u64, request: u64) -> RequestStatus {
+    pub fn check_request(
+        &self,
+        client_id: u128,
+        epoch: u64,
+        request: u64,
+        request_checksum: u128,
+    ) -> RequestStatus {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         // Header validation guarantees both > 0 at wire layer.
-        debug_assert!(session > 0, "check_request: session must be > 0");
+        debug_assert!(epoch > 0, "check_request: epoch must be > 0");
         debug_assert!(request > 0, "check_request: request must be > 0");
 
-        // Session check before request: wrong-session must be rejected even if
-        // (client_id, request) matches a correct-session pending entry.
+        // Epoch check before request: a fenced zombie must be rejected even
+        // if its request number would read as a clean duplicate.
         let Some(&slot_idx) = self.index.get(&client_id) else {
             return RequestStatus::NoSession;
         };
         let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
 
-        if session != entry.session {
-            return RequestStatus::SessionMismatch {
-                expected: entry.session,
-                received: session,
+        if epoch < entry.epoch {
+            return RequestStatus::Fenced {
+                current: entry.epoch,
+                received: epoch,
+            };
+        }
+        if epoch > entry.epoch {
+            return RequestStatus::EpochAhead {
+                current: entry.epoch,
+                received: epoch,
             };
         }
 
-        let committed_request = entry.reply.header().request;
-
-        if request < committed_request {
-            return RequestStatus::Stale;
-        }
-        if request == committed_request {
-            return RequestStatus::Duplicate(entry.reply.clone());
-        }
-        if request != committed_request + 1 {
-            return RequestStatus::RequestGap {
-                expected: committed_request + 1,
-                received: request,
-            };
+        if request > entry.watermark {
+            return RequestStatus::New;
         }
 
-        RequestStatus::New
+        if request == entry.watermark
+            && entry.watermark_checksum != 0
+            && request_checksum != 0
+            && entry.watermark_checksum != request_checksum
+        {
+            return RequestStatus::ChecksumMismatch { request };
+        }
+
+        match entry.find_cached(request) {
+            Some(cached) => RequestStatus::Duplicate(cached.clone()),
+            None => RequestStatus::AlreadyApplied {
+                request,
+                watermark: entry.watermark,
+            },
+        }
     }
 
-    /// Check register. Valid without existing session; returns
-    /// `AlreadyRegistered { session, cached_reply }`.
+    /// Check register. Valid without existing entry; returns
+    /// `AlreadyRegistered { epoch, cached_reply }` otherwise.
     ///
     /// Caller does in-flight dedup via `pipeline.has_message_from_client`.
     ///
@@ -216,33 +283,25 @@ impl ClientTable {
         };
         let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
         RequestStatus::AlreadyRegistered {
-            session: entry.session,
+            epoch: entry.epoch,
             cached_reply: entry.reply.clone(),
         }
     }
 
-    /// Record committed register; create or update session.
+    /// Record a committed register: create the entry at epoch 1, or bump the
+    /// existing entry's epoch (rebind).
     ///
-    /// Session = `reply.header().commit`. Monotonic, deterministic.
-    /// Idempotent on same-session WAL replay.
-    ///
-    /// # Session mismatch (no panic, log + skip)
-    ///
-    /// - `existing.session > new`: stale WAL replay; newer slot is authoritative.
-    /// - `existing.session < new`: duplicate Register at different ops,
-    ///   protocol violation; keep existing (other replicas may have agreed on it).
-    ///
-    /// Was `assert_eq!` pre-fix. `commit_journal` runs without the
-    /// `is_caught_up_primary` gate (it's what opens the gate), so a
-    /// malformed WAL or capacity-evict-then-reregister race could reach
-    /// here and panic the shard pump.
+    /// The epoch is minted HERE, in apply order, so it is deterministic
+    /// across replicas without reading any commit number. A rebind refreshes
+    /// `user_id` (the bind re-authenticated), replaces the latest reply with
+    /// the register reply (the displaced app reply moves into the ring), and
+    /// preserves the watermark - session resume keeps dedup history.
     ///
     /// Full table evicts oldest commit; `in_flight` protects pipeline
     /// holders, see [`Self::evict_oldest`].
     ///
     /// # Panics
-    /// If `client_id == 0`, `session == 0`, or `client_id != reply.header().client`.
-    /// Session mismatch does NOT panic.
+    /// If `client_id == 0` or `client_id != reply.header().client`.
     pub fn commit_register<F>(
         &mut self,
         client_id: u128,
@@ -260,55 +319,37 @@ impl ClientTable {
             reply.header().client
         );
 
-        let session = reply.header().commit;
-        assert!(session > 0, "commit_register: session must be > 0");
-
-        let existing = self.index.get(&client_id).copied();
-
-        // Mismatch on re-register: log + skip, not panic. See doc above.
-        if let Some(slot_idx) = existing {
-            let slot = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
-            if slot.session != session {
-                tracing::warn!(
-                    client_id,
-                    existing_session = slot.session,
-                    replay_session = session,
-                    "commit_register: session mismatch (stale WAL replay or \
-                     duplicate Register at different ops); skipping update"
-                );
-                return;
-            }
-        }
-
         // Freeze once; later dedup-hit clones Arc-bump.
         let cached: CachedReply = CachedReply::from_message(reply);
 
-        // Update in place on re-register, else new slot. Reply-delivery
-        // channel lives on popped `PipelineEntry`, fired by commit caller
-        // after this returns, slot-first ordering, see `commit_reply`.
-        if let Some(slot_idx) = existing {
-            self.slots[slot_idx]
-                .as_mut()
-                .expect("index/slot mismatch")
-                .reply = cached;
+        if let Some(&slot_idx) = self.index.get(&client_id) {
+            let entry = self.slots[slot_idx].as_mut().expect("index/slot mismatch");
+            entry.epoch += 1;
+            entry.user_id = user_id;
+            let displaced = std::mem::replace(&mut entry.reply, cached);
+            entry.push_ring(displaced);
         } else {
             if self.index.len() >= self.slots.len() {
                 self.evict_oldest(&in_flight);
             }
             let slot_idx = self.first_free_slot().expect("eviction must free a slot");
             self.slots[slot_idx] = Some(ClientEntry {
-                session,
+                epoch: 1,
                 user_id,
+                watermark: REGISTER_REQUEST_ID,
+                watermark_checksum: 0,
                 reply: cached,
+                ring: VecDeque::with_capacity(REPLY_RING_CAPACITY),
             });
             self.index.insert(client_id, slot_idx);
         }
     }
 
-    /// Record committed reply, update in place. Client must be registered.
+    /// Record a committed reply: advance the watermark, cache the reply,
+    /// move the displaced one into the ring.
     ///
-    /// `session` is asserted against stored session to guard WAL replay
-    /// from clobbering a newer entry.
+    /// `epoch` is asserted against the entry to guard a mis-attributed apply
+    /// from clobbering a rebound session's state.
     ///
     /// Reply delivery is caller's job, `Sender` lives on the popped
     /// `PipelineEntry` ([`crate::PipelineEntry::take_reply_sender`]),
@@ -319,17 +360,22 @@ impl ClientTable {
     /// ships; cache skipped; client gets `NoSession` next request.
     ///
     /// # Panics
-    /// On session mismatch or commit/request regression. Missing client
+    /// On epoch mismatch or commit/watermark regression. Missing client
     /// does NOT panic.
-    pub fn commit_reply(&mut self, client_id: u128, session: u64, reply: Message<ReplyHeader>) {
+    pub fn commit_reply(&mut self, client_id: u128, epoch: u64, reply: Message<ReplyHeader>) {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let new_header = reply.header();
         let new_client = new_header.client;
         let new_request = new_header.request;
         let new_commit = new_header.commit;
+        let new_checksum = new_header.request_checksum;
         assert_eq!(
             client_id, new_client,
             "commit_reply: client_id mismatch (arg={client_id}, header={new_client})",
+        );
+        debug_assert!(
+            new_request > REGISTER_REQUEST_ID,
+            "commit_reply: register replies go through commit_register"
         );
 
         let Some(&slot_idx) = self.index.get(&client_id) else {
@@ -345,33 +391,40 @@ impl ClientTable {
             return;
         };
 
-        let slot = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
-        let slot_header = slot.reply.header();
-        let slot_commit = slot_header.commit;
-        let slot_request = slot_header.request;
+        let entry = self.slots[slot_idx].as_mut().expect("index/slot mismatch");
         assert_eq!(
-            slot.session, session,
-            "commit_reply: session mismatch for client {client_id}: \
-             entry={}, prepare={session}",
-            slot.session
+            entry.epoch, epoch,
+            "commit_reply: epoch mismatch for client {client_id}: \
+             entry={}, prepare={epoch}",
+            entry.epoch
+        );
+        let latest_commit = entry.reply.header().commit;
+        assert!(
+            new_commit >= latest_commit,
+            "commit_reply: commit regression for client {client_id}: {latest_commit} -> {new_commit}",
         );
         assert!(
-            new_commit >= slot_commit,
-            "commit_reply: commit regression for client {client_id}: {slot_commit} -> {new_commit}",
-        );
-        assert!(
-            new_request >= slot_request,
-            "commit_reply: request regression for client {client_id}: {slot_request} -> {new_request}",
+            new_request >= entry.watermark,
+            "commit_reply: watermark regression for client {client_id}: {} -> {new_request}",
+            entry.watermark
         );
 
         // Freeze once; later dedup-hit clones Arc-bump.
-        self.slots[slot_idx]
-            .as_mut()
-            .expect("index/slot mismatch")
-            .reply = CachedReply::from_message(reply);
+        let cached = CachedReply::from_message(reply);
+        if new_request == entry.watermark {
+            // Same request re-committed (WAL replay shape): replace in
+            // place, never push the stale twin into the ring - two cached
+            // replies for one request number would make lookups ambiguous.
+            entry.reply = cached;
+        } else {
+            let displaced = std::mem::replace(&mut entry.reply, cached);
+            entry.push_ring(displaced);
+            entry.watermark = new_request;
+        }
+        entry.watermark_checksum = new_checksum;
     }
 
-    /// Remove a client session and cached reply.
+    /// Remove a client session and cached replies.
     ///
     /// **LOCAL ONLY -- does NOT replicate.** Two correct call sites:
     ///
@@ -412,9 +465,9 @@ impl ClientTable {
     /// state -> identical choice. `commit_journal` catch-up has empty pipeline,
     /// so `in_flight` returns `false` everywhere, matches pre-fix policy.
     ///
-    /// **Metadata caveat**: pre-checkpoint, eviction breaks at-most-once
-    /// for the evicted client, next metadata retry treated as `New`.
-    /// Partition plane unaffected (at-least-once, doesn't use this table).
+    /// **Caveat**: eviction erases the evicted session's watermark, so its
+    /// next retry is treated as `New` (re-executes). Bounded by table
+    /// capacity; the op-TTL + slice persistence work (IGGY-137) shrinks it.
     fn evict_oldest<F>(&mut self, in_flight: &F)
     where
         F: Fn(u128) -> bool,
@@ -453,7 +506,7 @@ impl ClientTable {
         self.slots.iter().position(Option::is_none)
     }
 
-    /// Cached reply for a client (duplicate re-sends).
+    /// Latest cached reply for a client.
     ///
     /// Borrow avoids Arc bump for header-only inspection. Wire-senders
     /// `.clone()` (Arc bump) then `.into_wire_bytes()`.
@@ -463,11 +516,21 @@ impl ClientTable {
         self.slots[slot_idx].as_ref().map(|entry| &entry.reply)
     }
 
-    /// Session number for a registered client.
+    /// Fence epoch for a registered client. This is the u64 the register
+    /// reply hands the client and the wire `session` field carries back.
     #[must_use]
-    pub fn get_session(&self, client_id: u128) -> Option<u64> {
+    pub fn get_epoch(&self, client_id: u128) -> Option<u64> {
         let &slot_idx = self.index.get(&client_id)?;
-        self.slots[slot_idx].as_ref().map(|entry| entry.session)
+        self.slots[slot_idx].as_ref().map(|entry| entry.epoch)
+    }
+
+    /// Committed-request watermark for a registered client. A (re)bind reply
+    /// surfaces this so a restarted client resumes numbering at
+    /// `watermark + 1` instead of silently colliding below it.
+    #[must_use]
+    pub fn get_watermark(&self, client_id: u128) -> Option<u64> {
+        let &slot_idx = self.index.get(&client_id)?;
+        self.slots[slot_idx].as_ref().map(|entry| entry.watermark)
     }
 
     /// Acting user id captured when the client registered.
@@ -481,6 +544,33 @@ impl ClientTable {
     #[must_use]
     pub fn count(&self) -> usize {
         self.index.len()
+    }
+}
+
+impl ClientEntry {
+    /// Cached reply whose `request` matches, latest first then the ring
+    /// (newest displaced entries sit at the back; scan order is irrelevant
+    /// because request numbers in the ring are unique).
+    fn find_cached(&self, request: u64) -> Option<&CachedReply> {
+        if self.reply.header().request == request {
+            return Some(&self.reply);
+        }
+        self.ring
+            .iter()
+            .find(|cached| cached.header().request == request)
+    }
+
+    /// Retain a displaced reply for below-watermark duplicates. Register
+    /// replies never enter: `request == REGISTER_REQUEST_ID` can never match
+    /// a `check_request` lookup (wire validation enforces `request > 0`).
+    fn push_ring(&mut self, displaced: CachedReply) {
+        if displaced.header().request == REGISTER_REQUEST_ID {
+            return;
+        }
+        if self.ring.len() == REPLY_RING_CAPACITY {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(displaced);
     }
 }
 
@@ -512,6 +602,15 @@ mod tests {
     }
 
     fn make_reply_for(client: u128, request: u64, commit: u64) -> Message<ReplyHeader> {
+        make_reply_with_checksum(client, request, commit, 0)
+    }
+
+    fn make_reply_with_checksum(
+        client: u128,
+        request: u64,
+        commit: u64,
+        request_checksum: u128,
+    ) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
         let mut msg = Message::<ReplyHeader>::new(header_size);
         let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
@@ -522,6 +621,7 @@ mod tests {
             client,
             request,
             commit,
+            request_checksum,
             command: Command2::Reply,
             operation: Operation::SendMessages,
             ..ReplyHeader::default()
@@ -534,28 +634,57 @@ mod tests {
         |_| false
     }
 
-    /// Register client 1 at commit 10. Returns (table, session=10).
+    /// Register client 1 (register commit stamped at op 10). Returns
+    /// (table, epoch=1).
     fn table_with_client() -> (ClientTable, u64) {
         let mut table = ClientTable::new(10);
-        let session = 10;
-        table.commit_register(
-            1,
-            TEST_USER_ID,
-            make_register_reply(1, session),
-            no_in_flight(),
-        );
-        (table, session)
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
+        (table, 1)
     }
 
     // Registration tests
 
     #[test]
-    fn register_creates_session() {
+    fn register_mints_epoch_one() {
         let mut table = ClientTable::new(10);
         table.commit_register(1, TEST_USER_ID, make_register_reply(1, 42), no_in_flight());
-        assert_eq!(table.get_session(1), Some(42));
+        assert_eq!(table.get_epoch(1), Some(1));
+        assert_eq!(table.get_watermark(1), Some(0));
         assert_eq!(table.get_user_id(1), Some(TEST_USER_ID));
         assert_eq!(table.count(), 1);
+    }
+
+    // Re-register = rebind: epoch bumps, watermark (dedup history) survives.
+    #[test]
+    fn reregister_bumps_epoch_and_preserves_watermark() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 5, 15));
+        assert_eq!(table.get_watermark(1), Some(5));
+
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20), no_in_flight());
+        assert_eq!(table.get_epoch(1), Some(2), "rebind mints the next epoch");
+        assert_eq!(
+            table.get_watermark(1),
+            Some(5),
+            "session resume keeps dedup history"
+        );
+        assert_eq!(table.count(), 1);
+
+        // The displaced app reply moved into the ring: the watermark request
+        // still answers with its original bytes under the new epoch.
+        match table.check_request(1, 2, 5, 0) {
+            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 5),
+            other => panic!("expected Duplicate from ring, got {other:?}"),
+        }
+    }
+
+    // A rebind re-authenticates; the fresh register's user wins.
+    #[test]
+    fn reregister_refreshes_user_id() {
+        let mut table = ClientTable::new(10);
+        table.commit_register(1, 11, make_register_reply(1, 10), no_in_flight());
+        table.commit_register(1, 22, make_register_reply(1, 20), no_in_flight());
+        assert_eq!(table.get_user_id(1), Some(22));
     }
 
     // Each entry keeps the user id it registered with; lookups are per-client.
@@ -581,16 +710,15 @@ mod tests {
 
     #[test]
     fn check_register_already_registered() {
-        let (table, session) = table_with_client();
+        let (table, epoch) = table_with_client();
         match table.check_register(1) {
             RequestStatus::AlreadyRegistered {
-                session: s,
+                epoch: e,
                 cached_reply,
             } => {
-                assert_eq!(s, session);
+                assert_eq!(e, epoch);
                 // Cached reply IS the register reply, preflight replays it.
                 assert_eq!(cached_reply.header().request, REGISTER_REQUEST_ID);
-                assert_eq!(cached_reply.header().commit, session);
             }
             other => panic!("expected AlreadyRegistered, got {other:?}"),
         }
@@ -598,17 +726,17 @@ mod tests {
 
     #[test]
     fn check_register_already_registered_after_progress() {
-        let (mut table, session) = table_with_client();
+        let (mut table, epoch) = table_with_client();
         // Client progresses past registration.
-        table.commit_reply(1, 10, make_reply_for(1, 1, 11));
-        table.commit_reply(1, 10, make_reply_for(1, 2, 12));
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        table.commit_reply(1, epoch, make_reply_for(1, 2, 12));
         // Cached reply is now latest app reply; preflight must silent-drop.
         match table.check_register(1) {
             RequestStatus::AlreadyRegistered {
-                session: s,
+                epoch: e,
                 cached_reply,
             } => {
-                assert_eq!(s, session);
+                assert_eq!(e, epoch);
                 assert_eq!(
                     cached_reply.header().request,
                     2,
@@ -619,46 +747,120 @@ mod tests {
         }
     }
 
-    // Session validation tests
+    // Epoch fence tests
 
     #[test]
     fn check_request_no_session() {
         let table = ClientTable::new(10);
-        // Not registered: valid session/request but no entry.
+        // Not registered: valid epoch/request but no entry.
         assert!(matches!(
-            table.check_request(1, 99, 1),
+            table.check_request(1, 99, 1, 0),
             RequestStatus::NoSession
         ));
     }
 
+    // Zombie fencing: requests stamped with a pre-rebind epoch are terminal.
     #[test]
-    fn check_request_session_mismatch() {
-        let (table, session) = table_with_client();
-        match table.check_request(1, session + 1, 1) {
-            RequestStatus::SessionMismatch { expected, received } => {
-                assert_eq!(expected, session);
-                assert_eq!(received, session + 1);
+    fn check_request_stale_epoch_is_fenced() {
+        let (mut table, _) = table_with_client();
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20), no_in_flight());
+        assert_eq!(table.get_epoch(1), Some(2));
+        match table.check_request(1, 1, 1, 0) {
+            RequestStatus::Fenced { current, received } => {
+                assert_eq!(current, 2);
+                assert_eq!(received, 1);
             }
-            other => panic!("expected SessionMismatch, got {other:?}"),
+            other => panic!("expected Fenced, got {other:?}"),
         }
     }
 
+    // Epochs are only handed out by register replies; a newer-than-minted
+    // epoch is a client bug, distinct from the zombie case.
     #[test]
-    fn check_request_correct_session_new() {
-        let (mut table, session) = table_with_client();
-        table.commit_reply(1, 10, make_reply_for(1, 1, 11));
+    fn check_request_future_epoch_is_client_bug() {
+        let (table, epoch) = table_with_client();
+        match table.check_request(1, epoch + 1, 1, 0) {
+            RequestStatus::EpochAhead { current, received } => {
+                assert_eq!(current, epoch);
+                assert_eq!(received, epoch + 1);
+            }
+            other => panic!("expected EpochAhead, got {other:?}"),
+        }
+    }
+
+    // Watermark tests
+
+    #[test]
+    fn check_request_above_watermark_is_new() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
         assert!(matches!(
-            table.check_request(1, session, 2),
+            table.check_request(1, epoch, 2, 0),
             RequestStatus::New
         ));
     }
 
+    // No contiguity requirement: a jump past the watermark executes. The
+    // watermark records the highest committed request, not a sequence.
     #[test]
-    fn check_request_duplicate_after_commit() {
-        let (mut table, session) = table_with_client();
-        table.commit_reply(1, 10, make_reply_for(1, 1, 11));
-        match table.check_request(1, session, 1) {
+    fn check_request_jump_above_watermark_is_new() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        assert!(matches!(
+            table.check_request(1, epoch, 9, 0),
+            RequestStatus::New
+        ));
+        // And committing the jump moves the watermark to it.
+        table.commit_reply(1, epoch, make_reply_for(1, 9, 12));
+        assert_eq!(table.get_watermark(1), Some(9));
+    }
+
+    #[test]
+    fn check_request_duplicate_at_watermark() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        match table.check_request(1, epoch, 1, 0) {
             RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 1),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    // Below-watermark duplicate with the original still in the ring answers
+    // with the original bytes.
+    #[test]
+    fn check_request_below_watermark_hits_ring() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        table.commit_reply(1, epoch, make_reply_for(1, 2, 12));
+        match table.check_request(1, epoch, 1, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 1, "original reply, not latest");
+                assert_eq!(cached.header().commit, 11, "original commit op");
+            }
+            other => panic!("expected Duplicate from ring, got {other:?}"),
+        }
+    }
+
+    // Below-watermark duplicate whose reply aged out of the ring is refused
+    // execution with nothing to replay.
+    #[test]
+    fn check_request_below_watermark_past_ring_is_already_applied() {
+        let (mut table, epoch) = table_with_client();
+        // Requests 1..=6: request 1's reply is displaced beyond the ring
+        // (capacity 4 holds 2,3,4,5 once 6 is latest).
+        for request in 1..=6u64 {
+            table.commit_reply(1, epoch, make_reply_for(1, request, 10 + request));
+        }
+        match table.check_request(1, epoch, 1, 0) {
+            RequestStatus::AlreadyApplied { request, watermark } => {
+                assert_eq!(request, 1);
+                assert_eq!(watermark, 6);
+            }
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+        // The oldest retained entry still answers.
+        match table.check_request(1, epoch, 2, 0) {
+            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 2),
             other => panic!("expected Duplicate, got {other:?}"),
         }
     }
@@ -670,10 +872,10 @@ mod tests {
     // Simulator test covers end-to-end; this is the unit invariant.
     #[test]
     fn duplicate_survives_view_change_reset() {
-        let (mut table, session) = table_with_client();
-        table.commit_reply(1, session, make_reply_for(1, 1, 11));
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
 
-        match table.check_request(1, session, 1) {
+        match table.check_request(1, epoch, 1, 0) {
             RequestStatus::Duplicate(cached) => {
                 assert_eq!(cached.header().client, 1, "original client_id");
                 assert_eq!(cached.header().request, 1, "ORIGINAL request, not re-issue");
@@ -687,48 +889,76 @@ mod tests {
         }
     }
 
+    // Checksum tests
+
+    // Same request id, different request bytes: returning the cached reply
+    // would answer the wrong request. Refused loudly.
     #[test]
-    fn check_request_stale() {
-        let (mut table, session) = table_with_client();
-        table.commit_reply(1, 10, make_reply_for(1, 5, 15));
+    fn check_request_checksum_mismatch_at_watermark() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_with_checksum(1, 1, 11, 0xAA));
+        match table.check_request(1, epoch, 1, 0xBB) {
+            RequestStatus::ChecksumMismatch { request } => assert_eq!(request, 1),
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        // Matching stamp replays.
         assert!(matches!(
-            table.check_request(1, session, 3),
-            RequestStatus::Stale
+            table.check_request(1, epoch, 1, 0xAA),
+            RequestStatus::Duplicate(_)
         ));
     }
 
+    // Integrity fields are zeroed on the wire today; a zero on either side
+    // must not trip the mismatch (rollout compatibility).
     #[test]
-    fn check_request_gap_rejected() {
-        let (mut table, session) = table_with_client();
-        table.commit_reply(1, 10, make_reply_for(1, 1, 11));
-        // Skip from 1 to 3, reject.
-        match table.check_request(1, session, 3) {
-            RequestStatus::RequestGap { expected, received } => {
-                assert_eq!(expected, 2);
-                assert_eq!(received, 3);
-            }
-            other => panic!("expected RequestGap, got {other:?}"),
-        }
+    fn check_request_zero_checksum_disables_comparison() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_with_checksum(1, 1, 11, 0xAA));
+        assert!(matches!(
+            table.check_request(1, epoch, 1, 0),
+            RequestStatus::Duplicate(_)
+        ));
+
+        table.commit_reply(1, epoch, make_reply_for(1, 2, 12)); // stored zero
+        assert!(matches!(
+            table.check_request(1, epoch, 2, 0xBB),
+            RequestStatus::Duplicate(_)
+        ));
     }
 
     // Commit tests
 
     #[test]
     fn commit_caches_reply() {
-        let (mut table, _) = table_with_client();
-        table.commit_reply(1, 10, make_reply_for(1, 1, 11));
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
         let cached = table.get_reply(1).expect("should have cached reply");
         assert_eq!(cached.header().request, 1);
     }
 
     #[test]
-    fn commit_updates_preserves_session() {
-        let (mut table, session) = table_with_client();
-        table.commit_reply(1, 10, make_reply_for(1, 1, 11));
-        table.commit_reply(1, 10, make_reply_for(1, 2, 12));
+    fn commit_updates_preserves_epoch() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        table.commit_reply(1, epoch, make_reply_for(1, 2, 12));
         assert_eq!(table.get_reply(1).unwrap().header().request, 2);
-        assert_eq!(table.get_session(1), Some(session));
+        assert_eq!(table.get_epoch(1), Some(epoch));
         assert_eq!(table.count(), 1);
+    }
+
+    // Same request re-committed (WAL replay shape): replace in place, no
+    // ring push - two cached replies for one request number would make
+    // duplicate lookups ambiguous.
+    #[test]
+    fn commit_reply_same_request_replaces_in_place() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        table.commit_reply(1, epoch, make_reply_for(1, 1, 11));
+        assert_eq!(table.get_watermark(1), Some(1));
+        match table.check_request(1, epoch, 1, 0) {
+            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 1),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
     }
 
     // Eviction tests
@@ -872,62 +1102,53 @@ mod tests {
 
     // Edge cases
 
-    #[test]
-    fn commit_register_idempotent_on_replay() {
-        let mut table = ClientTable::new(10);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
-        // Same client_id + session = idempotent (WAL replay).
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
-        assert_eq!(table.get_session(1), Some(10));
-        assert_eq!(table.count(), 1);
-    }
-
-    // Re-register with mismatched session must not panic shard pump.
-    // Stale WAL replay or duplicate Register at different ops; either way
-    // log + skip, existing slot stays authoritative.
-    #[test]
-    fn commit_register_different_session_logs_and_skips() {
-        let mut table = ClientTable::new(10);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
-        // existing=10, replay=20.
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20), no_in_flight());
-        assert_eq!(table.get_session(1), Some(10), "first session stays");
-        // Smaller replay session: same skip.
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 5), no_in_flight());
-        assert_eq!(table.get_session(1), Some(10));
-    }
-
     // commit_reply for unregistered/evicted client must not panic;
     // wire reply still ships, cache silently skipped.
     #[test]
     fn commit_reply_for_unregistered_client_is_noop() {
         let mut table = ClientTable::new(10);
         // No register: index has no entry.
-        table.commit_reply(1, 10, make_reply_for(1, 1, 10));
+        table.commit_reply(1, 1, make_reply_for(1, 1, 10));
         assert!(table.get_reply(1).is_none(), "no entry must be created");
         assert_eq!(table.count(), 0);
     }
 
     #[test]
-    #[should_panic(expected = "session mismatch")]
-    fn commit_reply_wrong_session_panics() {
-        let (mut table, _session) = table_with_client();
-        // Registered session=10, commit session=99.
+    #[should_panic(expected = "epoch mismatch")]
+    fn commit_reply_wrong_epoch_panics() {
+        let (mut table, _epoch) = table_with_client();
+        // Entry epoch=1, commit claims epoch=99.
         table.commit_reply(1, 99, make_reply_for(1, 1, 11));
     }
 
     #[test]
-    fn different_clients_independent_sessions() {
+    #[should_panic(expected = "watermark regression")]
+    fn commit_reply_watermark_regression_panics() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, epoch, make_reply_for(1, 5, 15));
+        table.commit_reply(1, epoch, make_reply_for(1, 3, 16));
+    }
+
+    #[test]
+    fn different_clients_independent_epochs() {
         let mut table = ClientTable::new(10);
         table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
         table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), no_in_flight());
-        assert_eq!(table.get_session(1), Some(10));
-        assert_eq!(table.get_session(2), Some(20));
-        assert!(matches!(table.check_request(1, 10, 1), RequestStatus::New));
-        assert!(matches!(table.check_request(2, 20, 1), RequestStatus::New));
+        // Rebind client 2 only.
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 30), no_in_flight());
+        assert_eq!(table.get_epoch(1), Some(1));
+        assert_eq!(table.get_epoch(2), Some(2));
         assert!(matches!(
-            table.check_request(1, 20, 1),
-            RequestStatus::SessionMismatch { .. }
+            table.check_request(1, 1, 1, 0),
+            RequestStatus::New
+        ));
+        assert!(matches!(
+            table.check_request(2, 2, 1, 0),
+            RequestStatus::New
+        ));
+        assert!(matches!(
+            table.check_request(2, 1, 1, 0),
+            RequestStatus::Fenced { .. }
         ));
     }
 }

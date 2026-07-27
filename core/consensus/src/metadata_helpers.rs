@@ -56,17 +56,23 @@ pub enum PreflightOutcome {
     Drop,
 }
 
-/// Request preflight (metadata only): session validation, dedup, in-flight check.
+/// Request preflight (metadata only): epoch fence, watermark dedup,
+/// in-flight check.
 ///
 /// Pure decision -- emits no frames (see [`PreflightOutcome`]). Callers turn
 /// the outcome into a reply: the home-shard path resends by transport id, the
 /// message-plane paths fall back to [`apply_preflight_consensus_plane`].
+///
+/// `session` is the wire `session` field, which carries the entry's fence
+/// epoch; `request_checksum` is the request's integrity stamp (zero =
+/// unstamped, disables the reuse check).
 pub fn request_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_table: &RefCell<ClientTable>,
     client_id: u128,
     session: u64,
     request: u64,
+    request_checksum: u128,
 ) -> PreflightOutcome
 where
     B: MessageBus,
@@ -107,7 +113,7 @@ where
 
     let status = client_table
         .borrow()
-        .check_request(client_id, session, request);
+        .check_request(client_id, session, request, request_checksum);
     match status {
         // Frozen-backed cache -> refcount handoff to the home shard, no copy.
         RequestStatus::Duplicate(cached_reply) => {
@@ -116,29 +122,45 @@ where
         // Session evicted under capacity pressure. SAFETY: catch-up gate makes
         // this replica authoritative for session truth.
         RequestStatus::NoSession => PreflightOutcome::Evict(EvictionReason::NoSession),
-        RequestStatus::SessionMismatch { expected, received } => {
-            // expected > received: stale session (rotated post-eviction) -> terminal eviction.
-            // expected < received: client bug; silent drop, log.
-            // SAFETY: catch-up gate makes this replica authoritative.
-            if expected > received {
-                PreflightOutcome::Evict(EvictionReason::SessionTooLow)
-            } else {
-                // Catch-up gate rules out network race; newer-than-issued
-                // session = client bug. Error log, no eviction (transient bug
-                // must not kill session), no rate limit (per-event).
-                tracing::error!(
-                    client_id,
-                    expected,
-                    received,
-                    "request_preflight: ignoring newer session (client bug)"
-                );
-                PreflightOutcome::Drop
-            }
+        // Zombie holdover from before a re-register: terminal for that
+        // holder. SAFETY: catch-up gate makes this replica authoritative.
+        RequestStatus::Fenced { current, received } => {
+            tracing::debug!(
+                client_id,
+                current,
+                received,
+                "request_preflight: fencing stale-epoch request"
+            );
+            PreflightOutcome::Evict(EvictionReason::SessionTooLow)
         }
-        // Client bug; recovered by client retry. Silent drop.
-        RequestStatus::Stale
-        | RequestStatus::RequestGap { .. }
-        | RequestStatus::AlreadyRegistered { .. } => PreflightOutcome::Drop,
+        // Catch-up gate rules out network race; an epoch newer than any this
+        // table minted = client bug. Error log, no eviction (transient bug
+        // must not kill the session), no rate limit (per-event).
+        RequestStatus::EpochAhead { current, received } => {
+            tracing::error!(
+                client_id,
+                current,
+                received,
+                "request_preflight: ignoring future epoch (client bug)"
+            );
+            PreflightOutcome::Drop
+        }
+        // Same request id, different request bytes: replaying the cached
+        // reply would answer the wrong request, and re-executing would
+        // double-apply. Loud drop; the client must fix its numbering.
+        RequestStatus::ChecksumMismatch { request } => {
+            tracing::error!(
+                client_id,
+                request,
+                "request_preflight: request id reused for a different operation (client bug)"
+            );
+            PreflightOutcome::Drop
+        }
+        // Applied once, original reply aged out of the ring: refuse
+        // re-execution, nothing to replay. Silent drop.
+        RequestStatus::AlreadyApplied { .. } | RequestStatus::AlreadyRegistered { .. } => {
+            PreflightOutcome::Drop
+        }
         RequestStatus::New => PreflightOutcome::Dispatch,
     }
 }
@@ -213,8 +235,9 @@ where
 
     // Catch-up gate: new primary may have inherited Register(client, op=N)
     // committed in WAL but not yet applied. Without gate, check_register
-    // returns New -> fresh register -> two register entries -> commit_register's
-    // session-equality assert panics on replay. SDK retry recovers post-catch-up.
+    // returns New -> a second register commits -> the epoch bumps past the
+    // one the first register's reply handed the client, fencing a live
+    // client for no reason. SDK retry recovers post-catch-up.
     if !is_caught_up_primary(consensus) {
         tracing::debug!(
             client_id,
@@ -231,7 +254,7 @@ where
     let status = client_table.borrow().check_register(client_id);
     match status {
         RequestStatus::AlreadyRegistered {
-            session,
+            epoch,
             cached_reply,
         } => {
             // cached.request == REGISTER_REQUEST_ID: replay cached bytes
@@ -247,13 +270,13 @@ where
                     .await;
                 tracing::debug!(
                     client_id,
-                    session,
+                    epoch,
                     "register_preflight: replayed cached register reply"
                 );
             } else {
                 tracing::debug!(
                     client_id,
-                    session,
+                    epoch,
                     cached_request = cached_reply.header().request,
                     "register_preflight: retry past register, drop"
                 );
@@ -368,8 +391,9 @@ fn build_eviction_from_header(header: EvictionHeader) -> Message<EvictionHeader>
 ///   `NoSession`/`SessionTooLow` against stale table erases live clients.
 /// - **Dispatch**: primary with `commit_min < commit_max` may hold an
 ///   inherited `Register(client, op=N)` in WAL but not yet applied.
-///   Fresh `Register(client, op=M>N)` panics `commit_register`'s
-///   session-equality assert on replay.
+///   Admitting a fresh Register commits a second register, bumping the
+///   epoch past the one the inherited register's reply handed the client
+///   and fencing a live client for no reason.
 ///
 /// `false` -> caller silent-drops; client retry lands on peer or here
 /// post-catch-up.
@@ -479,10 +503,10 @@ mod tests {
         let client_table = fresh_client_table();
 
         let client_id: u128 = 0xBEEF;
-        let session: u64 = 17;
+        let register_commit: u64 = 17;
 
         // Cached reply IS the register reply (request == REGISTER_REQUEST_ID).
-        let initial_reply = synthesize_register_reply(&consensus, client_id, session);
+        let initial_reply = synthesize_register_reply(&consensus, client_id, register_commit);
         let original_checksum = initial_reply.header().checksum;
         client_table
             .borrow_mut()
@@ -505,7 +529,7 @@ mod tests {
             "must be original cached bytes, not fresh synthesis"
         );
         assert_eq!(header.request, REGISTER_REQUEST_ID);
-        assert_eq!(header.commit, session);
+        assert_eq!(header.commit, register_commit);
     }
 
     // Past-register retry: silent drop, no replay, no eviction. Read-timeout
@@ -517,18 +541,18 @@ mod tests {
         let client_table = fresh_client_table();
 
         let client_id: u128 = 0xBEEF;
-        let session: u64 = 17;
+        let epoch: u64 = 1;
 
-        let initial_reply = synthesize_register_reply(&consensus, client_id, session);
+        let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
 
         // SendMessages commits -> cached is no longer the register reply.
-        let app_reply = synthesize_send_messages_reply(&consensus, client_id, session, 1, 18);
+        let app_reply = synthesize_send_messages_reply(&consensus, client_id, 1, 18);
         client_table
             .borrow_mut()
-            .commit_reply(client_id, session, app_reply);
+            .commit_reply(client_id, epoch, app_reply);
 
         let result =
             futures::executor::block_on(register_preflight(&consensus, &client_table, client_id));
@@ -556,8 +580,9 @@ mod tests {
                 &consensus,
                 &client_table,
                 client_id,
-                10, // session
+                10, // epoch (wire session field)
                 1,  // request
+                0,  // request_checksum (unstamped)
             ),
             client_id,
         ));
@@ -576,29 +601,33 @@ mod tests {
         assert_eq!(header.client, client_id);
     }
 
-    // Stale session (post capacity-evict + re-register): terminal SessionTooLow.
+    // Zombie fencing: a request stamped with a pre-rebind epoch gets a
+    // terminal SessionTooLow eviction.
     #[test]
-    fn request_preflight_session_too_low_evicts_client() {
+    fn request_preflight_stale_epoch_evicts_client() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         consensus.init();
         let client_table = fresh_client_table();
 
         let client_id: u128 = 0xBEEF;
-        let real_session: u64 = 99;
 
-        // Slot at session 99.
-        let initial_reply = synthesize_register_reply(&consensus, client_id, real_session);
+        // Register, then rebind: entry epoch is now 2.
+        let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
+        let rebind_reply = synthesize_register_reply(&consensus, client_id, 25);
+        client_table
+            .borrow_mut()
+            .commit_register(client_id, ACTING_USER_ID, rebind_reply, |_| false);
 
-        // Older retry (17 < 99): stale-session case.
+        // Zombie still stamping epoch 1: fenced.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            request_preflight(&consensus, &client_table, client_id, 17, 1),
+            request_preflight(&consensus, &client_table, client_id, 1, 1, 0),
             client_id,
         ));
-        assert!(!result, "SessionMismatch short-circuits");
+        assert!(!result, "Fenced short-circuits");
 
         let sends = consensus.message_bus().client_sends.borrow();
         assert_eq!(sends.len(), 1, "one Eviction");
@@ -611,36 +640,33 @@ mod tests {
         assert_eq!(header.client, client_id);
     }
 
-    // Newer-than-cluster session: sessions monotonic; healthy SDK can't reach
-    // this. Client bug -> silent drop, no eviction.
+    // Newer-than-minted epoch: epochs are only handed out by register
+    // replies; healthy SDK can't reach this. Client bug -> silent drop, no
+    // eviction.
     #[test]
-    fn request_preflight_session_too_high_is_silent_drop() {
+    fn request_preflight_future_epoch_is_silent_drop() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         consensus.init();
         let client_table = fresh_client_table();
 
         let client_id: u128 = 0xBEEF;
-        let real_session: u64 = 17;
 
-        // Slot at session 17.
-        let initial_reply = synthesize_register_reply(&consensus, client_id, real_session);
+        // Entry at epoch 1.
+        let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
 
-        // Client claims newer session (99 > 17), client bug.
+        // Client claims epoch 99 (> 1), client bug.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            request_preflight(&consensus, &client_table, client_id, 99, 1),
+            request_preflight(&consensus, &client_table, client_id, 99, 1, 0),
             client_id,
         ));
-        assert!(!result, "SessionMismatch short-circuits");
+        assert!(!result, "EpochAhead short-circuits");
 
         let sends = consensus.message_bus().client_sends.borrow();
-        assert!(
-            sends.is_empty(),
-            "newer-session mismatch must be silent drop"
-        );
+        assert!(sends.is_empty(), "future epoch must be silent drop");
     }
 
     // Backups never send NoSession: their ClientTable lags. Without gate,
@@ -661,8 +687,9 @@ mod tests {
                 &consensus,
                 &client_table,
                 client_id,
-                10, // session
+                10, // epoch (wire session field)
                 1,  // request
+                0,  // request_checksum (unstamped)
             ),
             client_id,
         ));
@@ -675,41 +702,75 @@ mod tests {
         );
     }
 
-    // Stale + RequestGap: silent drop, no eviction.
+    // Below-watermark retry whose reply is still cached: replayed, not
+    // re-executed and not dropped.
     #[test]
-    fn request_preflight_stale_is_silent_drop() {
+    fn request_preflight_below_watermark_replays_ring_hit() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         consensus.init();
         let client_table = fresh_client_table();
 
         let client_id: u128 = 0xABCD;
-        let session: u64 = 5;
+        let epoch: u64 = 1;
 
-        let initial_reply = synthesize_register_reply(&consensus, client_id, session);
+        let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
-        // Cache at request 5 -> request 3 is stale.
-        let advanced = synthesize_send_messages_reply(&consensus, client_id, session, 5, 100);
-        client_table
-            .borrow_mut()
-            .commit_reply(client_id, session, advanced);
+        for (request, commit) in [(3u64, 98u64), (5, 100)] {
+            let reply = synthesize_send_messages_reply(&consensus, client_id, request, commit);
+            client_table
+                .borrow_mut()
+                .commit_reply(client_id, epoch, reply);
+        }
 
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            request_preflight(&consensus, &client_table, client_id, session, 3), // stale
+            request_preflight(&consensus, &client_table, client_id, epoch, 3, 0),
             client_id,
         ));
-        assert!(!result);
+        assert!(!result, "duplicate short-circuits");
 
         let sends = consensus.message_bus().client_sends.borrow();
-        assert!(sends.is_empty(), "stale = silent drop");
+        assert_eq!(sends.len(), 1, "ring hit replays the original reply");
+        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+            &sends[0].1.as_slice()[..HEADER_SIZE],
+        )
+        .expect("valid ReplyHeader");
+        assert_eq!(header.request, 3, "original reply for the retried request");
     }
 
-    // Catch-up gate prevents WAL-replay race in commit_register: primary
-    // with commit_min < commit_max may hold inherited Register(client) in
-    // WAL not yet applied. Fresh Register would panic session-equality
-    // assert on replay.
+    // Watermark jump: request numbers above the watermark dispatch even
+    // when non-contiguous (there is no RequestGap).
+    #[test]
+    fn request_preflight_jump_above_watermark_dispatches() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let client_table = fresh_client_table();
+
+        let client_id: u128 = 0xABCD;
+        let epoch: u64 = 1;
+
+        let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
+        client_table
+            .borrow_mut()
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
+        let advanced = synthesize_send_messages_reply(&consensus, client_id, 2, 99);
+        client_table
+            .borrow_mut()
+            .commit_reply(client_id, epoch, advanced);
+
+        let outcome = request_preflight(&consensus, &client_table, client_id, epoch, 9, 0);
+        assert!(
+            matches!(outcome, PreflightOutcome::Dispatch),
+            "watermark jump must dispatch"
+        );
+    }
+
+    // Catch-up gate prevents the WAL-replay race in commit_register: primary
+    // with commit_min < commit_max may hold an inherited Register(client) in
+    // WAL not yet applied. A fresh Register would commit a second register
+    // and bump the epoch past the inherited reply's, fencing a live client.
     #[test]
     fn register_preflight_silently_drops_when_behind_on_commits() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
@@ -775,11 +836,13 @@ mod tests {
 
     // Fixture: register reply mirroring `commit_register` storage. Test-only
     // production replays cached via `AlreadyRegistered { cached_reply }`.
+    // `register_commit` stamps the reply's op/commit (recency for eviction
+    // ordering); the entry's epoch is minted by the table, not read from it.
     #[allow(clippy::cast_possible_truncation)]
     fn synthesize_register_reply<B, P>(
         consensus: &VsrConsensus<B, P>,
         client_id: u128,
-        session: u64,
+        register_commit: u64,
     ) -> Message<ReplyHeader>
     where
         B: MessageBus,
@@ -798,8 +861,8 @@ mod tests {
             command: Command2::Reply,
             replica: consensus.replica(),
             client: client_id,
-            op: session,
-            commit: session,
+            op: register_commit,
+            commit: register_commit,
             request: REGISTER_REQUEST_ID,
             operation: Operation::Register,
             ..ReplyHeader::default()
@@ -807,12 +870,11 @@ mod tests {
         msg
     }
 
-    // SendMessages reply fixture: advances cached request number.
+    // SendMessages reply fixture: advances the cached watermark.
     #[allow(clippy::cast_possible_truncation)]
     fn synthesize_send_messages_reply<B, P>(
         consensus: &VsrConsensus<B, P>,
         client_id: u128,
-        session: u64,
         request: u64,
         commit: u64,
     ) -> Message<ReplyHeader>
@@ -826,7 +888,6 @@ mod tests {
             &mut msg.as_mut_slice()[..header_size],
         )
         .expect("zeroed bytes are valid");
-        let _ = session;
         *header = ReplyHeader {
             cluster: consensus.cluster(),
             size: header_size as u32,

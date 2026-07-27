@@ -396,7 +396,8 @@ pub enum MetadataSubmitError {
     NotPrimary,
     /// Primary but `commit_min < commit_max` (committed prefix not yet
     /// drained). Dispatching now would race ops inherited from a prior view;
-    /// for `Register` that trips `commit_register`'s session-eq assert.
+    /// for `Register` that double-commits a register and bumps the epoch
+    /// past the first reply's, fencing a live client.
     NotCaughtUp,
     /// Prepare queue full.
     PipelineFull,
@@ -615,6 +616,7 @@ where
         let client_id = message.header().client;
         let session = message.header().session;
         let request = message.header().request;
+        let request_checksum = message.header().request_checksum;
         let operation = message.header().operation;
 
         // Preflight first: dedup, eviction sends, cached-reply replay all
@@ -624,8 +626,14 @@ where
         let dispatch = if operation == Operation::Register {
             register_preflight(consensus, &self.client_table, client_id).await
         } else {
-            let outcome =
-                request_preflight(consensus, &self.client_table, client_id, session, request);
+            let outcome = request_preflight(
+                consensus,
+                &self.client_table,
+                client_id,
+                session,
+                request,
+                request_checksum,
+            );
             apply_preflight_consensus_plane(consensus, outcome, client_id).await
         };
         if !dispatch {
@@ -995,9 +1003,12 @@ where
             .as_ref()
             .expect("submit_register_in_process: consensus only exists on shard 0");
 
-        // Idempotent fast path: existing session skips pipeline + wire-reply.
-        if let Some(session) = self.client_table.borrow().get_session(client_id) {
-            return Ok(session);
+        // Idempotent fast path: existing entry skips pipeline + wire-reply.
+        // Returns the current epoch without bumping it; rebind-bumps-epoch
+        // (zombie fencing per reconnect) arrives with the stable-session-id
+        // auth flow, which commits a Register per bind.
+        if let Some(epoch) = self.client_table.borrow().get_epoch(client_id) {
+            return Ok(epoch);
         }
 
         // Wrong node: waiting or queueing cannot fix that, the client must
@@ -1006,10 +1017,10 @@ where
             return Err(MetadataSubmitError::NotPrimary);
         }
 
-        // Mirror wire-path register_preflight: a racing second prepare fails
-        // check_register on commit. Surface pre-synthesis. Scans both the
-        // prepare queue and the request queue, so a register absorbed below
-        // dedups its own replays.
+        // Mirror wire-path register_preflight: a racing second prepare would
+        // commit a second register and bump the epoch past the first reply's.
+        // Surface pre-synthesis. Scans both the prepare queue and the request
+        // queue, so a register absorbed below dedups its own replays.
         if consensus
             .pipeline()
             .borrow()
@@ -1030,7 +1041,7 @@ where
         );
 
         // Catch-up gate (Register only: admitting one while a committed op
-        // is still unapplied races `commit_register`'s session-eq assert) or
+        // is still unapplied risks a double-register epoch bump) or
         // prepare queue full: absorb into the request queue instead of
         // bouncing with a transient error. The queued
         // entry carries this caller's reply subscriber; the commit path
@@ -1049,14 +1060,20 @@ where
                 return Err(MetadataSubmitError::PipelineFull);
             }
             return match receiver.await {
-                Ok(reply) => Ok(reply.header().commit),
+                // The commit's `commit_register` minted the epoch; read it
+                // from the table (the reply header does not carry it).
+                Ok(_reply) => self
+                    .client_table
+                    .borrow()
+                    .get_epoch(client_id)
+                    .ok_or(MetadataSubmitError::Canceled),
                 // Entry dropped before commit: view-change reset or a
                 // promotion-time preflight rejection. Same re-check as the
                 // direct path's cancel arm below.
                 Err(Canceled) => self
                     .client_table
                     .borrow()
-                    .get_session(client_id)
+                    .get_epoch(client_id)
                     .ok_or(MetadataSubmitError::Canceled),
             };
         }
@@ -1068,18 +1085,24 @@ where
             .expect("Operation::Register is client-allowed; prepare projection cannot fail");
 
         match self.dispatch_prepare_and_await(consensus, prepare).await {
-            Ok(reply) => Ok(reply.header().commit),
+            // The commit's `commit_register` minted the epoch; read it from
+            // the table (the reply header does not carry it).
+            Ok(_reply) => self
+                .client_table
+                .borrow()
+                .get_epoch(client_id)
+                .ok_or(MetadataSubmitError::Canceled),
             Err(Canceled) => {
                 // View-change cancel. Re-check is correct-by-VSR: any
                 // inherited Register applied via local commit_journal between
-                // cancel and read produces a cluster-authoritative session
-                // (`session = commit-op`, deterministic). Own surviving
-                // Register would have routed through `AlreadyRegistered`
-                // against the same entry, so no "this primary vs inherited
-                // primary" split.
+                // cancel and read mints the same epoch on every replica
+                // (`commit_register` counts in apply order, deterministic).
+                // Own surviving Register would have routed through
+                // `AlreadyRegistered` against the same entry, so no "this
+                // primary vs inherited primary" split.
                 self.client_table
                     .borrow()
-                    .get_session(client_id)
+                    .get_epoch(client_id)
                     .ok_or(MetadataSubmitError::Canceled)
             }
         }
@@ -1113,12 +1136,12 @@ where
             .as_ref()
             .expect("submit_logout_in_process: consensus only exists on shard 0");
 
-        // Session guard: only propose a Logout when the slot still holds the
-        // exact session this logout targets. A late disconnect-logout for a
-        // reused client id (slot since rebound to a newer session) carries the
-        // stale session and is dropped here, so it can never wipe the fresh
+        // Epoch guard: only propose a Logout when the slot still holds the
+        // exact epoch this logout targets. A late disconnect-logout for a
+        // reused client id (slot since rebound to a newer epoch) carries the
+        // stale epoch and is dropped here, so it can never wipe the fresh
         // registration. A missing slot also fails the match and short-circuits.
-        if self.client_table.borrow().get_session(client_id) != Some(session) {
+        if self.client_table.borrow().get_epoch(client_id) != Some(session) {
             return Ok(consensus.commit_min());
         }
 
@@ -1165,7 +1188,7 @@ where
             return match receiver.await {
                 Ok(reply) => Ok(reply.header().commit),
                 Err(Canceled) => {
-                    if self.client_table.borrow().get_session(client_id).is_none() {
+                    if self.client_table.borrow().get_epoch(client_id).is_none() {
                         Ok(consensus.commit_min())
                     } else {
                         Err(MetadataSubmitError::Canceled)
@@ -1180,7 +1203,7 @@ where
         match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.header().commit),
             Err(Canceled) => {
-                if self.client_table.borrow().get_session(client_id).is_none() {
+                if self.client_table.borrow().get_epoch(client_id).is_none() {
                     Ok(consensus.commit_min())
                 } else {
                     Err(MetadataSubmitError::Canceled)
@@ -1295,7 +1318,7 @@ where
     ///
     /// No client session exists, so this skips `request_preflight` (like
     /// the logout precedent) and uses the reserved internal `client` id
-    /// `0`: never registered, so the commit path's `get_session(0)` is
+    /// `0`: never registered, so the commit path's `get_epoch(0)` is
     /// `None` and skips `commit_reply` (and its `assert!(client_id != 0)`),
     /// while the preflight and register asserts never run. Delete is
     /// idempotent, so the dropped dedup is harmless and a re-proposal on the
@@ -1400,6 +1423,7 @@ where
         let client_id = request_header.client;
         let session = request_header.session;
         let request = request_header.request;
+        let request_checksum = request_header.request_checksum;
 
         let consensus = self
             .consensus
@@ -1429,13 +1453,21 @@ where
             .into_generic());
         }
 
-        // Dedup / session / eviction. shard 0 cannot route by the VSR
+        // Dedup / epoch fence / eviction. shard 0 cannot route by the VSR
         // consensus `client_id` (its top bits are random, not home-shard
         // routing), so a Replay/Evict/NotReady is returned to the home shard as
         // the reply -- `handle_client_request` writes it to the originating
         // socket by transport id, exactly like a fresh commit. Drop (client-bug
-        // stale/gap) surfaces as Canceled so the home shard stays silent.
-        match request_preflight(consensus, &self.client_table, client_id, session, request) {
+        // already-applied / future-epoch) surfaces as Canceled so the home
+        // shard stays silent.
+        match request_preflight(
+            consensus,
+            &self.client_table,
+            client_id,
+            session,
+            request,
+            request_checksum,
+        ) {
             PreflightOutcome::Dispatch => {}
             PreflightOutcome::Replay(reply) => {
                 return server_common::Message::<GenericHeader>::try_from(
@@ -1545,7 +1577,7 @@ where
         consensus.verify_pipeline();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         // Register is the one op whose admission requires the catch-up gate
-        // (session-eq assert at commit); its submit path checks the gate and
+        // (double-register epoch bump); its submit path checks the gate and
         // the check-to-dispatch section is synchronous. Non-register ops
         // dispatch mid-window by design (they pipeline behind the in-flight
         // batch, like the wire path always has).
@@ -1815,14 +1847,11 @@ where
                 // Cache only if session exists. Client evicted between
                 // prepare and commit: skip cache (`commit_reply` no-ops),
                 // wire reply still ships.
-                let session = self
-                    .client_table
-                    .borrow()
-                    .get_session(prepare_header.client);
-                if let Some(session) = session {
+                let epoch = self.client_table.borrow().get_epoch(prepare_header.client);
+                if let Some(epoch) = epoch {
                     self.client_table.borrow_mut().commit_reply(
                         prepare_header.client,
-                        session,
+                        epoch,
                         reply.clone(),
                     );
                 } else {
@@ -1931,8 +1960,9 @@ where
     ///
     /// # Safety
     /// Re-preflight per iteration: `commit_journal` may have advanced the
-    /// client's request between push and drain (Stale / Duplicate /
-    /// `AlreadyRegistered`). Skipping produces a duplicate prepare and panics.
+    /// client's watermark between push and drain (Duplicate / AlreadyApplied
+    /// / `AlreadyRegistered`). Skipping produces a duplicate prepare and
+    /// panics.
     #[allow(clippy::future_not_send)]
     async fn drain_request_queue_into_prepares(&self) {
         let consensus = self.consensus.as_ref().unwrap();
@@ -1952,6 +1982,7 @@ where
             let client_id = req.message.header().client;
             let session = req.message.header().session;
             let request = req.message.header().request;
+            let request_checksum = req.message.header().request_checksum;
             let operation = req.message.header().operation;
             // If preflight or projection rejects below, dropping `req` (and
             // the sender taken from it) wakes an in-process awaiter with
@@ -1960,8 +1991,14 @@ where
             let dispatch = if operation == Operation::Register {
                 register_preflight(consensus, &self.client_table, client_id).await
             } else {
-                let outcome =
-                    request_preflight(consensus, &self.client_table, client_id, session, request);
+                let outcome = request_preflight(
+                    consensus,
+                    &self.client_table,
+                    client_id,
+                    session,
+                    request,
+                    request_checksum,
+                );
                 apply_preflight_consensus_plane(consensus, outcome, client_id).await
             };
             if !dispatch {
@@ -2260,8 +2297,8 @@ where
     /// between. [`crate::metadata_helpers::is_caught_up_primary`] reads
     /// `commit_min == commit_max` as proof the table is caught up; an await
     /// here lets another task observe transient equality with stale table,
-    /// dispatch a fresh Register on an already-registered client, and panic
-    /// `commit_register`'s session-eq assert.
+    /// dispatch a fresh Register on an already-registered client, and bump
+    /// the epoch past the reply the live client holds.
     ///
     /// Inner block sync today. Future async state-machine must either:
     /// 1. Apply SM + bump `commit_min` in one `RefCell` borrow, or
@@ -2331,11 +2368,11 @@ where
                 });
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
-                let session = self.client_table.borrow().get_session(header.client);
-                if let Some(session) = session {
+                let epoch = self.client_table.borrow().get_epoch(header.client);
+                if let Some(epoch) = epoch {
                     self.client_table
                         .borrow_mut()
-                        .commit_reply(header.client, session, reply);
+                        .commit_reply(header.client, epoch, reply);
                 } else {
                     tracing::trace!(
                         client = header.client,
@@ -3507,20 +3544,20 @@ mod tests {
             "resumed driver commits nothing new"
         );
         assert_eq!(
-            md.client_table.borrow().get_session(CLIENT_A),
+            md.client_table.borrow().get_epoch(CLIENT_A),
             None,
             "session removed by the committed logout"
         );
     }
 
     /// Register is the one op that still honors the catch-up gate (its
-    /// admission races `commit_register`'s session-eq assert against
-    /// committed-but-unapplied ops). New contract: a register arriving in
-    /// the mid-commit window is ABSORBED into the pipeline's request queue
-    /// with its reply subscriber attached, promoted by
-    /// the commit path once the batch drains, and the caller's await
-    /// resolves with the committed session — instead of the historical
-    /// `NotCaughtUp` bounce that one-shot CLI clients surfaced as
+    /// admission races a committed-but-unapplied register; a double commit
+    /// bumps the epoch past the first reply's and fences a live client).
+    /// New contract: a register arriving in the mid-commit window is
+    /// ABSORBED into the pipeline's request queue with its reply subscriber
+    /// attached, promoted by the commit path once the batch drains, and the
+    /// caller's await resolves with the committed epoch — instead of the
+    /// historical `NotCaughtUp` bounce that one-shot CLI clients surfaced as
     /// "Disconnected" login failures.
     #[compio::test]
     async fn register_in_mid_commit_window_is_queued_then_committed() {
@@ -3634,13 +3671,13 @@ mod tests {
         }
         assert_eq!(
             outcome.expect("absorbed register must resolve"),
-            Ok(2),
-            "queued register commits with the next batch; session = commit op"
+            Ok(1),
+            "queued register commits with the next batch; first bind mints epoch 1"
         );
         assert_eq!(
-            md.client_table.borrow().get_session(CLIENT_C),
-            Some(2),
-            "session created by the promoted register"
+            md.client_table.borrow().get_epoch(CLIENT_C),
+            Some(1),
+            "entry created by the promoted register"
         );
     }
 
@@ -3765,8 +3802,8 @@ mod tests {
             }
             compio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert_eq!(outcome.expect("promoted register must resolve"), Ok(2));
-        assert_eq!(md.client_table.borrow().get_session(CLIENT_C), Some(2));
+        assert_eq!(outcome.expect("promoted register must resolve"), Ok(1));
+        assert_eq!(md.client_table.borrow().get_epoch(CLIENT_C), Some(1));
         assert!(is_caught_up_primary(consensus));
     }
 }
