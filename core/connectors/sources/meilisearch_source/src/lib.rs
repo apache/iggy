@@ -295,7 +295,7 @@ impl MeilisearchSource {
             }
 
             return Err(Error::InvalidConfigValue(format!(
-                "Meilisearch index '{}' must configure primary key '{}' in filterableAttributes for cursor pagination",
+                "Meilisearch index '{}' must configure primary key '{}' in filterableAttributes with comparison support for cursor pagination",
                 self.config.index, primary_key
             )));
         }
@@ -358,6 +358,10 @@ impl MeilisearchSource {
             valid_documents_and_last_primary_key(documents, primary_key, self.id)?;
         let messages = self.documents_to_messages(documents)?;
 
+        // The current source FFI has no post-send acknowledgment, so the
+        // plugin must advance its in-memory cursor when returning a batch to
+        // make steady-state polling progress. The runtime persists this same
+        // state only after it successfully sends the returned messages.
         let mut state = self.state.lock().await;
         if let Some(primary_key) = last_document_primary_key {
             state.last_primary_key = Some(primary_key);
@@ -740,10 +744,13 @@ fn primary_key_is_filterable(
         .iter()
         .any(|attribute| match attribute {
             FilterableAttribute::Attribute(attribute) => attribute == primary_key,
-            FilterableAttribute::Settings(settings) => settings
-                .attribute_patterns
-                .iter()
-                .any(|pattern| pattern == "*" || pattern == primary_key),
+            FilterableAttribute::Settings(settings) => {
+                settings.features.filter.comparison
+                    && settings
+                        .attribute_patterns
+                        .iter()
+                        .any(|pattern| pattern == "*" || pattern == primary_key)
+            }
         })
 }
 
@@ -1072,6 +1079,24 @@ mod tests {
         )];
 
         assert!(primary_key_is_filterable(&filterable_attributes, "id"));
+    }
+
+    #[test]
+    fn primary_key_is_filterable_should_reject_pattern_without_comparison() {
+        let filterable_attributes = vec![FilterableAttribute::Settings(
+            meilisearch_sdk::settings::FilterableAttributesSettings {
+                attribute_patterns: vec!["id".to_string()],
+                features: meilisearch_sdk::settings::FilterFeatures {
+                    facet_search: false,
+                    filter: meilisearch_sdk::settings::FilterFeatureModes {
+                        equality: true,
+                        comparison: false,
+                    },
+                },
+            },
+        )];
+
+        assert!(!primary_key_is_filterable(&filterable_attributes, "id"));
     }
 
     #[test]

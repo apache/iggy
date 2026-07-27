@@ -46,16 +46,16 @@ a `/search` request sorted by that primary key and stores the last emitted
 primary-key value in connector state. This avoids offset pagination skips when
 documents are inserted or deleted between polls.
 
-The primary-key field must be an integer, filterable, and sortable in
-Meilisearch, because the connector adds a cursor filter and primary-key sort to
-each search request. The connector validates the sortable setting during
-`open()`, but Meilisearch settings do not expose document value types, so the
-integer-value requirement is validated while polling. Documents with missing or
-non-integer primary-key values are skipped with a warning, and the cursor
-advances to the last valid integer primary key in the batch. String primary keys
-are not supported until the Meilisearch version used for validation supports
-greater-than filters on string attributes. Returned hits are serialized as JSON
-message payloads.
+The primary-key field must be an integer, filterable with comparison support,
+and sortable in Meilisearch, because the connector adds a cursor filter and
+primary-key sort to each search request. The connector validates the sortable
+and filterable settings during `open()`, but Meilisearch settings do not expose
+document value types, so the integer-value requirement is validated while
+polling. Documents with missing or non-integer primary-key values are skipped
+with a warning, and the cursor advances to the last valid integer primary key in
+the batch. String primary keys are not supported until the Meilisearch version
+used for validation supports greater-than filters on string attributes. Returned
+hits are serialized as JSON message payloads.
 
 Configure the primary-key field as both filterable and sortable before starting
 the connector. For example, when the primary key is `id`:
@@ -70,10 +70,12 @@ curl -X PATCH "$MEILISEARCH_URL/indexes/iggy_messages/settings" \
 ```
 
 Meilisearch state is advanced in memory when a batch is returned from `poll()`.
-If the runtime fails to send that batch to Iggy, the source trait does not
-provide an acknowledgment callback that would let this connector roll the cursor
-back before the next poll. This is a known limitation of the current connector
-source API.
+The runtime persists that returned state only after it sends the batch to Iggy,
+but the source trait does not provide an acknowledgment callback that would let
+this connector advance or roll back the in-memory cursor after send completion.
+If a runtime send fails, the next in-process poll can skip the unsent batch; a
+restart reloads the last persisted cursor. This is a known limitation of the
+current connector source API.
 
 When `include_metadata` is enabled, each payload has this shape:
 
