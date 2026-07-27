@@ -61,6 +61,9 @@
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\leader_redirection.feature">
             <Link>Features\leader_redirection.feature</Link>
         </ReqnrollFeatureFile>
+        <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\raw_command.feature">
+            <Link>Features\raw_command.feature</Link>
+        </ReqnrollFeatureFile>
     </ItemGroup>
 
     <ItemGroup>

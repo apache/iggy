@@ -2683,6 +2683,14 @@ where
         // `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
 
+        // Backstop for commit work stranded by a canceled `on_ack` driver
+        // (a future dropped at its journal-read or wire-reply await): no
+        // further ack re-drives an already-advanced `commit_max`, so on an
+        // idle primary committed-but-unapplied ops and queued requests
+        // would otherwise wait for unrelated traffic. Quiet no-op when
+        // nothing is stranded.
+        metadata.resume_stranded_commits().await;
+
         // Stall retry, mirroring `tick_partitions`: a lost repair frame must
         // not wedge the session forever.
         let stalled = {

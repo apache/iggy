@@ -135,7 +135,6 @@ pub enum RequestStatus {
 ///
 /// ## Known gaps
 ///
-/// - **Message repair**: gaps stall `commit_journal` until repair lands.
 /// - **Checkpoint serialization**: slot layout deterministic, encode/decode TODO.
 #[derive(Debug)]
 pub struct ClientTable {

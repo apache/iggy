@@ -45,15 +45,14 @@ pub fn apply_nodelay_for_connection(stream: &TcpStream) -> io::Result<()> {
     SockRef::from(stream).set_tcp_nodelay(true)
 }
 
-/// Build a TCP listener compatible with the harness's pre-bound reservation
-/// sockets.
+/// Build a TCP listener that tolerates another socket already holding the port.
 ///
-/// Only shard 0 binds the real listener; `SO_REUSEPORT` is enabled here solely
-/// so the server process can claim a port already held open by the integration
-/// harness during startup.
+/// Only shard 0 binds the real listener, so nothing here needs the load
+/// balancing `SO_REUSEPORT` exists for; it only widens what the bind accepts.
 ///
-/// TODO: remove `SO_REUSEPORT` again once the integration harness stops
-/// holding placeholder reservation sockets open across child startup.
+/// TODO: work out whether these listeners need `SO_REUSEPORT` at all. Dropping
+/// it would make a stale process holding the port a loud bind failure instead
+/// of two live listeners silently splitting the accept queue.
 pub fn bind_reusable_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -92,8 +91,9 @@ mod tests {
             not(any(target_os = "illumos", target_os = "solaris", target_os = "cygwin"))
         ))]
         socket.set_reuse_port(true).expect("reserve reuseport");
-        // Bound, not listening: mirrors the harness's PortReserver, which
-        // holds ports without joining the SO_REUSEPORT accept group.
+        // Bound, not listening: a port held without joining the accept group,
+        // which is what the reuse flags have to tolerate and what a plain bind
+        // would reject.
         socket.bind(&reserve_addr.into()).expect("reserve bind");
         let addr = socket
             .local_addr()

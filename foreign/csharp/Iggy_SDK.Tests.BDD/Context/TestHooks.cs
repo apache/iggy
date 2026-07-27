@@ -39,6 +39,8 @@ public class TestHooks
         _context.CreatedStream = null;
         _context.RedirectionOccurred = false;
         _context.LastStreamId = null;
+        _context.LastRawResponse = null;
+        _context.LastRawError = null;
     }
 
     [AfterScenario]

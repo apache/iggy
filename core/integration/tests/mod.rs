@@ -36,9 +36,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 // design: flush returns FeatureUnavailable, the session-timeout message
 // differs, and purge is eventually consistent so server state is polled.
 mod cli;
-// A single `#[ignore]`d multi-node ping matrix stub; none of its cells run in
-// either mode today.
-#[cfg(not(feature = "vsr"))]
+// Raw-wire spec tests for VSR session continuity across a node restart
+// (IGGY-137); the module is vsr-only by construction (file-level cfg).
 mod cluster;
 mod config_provider;
 mod connectors;
@@ -164,7 +163,7 @@ fn write_to_log_file(test_name: &str, buf: &[u8]) {
 fn teardown() {
     // Flush and close all log file handles
     if let Ok(mut files) = LOG_FILES.lock() {
-        for (_, file) in files.iter_mut() {
+        for file in files.values_mut() {
             let _ = file.flush();
         }
         files.clear();

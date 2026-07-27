@@ -34,6 +34,12 @@ interval = "1 m"
 # Determines if the HTTP server is active.
 # `true` enables the server, allowing it to handle HTTP requests.
 # `false` disables the server, preventing it from handling HTTP requests.
+# In cluster mode, followers forward control-plane requests (streams, topics,
+# users, ...) to the current primary when a cluster-wide JWT key exists (see
+# http.jwt / cluster.auth below).
+# TODO: forwarding does not cover the partition-plane APIs yet - message
+# produce and consumer-offset writes are never forwarded and must reach the
+# partition's primary node directly (message polls read locally on any node).
 enabled = true
 
 # Specifies the network address and port for the HTTP server.
@@ -75,9 +81,9 @@ allowed_origins = ["*"]
 allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
-# `x-iggy-view` carries the current VSR view number; exposing it lets browser
+# `iggy-view` carries the current VSR view number; exposing it lets browser
 # clients read it on cross-origin responses.
-exposed_headers = ["x-iggy-view"]
+exposed_headers = ["iggy-view"]
 
 # Determines if credentials like cookies or HTTP auth can be included in CORS requests.
 # `true` allows credentials to be included, useful for authenticated sessions;
@@ -120,6 +126,10 @@ not_before = "0 s"
 
 # Secret key for encoding JWTs.
 # If left empty, a secure random secret will be generated on each server start.
+# In cluster mode a configured secret (identical on every node) makes bearers
+# valid cluster-wide and activates follower-to-primary HTTP forwarding; with
+# cluster.auth enabled the key is instead derived from the shared PSK. Without
+# either, tokens are node-local and forwarding stays disabled.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
@@ -577,11 +587,21 @@ enabled = false
 # This prevents accidental cross-cluster communication.
 name = "iggy-cluster"
 
+# Backup-side liveness window for a consensus plane's primary (duration).
+# A replica that sees no primary traffic for this long starts a view change.
+# Raise it on oversubscribed hosts where scheduling stalls fake primary
+# death. Must be at least "2s": the primary heartbeats every second, and a
+# window at or below one ping interval would elect on every hiccup.
+heartbeat_timeout = "5s"
+
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be
 # rejected, and shared_secret becomes mandatory. Off by default = legacy
 # unauthenticated replica traffic. Enabling it is a coordinated-restart change.
+# With http enabled and no http.jwt secrets configured, the PSK also becomes
+# the JWT key source, making bearers valid cluster-wide and activating
+# follower-to-primary HTTP forwarding.
 enabled = false
 
 # Cluster-wide pre-shared key, >= 32 bytes of CSPRNG output, byte-identical on
@@ -695,6 +715,25 @@ enabled = false
 self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
+
+# Metadata consensus plane tunables (shard 0's VSR replica: users,
+# streams, topics, sessions). Size these together: a deeper prepare queue
+# admits more concurrent in-flight metadata ops (e.g. login storms), and
+# the journal must hold enough slots that a forced checkpoint (triggered
+# when remaining slots fall to the checkpoint margin, which itself is
+# max(64, prepare_queue_depth)) stays rare. Validation enforces
+# journal_slots >= 4 * max(64, prepare_queue_depth).
+[metadata]
+# Depth of the metadata prepare queue: how many uncommitted metadata ops
+# may be in flight at once. Submits beyond it are rejected with the
+# transient "metadata prepare queue is full" and retried by the SDK.
+prepare_queue_depth = 32
+
+# Size of the metadata WAL's in-memory index, in slots (one committed but
+# not-yet-snapshotted op per slot). Larger values buy more headroom
+# between forced checkpoints at the cost of memory and bigger WAL
+# rewrites per checkpoint.
+journal_slots = 1024
 
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships

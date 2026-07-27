@@ -22,6 +22,7 @@ use crate::utils::get_server_stats;
 use bench_report::{
     actor_kind::ActorKind,
     benchmark_kind::BenchmarkKind,
+    cluster::{BenchmarkClusterInfo, BenchmarkClusterNode},
     hardware::BenchmarkHardware,
     individual_metrics::BenchmarkIndividualMetrics,
     params::BenchmarkParams,
@@ -29,7 +30,14 @@ use bench_report::{
     server_stats::{BenchmarkCacheMetrics, BenchmarkCacheMetricsKey, BenchmarkServerStats},
 };
 use chrono::{DateTime, Utc};
-use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyClient, IggyTimestamp, Stats};
+use iggy::prelude::{
+    CacheMetrics, CacheMetricsKey, ClusterClient, ClusterMetadata, IggyClient, IggyTimestamp, Stats,
+};
+use tracing::warn;
+
+/// Both the legacy server and server-ng synthesize exactly this cluster name
+/// for a non-clustered instance, so it is the single-node sentinel.
+const SINGLE_NODE_CLUSTER_NAME: &str = "single-node";
 
 pub struct BenchmarkReportBuilder;
 
@@ -59,6 +67,22 @@ impl BenchmarkReportBuilder {
         if params.gitref_date.is_none() {
             params.gitref_date = Some(timestamp.clone());
         }
+
+        // Old servers predate the cluster-metadata command; tolerate the error
+        // and treat the target as a single node rather than failing the run.
+        let cluster = match admin_client.get_cluster_metadata().await {
+            Ok(metadata) => cluster_info_from_metadata(metadata),
+            Err(error) => {
+                warn!("cluster metadata unavailable, assuming single node: {error}");
+                None
+            }
+        };
+
+        // params_identifier is the dashboard trend grouping key; fork cluster
+        // runs into their own series so they never mix with single-node runs.
+        params
+            .params_identifier
+            .push_str(&cluster_suffix(cluster.as_ref()));
 
         let mut group_metrics = Vec::new();
 
@@ -132,10 +156,44 @@ impl BenchmarkReportBuilder {
             timestamp,
             hardware,
             params,
+            cluster,
             group_metrics,
             individual_metrics,
         }
     }
+}
+
+/// Classifies raw server metadata into cluster topology, returning `None` for a
+/// single node so callers can keep single-node reports untouched.
+fn cluster_info_from_metadata(metadata: ClusterMetadata) -> Option<BenchmarkClusterInfo> {
+    let is_real_cluster = metadata.nodes.len() > 1 || metadata.name != SINGLE_NODE_CLUSTER_NAME;
+    if !is_real_cluster {
+        return None;
+    }
+
+    let nodes = metadata
+        .nodes
+        .into_iter()
+        .map(|node| BenchmarkClusterNode {
+            name: node.name,
+            role: node.role.to_string(),
+            status: node.status.to_string(),
+        })
+        .collect();
+
+    Some(BenchmarkClusterInfo {
+        name: metadata.name,
+        nodes,
+    })
+}
+
+/// Trend/directory suffix that forks a cluster run away from the single-node
+/// run sharing the same benchmark params. Empty for single node so existing
+/// identifiers and directory names stay byte-identical.
+pub fn cluster_suffix(cluster: Option<&BenchmarkClusterInfo>) -> String {
+    cluster.map_or_else(String::new, |cluster| {
+        format!("_cluster{}", cluster.nodes.len())
+    })
 }
 
 /// This function is a workaround.
@@ -192,4 +250,91 @@ fn cache_metrics_to_benchmark_cache_metrics(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::{ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints};
+
+    fn metadata_node(name: &str, role: ClusterNodeRole) -> ClusterNode {
+        ClusterNode {
+            name: name.to_string(),
+            ip: "127.0.0.1".to_string(),
+            endpoints: TransportEndpoints::new(0, 0, 0, 0),
+            role,
+            status: ClusterNodeStatus::Healthy,
+        }
+    }
+
+    fn benchmark_cluster(node_count: usize) -> BenchmarkClusterInfo {
+        BenchmarkClusterInfo {
+            name: "vsr".to_string(),
+            nodes: (0..node_count)
+                .map(|idx| BenchmarkClusterNode {
+                    name: format!("node-{idx}"),
+                    role: "follower".to_string(),
+                    status: "healthy".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn given_single_node_metadata_when_classified_should_return_none() {
+        let metadata = ClusterMetadata {
+            name: SINGLE_NODE_CLUSTER_NAME.to_string(),
+            nodes: vec![metadata_node("iggy-node", ClusterNodeRole::Leader)],
+        };
+
+        assert!(cluster_info_from_metadata(metadata).is_none());
+    }
+
+    #[test]
+    fn given_multi_node_metadata_when_classified_should_map_lowercase_roles_and_keep_name() {
+        let metadata = ClusterMetadata {
+            name: "vsr".to_string(),
+            nodes: vec![
+                metadata_node("node-1", ClusterNodeRole::Leader),
+                metadata_node("node-2", ClusterNodeRole::Follower),
+                metadata_node("node-3", ClusterNodeRole::Follower),
+            ],
+        };
+
+        let info = cluster_info_from_metadata(metadata).expect("real cluster");
+        assert_eq!(info.name, "vsr");
+        assert_eq!(
+            info.nodes
+                .iter()
+                .map(|node| node.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["leader", "follower", "follower"]
+        );
+        assert!(info.nodes.iter().all(|node| node.status == "healthy"));
+    }
+
+    #[test]
+    fn given_single_node_with_custom_name_when_classified_should_return_some() {
+        let metadata = ClusterMetadata {
+            name: "vsr".to_string(),
+            nodes: vec![metadata_node("node-1", ClusterNodeRole::Leader)],
+        };
+
+        let info = cluster_info_from_metadata(metadata).expect("named roster counts as cluster");
+        assert_eq!(info.nodes.len(), 1);
+    }
+
+    #[test]
+    fn given_cluster_when_suffixing_identifier_should_append_node_count() {
+        let mut identifier = "pinned_producer_tcp".to_string();
+        identifier.push_str(&cluster_suffix(Some(&benchmark_cluster(3))));
+        assert_eq!(identifier, "pinned_producer_tcp_cluster3");
+    }
+
+    #[test]
+    fn given_no_cluster_when_suffixing_identifier_should_leave_it_unchanged() {
+        let mut identifier = "pinned_producer_tcp".to_string();
+        identifier.push_str(&cluster_suffix(None));
+        assert_eq!(identifier, "pinned_producer_tcp");
+    }
 }

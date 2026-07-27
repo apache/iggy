@@ -93,6 +93,12 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
         return FutureUtil.resolve(asyncClient.login());
     }
 
+    /** {@inheritDoc} */
+    @Override
+    public byte[] sendBinaryRequest(int code, byte[] payload) {
+        return FutureUtil.resolve(asyncClient.sendBinaryRequest(code, payload));
+    }
+
     @Override
     public void close() {
         FutureUtil.resolve(asyncClient.close());

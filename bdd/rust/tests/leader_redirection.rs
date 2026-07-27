@@ -24,5 +24,8 @@ use cucumber::World;
 
 #[tokio::main]
 async fn main() {
-    LeaderContext::run("../../bdd/scenarios/leader_redirection.feature").await;
+    LeaderContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/leader_redirection.feature")
+        .await;
 }

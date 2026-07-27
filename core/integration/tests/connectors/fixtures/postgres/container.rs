@@ -22,7 +22,7 @@ use sqlx::{Pool, Postgres};
 use crate::connectors::fixtures;
 use testcontainers_modules::{
     postgres,
-    testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
+    testcontainers::{ContainerAsync, ContainerRequest, ImageExt, runners::AsyncRunner},
 };
 
 pub(super) const POSTGRES_PORT: u16 = 5432;
@@ -68,6 +68,7 @@ pub(super) const ENV_SOURCE_PROCESSED_COLUMN: &str =
     "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_PROCESSED_COLUMN";
 pub(super) const ENV_SOURCE_INCLUDE_METADATA: &str =
     "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_INCLUDE_METADATA";
+pub(super) const ENV_SOURCE_MODE: &str = "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_MODE";
 
 pub(super) const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub(super) const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -128,7 +129,23 @@ pub struct PostgresContainer {
 
 impl PostgresContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
-        let container = postgres::Postgres::default()
+        Self::start_with_image(postgres::Postgres::default().into()).await
+    }
+
+    pub(super) async fn start_with_logical_replication() -> Result<Self, TestBinaryError> {
+        Self::start_with_image(postgres::Postgres::default().with_cmd([
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "fsync=off",
+        ]))
+        .await
+    }
+
+    async fn start_with_image(
+        image: ContainerRequest<postgres::Postgres>,
+    ) -> Result<Self, TestBinaryError> {
+        let container = image
             .with_container_name(fixtures::unique_container_name("postgres"))
             .start()
             .await
