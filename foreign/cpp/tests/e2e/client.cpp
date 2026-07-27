@@ -1588,6 +1588,55 @@ TEST_F(LowLevelE2E_Client, ChangePasswordForWrongUserThrows) {
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
 }
 
+TEST_F(LowLevelE2E_Client, UserWithoutManageUsersCannotChangeAnotherUsersPassword) {
+    RecordProperty("description",
+                   "Rejects another user's password change without manage_users and preserves the old credentials.");
+    iggy::ffi::Client *root_client    = GetLoggedInClient();
+    iggy::ffi::Client *actor_client   = GetLoggedOutClient();
+    iggy::ffi::Client *target_client  = GetLoggedOutClient();
+    const std::string actor_name      = GetRandomName(50);
+    const std::string target_name     = GetRandomName(50);
+    const std::string target_password = "target-secret";
+    const std::string new_password    = "replacement-secret";
+    ASSERT_NO_THROW({ CreateUser(root_client, actor_name, "actor-secret", 1); });
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_name, target_password, 1); });
+    ASSERT_NO_THROW(actor_client->connect());
+    ASSERT_NO_THROW(actor_client->login_user(actor_name, "actor-secret"));
+
+    ASSERT_THROW(actor_client->change_password(make_numeric_identifier(target.id), target_password, new_password),
+                 std::exception);
+
+    ASSERT_NO_THROW(target_client->connect());
+    ASSERT_NO_THROW(target_client->login_user(target_name, target_password));
+}
+
+TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsChangingAnotherUsersPassword) {
+    RecordProperty("description", "Allows a user with manage_users to change another user's password.");
+    iggy::ffi::Client *root_client         = GetLoggedInClient();
+    iggy::ffi::Client *manager_client      = GetLoggedOutClient();
+    iggy::ffi::Client *old_password_client = GetLoggedOutClient();
+    iggy::ffi::Client *new_password_client = GetLoggedOutClient();
+    const std::string manager_name         = GetRandomName(50);
+    const std::string target_name          = GetRandomName(50);
+    const std::string target_password      = "target-secret";
+    const std::string new_password         = "replacement-secret";
+    iggy::ffi::Permissions permissions{};
+    permissions.global.manage_users = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, manager_name, "manager-secret", 1, true, std::move(permissions)); });
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_name, target_password, 1); });
+    ASSERT_NO_THROW(manager_client->connect());
+    ASSERT_NO_THROW(manager_client->login_user(manager_name, "manager-secret"));
+
+    ASSERT_NO_THROW(manager_client->change_password(make_numeric_identifier(target.id), target_password, new_password));
+
+    ASSERT_NO_THROW(old_password_client->connect());
+    ASSERT_THROW(old_password_client->login_user(target_name, target_password), std::exception);
+    ASSERT_NO_THROW(new_password_client->connect());
+    ASSERT_NO_THROW(new_password_client->login_user(target_name, new_password));
+}
+
 TEST_F(LowLevelE2E_Client, ChangePasswordUpdatesCredentialsAndCanBeRestored) {
     RecordProperty("description",
                    "Changes the password for the current user, updates login behavior, and restores the original "

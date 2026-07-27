@@ -139,9 +139,8 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
 }
 
 pub fn from_connection_string(connection_string: String) -> Result<*mut Client, String> {
-    let client = RustIggyClient::from_connection_string(&connection_string).map_err(|error| {
-        format!("Could not parse connection string '{connection_string}': {error}")
-    })?;
+    let client = RustIggyClient::from_connection_string(&connection_string)
+        .map_err(|error| format!("Could not parse connection string: {error}"))?;
 
     Ok(Box::into_raw(Box::new(Client {
         inner: Arc::new(client),
