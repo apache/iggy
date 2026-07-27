@@ -255,6 +255,28 @@ where
     drained
 }
 
+/// Header of the pipeline head, iff its op is covered by the commit frontier.
+///
+/// Peek-only counterpart of [`drain_committable_prefix`] for commit paths that
+/// must survive their driving future being canceled between "committable" and
+/// "applied" (see `IggyMetadata::on_ack`): the caller peeks here, performs its
+/// awaits with the entry still in the pipeline, then — in a sync region —
+/// revalidates that the head is still this exact entry before popping and
+/// applying it. A driver dropped at an await strands nothing; a sibling driver
+/// that committed the op first fails the caller's revalidation and re-peeks.
+pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let commit = consensus.commit_max();
+    let pipeline = consensus.pipeline().borrow();
+    pipeline
+        .head()
+        .map(|entry| entry.header)
+        .filter(|header| header.op <= commit)
+}
+
 /// Build reply for a committed prepare.
 ///
 /// Every field except `size` comes from `prepare_header`, bytes are identical

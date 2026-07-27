@@ -495,6 +495,7 @@ pub async fn build_partition_fresh(
         bus,
         LocalPipeline::new(),
     );
+    consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
     // A partition directory that already holds segment bytes is a RESTART
     // materialization, not a fresh create: this replica's group state died
     // with the process, so claiming view-0 primaryship would heartbeat

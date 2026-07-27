@@ -101,7 +101,7 @@ impl ConsumerGroupClient for HttpClient {
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            &group_id.as_cow_str()
+            group_id.as_cow_str()
         );
         self.delete(&path).await?;
         Ok(())

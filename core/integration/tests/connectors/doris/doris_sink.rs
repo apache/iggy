@@ -251,24 +251,57 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
         .expect("count before");
     assert_eq!(row_before, message_count as i64);
 
-    // Replay the same offsets => same label => Doris dedupes server-side.
-    // Reuse the connector's own `build_label` so the test cannot drift from
-    // the production label format.
-    let label = iggy_connector_doris_sink::build_label(
-        "iggy_test",
-        seeds::names::STREAM,
-        seeds::names::TOPIC,
-        0,
-        0,
-        (message_count - 1) as u64,
-    );
-
-    let body = serde_json::to_vec(&test_messages).expect("serialize replay body");
-
     let client_http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
+
+    // The connector labels each Stream Load with the batch's offset range,
+    // and a multi-node cluster can flush the 5 messages in several splits at
+    // the commit watermark (e.g. offsets 0-1 + 2-4), so predicting a single
+    // 0-4 label is wrong. Enumerate every contiguous range's candidate label
+    // via the connector's own `build_label` (so the test cannot drift from
+    // the production format) and keep those Doris actually recorded. Stream
+    // Loads never show up in `SHOW LOAD` (and `SHOW STREAM LOAD` requires a
+    // non-default BE config), so probe the FE's db-scoped load-state API.
+    let last_offset = (message_count - 1) as u64;
+    let mut observed_labels = Vec::new();
+    for first in 0..=last_offset {
+        for last in first..=last_offset {
+            let candidate = iggy_connector_doris_sink::build_label(
+                "iggy_test",
+                seeds::names::STREAM,
+                seeds::names::TOPIC,
+                0,
+                first,
+                last,
+            );
+            let state_url = format!(
+                "{}/api/{db}/get_load_state?label={candidate}",
+                fixture.container().fe_url()
+            );
+            let state: serde_json::Value = client_http
+                .get(&state_url)
+                .basic_auth("root", Some(""))
+                .send()
+                .await
+                .expect("get_load_state request")
+                .json()
+                .await
+                .expect("get_load_state response");
+            if state["data"] == "VISIBLE" {
+                observed_labels.push(candidate);
+            }
+        }
+    }
+    eprintln!("observed Doris stream load labels: {observed_labels:?}");
+
+    // Replay one observed label => Doris must dedupe server-side.
+    let label = observed_labels
+        .pop()
+        .expect("connector should have produced at least one visible stream load");
+
+    let body = serde_json::to_vec(&test_messages).expect("serialize replay body");
 
     let url = format!(
         "{}/api/{db}/{TEST_TABLE}/_stream_load",
@@ -316,10 +349,10 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
         break resp;
     };
     let body_text = response.text().await.expect("body");
-    // Require Doris to report dedupe explicitly. A `"Success"` here would
-    // mean the label drifted from what the connector built — which doubles
-    // rows and is caught by `row_after == message_count`, but we want the
-    // dedupe path itself to be load-bearing in this test.
+    // Require Doris to report dedupe explicitly. The label was just observed
+    // as a VISIBLE load, so anything but "Label Already Exists" is a dedupe
+    // regression; a "Success" would also double rows, which the count check
+    // below catches.
     assert!(
         body_text.contains("Label Already Exists"),
         "expected Doris to dedupe by label, got: {body_text}"

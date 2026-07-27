@@ -47,7 +47,6 @@ pub trait IggyServerDependent: TestBinary {
     fn set_iggy_address(&mut self, addr: SocketAddr);
 
     /// Wait until the dependent service is ready to accept requests.
-    /// May release internal resources (e.g., port reservations) once ready.
     fn wait_ready(
         &mut self,
     ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send;

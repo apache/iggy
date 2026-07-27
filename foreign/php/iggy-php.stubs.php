@@ -208,6 +208,16 @@ namespace Iggy {
         public function pollMessages(mixed $stream, mixed $topic, int $partition_id, \Iggy\PollingStrategy $polling_strategy, int $count, bool $auto_commit): array {}
 
         /**
+         * Sends a command code with a payload and returns the raw response bytes.
+         * Session-control codes return an invalid-command exception.
+         *
+         * @param int $code
+         * @param string $payload
+         * @return string
+         */
+        public function sendBinaryRequest(int $code, string $payload): string {}
+
+        /**
          * Sends messages to a topic.
          *
          * @param mixed $stream

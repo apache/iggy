@@ -31,6 +31,7 @@ FROM node:26-slim
 
 COPY ./foreign/node .
 COPY ./bdd/scenarios/basic_messaging.feature ./bdd/
+COPY ./bdd/scenarios/raw_command.feature ./bdd/
 
 RUN npm ci
 

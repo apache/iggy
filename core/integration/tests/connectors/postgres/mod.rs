@@ -17,6 +17,7 @@
 
 mod postgres_sink;
 mod postgres_source;
+mod postgres_source_cdc;
 mod restart;
 
 use crate::connectors::TestMessage;

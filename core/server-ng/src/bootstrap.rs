@@ -511,7 +511,6 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     let config = ServerNgConfig::load()
         .await
         .map_err(ServerNgError::Config)?;
-    // TODO: decouple directory bootstrap from the `server` crate.
     create_directories(&config.system).await.map_err(|source| {
         error!(
             system_path = %config.system.get_system_path(),
@@ -797,9 +796,6 @@ fn run_shard_thread(
         .bind_memory()
         .map_err(|source| ServerNgError::MemoryAffinityFailed { shard_id, source })?;
 
-    // TODO(hubcio): decouple runtime creation from the `server` crate
-    // (mirrors the identical TODO in `main.rs`). Reusing legacy here so
-    // server-ng and the legacy server share one io_uring tuning surface.
     let runtime = create_shard_executor()
         .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
 
@@ -888,6 +884,7 @@ async fn shard_main(
             let recovered = recover::<ServerNgMuxStateMachine>(
                 data_dir,
                 topology.replica_count == 1,
+                config.metadata.journal_slots,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
@@ -959,6 +956,8 @@ async fn shard_main(
                 topology.self_replica_id,
                 topology.replica_count,
                 Rc::clone(&bus),
+                config.metadata.prepare_queue_depth,
+                cluster_heartbeat_ticks(config),
             );
             (Some(consensus), Some(journal), snapshot)
         } else {
@@ -975,6 +974,10 @@ async fn shard_main(
     // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
     metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
+    // Keep the forced-checkpoint margin >= the configured prepare-queue
+    // depth: ops already pipelined while a checkpoint runs append into that
+    // margin (config validation keeps journal_slots >= 4x this).
+    metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -1488,7 +1491,7 @@ fn build_cluster_roster(
         name: config.cluster.name.clone(),
         nodes: config.cluster.nodes.clone(),
         self_ip: topology.client_listen_addr.ip().to_string(),
-        self_ports: configs::cluster::TransportPorts {
+        self_ports: configs::ng_cluster::TransportPorts {
             tcp: Some(topology.client_listen_addr.port()),
             quic: topology.quic_listen_addr.map(|addr| addr.port()),
             http: http_port,
@@ -1675,6 +1678,28 @@ async fn build_shard_for_thread(
     Ok((shard, sessions))
 }
 
+// Pin the configs-crate default literals (duplicated there to avoid a
+// build-time edge onto the runtime crates) against the runtime constants,
+// mirroring the message_bus IOV_MAX pin. A drift on either side fails this
+// crate's build until both are reconciled.
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_PREPARE_QUEUE_DEPTH
+        == consensus::PIPELINE_PREPARE_QUEUE_MAX
+);
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_JOURNAL_SLOTS
+        == journal::prepare_journal::DEFAULT_SLOT_COUNT
+);
+/// `[cluster] heartbeat_timeout` in consensus ticks, floored at one tick.
+/// Every consensus group (metadata and per-partition planes alike) gets the
+/// same window: the failure it guards against - a primary that stopped
+/// heartbeating - is host-level, not per-plane.
+pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
+    let window = config.cluster.heartbeat_timeout.get_duration().as_millis();
+    u64::try_from((window / shard::CONSENSUS_TICK_INTERVAL.as_millis()).max(1)).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
@@ -1683,6 +1708,8 @@ fn restore_metadata_consensus(
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
+    prepare_queue_depth: usize,
+    normal_heartbeat_ticks: u64,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         cluster_id,
@@ -1690,8 +1717,12 @@ fn restore_metadata_consensus(
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
-        LocalPipeline::new(),
+        // Request queue keeps the stock 2x ratio over the prepare queue
+        // (32 -> 64 at defaults): buffered requests are cheap relative to
+        // in-flight prepares and drain as prepares commit.
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
+    consensus.set_normal_heartbeat_ticks(normal_heartbeat_ticks);
 
     let last_header = journal
         .last_op()
@@ -1815,6 +1846,7 @@ async fn load_partition(
         bus,
         LocalPipeline::new(),
     );
+    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
     // A recovered partition lost its consensus state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
     // this replica cannot know the group's (op, commit). In a cluster it
@@ -2081,7 +2113,7 @@ fn resolve_optional_listener_addr(
 }
 
 fn resolve_cluster_client_addrs(
-    self_node: &configs::cluster::ClusterNodeConfig,
+    self_node: &configs::ng_cluster::ClusterNodeConfig,
     default_client_addr: SocketAddr,
     default_ws_addr: Option<SocketAddr>,
     default_quic_addr: Option<SocketAddr>,
@@ -2108,10 +2140,10 @@ fn resolve_cluster_client_addrs(
 }
 
 fn resolve_cluster_optional_addr(
-    self_node: &configs::cluster::ClusterNodeConfig,
+    self_node: &configs::ng_cluster::ClusterNodeConfig,
     context: &'static str,
     default_addr: Option<SocketAddr>,
-    port_selector: impl Fn(&configs::cluster::TransportPorts) -> Option<u16>,
+    port_selector: impl Fn(&configs::ng_cluster::TransportPorts) -> Option<u16>,
 ) -> Result<Option<SocketAddr>, ServerNgError> {
     let Some(default_addr) = default_addr else {
         return Ok(None);
@@ -2121,7 +2153,7 @@ fn resolve_cluster_optional_addr(
 }
 
 fn resolve_cluster_replica_peers(
-    nodes: &[configs::cluster::ClusterNodeConfig],
+    nodes: &[configs::ng_cluster::ClusterNodeConfig],
     self_replica_id: u8,
 ) -> Result<Vec<(u8, SocketAddr)>, ServerNgError> {
     let mut peers = Vec::with_capacity(nodes.len().saturating_sub(1));
@@ -2178,7 +2210,7 @@ async fn start_tcp_runtime(
     // caller of this function.
     if config.http.enabled {
         let http_addr = parse_socket_addr("http.address", &config.http.address)?;
-        let self_ports = configs::cluster::TransportPorts {
+        let self_ports = configs::ng_cluster::TransportPorts {
             tcp: config
                 .tcp
                 .enabled
@@ -3032,6 +3064,24 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_cluster_heartbeat_timeout_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .heartbeat_timeout
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] heartbeat_timeout default drifted from \
+             TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+        );
+    }
 
     #[test]
     fn shutdown_on_drop_armed_flips_flag() {

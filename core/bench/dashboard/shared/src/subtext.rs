@@ -122,9 +122,13 @@ impl BenchmarkReportLight {
             format!("  •  {} Partitions per Topic", self.params.partitions)
         };
         let streams = format!("{} Streams", self.params.streams);
+        let cluster = match &self.cluster {
+            Some(info) => format!("  •  {}", info.label()),
+            None => String::new(),
+        };
 
         format!(
-            "{actors_info}  •  {streams}  •  {topics}{partitions}  •  {messages_per_batch} Msg/batch  •  {message_batches} Batches  •  {message_size} Bytes/msg  •  {user_data_print}",
+            "{actors_info}  •  {streams}  •  {topics}{partitions}  •  {messages_per_batch} Msg/batch  •  {message_batches} Batches  •  {message_size} Bytes/msg  •  {user_data_print}{cluster}",
         )
     }
 
@@ -216,5 +220,51 @@ impl BenchmarkGroupMetricsLight {
             self.summary.max_latency_ms,
             self.summary.std_dev_latency_ms,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_report::cluster::{BenchmarkClusterInfo, BenchmarkClusterNode};
+
+    fn node(name: &str, role: &str) -> BenchmarkClusterNode {
+        BenchmarkClusterNode {
+            name: name.to_string(),
+            role: role.to_string(),
+            status: "healthy".to_string(),
+        }
+    }
+
+    fn three_node_cluster() -> BenchmarkClusterInfo {
+        BenchmarkClusterInfo {
+            name: "vsr".to_string(),
+            nodes: vec![
+                node("node-1", "leader"),
+                node("node-2", "follower"),
+                node("node-3", "follower"),
+            ],
+        }
+    }
+
+    #[test]
+    fn given_single_node_report_when_formatting_params_should_omit_cluster_segment() {
+        let report = BenchmarkReportLight::default();
+        assert!(!report.format_params().contains("cluster"));
+    }
+
+    #[test]
+    fn given_cluster_report_when_formatting_params_should_append_one_label_segment() {
+        let single = BenchmarkReportLight::default();
+        let clustered = BenchmarkReportLight {
+            cluster: Some(three_node_cluster()),
+            ..Default::default()
+        };
+        let expected = format!(
+            "{}  •  {}",
+            single.format_params(),
+            three_node_cluster().label()
+        );
+        assert_eq!(clustered.format_params(), expected);
     }
 }

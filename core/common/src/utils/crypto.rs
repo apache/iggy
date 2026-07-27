@@ -17,8 +17,8 @@
 
 use crate::IggyError;
 use crate::text;
-use aes_gcm::aead::{Aead, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
+use aes_gcm::aead::{Aead, Generate};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use std::fmt::Debug;
 
 #[derive(Debug, Clone)]
@@ -57,11 +57,8 @@ impl Debug for Aes256GcmEncryptor {
 
 impl Aes256GcmEncryptor {
     pub fn new(key: &[u8]) -> Result<Self, IggyError> {
-        if key.len() != 32 {
-            return Err(IggyError::InvalidEncryptionKey);
-        }
         Ok(Self {
-            cipher: Aes256Gcm::new(key.into()),
+            cipher: Aes256Gcm::new_from_slice(key).map_err(|_| IggyError::InvalidEncryptionKey)?,
         })
     }
 
@@ -72,7 +69,7 @@ impl Aes256GcmEncryptor {
 
 impl Encryptor for Aes256GcmEncryptor {
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::generate();
         let encrypted_data = self.cipher.encrypt(&nonce, data);
         if encrypted_data.is_err() {
             return Err(IggyError::CannotEncryptData);
@@ -82,7 +79,9 @@ impl Encryptor for Aes256GcmEncryptor {
     }
 
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        let nonce = (&data[0..12]).into();
+        let nonce = (&data[0..12])
+            .try_into()
+            .map_err(|_| IggyError::CannotDecryptData)?;
         let payload = self.cipher.decrypt(nonce, &data[12..]);
         if payload.is_err() {
             return Err(IggyError::CannotDecryptData);

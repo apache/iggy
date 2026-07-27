@@ -30,7 +30,6 @@ use crate::{
     RawPersonalAccessToken, Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails,
     TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
 };
-use iggy_binary_protocol::WireConsumer;
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
@@ -61,6 +60,7 @@ use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
+use iggy_binary_protocol::{WireConsumer, WireUserHeaderIterator};
 use std::collections::{BTreeMap, HashMap};
 
 /// Sentinel value in the wire protocol indicating no authenticated user.
@@ -756,11 +756,27 @@ pub fn user_headers_to_wire(
 pub fn user_headers_from_wire(
     wire: &iggy_binary_protocol::WireUserHeaders,
 ) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
-    if wire.is_empty() {
+    user_headers_from_validated_slice(wire.as_bytes())
+}
+
+/// Decode user headers from a slice that has already passed structural TLV validation.
+///
+/// Callers holding only a borrowed buffer can use this to skip the copy that
+/// [`iggy_binary_protocol::WireUserHeaders::from_slice`] performs.
+///
+/// # Panics
+///
+/// Panics or yields garbage if `buf` has not been validated by
+/// [`iggy_binary_protocol::validate_user_headers`]. The underlying iterator
+/// slices each TLV field without bounds checks, relying on that validation.
+pub(crate) fn user_headers_from_validated_slice(
+    buf: &[u8],
+) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
+    if buf.is_empty() {
         return Ok(BTreeMap::new());
     }
     let mut headers = BTreeMap::new();
-    for entry in wire.iter() {
+    for entry in WireUserHeaderIterator::new(buf) {
         let key_kind = HeaderKind::from_code(entry.key_kind.0)?;
         if let Some(expected) = key_kind.expected_size()
             && entry.key.len() != expected
@@ -781,4 +797,75 @@ pub fn user_headers_from_wire(
         );
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::WireUserHeaders;
+    use std::str::FromStr;
+
+    fn sample_headers() -> BTreeMap<HeaderKey, HeaderValue> {
+        BTreeMap::from([
+            (
+                HeaderKey::from_str("content-type").unwrap(),
+                HeaderValue::from_str("text/plain").unwrap(),
+            ),
+            (HeaderKey::from_str("retries").unwrap(), 7u32.into()),
+        ])
+    }
+
+    #[test]
+    fn given_encoded_headers_when_decoded_from_slice_should_recover_the_originals() {
+        let wire = user_headers_to_wire(&sample_headers());
+
+        // The originals are the oracle here. Comparing against `user_headers_from_wire`
+        // would be vacuous, since it delegates to the function under test.
+        let decoded = user_headers_from_validated_slice(wire.as_bytes()).unwrap();
+
+        assert_eq!(decoded, sample_headers());
+        for (key, value) in &decoded {
+            let (expected_key, expected_value) = sample_headers()
+                .into_iter()
+                .find(|(k, _)| k == key)
+                .unwrap();
+            assert_eq!(key.kind(), expected_key.kind());
+            assert_eq!(value.kind(), expected_value.kind());
+            assert_eq!(value.as_bytes(), expected_value.as_bytes());
+        }
+    }
+
+    #[test]
+    fn given_headers_copied_into_owned_wire_when_decoded_should_match_borrowed_decode() {
+        // Guards the assumption that decoding a borrowed slice is equivalent to
+        // decoding an independently copied buffer.
+        let wire = user_headers_to_wire(&sample_headers());
+        let copied = WireUserHeaders::from_slice(wire.as_bytes()).unwrap();
+
+        assert_eq!(
+            user_headers_from_validated_slice(wire.as_bytes()).unwrap(),
+            user_headers_from_validated_slice(copied.as_bytes()).unwrap()
+        );
+    }
+
+    #[test]
+    fn given_empty_buffer_when_decoded_from_slice_should_return_empty_map() {
+        assert!(user_headers_from_validated_slice(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn given_unknown_kind_code_when_decoded_from_slice_should_return_error() {
+        // Structurally valid TLV whose key kind code has no domain meaning.
+        let mut buf = Vec::new();
+        buf.push(0xFF);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(b"key");
+        buf.push(0xFF);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(b"val");
+
+        assert!(iggy_binary_protocol::validate_user_headers(&buf).is_ok());
+        assert!(user_headers_from_validated_slice(&buf).is_err());
+        assert!(user_headers_from_wire(&WireUserHeaders::from_slice(&buf).unwrap()).is_err());
+    }
 }
