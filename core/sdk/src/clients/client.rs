@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::binary::validate_binary_request_code;
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::client_wrappers::connection_info::ConnectionInfo;
 use crate::clients::client_builder::IggyClientBuilder;
@@ -30,13 +31,9 @@ use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy_binary_protocol::codes::{
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
-    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE,
-};
 use iggy_common::Consumer;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
+use iggy_common::{BinaryRequestKind, BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -44,16 +41,6 @@ use tokio::spawn;
 use tokio::time::sleep;
 use tracing::log::warn;
 use tracing::{debug, error, info};
-
-/// Auth/session codes rejected by the raw binary path. Must go through the
-/// typed `login_user` / `logout_user` methods to keep session state correct.
-const SESSION_CONTROL_CODES: [u32; 5] = [
-    LOGIN_USER_CODE,
-    LOGOUT_USER_CODE,
-    LOGIN_REGISTER_CODE,
-    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
-    LOGIN_REGISTER_WITH_PAT_CODE,
-];
 
 /// The main client struct which implements all the `Client` traits and wraps the underlying low-level client for the specific transport.
 ///
@@ -198,23 +185,34 @@ impl IggyClient {
         self.client.read().await.get_connection_info().await
     }
 
-    /// Send a raw binary command (`code` + serialized `payload`), returning the
-    /// raw response. Binary transports only (HTTP yields `FeatureUnavailable`).
+    /// Send a raw binary command with its replication declaration.
+    ///
+    /// A standard command keeps the class defined by the protocol tables, and
+    /// a conflicting declaration is rejected with `InvalidCommand`. Classic
+    /// framing carries no operation field, so the declaration does not change
+    /// the encoded bytes. Under `vsr`, an unknown
+    /// [`BinaryRequestKind::NonReplicated`] code uses
+    /// `Operation::NonReplicated`; an unknown
+    /// [`BinaryRequestKind::Replicated`] code yields `FeatureUnavailable`
+    /// until the protocol has a replicated extension registry.
     ///
     /// Login and logout codes are rejected with `InvalidCommand`. Use the
-    /// `login_user` / `logout_user` methods so SDK session state stays correct.
-    ///
-    /// Custom codes only work on the classic protocol. Under `vsr` the encoder
-    /// is closed-world: an unknown code yields `InvalidCommand`, a replicated
-    /// code with no mapping yields `UnknownReplicatedCommand`.
-    pub async fn send_binary_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        if SESSION_CONTROL_CODES.contains(&code) {
-            return Err(IggyError::InvalidCommand);
-        }
+    /// typed session methods so SDK state stays synchronized with the server.
+    pub async fn send_binary_request(
+        &self,
+        kind: BinaryRequestKind,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        // Validate before dispatch so HTTP returns InvalidCommand for session
+        // control instead of its blanket FeatureUnavailable.
+        validate_binary_request_code(code)?;
         match &*self.client.read().await {
-            ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
-            ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
-            ClientWrapper::WebSocket(client) => client.send_raw_with_response(code, payload).await,
+            ClientWrapper::Tcp(client) => client.send_binary_request(kind, code, payload).await,
+            ClientWrapper::Quic(client) => client.send_binary_request(kind, code, payload).await,
+            ClientWrapper::WebSocket(client) => {
+                client.send_binary_request(kind, code, payload).await
+            }
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
         }
     }
@@ -289,6 +287,7 @@ impl Client for IggyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary::SESSION_CONTROL_CODES;
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -480,19 +479,26 @@ mod tests {
     async fn should_reject_binary_request_on_http_transport() {
         let client =
             IggyClient::from_connection_string("iggy+http://user:secret@127.0.0.1:1234").unwrap();
-        let result = client.send_binary_request(0, Bytes::new()).await;
+        let result = client
+            .send_binary_request(BinaryRequestKind::NonReplicated, 0, Bytes::new())
+            .await;
         assert!(matches!(result, Err(IggyError::FeatureUnavailable)));
     }
 
     #[tokio::test]
     async fn should_reject_session_control_codes_on_binary_request() {
         let client = IggyClient::default();
-        for code in SESSION_CONTROL_CODES {
-            let result = client.send_binary_request(code, Bytes::new()).await;
-            assert!(
-                matches!(result, Err(IggyError::InvalidCommand)),
-                "code {code} must be rejected before reaching the transport"
-            );
+        for kind in [
+            BinaryRequestKind::NonReplicated,
+            BinaryRequestKind::Replicated,
+        ] {
+            for code in SESSION_CONTROL_CODES {
+                let result = client.send_binary_request(kind, code, Bytes::new()).await;
+                assert!(
+                    matches!(result, Err(IggyError::InvalidCommand)),
+                    "code {code} declared {kind} must be rejected before reaching the transport"
+                );
+            }
         }
     }
 }

@@ -38,7 +38,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
-use iggy_common::{IggyError, eviction_reason_to_error};
+use iggy_common::{BinaryRequestKind, IggyError, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -54,18 +54,23 @@ const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 // independent of (client_id, request_id).
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
+    kind: Option<BinaryRequestKind>,
     code: u32,
     payload: &Bytes,
 ) -> Result<Bytes, IggyError> {
-    let (header, total_size) = encode_request_header(session, code, payload)?;
+    let (header, total_size) = encode_request_header(session, kind, code, payload)?;
     let mut request = BytesMut::with_capacity(total_size);
     request.put_slice(bytemuck::bytes_of(&header));
     request.put_slice(payload);
     Ok(request.freeze())
 }
 
+/// `kind` is the caller's replication declaration for a raw request. `None`
+/// marks a standard typed command, which the protocol tables classify on their
+/// own.
 pub(crate) fn encode_request_header(
     session: &mut ConsensusSession,
+    kind: Option<BinaryRequestKind>,
     code: u32,
     payload: &Bytes,
 ) -> Result<(RequestHeader, usize), IggyError> {
@@ -79,7 +84,7 @@ pub(crate) fn encode_request_header(
             (Operation::Register, session.begin_register(), 0)
         }
         _ => {
-            let operation = operation_for_code(code)?;
+            let operation = operation_for_code(code, kind)?;
             // NonReplicated ops (ping, reads) bypass server-side dedup --
             // `ClientTable` only tracks request_ids for replicated ops. If
             // they consumed the monotonic counter, the next replicated
@@ -144,19 +149,57 @@ pub(crate) fn encode_request_header(
     Ok((header, total_size))
 }
 
-fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
+/// Pick the header operation for `code`, honoring the caller's declaration
+/// only where the protocol tables have nothing to say.
+///
+/// Standard codes resolve first so a caller cannot redirect a shipped command
+/// into the other execution model, then an unknown code falls back to the
+/// declaration. Without a declaration an unknown code is a bug in a typed SDK
+/// method rather than a vendor extension, so it stays `InvalidCommand`.
+fn operation_for_code(code: u32, kind: Option<BinaryRequestKind>) -> Result<Operation, IggyError> {
     if code == LOGOUT_USER_CODE {
-        return Ok(Operation::Logout);
+        return accept_declaration(Operation::Logout, kind);
     }
 
     if let Some(operation) = Operation::from_command_code(code) {
-        return Ok(operation);
+        return accept_declaration(operation, kind);
     }
 
     match iggy_binary_protocol::dispatch::lookup_command(code) {
-        Some(meta) if !meta.is_replicated() => Ok(Operation::NonReplicated),
+        Some(meta) if !meta.is_replicated() => accept_declaration(Operation::NonReplicated, kind),
         Some(_) => Err(IggyError::UnknownReplicatedCommand(code)),
-        None => Err(IggyError::InvalidCommand),
+        None => match kind {
+            Some(BinaryRequestKind::NonReplicated) => Ok(Operation::NonReplicated),
+            // A replicated vendor command needs a deterministic server-side
+            // handler registry, replicated state ownership, and a snapshot
+            // contract. None of that exists, and a half-supported frame would
+            // be worse than no frame.
+            Some(BinaryRequestKind::Replicated) => Err(IggyError::FeatureUnavailable),
+            None => Err(IggyError::InvalidCommand),
+        },
+    }
+}
+
+/// Reject a declaration that disagrees with the class `operation` already
+/// carries. Partition operations decode their namespace from a payload the SDK
+/// must understand, so they are replicated but never reachable from a raw
+/// request: `namespace_for_request` refuses an unrecognised code.
+fn accept_declaration(
+    operation: Operation,
+    kind: Option<BinaryRequestKind>,
+) -> Result<Operation, IggyError> {
+    let Some(declared) = kind else {
+        return Ok(operation);
+    };
+    let standard = if operation == Operation::NonReplicated {
+        BinaryRequestKind::NonReplicated
+    } else {
+        BinaryRequestKind::Replicated
+    };
+    if declared == standard {
+        Ok(operation)
+    } else {
+        Err(IggyError::InvalidCommand)
     }
 }
 
@@ -460,6 +503,7 @@ mod tests {
     use iggy_binary_protocol::codes::{
         CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE,
     };
+    use iggy_binary_protocol::dispatch::COMMAND_TABLE;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
@@ -467,8 +511,27 @@ mod tests {
     use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName};
     use secrecy::SecretString;
 
+    /// Outside every range the protocol assigns, so it stays unknown as the
+    /// command table grows.
+    const VENDOR_CODE: u32 = 60_001;
+
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
         *bytemuck::checked::try_from_bytes::<RequestHeader>(&bytes[..HEADER_SIZE]).unwrap()
+    }
+
+    fn read_non_replicated_code(header: &RequestHeader) -> u32 {
+        u32::from_le_bytes(
+            header.reserved[NON_REPLICATED_CODE_RANGE]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn bound_session() -> ConsensusSession {
+        let mut session = ConsensusSession::with_client_id(42);
+        let _ = session.register_request_id();
+        session.bind(99);
+        session
     }
 
     #[test]
@@ -486,7 +549,7 @@ mod tests {
         };
 
         let bytes =
-            encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes())
+            encode_contiguous_request(&mut session, None, LOGIN_REGISTER_CODE, &request.to_bytes())
                 .unwrap();
         let header = decode_request_header(&bytes);
 
@@ -513,13 +576,14 @@ mod tests {
         };
 
         let mut session = ConsensusSession::with_client_id(7);
-        encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes()).unwrap();
+        encode_contiguous_request(&mut session, None, LOGIN_REGISTER_CODE, &request.to_bytes())
+            .unwrap();
         session.bind(42);
 
         // A second login on the same bound session must encode a fresh Register
         // (request 0, session 0), not panic in the one-shot register guard.
         let bytes =
-            encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes())
+            encode_contiguous_request(&mut session, None, LOGIN_REGISTER_CODE, &request.to_bytes())
                 .unwrap();
         let header = decode_request_header(&bytes);
         assert_eq!(header.operation, Operation::Register);
@@ -618,8 +682,10 @@ mod tests {
         }
         .to_bytes();
 
-        let first = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
-        let second = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        let first =
+            encode_contiguous_request(&mut session, None, CREATE_STREAM_CODE, &payload).unwrap();
+        let second =
+            encode_contiguous_request(&mut session, None, CREATE_STREAM_CODE, &payload).unwrap();
 
         assert_eq!(decode_request_header(&first).request, 1);
         assert_eq!(decode_request_header(&second).request, 2);
@@ -631,18 +697,12 @@ mod tests {
     fn ping_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
-        let bytes = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        let bytes =
+            encode_contiguous_request(&mut session, None, PING_CODE, &Bytes::new()).unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
-        assert_eq!(
-            u32::from_le_bytes(
-                header.reserved[NON_REPLICATED_CODE_RANGE]
-                    .try_into()
-                    .unwrap()
-            ),
-            PING_CODE
-        );
+        assert_eq!(read_non_replicated_code(&header), PING_CODE);
         assert_eq!(header.session, 99);
         assert_eq!(header.namespace, 0);
     }
@@ -652,7 +712,7 @@ mod tests {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let bytes =
-            encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
+            encode_contiguous_request(&mut session, None, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::Logout);
@@ -668,18 +728,11 @@ mod tests {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let bytes =
-            encode_contiguous_request(&mut session, GET_STREAM_CODE, &Bytes::new()).unwrap();
+            encode_contiguous_request(&mut session, None, GET_STREAM_CODE, &Bytes::new()).unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
-        assert_eq!(
-            u32::from_le_bytes(
-                header.reserved[NON_REPLICATED_CODE_RANGE]
-                    .try_into()
-                    .unwrap()
-            ),
-            GET_STREAM_CODE
-        );
+        assert_eq!(read_non_replicated_code(&header), GET_STREAM_CODE);
         assert_eq!(header.session, 99);
     }
 
@@ -835,5 +888,151 @@ mod tests {
         let body = rejection_body(IggyError::InvalidOffset(1).as_code());
         let out = split_metadata_result(Operation::SendMessages, body.clone()).unwrap();
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn vendor_non_replicated_code_encodes_with_the_code_in_reserved() {
+        let mut session = bound_session();
+        let payload = Bytes::from_static(b"vendor-body");
+
+        let bytes = encode_contiguous_request(
+            &mut session,
+            Some(BinaryRequestKind::NonReplicated),
+            VENDOR_CODE,
+            &payload,
+        )
+        .unwrap();
+        let header = decode_request_header(&bytes);
+
+        assert_eq!(header.operation, Operation::NonReplicated);
+        assert_eq!(read_non_replicated_code(&header), VENDOR_CODE);
+        assert_eq!(header.namespace, 0);
+        assert_eq!(header.session, 99);
+        assert_eq!(&bytes[HEADER_SIZE..], &payload[..]);
+        assert_eq!(header.size as usize, HEADER_SIZE + payload.len());
+    }
+
+    #[test]
+    fn vendor_non_replicated_code_does_not_advance_the_request_identifier() {
+        let mut session = bound_session();
+        let payload = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+        }
+        .to_bytes();
+
+        for _ in 0..3 {
+            encode_contiguous_request(
+                &mut session,
+                Some(BinaryRequestKind::NonReplicated),
+                VENDOR_CODE,
+                &Bytes::new(),
+            )
+            .unwrap();
+        }
+        // The next replicated request must still claim id 1: a gap makes the
+        // primary's `request_preflight` drop it as a `RequestGap`.
+        let replicated =
+            encode_contiguous_request(&mut session, None, CREATE_STREAM_CODE, &payload).unwrap();
+
+        assert_eq!(decode_request_header(&replicated).request, 1);
+    }
+
+    #[test]
+    fn vendor_replicated_code_is_unavailable_until_the_registry_exists() {
+        let mut session = bound_session();
+        let error = encode_contiguous_request(
+            &mut session,
+            Some(BinaryRequestKind::Replicated),
+            VENDOR_CODE,
+            &Bytes::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
+    fn vendor_code_without_a_declaration_stays_closed_world() {
+        let mut session = bound_session();
+        let error =
+            encode_contiguous_request(&mut session, None, VENDOR_CODE, &Bytes::new()).unwrap_err();
+
+        assert!(matches!(error, IggyError::InvalidCommand));
+    }
+
+    #[test]
+    fn every_standard_code_accepts_its_own_class_and_rejects_the_other() {
+        for meta in COMMAND_TABLE {
+            let Ok(operation) = operation_for_code(meta.code, None) else {
+                // A replicated table entry with no `Operation` mapping stays
+                // unknown, and no declaration may rescue it.
+                for kind in [
+                    BinaryRequestKind::NonReplicated,
+                    BinaryRequestKind::Replicated,
+                ] {
+                    assert!(
+                        matches!(
+                            operation_for_code(meta.code, Some(kind)),
+                            Err(IggyError::UnknownReplicatedCommand(_))
+                        ),
+                        "{} must stay unknown when declared {kind}",
+                        meta.name
+                    );
+                }
+                continue;
+            };
+            let (matching, conflicting) = if operation == Operation::NonReplicated {
+                (
+                    BinaryRequestKind::NonReplicated,
+                    BinaryRequestKind::Replicated,
+                )
+            } else {
+                (
+                    BinaryRequestKind::Replicated,
+                    BinaryRequestKind::NonReplicated,
+                )
+            };
+
+            assert_eq!(
+                operation_for_code(meta.code, Some(matching)).unwrap(),
+                operation,
+                "{} must keep {operation:?} when declared {matching}",
+                meta.name
+            );
+            assert!(
+                matches!(
+                    operation_for_code(meta.code, Some(conflicting)),
+                    Err(IggyError::InvalidCommand)
+                ),
+                "{} must not be redirected by a {conflicting} declaration",
+                meta.name
+            );
+        }
+    }
+
+    #[test]
+    fn logout_keeps_its_replicated_class_despite_the_table_entry() {
+        // The command table lists logout as non-replicated because classic
+        // framing runs it locally, but VSR commits it through `Operation::Logout`.
+        assert!(
+            matches!(
+                operation_for_code(LOGOUT_USER_CODE, Some(BinaryRequestKind::NonReplicated)),
+                Err(IggyError::InvalidCommand)
+            ),
+            "logout must not be reachable as a non-replicated raw request"
+        );
+        assert_eq!(
+            operation_for_code(LOGOUT_USER_CODE, Some(BinaryRequestKind::Replicated)).unwrap(),
+            Operation::Logout
+        );
+    }
+
+    #[test]
+    fn vendor_replicated_code_cannot_reach_partition_routing() {
+        // Partition namespaces are decoded from a payload the SDK must
+        // understand, so no raw request can select one.
+        let error =
+            namespace_for_request(VENDOR_CODE, &Bytes::new(), Operation::SendMessages).unwrap_err();
+        assert!(matches!(error, IggyError::FeatureUnavailable));
     }
 }

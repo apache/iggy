@@ -17,7 +17,8 @@
 
 use bytes::Bytes;
 use iggy::prelude::{
-    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
+    BinaryRequestKind as RustBinaryRequestKind, Consumer as RustConsumer,
+    IggyClient as RustIggyClient, IggyMessage as RustMessage,
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
@@ -29,6 +30,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::binary_request_kind::BinaryRequestKind;
 use crate::consumer::{
     AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
     IggyConsumer, py_delta_to_iggy_duration,
@@ -969,12 +971,14 @@ impl IggyClient {
         })
     }
 
-    /// Send a command code with a payload and return the raw response bytes.
+    /// Send a raw command with its replication declaration.
     ///
-    /// Session-control codes are rejected client-side. HTTP transport does not
-    /// support raw binary commands.
+    /// The declaration is inert on classic framing. With a VSR build, standard
+    /// command tables remain authoritative, unknown non-replicated codes are
+    /// forwarded, and unknown replicated codes are unavailable.
     ///
     /// Args:
+    ///     kind: How the command executes, as `BinaryRequestKind`.
     ///     code: Command code as `int`.
     ///     payload: Request payload as `bytes`.
     ///
@@ -987,13 +991,15 @@ impl IggyClient {
     fn send_binary_request<'a>(
         &self,
         py: Python<'a>,
+        kind: BinaryRequestKind,
         code: u32,
         #[gen_stub(override_type(type_repr = "builtins.bytes"))] payload: Vec<u8>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
+        let kind = RustBinaryRequestKind::from(kind);
         future_into_py(py, async move {
             let response = inner
-                .send_binary_request(code, Bytes::from(payload))
+                .send_binary_request(kind, code, Bytes::from(payload))
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))

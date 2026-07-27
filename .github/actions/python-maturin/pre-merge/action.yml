@@ -20,7 +20,7 @@ description: Python pre-merge testing with maturin github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, test, build)"
+    description: "Task to run (lint, test, test-vsr, build)"
     required: true
 
 runs:
@@ -117,11 +117,30 @@ runs:
         ls -la dist/
       shell: bash
 
+    - name: Build VSR Python extension and server
+      if: inputs.task == 'test-vsr'
+      run: |
+        cd foreign/python
+        uv run --no-sync maturin develop --features vsr
+        cd ../..
+        cargo build --locked --bin iggy-server-ng --features vsr
+      shell: bash
+
     - name: Start Iggy server
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
       continue-on-error: true
+
+    - name: Start VSR Iggy server
+      if: inputs.task == 'test-vsr'
+      id: iggy-vsr
+      uses: ./.github/actions/utils/server-start
+      with:
+        mode: bin
+        bin: ${{ github.workspace }}/target/debug/iggy-server-ng
+        log-file: ${{ runner.temp }}/iggy-server-vsr.log
+        pid-file: ${{ runner.temp }}/iggy-server-vsr.pid
 
     - name: Run Python integration tests
       if: inputs.task == 'test' && steps.iggy.outcome == 'success'
@@ -142,6 +161,20 @@ runs:
 
         # Exit with test result
         exit ${TEST_EXIT_CODE:-0}
+      shell: bash
+
+    - name: Run Python VSR raw request tests
+      if: inputs.task == 'test-vsr'
+      run: |
+        cd foreign/python
+        mkdir -p ../../reports
+        IGGY_TEST_PROTOCOL=vsr \
+        IGGY_SERVER_HOST=127.0.0.1 \
+        IGGY_SERVER_TCP_PORT=8090 \
+          uv run --no-sync pytest tests/test_raw_command_vsr.py -v \
+            --junitxml=../../reports/python-vsr-junit.xml \
+            --tb=short \
+            --capture=no
       shell: bash
 
     - name: Run Python unit tests only (fallback)
@@ -168,6 +201,13 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Stop VSR Iggy server
+      if: always() && inputs.task == 'test-vsr'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-vsr.outputs.pid_file }}
+        log-file: ${{ steps.iggy-vsr.outputs.log_file }}
+
     - name: Generate coverage report
       if: inputs.task == 'test'
       run: |
@@ -189,13 +229,15 @@ runs:
       shell: bash
 
     - name: Upload test artifacts
-      if: always() && inputs.task == 'test'
+      if: always() && (inputs.task == 'test' || inputs.task == 'test-vsr')
       uses: actions/upload-artifact@v7
       with:
-        name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+        name: python-${{ inputs.task }}-results-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
           reports/python-junit.xml
+          reports/python-vsr-junit.xml
           reports/python-coverage.lcov
           foreign/python/dist/*.whl
+          ${{ runner.temp }}/iggy-server-vsr.log
         retention-days: 7
         if-no-files-found: ignore

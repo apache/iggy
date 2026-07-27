@@ -58,6 +58,34 @@ maturin develop
 pytest tests/ -v # Run tests (requires iggy-server running)
 ```
 
+### VSR builds
+
+The Python extension uses the Rust SDK's compile-time framing mode. The default
+build speaks classic framing. Build a VSR extension explicitly:
+
+```bash
+uv run maturin develop --features vsr
+```
+
+A built wheel contains one framing mode; it cannot switch between classic and
+VSR at runtime.
+
+Raw requests require an explicit replication declaration:
+
+```python
+from apache_iggy import BinaryRequestKind
+
+response = await client.send_binary_request(
+    BinaryRequestKind.NonReplicated,
+    code,
+    payload,
+)
+```
+
+With VSR framing, standard command tables remain authoritative. Unknown
+non-replicated codes are forwarded for the server to judge. Unknown replicated
+codes are unavailable until the protocol has a replicated extension registry.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.

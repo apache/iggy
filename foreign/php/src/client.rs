@@ -385,7 +385,11 @@ impl IggyClient {
 
         runtime().block_on(async move {
             inner
-                .send_binary_request(code, Bytes::from(Vec::<u8>::from(payload)))
+                .send_binary_request(
+                    BinaryRequestKind::NonReplicated,
+                    code,
+                    Bytes::from(Vec::<u8>::from(payload)),
+                )
                 .await
                 .map(|response| Binary::new(Vec::from(response)))
                 .map_err(to_php_exception)

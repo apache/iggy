@@ -15,4 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::codes::{
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE,
+};
+use iggy_common::IggyError;
 pub use iggy_common::{BinaryClient, BinaryTransport};
+
+/// Auth/session codes rejected by the raw binary path. Must go through the
+/// typed `login_user` / `logout_user` methods to keep session state correct.
+pub(crate) const SESSION_CONTROL_CODES: [u32; 5] = [
+    LOGIN_USER_CODE,
+    LOGOUT_USER_CODE,
+    LOGIN_REGISTER_CODE,
+    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+    LOGIN_REGISTER_WITH_PAT_CODE,
+];
+
+pub(crate) fn validate_binary_request_code(code: u32) -> Result<(), IggyError> {
+    if SESSION_CONTROL_CODES.contains(&code) {
+        Err(IggyError::InvalidCommand)
+    } else {
+        Ok(())
+    }
+}

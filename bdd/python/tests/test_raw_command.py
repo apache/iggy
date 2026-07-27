@@ -18,7 +18,7 @@
 import asyncio
 import socket
 
-from apache_iggy import IggyClient
+from apache_iggy import BinaryRequestKind, IggyClient
 from pytest_bdd import given, parsers, scenarios, then, when
 
 scenarios("/app/features/raw_command.feature")
@@ -53,7 +53,7 @@ def send_raw_command(context, code):
     async def send():
         try:
             context.last_raw_response = await context.client.send_binary_request(
-                code, b""
+                BinaryRequestKind.NonReplicated, code, b""
             )
             context.last_raw_error = None
         except RuntimeError as error:

@@ -18,12 +18,16 @@
 use crate::common::global_context::GlobalContext;
 use bytes::Bytes;
 use cucumber::{then, when};
-use iggy::prelude::IggyError;
+use iggy::prelude::{BinaryRequestKind, IggyError};
 
 #[when(regex = r"^I send a raw command with code (\d+) and an empty payload$")]
 pub async fn when_send_raw_command(world: &mut GlobalContext, code: u32) {
     let client = world.client.as_ref().expect("Client should be available");
-    world.last_raw_result = Some(client.send_binary_request(code, Bytes::new()).await);
+    world.last_raw_result = Some(
+        client
+            .send_binary_request(BinaryRequestKind::NonReplicated, code, Bytes::new())
+            .await,
+    );
 }
 
 #[then("the raw command should succeed with an empty response")]

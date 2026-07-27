@@ -48,12 +48,12 @@ pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
 pub use crate::websocket::websocket_client::WebSocketClient;
 pub use iggy_common::{
-    Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, CacheMetrics, CacheMetricsKey, ClientError,
-    ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus,
-    CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember,
-    ConsumerKind, EncryptorKind, GlobalPermissions, HeaderKey, HeaderKind, HeaderValue,
-    HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind, Identifier, IdentityInfo,
-    IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
+    Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BinaryRequestKind, CacheMetrics,
+    CacheMetricsKey, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
+    ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerGroupMember, ConsumerKind, EncryptorKind, GlobalPermissions, HeaderKey, HeaderKind,
+    HeaderValue, HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind, Identifier,
+    IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
     IggyMessageHeader, IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator,
     IggyTimestamp, MaxTopicSize, Partition, Partitioner, Partitioning, Permissions,
     PersonalAccessTokenExpiry, PollMessages, PolledMessages, PollingKind, PollingStrategy,

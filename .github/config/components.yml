@@ -232,7 +232,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/python/**"
-    tasks: ["lint", "test", "build"]
+    tasks: ["lint", "test", "test-vsr", "build"]
 
   sdk-php:
     depends_on:

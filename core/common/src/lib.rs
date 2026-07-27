@@ -72,6 +72,7 @@ pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 pub use types::args::*;
+pub use types::binary_request_kind::BinaryRequestKind;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;
 pub use types::cluster::*;

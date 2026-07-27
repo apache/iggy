@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::binary::validate_binary_request_code;
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 #[cfg(feature = "vsr")]
 use crate::session::ConsensusSession;
@@ -39,7 +40,9 @@ use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
     IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
 };
-use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
+use iggy_common::{
+    BinaryClient, BinaryRequestKind, BinaryTransport, PersonalAccessTokenClient, UserClient,
+};
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -136,61 +139,17 @@ impl BinaryTransport for WebSocketClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let result = self.send_raw(code, payload.clone()).await;
-        if result.is_ok() {
-            return result;
-        }
+        self.send_with_reconnect(None, code, payload).await
+    }
 
-        let error = result.unwrap_err();
-        if !matches!(
-            error,
-            IggyError::Disconnected
-                | IggyError::EmptyResponse
-                | IggyError::Unauthenticated
-                | IggyError::StaleClient
-                | IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::TcpError
-                | IggyError::ConnectionClosed
-                | IggyError::WebSocketSendError
-                | IggyError::WebSocketReceiveError
-        ) {
-            return Err(error);
-        }
-
-        if !self.config.reconnection.enabled {
-            return Err(IggyError::Disconnected);
-        }
-
-        #[cfg(feature = "vsr")]
-        if matches!(self.config.auto_login, AutoLogin::Disabled) {
-            return Err(error);
-        }
-
-        self.disconnect().await?;
-
-        #[cfg(feature = "vsr")]
-        let skip_auto_login = is_login_register_code(code);
-        #[cfg(feature = "vsr")]
-        if skip_auto_login {
-            *self.skip_auto_login_once.lock().await = true;
-        }
-
-        {
-            let client_address = self.get_client_address_value().await;
-            info!(
-                "Reconnecting to the server: {} by client: {client_address}...",
-                self.config.server_address
-            );
-        }
-
-        let reconnect = self.connect().await;
-        #[cfg(feature = "vsr")]
-        if skip_auto_login && reconnect.is_err() {
-            *self.skip_auto_login_once.lock().await = false;
-        }
-        reconnect?;
-        self.send_raw(code, payload).await
+    async fn send_binary_request(
+        &self,
+        kind: BinaryRequestKind,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        validate_binary_request_code(code)?;
+        self.send_with_reconnect(Some(kind), code, payload).await
     }
 
     fn get_heartbeat_interval(&self) -> IggyDuration {
@@ -683,7 +642,78 @@ impl WebSocketClient {
         Ok(())
     }
 
-    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    /// Single reconnect-and-replay path shared by the typed and the raw entry
+    /// points, so `kind` survives the retry attempt unchanged.
+    async fn send_with_reconnect(
+        &self,
+        kind: Option<BinaryRequestKind>,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        let result = self.send_raw(kind, code, payload.clone()).await;
+        if result.is_ok() {
+            return result;
+        }
+
+        let error = result.unwrap_err();
+        if !matches!(
+            error,
+            IggyError::Disconnected
+                | IggyError::EmptyResponse
+                | IggyError::Unauthenticated
+                | IggyError::StaleClient
+                | IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::TcpError
+                | IggyError::ConnectionClosed
+                | IggyError::WebSocketSendError
+                | IggyError::WebSocketReceiveError
+        ) {
+            return Err(error);
+        }
+
+        if !self.config.reconnection.enabled {
+            return Err(IggyError::Disconnected);
+        }
+
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+            return Err(error);
+        }
+
+        self.disconnect().await?;
+
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
+
+        {
+            let client_address = self.get_client_address_value().await;
+            info!(
+                "Reconnecting to the server: {} by client: {client_address}...",
+                self.config.server_address
+            );
+        }
+
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
+        self.send_raw(kind, code, payload).await
+    }
+
+    #[cfg_attr(not(feature = "vsr"), expect(unused_variables))]
+    async fn send_raw(
+        &self,
+        kind: Option<BinaryRequestKind>,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
                 trace!("Cannot send data. Client is shutdown.");
@@ -720,7 +750,7 @@ impl WebSocketClient {
                     .consensus_session
                     .lock()
                     .expect("consensus session mutex poisoned");
-                crate::vsr::encode_contiguous_request(&mut consensus_session, code, &payload)?
+                crate::vsr::encode_contiguous_request(&mut consensus_session, kind, code, &payload)?
             };
             trace!(
                 "Sending {NAME} VSR request of size {} with code: {code}",
@@ -874,6 +904,27 @@ const fn is_login_register_code(code: u32) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn raw_binary_transport_rejects_session_control_before_io() {
+        let client =
+            WebSocketClient::from_connection_string("iggy+ws://iggy:iggy@127.0.0.1:8092").unwrap();
+
+        for kind in [
+            BinaryRequestKind::NonReplicated,
+            BinaryRequestKind::Replicated,
+        ] {
+            let error = client
+                .send_binary_request(
+                    kind,
+                    iggy_binary_protocol::codes::LOGIN_USER_CODE,
+                    Bytes::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, IggyError::InvalidCommand));
+        }
+    }
 
     #[test]
     fn should_be_created_with_default_config() {

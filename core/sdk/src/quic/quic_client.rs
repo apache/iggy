@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::binary::validate_binary_request_code;
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
 #[cfg(feature = "vsr")]
 use crate::session::ConsensusSession;
 #[cfg(feature = "vsr")]
 use iggy_common::VsrSessionControl as _;
-use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
+use iggy_common::{
+    BinaryClient, BinaryRequestKind, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
+};
 
 use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
 use crate::quic::skip_server_verification::SkipServerVerification;
@@ -137,59 +140,17 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let result = self.send_raw(code, payload.clone()).await;
-        if result.is_ok() {
-            return result;
-        }
+        self.send_with_reconnect(None, code, payload).await
+    }
 
-        let error = result.unwrap_err();
-        if !matches!(
-            error,
-            IggyError::Disconnected
-                | IggyError::EmptyResponse
-                | IggyError::Unauthenticated
-                | IggyError::StaleClient
-                | IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::QuicError
-        ) {
-            return Err(error);
-        }
-
-        if !self.config.reconnection.enabled {
-            return Err(IggyError::Disconnected);
-        }
-
-        #[cfg(feature = "vsr")]
-        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
-            // Without auto-login a reconnect cannot re-establish the session, so
-            // non-login requests are not recovered here - their transient replay
-            // happens on the live connection inside `send_raw`. Login/register
-            // is the exception: the server stays deliberately silent on a
-            // transient register failure and relies on the client replaying via
-            // a reconnect with a fresh session.
-            return Err(error);
-        }
-
-        self.disconnect().await?;
-        #[cfg(feature = "vsr")]
-        let skip_auto_login = is_login_register_code(code);
-        #[cfg(feature = "vsr")]
-        if skip_auto_login {
-            *self.skip_auto_login_once.lock().await = true;
-        }
-        let server_address = self.current_server_address.lock().await.to_string();
-        info!(
-            "Reconnecting to the server: {}, by client: {}",
-            server_address, self.config.client_address
-        );
-        let reconnect = self.connect().await;
-        #[cfg(feature = "vsr")]
-        if skip_auto_login && reconnect.is_err() {
-            *self.skip_auto_login_once.lock().await = false;
-        }
-        reconnect?;
-        self.send_raw(code, payload).await
+    async fn send_binary_request(
+        &self,
+        kind: BinaryRequestKind,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        validate_binary_request_code(code)?;
+        self.send_with_reconnect(Some(kind), code, payload).await
     }
 
     fn get_heartbeat_interval(&self) -> IggyDuration {
@@ -679,7 +640,76 @@ impl QuicClient {
         Ok(())
     }
 
-    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    /// Single reconnect-and-replay path shared by the typed and the raw entry
+    /// points, so `kind` survives the retry attempt unchanged.
+    async fn send_with_reconnect(
+        &self,
+        kind: Option<BinaryRequestKind>,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        let result = self.send_raw(kind, code, payload.clone()).await;
+        if result.is_ok() {
+            return result;
+        }
+
+        let error = result.unwrap_err();
+        if !matches!(
+            error,
+            IggyError::Disconnected
+                | IggyError::EmptyResponse
+                | IggyError::Unauthenticated
+                | IggyError::StaleClient
+                | IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::QuicError
+        ) {
+            return Err(error);
+        }
+
+        if !self.config.reconnection.enabled {
+            return Err(IggyError::Disconnected);
+        }
+
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
+            // Without auto-login a reconnect cannot re-establish the session, so
+            // non-login requests are not recovered here - their transient replay
+            // happens on the live connection inside `send_raw`. Login/register
+            // is the exception: the server stays deliberately silent on a
+            // transient register failure and relies on the client replaying via
+            // a reconnect with a fresh session.
+            return Err(error);
+        }
+
+        self.disconnect().await?;
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
+        let server_address = self.current_server_address.lock().await.to_string();
+        info!(
+            "Reconnecting to the server: {}, by client: {}",
+            server_address, self.config.client_address
+        );
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
+        self.send_raw(kind, code, payload).await
+    }
+
+    #[cfg_attr(not(feature = "vsr"), expect(unused_variables))]
+    async fn send_raw(
+        &self,
+        kind: Option<BinaryRequestKind>,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
                 trace!("Cannot send data. Client is shutdown.");
@@ -720,7 +750,12 @@ impl QuicClient {
                     let mut consensus_session = consensus_session
                         .lock()
                         .expect("consensus session mutex poisoned");
-                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+                    crate::vsr::encode_request_header(
+                        &mut consensus_session,
+                        kind,
+                        code,
+                        &payload,
+                    )?
                 };
                 trace!("Sending a QUIC VSR request of size {request_size} with code: {code}");
                 // Same-connection transient resend, gated on the EXPLICIT
@@ -923,6 +958,27 @@ mod tests {
         let value = "";
         let quic_client = QuicClient::from_connection_string(value);
         assert!(quic_client.is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_binary_transport_rejects_session_control_before_io() {
+        let client =
+            QuicClient::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080").unwrap();
+
+        for kind in [
+            BinaryRequestKind::NonReplicated,
+            BinaryRequestKind::Replicated,
+        ] {
+            let error = client
+                .send_binary_request(
+                    kind,
+                    iggy_binary_protocol::codes::LOGIN_USER_CODE,
+                    Bytes::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, IggyError::InvalidCommand));
+        }
     }
 
     #[tokio::test]

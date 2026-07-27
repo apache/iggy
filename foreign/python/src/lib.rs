@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod binary_request_kind;
 pub mod client;
 mod consumer;
 mod identifier;
@@ -24,6 +25,7 @@ mod stream;
 mod topic;
 mod user;
 
+use binary_request_kind::BinaryRequestKind;
 use client::IggyClient;
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
@@ -57,5 +59,6 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<UserStatus>()?;
     m.add_class::<UserInfo>()?;
     m.add_class::<UserInfoDetails>()?;
+    m.add_class::<BinaryRequestKind>()?;
     Ok(())
 }

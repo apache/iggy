@@ -18,7 +18,7 @@
 use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
-    Client as IggyConnectionClient, ClusterClient,
+    BinaryRequestKind, Client as IggyConnectionClient, ClusterClient,
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
@@ -1137,7 +1137,7 @@ impl Client {
         RUNTIME.block_on(async {
             let response = self
                 .inner
-                .send_binary_request(code, Bytes::from(payload))
+                .send_binary_request(BinaryRequestKind::NonReplicated, code, Bytes::from(payload))
                 .await
                 .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
             Ok(Vec::from(response))

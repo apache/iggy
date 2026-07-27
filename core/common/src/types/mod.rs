@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod args;
+pub(crate) mod binary_request_kind;
 pub(crate) mod client;
 pub(crate) mod client_state;
 pub(crate) mod cluster;
