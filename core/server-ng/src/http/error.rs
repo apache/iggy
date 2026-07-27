@@ -25,7 +25,7 @@ use axum::Json;
 use axum::http::header::{LOCATION, RETRY_AFTER};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use configs::ng_cluster::ClusterNodeConfig;
+use configs::ng_cluster::{AdvertisedAddress, ClusterNodeConfig};
 use iggy_binary_protocol::Operation;
 use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
@@ -501,8 +501,8 @@ pub(in crate::http) fn primary_redirect_location(
     scheme: &str,
     path_and_query: &str,
 ) -> Option<String> {
-    let socket = primary_advertised_http_socket(roster, primary_index)?;
-    Some(format!("{scheme}://{socket}{path_and_query}"))
+    let authority = primary_advertised_http_authority(roster, primary_index)?;
+    Some(format!("{scheme}://{authority}{path_and_query}"))
 }
 
 /// Resolve the VSR primary's HTTP socket from the static roster: the node
@@ -517,15 +517,17 @@ pub(in crate::http) fn primary_http_socket(
     Some(SocketAddr::new(ip, http_port))
 }
 
-/// Resolve the client-facing HTTP socket for a redirect. The advertised
-/// address is preferred, with the private roster IP retained as the
-/// compatibility fallback. Constructing a socket address brackets IPv6 hosts,
-/// which keeps the resulting redirect URL valid.
-fn primary_advertised_http_socket(roster: &ClusterRoster, primary_index: u8) -> Option<SocketAddr> {
+/// Resolve the client-facing HTTP authority (`host:port`) for a redirect. The
+/// advertised address is preferred, with the private roster IP retained as
+/// the compatibility fallback. [`AdvertisedAddress::authority`] brackets IPv6
+/// hosts and passes hostnames through, so the redirect URL stays valid; a
+/// host that is neither a valid IP nor a valid hostname yields `None` so
+/// callers fail closed.
+fn primary_advertised_http_authority(roster: &ClusterRoster, primary_index: u8) -> Option<String> {
     let (node, http_port) = primary_node(roster, primary_index)?;
     let host = node.advertised_address.as_deref().unwrap_or(&node.ip);
-    let ip = host.parse::<IpAddr>().ok()?;
-    Some(SocketAddr::new(ip, http_port))
+    let address = host.parse::<AdvertisedAddress>().ok()?;
+    Some(address.authority(http_port))
 }
 
 fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ClusterNodeConfig, u16)> {
@@ -639,6 +641,18 @@ mod tests {
         assert_eq!(
             primary_redirect_location(&roster, 0, "https", READ_PATH),
             Some("https://[2001:db8::1]:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_uses_advertised_hostname() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("broker-1.example.com".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            Some("https://broker-1.example.com:8080/streams?consistency=linearizable".to_owned())
         );
     }
 

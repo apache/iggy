@@ -643,8 +643,9 @@ ca_file = ""
 # Each node may also set 'advertised_address': the client-facing address
 # handed out in cluster metadata and leader redirects. Set it when 'ip' is
 # a private replica-network address unreachable by clients (Docker,
-# Kubernetes, NAT). Must be a literal IP address for now. Replica-to-replica
-# traffic always uses 'ip'. Unset = clients get 'ip'.
+# Kubernetes, NAT). Accepts a literal IPv4/IPv6 address or a DNS hostname
+# (RFC 1123: ASCII letters, digits, '-' and '.'; no port, no trailing dot).
+# Replica-to-replica traffic always uses 'ip'. Unset = clients get 'ip'.
 [[cluster.nodes]]
 name = "iggy-node-1"
 ip = "127.0.0.1"
@@ -661,7 +662,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
-# advertised_address = "203.0.113.10"
+# advertised_address = "iggy-node-3.example.com"
 # replica_id = 2
 # ports = { tcp = 8092, http = 3002, tcp_replica = 9092 }
 
