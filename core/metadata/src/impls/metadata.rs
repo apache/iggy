@@ -547,6 +547,14 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         *self.commit_notifier.borrow_mut() = notifier;
     }
 
+    /// Install the client table rebuilt by WAL-replay recovery
+    /// ([`crate::impls::recovery::recover`]). Boot-time only, on the owning
+    /// shard, before it serves traffic - replacing a live table would drop
+    /// committed session state.
+    pub fn install_client_table(&self, client_table: ClientTable) {
+        *self.client_table.borrow_mut() = client_table;
+    }
+
     /// Install the resolved byte value used for `MaxTopicSize::ServerDefault`.
     /// Server-ng bootstrap calls this with `system.topic.max_size` on every
     /// shard (responses read it too); only shard 0's copy feeds admission.
@@ -1960,9 +1968,9 @@ where
     ///
     /// # Safety
     /// Re-preflight per iteration: `commit_journal` may have advanced the
-    /// client's watermark between push and drain (Duplicate / AlreadyApplied
-    /// / `AlreadyRegistered`). Skipping produces a duplicate prepare and
-    /// panics.
+    /// client's watermark between push and drain (`Duplicate` /
+    /// `AlreadyApplied` / `AlreadyRegistered`). Skipping produces a duplicate
+    /// prepare and panics.
     #[allow(clippy::future_not_send)]
     async fn drain_request_queue_into_prepares(&self) {
         let consensus = self.consensus.as_ref().unwrap();

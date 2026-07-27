@@ -199,6 +199,15 @@ pub enum MetadataSubmit {
         partition_id: u32,
         reply: Sender<Option<u64>>,
     },
+    /// A home shard asks shard 0 whether `vsr_client_id` has a live entry in
+    /// the replicated client table, to rebind a reconnecting transport that
+    /// presents its old identity (session resume, IGGY-137). Read-only.
+    /// `reply` carries `(epoch, user_id)` for a registered client, `None`
+    /// otherwise.
+    ResumeLookup {
+        vsr_client_id: u128,
+        reply: Sender<Option<(u64, u32)>>,
+    },
 }
 
 /// Handler shard 0 runs for an inbound [`MetadataSubmit`].

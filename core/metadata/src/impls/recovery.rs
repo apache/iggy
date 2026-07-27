@@ -19,7 +19,8 @@ use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
-use iggy_binary_protocol::consensus::PrepareHeader;
+use consensus::{CLIENTS_TABLE_MAX, ClientTable, build_reply_message, build_reply_message_with};
+use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use server_common::Message;
@@ -86,6 +87,13 @@ pub struct RecoveredMetadata<M> {
     pub journal: PrepareJournal,
     pub snapshot: Option<IggySnapshot>,
     pub mux_stm: M,
+    /// Client table rebuilt from the replayed committed prefix: registers
+    /// re-mint epochs in apply order, replies re-cache byte-identically
+    /// (`build_reply_message*` reads only the prepare header + deterministic
+    /// apply output). Sessions whose register fell below the snapshot floor
+    /// are NOT recovered - the table has no checkpoint artifact yet
+    /// (IGGY-137); those clients re-register and their epoch restarts at 1.
+    pub client_table: ClientTable,
     /// `None` means no snapshot existed and no journal entries were replayed.
     /// `Some(op)` is the highest op applied, either from the snapshot or journal replay.
     ///
@@ -105,7 +113,9 @@ pub struct RecoveredMetadata<M> {
 /// 1. Load snapshot from `{data_dir}/metadata/snapshot.bin` if present
 /// 2. Restore state machine from snapshot, or initialize empty state
 /// 3. Open WAL at `{data_dir}/metadata/journal.wal`, scan and rebuild index
-/// 4. Replay journal entries from the first post-snapshot op through the state machine
+/// 4. Replay journal entries from the first post-snapshot op through the
+///    state machine, rebuilding the client table alongside (registers mint
+///    epochs, replies re-cache) exactly as the commit paths did live
 /// 5. Return the assembled `RecoveredMetadata`
 ///
 /// Only the owning shard (shard 0) should call this. Peer shards receive
@@ -188,6 +198,7 @@ where
             .fold(snapshot_floor, u64::max)
     };
 
+    let mut client_table = ClientTable::new(CLIENTS_TABLE_MAX);
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
     for header in &headers_to_replay {
@@ -200,6 +211,26 @@ where
             continue;
         }
 
+        // Register/Logout mutate the client table and skip the state
+        // machine, mirroring the commit paths (`on_ack` / `commit_journal`).
+        // Replaying them from a fresh table in apply order re-mints the same
+        // epochs every replica derived live.
+        if header.operation == Operation::Register {
+            let reply = build_reply_message(header, &bytes::Bytes::new());
+            client_table.commit_register(header.client, header.user_id, reply, |_| false);
+            last_applied_op = Some(header.op);
+            continue;
+        }
+        if header.operation == Operation::Logout {
+            client_table.remove_client(header.client);
+            // TODO: the commit paths also run `remove_consumer_group_member`
+            // here; recovery has no `StreamsFrontend` bound, so replayed
+            // logouts leave stale group members (pre-existing, harmless for
+            // dead connections but a divergence from the live apply).
+            last_applied_op = Some(header.op);
+            continue;
+        }
+
         let entry = journal.entry_at(header).await?.ok_or_else(|| {
             RecoveryError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -209,6 +240,16 @@ where
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
         let reply = mux_stm.gated_update(entry)?;
+        // Re-cache the reply exactly like the commit paths: same prepare
+        // header + deterministic apply output = the original bytes. Skipped
+        // when the session is absent (server-originated ops, or the client
+        // was evicted / registered below the snapshot floor).
+        if let Some(epoch) = client_table.get_epoch(header.client) {
+            let cached = build_reply_message_with(header, reply.reply_body_len(), |dst| {
+                reply.write_reply_body(dst);
+            });
+            client_table.commit_reply(header.client, epoch, cached);
+        }
         tracing::debug!(
             target: "iggy.metadata.diag",
             op = header.op,
@@ -224,6 +265,7 @@ where
         journal,
         snapshot,
         mux_stm,
+        client_table,
         last_applied_op,
         last_journaled_op,
     })
@@ -261,6 +303,31 @@ mod tests {
         header.op = op;
         header.commit = commit;
         header.operation = Operation::CreateStream;
+        Message::try_from(buffer).unwrap()
+    }
+
+    /// A client-attributed prepare (Register / app op / Logout) as the
+    /// admission path stamps it.
+    fn make_client_prepare(
+        op: u64,
+        operation: Operation,
+        client: u128,
+        user_id: u32,
+        request: u64,
+    ) -> Message<PrepareHeader> {
+        let total_size = HEADER_SIZE;
+        let mut buffer = Owned::<4096>::zeroed(total_size);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.size = total_size as u32;
+        header.command = Command2::Prepare;
+        header.op = op;
+        header.commit = op.saturating_sub(1);
+        header.operation = operation;
+        header.client = client;
+        header.user_id = user_id;
+        header.request = request;
         Message::try_from(buffer).unwrap()
     }
 
@@ -420,6 +487,113 @@ mod tests {
                 .map(IggySnapshot::sequence_number),
             Some(5)
         );
+    }
+
+    // The IGGY-137 restart contract: a rebooted node must remember where
+    // each client left off. Replay re-mints the epoch, restores the
+    // watermark, and re-caches the reply so a retry of the last committed
+    // request id dedups instead of re-executing or silently dropping.
+    #[compio::test]
+    async fn recover_rebuilds_client_table_from_wal() {
+        use consensus::client_table::RequestStatus;
+
+        const CLIENT: u128 = 0x1337;
+        const USER: u32 = 7;
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(1, Operation::Register, CLIENT, USER, 0))
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(
+                    2,
+                    Operation::CreateStream,
+                    CLIENT,
+                    USER,
+                    1,
+                ))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        // Solo: every journaled op is committed.
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            true,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let table = &recovered.client_table;
+        assert_eq!(table.get_epoch(CLIENT), Some(1), "register minted epoch 1");
+        assert_eq!(table.get_user_id(CLIENT), Some(USER));
+        assert_eq!(
+            table.get_watermark(CLIENT),
+            Some(1),
+            "committed request 1 restored the watermark"
+        );
+        match table.check_request(CLIENT, 1, 1, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 1, "retry replays the cached reply");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        assert!(
+            matches!(table.check_request(CLIENT, 1, 2, 0), RequestStatus::New),
+            "the next request id is admitted"
+        );
+    }
+
+    // A replayed Logout removes the entry, mirroring the commit paths.
+    #[compio::test]
+    async fn recover_replays_logout_as_session_removal() {
+        const CLIENT: u128 = 0x1337;
+        const USER: u32 = 7;
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(1, Operation::Register, CLIENT, USER, 0))
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(2, Operation::Logout, CLIENT, USER, 1))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            true,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.client_table.get_epoch(CLIENT),
+            None,
+            "logged-out session must not be resurrected"
+        );
+        assert_eq!(recovered.last_applied_op, Some(2));
     }
 
     #[test]

@@ -258,13 +258,13 @@ impl ClientTable {
             return RequestStatus::ChecksumMismatch { request };
         }
 
-        match entry.find_cached(request) {
-            Some(cached) => RequestStatus::Duplicate(cached.clone()),
-            None => RequestStatus::AlreadyApplied {
+        entry.find_cached(request).map_or(
+            RequestStatus::AlreadyApplied {
                 request,
                 watermark: entry.watermark,
             },
-        }
+            |cached| RequestStatus::Duplicate(cached.clone()),
+        )
     }
 
     /// Check register. Valid without existing entry; returns

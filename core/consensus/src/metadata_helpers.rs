@@ -733,10 +733,9 @@ mod tests {
 
         let sends = consensus.message_bus().client_sends.borrow();
         assert_eq!(sends.len(), 1, "ring hit replays the original reply");
-        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
-            &sends[0].1.as_slice()[..HEADER_SIZE],
-        )
-        .expect("valid ReplyHeader");
+        let header =
+            bytemuck::checked::try_from_bytes::<ReplyHeader>(&sends[0].1.as_slice()[..HEADER_SIZE])
+                .expect("valid ReplyHeader");
         assert_eq!(header.request, 3, "original reply for the retried request");
     }
 

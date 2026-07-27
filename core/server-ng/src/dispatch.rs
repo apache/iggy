@@ -107,7 +107,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
@@ -578,9 +578,140 @@ where
                         .ok();
                     let _ = reply.try_send(commit);
                 }
+                shard::MetadataSubmit::ResumeLookup {
+                    vsr_client_id,
+                    reply,
+                } => {
+                    let entry = lookup_resumable_session(&shard, vsr_client_id);
+                    let _ = reply.try_send(entry);
+                }
             }
         });
     })
+}
+
+/// Shard 0's read side of a session-resume attempt: `(epoch, user_id)` for a
+/// registered client, `None` otherwise. Table reads are only authoritative on
+/// a caught-up primary (same rule as `request_preflight`'s gate); a stale
+/// answer here would rebind a transport to a session the cluster has already
+/// rotated, so fail closed and let the client retry.
+fn lookup_resumable_session<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+    vsr_client_id: u128,
+) -> Option<(u64, u32)>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
+    let metadata = shard.plane.metadata();
+    let consensus = metadata.consensus.as_ref()?;
+    if !consensus::is_caught_up_primary(consensus) {
+        debug!(
+            vsr_client_id,
+            is_primary = consensus.is_primary(),
+            commit_min = consensus.commit_min(),
+            commit_max = consensus.commit_max(),
+            "resume lookup refused: not a caught-up primary"
+        );
+        return None;
+    }
+    let table = metadata.client_table.borrow();
+    let entry = table
+        .get_epoch(vsr_client_id)
+        .zip(table.get_user_id(vsr_client_id));
+    if entry.is_none() {
+        debug!(vsr_client_id, "resume lookup: no table entry");
+    }
+    entry
+}
+
+/// Rebind a reconnecting transport that presents its pre-restart identity
+/// (IGGY-137 session resume, the implicit-rebind contract): a replicated
+/// request on an unbound transport whose `(client, session)` matches a live
+/// entry in the replicated client table binds this connection to that
+/// session and proceeds as if bound all along.
+///
+/// The `(client_id, epoch)` pair acts as a bearer token here: the client id
+/// is a client-generated random u128, so presenting it proves the caller is
+/// (or eavesdropped on) the original registrant. `bind_session` evicts any
+/// previous connection bound to the same client id, which is the conflict
+/// rule for one session arriving on two connections.
+///
+/// Returns the `(client_id, session)` binding on success, `None` when the
+/// identity does not check out (caller falls back to the unbound-transport
+/// reply and the client re-registers).
+#[allow(clippy::future_not_send)]
+async fn try_resume_session<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    header: &RequestHeader,
+) -> Option<(u128, u64)>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
+    // A resumable frame carries the full old identity; anything less is a
+    // plain unbound request (e.g. a fresh SDK that has not registered yet).
+    if header.client == 0 || header.session == 0 || header.request == 0 {
+        return None;
+    }
+
+    let entry = if shard.id == 0 {
+        lookup_resumable_session(shard, header.client)
+    } else {
+        let (reply, rx) = shard::channel::<Option<(u64, u32)>>(1);
+        shard.forward_metadata_submit(shard::MetadataSubmit::ResumeLookup {
+            vsr_client_id: header.client,
+            reply,
+        });
+        rx.recv().await.ok().flatten()
+    };
+    let (epoch, user_id) = entry?;
+    if epoch != header.session {
+        // Stale epoch = zombie holdover (the preflight would fence it);
+        // future epoch = client bug. Neither may rebind.
+        warn!(
+            transport_client_id,
+            client = header.client,
+            presented = header.session,
+            current = epoch,
+            "refusing session resume with mismatched epoch"
+        );
+        return None;
+    }
+
+    {
+        let mut sessions = sessions.borrow_mut();
+        if let Err(error) = sessions.login(transport_client_id, user_id) {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "session resume: login transition failed"
+            );
+            return None;
+        }
+        if let Err(error) = sessions.bind_session(transport_client_id, header.client, epoch) {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "session resume: bind failed"
+            );
+            return None;
+        }
+    }
+    info!(
+        transport_client_id,
+        client = header.client,
+        epoch,
+        user_id,
+        "rebound transport to resumed session"
+    );
+    Some((header.client, epoch))
 }
 
 fn enqueue_client_request<B, MJ, S>(
@@ -748,6 +879,13 @@ async fn handle_client_request<B, MJ, S>(
     }
 
     let bound = sessions.borrow().get_session(transport_client_id);
+    // Unbound transport presenting a full old identity: session resume
+    // (IGGY-137). The table survived the restart via WAL-replay recovery;
+    // a matching `(client, epoch)` rebinds this connection in place.
+    let bound = match bound {
+        Some(bound) => Some(bound),
+        None => try_resume_session(shard, sessions, transport_client_id, &header).await,
+    };
     if bound.is_none() {
         // Replicated request on an unbound transport. Without this short-
         // circuit, the rewrite below overwrites `header.client` with
@@ -2168,11 +2306,10 @@ async fn handle_delete_segments_request<B, MJ, S>(
     // offset on the owning shard, then replicate a `TruncatePartition(offset)`
     // AS the client's own request through the standard owner path: the commit
     // records (client, session, request) in the `ClientTable` on every replica,
-    // keeping the sequence contiguous. Skipping the commit (or attributing it
-    // to an internal id) leaves a hole that fails the next metadata op's
-    // `request == committed + 1` preflight -> RequestGap -> silent drop -> the
-    // SDK blocks until timeout. A no-op delete still commits `up_to_offset = 0`
-    // (monotonic apply) for the same reason.
+    // advancing the watermark. Skipping the commit (or attributing it to an
+    // internal id) leaves this request id unrecorded, so the SDK's own retry
+    // of it would re-execute instead of deduping. A no-op delete still
+    // commits `up_to_offset = 0` (monotonic apply) for the same reason.
     let truncate = match resolve_delete_segments_truncate(
         shard,
         &header,
@@ -2370,9 +2507,17 @@ where
 }
 
 /// Disconnect cleanup: the local `SessionManager` connection is already
-/// dropped by the caller; this submits a session-matched `Logout` so the
-/// committed apply releases the `ClientTable` slot on every replica (shard 0
-/// included, since shard 0 is itself a replica).
+/// dropped by the caller; for a consumer-group member this submits a
+/// session-matched `Logout` so the committed apply releases the
+/// `ClientTable` slot on every replica (shard 0 included, since shard 0 is
+/// itself a replica) and the group rebalances off the dead consumer.
+///
+/// A connection with NO group membership keeps its session: the client may
+/// reconnect and resume under its old `(client, session)` identity
+/// (IGGY-137, `try_resume_session`), which is exactly the crash-retry window
+/// dedup exists for. Its slot is reclaimed by an explicit client `Logout` or
+/// the table's capacity eviction. Same membership rule as the heartbeat
+/// verifier, which deliberately reaps only group members.
 ///
 /// Deliberately does NOT drop the local `ClientTable` slot first:
 /// `submit_logout_*` short-circuits when the slot is already gone, so a
@@ -2397,6 +2542,21 @@ fn submit_disconnect_logout<B, MJ, S>(
     // The logout apply keys on (client, session) only, so any non-zero id
     // is valid here.
     const DISCONNECT_LOGOUT_REQUEST_ID: u64 = u64::MAX;
+
+    let is_group_member = !shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_group_memberships(vsr_client_id)
+        .is_empty();
+    if !is_group_member {
+        debug!(
+            vsr_client_id,
+            "transport disconnected; keeping session for resume"
+        );
+        return;
+    }
     let bus = shard.bus.clone();
     bus.spawn(async move {
         if let Err(error) =

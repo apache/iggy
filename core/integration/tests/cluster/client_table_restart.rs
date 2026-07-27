@@ -21,41 +21,40 @@
 //! node crash must be able to continue: a retry of an already-committed
 //! request id must be answered from the dedup cache (never re-applied,
 //! never silently dropped), and the next request id must be admitted.
-//! Today the table lives only in memory, so a rebooted node has no record
-//! of the session or its request watermark and both scenarios fail.
 //!
-//! The Rust SDK cannot drive this: it resets its `ConsensusSession` on every
-//! disconnect and re-registers under a fresh identity. The frames are
-//! therefore hand-crafted on a raw TCP socket, same technique as the
-//! protocol-version gate tests.
+//! Server-side this rests on three landed pieces:
 //!
-//! What has to land for these tests to go green, in order:
+//! 1. WAL-replay table recovery: `metadata::impls::recovery::recover`
+//!    replays registers (minting the same epochs) and re-caches committed
+//!    replies byte-identically, so a rebooted node remembers where each
+//!    client left off. Sessions whose register fell below the snapshot
+//!    floor are not recovered yet (no checkpoint artifact - IGGY-137
+//!    remainder).
+//! 2. Implicit rebind: a replicated request on an unbound transport whose
+//!    `(client, session)` matches a live table entry rebinds the transport
+//!    (`try_resume_session`); the same session arriving on two connections
+//!    evicts the older binding (`SessionManager::bind_session`).
+//! 3. Sessions survive transport disconnect: `submit_disconnect_logout`
+//!    tears down only consumer-group members (the group must rebalance off
+//!    a dead consumer); everything else keeps its slot for resume until an
+//!    explicit `Logout` or capacity eviction.
 //!
-//! 1. Persist the clients table (IGGY-137, standalone): include the
-//!    (client id, last request id, cached reply) entries in the checkpoint
-//!    and recover them on boot from WAL replay, so a rebooted node
-//!    remembers where each client left off.
-//! 2. The client stops forgetting itself on disconnect: keep client id,
-//!    session id and request counter across reconnects and present the old
-//!    identity instead of a fresh Register.
-//! 3. The server accepts a resumed identity: look the session up in the
-//!    replicated table, rebind the new transport to it, and answer with
-//!    the last committed request id so the client knows whether its
-//!    in-doubt request went through. Define the conflict rule for the same
-//!    session arriving on two connections (evict the older).
-//! 4. SDK retry rule change: a replicated write may only be retried under
-//!    the same (client id, request id); the path that re-issues an
-//!    in-doubt write under a fresh session after failover goes away.
+//! The Rust SDK cannot drive this yet: it resets its `ConsensusSession` on
+//! every disconnect and re-registers under a fresh identity (the
+//! `sdk/vsr.rs` retry TODO). The frames are therefore hand-crafted on a raw
+//! TCP socket, same technique as the protocol-version gate tests. SDK-side
+//! identity stability (keep client id + request counter across reconnects,
+//! retry replicated writes only under the same identity) is the remaining
+//! client half.
 //!
-//! Steps 2+3 must ship together; 1 is standalone. An alternative to 2-4 is
-//! a per-request idempotency key that is independent of the session, the
-//! way TigerBeetle does it: no session resume at all, retries from a fresh
-//! client session stay safe because dedup keys off the request, not the
-//! (client, session) pair.
+//! Single-node topology on purpose: the raw client pins one address, and a
+//! follower cannot commit replicated TCP writes (no follower forwarding for
+//! TCP yet), so post-failover resume against a 3-node cluster is future
+//! work alongside that forwarding.
 //!
 //! These tests pin the implicit-rebind contract: a resumed client simply
 //! keeps sending under its old `(client, session)` on a fresh connection and
-//! the server rebinds the transport from the persisted table. If the
+//! the server rebinds the transport from the recovered table. If the
 //! session-resume work settles on an explicit resume handshake instead,
 //! adjust `resume_request` to speak it.
 
@@ -102,8 +101,7 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-#[iggy_harness]
-#[ignore = "red until clients-table persistence + session resume land"]
+#[iggy_harness(cluster_nodes = 1)]
 async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     harness: &mut TestHarness,
 ) {
@@ -122,8 +120,7 @@ async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     resume_request(addr, session, 1, &create_stream).await;
 }
 
-#[iggy_harness]
-#[ignore = "red until clients-table persistence + session resume land"]
+#[iggy_harness(cluster_nodes = 1)]
 async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
     harness: &mut TestHarness,
 ) {
