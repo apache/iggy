@@ -43,8 +43,8 @@ use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
 use crate::http::session::{
-    BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, MAX_HTTP_SESSIONS,
-    RegistrationBarrier, forget_if_same, live_entry, sweep_expired,
+    BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
+    forget_if_same, live_entry, sweep_expired,
 };
 
 /// Response header carrying the current VSR view number. Stamped by
@@ -82,6 +82,11 @@ pub(in crate::http) struct HttpInner {
     /// requests for one credential from each running its own `Register`.
     pub(in crate::http) registrations: RegistrationBarrier,
     pub(in crate::http) roster: ClusterRoster,
+    /// Cap on live per-credential sessions: half the configured `[metadata]
+    /// clients_table_max`, so HTTP sessions cannot crowd the TCP/QUIC/WS virtual
+    /// clients out of the shared VSR client table. Read by `resolve_session`
+    /// when admitting a fresh session.
+    pub(in crate::http) max_http_sessions: usize,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
@@ -170,7 +175,7 @@ impl HttpInner {
                     let (admitted, torn) = {
                         let mut table = self.sessions.borrow_mut();
                         let torn = sweep_expired(&mut table, now);
-                        if table.len() >= MAX_HTTP_SESSIONS {
+                        if table.len() >= self.max_http_sessions {
                             // Still full after dropping expired entries: too many
                             // genuinely live sessions. Refuse rather than evict a
                             // live one (its `fresh` client id is orphaned on the

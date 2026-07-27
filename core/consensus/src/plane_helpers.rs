@@ -683,9 +683,9 @@ mod tests {
         consensus.init();
 
         // Diverge the frontiers: applied (commit_min=5) lags known-committed
-        // (commit_max=13) by more than PIPELINE_PREPARE_QUEUE_MAX (8). op is at
-        // 13 (>= commit_max), so the op clamp on the DVC commit is a no-op here
-        // and the carried value is commit_max. The clamp itself is covered by
+        // (commit_max=13). op is at 13 (>= commit_max), so the op clamp on the
+        // DVC commit is a no-op here and the carried value is commit_max. The
+        // clamp itself is covered by
         // `do_view_change_commit_clamped_to_op_when_commit_max_exceeds_op`.
         consensus.advance_commit_max(13);
         consensus.sequencer().set_sequence(13);
@@ -908,6 +908,74 @@ mod tests {
         assert!(
             buf.is_empty(),
             "loopback queue must be empty after view change completion"
+        );
+    }
+
+    /// A DVC winner may claim an uncommitted range up to the *configured*
+    /// prepare depth. With a pipeline deeper than the default const, the new
+    /// primary schedules the rebuild rather than panicking on the old
+    /// `PIPELINE_PREPARE_QUEUE_MAX` bound.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn given_view_change_range_above_default_when_complete_as_primary_should_rebuild() {
+        use iggy_binary_protocol::{DoViewChangeHeader, StartViewChangeHeader};
+
+        let depth = crate::PIPELINE_PREPARE_QUEUE_MAX * 2;
+        // Strictly above the default const, still within the configured depth.
+        let winner_op = (crate::PIPELINE_PREPARE_QUEUE_MAX + 8) as u64;
+
+        // 3 replicas, replica 0 is primary for view 3 (3 % 3 = 0).
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            0,
+            NoopBus,
+            LocalPipeline::with_capacities(depth, depth * 2),
+        );
+        consensus.init();
+
+        // SVC from replica 1 moves replica 0 into view 3 and records its own DVC.
+        let svc = StartViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 3,
+            release: 0,
+            command: Command2::StartViewChange,
+            replica: 1,
+            reserved_frame: [0; 66],
+            namespace: 0,
+            reserved: [0; 120],
+        };
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc);
+
+        // DVC from replica 2 claims a log head far past commit, forming quorum.
+        let dvc = DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 3,
+            release: 0,
+            command: Command2::DoViewChange,
+            replica: 2,
+            reserved_frame: [0; 66],
+            op: winner_op,
+            commit: 0,
+            namespace: 0,
+            log_view: 0,
+            reserved: [0; 100],
+        };
+        let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc);
+
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                VsrAction::RebuildPipeline { from_op: 1, to_op } if *to_op == winner_op
+            )),
+            "expected RebuildPipeline over the full uncommitted range"
         );
     }
 

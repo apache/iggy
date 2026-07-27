@@ -198,10 +198,11 @@ impl IntoResponse for AuthError {
             }
             // A fresh session could not be established: the Register was
             // canceled with its commit outcome unknown, or the session table
-            // is at `MAX_HTTP_SESSIONS` and refused the fresh registration.
-            // Transient server condition -> 503, retryable by the CLIENT only
-            // (a forwarder must not re-issue an unknown-outcome Register under
-            // this node's session budget on the caller's behalf).
+            // is at its cap (half `[metadata] clients_table_max`) and refused
+            // the fresh registration. Transient server condition -> 503,
+            // retryable by the CLIENT only (a forwarder must not re-issue an
+            // unknown-outcome Register under this node's session budget on
+            // the caller's behalf).
             // `SessionIdTaken` only escapes the mint retry when every attempt
             // collided, which means the minter is wrong rather than unlucky --
             // same unknown-outcome answer as a canceled Register.
@@ -461,6 +462,12 @@ pub(in crate::http) enum ReadError {
     /// query, so the caller re-issues the read against the leader (see
     /// [`primary_redirect_response`]).
     RedirectToPrimary(String),
+    /// The post-restart read-recovery barrier expired with the recovered WAL
+    /// suffix still uncommitted: serving now could show state that rolls back
+    /// history a client already saw acked. Fail-closed 503 via the shared
+    /// [`service_unavailable`] body, retryable once the cluster re-commits the
+    /// suffix.
+    RecoveryIncomplete,
     /// A partition read (poll / consumer-offset) got no reply from the owning
     /// shard within the mesh budget. 504 like a produce timeout: the outcome is
     /// unknown (the abandoned read may still be running), so the caller retries.
@@ -476,6 +483,7 @@ impl IntoResponse for ReadError {
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
+            Self::RecoveryIncomplete => service_unavailable(),
             Self::Timeout => gateway_timeout_response(
                 "partition_read_timeout",
                 "the partition owner did not answer the read in time; retry",
@@ -738,5 +746,25 @@ mod tests {
                 "an unknown commit outcome must stay retryable, got {status}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_incomplete_renders_retryable_503_like_not_primary() {
+        // Barrier expiry must render as the shared retryable 503: the same
+        // status and Retry-After hint as the not-primary 503, so an SDK treats
+        // it as a connection-level retry rather than a terminal error.
+        let recovery = ReadError::RecoveryIncomplete.into_response();
+        assert_eq!(recovery.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            recovery.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(RETRY_AFTER_SECONDS))
+        );
+
+        let not_primary = ReadError::NotPrimary.into_response();
+        assert_eq!(recovery.status(), not_primary.status());
+        assert_eq!(
+            recovery.headers().get(RETRY_AFTER),
+            not_primary.headers().get(RETRY_AFTER)
+        );
     }
 }
