@@ -155,6 +155,13 @@ pub struct ClusterNodeConfig {
     pub ports: TransportPorts,
 }
 
+/// Per-node listener ports advertised in the cluster roster. In cluster mode
+/// the roster is the single source of ports: every enabled transport needs
+/// an explicit per-node port (validated at startup, no fallback to the
+/// transport's top-level `address` port). The roster entry's `ip` is the
+/// advertised address only: ws/quic/http bind the interface from their own
+/// `address` config, and followers forward HTTP requests to the primary at
+/// `ip:http`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, ConfigEnv)]
 pub struct TransportPorts {
     pub tcp: Option<u16>,
@@ -171,11 +178,9 @@ pub struct TransportPorts {
 /// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
 /// themselves; this covers only the key material.
 ///
-/// Single source for both the boot-time config validator and the server-ng
-/// runtime forwarding gate. If the two ever disagree the validator's roster
-/// http-port guarantee is silently bypassed: forwarding would activate against
-/// a node the validator never required to expose an http port, and every
-/// forward through it fails closed with a 503.
+/// Forwarding targets resolve from the roster (`ip:ports.http`); the config
+/// validator unconditionally requires a roster port for every enabled
+/// transport, so a forward never dials a node without a declared http port.
 pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
     cluster.enabled
         && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())

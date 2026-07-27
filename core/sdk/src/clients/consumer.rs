@@ -39,7 +39,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::sleep;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>> + Send>>;
@@ -1209,7 +1209,10 @@ impl IggyConsumer {
                 .leave_consumer_group(&self.stream_id, &self.topic_id, &group_id)
                 .await
             {
-                warn!(
+                // Expected on clean teardown after an explicit leave (member
+                // not found) or when the group was deleted underneath the
+                // consumer, so this is debug, not a warning.
+                debug!(
                     "Failed to leave consumer group: {group_id} for stream: {}, topic: {}. {error}",
                     self.stream_id, self.topic_id
                 );
