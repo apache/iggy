@@ -58,6 +58,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 use tracing::warn;
 
+/// Bit position of the target-shard tag inside a minted client id: the top 16
+/// bits carry the shard, the bottom 112 the mint sequence.
+const CLIENT_ID_SHARD_SHIFT: u32 = 112;
+
 /// Coordinator owned by shard 0 only.
 ///
 /// Wrapped in `Rc` by the bootstrap and shared with the replica listener,
@@ -143,7 +147,32 @@ impl ShardZeroCoordinator {
     fn mint_client_id(&self, target_shard: u16) -> u128 {
         let seq = self.client_seq.get();
         self.client_seq.set(seq.wrapping_add(1));
-        (u128::from(target_shard) << 112) | seq
+        (u128::from(target_shard) << CLIENT_ID_SHARD_SHIFT) | seq
+    }
+
+    /// Reseed the mint counter above every sequence in `recovered_ids`.
+    ///
+    /// The counter is per process and starts at 1, while a restarted node
+    /// recovers client-table entries keyed by the previous boot's ids. Left
+    /// alone, the first logins after a restart re-mint ids that are already
+    /// taken: a different user's login is then refused outright (the register
+    /// ownership gate), and the same user's inherits a watermark it never
+    /// wrote. Seeding past the recovered high-water mark makes the collision
+    /// unreachable instead of handled.
+    ///
+    /// Boot-time only, on shard 0, before any listener accepts. Never lowers
+    /// the counter.
+    pub fn seed_client_sequence(&self, recovered_ids: impl Iterator<Item = u128>) {
+        const SEQUENCE_MASK: u128 = (1 << CLIENT_ID_SHARD_SHIFT) - 1;
+
+        let highest = recovered_ids.map(|id| id & SEQUENCE_MASK).max();
+        let Some(highest) = highest else {
+            return;
+        };
+        let next = highest.saturating_add(1);
+        if next > self.client_seq.get() {
+            self.client_seq.set(next);
+        }
     }
 
     /// Mint a client id for a connection that terminates locally on shard 0
@@ -484,6 +513,64 @@ mod tests {
         let id = coord.mint_client_id(5);
         assert_eq!((id >> 112) as u16, 5);
         assert_eq!(id & ((1u128 << 112) - 1), 1, "first seq is 1");
+    }
+
+    // A restarted node recovers table entries keyed by the previous boot's
+    // ids while the minter restarts at 1. Reseeding past the recovered
+    // high-water mark is what keeps a fresh login off an existing entry.
+    #[test]
+    fn seed_client_sequence_mints_above_recovered_ids() {
+        let senders = build_senders(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        // Recovered ids carry their own shard tags; only the sequence matters.
+        let recovered = [
+            (1u128 << CLIENT_ID_SHARD_SHIFT) | 0x07,
+            (3u128 << CLIENT_ID_SHARD_SHIFT) | 0x2a,
+            9,
+        ];
+        coord.seed_client_sequence(recovered.into_iter());
+
+        let id = coord.mint_client_id(2);
+        assert_eq!(
+            id & ((1u128 << CLIENT_ID_SHARD_SHIFT) - 1),
+            0x2b,
+            "must mint above the highest recovered sequence"
+        );
+        assert_eq!((id >> CLIENT_ID_SHARD_SHIFT) as u16, 2, "tag preserved");
+    }
+
+    // Never lower the counter: a later reseed (or an empty table) must not
+    // hand back ids this process already minted.
+    #[test]
+    fn seed_client_sequence_never_lowers_the_counter() {
+        let senders = build_senders(2);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            2,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        for _ in 0..5 {
+            let _ = coord.mint_client_id(0);
+        }
+        coord.seed_client_sequence(std::iter::empty());
+        coord.seed_client_sequence([1u128, 2].into_iter());
+
+        let id = coord.mint_client_id(0);
+        assert_eq!(
+            id & ((1u128 << CLIENT_ID_SHARD_SHIFT) - 1),
+            6,
+            "counter must keep advancing from where minting left off"
+        );
     }
 
     #[test]

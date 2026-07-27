@@ -37,10 +37,12 @@ use tokio::sync::Mutex;
 ///
 /// Bounded by the shared VSR client table: HTTP sessions and the TCP/QUIC/WS
 /// virtual clients all Register into the one [`CLIENTS_TABLE_MAX`]-slot table,
-/// which LRU-evicts the oldest client when full. Capping HTTP at half that
-/// bound keeps this plane from crowding the others out and keeps the combined
-/// steady state under the shared bound, so a live idle HTTP session is not
-/// routinely evicted consensus-side. The residual eviction race (both planes
+/// which evicts the oldest-committed client when full. Capping HTTP at half
+/// that bound keeps this plane from crowding the others out and keeps the
+/// combined steady state under the shared bound, so a live idle HTTP session
+/// is not routinely evicted consensus-side. The other half stays honest
+/// because a dropped connection releases its slot once the reclaim grace
+/// expires, rather than holding it for the process lifetime. The residual eviction race (both planes
 /// busy) degrades gracefully: an evicted session's next control write is
 /// classified as an eviction and re-registers (see [`HttpInner::forget_session`]).
 pub(in crate::http) const MAX_HTTP_SESSIONS: usize = CLIENTS_TABLE_MAX / 2;

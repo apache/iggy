@@ -217,7 +217,7 @@ where
         // epochs every replica derived live.
         if header.operation == Operation::Register {
             let reply = build_reply_message(header, &bytes::Bytes::new());
-            client_table.commit_register(header.client, header.user_id, reply, |_| false);
+            client_table.commit_register(header.client, header.user_id, reply);
             last_applied_op = Some(header.op);
             continue;
         }
@@ -244,11 +244,15 @@ where
         // header + deterministic apply output = the original bytes. Skipped
         // when the session is absent (server-originated ops, or the client
         // was evicted / registered below the snapshot floor).
-        if let Some(epoch) = client_table.get_epoch(header.client) {
+        if client_table.get_epoch(header.client).is_some() {
             let cached = build_reply_message_with(header, reply.reply_body_len(), |dst| {
                 reply.write_reply_body(dst);
             });
-            client_table.commit_reply(header.client, epoch, cached);
+            // Skips (never panics) on a stale-request replay: capacity
+            // eviction is replica-local and unlogged, so a WAL can legitimately
+            // replay a lower request id onto a preserved watermark. Recovery
+            // must boot from such a WAL, not refuse it.
+            let _ = client_table.commit_reply(header.client, cached);
         }
         tracing::debug!(
             target: "iggy.metadata.diag",

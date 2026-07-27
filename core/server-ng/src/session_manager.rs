@@ -99,11 +99,25 @@ pub struct SessionManager {
     /// Reverse index: `client_id` → `connection_id` for fast lookup when
     /// a consensus reply arrives and needs routing to the right connection.
     client_to_connection: HashMap<u128, u128>,
+    /// Disconnected sessions awaiting reclaim, `client_id` -> deadline.
+    /// See [`Self::defer_reclaim`].
+    pending_reclaims: HashMap<u128, PendingReclaim>,
     /// This shard's copy of the configured cluster roster, served by the
     /// pre-auth `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
     /// installed once at bootstrap, disabled until then.
     cluster_roster: Rc<ClusterRoster>,
+}
+
+/// A disconnected session's slot, held open just long enough for the client
+/// to come back and resume onto it.
+#[derive(Debug, Clone, Copy)]
+struct PendingReclaim {
+    /// Fence epoch the disconnected connection was bound to; the reclaiming
+    /// `Logout` is session-matched against it so it cannot wipe a newer
+    /// registration under the same id.
+    session: u64,
+    deadline: Instant,
 }
 
 impl SessionManager {
@@ -112,6 +126,7 @@ impl SessionManager {
         Self {
             connections: HashMap::new(),
             client_to_connection: HashMap::new(),
+            pending_reclaims: HashMap::new(),
             cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
     }
@@ -164,6 +179,66 @@ impl SessionManager {
             .filter(|(_, conn)| now.duration_since(conn.last_heartbeat) > max_age)
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// Hold a disconnected session's client-table slot open for `grace`, then
+    /// let the sweeper reclaim it.
+    ///
+    /// Session resume runs through the login path: a reconnecting client
+    /// re-authenticates under its previous `client_id` and the register fast
+    /// path binds it back to the existing entry, watermark and reply ring
+    /// intact. That only works while the entry still exists, so a disconnect
+    /// cannot reclaim it immediately -- but leaving it forever moves the
+    /// client table's eviction point from concurrent connections to CUMULATIVE
+    /// connects, and every capacity eviction silently erases a watermark
+    /// (turning that client's next retry back into a re-execution). The grace
+    /// window is the compromise: resume within it, reclaim after.
+    ///
+    /// Consumer-group members skip this entirely and are logged out at once --
+    /// the group must rebalance off a dead consumer without waiting.
+    pub fn defer_reclaim(&mut self, client_id: u128, session: u64, grace: Duration, now: Instant) {
+        self.pending_reclaims.insert(
+            client_id,
+            PendingReclaim {
+                session,
+                deadline: now + grace,
+            },
+        );
+    }
+
+    /// Drop a pending reclaim because the client came back. Called from
+    /// [`Self::bind_session`], so a resumed session is never reclaimed out
+    /// from under its new connection.
+    fn cancel_reclaim(&mut self, client_id: u128) {
+        self.pending_reclaims.remove(&client_id);
+    }
+
+    /// Drop a pending reclaim because its `Logout` committed and the slot is
+    /// released. Separate from [`Self::cancel_reclaim`] only in intent: the
+    /// reclaim submit is fire-and-forget and can fail transiently, so the
+    /// sweeper re-arms the deadline before submitting and the entry is cleared
+    /// here on success. Without that pairing a failed submit would drop the
+    /// bookkeeping and leak the slot until capacity eviction, which silently
+    /// erases the client's dedup watermark.
+    pub fn complete_reclaim(&mut self, client_id: u128) {
+        self.pending_reclaims.remove(&client_id);
+    }
+
+    /// Take every reclaim whose grace has elapsed. The caller submits a
+    /// session-matched `Logout` for each, which releases the client-table slot
+    /// on every replica.
+    #[must_use]
+    pub fn take_expired_reclaims(&mut self, now: Instant) -> Vec<(u128, u64)> {
+        let mut reclaimed = Vec::new();
+        self.pending_reclaims.retain(|&client_id, pending| {
+            if now >= pending.deadline {
+                reclaimed.push((client_id, pending.session));
+                false
+            } else {
+                true
+            }
+        });
+        reclaimed
     }
 
     /// The consensus client id a connection is bound to, if any. The heartbeat
@@ -266,6 +341,10 @@ impl SessionManager {
         {
             old_conn.state = ConnectionState::Connected;
         }
+
+        // The client came back and re-authenticated onto this session, so a
+        // reclaim deferred by its previous disconnect must not fire.
+        self.cancel_reclaim(client_id);
 
         // Now mutate the target connection.
         self.connections.get_mut(&connection_id).unwrap().state = ConnectionState::Bound {
@@ -547,5 +626,84 @@ mod tests {
         assert_eq!(mgr.remove_connection(c1), Some((100, 10)));
         assert!(mgr.get_session(c1).is_none());
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
+    }
+    // A disconnected non-group session holds its client-table slot only for
+    // the grace window: resume within it, reclaim after. Without the reclaim
+    // the slot leaks per cumulative connect and pushes the client table into
+    // capacity eviction, which silently erases dedup watermarks.
+    #[test]
+    fn deferred_reclaim_expires_after_its_grace_window() {
+        let mut mgr = SessionManager::new();
+        let now = Instant::now();
+        let grace = Duration::from_mins(1);
+
+        mgr.defer_reclaim(100, 7, grace, now);
+        assert!(
+            mgr.take_expired_reclaims(now + Duration::from_secs(59))
+                .is_empty(),
+            "inside the window the slot is held for resume"
+        );
+        assert_eq!(
+            mgr.take_expired_reclaims(now + Duration::from_secs(61)),
+            vec![(100, 7)],
+            "past the window the slot is reclaimed with its bound epoch"
+        );
+        assert!(
+            mgr.take_expired_reclaims(now + Duration::from_mins(10))
+                .is_empty(),
+            "a reclaim is taken exactly once"
+        );
+    }
+
+    // A client that comes back and re-authenticates onto its session must not
+    // have it reclaimed out from under the new connection.
+    #[test]
+    fn rebinding_cancels_a_pending_reclaim() {
+        let mut mgr = SessionManager::new();
+        let now = Instant::now();
+        mgr.defer_reclaim(100, 7, Duration::from_mins(1), now);
+
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5100), ClientTransportKind::Tcp);
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 7).unwrap();
+
+        assert!(
+            mgr.take_expired_reclaims(now + Duration::from_mins(10))
+                .is_empty(),
+            "the resumed session must survive its old disconnect's reclaim"
+        );
+        assert_eq!(mgr.get_session(conn), Some((100, 7)));
+    }
+
+    // The reclaim submit is spawned and can fail transiently, so the sweeper
+    // re-arms before submitting and clears only on a committed `Logout`. This
+    // pins both halves: a failed submit comes back, a committed one does not.
+    #[test]
+    fn re_armed_reclaim_retries_until_completed() {
+        let mut mgr = SessionManager::new();
+        let now = Instant::now();
+        let grace = Duration::from_mins(1);
+
+        mgr.defer_reclaim(100, 7, grace, now);
+        let swept = mgr.take_expired_reclaims(now + grace);
+        assert_eq!(swept, vec![(100, 7)]);
+
+        // Submit failed: the sweeper's re-arm is what makes it retryable.
+        mgr.defer_reclaim(100, 7, grace, now + grace);
+        assert_eq!(
+            mgr.take_expired_reclaims(now + grace + grace),
+            vec![(100, 7)],
+            "a failed submit must be retried, not leaked"
+        );
+
+        // Submit committed on the retry.
+        mgr.defer_reclaim(100, 7, grace, now + grace + grace);
+        mgr.complete_reclaim(100);
+        assert!(
+            mgr.take_expired_reclaims(now + Duration::from_mins(10))
+                .is_empty(),
+            "a completed reclaim must not be re-submitted"
+        );
     }
 }

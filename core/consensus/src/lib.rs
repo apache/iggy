@@ -143,7 +143,7 @@ where
 }
 
 pub mod client_table;
-pub use client_table::{CachedReply, ClientTable};
+pub use client_table::{CachedReply, ClientTable, CommitReply};
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};

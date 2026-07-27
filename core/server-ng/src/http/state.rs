@@ -235,7 +235,7 @@ impl HttpInner {
             let _ = result_slot.send(result);
         })
         .detach();
-        let session = committed
+        let bound = committed
             .await
             .map_err(|_| AuthError::SessionUnavailable)?
             .map_err(|error| {
@@ -253,14 +253,23 @@ impl HttpInner {
                     _ => AuthError::SessionUnavailable,
                 }
             })?;
+        // Number from above the entry's watermark, not from 1. The gateway is
+        // the one client whose request counter lives in the process that
+        // restarts: after a reboot the id minter can re-mint this client id
+        // for the same user, binding to the recovered entry -- numbering from
+        // FIRST_REQUEST_ID would then read as duplicates and answer this
+        // session's writes with the previous boot's cached replies. A fresh
+        // entry has watermark 0, so this is FIRST_REQUEST_ID there.
+        let next_request = bound.watermark + 1;
+        debug_assert!(next_request >= FIRST_REQUEST_ID);
         Ok(Rc::new(HttpSession {
             key,
             client_id,
-            session,
+            session: bound.epoch,
             user_id,
             expiry,
-            gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
+            gate: Mutex::new(next_request),
+            data_request: Cell::new(next_request),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         }))

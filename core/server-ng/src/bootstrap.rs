@@ -977,7 +977,9 @@ async fn shard_main(
     // dedups retries and admits continuations from clients that kept their
     // identity across the restart (IGGY-137).
     if let Some(client_table) = recovered_client_table {
-        metadata.install_client_table(client_table);
+        // Refusal (a client registered before this ran) keeps the live table
+        // and is logged by the callee; boot continues either way.
+        let _ = metadata.install_client_table(client_table);
     }
     // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
     // message expiry) at admission; every shard's copy backs the same resolution in responses.
@@ -1214,6 +1216,10 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
+        // Reseed the client-id minter above every recovered entry before any
+        // listener accepts. The counter is per process; the table it must not
+        // collide with was rebuilt from the previous boot's WAL.
+        coord.seed_client_sequence(shard.plane.metadata().client_table.borrow().client_ids());
         let on_client_request =
             make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
         let (accepted_replica, dialed_replica) =
