@@ -26,6 +26,7 @@
 //! net.
 
 use super::COMPONENT_NG;
+use super::cluster::http_forwarding_key_material;
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
@@ -135,6 +136,25 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
                 "http.tls.enabled=true requires non-empty http.tls.cert_file and http.tls.key_file"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Without key material forwarding is disabled (followers answer a
+        // transient 503) and the server still boots, so it is not required
+        // here. When it IS present the operator opted into forwarding, and the
+        // roster must support it: a node listed without an http port would
+        // silently degrade every forward through it to a fail-closed 503.
+        let http_forwarding_active =
+            self.http.enabled && http_forwarding_key_material(&self.http.jwt, &self.cluster);
+        if http_forwarding_active {
+            for node in &self.cluster.nodes {
+                if node.ports.http.is_none() {
+                    eprintln!(
+                        "cluster node '{}' has no ports.http; every node needs one when http.enabled so followers can forward to the primary",
+                        node.name
+                    );
+                    return Err(ConfigurationError::InvalidConfigurationValue);
+                }
+            }
         }
 
         if topic_size < self.system.segment.size.as_bytes_u64() {
@@ -272,6 +292,7 @@ impl Validatable<ConfigurationError> for NamespaceConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cluster::{ClusterNodeConfig, TransportPorts};
     use super::*;
     use figment::Figment;
     use figment::providers::{Format, Toml};
@@ -408,5 +429,79 @@ mod tests {
     fn validate_accepts_tls_enabled_with_both_files_set() {
         let cfg = https_config("cert.pem", "key.pem");
         assert!(cfg.validate().is_ok());
+    }
+
+    fn cluster_node(replica_id: u8, http: Option<u16>) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: format!("node-{replica_id}"),
+            ip: "127.0.0.1".to_string(),
+            replica_id,
+            ports: TransportPorts {
+                tcp: Some(8090 + u16::from(replica_id)),
+                quic: None,
+                http,
+                websocket: None,
+                tcp_replica: Some(9090 + u16::from(replica_id)),
+            },
+        }
+    }
+
+    fn clustered_http_config(nodes: Vec<ClusterNodeConfig>) -> ServerNgConfig {
+        let mut cfg = ServerNgConfig::default();
+        cfg.http.enabled = true;
+        cfg.cluster.enabled = true;
+        cfg.cluster.name = "test-cluster".to_string();
+        cfg.cluster.nodes = nodes;
+        cfg
+    }
+
+    // Keyless cluster+http boots: forwarding degrades to off instead of
+    // failing the whole server.
+    #[test]
+    fn validate_accepts_cluster_http_without_jwt_secret_or_cluster_auth() {
+        let cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // Without key material forwarding is off, so the roster http-port
+    // requirement does not apply either.
+    #[test]
+    fn validate_accepts_keyless_cluster_http_with_portless_roster_node() {
+        let cfg = clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_cluster_http_with_configured_jwt_secrets() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef".to_string();
+        cfg.http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_cluster_http_with_cluster_auth_as_jwt_key_source() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.cluster.auth.enabled = true;
+        cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_cluster_http_when_a_roster_node_has_no_http_port() {
+        let mut cfg =
+            clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
+        cfg.cluster.auth.enabled = true;
+        cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(cfg.validate().is_err());
     }
 }

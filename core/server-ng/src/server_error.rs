@@ -177,6 +177,8 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to build the HTTP forward client: {reason}")]
+    HttpForwardClient { reason: String },
     #[error("failed to construct IggyShard from bootstrap inputs")]
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]

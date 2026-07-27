@@ -24,6 +24,7 @@
 
 use super::defaults::SERVER_NG_CONFIG;
 use crate::ConfigurationError;
+use crate::http::HttpJwtConfig;
 use configs::ConfigEnv;
 use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,24 @@ pub struct TransportPorts {
     pub websocket: Option<u16>,
     /// Dedicated port for replica-to-replica consensus traffic.
     pub tcp_replica: Option<u16>,
+}
+
+/// Whether cluster-wide JWT key material exists: a configured `http.jwt`
+/// secret, or the signing key derived from the cluster PSK. When it does, a
+/// bearer minted on any node verifies on every node - the invariant
+/// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
+/// themselves; this covers only the key material.
+///
+/// Single source for both the boot-time config validator and the server-ng
+/// runtime forwarding gate. If the two ever disagree the validator's roster
+/// http-port guarantee is silently bypassed: forwarding would activate against
+/// a node the validator never required to expose an http port, and every
+/// forward through it fails closed with a 503.
+pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
+    cluster.enabled
+        && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
+            || !jwt.encoding_secret.is_empty()
+            || !jwt.decoding_secret.is_empty())
 }
 
 impl Validatable<ConfigurationError> for ClusterConfig {

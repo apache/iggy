@@ -38,7 +38,7 @@ use crate::dispatch::{
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{
-    classify_partition_reply, committed_payload, eviction_error, is_transient_not_committed,
+    classify_partition_reply, committed_payload, eviction_error, transient_code,
 };
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
@@ -189,6 +189,7 @@ async fn submit_gated(
     let request_header = *message.header();
     let deadline = Instant::now() + TRANSIENT_RETRY_DEADLINE;
     let mut request = message;
+    let mut saw_not_committed = false;
     let reply = loop {
         // The submit consumes the request; keep a byte-identical copy for a
         // possible replay. Re-running the rewrites instead would mint a fresh
@@ -197,22 +198,36 @@ async fn submit_gated(
         let Some(reply) = submit_client_request_on_owner(shard, request).await else {
             return Err(WriteError::Unavailable);
         };
-        if reply.header().command != Command2::Reply || !is_transient_not_committed(&reply) {
+        let transient = (reply.header().command == Command2::Reply)
+            .then(|| transient_code(&reply))
+            .flatten();
+        let Some(transient) = transient else {
             break reply;
-        }
-        // Pre-consensus `TransientNotCommitted`: replay the SAME request id,
-        // mirroring the binary SDKs' in-client loop. Safe to replay - the
-        // dominant emissions never entered the pipeline, and the view-change
-        // cancel is dedup-idempotent (the client table serves the cached
-        // reply). The gate stays held across the replay on purpose: the
-        // request keeps its serialization turn, and a queued same-session
-        // write would only hit the same transient.
+        };
+        saw_not_committed |= matches!(transient, IggyError::TransientNotCommitted);
+        // Pre-consensus transient frame: replay the SAME request id, mirroring
+        // the binary SDKs' in-client loop. Safe to replay - the dominant
+        // emissions never entered the pipeline, and the view-change cancel is
+        // dedup-idempotent (the client table serves the cached reply). The
+        // gate stays held across the replay on purpose: the request keeps its
+        // serialization turn, and a queued same-session write would only hit
+        // the same transient.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Budget exhausted with the op still not committed: surface the
-            // transient code, which renders as a retryable 503, never the
-            // catch-all 400.
-            return Err(WriteError::Rejected(IggyError::TransientNotCommitted));
+            // Budget exhausted: surface a retryable 503 (never the catch-all
+            // 400), with the code sticky across frames. Once ANY frame was
+            // `TransientNotCommitted` the op may still commit cluster-wide (a
+            // view-change-canceled prepare can reach quorum and be inherited
+            // by the new primary), so a later `TransientNotAccepted` frame -
+            // this node losing the primary role mid-replay - must not
+            // downgrade it: `TransientNotAccepted` licenses a forwarding
+            // follower to re-issue at the new primary under a fresh session,
+            // which would double-apply the possibly-committed op.
+            return Err(WriteError::Rejected(if saw_not_committed {
+                IggyError::TransientNotCommitted
+            } else {
+                transient
+            }));
         }
         compio::time::sleep(TRANSIENT_RETRY_INTERVAL.min(remaining)).await;
         request = retry_request;
