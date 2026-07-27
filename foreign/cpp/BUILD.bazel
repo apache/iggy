@@ -17,6 +17,11 @@
 
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library", "cc_test")
 
+config_setting(
+    name = "vsr_enabled",
+    define_values = {"iggy_cpp_vsr": "true"},
+)
+
 genrule(
     name = "cargo_build",
     srcs = glob(["src/**/*.rs"]) + [
@@ -30,6 +35,13 @@ genrule(
         "cxxbridge/sources/lib.rs.cc",
     ],
     cmd = """
+        CARGO_FEATURE_FLAGS=""
+    """ + select({
+        ":vsr_enabled": """
+        CARGO_FEATURE_FLAGS="--features vsr"
+        """,
+        "//conditions:default": "",
+    }) + """
         set -euo pipefail
 
         EXECROOT="$$(pwd)"
@@ -55,7 +67,7 @@ genrule(
         env -u PWD \
             CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" \
             RUSTC="$$RUSTC" \
-            "$$CARGO" build $$FLAGS
+            "$$CARGO" build $$FLAGS $$CARGO_FEATURE_FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 

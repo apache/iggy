@@ -37,18 +37,6 @@ use std::sync::Arc;
 /// reserve `u32::MAX` as the sentinel for `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
 
-/// A C++ `enum class` can hold any value of its underlying type, so cxx models
-/// a shared enum as an open repr and the catch-all arm is reachable.
-fn resolve_binary_request_kind(
-    kind: ffi::BinaryRequestKind,
-) -> Result<RustBinaryRequestKind, String> {
-    match kind {
-        ffi::BinaryRequestKind::NonReplicated => Ok(RustBinaryRequestKind::NonReplicated),
-        ffi::BinaryRequestKind::Replicated => Ok(RustBinaryRequestKind::Replicated),
-        _ => Err(format!("invalid binary request kind: {}", kind.repr)),
-    }
-}
-
 fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<Consumer, String> {
     match consumer_kind {
         "consumer" => Ok(Consumer::new(consumer_id)),
@@ -1151,7 +1139,7 @@ impl Client {
         code: u32,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
-        let kind = resolve_binary_request_kind(kind)?;
+        let kind = RustBinaryRequestKind::try_from(kind)?;
         RUNTIME.block_on(async {
             let response = self
                 .inner

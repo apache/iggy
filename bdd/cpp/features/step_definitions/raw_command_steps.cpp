@@ -30,20 +30,6 @@
 
 #include "world.hpp"
 
-namespace {
-
-iggy::ffi::BinaryRequestKind parse_request_kind(const std::string &kind) {
-    if (kind == "non_replicated") {
-        return iggy::ffi::BinaryRequestKind::NonReplicated;
-    }
-    if (kind == "replicated") {
-        return iggy::ffi::BinaryRequestKind::Replicated;
-    }
-    throw std::invalid_argument("unknown binary request kind: " + kind);
-}
-
-}  // namespace
-
 WHEN("^I send a raw (\\w+) command with code ([0-9]+) and an empty payload$") {
     REGEX_PARAM(std::string, kind);
     REGEX_PARAM(std::uint32_t, code);
@@ -52,8 +38,14 @@ WHEN("^I send a raw (\\w+) command with code ([0-9]+) and an empty payload$") {
     context->raw_response.clear();
     context->raw_error.clear();
     try {
+        auto request_kind = iggy::ffi::BinaryRequestKind::NonReplicated;
+        if (kind == "replicated") {
+            request_kind = iggy::ffi::BinaryRequestKind::Replicated;
+        } else if (kind != "non_replicated") {
+            throw std::invalid_argument("unknown binary request kind: " + kind);
+        }
         const auto response =
-            context->client->send_binary_request(parse_request_kind(kind), code, rust::Vec<std::uint8_t>());
+            context->client->send_binary_request(request_kind, code, rust::Vec<std::uint8_t>());
         context->raw_response.assign(response.begin(), response.end());
     } catch (const std::exception &error) {
         context->raw_error = error.what();

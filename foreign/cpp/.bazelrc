@@ -35,6 +35,9 @@ build:release --copt=-O2
 build:release --copt=-DNDEBUG
 build:release --strip=always
 
+# VSR framing
+build:vsr --define=iggy_cpp_vsr=true
+
 # CI configuration
 common:ci --color=no
 common:ci --curses=no

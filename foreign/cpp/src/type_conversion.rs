@@ -18,10 +18,11 @@
 use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{
-    ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
-    IggyMessage as RustIggyMessage, Partition as RustPartition,
-    PolledMessages as RustPolledMessages, Stream as RustStream, StreamDetails as RustStreamDetails,
-    Topic as RustTopic, TopicDetails as RustTopicDetails, Validatable,
+    BinaryRequestKind as RustBinaryRequestKind, ConsumerGroupDetails as RustConsumerGroupDetails,
+    IdKind, Identifier as RustIdentifier, IggyMessage as RustIggyMessage,
+    Partition as RustPartition, PolledMessages as RustPolledMessages, Stream as RustStream,
+    StreamDetails as RustStreamDetails, Topic as RustTopic, TopicDetails as RustTopicDetails,
+    Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::{
@@ -36,6 +37,19 @@ use iggy_common::{
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
 };
 use std::collections::BTreeMap;
+
+/// Cxx models shared C++ enums as open representations, so the catch-all arm is reachable.
+impl TryFrom<ffi::BinaryRequestKind> for RustBinaryRequestKind {
+    type Error = String;
+
+    fn try_from(kind: ffi::BinaryRequestKind) -> Result<Self, Self::Error> {
+        match kind {
+            ffi::BinaryRequestKind::NonReplicated => Ok(Self::NonReplicated),
+            ffi::BinaryRequestKind::Replicated => Ok(Self::Replicated),
+            _ => Err(format!("invalid binary request kind: {}", kind.repr)),
+        }
+    }
+}
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {

@@ -24,6 +24,9 @@ Build commands
 // Build binary
 bazel build //:iggy-cpp
 
+// Build binary with VSR framing
+bazel build --config=vsr //:iggy-cpp
+
 // Unit tests
 bazel test //:unit
 
