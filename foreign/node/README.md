@@ -30,6 +30,35 @@ npm i --save apache-iggy
 
 ## basic usage
 
+### VSR framing
+
+Select VSR at runtime when connecting to `iggy-server-ng`:
+
+```typescript
+import {
+  BinaryRequestKind,
+  SimpleClient,
+  getRawClient,
+} from "apache-iggy";
+
+const config = {
+  protocol: "vsr" as const,
+  transport: "TCP" as const,
+  options: { host: "127.0.0.1", port: 8090 },
+  credentials: { username: "iggy", password: "iggy" },
+};
+const client = new SimpleClient(getRawClient(config));
+const response = await client.sendBinaryRequest(
+  BinaryRequestKind.NonReplicated,
+  60_000,
+  Buffer.from("opaque mutation"),
+);
+```
+
+VSR is a runtime protocol choice in Node.js, not a build feature. Custom
+non-replicated codes use `Operation::NonReplicated`; custom replicated codes
+are rejected until a server-side replicated extension registry exists.
+
 ```ts
 import { Client } from "apache-iggy";
 

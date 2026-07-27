@@ -18,7 +18,7 @@
 import asyncio
 import socket
 
-from apache_iggy import IggyClient
+from apache_iggy import BinaryRequestKind, IggyClient
 from pytest_bdd import given, parsers, scenarios, then, when
 
 scenarios("/app/features/raw_command.feature")
@@ -48,12 +48,20 @@ def authenticated_root_user(context):
     asyncio.run(login())
 
 
-@when(parsers.parse("I send a raw command with code {code:d} and an empty payload"))
-def send_raw_command(context, code):
+KINDS = {
+    "non_replicated": BinaryRequestKind.NonReplicated,
+    "replicated": BinaryRequestKind.Replicated,
+}
+
+
+@when(
+    parsers.parse("I send a raw {kind} command with code {code:d} and an empty payload")
+)
+def send_raw_command(context, kind, code):
     async def send():
         try:
             context.last_raw_response = await context.client.send_binary_request(
-                code, b""
+                KINDS[kind], code, b""
             )
             context.last_raw_error = None
         except RuntimeError as error:
@@ -80,3 +88,9 @@ def raw_command_fails_with_invalid_command(context):
     assert context.last_raw_response is None
     assert context.last_raw_error is not None
     assert "invalid command" in str(context.last_raw_error).lower()
+
+
+@then("the raw command should fail")
+def raw_command_fails(context):
+    assert context.last_raw_response is None
+    assert context.last_raw_error is not None

@@ -18,7 +18,7 @@
 use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
-    Client as IggyConnectionClient, ClusterClient,
+    BinaryRequestKind as RustBinaryRequestKind, Client as IggyConnectionClient, ClusterClient,
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
@@ -36,6 +36,18 @@ use std::sync::Arc;
 /// partition based on the consumer/strategy. Cxx FFI does not support `Option<u32>`, so we
 /// reserve `u32::MAX` as the sentinel for `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
+
+/// A C++ `enum class` can hold any value of its underlying type, so cxx models
+/// a shared enum as an open repr and the catch-all arm is reachable.
+fn resolve_binary_request_kind(
+    kind: ffi::BinaryRequestKind,
+) -> Result<RustBinaryRequestKind, String> {
+    match kind {
+        ffi::BinaryRequestKind::NonReplicated => Ok(RustBinaryRequestKind::NonReplicated),
+        ffi::BinaryRequestKind::Replicated => Ok(RustBinaryRequestKind::Replicated),
+        _ => Err(format!("invalid binary request kind: {}", kind.repr)),
+    }
+}
 
 fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<Consumer, String> {
     match consumer_kind {
@@ -1133,11 +1145,17 @@ impl Client {
 
     /// Sends a command code and payload and returns the raw response bytes.
     /// Session-control codes return an invalid-command error.
-    pub fn send_binary_request(&self, code: u32, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+    pub fn send_binary_request(
+        &self,
+        kind: ffi::BinaryRequestKind,
+        code: u32,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let kind = resolve_binary_request_kind(kind)?;
         RUNTIME.block_on(async {
             let response = self
                 .inner
-                .send_binary_request(code, Bytes::from(payload))
+                .send_binary_request(kind, code, Bytes::from(payload))
                 .await
                 .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
             Ok(Vec::from(response))

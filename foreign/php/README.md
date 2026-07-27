@@ -214,8 +214,13 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   be read repeatedly.
 - Large unsigned values that can overflow PHP integers, such as message checksums,
   are returned as decimal strings.
-- `Iggy\Client::sendBinaryRequest(int $code, string $payload): string` sends a
-  command code and payload and returns the raw response body.
+- `Iggy\Client::sendBinaryRequest(string $kind, int $code, string $payload): string`
+  sends a command code and payload and returns the raw response body. `$kind` is
+  `'non_replicated'` or `'replicated'`. The kind is inert on classic framing (both
+  kinds encode identical bytes and the server decides); it only selects a wire
+  path when the extension is built with `vsr`.
+- Framing is chosen at compile time. Build the extension with `--features vsr` to
+  speak the consensus protocol; the default build uses the classic protocol.
 - `Iggy\Client` is synchronous and blocks the current PHP thread.
 - The extension owns a lazy global Tokio runtime. Do not call `pcntl_fork()` after
   the first Iggy SDK call; the child process inherits file descriptors but not

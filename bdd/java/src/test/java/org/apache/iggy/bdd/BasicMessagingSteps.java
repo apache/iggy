@@ -22,6 +22,7 @@ package org.apache.iggy.bdd;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
+import org.apache.iggy.client.BinaryRequestKind;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.exception.IggyErrorCode;
@@ -212,10 +213,11 @@ public class BasicMessagingSteps {
         assertEquals(context.lastSentMessage, lastPayload, "Last message should match sent message");
     }
 
-    @When("I send a raw command with code {int} and an empty payload")
-    public void sendRawCommand(int code) {
+    @When("I send a raw {word} command with code {int} and an empty payload")
+    public void sendRawCommand(String kind, int code) {
         try {
-            context.lastRawResponse = getClient().sendBinaryRequest(code, new byte[0]);
+            context.lastRawResponse =
+                    getClient().sendBinaryRequest(BinaryRequestKind.fromName(kind), code, new byte[0]);
             context.lastRawError = null;
         } catch (RuntimeException error) {
             context.lastRawResponse = null;
@@ -243,6 +245,12 @@ public class BasicMessagingSteps {
         assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
         IggyServerException error = (IggyServerException) context.lastRawError;
         assertEquals(IggyErrorCode.INVALID_COMMAND, error.getErrorCode());
+    }
+
+    @Then("the raw command should fail")
+    public void rawCommandFails() {
+        assertNull(context.lastRawResponse, "Raw response should be absent");
+        assertNotNull(context.lastRawError, "Raw command should fail");
     }
 
     private IggyBaseClient getClient() {

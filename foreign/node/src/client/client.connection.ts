@@ -23,6 +23,7 @@ import { connect as TLSConnect } from 'node:tls';
 import type { ClientConfig, TlsOption, TcpOption, ReconnectOption } from "./client.type.js"
 import { serializeCommand } from './client.utils.js';
 import { debug } from './client.debug.js';
+import { HEADER_SIZE as VSR_HEADER_SIZE, readSize as readVsrSize } from '../wire/vsr/header.js';
 
 
 /**
@@ -208,6 +209,23 @@ export class IggyConnection extends EventEmitter {
     this.connect();
   }
 
+  async redirect(host: string, port: number) {
+    this.socket.removeAllListeners();
+    this.socket.destroy();
+    this.connected = false;
+    this.connecting = false;
+    this._endResponseWait();
+    this.config.options = { ...this.config.options, host, port };
+    this.socket = getTransport(this.config);
+    await this.connect();
+  }
+
+  isConnectedTo(host: string, port: number): boolean {
+    if (this.socket.remotePort !== port)
+      return false;
+    return normalizeHost(this.socket.remoteAddress) === normalizeHost(host);
+  }
+
   /**
    * Destroys the connection and marks it as ending.
    */
@@ -250,17 +268,17 @@ export class IggyConnection extends EventEmitter {
     while (offset < data.length) {
       const remaining = data.length - offset;
 
-      // Need at least 8 bytes for the header (4 bytes status + 4 bytes length)
-      if (remaining < 8) {
+      const headerSize = this.config.protocol === 'vsr' ? VSR_HEADER_SIZE : 8;
+      if (remaining < headerSize) {
         // Buffer the incomplete header and wait for more data
         this.waitingResponseEnd = true;
         this.readBuffers = data.subarray(offset);
         return;
       }
 
-      // Read the header
-      const responseSize = data.readUInt32LE(offset + 4);
-      const totalSize = 8 + responseSize;
+      const totalSize = this.config.protocol === 'vsr'
+        ? readVsrSize(data.subarray(offset))
+        : 8 + data.readUInt32LE(offset + 4);
 
       // Check if we have the complete response (header + payload)
       if (remaining < totalSize) {
@@ -293,4 +311,14 @@ export class IggyConnection extends EventEmitter {
     const cmd = serializeCommand(command, payload);
     return this.socket.write(cmd);
   }
+
+  writeFrame(frame: Buffer): boolean {
+    return this.socket.write(frame);
+  }
 }
+
+const normalizeHost = (host?: string): string =>
+  (host ?? '').toLowerCase()
+    .replace(/^::ffff:/, '')
+    .replace('localhost', '127.0.0.1')
+    .replace('::1', '127.0.0.1');

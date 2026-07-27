@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::binary::validate_binary_request_code;
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
@@ -38,7 +39,9 @@ use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
 };
-use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
+use iggy_common::{
+    BinaryClient, BinaryRequestKind, BinaryTransport, PersonalAccessTokenClient, UserClient,
+};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
@@ -148,64 +151,17 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let result = self.send_raw(code, payload.clone()).await;
-        if result.is_ok() {
-            return result;
-        }
+        self.send_with_reconnect(None, code, payload).await
+    }
 
-        let error = result.unwrap_err();
-        if !matches!(
-            error,
-            IggyError::Disconnected
-                | IggyError::EmptyResponse
-                | IggyError::Unauthenticated
-                | IggyError::StaleClient
-                | IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::TcpError
-        ) {
-            return Err(error);
-        }
-
-        if !self.config.reconnection.enabled {
-            return Err(IggyError::Disconnected);
-        }
-
-        #[cfg(feature = "vsr")]
-        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
-            // Without auto-login a reconnect cannot re-establish the session,
-            // so non-login requests fail fast. Login/register itself is the
-            // exception: the server stays deliberately silent on transient
-            // register failures (server-ng `surface_login_failure`) and
-            // relies on the client timing out and replaying the request.
-            return Err(error);
-        }
-
-        self.disconnect().await?;
-
-        #[cfg(feature = "vsr")]
-        let skip_auto_login = is_login_register_code(code);
-        #[cfg(feature = "vsr")]
-        if skip_auto_login {
-            *self.skip_auto_login_once.lock().await = true;
-        }
-
-        {
-            let client_address = self.get_client_address_value().await;
-            let server_address = self.current_server_address.lock().await.clone();
-            info!(
-                "Reconnecting to the server: {} by client: {client_address}...",
-                server_address
-            );
-        }
-
-        let reconnect = self.connect().await;
-        #[cfg(feature = "vsr")]
-        if skip_auto_login && reconnect.is_err() {
-            *self.skip_auto_login_once.lock().await = false;
-        }
-        reconnect?;
-        self.send_raw(code, payload).await
+    async fn send_binary_request(
+        &self,
+        kind: BinaryRequestKind,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        validate_binary_request_code(code)?;
+        self.send_with_reconnect(Some(kind), code, payload).await
     }
 
     fn get_heartbeat_interval(&self) -> IggyDuration {
@@ -708,7 +664,81 @@ impl TcpClient {
         Ok(())
     }
 
-    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    /// Single reconnect-and-replay path shared by the typed and the raw entry
+    /// points, so `kind` survives the retry attempt unchanged.
+    async fn send_with_reconnect(
+        &self,
+        kind: Option<BinaryRequestKind>,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
+        let result = self.send_raw(kind, code, payload.clone()).await;
+        if result.is_ok() {
+            return result;
+        }
+
+        let error = result.unwrap_err();
+        if !matches!(
+            error,
+            IggyError::Disconnected
+                | IggyError::EmptyResponse
+                | IggyError::Unauthenticated
+                | IggyError::StaleClient
+                | IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::TcpError
+        ) {
+            return Err(error);
+        }
+
+        if !self.config.reconnection.enabled {
+            return Err(IggyError::Disconnected);
+        }
+
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
+            // Without auto-login a reconnect cannot re-establish the session,
+            // so non-login requests fail fast. Login/register itself is the
+            // exception: the server stays deliberately silent on transient
+            // register failures (server-ng `surface_login_failure`) and
+            // relies on the client timing out and replaying the request.
+            return Err(error);
+        }
+
+        self.disconnect().await?;
+
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
+
+        {
+            let client_address = self.get_client_address_value().await;
+            let server_address = self.current_server_address.lock().await.clone();
+            info!(
+                "Reconnecting to the server: {} by client: {client_address}...",
+                server_address
+            );
+        }
+
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
+        self.send_raw(kind, code, payload).await
+    }
+
+    #[cfg_attr(not(feature = "vsr"), expect(unused_variables))]
+    async fn send_raw(
+        &self,
+        kind: Option<BinaryRequestKind>,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
                 trace!("Cannot send data. Client is shutdown.");
@@ -744,6 +774,7 @@ impl TcpClient {
                 };
                 let (header, result) = self
                     .send_raw_vsr_attempt(
+                        kind,
                         code,
                         payload.clone(),
                         preencoded,
@@ -858,6 +889,7 @@ impl TcpClient {
     #[cfg(feature = "vsr")]
     async fn send_raw_vsr_attempt(
         &self,
+        kind: Option<BinaryRequestKind>,
         code: u32,
         payload: Bytes,
         preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
@@ -892,7 +924,12 @@ impl TcpClient {
                         let mut consensus_session = consensus_session
                             .lock()
                             .expect("consensus session mutex poisoned");
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)
+                        crate::vsr::encode_request_header(
+                            &mut consensus_session,
+                            kind,
+                            code,
+                            &payload,
+                        )
                     };
                     match encoded {
                         Ok((header, request_size)) => {
@@ -1063,6 +1100,27 @@ mod tests {
         let value = "";
         let tcp_client = TcpClient::from_connection_string(value);
         assert!(tcp_client.is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_binary_transport_rejects_session_control_before_io() {
+        let client =
+            TcpClient::from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090").unwrap();
+
+        for kind in [
+            BinaryRequestKind::NonReplicated,
+            BinaryRequestKind::Replicated,
+        ] {
+            let error = client
+                .send_binary_request(
+                    kind,
+                    iggy_binary_protocol::codes::LOGIN_USER_CODE,
+                    Bytes::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, IggyError::InvalidCommand));
+        }
     }
 
     #[test]

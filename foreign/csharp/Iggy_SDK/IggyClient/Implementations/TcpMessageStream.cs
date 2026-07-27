@@ -594,9 +594,16 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default)
+    /// <remarks>
+    ///     <paramref name="kind" /> is not encoded: classic framing has no operation field, so both
+    ///     kinds produce the same bytes and the server owns the command's execution model. It is
+    ///     validated so a caller learns about an undefined value here rather than once the C# client
+    ///     gains VSR framing.
+    /// </remarks>
+    public async Task<byte[]> SendBinaryRequestAsync(BinaryRequestKind kind, uint code, byte[] payload,
+        CancellationToken token = default)
     {
-        if (SessionControlCodes.Contains(code))
+        if (!Enum.IsDefined(kind) || SessionControlCodes.Contains(code))
         {
             throw new IggyInvalidStatusCodeException(InvalidCommandStatus,
                 $"Invalid response status code: {InvalidCommandStatus}");

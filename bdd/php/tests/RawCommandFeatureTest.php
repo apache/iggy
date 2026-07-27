@@ -64,9 +64,9 @@ final class RawCommandFeatureTest extends TestCase
             );
             return;
         }
-        if (preg_match('/^I send a raw command with code (\d+) and an empty payload$/', $step, $matches) === 1) {
+        if (preg_match('/^I send a raw (\w+) command with code (\d+) and an empty payload$/', $step, $matches) === 1) {
             try {
-                $this->lastResponse = $this->requireClient()->sendBinaryRequest((int) $matches[1], '');
+                $this->lastResponse = $this->requireClient()->sendBinaryRequest($matches[1], (int) $matches[2], '');
                 $this->lastError = null;
             } catch (Throwable $error) {
                 $this->lastResponse = null;
@@ -88,6 +88,11 @@ final class RawCommandFeatureTest extends TestCase
             assert_same(null, $this->lastResponse);
             assert_instance_of(IggyException::class, $this->lastError);
             assert_true(str_contains(strtolower((string) $this->lastError?->getMessage()), 'invalid command'));
+            return;
+        }
+        if ($step === 'the raw command should fail') {
+            assert_same(null, $this->lastResponse);
+            assert_instance_of(IggyException::class, $this->lastError);
             return;
         }
 

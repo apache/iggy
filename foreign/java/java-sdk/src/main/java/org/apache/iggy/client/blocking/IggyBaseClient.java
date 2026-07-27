@@ -19,6 +19,8 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.client.BinaryRequestKind;
+
 public interface IggyBaseClient {
 
     /**
@@ -27,11 +29,13 @@ public interface IggyBaseClient {
      * <p>Session-control codes are rejected with an invalid-command error. HTTP clients report
      * that this operation is unsupported.
      *
+     * @param kind how the command executes; classic framing has no operation field, so both kinds
+     *     encode identical bytes and the server decides
      * @param code the command code
      * @param payload the command payload
      * @return the raw response payload
      */
-    byte[] sendBinaryRequest(int code, byte[] payload);
+    byte[] sendBinaryRequest(BinaryRequestKind kind, int code, byte[] payload);
 
     SystemClient system();
 

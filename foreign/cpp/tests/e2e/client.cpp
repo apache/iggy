@@ -1718,7 +1718,10 @@ TEST_F(LowLevelE2E_Client, SendBinaryRequestPingReturnsEmptyBytes) {
 
     rust::Vec<std::uint8_t> empty_payload;
     rust::Vec<std::uint8_t> response;
-    ASSERT_NO_THROW({ response = client->send_binary_request(ping_command_code, empty_payload); });
+    ASSERT_NO_THROW({
+        response =
+            client->send_binary_request(iggy::ffi::BinaryRequestKind::NonReplicated, ping_command_code, empty_payload);
+    });
     EXPECT_TRUE(response.empty());
 }
 
@@ -1730,8 +1733,37 @@ TEST_F(LowLevelE2E_Client, SendBinaryRequestGetStatsReturnsNonEmptyBytes) {
 
     rust::Vec<std::uint8_t> empty_payload;
     rust::Vec<std::uint8_t> response;
-    ASSERT_NO_THROW({ response = client->send_binary_request(get_stats_command_code, empty_payload); });
+    ASSERT_NO_THROW({
+        response = client->send_binary_request(iggy::ffi::BinaryRequestKind::NonReplicated, get_stats_command_code,
+                                               empty_payload);
+    });
     EXPECT_FALSE(response.empty());
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestReplicatedDeclarationIsIgnoredOnClassicFraming) {
+    RecordProperty("description",
+                   "The kind is inert on classic framing: a replicated declaration on a standard command succeeds.");
+    constexpr std::uint32_t get_stats_command_code = 10;
+    iggy::ffi::Client *client                      = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    rust::Vec<std::uint8_t> response;
+    ASSERT_NO_THROW({
+        response = client->send_binary_request(iggy::ffi::BinaryRequestKind::Replicated, get_stats_command_code,
+                                               empty_payload);
+    });
+    EXPECT_FALSE(response.empty());
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestUndefinedKindThrows) {
+    RecordProperty("description", "Rejects a kind value outside the defined enum before any bytes are sent.");
+    constexpr std::uint32_t ping_command_code = 1;
+    iggy::ffi::Client *client                 = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    ASSERT_THROW(
+        client->send_binary_request(static_cast<iggy::ffi::BinaryRequestKind>(7), ping_command_code, empty_payload),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, SendBinaryRequestLoginUserCodeThrows) {
@@ -1741,14 +1773,34 @@ TEST_F(LowLevelE2E_Client, SendBinaryRequestLoginUserCodeThrows) {
     iggy::ffi::Client *client                       = GetLoggedInClient();
 
     rust::Vec<std::uint8_t> empty_payload;
-    ASSERT_THROW(client->send_binary_request(login_user_command_code, empty_payload), std::exception);
+    for (auto kind : {iggy::ffi::BinaryRequestKind::NonReplicated, iggy::ffi::BinaryRequestKind::Replicated}) {
+        ASSERT_THROW(client->send_binary_request(kind, login_user_command_code, empty_payload), std::exception);
+    }
 }
 
-TEST_F(LowLevelE2E_Client, SendBinaryRequestUnknownCommandCodeThrows) {
-    RecordProperty("description", "Rejects an unknown command code with an invalid-command error from the server.");
-    constexpr std::uint32_t unknown_command_code = 60000;
-    iggy::ffi::Client *client                    = GetLoggedInClient();
+TEST_F(LowLevelE2E_Client, SendBinaryRequestVendorCommandCodeThrows) {
+    RecordProperty("description", "Rejects a vendor command code no server registers a handler for.");
+    constexpr std::uint32_t vendor_command_code = 60001;
+    iggy::ffi::Client *client                   = GetLoggedInClient();
 
     rust::Vec<std::uint8_t> empty_payload;
-    ASSERT_THROW(client->send_binary_request(unknown_command_code, empty_payload), std::exception);
+    ASSERT_THROW(
+        client->send_binary_request(iggy::ffi::BinaryRequestKind::NonReplicated, vendor_command_code, empty_payload),
+        std::exception);
+
+    // The rejection is request-level, so the connection stays usable.
+    constexpr std::uint32_t ping_command_code = 1;
+    ASSERT_NO_THROW(
+        client->send_binary_request(iggy::ffi::BinaryRequestKind::NonReplicated, ping_command_code, empty_payload));
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestReplicatedVendorCommandCodeThrows) {
+    RecordProperty("description", "Rejects a replicated vendor command code: there is no extension registry yet.");
+    constexpr std::uint32_t vendor_command_code = 60001;
+    iggy::ffi::Client *client                   = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    ASSERT_THROW(
+        client->send_binary_request(iggy::ffi::BinaryRequestKind::Replicated, vendor_command_code, empty_payload),
+        std::exception);
 }

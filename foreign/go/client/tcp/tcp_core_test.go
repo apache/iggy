@@ -386,8 +386,22 @@ func TestDisconnect_ShutdownClientIsNotResurrected(t *testing.T) {
 }
 
 func TestSendBinaryRequest_FrameLayoutAndSuccess(t *testing.T) {
+	for _, kind := range []iggcon.BinaryRequestKind{
+		iggcon.BinaryRequestKindNonReplicated,
+		iggcon.BinaryRequestKindReplicated,
+	} {
+		t.Run(kind.String(), func(t *testing.T) {
+			assertRawFrameLayout(t, kind)
+		})
+	}
+}
+
+// assertRawFrameLayout proves the declaration never reaches the wire: classic
+// framing has no operation field, so both kinds emit the same bytes.
+func assertRawFrameLayout(t *testing.T, kind iggcon.BinaryRequestKind) {
+	t.Helper()
 	c, serverConn := newTestClient(t)
-	const code = uint32(60_000)
+	const code = uint32(60_001)
 	payload := []byte{0xAA, 0xBB, 0xCC}
 	body := []byte("opaque response")
 
@@ -424,7 +438,7 @@ func TestSendBinaryRequest_FrameLayoutAndSuccess(t *testing.T) {
 		}
 	}()
 
-	result, err := c.SendBinaryRequest(context.Background(), code, payload)
+	result, err := c.SendBinaryRequest(context.Background(), kind, code, payload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,9 +464,32 @@ func TestSendBinaryRequest_ErrorStatus(t *testing.T) {
 
 	go serverRespond(t, serverConn, uint32(ierror.InvalidCommandCode), nil)
 
-	_, err := c.SendBinaryRequest(context.Background(), 60_000, nil)
+	_, err := c.SendBinaryRequest(context.Background(), iggcon.BinaryRequestKindNonReplicated, 60_001, nil)
 	if !errors.Is(err, ierror.ErrInvalidCommand) {
 		t.Errorf("got %v, want %v", err, ierror.ErrInvalidCommand)
+	}
+}
+
+func TestSendBinaryRequest_UndefinedKindGuard(t *testing.T) {
+	c, serverConn := newTestClient(t)
+
+	wrote := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		if _, err := serverConn.Read(buf); err == nil {
+			close(wrote)
+		}
+	}()
+
+	_, err := c.SendBinaryRequest(context.Background(), iggcon.BinaryRequestKind(0), 60_001, nil)
+	if !errors.Is(err, ierror.ErrInvalidCommand) {
+		t.Errorf("got %v, want %v", err, ierror.ErrInvalidCommand)
+	}
+
+	select {
+	case <-wrote:
+		t.Fatal("expected no bytes to be written to the wire for an undefined kind")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -474,10 +511,15 @@ func TestSendBinaryRequest_SessionControlGuard(t *testing.T) {
 		uint32(command.LoginWithAccessTokenCode),
 		uint32(command.LoginRegisterWithPATCode),
 	}
-	for _, guardedCode := range guardedCodes {
-		_, err := c.SendBinaryRequest(context.Background(), guardedCode, nil)
-		if !errors.Is(err, ierror.ErrInvalidCommand) {
-			t.Errorf("code %d: got %v, want %v", guardedCode, err, ierror.ErrInvalidCommand)
+	for _, kind := range []iggcon.BinaryRequestKind{
+		iggcon.BinaryRequestKindNonReplicated,
+		iggcon.BinaryRequestKindReplicated,
+	} {
+		for _, guardedCode := range guardedCodes {
+			_, err := c.SendBinaryRequest(context.Background(), kind, guardedCode, nil)
+			if !errors.Is(err, ierror.ErrInvalidCommand) {
+				t.Errorf("kind %s, code %d: got %v, want %v", kind, guardedCode, err, ierror.ErrInvalidCommand)
+			}
 		}
 	}
 

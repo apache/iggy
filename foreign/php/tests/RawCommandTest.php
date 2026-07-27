@@ -27,14 +27,18 @@ final class RawCommandTest extends TestCase
 {
     private const PING_CODE = 1;
     private const GET_STATS_CODE = 10;
-    private const UNKNOWN_CODE = 60_000;
+    private const NON_REPLICATED = 'non_replicated';
+    private const REPLICATED = 'replicated';
+
+    /** No server registers a handler for this code. */
+    private const VENDOR_CODE = 60_001;
 
     #[TestDox('A raw ping command returns an empty successful response')]
     public function testRawPingReturnsEmptyResponse(): void
     {
         $client = new_client();
 
-        $response = $client->sendBinaryRequest(self::PING_CODE, '');
+        $response = $client->sendBinaryRequest(self::NON_REPLICATED, self::PING_CODE, '');
 
         assert_same('', $response);
     }
@@ -44,34 +48,82 @@ final class RawCommandTest extends TestCase
     {
         $client = new_client();
 
-        $response = $client->sendBinaryRequest(self::GET_STATS_CODE, '');
+        $response = $client->sendBinaryRequest(self::NON_REPLICATED, self::GET_STATS_CODE, '');
 
         assert_true($response !== '', 'expected a non-empty stats response');
     }
 
     #[TestDox('A session-control code is rejected before reaching the server')]
     #[DataProvider('sessionControlCodes')]
-    public function testRawSessionControlCodeIsRejected(int $code): void
+    public function testRawSessionControlCodeIsRejected(string $kind, int $code): void
     {
         $client = new_client();
 
-        $throwable = assert_throws(static fn () => $client->sendBinaryRequest($code, ''));
+        $throwable = assert_throws(static fn () => $client->sendBinaryRequest($kind, $code, ''));
 
         assert_instance_of(IggyException::class, $throwable);
     }
 
-    #[TestDox('An unknown command code is rejected by the server')]
-    public function testRawUnknownCodeIsRejectedByServer(): void
+    #[TestDox('A vendor command code is rejected and the connection stays usable')]
+    public function testRawVendorCodeIsRejectedByServer(): void
     {
         $client = new_client();
 
-        $throwable = assert_throws(static fn () => $client->sendBinaryRequest(self::UNKNOWN_CODE, ''));
+        $throwable = assert_throws(
+            static fn () => $client->sendBinaryRequest(self::NON_REPLICATED, self::VENDOR_CODE, '')
+        );
 
         assert_instance_of(IggyException::class, $throwable);
+        assert_same('', $client->sendBinaryRequest(self::NON_REPLICATED, self::PING_CODE, ''));
+    }
+
+    #[TestDox('A replicated vendor command code has no handler')]
+    public function testRawReplicatedVendorCodeIsRejected(): void
+    {
+        $client = new_client();
+
+        $throwable = assert_throws(
+            static fn () => $client->sendBinaryRequest(self::REPLICATED, self::VENDOR_CODE, '')
+        );
+
+        assert_instance_of(IggyException::class, $throwable);
+    }
+
+    #[TestDox('A replicated declaration on a standard command is inert on classic framing')]
+    public function testRawReplicatedDeclarationIsIgnoredOnClassicFraming(): void
+    {
+        $client = new_client();
+
+        $response = $client->sendBinaryRequest(self::REPLICATED, self::GET_STATS_CODE, '');
+
+        assert_true($response !== '', 'expected a non-empty stats response');
+    }
+
+    #[TestDox('An unknown request kind is rejected')]
+    public function testRawUnknownKindIsRejected(): void
+    {
+        $client = new_client();
+
+        $throwable = assert_throws(static fn () => $client->sendBinaryRequest('auto', self::PING_CODE, ''));
+
+        assert_instance_of(IggyException::class, $throwable);
+        // Distinct from the server's "invalid command", so a mistyped kind is
+        // never mistaken for a rejected code.
+        assert_true(
+            str_contains($throwable->getMessage(), 'invalid binary request kind'),
+            'expected the kind-specific rejection message'
+        );
     }
 
     public static function sessionControlCodes(): array
     {
-        return [[38], [39], [40], [44], [45]];
+        $cases = [];
+        foreach ([self::NON_REPLICATED, self::REPLICATED] as $kind) {
+            foreach ([38, 39, 40, 44, 45] as $code) {
+                $cases[] = [$kind, $code];
+            }
+        }
+
+        return $cases;
     }
 }

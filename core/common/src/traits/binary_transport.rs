@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClientState, DiagnosticEvent, IggyDuration, IggyError};
+use crate::{BinaryRequestKind, ClientState, DiagnosticEvent, IggyDuration, IggyError};
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(feature = "vsr")]
@@ -28,7 +28,18 @@ pub trait BinaryTransport {
     /// Sets the state of the client.
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
+    /// Send a standard command. The protocol tables classify `code`, so the
+    /// caller declares no execution model; every typed SDK method lands here.
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    /// Send a raw command whose `code` the SDK need not know, with the caller
+    /// declaring how it executes. A code the tables do know keeps its own
+    /// class and a conflicting `kind` is rejected.
+    async fn send_binary_request(
+        &self,
+        kind: BinaryRequestKind,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError>;
     fn get_heartbeat_interval(&self) -> IggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve

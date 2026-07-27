@@ -88,6 +88,17 @@ mod ffi {
         topics_count: u32,
     }
 
+    /// How a raw binary request executes on the server. Inert on classic
+    /// framing (both kinds encode identical bytes and the server decides);
+    /// it only selects a wire path when the binding is built with `vsr`.
+    /// Starts at 1 so a value-initialized variable is not silently a valid
+    /// kind, matching the other FFI enums here.
+    #[repr(u8)]
+    enum BinaryRequestKind {
+        NonReplicated = 1,
+        Replicated = 2,
+    }
+
     #[repr(u8)]
     enum HeaderKind {
         Raw = 1,
@@ -480,7 +491,12 @@ mod ffi {
             snapshot_compression: String,
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
-        fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
+        fn send_binary_request(
+            self: &Client,
+            kind: BinaryRequestKind,
+            code: u32,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>>;
 
         // Future functions
         fn disconnect(self: &Client) -> Result<()>;

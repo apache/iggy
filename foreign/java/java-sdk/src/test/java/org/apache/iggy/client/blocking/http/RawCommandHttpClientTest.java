@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.iggy.client.BinaryRequestKind;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.junit.jupiter.api.Test;
 
@@ -30,7 +31,9 @@ class RawCommandHttpClientTest {
     void shouldRejectRawCommands() {
         var client = new IggyHttpClient("http://127.0.0.1:3000");
 
-        assertThatThrownBy(() -> client.sendBinaryRequest(1, new byte[0]))
-                .isInstanceOf(IggyOperationNotSupportedException.class);
+        for (BinaryRequestKind kind : BinaryRequestKind.values()) {
+            assertThatThrownBy(() -> client.sendBinaryRequest(kind, 1, new byte[0]))
+                    .isInstanceOf(IggyOperationNotSupportedException.class);
+        }
     }
 }

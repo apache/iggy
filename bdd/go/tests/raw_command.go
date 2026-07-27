@@ -70,9 +70,24 @@ func (rawCommandSteps) givenAuthenticationAsRoot(ctx context.Context) error {
 	return nil
 }
 
-func (rawCommandSteps) whenSendRawCommand(ctx context.Context, code uint32) error {
+func parseRequestKind(kind string) (iggcon.BinaryRequestKind, error) {
+	switch kind {
+	case "non_replicated":
+		return iggcon.BinaryRequestKindNonReplicated, nil
+	case "replicated":
+		return iggcon.BinaryRequestKindReplicated, nil
+	default:
+		return 0, fmt.Errorf("unknown binary request kind: %s", kind)
+	}
+}
+
+func (rawCommandSteps) whenSendRawCommand(ctx context.Context, kind string, code uint32) error {
+	requestKind, err := parseRequestKind(kind)
+	if err != nil {
+		return err
+	}
 	state := getRawCommandCtx(ctx)
-	state.lastResponse, state.lastError = state.client.SendBinaryRequest(ctx, code, nil)
+	state.lastResponse, state.lastError = state.client.SendBinaryRequest(ctx, requestKind, code, nil)
 	return nil
 }
 
@@ -105,6 +120,17 @@ func (rawCommandSteps) thenInvalidCommand(ctx context.Context) error {
 	return nil
 }
 
+func (rawCommandSteps) thenFailure(ctx context.Context) error {
+	state := getRawCommandCtx(ctx)
+	if state.lastError == nil {
+		return errors.New("expected the raw command to fail")
+	}
+	if len(state.lastResponse) != 0 {
+		return fmt.Errorf("expected no response alongside the failure, got %d bytes", len(state.lastResponse))
+	}
+	return nil
+}
+
 func initRawCommandScenario(sc *godog.ScenarioContext) {
 	sc.Before(func(context.Context, *godog.Scenario) (context.Context, error) {
 		return context.WithValue(context.Background(), rawCommandCtxKey{}, &rawCommandCtx{}), nil
@@ -112,10 +138,11 @@ func initRawCommandScenario(sc *godog.ScenarioContext) {
 	steps := rawCommandSteps{}
 	sc.Step(`I have a running Iggy server`, steps.givenRunningServer)
 	sc.Step(`I am authenticated as the root user`, steps.givenAuthenticationAsRoot)
-	sc.Step(`^I send a raw command with code (\d+) and an empty payload$`, steps.whenSendRawCommand)
+	sc.Step(`^I send a raw (\w+) command with code (\d+) and an empty payload$`, steps.whenSendRawCommand)
 	sc.Step(`the raw command should succeed with an empty response`, steps.thenEmptyResponse)
 	sc.Step(`the raw command should succeed with a non-empty response`, steps.thenNonEmptyResponse)
-	sc.Step(`the raw command should fail with an invalid command error`, steps.thenInvalidCommand)
+	sc.Step(`^the raw command should fail with an invalid command error$`, steps.thenInvalidCommand)
+	sc.Step(`^the raw command should fail$`, steps.thenFailure)
 	sc.After(func(ctx context.Context, _ *godog.Scenario, scenarioError error) (context.Context, error) {
 		state := getRawCommandCtx(ctx)
 		if state.client != nil {

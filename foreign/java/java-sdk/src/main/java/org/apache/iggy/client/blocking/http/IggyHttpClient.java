@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.IggyVersion;
+import org.apache.iggy.client.BinaryRequestKind;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.client.blocking.ConsumerOffsetsClient;
 import org.apache.iggy.client.blocking.IggyBaseClient;
@@ -113,7 +114,7 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
 
     /** {@inheritDoc} */
     @Override
-    public byte[] sendBinaryRequest(int code, byte[] payload) {
+    public byte[] sendBinaryRequest(BinaryRequestKind kind, int code, byte[] payload) {
         throw new IggyOperationNotSupportedException("sendBinaryRequest", "HTTP");
     }
 

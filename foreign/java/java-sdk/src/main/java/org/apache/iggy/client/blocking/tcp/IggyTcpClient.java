@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.client.BinaryRequestKind;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.client.blocking.ConsumerOffsetsClient;
@@ -95,8 +96,8 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
 
     /** {@inheritDoc} */
     @Override
-    public byte[] sendBinaryRequest(int code, byte[] payload) {
-        return FutureUtil.resolve(asyncClient.sendBinaryRequest(code, payload));
+    public byte[] sendBinaryRequest(BinaryRequestKind kind, int code, byte[] payload) {
+        return FutureUtil.resolve(asyncClient.sendBinaryRequest(kind, code, payload));
     }
 
     @Override

@@ -17,7 +17,7 @@
 
 [package]
 name = "apache-iggy"
-version = "0.8.1-dev3"
+version = "0.8.1-dev4"
 edition = "2024"
 authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"
@@ -34,10 +34,16 @@ name = "stub_gen"
 path = "src/bin/stub_gen.rs"
 doc = false
 
+# Framing is a compile-time choice, so a published wheel is locked to whatever it
+# was built with. Opt in with `--features vsr` to build a consensus-protocol wheel;
+# the default build stays on the classic protocol.
+[features]
+vsr = ["iggy/vsr"]
+
 [dependencies]
 bytes = "1.12.1"
 futures = "0.3.33"
-iggy = { path = "../../core/sdk", version = "0.10.3-edge.2" }
+iggy = { path = "../../core/sdk", version = "0.10.3-edge.3" }
 pyo3 = "0.29.0"
 pyo3-async-runtimes = { version = "0.29.0", features = [
     "attributes",

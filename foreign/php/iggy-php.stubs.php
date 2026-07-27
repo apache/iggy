@@ -211,11 +211,16 @@ namespace Iggy {
          * Sends a command code with a payload and returns the raw response bytes.
          * Session-control codes return an invalid-command exception.
          *
+         * `kind` is `non_replicated` or `replicated`. Inert on classic framing
+         * (both kinds encode identical bytes and the server decides); it only
+         * selects a wire path when the extension is built with `vsr`.
+         *
+         * @param string $kind
          * @param int $code
          * @param string $payload
          * @return string
          */
-        public function sendBinaryRequest(int $code, string $payload): string {}
+        public function sendBinaryRequest(string $kind, int $code, string $payload): string {}
 
         /**
          * Sends messages to a topic.

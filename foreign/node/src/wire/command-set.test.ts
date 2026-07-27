@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { SimpleClient } from '../client/client.js';
 import type { RawClient } from '../client/client.type.js';
 import { COMMAND_CODE } from './command.code.js';
+import { BINARY_REQUEST_KIND, type BinaryRequestKind } from './command-set.js';
 
 const mockRawClient = (): RawClient => ({
   sendCommand: async () => {
@@ -42,22 +43,50 @@ describe('CommandAPI.sendBinaryRequest', () => {
 
   describe('session-control guard', () => {
 
-    [
-      COMMAND_CODE.LoginUser,
-      COMMAND_CODE.LogoutUser,
-      COMMAND_CODE.LoginRegister,
-      COMMAND_CODE.LoginWithAccessToken,
-      COMMAND_CODE.LoginRegisterWithAccessToken,
-    ].forEach((code) => {
-      it(`rejects code ${code} before reaching the client provider`, async () => {
-        const client = new SimpleClient(mockRawClient());
-        await assert.rejects(
-          () => client.sendBinaryRequest(code, Buffer.alloc(0)),
-          /code: 3, message: Invalid command/
-        );
+    Object.values(BINARY_REQUEST_KIND).forEach((kind) => {
+      [
+        COMMAND_CODE.LoginUser,
+        COMMAND_CODE.LogoutUser,
+        COMMAND_CODE.LoginRegister,
+        COMMAND_CODE.LoginWithAccessToken,
+        COMMAND_CODE.LoginRegisterWithAccessToken,
+      ].forEach((code) => {
+        it(`rejects ${kind} code ${code} before reaching the client provider`, async () => {
+          const client = new SimpleClient(mockRawClient());
+          await assert.rejects(
+            () => client.sendBinaryRequest(kind, code, Buffer.alloc(0)),
+            /code: 3, message: Invalid command/
+          );
+        });
       });
     });
 
+  });
+
+  it('rejects an undefined request kind before reaching the client provider', async () => {
+    const client = new SimpleClient(mockRawClient());
+    await assert.rejects(
+      () => client.sendBinaryRequest('auto' as BinaryRequestKind, COMMAND_CODE.Ping, Buffer.alloc(0)),
+      /code: 3, message: Invalid command/
+    );
+  });
+
+  it('encodes both kinds identically because classic framing has no operation field', async () => {
+    const customCode = 60_001;
+    const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
+    const frames: { code: number, payload: Buffer }[] = [];
+    const raw = mockRawClient();
+    raw.sendCommand = async (code, sentPayload) => {
+      frames.push({ code, payload: Buffer.from(sentPayload) });
+      return { status: 0, length: 1, data: Buffer.alloc(0) };
+    };
+    const client = new SimpleClient(raw);
+
+    for (const kind of Object.values(BINARY_REQUEST_KIND))
+      await client.sendBinaryRequest(kind, customCode, payload);
+
+    assert.equal(frames.length, 2);
+    assert.deepEqual(frames[0], frames[1]);
   });
 
   it('forwards a custom code and opaque payload to sendCommand', async () => {
@@ -65,9 +94,10 @@ describe('CommandAPI.sendBinaryRequest', () => {
     const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
     const expectedResponse = Buffer.from('opaque response');
     const raw = mockRawClient();
-    raw.sendCommand = async (code, sentPayload) => {
+    raw.sendCommand = async (code, sentPayload, _handleResponse, _last, kind) => {
       assert.equal(code, customCode);
       assert.deepEqual(sentPayload, payload);
+      assert.equal(kind, BINARY_REQUEST_KIND.NonReplicated);
       return {
         status: 0,
         length: expectedResponse.length,
@@ -75,7 +105,11 @@ describe('CommandAPI.sendBinaryRequest', () => {
       };
     };
     const client = new SimpleClient(raw);
-    const response = await client.sendBinaryRequest(customCode, payload);
+    const response = await client.sendBinaryRequest(
+      BINARY_REQUEST_KIND.NonReplicated,
+      customCode,
+      payload
+    );
     assert.deepEqual(response, expectedResponse);
   });
 
@@ -88,7 +122,11 @@ describe('CommandAPI.sendBinaryRequest', () => {
       return { status: 0, length: 1, data: Buffer.alloc(0) };
     };
 
-    const request = new SimpleClient(raw).sendBinaryRequest(60_000, payload);
+    const request = new SimpleClient(raw).sendBinaryRequest(
+      BINARY_REQUEST_KIND.NonReplicated,
+      60_001,
+      payload
+    );
     payload.fill(0);
 
     await request;
@@ -103,6 +141,7 @@ describe('CommandAPI.sendBinaryRequest', () => {
     });
 
     const response = await new SimpleClient(raw).sendBinaryRequest(
+      BINARY_REQUEST_KIND.NonReplicated,
       COMMAND_CODE.Ping,
       Buffer.alloc(0)
     );

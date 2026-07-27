@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cpp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [package.metadata.cargo-machete]
@@ -25,6 +25,12 @@ ignored = ["cxx-build"]
 
 [lib]
 crate-type = ["staticlib"]
+
+# Framing is a compile-time choice, so the static library is locked to whatever it
+# was built with. Opt in with `--features vsr` to build against the consensus
+# protocol; the default build stays on the classic protocol.
+[features]
+vsr = ["iggy/vsr", "iggy_common/vsr"]
 
 [dependencies]
 bytes = "1.12.1"

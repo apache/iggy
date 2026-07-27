@@ -26,16 +26,30 @@ Feature: Raw Command API
     And I am authenticated as the root user
 
   Scenario: Known command codes round-trip
-    When I send a raw command with code 1 and an empty payload
+    When I send a raw non_replicated command with code 1 and an empty payload
     Then the raw command should succeed with an empty response
 
-    When I send a raw command with code 10 and an empty payload
+    When I send a raw non_replicated command with code 10 and an empty payload
     Then the raw command should succeed with a non-empty response
 
   Scenario: Unknown command code is rejected
-    When I send a raw command with code 60000 and an empty payload
+    When I send a raw non_replicated command with code 60000 and an empty payload
     Then the raw command should fail with an invalid command error
 
   Scenario: Session control command code is rejected
-    When I send a raw command with code 38 and an empty payload
+    When I send a raw non_replicated command with code 38 and an empty payload
     Then the raw command should fail with an invalid command error
+
+    When I send a raw replicated command with code 38 and an empty payload
+    Then the raw command should fail with an invalid command error
+
+  Scenario: Replicated vendor command code has no handler
+    When I send a raw replicated command with code 60000 and an empty payload
+    Then the raw command should fail
+
+  Scenario: Connection survives a rejected raw command
+    When I send a raw non_replicated command with code 60000 and an empty payload
+    Then the raw command should fail with an invalid command error
+
+    When I send a raw non_replicated command with code 1 and an empty payload
+    Then the raw command should succeed with an empty response

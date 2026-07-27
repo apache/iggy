@@ -17,13 +17,21 @@
 
 import assert from 'node:assert/strict';
 import { Then, When } from '@cucumber/cucumber';
+import { BINARY_REQUEST_KIND, type BinaryRequestKind } from '../wire/command-set.js';
 import type { TestWorld } from './world.js';
 
+const REQUEST_KINDS: Record<string, BinaryRequestKind> = {
+  non_replicated: BINARY_REQUEST_KIND.NonReplicated,
+  replicated: BINARY_REQUEST_KIND.Replicated
+};
+
 When(
-  'I send a raw command with code {int} and an empty payload',
-  async function (this: TestWorld, code: number) {
+  'I send a raw {word} command with code {int} and an empty payload',
+  async function (this: TestWorld, kind: string, code: number) {
+    const requestKind = REQUEST_KINDS[kind];
+    assert.ok(requestKind, `unknown binary request kind: ${kind}`);
     try {
-      this.rawResponse = await this.client.sendBinaryRequest(code, Buffer.alloc(0));
+      this.rawResponse = await this.client.sendBinaryRequest(requestKind, code, Buffer.alloc(0));
       this.rawError = undefined;
     } catch (error) {
       this.rawResponse = undefined;
@@ -45,4 +53,9 @@ Then('the raw command should succeed with a non-empty response', function (this:
 Then('the raw command should fail with an invalid command error', function (this: TestWorld) {
   assert.equal(this.rawResponse, undefined);
   assert.match(this.rawError?.message ?? '', /code: 3, message: Invalid command/);
+});
+
+Then('the raw command should fail', function (this: TestWorld) {
+  assert.equal(this.rawResponse, undefined);
+  assert.ok(this.rawError);
 });

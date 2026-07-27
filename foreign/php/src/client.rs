@@ -380,12 +380,25 @@ impl IggyClient {
 
     /// Sends a command code with a payload and returns the raw response bytes.
     /// Session-control codes return an invalid-command exception.
-    pub fn send_binary_request(&self, code: u32, payload: Binary<u8>) -> PhpResult<Binary<u8>> {
+    ///
+    /// `kind` is `non_replicated` or `replicated`. Inert on classic framing
+    /// (both kinds encode identical bytes and the server decides); it only
+    /// selects a wire path when the extension is built with `vsr`.
+    pub fn send_binary_request(
+        &self,
+        kind: String,
+        code: u32,
+        payload: Binary<u8>,
+    ) -> PhpResult<Binary<u8>> {
+        // A distinct message from the server's "invalid command", so a caller
+        // can tell a mistyped kind from a rejected code.
+        let kind = BinaryRequestKind::from_str(&kind)
+            .map_err(|_| to_php_exception(format!("invalid binary request kind: {kind}")))?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
             inner
-                .send_binary_request(code, Bytes::from(Vec::<u8>::from(payload)))
+                .send_binary_request(kind, code, Bytes::from(Vec::<u8>::from(payload)))
                 .await
                 .map(|response| Binary::new(Vec::from(response)))
                 .map_err(to_php_exception)

@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.client.BinaryRequestKind;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.exception.IggyErrorCode;
@@ -30,6 +31,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class RawCommandTcpClientTest extends IntegrationTest {
+
+    /** No server registers a handler for this code. */
+    private static final int VENDOR_CODE = 60_001;
 
     @Override
     protected IggyBaseClient getClient() {
@@ -43,32 +47,55 @@ class RawCommandTcpClientTest extends IntegrationTest {
 
     @Test
     void shouldReturnRawResponsePayloads() {
-        assertThat(client.sendBinaryRequest(1, new byte[0])).isEmpty();
-        assertThat(client.sendBinaryRequest(10, new byte[0])).isNotEmpty();
+        assertThat(client.sendBinaryRequest(BinaryRequestKind.NonReplicated, 1, new byte[0]))
+                .isEmpty();
+        assertThat(client.sendBinaryRequest(BinaryRequestKind.NonReplicated, 10, new byte[0]))
+                .isNotEmpty();
+    }
+
+    @Test
+    void shouldIgnoreTheDeclarationOnClassicFraming() {
+        // Classic framing has no operation field, so a replicated declaration encodes the same
+        // bytes and the read still succeeds.
+        assertThat(client.sendBinaryRequest(BinaryRequestKind.Replicated, 10, new byte[0]))
+                .isNotEmpty();
+    }
+
+    @Test
+    void shouldRejectNullKind() {
+        assertThatThrownBy(() -> client.sendBinaryRequest(null, 1, new byte[0]))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("kind cannot be null");
     }
 
     @Test
     void shouldRejectNullPayload() {
-        assertThatThrownBy(() -> client.sendBinaryRequest(1, null))
+        assertThatThrownBy(() -> client.sendBinaryRequest(BinaryRequestKind.NonReplicated, 1, null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessage("payload cannot be null");
     }
 
     @Test
     void shouldRejectAllSessionControlCodes() {
-        for (int code : new int[] {38, 39, 40, 44, 45}) {
-            assertThatThrownBy(() -> client.sendBinaryRequest(code, new byte[0]))
-                    .isInstanceOf(IggyServerException.class)
-                    .extracting(exception -> ((IggyServerException) exception).getErrorCode())
-                    .isEqualTo(IggyErrorCode.INVALID_COMMAND);
+        for (BinaryRequestKind kind : BinaryRequestKind.values()) {
+            for (int code : new int[] {38, 39, 40, 44, 45}) {
+                assertThatThrownBy(() -> client.sendBinaryRequest(kind, code, new byte[0]))
+                        .isInstanceOf(IggyServerException.class)
+                        .extracting(exception -> ((IggyServerException) exception).getErrorCode())
+                        .isEqualTo(IggyErrorCode.INVALID_COMMAND);
+            }
         }
     }
 
     @Test
-    void shouldPropagateUnknownCommandError() {
-        assertThatThrownBy(() -> client.sendBinaryRequest(60_000, new byte[0]))
+    void shouldPropagateVendorCommandError() {
+        assertThatThrownBy(() -> client.sendBinaryRequest(BinaryRequestKind.NonReplicated, VENDOR_CODE, new byte[0]))
                 .isInstanceOf(IggyServerException.class)
                 .extracting(exception -> ((IggyServerException) exception).getErrorCode())
                 .isEqualTo(IggyErrorCode.INVALID_COMMAND);
+
+        // The rejection is request-level, so the connection stays usable.
+        assertThat(client.sendBinaryRequest(BinaryRequestKind.NonReplicated, 1, new byte[0]))
+                .isEmpty();
     }
 }

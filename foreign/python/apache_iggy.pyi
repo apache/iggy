@@ -29,6 +29,7 @@ __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
+    "BinaryRequestKind",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
@@ -726,7 +727,7 @@ class IggyClient:
         Returns the consumer or a PyRuntimeError on failure.
         """
     def send_binary_request(
-        self, code: builtins.int, payload: builtins.bytes
+        self, kind: BinaryRequestKind, code: builtins.int, payload: builtins.bytes
     ) -> collections.abc.Awaitable[bytes]:
         r"""
         Send a command code with a payload and return the raw response bytes.
@@ -735,6 +736,10 @@ class IggyClient:
         support raw binary commands.
 
         Args:
+            kind: How the command executes, as `BinaryRequestKind`. Inert on
+                classic framing (both kinds encode identical bytes and the
+                server decides); it only selects a wire path when the binding
+                is built with `vsr`.
             code: Command code as `int`.
             payload: Request payload as `bytes`.
 
@@ -1017,6 +1022,24 @@ class UserInfoDetails:
         r"""
         The username of the user.
         """
+
+@typing.final
+class BinaryRequestKind(enum.Enum):
+    r"""
+    How a raw binary request executes on the server.
+    """
+
+    NonReplicated = ...
+    r"""
+    Runs on the receiving node only, outside consensus.
+    """
+    Replicated = ...
+    r"""
+    Replicated through consensus before it takes effect. Inert on classic
+    framing, where both kinds encode identical bytes; under `vsr` an
+    unknown code declared this way is rejected until the server grows a
+    replicated extension registry.
+    """
 
 @typing.final
 class UserStatus(enum.Enum):

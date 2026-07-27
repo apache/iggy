@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Encryption;
+using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -63,12 +64,14 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     ///     Sends a command code with a payload and returns the raw response bytes.
     /// </summary>
     /// <remarks>
-    ///     Session-control codes are rejected with an invalid-command error.
-    ///     HTTP clients report that this operation is unavailable.
+    ///     Session-control codes are rejected with an invalid-command error, as is an undefined
+    ///     <paramref name="kind" />. HTTP clients report that this operation is unavailable.
     /// </remarks>
+    /// <param name="kind">How the command executes. Classic framing has no operation field, so both kinds encode identical bytes and the server decides.</param>
     /// <param name="code">The numeric command code to send.</param>
     /// <param name="payload">The request payload.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
-    Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
+    Task<byte[]> SendBinaryRequestAsync(BinaryRequestKind kind, uint code, byte[] payload,
+        CancellationToken token = default);
 }

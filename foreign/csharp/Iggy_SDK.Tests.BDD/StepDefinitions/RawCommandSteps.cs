@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Reqnroll;
 using Shouldly;
@@ -32,12 +33,19 @@ public class RawCommandSteps
         _context = context;
     }
 
-    [When(@"I send a raw command with code (\d+) and an empty payload")]
-    public async Task WhenISendARawCommand(uint code)
+    [When(@"I send a raw (\w+) command with code (\d+) and an empty payload")]
+    public async Task WhenISendARawCommand(string kind, uint code)
     {
+        var requestKind = kind switch
+        {
+            "non_replicated" => BinaryRequestKind.NonReplicated,
+            "replicated" => BinaryRequestKind.Replicated,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown binary request kind")
+        };
+
         try
         {
-            _context.LastRawResponse = await _context.IggyClient.SendBinaryRequestAsync(code, []);
+            _context.LastRawResponse = await _context.IggyClient.SendBinaryRequestAsync(requestKind, code, []);
             _context.LastRawError = null;
         }
         catch (Exception error)
@@ -67,5 +75,12 @@ public class RawCommandSteps
         _context.LastRawResponse.ShouldBeNull();
         var error = _context.LastRawError.ShouldBeOfType<IggyInvalidStatusCodeException>();
         error.StatusCode.ShouldBe(3);
+    }
+
+    [Then(@"the raw command should fail")]
+    public void ThenTheRawCommandShouldFail()
+    {
+        _context.LastRawResponse.ShouldBeNull();
+        _context.LastRawError.ShouldNotBeNull();
     }
 }

@@ -35,11 +35,38 @@ public class RawCommandTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var pingResponse = await client.SendBinaryRequestAsync(1, []);
-        var statsResponse = await client.SendBinaryRequestAsync(10, []);
+        var pingResponse = await client.SendBinaryRequestAsync(BinaryRequestKind.NonReplicated, 1, []);
+        var statsResponse = await client.SendBinaryRequestAsync(BinaryRequestKind.NonReplicated, 10, []);
 
         pingResponse.ShouldBeEmpty();
         statsResponse.ShouldNotBeEmpty();
+    }
+
+    [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendBinaryRequest_Tcp_ShouldIgnoreTheDeclaration(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        // Classic framing has no operation field, so a replicated declaration encodes the same
+        // bytes and the read still succeeds.
+        var statsResponse = await client.SendBinaryRequestAsync(BinaryRequestKind.Replicated, 10, []);
+
+        statsResponse.ShouldNotBeEmpty();
+    }
+
+    [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendBinaryRequest_Tcp_ShouldRejectUndefinedKind(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            () => client.SendBinaryRequestAsync((BinaryRequestKind)0, 1, []));
+
+        exception.StatusCode.ShouldBe(3);
     }
 
     [Test]
@@ -49,11 +76,14 @@ public class RawCommandTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        foreach (var code in new uint[] { 38, 39, 40, 44, 45 })
+        foreach (var kind in new[] { BinaryRequestKind.NonReplicated, BinaryRequestKind.Replicated })
         {
-            var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
-                () => client.SendBinaryRequestAsync(code, []));
-            exception.StatusCode.ShouldBe(3);
+            foreach (var code in new uint[] { 38, 39, 40, 44, 45 })
+            {
+                var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+                    () => client.SendBinaryRequestAsync(kind, code, []));
+                exception.StatusCode.ShouldBe(3);
+            }
         }
     }
 
@@ -65,9 +95,13 @@ public class RawCommandTests
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
-            () => client.SendBinaryRequestAsync(60_000, []));
+            () => client.SendBinaryRequestAsync(BinaryRequestKind.NonReplicated, 60_001, []));
 
         exception.StatusCode.ShouldBe(3);
+
+        // The rejection is request-level, so the connection stays usable.
+        var pingResponse = await client.SendBinaryRequestAsync(BinaryRequestKind.NonReplicated, 1, []);
+        pingResponse.ShouldBeEmpty();
     }
 
     [Test]
@@ -77,7 +111,10 @@ public class RawCommandTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        await Should.ThrowAsync<FeatureUnavailableException>(
-            () => client.SendBinaryRequestAsync(1, []));
+        foreach (var kind in new[] { BinaryRequestKind.NonReplicated, BinaryRequestKind.Replicated })
+        {
+            await Should.ThrowAsync<FeatureUnavailableException>(
+                () => client.SendBinaryRequestAsync(kind, 1, []));
+        }
     }
 }

@@ -303,5 +303,8 @@ type Client interface {
 
 	// SendBinaryRequest sends a command code and payload and returns the raw response body.
 	// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
-	SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error)
+	//
+	// kind declares how the command executes. Classic framing has no operation field, so both
+	// kinds encode identical bytes and the server decides; an undefined kind is rejected.
+	SendBinaryRequest(ctx context.Context, kind BinaryRequestKind, code uint32, payload []byte) ([]byte, error)
 }

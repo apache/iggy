@@ -18,12 +18,14 @@
 use crate::common::global_context::GlobalContext;
 use bytes::Bytes;
 use cucumber::{then, when};
-use iggy::prelude::IggyError;
+use iggy::prelude::{BinaryRequestKind, IggyError};
+use std::str::FromStr;
 
-#[when(regex = r"^I send a raw command with code (\d+) and an empty payload$")]
-pub async fn when_send_raw_command(world: &mut GlobalContext, code: u32) {
+#[when(regex = r"^I send a raw (\w+) command with code (\d+) and an empty payload$")]
+pub async fn when_send_raw_command(world: &mut GlobalContext, kind: String, code: u32) {
+    let kind = BinaryRequestKind::from_str(&kind).expect("Kind should be a known request kind");
     let client = world.client.as_ref().expect("Client should be available");
-    world.last_raw_result = Some(client.send_binary_request(code, Bytes::new()).await);
+    world.last_raw_result = Some(client.send_binary_request(kind, code, Bytes::new()).await);
 }
 
 #[then("the raw command should succeed with an empty response")]
@@ -57,4 +59,14 @@ pub async fn then_raw_command_fails_with_invalid_command_error(world: &mut Globa
         .as_ref()
         .expect_err("Raw command should have failed");
     assert_eq!(*error, IggyError::InvalidCommand);
+}
+
+#[then("the raw command should fail")]
+pub async fn then_raw_command_fails(world: &mut GlobalContext) {
+    world
+        .last_raw_result
+        .as_ref()
+        .expect("Should have sent a raw command")
+        .as_ref()
+        .expect_err("Raw command should have failed");
 }

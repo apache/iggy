@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
+import org.apache.iggy.client.BinaryRequestKind;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.client.async.MessagesClient;
@@ -227,12 +228,18 @@ public class AsyncIggyTcpClient {
      *
      * <p>Session-control codes complete the returned future with an invalid-command error.
      *
+     * <p>{@code kind} is not encoded: classic framing has no operation field, so both kinds produce
+     * the same bytes and the server owns the command's execution model. It is required so the API
+     * matches every other Iggy SDK and is already in place when this client gains VSR framing.
+     *
+     * @param kind how the command executes
      * @param code the command code
      * @param payload the command payload
      * @return a future containing the raw response payload
      * @throws IggyNotConnectedException if {@link #connect()} has not been called
      */
-    public CompletableFuture<byte[]> sendBinaryRequest(int code, byte[] payload) {
+    public CompletableFuture<byte[]> sendBinaryRequest(BinaryRequestKind kind, int code, byte[] payload) {
+        Objects.requireNonNull(kind, "kind cannot be null");
         Objects.requireNonNull(payload, "payload cannot be null");
         if (isSessionControlCode(code)) {
             return CompletableFuture.failedFuture(

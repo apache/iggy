@@ -307,8 +307,17 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 
 // SendBinaryRequest sends a command code and payload and returns the raw response body.
 // Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
-func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
-	if isSessionControlCode(code) {
+//
+// kind is not encoded: classic framing has no operation field, so both kinds produce the same
+// bytes and the server owns the command's execution model. It is validated so a caller learns
+// about an undefined value here rather than once the Go client gains VSR framing.
+func (c *IggyTcpClient) SendBinaryRequest(
+	ctx context.Context,
+	kind iggcon.BinaryRequestKind,
+	code uint32,
+	payload []byte,
+) ([]byte, error) {
+	if !kind.IsValid() || isSessionControlCode(code) {
 		return nil, ierror.ErrInvalidCommand
 	}
 
