@@ -926,6 +926,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
+    /// Override the normal-heartbeat (primary liveness) window, in consensus
+    /// ticks. Sized from `[cluster] heartbeat_timeout` by the runtime. Must
+    /// run before `init` / `init_as_backup`: the override discards any
+    /// countdown already in flight.
+    pub fn set_normal_heartbeat_ticks(&self, ticks: u64) {
+        self.timeouts.borrow_mut().set_normal_heartbeat_ticks(ticks);
+    }
+
     pub fn init(&self) {
         self.status.set(Status::Normal);
         let mut timeouts = self.timeouts.borrow_mut();

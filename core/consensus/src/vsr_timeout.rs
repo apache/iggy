@@ -133,13 +133,15 @@ impl TimeoutManager {
     const PING_TICKS: u64 = 100;
     const PREPARE_TICKS: u64 = 25;
     const COMMIT_MESSAGE_TICKS: u64 = 50;
-    const NORMAL_HEARTBEAT_TICKS: u64 = 500;
+    /// Public so the runtime can pin its config default (`[cluster]
+    /// heartbeat_timeout`) against this built-in with a static assert.
+    pub const NORMAL_HEARTBEAT_TICKS: u64 = 500;
     const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
     const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
     const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
     const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
 
-    // TODO: add #[must_use] -- constructor, discarding is always a bug.
+    #[must_use]
     pub fn new(replica_id: u128) -> Self {
         Self {
             ping: Timeout::new(replica_id, Self::PING_TICKS),
@@ -162,6 +164,14 @@ impl TimeoutManager {
         }
     }
 
+    /// Override the backup's primary-liveness window (`[cluster]
+    /// heartbeat_timeout`). Replaces the timeout object, so any countdown
+    /// already in flight is discarded: call before the replica starts
+    /// ticking (i.e. before `init` / `init_as_backup`).
+    pub const fn set_normal_heartbeat_ticks(&mut self, ticks: u64) {
+        self.normal_heartbeat = Timeout::new(self.normal_heartbeat.id, ticks);
+    }
+
     /// Tick all timeouts
     /// This is the first phase of the two-phase tick-based timeout mechanism.
     /// 2nd phase is checking which timeouts have fired and calling the appropriate handlers.
@@ -181,6 +191,7 @@ impl TimeoutManager {
         self.get(kind).fired()
     }
 
+    #[must_use]
     pub const fn get(&self, kind: TimeoutKind) -> &Timeout {
         match kind {
             TimeoutKind::Ping => &self.ping,

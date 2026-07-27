@@ -51,18 +51,28 @@ jobs:
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          echo "Building server binary and CLI for BDD tests..."
-          cargo build --locked --bin iggy-server --bin iggy
+          if [ "${{ inputs.task }}" = "bdd-rust-vsr" ]; then
+            # server-ng lane: the vsr feature must be enabled on both the
+            # server and the CLI, otherwise the CLI cannot frame requests
+            # for the VSR wire protocol (healthcheck ping would fail).
+            SERVER_BIN="iggy-server-ng"
+            echo "Building server-ng binary and CLI (--features vsr) for BDD tests..."
+            cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
+          else
+            SERVER_BIN="iggy-server"
+            echo "Building server binary and CLI for BDD tests..."
+            cargo build --locked --bin iggy-server --bin iggy
+          fi
 
-          echo "Server binary built at: target/debug/iggy-server"
-          ls -lh target/debug/iggy-server
+          echo "Server binary built at: target/debug/${SERVER_BIN}"
+          ls -lh "target/debug/${SERVER_BIN}"
 
           echo "CLI binary built at: target/debug/iggy"
           ls -lh target/debug/iggy
 
           # Verify the binary exists and is executable
-          if [ ! -f "target/debug/iggy-server" ]; then
-            echo "ERROR: Server binary not found at target/debug/iggy-server"
+          if [ ! -f "target/debug/${SERVER_BIN}" ]; then
+            echo "ERROR: Server binary not found at target/debug/${SERVER_BIN}"
             exit 1
           fi
 
@@ -74,12 +84,21 @@ jobs:
       - name: Run BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          # Extract SDK name from task (format: bdd-<sdk>)
+          # Extract SDK name from task (format: bdd-<sdk>, or bdd-<sdk>-vsr
+          # for the server-ng lane)
           SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
+          EXTRA_FLAGS=()
+          if [ "$SDK_NAME" = "rust-vsr" ]; then
+            SDK_NAME="rust"
+            EXTRA_FLAGS+=(--vsr)
+            export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
+            echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
+          else
+            echo "Server binary location: $(ls -lh target/debug/iggy-server)"
+          fi
 
           echo "Running BDD tests for SDK: $SDK_NAME"
           echo "Current directory: $(pwd)"
-          echo "Server binary location: $(ls -lh target/debug/iggy-server)"
           echo "CLI binary location: $(ls -lh target/debug/iggy)"
 
           # Export path to the pre-built server and cli binaries (relative to repo root)
@@ -87,7 +106,7 @@ jobs:
           export IGGY_CLI_PATH="target/debug/iggy"
           export IGGY_ROOT_USERNAME="iggy"
           export IGGY_ROOT_PASSWORD="iggy"
-          ./scripts/run-bdd-tests.sh "$SDK_NAME"
+          ./scripts/run-bdd-tests.sh "${EXTRA_FLAGS[@]}" "$SDK_NAME"
 
       - name: Clean up Docker resources (BDD)
         if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')

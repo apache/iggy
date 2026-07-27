@@ -28,7 +28,7 @@
 //! leader, but the full roster is still returned). The self-synthesized single
 //! node is the cluster-disabled fallback, shared by both callers.
 
-use configs::cluster::{ClusterNodeConfig, TransportPorts};
+use configs::ng_cluster::{ClusterNodeConfig, TransportPorts};
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
 };

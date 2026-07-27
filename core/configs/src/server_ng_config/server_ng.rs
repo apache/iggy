@@ -16,13 +16,13 @@
 // under the License.
 
 use super::COMPONENT_NG;
+use super::cluster::ClusterConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::quic::QuicConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
-use crate::server_config::cluster::ClusterConfig;
 use crate::server_config::http::HttpConfig;
 use crate::server_config::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
