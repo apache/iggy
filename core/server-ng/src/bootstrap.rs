@@ -958,6 +958,16 @@ async fn shard_main(
                 Rc::clone(&bus),
                 config.metadata.prepare_queue_depth,
                 cluster_heartbeat_ticks(config),
+                commit_broadcast_ticks(config),
+                prepare_retransmit_ticks(config),
+                view_change_retransmit_ticks(config),
+                view_change_status_ticks(config),
+                request_start_view_ticks(config),
+                config.cluster.view_probe_attempts_max,
+                recovery_barrier_deadline(
+                    config.cluster.heartbeat_timeout.get_duration(),
+                    config.cluster.view_change_status_timeout.get_duration(),
+                ),
             );
             (Some(consensus), Some(journal), snapshot)
         } else {
@@ -978,6 +988,10 @@ async fn shard_main(
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
+    // Size the VSR client table before listeners bind and any client registers.
+    // The table is empty here on both fresh boot and restart (its slots are not
+    // restored from snapshot), which the setter's empty-table contract requires.
+    metadata.set_clients_table_max(config.metadata.clients_table_max);
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -1674,6 +1688,10 @@ async fn build_shard_for_thread(
     .map_err(ServerNgError::ShardConstruction)?;
 
     let shard = Rc::new(built.shard);
+    // Repair pacing is shared by both planes' repair loops, so it is a
+    // per-shard tunable set once here rather than per consensus group.
+    shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1690,13 +1708,127 @@ const _: () = assert!(
     configs::ng_metadata::DEFAULT_METADATA_JOURNAL_SLOTS
         == journal::prepare_journal::DEFAULT_SLOT_COUNT
 );
-/// `[cluster] heartbeat_timeout` in consensus ticks, floored at one tick.
-/// Every consensus group (metadata and per-partition planes alike) gets the
-/// same window: the failure it guards against - a primary that stopped
-/// heartbeating - is host-level, not per-plane.
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH
+        == consensus::PIPELINE_PREPARE_QUEUE_MAX
+);
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX
+);
+const _: () =
+    assert!(configs::ng_cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_EVICTED_RING_CAPACITY == partitions::EVICTED_RING_CAPACITY
+);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_EVICTED_RING_BYTES_MAX == partitions::EVICTED_RING_BYTES_MAX
+);
+const _: () =
+    assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+/// Convert a consensus-timer interval to whole ticks, floored at one tick so a
+/// sub-tick value still fires and saturated on overflow.
+fn duration_to_ticks(interval: Duration) -> u64 {
+    let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
+    u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
+}
+
+/// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
+/// (metadata and per-partition planes alike) gets the same window: the failure
+/// it guards against - a primary that stopped heartbeating - is host-level, not
+/// per-plane.
 pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
-    let window = config.cluster.heartbeat_timeout.get_duration().as_millis();
-    u64::try_from((window / shard::CONSENSUS_TICK_INTERVAL.as_millis()).max(1)).unwrap_or(u64::MAX)
+    duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
+}
+
+/// Floor for the post-restart read-recovery deadline (see
+/// [`recovery_barrier_deadline`]). At and below the 5s default heartbeat the
+/// worst-case recovery is dominated by the heartbeat-independent term - the
+/// `ViewChangeStatus` backstop plus election ceremony and suffix recommit,
+/// empirically ~7s - so the scaled value must never fall under this or a
+/// fast-heartbeat cluster would 503 legitimate reads mid-recovery. The backstop
+/// is the configurable `[cluster] view_change_status_timeout`; raising it past
+/// its 5s default is why `recovery_barrier_deadline` scales that knob in too
+/// rather than leaning on this floor to cover it.
+const RECOVERY_BARRIER_DEADLINE_FLOOR: Duration = Duration::from_secs(15);
+
+/// Safety factor applied to each scaled term of the recovery deadline: a slower
+/// heartbeat stretches election and suffix recommit proportionally, and a wider
+/// status backstop stretches the ceremony it bounds. 3x reproduces the
+/// empirically chosen 15s margin at the shared 5s default (3 x 5s = 15s) and
+/// holds that factor as either knob grows.
+const RECOVERY_BARRIER_MULTIPLIER: u32 = 3;
+
+/// How long the post-restart read path waits for the recovered WAL suffix to
+/// re-commit before failing loud (retryable 503): the largest of the fixed
+/// floor, a `[cluster] heartbeat_timeout`-scaled window, and a
+/// `[cluster] view_change_status_timeout`-scaled window. Both knobs feed it
+/// because either, raised far past its default, stretches worst-case recovery
+/// past the fixed floor; see `await_recovery_barrier` for the read-side wait.
+pub(crate) fn recovery_barrier_deadline(
+    heartbeat: Duration,
+    view_change_status: Duration,
+) -> Duration {
+    // saturating: neither timeout has a config ceiling, plain `*` panics
+    heartbeat
+        .saturating_mul(RECOVERY_BARRIER_MULTIPLIER)
+        .max(view_change_status.saturating_mul(RECOVERY_BARRIER_MULTIPLIER))
+        .max(RECOVERY_BARRIER_DEADLINE_FLOOR)
+}
+
+/// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
+/// primary broadcasts its commit point, the cluster's liveness feed. Applied
+/// to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn commit_broadcast_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.commit_broadcast_interval.get_duration())
+}
+
+/// `[cluster] prepare_retransmit_interval` in consensus ticks: how often the
+/// primary retransmits un-acked prepares. Applied to every consensus group,
+/// matching `cluster_heartbeat_ticks`.
+pub(crate) fn prepare_retransmit_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.prepare_retransmit_interval.get_duration())
+}
+
+/// `[cluster] view_change_retransmit_interval` in consensus ticks: how often a
+/// replica retransmits its `StartViewChange` / `DoViewChange` during a view
+/// change. Applied to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn view_change_retransmit_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(
+        config
+            .cluster
+            .view_change_retransmit_interval
+            .get_duration(),
+    )
+}
+
+/// `[cluster] view_change_status_timeout` in consensus ticks: the stalled
+/// view-change backstop before escalating to a fresh election. Applied to every
+/// consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn view_change_status_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.view_change_status_timeout.get_duration())
+}
+
+/// `[cluster] request_start_view_retransmit_interval` in consensus ticks: how
+/// often a recovering or view-change backup re-requests the current `StartView`.
+/// Applied to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn request_start_view_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(
+        config
+            .cluster
+            .request_start_view_retransmit_interval
+            .get_duration(),
+    )
+}
+
+/// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
+/// journal-repair stream waits before re-requesting its window. Both planes'
+/// repair loops share it, so it is applied once per shard (not per consensus
+/// group). Clamped to `u32`, the width of the session idle-tick counter.
+pub(crate) fn repair_retry_ticks(config: &ServerNgConfig) -> u32 {
+    u32::try_from(duration_to_ticks(
+        config.cluster.repair_retry_interval.get_duration(),
+    ))
+    .unwrap_or(u32::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1710,6 +1842,13 @@ fn restore_metadata_consensus(
     bus: Rc<IggyMessageBus>,
     prepare_queue_depth: usize,
     normal_heartbeat_ticks: u64,
+    commit_message_ticks: u64,
+    prepare_ticks: u64,
+    view_change_retransmit_ticks: u64,
+    view_change_status_ticks: u64,
+    request_start_view_ticks: u64,
+    probe_attempts_max: u32,
+    recovery_deadline: Duration,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         cluster_id,
@@ -1723,6 +1862,12 @@ fn restore_metadata_consensus(
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(normal_heartbeat_ticks);
+    consensus.set_commit_message_ticks(commit_message_ticks);
+    consensus.set_prepare_ticks(prepare_ticks);
+    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks);
+    consensus.set_view_change_status_ticks(view_change_status_ticks);
+    consensus.set_request_start_view_ticks(request_start_view_ticks);
+    consensus.set_probe_attempts_max(probe_attempts_max);
 
     let last_header = journal
         .last_op()
@@ -1787,10 +1932,11 @@ fn restore_metadata_consensus(
     // primary; via StartView adoption + the local commit walk on a rejoined
     // backup), serving reads would show pre-restart state that clients already
     // saw acked -- gate them on the barrier regardless of role. If the suffix
-    // never committed cluster-wide, the barrier times out on the read path and
-    // serving resumes (`await_recovery_barrier`).
+    // never re-commits cluster-wide, the read path fails loud with a retryable
+    // 503 once the paired deadline expires (`await_recovery_barrier`).
     if commit_watermark < restored_op {
         consensus.set_recovery_barrier(restored_op);
+        consensus.set_recovery_deadline(recovery_deadline);
     }
 
     // Re-pipeline the prepared-but-uncommitted suffix so the primary's
@@ -1838,15 +1984,24 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
         bus,
-        LocalPipeline::new(),
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
+    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
     // A recovered partition lost its consensus state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
     // this replica cannot know the group's (op, commit). In a cluster it
@@ -1886,6 +2041,13 @@ async fn load_partition(
             })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    // Recovered partitions honor the same config-surfaced ring ceilings as the
+    // fresh-create path (build_partition_fresh). Retention is already off for
+    // single-replica groups, so this only sizes the multi-replica ring.
+    partition.log.journal().inner.set_ring_caps(
+        config.partition.evicted_ring_capacity,
+        config.partition.evicted_ring_bytes_max.as_bytes_u64(),
+    );
     partition.set_partition_dir(config.system.get_partition_path(
         stream_id,
         topic_id,
@@ -2223,6 +2385,7 @@ async fn start_tcp_runtime(
             shard,
             http_addr,
             &config.http,
+            config.metadata.clients_table_max,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
@@ -3080,6 +3243,264 @@ mod tests {
             config_default, built_in,
             "[cluster] heartbeat_timeout default drifted from \
              TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_holds_the_floor_for_small_heartbeats() {
+        // Below the 5s default the heartbeat-independent recovery term (~7s of
+        // ViewChangeStatus backstop plus ceremony) dominates, so the floor
+        // governs however small the heartbeat is; 3 x 5s lands exactly on it.
+        // A default-sized status backstop stays on the floor, not above it.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(1), Duration::from_secs(5)),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(5), Duration::from_secs(5)),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_scales_past_the_floor_for_large_heartbeats() {
+        // Once 3 x heartbeat clears the floor the scaled window governs, so a
+        // slow-heartbeat cluster is not failed 503 before its longer recovery
+        // can finish. A default-sized status backstop stays under it.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(10), Duration::from_secs(5)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(15), Duration::from_secs(5)),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_scales_with_the_status_backstop() {
+        // A raised view-change status backstop stretches worst-case recovery
+        // even when the heartbeat stays fast, so the deadline must track it or
+        // post-restart reads 503 before a slow election settles.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(1), Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_at_config_defaults_matches_the_floor() {
+        // Folding the status term in must not move the stock deadline: at the
+        // shared 5s defaults each scaled term lands exactly on the 15s floor,
+        // so an un-tuned cluster keeps its pre-existing recovery window.
+        let cluster = configs::ng_cluster::ClusterConfig::default();
+        assert_eq!(
+            recovery_barrier_deadline(
+                cluster.heartbeat_timeout.get_duration(),
+                cluster.view_change_status_timeout.get_duration(),
+            ),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_saturates_instead_of_panicking() {
+        // Neither timeout has a config ceiling, so both multiplies must
+        // saturate rather than abort boot on an absurd parseable value.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::MAX, Duration::from_secs(5)),
+            Duration::MAX
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(5), Duration::MAX),
+            Duration::MAX
+        );
+    }
+
+    #[test]
+    fn default_commit_broadcast_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .commit_broadcast_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::COMMIT_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] commit_broadcast_interval default drifted from \
+             TimeoutManager::COMMIT_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_prepare_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .prepare_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::PREPARE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] prepare_retransmit_interval default drifted from \
+             TimeoutManager::PREPARE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_partition_prepare_queue_depth_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml and flows
+        // through PartitionConfig::default(); keep the embedded value in
+        // lockstep with the pipeline depth LocalPipeline::new() (the simulator
+        // and tests) runs on, so a default deployment is byte-identical.
+        let config_default = configs::ng_partition::PartitionConfig::default().prepare_queue_depth;
+        assert_eq!(
+            config_default,
+            consensus::PIPELINE_PREPARE_QUEUE_MAX,
+            "[partition] prepare_queue_depth default drifted from \
+             consensus::PIPELINE_PREPARE_QUEUE_MAX"
+        );
+    }
+
+    #[test]
+    fn default_view_change_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it). One knob drives both view-change
+        // retransmit timers, which are equal by design, so pin it against both.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .view_change_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let start_view_change =
+            u128::from(consensus::TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS)
+                * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        let do_view_change = u128::from(consensus::TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, start_view_change,
+            "[cluster] view_change_retransmit_interval default drifted from \
+             TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS"
+        );
+        assert_eq!(
+            config_default, do_view_change,
+            "[cluster] view_change_retransmit_interval default drifted from \
+             TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_view_change_status_timeout_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .view_change_status_timeout
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] view_change_status_timeout default drifted from \
+             TimeoutManager::VIEW_CHANGE_STATUS_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_request_start_view_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .request_start_view_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] request_start_view_retransmit_interval default drifted from \
+             TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_view_probe_attempts_max_matches_consensus_constant() {
+        // Belt and suspenders with the static assert above: that pins the
+        // duplicated configs-crate literal, this pins the shipped config.toml
+        // value the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default().view_probe_attempts_max;
+        assert_eq!(
+            config_default,
+            consensus::PROBE_ATTEMPTS_MAX,
+            "[cluster] view_probe_attempts_max default drifted from \
+             consensus::PROBE_ATTEMPTS_MAX"
+        );
+    }
+
+    #[test]
+    fn default_repair_retry_interval_matches_partitions_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .repair_retry_interval
+            .get_duration()
+            .as_millis();
+        let built_in =
+            u128::from(partitions::REPAIR_RETRY_TICKS) * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] repair_retry_interval default drifted from \
+             partitions::REPAIR_RETRY_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_repair_chunk_max_matches_shard_constant() {
+        // Belt and suspenders with the static assert above: that pins the
+        // duplicated configs-crate literal, this pins the shipped config.toml
+        // value the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default().repair_chunk_max;
+        assert_eq!(
+            config_default as u64,
+            shard::REPAIR_CHUNK_MAX,
+            "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn default_evicted_ring_capacity_matches_partitions_constant() {
+        // Belt and suspenders with the static assert above; this pins the
+        // shipped config.toml value.
+        let config_default =
+            configs::ng_partition::PartitionConfig::default().evicted_ring_capacity;
+        assert_eq!(
+            config_default,
+            partitions::EVICTED_RING_CAPACITY,
+            "[partition] evicted_ring_capacity default drifted from \
+             partitions::EVICTED_RING_CAPACITY"
+        );
+    }
+
+    #[test]
+    fn default_evicted_ring_bytes_max_matches_partitions_constant() {
+        // Belt and suspenders with the static assert above; this pins the
+        // shipped config.toml value.
+        let config_default = configs::ng_partition::PartitionConfig::default()
+            .evicted_ring_bytes_max
+            .as_bytes_u64();
+        assert_eq!(
+            config_default,
+            partitions::EVICTED_RING_BYTES_MAX,
+            "[partition] evicted_ring_bytes_max default drifted from \
+             partitions::EVICTED_RING_BYTES_MAX"
         );
     }
 

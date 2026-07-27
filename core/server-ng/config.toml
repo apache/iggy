@@ -590,9 +590,58 @@ name = "iggy-cluster"
 # Backup-side liveness window for a consensus plane's primary (duration).
 # A replica that sees no primary traffic for this long starts a view change.
 # Raise it on oversubscribed hosts where scheduling stalls fake primary
-# death. Must be at least "2s": the primary heartbeats every second, and a
-# window at or below one ping interval would elect on every hiccup.
+# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
+# primary signals liveness through its commit broadcast, and the window must
+# span several broadcasts so one delayed broadcast never trips an election.
 heartbeat_timeout = "5s"
+
+# How often the primary broadcasts its commit point to every backup (duration).
+# This is the cluster's liveness signal: each broadcast resets every backup's
+# heartbeat_timeout window and carries the latest commit point forward. Must be
+# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
+# value. Drives the consensus CommitMessage timer.
+commit_broadcast_interval = "500ms"
+
+# How often the primary retransmits prepares that backups have not yet acked
+# (duration). Lower values recover faster from a dropped prepare at the cost of
+# more replica traffic; must be nonzero. Drives the consensus Prepare timer.
+prepare_retransmit_interval = "250ms"
+
+# How often a replica retransmits its StartViewChange / DoViewChange while a
+# view change is in progress (duration). Lower values converge a healthy
+# election faster at the cost of more replica traffic; must be nonzero. Drives
+# both consensus view-change retransmit timers.
+view_change_retransmit_interval = "500ms"
+
+# Backstop for a stalled view change (duration): one that does not conclude
+# within this window escalates to a fresh cluster-wide election. Must be nonzero
+# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# messages retransmit rather than prematurely escalate.
+view_change_status_timeout = "5s"
+
+# How often a recovering or view-change backup re-requests the current view's
+# StartView from its primary (duration); must be nonzero. Drives the consensus
+# RequestStartView timer.
+request_start_view_retransmit_interval = "1s"
+
+# How many consecutive unanswered RequestStartView probes a recovering replica
+# tolerates before falling back to an election (integer). A full-cluster restart
+# leaves nobody settled to answer, so the replica elects on its recovered log.
+# Must be between 1 and 100.
+view_probe_attempts_max = 5
+
+# How long a stalled journal-repair stream waits before re-requesting its
+# remaining window from the serving peer (duration). Repair frames are
+# fire-and-forget over the lossy bus, so a session with no retry wedges forever
+# on a single dropped frame. Paces both the metadata and partition repair loops;
+# must be nonzero.
+repair_retry_interval = "1s"
+
+# Prepares a peer serves per repair round before the requester walks to the next
+# chunk (integer). Each frame rides the per-peer message-bus queue, so this must
+# stay strictly below message_bus.peer_queue_capacity or a full round overruns
+# the queue and drops frames. Must be > 0 and <= 1024.
+repair_chunk_max = 128
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -734,6 +783,36 @@ prepare_queue_depth = 32
 # between forced checkpoints at the cost of memory and bigger WAL
 # rewrites per checkpoint.
 journal_slots = 1024
+
+# Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
+# virtual clients and HTTP sessions together) hold live session state at once.
+# When full, the client whose last commit is oldest is evicted and its next
+# request re-registers. The HTTP session cap tracks this at half, so raising
+# it lifts both. Must be between 2 and 65536.
+clients_table_max = 8192
+
+# Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
+# plane), a pipeline exists per partition, so raising this multiplies pinned
+# request-buffer memory by the partition count. Keep it modest.
+[partition]
+# Depth of a partition's prepare queue: how many uncommitted produce /
+# consumer-offset ops may be in flight at once for that partition. Submits past
+# it spill into a request queue of twice this depth; once both are full the
+# server drops the request without a reply and the client retries on its own
+# request timeout. Must be > 0 and <= 256.
+prepare_queue_depth = 32
+
+# Entries the evicted ring retains per multi-replica partition for journal
+# repair after a peer rejoins. Larger widens the window a restarting peer can be
+# served from the ring before falling back to bulk sync, at the cost of pinned
+# memory per partition. Must be > 0 and <= 65536. Single-replica partitions
+# retain nothing regardless.
+evicted_ring_capacity = 4096
+
+# Byte ceiling for the evicted ring per partition; whichever ring cap (this or
+# evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
+# large batches can pin. Must be > 0 and <= "256 MiB".
+evicted_ring_bytes_max = "16 MiB"
 
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships

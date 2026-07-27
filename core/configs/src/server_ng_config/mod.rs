@@ -32,6 +32,7 @@ pub mod defaults;
 pub mod displays;
 pub mod message_bus;
 pub mod metadata;
+pub mod partition;
 pub mod quic;
 pub mod server_ng;
 pub mod sharding;

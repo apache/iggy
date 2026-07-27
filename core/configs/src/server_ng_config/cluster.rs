@@ -31,9 +31,47 @@ use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::time::Duration;
 
-/// The primary heartbeats roughly every second (`PING_TICKS`); a window at
-/// or below one ping interval would elect on every scheduling hiccup.
+/// Absolute floor for the backup liveness window, independent of the
+/// commit-broadcast rate. The primary signals liveness through its commit
+/// broadcast (`commit_broadcast_interval`, 500ms by default); 2s spans several
+/// broadcasts, so a single delayed one never elects. The per-config
+/// `MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO` check scales the same headroom
+/// when the broadcast interval is retuned.
 pub const MIN_CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The backup liveness window (`heartbeat_timeout`) must span at least this
+/// many commit broadcasts (`commit_broadcast_interval`), so one dropped or
+/// delayed broadcast never trips a view change on a healthy primary.
+const MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO: u32 = 4;
+
+/// The view-change status backstop (`view_change_status_timeout`) must span at
+/// least this many retransmit intervals (`view_change_retransmit_interval`), so
+/// a few dropped `StartViewChange` / `DoViewChange` messages retransmit rather
+/// than escalating a progressing view change into a fresh cluster-wide election.
+const MIN_STATUS_TO_RETRANSMIT_RATIO: u32 = 4;
+
+/// Default recovering-replica probe-attempt ceiling. Duplicated here rather
+/// than imported so `core/configs` keeps off a build-time edge onto
+/// `core/consensus` (mirroring [`super::partition`]); `core/server-ng`'s
+/// bootstrap static-asserts it equal to `consensus::PROBE_ATTEMPTS_MAX`.
+pub const DEFAULT_VIEW_PROBE_ATTEMPTS_MAX: u32 = 5;
+
+/// Upper bound on `view_probe_attempts_max`. A recovering replica probes once
+/// per `request_start_view_retransmit_interval`, so hundreds of attempts would
+/// stall the election fallback for minutes on a full-cluster restart; this is a
+/// typo guard, not a sizing endorsement.
+const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
+
+/// Default per-round repair-serving chunk. Duplicated here rather than imported
+/// so `core/configs` keeps off a build-time edge onto `core/shard` (mirroring
+/// [`DEFAULT_VIEW_PROBE_ATTEMPTS_MAX`]); `core/server-ng`'s bootstrap
+/// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
+pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
+
+/// Upper bound on `repair_chunk_max`. A chunk rides the per-peer bus queue, so
+/// the load-bearing rule is `repair_chunk_max < message_bus.peer_queue_capacity`
+/// (enforced at the top level); this standalone ceiling is a typo guard.
+const MAX_REPAIR_CHUNK_MAX: usize = 1024;
 
 /// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
 /// is KDF-derived from these bytes at use-site, so any encoding clearing this
@@ -44,6 +82,78 @@ const MIN_SHARED_SECRET_LEN: usize = 32;
 /// itself lives in `core/server-ng/config.toml` like every other default.
 fn default_heartbeat_timeout() -> IggyDuration {
     SERVER_NG_CONFIG.cluster.heartbeat_timeout.parse().unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_commit_broadcast_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .commit_broadcast_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_prepare_retransmit_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .prepare_retransmit_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_view_change_retransmit_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .view_change_retransmit_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_view_change_status_timeout() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .view_change_status_timeout
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_request_start_view_retransmit_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .request_start_view_retransmit_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_view_probe_attempts_max() -> u32 {
+    SERVER_NG_CONFIG.cluster.view_probe_attempts_max as u32
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_repair_retry_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .repair_retry_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_repair_chunk_max() -> usize {
+    SERVER_NG_CONFIG.cluster.repair_chunk_max as usize
 }
 
 #[serde_as]
@@ -62,6 +172,80 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub heartbeat_timeout: IggyDuration,
+    /// How often the primary broadcasts its commit point to every backup, the
+    /// cluster's primary-liveness signal. Each broadcast resets the backups'
+    /// `heartbeat_timeout` window, so that window must span several broadcasts:
+    /// boot rejects `heartbeat_timeout < MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO
+    /// * commit_broadcast_interval`. Sizes the consensus `CommitMessage` timer.
+    /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
+    /// to zero) is rejected at boot.
+    #[serde(default = "default_commit_broadcast_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub commit_broadcast_interval: IggyDuration,
+    /// How often the primary retransmits prepares a backup has not yet acked.
+    /// Lower recovers faster from a dropped prepare at the cost of replica
+    /// traffic. Sizes the consensus `Prepare` timer. Zero (and the `0` /
+    /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
+    /// at boot.
+    #[serde(default = "default_prepare_retransmit_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub prepare_retransmit_interval: IggyDuration,
+    /// How often a plane retransmits its `StartViewChange` / `DoViewChange`
+    /// while a view change is running. Lower converges a healthy election
+    /// faster at the cost of replica traffic. Sizes both consensus view-change
+    /// retransmit timers, which are deliberately equal. Zero (and the `0` /
+    /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
+    /// at boot.
+    #[serde(default = "default_view_change_retransmit_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub view_change_retransmit_interval: IggyDuration,
+    /// Backstop for a stalled view change: one that does not conclude within
+    /// this window escalates to a fresh cluster-wide election. Must span
+    /// several `view_change_retransmit_interval`s so a few dropped view-change
+    /// messages retransmit rather than escalate: boot rejects
+    /// `view_change_status_timeout < MIN_STATUS_TO_RETRANSMIT_RATIO *
+    /// view_change_retransmit_interval`. Zero (and the `0` / `disabled` /
+    /// `unlimited` sentinels, which all parse to zero) is rejected at boot.
+    #[serde(default = "default_view_change_status_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub view_change_status_timeout: IggyDuration,
+    /// How often a recovering or view-change backup re-requests the current
+    /// view's `StartView` from its primary (`RequestStartView`). Sizes the
+    /// consensus `RequestStartView` timer. Zero (and the `0` / `disabled` /
+    /// `unlimited` sentinels, which all parse to zero) is rejected at boot.
+    #[serde(default = "default_request_start_view_retransmit_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub request_start_view_retransmit_interval: IggyDuration,
+    /// How many consecutive unanswered `RequestStartView` probes a recovering
+    /// replica tolerates before it falls back to an election (a full-cluster
+    /// restart leaves nobody settled to answer). Must be >= 1 and <=
+    /// `MAX_VIEW_PROBE_ATTEMPTS`.
+    #[serde(default = "default_view_probe_attempts_max")]
+    pub view_probe_attempts_max: u32,
+    /// How long a stalled journal-repair stream waits before re-requesting its
+    /// remaining window from the serving peer. Repair frames are
+    /// fire-and-forget over the lossy bus, so a session with no retry wedges
+    /// forever on a single dropped frame. Paces both the metadata and
+    /// partition repair loops. Sizes the retry threshold in consensus ticks.
+    /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
+    /// to zero) is rejected at boot.
+    #[serde(default = "default_repair_retry_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub repair_retry_interval: IggyDuration,
+    /// Prepares a peer serves per repair round before the requester walks to
+    /// the next chunk. Each frame rides the per-peer message-bus queue, so this
+    /// must stay below `message_bus.peer_queue_capacity` or a full round
+    /// overruns the queue and silently drops frames (enforced at the top
+    /// level). Applies to both the metadata and partition repair planes. Must
+    /// be > 0 and <= `MAX_REPAIR_CHUNK_MAX`.
+    #[serde(default = "default_repair_chunk_max")]
+    pub repair_chunk_max: usize,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -199,9 +383,141 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         if self.heartbeat_timeout.get_duration() < MIN_CLUSTER_HEARTBEAT_TIMEOUT {
             eprintln!(
                 "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least {}s \
-                 (the primary heartbeats every second; a shorter window elects on every hiccup)",
+                 (the primary signals liveness through its commit broadcast; a shorter window \
+                 elects on every scheduling hiccup)",
                 self.heartbeat_timeout,
                 MIN_CLUSTER_HEARTBEAT_TIMEOUT.as_secs()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The commit broadcast is the cluster's liveness feed and the prepare
+        // retransmit its recovery timer; both size consensus timers that have
+        // to advance. `0` / `disabled` / `unlimited` all collapse to a zero
+        // duration, which would stall the timer - reject them.
+        if self.commit_broadcast_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.commit_broadcast_interval must be nonzero \
+                 (it drives the primary's liveness broadcast)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.prepare_retransmit_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.prepare_retransmit_interval must be \
+                 nonzero (it drives prepare retransmission)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The liveness window must span several commit broadcasts so a single
+        // delayed broadcast never trips a view change on a healthy primary.
+        let min_heartbeat = self
+            .commit_broadcast_interval
+            .get_duration()
+            .saturating_mul(MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO);
+        if self.heartbeat_timeout.get_duration() < min_heartbeat {
+            eprintln!(
+                "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least \
+                 {}x cluster.commit_broadcast_interval '{}' so the liveness window spans several \
+                 broadcasts",
+                self.heartbeat_timeout,
+                MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO,
+                self.commit_broadcast_interval
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The three view-change timers each size a consensus timer that has to
+        // advance; `0` / `disabled` / `unlimited` all collapse to zero and
+        // would stall it - reject them.
+        if self
+            .view_change_retransmit_interval
+            .get_duration()
+            .is_zero()
+        {
+            eprintln!(
+                "Invalid cluster configuration: cluster.view_change_retransmit_interval must be \
+                 nonzero (it drives StartViewChange / DoViewChange retransmission)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.view_change_status_timeout.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.view_change_status_timeout must be nonzero \
+                 (it backstops a stalled view change)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self
+            .request_start_view_retransmit_interval
+            .get_duration()
+            .is_zero()
+        {
+            eprintln!(
+                "Invalid cluster configuration: cluster.request_start_view_retransmit_interval \
+                 must be nonzero (it drives RequestStartView retransmission)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The status backstop must span several retransmits so a few dropped
+        // view-change messages retransmit rather than escalating a progressing
+        // view change into a fresh cluster-wide election.
+        let min_status = self
+            .view_change_retransmit_interval
+            .get_duration()
+            .saturating_mul(MIN_STATUS_TO_RETRANSMIT_RATIO);
+        if self.view_change_status_timeout.get_duration() < min_status {
+            eprintln!(
+                "Invalid cluster configuration: cluster.view_change_status_timeout '{}' must be at \
+                 least {}x cluster.view_change_retransmit_interval '{}' so a stalled view change \
+                 retransmits before it escalates to an election",
+                self.view_change_status_timeout,
+                MIN_STATUS_TO_RETRANSMIT_RATIO,
+                self.view_change_retransmit_interval
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // A recovering replica needs at least one probe before it may give up
+        // and elect; the ceiling is a typo guard (see MAX_VIEW_PROBE_ATTEMPTS).
+        if self.view_probe_attempts_max == 0 {
+            eprintln!(
+                "Invalid cluster configuration: cluster.view_probe_attempts_max must be >= 1"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.view_probe_attempts_max > MAX_VIEW_PROBE_ATTEMPTS {
+            eprintln!(
+                "Invalid cluster configuration: cluster.view_probe_attempts_max ({}) exceeds the \
+                 maximum ({MAX_VIEW_PROBE_ATTEMPTS})",
+                self.view_probe_attempts_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The repair retry interval sizes a tick threshold that has to advance;
+        // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
+        // every stalled repair stream - reject them. The chunk is a per-round
+        // count with a standalone typo ceiling; the load-bearing rule against
+        // message_bus.peer_queue_capacity is enforced at the top level.
+        if self.repair_retry_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_retry_interval must be nonzero \
+                 (it paces stalled-repair retries)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.repair_chunk_max == 0 {
+            eprintln!("Invalid cluster configuration: cluster.repair_chunk_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.repair_chunk_max > MAX_REPAIR_CHUNK_MAX {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_chunk_max ({}) exceeds the maximum \
+                 ({MAX_REPAIR_CHUNK_MAX})",
+                self.repair_chunk_max
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -363,6 +679,15 @@ mod tests {
             enabled: true,
             name: "iggy-cluster".to_owned(),
             heartbeat_timeout: default_heartbeat_timeout(),
+            commit_broadcast_interval: default_commit_broadcast_interval(),
+            prepare_retransmit_interval: default_prepare_retransmit_interval(),
+            view_change_retransmit_interval: default_view_change_retransmit_interval(),
+            view_change_status_timeout: default_view_change_status_timeout(),
+            request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
+            ),
+            view_probe_attempts_max: default_view_probe_attempts_max(),
+            repair_retry_interval: default_repair_retry_interval(),
+            repair_chunk_max: default_repair_chunk_max(),
             nodes: Vec::new(),
             auth: ClusterAuthConfig {
                 enabled: true,
@@ -400,6 +725,15 @@ mod cluster_validate_tests {
             enabled: true,
             name: "iggy-cluster".to_string(),
             heartbeat_timeout: default_heartbeat_timeout(),
+            commit_broadcast_interval: default_commit_broadcast_interval(),
+            prepare_retransmit_interval: default_prepare_retransmit_interval(),
+            view_change_retransmit_interval: default_view_change_retransmit_interval(),
+            view_change_status_timeout: default_view_change_status_timeout(),
+            request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
+            ),
+            view_probe_attempts_max: default_view_probe_attempts_max(),
+            repair_retry_interval: default_repair_retry_interval(),
+            repair_chunk_max: default_repair_chunk_max(),
             nodes,
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
@@ -415,6 +749,136 @@ mod cluster_validate_tests {
         // be rejected the same way.
         c.heartbeat_timeout = IggyDuration::new(Duration::ZERO);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_commit_broadcast_interval() {
+        // `0` / `disabled` / `unlimited` all collapse to zero and stall the
+        // liveness broadcast.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.commit_broadcast_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_prepare_retransmit_interval() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.prepare_retransmit_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_heartbeat_below_commit_broadcast_ratio() {
+        // 3s clears the absolute 2s floor but is still < 4x the 1s broadcast,
+        // so the ratio rule is what rejects here, not the floor.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(3));
+        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_heartbeat_at_commit_broadcast_ratio() {
+        // Exactly 4x the broadcast (and above the 2s floor) must pass.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(4));
+        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_view_change_retransmit_interval() {
+        // `0` / `disabled` / `unlimited` all collapse to zero and stall the
+        // view-change retransmit timers.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_change_retransmit_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_view_change_status_timeout() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_change_status_timeout = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_request_start_view_retransmit_interval() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.request_start_view_retransmit_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_view_change_status_below_retransmit_ratio() {
+        // 3s is nonzero but still < 4x the 1s retransmit, so the ratio rule is
+        // what rejects here, not the zero check.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_change_retransmit_interval = IggyDuration::new(Duration::from_secs(1));
+        c.view_change_status_timeout = IggyDuration::new(Duration::from_secs(3));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_view_change_status_at_retransmit_ratio() {
+        // Exactly 4x the retransmit interval must pass.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_change_retransmit_interval = IggyDuration::new(Duration::from_secs(1));
+        c.view_change_status_timeout = IggyDuration::new(Duration::from_secs(4));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_view_probe_attempts_max() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_probe_attempts_max = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_view_probe_attempts_above_ceiling() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_probe_attempts_max = MAX_VIEW_PROBE_ATTEMPTS + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_view_probe_attempts_at_ceiling() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.view_probe_attempts_max = MAX_VIEW_PROBE_ATTEMPTS;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_repair_retry_interval() {
+        // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
+        // stalled repair streams.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_retry_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_repair_chunk_max() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_chunk_max = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_repair_chunk_max_above_ceiling() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_chunk_max = MAX_REPAIR_CHUNK_MAX + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_repair_chunk_max_at_ceiling() {
+        // Section-level validate only; the cross-section rule against
+        // message_bus.peer_queue_capacity lives in the top-level validate.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_chunk_max = MAX_REPAIR_CHUNK_MAX;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

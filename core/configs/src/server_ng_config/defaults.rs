@@ -32,6 +32,7 @@ use super::cluster::{
 };
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
@@ -66,6 +67,7 @@ impl Default for ServerNgConfig {
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
             metadata: MetadataConfig::default(),
+            partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
         }
     }
@@ -77,6 +79,38 @@ impl Default for ClusterConfig {
             enabled: SERVER_NG_CONFIG.cluster.enabled,
             name: SERVER_NG_CONFIG.cluster.name.parse().unwrap(),
             heartbeat_timeout: SERVER_NG_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
+            commit_broadcast_interval: SERVER_NG_CONFIG
+                .cluster
+                .commit_broadcast_interval
+                .parse()
+                .unwrap(),
+            prepare_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .prepare_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_change_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .view_change_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_change_status_timeout: SERVER_NG_CONFIG
+                .cluster
+                .view_change_status_timeout
+                .parse()
+                .unwrap(),
+            request_start_view_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .request_start_view_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_probe_attempts_max: SERVER_NG_CONFIG.cluster.view_probe_attempts_max as u32,
+            repair_retry_interval: SERVER_NG_CONFIG
+                .cluster
+                .repair_retry_interval
+                .parse()
+                .unwrap(),
+            repair_chunk_max: SERVER_NG_CONFIG.cluster.repair_chunk_max as usize,
             nodes: SERVER_NG_CONFIG
                 .cluster
                 .nodes
@@ -126,6 +160,20 @@ impl Default for MetadataConfig {
         MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
+            clients_table_max: metadata.clients_table_max as usize,
+        }
+    }
+}
+
+impl Default for PartitionConfig {
+    fn default() -> PartitionConfig {
+        // Read from the embedded TOML so the Default impl and the on-disk
+        // schema cannot drift (same pattern as MetadataConfig above).
+        let partition = &SERVER_NG_CONFIG.partition;
+        PartitionConfig {
+            prepare_queue_depth: partition.prepare_queue_depth as usize,
+            evicted_ring_capacity: partition.evicted_ring_capacity as usize,
+            evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
         }
     }
 }

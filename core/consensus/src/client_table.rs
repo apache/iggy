@@ -156,6 +156,21 @@ impl ClientTable {
         }
     }
 
+    /// Resize the table to `max_clients` slots. Boot-only: reallocating a
+    /// populated table would silently drop live sessions, so this must run
+    /// before any client registers (server-ng bootstrap applies the configured
+    /// `[metadata] clients_table_max` here).
+    ///
+    /// # Panics
+    /// If the table already holds a client.
+    pub fn set_capacity(&mut self, max_clients: usize) {
+        assert!(
+            self.index.is_empty(),
+            "set_capacity must run before any client registers"
+        );
+        *self = Self::new(max_clients);
+    }
+
     /// Check request against table. Session first, then request progression.
     /// For Register, use [`check_register`].
     ///
@@ -868,6 +883,45 @@ mod tests {
         );
         assert!(table.get_reply(200).is_some());
         assert!(table.get_reply(300).is_some());
+    }
+
+    // Capacity resize (boot-only)
+
+    // Resizing an empty table swaps its slot count in: a smaller cap then
+    // evicts once the new bound is reached.
+    #[test]
+    fn set_capacity_resizes_empty_table() {
+        let mut table = ClientTable::new(10);
+        table.set_capacity(2);
+        table.commit_register(
+            100,
+            TEST_USER_ID,
+            make_register_reply(100, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            200,
+            TEST_USER_ID,
+            make_register_reply(200, 20),
+            no_in_flight(),
+        );
+        table.commit_register(
+            300,
+            TEST_USER_ID,
+            make_register_reply(300, 30),
+            no_in_flight(),
+        );
+        assert_eq!(table.count(), 2, "resized cap of 2 evicts the oldest");
+        assert!(table.get_reply(100).is_none());
+    }
+
+    // The empty-table contract is asserted, not silently honored: resizing a
+    // populated table would drop live sessions, so it must panic.
+    #[test]
+    #[should_panic(expected = "before any client registers")]
+    fn set_capacity_rejects_a_populated_table() {
+        let (mut table, _session) = table_with_client();
+        table.set_capacity(2);
     }
 
     // Edge cases

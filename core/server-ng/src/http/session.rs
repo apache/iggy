@@ -29,21 +29,38 @@ use futures::channel::oneshot;
 use message_bus::InstanceToken;
 use tokio::sync::Mutex;
 
-/// Hard cap on live per-credential sessions. A leak-guard, not a tuning knob:
-/// reaching it means this many distinct live tokens are in flight at once. New
-/// sessions past the cap are refused with a transient 503 rather than evicting
-/// a live one; the client retries. Expired entries are dropped first, so the
-/// cap only bites on live oversubscription.
+/// HTTP's slice of the shared VSR client table: half the configured
+/// `[metadata] clients_table_max`. A leak-guard, not a tuning knob: reaching
+/// the cap means that many distinct live tokens are in flight at once. New
+/// sessions past it are refused with a transient 503 rather than evicting a
+/// live one; the client retries. Expired entries are dropped first, so the cap
+/// only bites on live oversubscription.
 ///
 /// Bounded by the shared VSR client table: HTTP sessions and the TCP/QUIC/WS
-/// virtual clients all Register into the one [`CLIENTS_TABLE_MAX`]-slot table,
-/// which LRU-evicts the oldest client when full. Capping HTTP at half that
-/// bound keeps this plane from crowding the others out and keeps the combined
-/// steady state under the shared bound, so a live idle HTTP session is not
-/// routinely evicted consensus-side. The residual eviction race (both planes
-/// busy) degrades gracefully: an evicted session's next control write is
-/// classified as an eviction and re-registers (see [`HttpInner::forget_session`]).
-pub(in crate::http) const MAX_HTTP_SESSIONS: usize = CLIENTS_TABLE_MAX / 2;
+/// virtual clients all Register into the one client table, which LRU-evicts the
+/// oldest client when full. Capping HTTP at half that bound keeps this plane
+/// from crowding the others out and keeps the combined steady state under the
+/// shared bound, so a live idle HTTP session is not routinely evicted
+/// consensus-side. The residual eviction race (both planes busy) degrades
+/// gracefully: an evicted session's next control write is classified as an
+/// eviction and re-registers (see [`HttpInner::forget_session`]).
+///
+/// The half rule lives here so a change to the ratio flows to both the runtime
+/// value (threaded through `HttpInner` at boot) and the pinned default.
+pub(in crate::http) const fn max_http_sessions(clients_table_max: usize) -> usize {
+    clients_table_max / 2
+}
+
+/// HTTP session cap at the shipped-default client table ([`CLIENTS_TABLE_MAX`]).
+/// The runtime value ([`max_http_sessions`] of the configured
+/// `clients_table_max`) equals this on a default deployment; the tests pin it.
+pub(in crate::http) const DEFAULT_MAX_HTTP_SESSIONS: usize = max_http_sessions(CLIENTS_TABLE_MAX);
+
+// HTTP must never claim the whole shared VSR client table, or a login storm
+// could evict every TCP/QUIC/WS virtual client. Compile-time pin of the
+// headroom the half-cap guarantees (config validation floors the table at 2, so
+// the runtime cap keeps the same headroom).
+const _: () = assert!(DEFAULT_MAX_HTTP_SESSIONS < CLIENTS_TABLE_MAX);
 
 /// First per-session request id the write path hands out. VSR request numbers
 /// are 1-based and strictly increasing within a session.
@@ -346,15 +363,21 @@ mod tests {
         assert_eq!(table.len(), 8, "no live session is evicted to make room");
     }
 
+    // Pins the specific half ratio (not just headroom, which the module-level
+    // compile assert covers): narrowing the split would silently starve HTTP.
     #[test]
-    fn http_session_cap_leaves_headroom_below_the_shared_client_table_bound() {
-        const {
-            assert!(
-                MAX_HTTP_SESSIONS < CLIENTS_TABLE_MAX,
-                "HTTP must not claim the whole shared VSR client table"
-            );
-        }
-        assert_eq!(MAX_HTTP_SESSIONS, CLIENTS_TABLE_MAX / 2);
+    fn http_session_cap_is_half_the_shared_client_table_bound() {
+        assert_eq!(DEFAULT_MAX_HTTP_SESSIONS, CLIENTS_TABLE_MAX / 2);
+    }
+
+    // Zero behavior change at defaults: the cap computed at boot from the
+    // shipped `[metadata] clients_table_max` equals the historical compile-time
+    // default, so surfacing the table size as config leaves a default
+    // deployment untouched.
+    #[test]
+    fn runtime_cap_at_default_config_equals_pinned_default() {
+        let configured = configs::ng_metadata::MetadataConfig::default().clients_table_max;
+        assert_eq!(max_http_sessions(configured), DEFAULT_MAX_HTTP_SESSIONS);
     }
 
     // Eviction recovery: forgetting the evicted session drops exactly its
