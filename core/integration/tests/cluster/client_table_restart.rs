@@ -33,7 +33,7 @@
 //! 2. Resume through the login path: a reconnecting client re-authenticates
 //!    presenting its previous `client_id`. The rebind commits a Register --
 //!    `submit_register_in_process` verifies the authenticated user owns the
-//!    entry, then proposes -- so the entry refences at the new register's
+//!    entry, then proposes -- so the entry's fence moves to the new register's
 //!    commit op while keeping its watermark and reply ring. The client
 //!    continues under the NEW epoch from the login reply; frames stamped with
 //!    the pre-restart epoch are fenced zombies. There is deliberately no
@@ -349,7 +349,7 @@ async fn commit_request(
 /// commits (or serves the cached reply for) the request.
 ///
 /// The re-login is the resume, and it is a rebind: the ownership-gated
-/// Register commits, the recovered entry refences at that register's op, and
+/// Register commits, the recovered entry's fence moves to that register's op,
 /// the login reply hands back the NEW epoch. Continuation frames must stamp
 /// it -- the pre-restart epoch is a fenced zombie from here on. Watermark and
 /// reply ring survive the rebind, which is what the dedup assertion rests on.
@@ -384,7 +384,8 @@ async fn resume_request(
             Some(resumed) => {
                 assert!(
                     resumed > session,
-                    "rebind must refence above the pre-restart epoch                      (old {session}, got {resumed})"
+                    "rebind must move the fence above the pre-restart epoch \
+                     (old {session}, got {resumed})"
                 );
                 resumed
             }

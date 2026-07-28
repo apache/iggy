@@ -2459,7 +2459,7 @@ where
 /// rebalance off a dead consumer without waiting. Anything else has its
 /// reclaim DEFERRED by [`SESSION_RECLAIM_GRACE`], because session resume runs
 /// through the login path: a reconnecting client re-authenticates under its
-/// previous `client_id` and the committed rebind refences the existing entry
+/// previous `client_id` and the committed rebind adopts the existing entry
 /// while keeping its watermark and reply ring intact, which only works while
 /// that entry still exists.
 ///

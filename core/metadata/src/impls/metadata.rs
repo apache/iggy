@@ -1160,7 +1160,7 @@ where
                 return Err(MetadataSubmitError::PipelineFull);
             }
             // Commit and cancel share one recovery: read the table. On
-            // commit, `commit_register` refenced the entry (the reply header
+            // commit, `commit_register` moved the entry's fence (the reply header
             // carries neither epoch nor watermark). On a view-change cancel
             // or promotion-time rejection the re-read is correct-by-VSR: an
             // inherited Register applied via `commit_journal` between cancel

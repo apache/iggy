@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(
             table.get_epoch(1),
             Some(20),
-            "rebind refences at the new register's op"
+            "rebind moves the fence to the new register's op"
         );
         assert_eq!(
             table.get_watermark(1),
