@@ -65,24 +65,30 @@ lets the SDK replay the credentials whenever it reconnects, so a session dropped
 server restart is recovered instead of surfacing as `Unauthenticated`:
 
 ```python
+import asyncio
 from datetime import timedelta
 
 from apache_iggy import AutoLogin, IggyClient, TcpConfig, TcpReconnectionConfig
 
-client = IggyClient(
-    TcpConfig(
-        server_address="127.0.0.1:8090",
-        auto_login=AutoLogin.username_password("iggy", "iggy"),
-        reconnection=TcpReconnectionConfig(
-            enabled=True,
-            max_retries=10,
-            interval=timedelta(seconds=2),
-            reestablish_after=timedelta(seconds=30),
-        ),
-        heartbeat_interval=timedelta(seconds=5),
+
+async def main():
+    client = IggyClient(
+        TcpConfig(
+            server_address="127.0.0.1:8090",
+            auto_login=AutoLogin.username_password("iggy", "iggy"),
+            reconnection=TcpReconnectionConfig(
+                enabled=True,
+                max_retries=10,
+                interval=timedelta(seconds=2),
+                reestablish_after=timedelta(seconds=30),
+            ),
+            heartbeat_interval=timedelta(seconds=5),
+        )
     )
-)
-await client.connect()
+    await client.connect()
+
+
+asyncio.run(main())
 ```
 
 `TcpConfig` also carries `tls_enabled`, `tls_domain`, `tls_ca_file`,
