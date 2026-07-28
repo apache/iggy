@@ -25,6 +25,7 @@ proves the point of the configuration: with `auto_login` set, credentials are
 replayed on connect and no manual `login_user()` is needed.
 """
 
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -34,6 +35,7 @@ from apache_iggy import AutoLogin, IggyClient, TcpConfig, TcpReconnectionConfig
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
 
+@pytest.mark.unit
 class TestAutoLogin:
     """Test the credentials carried into the client."""
 
@@ -61,6 +63,7 @@ class TestAutoLogin:
         assert "secret-token" not in repr(auto_login)
 
 
+@pytest.mark.unit
 class TestTcpReconnectionConfig:
     """Test the reconnection policy."""
 
@@ -93,7 +96,41 @@ class TestTcpReconnectionConfig:
             # pyrefly: ignore  # bad-argument-count
             TcpReconnectionConfig(True)
 
+    @pytest.mark.parametrize(
+        "construct",
+        [
+            lambda duration: TcpReconnectionConfig(interval=duration),
+            lambda duration: TcpReconnectionConfig(reestablish_after=duration),
+        ],
+        ids=["interval", "reestablish_after"],
+    )
+    @pytest.mark.parametrize(
+        "negative",
+        [timedelta(microseconds=-1), timedelta(seconds=-1), timedelta(days=-1)],
+    )
+    def test_negative_duration_is_rejected(
+        self,
+        construct: Callable[[timedelta], TcpReconnectionConfig],
+        negative: timedelta,
+    ):
+        """Test that a negative duration fails at construction, not at connect."""
+        with pytest.raises(ValueError, match="negative"):
+            construct(negative)
 
+    def test_zero_interval_is_allowed(self):
+        """Test that a zero interval is legal and readable back."""
+        reconnection = TcpReconnectionConfig(interval=timedelta(0))
+
+        assert reconnection.interval == timedelta(0)
+
+    def test_very_long_interval_round_trips(self):
+        """Test that an interval beyond 68 years survives the i32 boundary."""
+        reconnection = TcpReconnectionConfig(interval=timedelta(days=30_000))
+
+        assert reconnection.interval == timedelta(days=30_000)
+
+
+@pytest.mark.unit
 class TestTcpConfig:
     """Test the transport configuration."""
 
@@ -156,7 +193,13 @@ class TestTcpConfig:
         with pytest.raises(ValueError):
             TcpConfig(server_address=invalid_address)
 
+    def test_negative_heartbeat_interval_is_rejected(self):
+        """Test that a negative heartbeat interval fails at construction."""
+        with pytest.raises(ValueError, match="negative"):
+            TcpConfig(heartbeat_interval=timedelta(seconds=-3))
 
+
+@pytest.mark.unit
 class TestClientConstruction:
     """Test what the client constructor accepts."""
 
@@ -215,6 +258,32 @@ class TestAutoLoginAgainstServer:
 
         with pytest.raises(RuntimeError):
             await client.create_stream(unique_name())
+
+    @pytest.mark.asyncio
+    async def test_config_and_connection_string_are_equivalent(self, unique_name):
+        """Test that TcpConfig and a connection string reach the same behavior."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        from_config = IggyClient(
+            TcpConfig(
+                server_address=f"{host}:{port}",
+                auto_login=AutoLogin.username_password("iggy", "iggy"),
+                reconnection=TcpReconnectionConfig(
+                    max_retries=3, interval=timedelta(seconds=1)
+                ),
+            )
+        )
+        from_string = IggyClient.from_connection_string(
+            f"iggy+tcp://iggy:iggy@{host}:{port}"
+            "?reconnection_retries=3&reconnection_interval=1s"
+        )
+
+        stream_name = unique_name()
+        for client in (from_config, from_string):
+            await client.connect()
+            await wait_for_ping(client)
+            assert await client.get_stream(stream_name) is None
 
     @pytest.mark.asyncio
     async def test_wrong_auto_login_credentials_fail(self):
