@@ -886,6 +886,7 @@ async fn shard_main(
                 data_dir,
                 topology.replica_count == 1,
                 config.metadata.journal_slots,
+                config.metadata.clients_table_max,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
@@ -984,6 +985,12 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
+    // Size the VSR client table before the recovered table installs and before
+    // listeners bind: `set_capacity` requires an EMPTY table, and on a restart
+    // the WAL replay rebuilds sessions into the table `recover()` returns (the
+    // recovered table is built at the same configured capacity, so the install
+    // below does not shrink it back).
+    metadata.set_clients_table_max(config.metadata.clients_table_max);
     // Reinstall the sessions the WAL replay rebuilt, so a rebooted node
     // dedups retries and admits continuations from clients that kept their
     // identity across the restart (IGGY-137).
@@ -1000,10 +1007,6 @@ async fn shard_main(
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
-    // Size the VSR client table before listeners bind and any client registers.
-    // The table is empty here on both fresh boot and restart (its slots are not
-    // restored from snapshot), which the setter's empty-table contract requires.
-    metadata.set_clients_table_max(config.metadata.clients_table_max);
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -1713,6 +1716,7 @@ async fn build_shard_for_thread(
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
     shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
+    shard.set_clients_table_max(config.metadata.clients_table_max);
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }

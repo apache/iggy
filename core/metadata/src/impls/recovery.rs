@@ -19,7 +19,7 @@ use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
-use consensus::{CLIENTS_TABLE_MAX, ClientTable, build_reply_message, build_reply_message_with};
+use consensus::{ClientTable, build_reply_message, build_reply_message_with};
 use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
@@ -140,6 +140,7 @@ pub async fn recover<M>(
     data_dir: &Path,
     solo: bool,
     journal_slots: usize,
+    clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
@@ -198,7 +199,7 @@ where
             .fold(snapshot_floor, u64::max)
     };
 
-    let mut client_table = ClientTable::new(CLIENTS_TABLE_MAX);
+    let mut client_table = ClientTable::new(clients_table_max);
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
     for header in &headers_to_replay {
@@ -300,6 +301,7 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
     use server_common::iobuf::Owned;
@@ -363,6 +365,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -387,6 +390,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -421,6 +425,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -462,6 +467,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -498,6 +504,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -564,6 +571,7 @@ mod tests {
             dir.path(),
             true,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -624,6 +632,7 @@ mod tests {
             dir.path(),
             true,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -678,6 +687,7 @@ mod tests {
             dir.path(),
             true,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await

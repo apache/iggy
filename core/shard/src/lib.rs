@@ -905,6 +905,13 @@ where
     /// `[cluster] repair_chunk_max` at bootstrap.
     repair_chunk_max: Cell<u64>,
 
+    /// Capacity for a state-transferred client table
+    /// ([`consensus::ClientTable::decode`]). Defaults to
+    /// [`consensus::CLIENTS_TABLE_MAX`]; server-ng overrides it from
+    /// `[metadata] clients_table_max` at bootstrap so the installed table
+    /// matches the configured capacity instead of the compile-time default.
+    clients_table_max: Cell<usize>,
+
     /// Live stalled-repair retry threshold in consensus ticks. Defaults to
     /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
     /// `[cluster] repair_retry_interval` at bootstrap.
@@ -1005,6 +1012,7 @@ where
             metadata_transfer_offers: RefCell::new(HashMap::new()),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
+            clients_table_max: Cell::new(consensus::CLIENTS_TABLE_MAX),
         })
     }
 
@@ -1020,6 +1028,14 @@ where
     /// compile-time [`REPAIR_CHUNK_MAX`] default.
     pub fn set_repair_chunk_max(&self, chunk: u64) {
         self.repair_chunk_max.set(chunk);
+    }
+
+    /// Override the state-transfer client-table capacity from configuration
+    /// (`[metadata] clients_table_max`). Called once per shard at bootstrap;
+    /// the simulator and tests keep the compile-time
+    /// [`consensus::CLIENTS_TABLE_MAX`] default.
+    pub fn set_clients_table_max(&self, max_clients: usize) {
+        self.clients_table_max.set(max_clients);
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1230,6 +1246,7 @@ where
             metadata_transfer_offers: RefCell::new(HashMap::new()),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
+            clients_table_max: Cell::new(consensus::CLIENTS_TABLE_MAX),
         }
     }
 
@@ -3224,7 +3241,7 @@ where
         let snapshot_ok = state_artifact_checksum(&session.snapshot) == target.snapshot_checksum;
         let table_ok = state_artifact_checksum(&session.table) == target.table_checksum;
         let table = if snapshot_ok && table_ok {
-            match consensus::ClientTable::decode(&session.table, consensus::CLIENTS_TABLE_MAX) {
+            match consensus::ClientTable::decode(&session.table, self.clients_table_max.get()) {
                 Ok(table) => Some(table),
                 Err(error) => {
                     tracing::error!(shard = self.id, %error, "transferred client table undecodable");
