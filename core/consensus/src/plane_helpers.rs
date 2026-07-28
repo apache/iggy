@@ -359,6 +359,7 @@ where
         .expect("reply buffer must contain a valid reply message")
 }
 
+<<<<<<< Updated upstream
 /// Builds a `Reply` carrying only a single-entry result section, no payload:
 /// the generic `[count=1][index=0][result=code]` rejection frame.
 ///
@@ -374,12 +375,31 @@ where
 /// `commit` is the primary's current commit position and is informational
 /// here: a rejection reply is sent, never cached in the `ClientTable`, so it
 /// is not subject to the `commit_reply` regression order.
+=======
+/// Builds a `Reply` carrying only a metadata result section, no payload.
+///
+/// For a request that could not be committed *right now* (not-caught-up /
+/// in-flight / pipeline-full / view-change cancel): the body is
+/// `[count=1][index=0][result=code]`. The SDK decodes the nonzero `result` to a
+/// typed retryable error (`IggyError::TransientNotCommitted`) and replays the
+/// same `request_id` immediately, instead of waiting out its response
+/// read-timeout.
+///
+/// Stamped from the request header (no prepare exists for an uncommitted op).
+/// `commit` is the primary's current commit position and is informational here:
+/// a transient reply is sent, never cached in the `ClientTable`, so it is not
+/// subject to the `commit_reply` regression order.
+>>>>>>> Stashed changes
 ///
 /// # Panics
 /// If the constructed message buffer is not a valid reply.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
+<<<<<<< Updated upstream
 pub fn build_result_rejection_reply(
+=======
+pub fn build_transient_reply(
+>>>>>>> Stashed changes
     request_header: &RequestHeader,
     commit: u64,
     code: u32,
@@ -391,7 +411,13 @@ pub fn build_result_rejection_reply(
     let total_size = header_size + RESULT_BODY_LEN;
     let mut buffer = bytes::BytesMut::zeroed(total_size);
 
+<<<<<<< Updated upstream
     let header = ReplyHeader {
+=======
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
+        .expect("zeroed bytes are valid");
+    *header = ReplyHeader {
+>>>>>>> Stashed changes
         cluster: request_header.cluster,
         size: total_size as u32,
         view: request_header.view,
@@ -400,10 +426,14 @@ pub fn build_result_rejection_reply(
         replica: request_header.replica,
         request_checksum: request_header.request_checksum,
         client: request_header.client,
+<<<<<<< Updated upstream
         // Position-typed like the sibling builders (`build_reply_from_request`
         // stamps `op: commit` too); inert on this path -- rejections are never
         // cached -- but keeps the wire field convention for frame inspection.
         op: commit,
+=======
+        op: request_header.session,
+>>>>>>> Stashed changes
         commit,
         timestamp: request_header.timestamp,
         request: request_header.request,
@@ -411,7 +441,10 @@ pub fn build_result_rejection_reply(
         namespace: request_header.namespace,
         ..Default::default()
     };
+<<<<<<< Updated upstream
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+=======
+>>>>>>> Stashed changes
 
     let body = &mut buffer[header_size..];
     body[0..4].copy_from_slice(&1u32.to_le_bytes());

@@ -20,11 +20,39 @@ use serde::{Deserialize, Serialize};
 use super::defaults::SERVER_CONFIG;
 use configs::ConfigEnv;
 
+<<<<<<< Updated upstream
 // `CpuAllocation`/`NumaConfig` are pure config types and live in their own
 // leaf crate so both `configs` and `shard_allocator` can share them without
 // pulling each other's heavier dependency trees. Re-exported here to keep the
 // `configs::sharding::*` path stable for existing callers.
 pub use cpu_allocation::{CpuAllocation, NumaConfig};
+=======
+/// Default capacity of the per-shard inter-shard inbox channel. Sized
+/// comfortably above the consensus working set, which is roughly
+/// `PIPELINE_PREPARE_QUEUE_MAX (= 32) * replica_count * directions`
+/// frames in flight per shard, without allowing a runaway producer to
+/// eat unbounded memory. Tunable via `[system.sharding] inbox_capacity`
+/// in TOML.
+///
+/// The capacity must also absorb the worst-case cross-shard client
+/// Reply burst. Unlike consensus frames, client Replies have no VSR
+/// retransmit path: a Reply lost on full inbox is gone and the client
+/// times out. A reasonable lower bound is
+/// `max_inflight_client_requests / num_shards` (assuming requests are
+/// distributed evenly across owning shards) plus the consensus
+/// headroom above.
+///
+/// Consensus frames and client-reply forwards share this one channel,
+/// so the two headrooms are not independent: a consensus burst or
+/// retransmit storm can fill the inbox with consensus frames exactly
+/// when a client Reply needs the space. A single `inbox_capacity` knob
+/// cannot isolate the two frame classes - size it for the sum of both
+/// worst cases occurring together. Watch the drop-site `tracing` logs
+/// (and, once a per-shard exporter lands, the `frame_drops_total`
+/// `{variant="forward_client_send"}` counter) to detect when the bound
+/// is too low in production.
+pub const DEFAULT_INBOX_CAPACITY: usize = 1024;
+>>>>>>> Stashed changes
 
 /// Sharding config for the legacy `core/server`. That server consumes only
 /// `cpu_allocation` and `pin_cores`; the bus / shutdown / reconcile knobs are

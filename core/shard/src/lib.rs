@@ -3400,10 +3400,14 @@ where
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
+<<<<<<< Updated upstream
             > + StreamsFrontend
             + metadata::stm::snapshot::RestoreSnapshotInPlace<
                 metadata::stm::snapshot::MetadataSnapshot,
             >,
+=======
+            > + StreamsFrontend,
+>>>>>>> Stashed changes
     {
         let metadata = self.plane.metadata();
         let Some(ref consensus) = metadata.consensus else {
@@ -3420,6 +3424,7 @@ where
         // forever (commit_min stuck below commit_max). See
         // `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
+<<<<<<< Updated upstream
 
         // Backstop for commit work stranded by a canceled `on_ack` driver
         // (a future dropped at its journal-read or wire-reply await): no
@@ -3496,6 +3501,8 @@ where
                 .await;
             }
         }
+=======
+>>>>>>> Stashed changes
     }
 }
 

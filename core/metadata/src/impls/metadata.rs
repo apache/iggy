@@ -29,7 +29,11 @@ use consensus::{
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
+<<<<<<< Updated upstream
     build_reply_message_with, build_result_rejection_reply, emit_sim_event,
+=======
+    build_reply_message_with, build_transient_reply, drain_committable_prefix, emit_sim_event,
+>>>>>>> Stashed changes
     fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
     register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
@@ -785,6 +789,7 @@ where
         // Durable here but not yet committed, and the primary is retransmitting
         // it: our original PrepareOk was lost (e.g. the primary's inbox
         // overflowed under a client burst). Re-forward the tail down the chain
+<<<<<<< Updated upstream
         // so a downstream replica that missed it recovers, then re-ack ONLY
         // the retransmitted op. The primary's retransmit cycle walks every
         // un-acked op in the window (`retransmit_targets`), so a lost ack for
@@ -793,6 +798,16 @@ where
         // backups, which can overflow the primary's inbox -- the very failure
         // this path recovers from. Both downstream and primary are idempotent
         // on a duplicate (replica, op).
+=======
+        // so a downstream replica that missed it recovers, then re-ack every
+        // op in our uncommitted prepared suffix - not just this one. Acks are
+        // tracked per-op (see `ack_quorum_reached`), and the primary's commit
+        // frontier only advances over a contiguous quorum-acked prefix, so a
+        // lost ack for a lower op keeps that prefix pinned even after we re-ack
+        // the tail. Re-acking the whole suffix the backup holds restores
+        // quorum on the gap. Bounded by the pipeline depth; both downstream
+        // and primary are idempotent on a duplicate (replica, op).
+>>>>>>> Stashed changes
         #[allow(clippy::cast_possible_truncation)]
         if journal.handle().header(header.op as usize).is_some() {
             warn!(
@@ -803,10 +818,23 @@ where
                 op = header.op,
                 commit = consensus.commit_max(),
                 operation = ?header.operation,
+<<<<<<< Updated upstream
                 "journal already holds prepare, re-forwarding + re-acking it"
             );
             self.replicate(&message).await;
             self.send_prepare_ok(&header).await;
+=======
+                "journal already holds prepare, re-forwarding + re-acking suffix"
+            );
+            self.replicate(&message).await;
+            for op in (consensus.commit_max() + 1)..=header.op {
+                if let Some(suffix_header) =
+                    journal.handle().header(op as usize).map(|header| *header)
+                {
+                    self.send_prepare_ok(&suffix_header).await;
+                }
+            }
+>>>>>>> Stashed changes
             return;
         }
 
@@ -1603,6 +1631,7 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
+<<<<<<< Updated upstream
         // Not-primary is transient: the same request replayed against the
         // current primary commits fine. Reply with the explicit transient
         // frame (relayed to the socket by the home shard) so the client
@@ -1622,6 +1651,19 @@ where
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotAccepted.as_code(),
+=======
+        // Not-primary / not-caught-up is transient: the same request replayed
+        // once a primary is caught up commits fine. Reply with the explicit
+        // `TransientNotCommitted` frame (relayed to the socket by the home shard)
+        // so the client replays immediately rather than waiting out its
+        // read-timeout. The frame keeps the lockstep TCP/WS stream in framing
+        // sync, so the client resends on the same connection (session intact).
+        if !is_caught_up_primary(consensus) {
+            return Ok(build_transient_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::TransientNotCommitted.as_code(),
+>>>>>>> Stashed changes
             )
             .into_generic());
         }
@@ -1631,6 +1673,7 @@ where
         // routing), so a Replay/Evict/NotReady is returned to the home shard as
         // the reply -- `handle_client_request` writes it to the originating
         // socket by transport id, exactly like a fresh commit. Drop (client-bug
+<<<<<<< Updated upstream
         // already-applied / future-epoch) surfaces as Canceled so the home
         // shard stays silent.
         match request_preflight(
@@ -1641,6 +1684,10 @@ where
             request,
             request_checksum,
         ) {
+=======
+        // stale/gap) surfaces as Canceled so the home shard stays silent.
+        match request_preflight(consensus, &self.client_table, client_id, session, request) {
+>>>>>>> Stashed changes
             PreflightOutcome::Dispatch => {}
             PreflightOutcome::Replay(reply) => {
                 return server_common::Message::<GenericHeader>::try_from(
@@ -1657,7 +1704,11 @@ where
             // In-flight prepare from this client: replaying the same request_id
             // is absorbed until the original commits, then served from cache.
             PreflightOutcome::NotReady => {
+<<<<<<< Updated upstream
                 return Ok(build_result_rejection_reply(
+=======
+                return Ok(build_transient_reply(
+>>>>>>> Stashed changes
                     &request_header,
                     consensus.commit_max(),
                     IggyError::TransientNotCommitted.as_code(),
@@ -1667,6 +1718,7 @@ where
             PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
         }
 
+<<<<<<< Updated upstream
         // Prepare queue full: backpressure, not failure. Absorb into the
         // request queue with this caller's reply subscriber; the commit
         // path promotes it as slots free up and the await below resolves
@@ -1699,6 +1751,16 @@ where
                 )
                 .into_generic()),
             };
+=======
+        // Pipeline full: backpressure, not failure. Tell the client to replay.
+        if consensus.pipeline().borrow().is_full() {
+            return Ok(build_transient_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::TransientNotCommitted.as_code(),
+            )
+            .into_generic());
+>>>>>>> Stashed changes
         }
 
         // The acting-user RBAC stamp lives in the shared `prepare_request`
@@ -1719,7 +1781,11 @@ where
         // so reply with the transient frame rather than staying silent.
         match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.into_generic()),
+<<<<<<< Updated upstream
             Err(Canceled) => Ok(build_result_rejection_reply(
+=======
+            Err(Canceled) => Ok(build_transient_reply(
+>>>>>>> Stashed changes
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotCommitted.as_code(),
@@ -1809,7 +1875,11 @@ where
         let Some(consensus) = self.consensus.as_ref() else {
             return;
         };
+<<<<<<< Updated upstream
         if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+=======
+        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_syncing() {
+>>>>>>> Stashed changes
             return;
         }
         let Some(journal) = self.journal.as_ref() else {
@@ -1842,6 +1912,7 @@ where
             return;
         }
 
+<<<<<<< Updated upstream
         // Interleave push + drain per header instead of push-all-then-drain-once:
         // each `on_ack` below can promote a full window of buffered requests
         // (`drain_request_queue_into_prepares`), and every promoted prepare
@@ -1874,6 +1945,14 @@ where
             return false;
         }
         for message in loopback.drain(..) {
+=======
+        for header in &headers {
+            self.send_prepare_ok(header).await;
+        }
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+>>>>>>> Stashed changes
             match message.header().command {
                 Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
@@ -1888,6 +1967,7 @@ where
                 ),
             }
         }
+<<<<<<< Updated upstream
         true
     }
 
@@ -2140,6 +2220,12 @@ where
 
     /// Promote buffered requests into free prepare slots after a commit
     /// batch drains.
+=======
+    }
+
+    /// Promote up to `slots_freed` buffered requests into prepares after
+    /// `on_ack` commits a prefix.
+>>>>>>> Stashed changes
     ///
     /// # Safety
     /// Re-preflight per iteration: `commit_journal` may have advanced the
