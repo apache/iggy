@@ -124,6 +124,8 @@ pub enum IggyError {
     TransientNotCommitted = 57,
     #[error("Request transiently not accepted; retry, on any replica")]
     TransientNotAccepted = 58,
+    #[error("Request already applied; its reply is no longer available")]
+    RequestAlreadyApplied = 59,
     #[error("Not connected")]
     NotConnected = 61,
     #[error("Client shutdown")]
