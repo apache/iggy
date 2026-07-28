@@ -124,34 +124,41 @@ impl TcpReconnectionConfig {
     /// value the Rust SDK uses.
     ///
     /// Args:
-    ///     enabled: Whether to reconnect at all.
+    ///     enabled: Whether to reconnect at all. Defaults to enabled.
     ///     max_retries: Attempts before giving up, or `None` for unlimited.
     ///     interval: Delay between attempts. Defaults to 1 second.
     ///     reestablish_after: Cooldown before reconnecting after a previously
     ///         successful connection. Defaults to 5 seconds.
+    ///
+    /// Raises:
+    ///     PyValueError: If a duration is negative.
     #[new]
-    #[pyo3(signature = (*, enabled=true, max_retries=None, interval=None, reestablish_after=None))]
+    #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
-        enabled: bool,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enabled: Option<bool>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_retries: Option<u32>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         reestablish_after: Option<Py<PyDelta>>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let defaults = RustTcpClientReconnectionConfig::default();
-        Self {
+        Ok(Self {
             inner: RustTcpClientReconnectionConfig {
-                enabled,
+                enabled: enabled.unwrap_or(defaults.enabled),
                 max_retries,
                 interval: interval
                     .as_ref()
-                    .map_or(defaults.interval, py_delta_to_iggy_duration),
+                    .map(py_delta_to_iggy_duration)
+                    .transpose()?
+                    .unwrap_or(defaults.interval),
                 reestablish_after: reestablish_after
                     .as_ref()
-                    .map_or(defaults.reestablish_after, py_delta_to_iggy_duration),
+                    .map(py_delta_to_iggy_duration)
+                    .transpose()?
+                    .unwrap_or(defaults.reestablish_after),
             },
-        }
+        })
     }
 
     #[getter]
@@ -222,15 +229,18 @@ impl TcpConfig {
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
     ///     reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
-    ///     tls_enabled: Whether to connect over TLS.
+    ///     tls_enabled: Whether to connect over TLS. Defaults to disabled.
     ///     tls_domain: Domain to validate the certificate against. Empty means it is
     ///         taken from `server_address`.
     ///     tls_ca_file: Path to the CA file for TLS.
     ///     tls_validate_certificate: Whether to validate the server certificate.
-    ///     nodelay: Disable the Nagle algorithm for the TCP socket.
+    ///         Defaults to validating.
+    ///     nodelay: Disable the Nagle algorithm for the TCP socket. Defaults to
+    ///         leaving it on.
     ///
     /// Raises:
-    ///     PyValueError: If `server_address` is not a valid `host:port` pair.
+    ///     PyValueError: If `server_address` is not a valid `host:port` pair, or
+    ///         if a duration is negative.
     #[new]
     #[pyo3(signature = (
         *,
@@ -238,11 +248,11 @@ impl TcpConfig {
         auto_login=None,
         reconnection=None,
         heartbeat_interval=None,
-        tls_enabled=false,
+        tls_enabled=None,
         tls_domain=None,
         tls_ca_file=None,
-        tls_validate_certificate=true,
-        nodelay=false,
+        tls_validate_certificate=None,
+        nodelay=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -255,37 +265,38 @@ impl TcpConfig {
         >,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         heartbeat_interval: Option<Py<PyDelta>>,
-        tls_enabled: bool,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tls_enabled: Option<bool>,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_domain: Option<String>,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_ca_file: Option<String>,
-        tls_validate_certificate: bool,
-        nodelay: bool,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))]
+        tls_validate_certificate: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] nodelay: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = RustTcpClientConfig::default();
         let auto_login = auto_login.unwrap_or_default();
         let reconnection = reconnection.unwrap_or_default();
 
-        let mut builder = TcpClientConfigBuilder::new()
+        // The builder is only used to validate and trim the server address; the
+        // remaining fields are assigned directly so every unset argument falls
+        // back to the Rust `TcpClientConfig::default()` value instead of a
+        // literal duplicated here.
+        let mut inner = TcpClientConfigBuilder::new()
             .with_server_address(server_address.unwrap_or(defaults.server_address))
-            .with_auto_sign_in(auto_login.inner.clone())
-            .with_tls_enabled(tls_enabled)
-            .with_tls_domain(tls_domain.unwrap_or(defaults.tls_domain))
-            .with_tls_validate_certificate(tls_validate_certificate);
-        if let Some(tls_ca_file) = tls_ca_file {
-            builder = builder.with_tls_ca_file(tls_ca_file);
-        }
-        if nodelay {
-            builder = builder.with_no_delay();
-        }
-
-        let mut inner = builder
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        // TcpClientConfigBuilder exposes no setter for either of these.
+        inner.auto_login = auto_login.inner.clone();
+        inner.reconnection = reconnection.inner.clone();
         inner.heartbeat_interval = heartbeat_interval
             .as_ref()
-            .map_or(defaults.heartbeat_interval, py_delta_to_iggy_duration);
-        inner.reconnection = reconnection.inner.clone();
+            .map(py_delta_to_iggy_duration)
+            .transpose()?
+            .unwrap_or(defaults.heartbeat_interval);
+        inner.tls_enabled = tls_enabled.unwrap_or(defaults.tls_enabled);
+        inner.tls_domain = tls_domain.unwrap_or(defaults.tls_domain);
+        inner.tls_ca_file = tls_ca_file.or(defaults.tls_ca_file);
+        inner.tls_validate_certificate =
+            tls_validate_certificate.unwrap_or(defaults.tls_validate_certificate);
+        inner.nodelay = nodelay.unwrap_or(defaults.nodelay);
 
         Ok(Self {
             auto_login,

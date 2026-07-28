@@ -20,12 +20,19 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDelta, PyDeltaAccess};
 use std::time::Duration;
 
-pub fn py_delta_to_iggy_duration(delta: &Py<PyDelta>) -> IggyDuration {
+pub fn py_delta_to_iggy_duration(delta: &Py<PyDelta>) -> PyResult<IggyDuration> {
     Python::attach(|py| {
         let delta = delta.bind(py);
-        let seconds = (delta.get_days() * 60 * 60 * 24 + delta.get_seconds()) as u64;
+        // Python normalizes a negative timedelta to negative days plus
+        // non-negative seconds/microseconds, so the sign lives in the sum.
+        let seconds = i64::from(delta.get_days()) * 60 * 60 * 24 + i64::from(delta.get_seconds());
+        if seconds < 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "duration must not be negative",
+            ));
+        }
         let nanos = (delta.get_microseconds() * 1_000) as u32;
-        IggyDuration::new(Duration::new(seconds, nanos))
+        Ok(IggyDuration::new(Duration::new(seconds as u64, nanos)))
     })
 }
 
@@ -34,10 +41,12 @@ pub fn iggy_duration_to_py_delta(
     duration: IggyDuration,
 ) -> PyResult<Bound<'_, PyDelta>> {
     let micros = duration.as_micros();
-    let seconds = i32::try_from(micros / 1_000_000).map_err(|_| {
+    let total_seconds = micros / 1_000_000;
+    let days = i32::try_from(total_seconds / 86_400).map_err(|_| {
         PyErr::new::<pyo3::exceptions::PyOverflowError, _>(
             "duration does not fit into a datetime.timedelta",
         )
     })?;
-    PyDelta::new(py, 0, seconds, (micros % 1_000_000) as i32, true)
+    let seconds = (total_seconds % 86_400) as i32;
+    PyDelta::new(py, days, seconds, (micros % 1_000_000) as i32, true)
 }

@@ -429,25 +429,24 @@ pub enum AutoCommit {
     After(AutoCommitAfter),
 }
 
-impl From<&AutoCommit> for RustAutoCommit {
-    fn from(val: &AutoCommit) -> RustAutoCommit {
-        match val {
+impl TryFrom<&AutoCommit> for RustAutoCommit {
+    type Error = PyErr;
+
+    fn try_from(val: &AutoCommit) -> PyResult<RustAutoCommit> {
+        Ok(match val {
             AutoCommit::Disabled() => RustAutoCommit::Disabled,
             AutoCommit::Interval(delta) => {
-                let duration = py_delta_to_iggy_duration(delta);
-                RustAutoCommit::Interval(duration)
+                RustAutoCommit::Interval(py_delta_to_iggy_duration(delta)?)
             }
             AutoCommit::IntervalOrWhen(delta, when) => {
-                let duration = py_delta_to_iggy_duration(delta);
-                RustAutoCommit::IntervalOrWhen(duration, when.into())
+                RustAutoCommit::IntervalOrWhen(py_delta_to_iggy_duration(delta)?, when.into())
             }
             AutoCommit::IntervalOrAfter(delta, after) => {
-                let duration = py_delta_to_iggy_duration(delta);
-                RustAutoCommit::IntervalOrAfter(duration, after.into())
+                RustAutoCommit::IntervalOrAfter(py_delta_to_iggy_duration(delta)?, after.into())
             }
             AutoCommit::When(when) => RustAutoCommit::When(when.into()),
             AutoCommit::After(after) => RustAutoCommit::After(after.into()),
-        }
+        })
     }
 }
 

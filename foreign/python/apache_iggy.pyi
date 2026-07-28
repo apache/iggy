@@ -996,11 +996,11 @@ class TcpConfig:
         auto_login: AutoLogin | None = None,
         reconnection: TcpReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
-        tls_enabled: builtins.bool = False,
+        tls_enabled: builtins.bool | None = None,
         tls_domain: builtins.str | None = None,
         tls_ca_file: builtins.str | None = None,
-        tls_validate_certificate: builtins.bool = True,
-        nodelay: builtins.bool = False,
+        tls_validate_certificate: builtins.bool | None = None,
+        nodelay: builtins.bool | None = None,
     ) -> TcpConfig:
         r"""
         Constructs a TCP configuration, defaulting every unset field to the value
@@ -1011,15 +1011,18 @@ class TcpConfig:
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
             reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
-            tls_enabled: Whether to connect over TLS.
+            tls_enabled: Whether to connect over TLS. Defaults to disabled.
             tls_domain: Domain to validate the certificate against. Empty means it is
                 taken from `server_address`.
             tls_ca_file: Path to the CA file for TLS.
             tls_validate_certificate: Whether to validate the server certificate.
-            nodelay: Disable the Nagle algorithm for the TCP socket.
+                Defaults to validating.
+            nodelay: Disable the Nagle algorithm for the TCP socket. Defaults to
+                leaving it on.
 
         Raises:
-            PyValueError: If `server_address` is not a valid `host:port` pair.
+            PyValueError: If `server_address` is not a valid `host:port` pair, or
+                if a duration is negative.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -1039,7 +1042,7 @@ class TcpReconnectionConfig:
     def __new__(
         cls,
         *,
-        enabled: builtins.bool = True,
+        enabled: builtins.bool | None = None,
         max_retries: builtins.int | None = None,
         interval: datetime.timedelta | None = None,
         reestablish_after: datetime.timedelta | None = None,
@@ -1049,11 +1052,14 @@ class TcpReconnectionConfig:
         value the Rust SDK uses.
 
         Args:
-            enabled: Whether to reconnect at all.
+            enabled: Whether to reconnect at all. Defaults to enabled.
             max_retries: Attempts before giving up, or `None` for unlimited.
             interval: Delay between attempts. Defaults to 1 second.
             reestablish_after: Cooldown before reconnecting after a previously
                 successful connection. Defaults to 5 seconds.
+
+        Raises:
+            PyValueError: If a duration is negative.
         """
     def __repr__(self) -> builtins.str: ...
 
