@@ -886,6 +886,7 @@ async fn shard_main(
                 data_dir,
                 topology.replica_count == 1,
                 config.metadata.journal_slots,
+                config.metadata.clients_table_max,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
@@ -984,9 +985,15 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
+    // Size the VSR client table before listeners bind and any client registers.
+    // Must precede the recovered-table install below: the setter rebuilds the
+    // table from scratch, so running it afterwards would drop every resumed
+    // session (and trip its empty-table assert).
+    metadata.set_clients_table_max(config.metadata.clients_table_max);
     // Reinstall the sessions the WAL replay rebuilt, so a rebooted node
     // dedups retries and admits continuations from clients that kept their
-    // identity across the restart (IGGY-137).
+    // identity across the restart (IGGY-137). Recovery sized this table from
+    // the same config value, so the install preserves the configured cap.
     if let Some(client_table) = recovered_client_table {
         // Refusal (a client registered before this ran) keeps the live table
         // and is logged by the callee; boot continues either way.
@@ -1000,10 +1007,6 @@ async fn shard_main(
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
-    // Size the VSR client table before listeners bind and any client registers.
-    // The table is empty here on both fresh boot and restart (its slots are not
-    // restored from snapshot), which the setter's empty-table contract requires.
-    metadata.set_clients_table_max(config.metadata.clients_table_max);
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
