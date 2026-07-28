@@ -111,6 +111,7 @@ jobs:
             - `iggy_connector_s3_sink`
             - `iggy_connector_stdout_sink`
             - `iggy_connector_surrealdb_sink`
+            - `iggy_connector_rabbitmq_sink`
 
             ## Downloads
 

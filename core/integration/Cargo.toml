@@ -69,6 +69,7 @@ iggy_connector_sdk = { workspace = true, features = ["api"] }
 journal = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
+lapin = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
