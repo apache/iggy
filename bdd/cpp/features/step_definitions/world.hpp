@@ -45,6 +45,8 @@ struct GlobalContext {
     std::uint64_t last_sent_id_lo = 0;
     std::string last_sent_payload;
     PolledData polled;
+    std::vector<std::uint8_t> raw_response;
+    std::string raw_error;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;

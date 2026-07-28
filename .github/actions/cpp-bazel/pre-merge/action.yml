@@ -83,7 +83,7 @@ runs:
       shell: bash
       run: |
         cd foreign/cpp
-        bazel test --config=ci //:low-level-e2e
+        bazel test --config=ci //:e2e
 
     - name: Stop server after e2e tests
       if: always() && inputs.task == 'e2e'

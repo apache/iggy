@@ -17,6 +17,7 @@
 
 pub mod actor_kind;
 pub mod benchmark_kind;
+pub mod cluster;
 pub mod group_metrics;
 pub mod group_metrics_kind;
 pub mod group_metrics_summary;

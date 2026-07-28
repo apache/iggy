@@ -23,8 +23,8 @@ flink = "2.3.0"
 pinot = "1.5.1"
 
 # Jackson
-jackson = "3.2.0"
-jackson2 = "2.22.0"
+jackson = "3.2.1"
+jackson2 = "2.22.1"
 
 # Apache Commons
 commons-lang3 = "3.20.0"
@@ -34,10 +34,10 @@ httpclient5 = "5.6.2"
 
 # Logging
 slf4j = "2.0.18"
-logback = "1.5.37"
+logback = "1.5.38"
 
 # Testing
-junit = "6.1.1"
+junit = "6.1.2"
 assertj = "3.27.7"
 testcontainers = "2.0.5"
 
@@ -45,7 +45,7 @@ testcontainers = "2.0.5"
 netty = "4.2.16.Final"
 
 # Spotbugs
-spotbugs = "4.10.2"
+spotbugs = "4.10.3"
 
 # Config
 typesafe-config = "1.4.9"

@@ -20,7 +20,8 @@ pub(crate) mod help;
 pub(crate) mod keyring;
 pub(crate) use crate::cli::common::command::IggyCmdCommand;
 pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
-#[allow(unused_imports)]
+pub(crate) use crate::cli::common::keyring::clear_session_entry;
+#[cfg(not(any(target_os = "macos", target_env = "musl")))]
 pub(crate) use crate::cli::common::keyring::ensure_keyring_store;
 use assert_cmd::assert::{Assert, OutputAssertExt};
 use assert_cmd::prelude::CommandCargoExt;
@@ -119,6 +120,32 @@ impl IggyCmdTest {
                 .start()
                 .await
                 .expect("Failed to start test harness");
+        }
+        self.clear_session_keyring();
+    }
+
+    /// Drop any CLI session token the OS keyring holds for this server's
+    /// addresses.
+    ///
+    /// The CLI keys a stored session by server address, the harness recycles its
+    /// port slots, and nothing scopes a keyring to one test run. An entry left
+    /// behind therefore reaches the next test on that address, which then
+    /// replays a token the server it reaches never issued.
+    ///
+    /// Both sides: on setup the leftover may predate this process, on teardown
+    /// so a real keyring is not polluted in the first place.
+    fn clear_session_keyring(&self) {
+        let server = self.harness.server();
+        for address in [
+            server.tcp_addr(),
+            server.quic_addr(),
+            server.http_addr(),
+            server.websocket_addr(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            clear_session_entry(address);
         }
     }
 
@@ -246,5 +273,11 @@ impl IggyCmdTest {
 impl Default for IggyCmdTest {
     fn default() -> Self {
         Self::new(true)
+    }
+}
+
+impl Drop for IggyCmdTest {
+    fn drop(&mut self) {
+        self.clear_session_keyring();
     }
 }

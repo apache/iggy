@@ -29,11 +29,11 @@
 //! Full cross-replica EQUALITY (every live replica holding the same committed
 //! log) is the real consensus property, but it is not asserted yet. Backups
 //! apply prepares in strict order and drop any gap (`op != current_op + 1` in
-//! `metadata::on_replicate` / `iggy_partition`), and there is no log repair
-//! (no `RequestPrepare` / state transfer) to refetch a missed prepare. Under
-//! realistic reorder/drop a behind backup therefore never catches up and
-//! legitimately sits behind the leader at quiesce. Re-enable equality once
-//! message repair lands (the state-sync workstream).
+//! `metadata::on_replicate` / `iggy_partition`), relying on the primary's
+//! retransmit and the repair sessions (`MetadataRepairSession` / partition
+//! `RepairSession`) to refill. Message repair has landed on both planes, so
+//! the equality assert is unblocked but not yet re-enabled: the sim must
+//! first drive quiesce long enough for repair rounds to converge.
 
 use crate::Simulator;
 use crate::replica::Replica;

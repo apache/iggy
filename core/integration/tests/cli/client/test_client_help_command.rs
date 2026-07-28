@@ -32,8 +32,8 @@ pub async fn should_help_match() {
 {USAGE_PREFIX} client <COMMAND>
 
 Commands:
-  get   Get details of a single client with given ID [aliases: g]
-  list  List all currently connected clients to iggy server [aliases: l]
+  get   Get details of a single client with given ID [alias: g]
+  list  List all currently connected clients to iggy server [alias: l]
   help  Print this message or the help of the given subcommand(s)
 
 Options:

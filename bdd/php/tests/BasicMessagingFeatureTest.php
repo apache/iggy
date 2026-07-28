@@ -18,10 +18,13 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/SharedFeatureParser.php';
+
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\SendMessage;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -36,6 +39,7 @@ final class BasicMessagingFeatureTest extends TestCase
     private ?int $lastSentMessageCount = null;
 
     #[DataProvider('scenarioCases')]
+    #[Group('basic-messaging')]
     #[TestDox('Basic messaging shared BDD scenario passes for the PHP SDK')]
     public function testBasicMessagingScenario(string $scenarioName, array $steps): void
     {
@@ -61,89 +65,7 @@ final class BasicMessagingFeatureTest extends TestCase
 
     public static function scenarioCases(): array
     {
-        $featureFile = getenv('BDD_FEATURE_FILE') ?: __DIR__ . '/../../scenarios/basic_messaging.feature';
-        if (!is_file($featureFile)) {
-            throw new RuntimeException("feature file not found at {$featureFile}");
-        }
-
-        $lines = file($featureFile, FILE_IGNORE_NEW_LINES);
-        if ($lines === false) {
-            throw new RuntimeException("failed to read feature file at {$featureFile}");
-        }
-
-        $backgroundSteps = [];
-        $scenarios = [];
-        $currentScenario = null;
-        $currentSteps = [];
-        $section = null;
-        $stepPattern = '/^(Given|When|Then|And|But|\*) (.+)$/';
-        $unsupportedStructurePattern = '/^(Scenario Outline|Rule|Examples):|^\|/';
-        foreach ($lines as $line) {
-            $line = trim($line);
-            if ($line === '' || str_starts_with($line, '#') || str_starts_with($line, '@')) {
-                continue;
-            }
-
-            if ($line === 'Background:') {
-                $section = 'background';
-                continue;
-            }
-
-            if (str_starts_with($line, 'Scenario:')) {
-                if ($currentScenario !== null) {
-                    $scenarios[$currentScenario] = $currentSteps;
-                }
-
-                $currentScenario = trim(substr($line, strlen('Scenario:')));
-                $currentSteps = [];
-                $section = 'scenario';
-                continue;
-            }
-
-            if (preg_match($unsupportedStructurePattern, $line) === 1) {
-                throw new RuntimeException("Unsupported BDD structure: {$line}");
-            }
-
-            if (preg_match($stepPattern, $line, $matches) !== 1) {
-                continue;
-            }
-
-            if ($section === null) {
-                throw new RuntimeException("BDD step appears before Background or Scenario: {$line}");
-            }
-
-            if ($section === 'background') {
-                $backgroundSteps[] = $matches[2];
-                continue;
-            }
-
-            if ($section === 'scenario' && $currentScenario !== null) {
-                $currentSteps[] = $matches[2];
-            }
-        }
-
-        if ($currentScenario !== null) {
-            $scenarios[$currentScenario] = $currentSteps;
-        }
-
-        if ($backgroundSteps === []) {
-            throw new RuntimeException('no BDD background steps were loaded from the feature');
-        }
-
-        if ($scenarios === []) {
-            throw new RuntimeException('no BDD scenarios were loaded from the feature');
-        }
-
-        $cases = [];
-        foreach ($scenarios as $scenarioName => $scenarioSteps) {
-            if ($scenarioSteps === []) {
-                throw new RuntimeException("scenario has no steps: {$scenarioName}");
-            }
-
-            $cases[$scenarioName] = [$scenarioName, [...$backgroundSteps, ...$scenarioSteps]];
-        }
-
-        return $cases;
+        return SharedFeatureParser::load(__DIR__ . '/../../scenarios/basic_messaging.feature');
     }
 
     private function runStep(string $step): void

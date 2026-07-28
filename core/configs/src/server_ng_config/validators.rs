@@ -80,6 +80,9 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate cluster config")
         })?;
+        self.metadata.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate metadata config")
+        })?;
         self.system
             .logging
             .validate()
@@ -132,6 +135,33 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
                 "http.tls.enabled=true requires non-empty http.tls.cert_file and http.tls.key_file"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Cluster mode has no port fallbacks: the roster is the single source
+        // of listener ports, so every enabled transport needs an explicit
+        // per-node port. Falling back to the port of a transport's top-level
+        // `address` would hand two same-host nodes the same socket and fail
+        // only at bind time, and a portless node would silently degrade every
+        // follower-to-primary HTTP forward through it to a fail-closed 503.
+        if self.cluster.enabled {
+            for node in &self.cluster.nodes {
+                let required_ports = [
+                    ("tcp", true, node.ports.tcp),
+                    ("quic", self.quic.enabled, node.ports.quic),
+                    ("http", self.http.enabled, node.ports.http),
+                    ("websocket", self.websocket.enabled, node.ports.websocket),
+                    ("tcp_replica", true, node.ports.tcp_replica),
+                ];
+                for (transport, enabled, port) in required_ports {
+                    if enabled && port.is_none() {
+                        eprintln!(
+                            "cluster node '{}' has no ports.{transport}; cluster mode requires an explicit roster port for every enabled transport",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                }
+            }
         }
 
         if topic_size < self.system.segment.size.as_bytes_u64() {
@@ -269,6 +299,7 @@ impl Validatable<ConfigurationError> for NamespaceConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cluster::{ClusterNodeConfig, TransportPorts};
     use super::*;
     use figment::Figment;
     use figment::providers::{Format, Toml};
@@ -404,6 +435,95 @@ mod tests {
     #[test]
     fn validate_accepts_tls_enabled_with_both_files_set() {
         let cfg = https_config("cert.pem", "key.pem");
+        assert!(cfg.validate().is_ok());
+    }
+
+    fn cluster_node(replica_id: u8, http: Option<u16>) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: format!("node-{replica_id}"),
+            ip: "127.0.0.1".to_string(),
+            replica_id,
+            ports: TransportPorts {
+                tcp: Some(8090 + u16::from(replica_id)),
+                quic: Some(8080 + u16::from(replica_id)),
+                http,
+                websocket: Some(8070 + u16::from(replica_id)),
+                tcp_replica: Some(9090 + u16::from(replica_id)),
+            },
+        }
+    }
+
+    fn clustered_http_config(nodes: Vec<ClusterNodeConfig>) -> ServerNgConfig {
+        let mut cfg = ServerNgConfig::default();
+        cfg.http.enabled = true;
+        cfg.cluster.enabled = true;
+        cfg.cluster.name = "test-cluster".to_string();
+        cfg.cluster.nodes = nodes;
+        cfg
+    }
+
+    // Keyless cluster+http boots: forwarding degrades to off instead of
+    // failing the whole server.
+    #[test]
+    fn validate_accepts_cluster_http_without_jwt_secret_or_cluster_auth() {
+        let cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // Cluster mode has no port fallbacks, so a portless roster node is
+    // invalid even when forwarding is off (keyless).
+    #[test]
+    fn validate_rejects_keyless_cluster_http_with_portless_roster_node() {
+        let cfg = clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    // The explicit-port rule covers every enabled transport, not just http.
+    #[test]
+    fn validate_rejects_cluster_node_without_port_for_enabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = true;
+        cfg.cluster.nodes[1].ports.quic = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    // A disabled transport never binds, so its roster port may stay unset.
+    #[test]
+    fn validate_accepts_cluster_node_without_port_for_disabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = false;
+        cfg.cluster.nodes[1].ports.quic = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_cluster_http_with_configured_jwt_secrets() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef".to_string();
+        cfg.http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_cluster_http_with_cluster_auth_as_jwt_key_source() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.cluster.auth.enabled = true;
+        cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
         assert!(cfg.validate().is_ok());
     }
 }

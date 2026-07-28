@@ -32,10 +32,10 @@ pub async fn should_help_match() {
 {USAGE_PREFIX} consumer-group <COMMAND>
 
 Commands:
-  create  Create consumer group with given ID and name for given stream ID and topic ID. [aliases: c]
-  delete  Delete consumer group with given ID for given stream ID and topic ID [aliases: d]
-  get     Get details of a single consumer group with given ID for given stream ID and topic ID [aliases: g]
-  list    List all consumer groups for given stream ID and topic ID [aliases: l]
+  create  Create consumer group with given ID and name for given stream ID and topic ID. [alias: c]
+  delete  Delete consumer group with given ID for given stream ID and topic ID [alias: d]
+  get     Get details of a single consumer group with given ID for given stream ID and topic ID [alias: g]
+  list    List all consumer groups for given stream ID and topic ID [alias: l]
   help    Print this message or the help of the given subcommand(s)
 
 Options:

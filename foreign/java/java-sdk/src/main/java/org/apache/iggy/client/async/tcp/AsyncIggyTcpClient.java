@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.ConsumerOffsetsClient;
@@ -33,12 +34,15 @@ import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TCPConnectionPoolConf
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -94,6 +98,7 @@ import java.util.concurrent.CompletableFuture;
  */
 public class AsyncIggyTcpClient {
 
+    private static final int INVALID_COMMAND_ERROR_CODE = 3;
     private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
 
     private final String host;
@@ -215,6 +220,40 @@ public class AsyncIggyTcpClient {
             throw new IggyMissingCredentialsException();
         }
         return usersClient.login(username.get(), password.get());
+    }
+
+    /**
+     * Sends a command code and payload and returns the raw response payload.
+     *
+     * <p>Session-control codes complete the returned future with an invalid-command error.
+     *
+     * @param code the command code
+     * @param payload the command payload
+     * @return a future containing the raw response payload
+     * @throws IggyNotConnectedException if {@link #connect()} has not been called
+     */
+    public CompletableFuture<byte[]> sendBinaryRequest(int code, byte[] payload) {
+        Objects.requireNonNull(payload, "payload cannot be null");
+        if (isSessionControlCode(code)) {
+            return CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));
+        }
+        if (connection == null) {
+            throw new IggyNotConnectedException();
+        }
+
+        return connection.send(code, Unpooled.copiedBuffer(payload)).thenApply(response -> {
+            try {
+                if (response.readableBytes() <= 1) {
+                    return new byte[0];
+                }
+                byte[] responsePayload = new byte[response.readableBytes()];
+                response.readBytes(responsePayload);
+                return responsePayload;
+            } finally {
+                response.release();
+            }
+        });
     }
 
     /**
@@ -347,5 +386,13 @@ public class AsyncIggyTcpClient {
             return connection.close();
         }
         return CompletableFuture.completedFuture(null);
+    }
+
+    private static boolean isSessionControlCode(int code) {
+        return code == CommandCode.User.LOGIN.getValue()
+                || code == CommandCode.User.LOGOUT.getValue()
+                || code == CommandCode.User.LOGIN_REGISTER.getValue()
+                || code == CommandCode.PersonalAccessToken.LOGIN.getValue()
+                || code == CommandCode.PersonalAccessToken.LOGIN_REGISTER.getValue();
     }
 }

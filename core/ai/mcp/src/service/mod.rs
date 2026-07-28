@@ -25,7 +25,7 @@ use requests::*;
 use rmcp::{
     ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
@@ -760,7 +760,7 @@ fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallTool
         ErrorData::invalid_request(message, None)
     })?;
 
-    let content = Content::json(result).map_err(|error| {
+    let content = ContentBlock::json(result).map_err(|error| {
         let message = format!("Failed to serialize result. {error}");
         error!(message);
         ErrorData::internal_error(message, None)

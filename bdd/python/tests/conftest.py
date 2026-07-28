@@ -40,6 +40,8 @@ class GlobalContext:
     last_topic_partitions: int | None = None
     last_polled_messages: list[ReceiveMessage] | None = None
     last_sent_message: str | None = None  # Store message payload as string
+    last_raw_response: bytes | None = None
+    last_raw_error: RuntimeError | None = None
 
 
 @pytest.fixture(scope="session")

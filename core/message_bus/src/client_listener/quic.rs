@@ -64,11 +64,12 @@ pub fn bind(
     addr: SocketAddr,
     server_config: ServerConfig,
 ) -> Result<(Endpoint, SocketAddr), IggyError> {
-    // QUIC remains shard-0 terminal; this only enables coexistence with the
-    // harness's placeholder UDP socket during process startup.
+    // QUIC remains shard-0 terminal, so nothing here needs the load balancing
+    // `SO_REUSEPORT` exists for; it only widens what the bind accepts.
     //
-    // TODO: remove `SO_REUSEPORT` again once the integration harness stops
-    // holding placeholder reservation sockets open across child startup.
+    // TODO: work out whether this listener needs `SO_REUSEPORT` at all. Dropping
+    // it would make a stale process holding the port a loud bind failure instead
+    // of two live sockets silently splitting inbound datagrams.
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         .map_err(|e| IggyError::IoError(e.to_string()))?;
     socket

@@ -20,6 +20,7 @@
 use std::rc::Rc;
 
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use iggy_common::{IggyError, PersonalAccessToken};
@@ -59,7 +60,7 @@ impl FromRequestParts<HttpState> for Authenticated {
         parts: &mut Parts,
         state: &HttpState,
     ) -> Result<Self, Self::Rejection> {
-        let bearer = bearer_token(parts)?;
+        let bearer = bearer_token(&parts.headers)?;
 
         // Both `resolve_credential` (its JWT verify may await a `!Send` JWKS
         // fetch through cyper) and `resolve_session` (`Rc`-based, `!Send`) must
@@ -104,7 +105,7 @@ impl FromRequestParts<HttpState> for Identity {
         parts: &mut Parts,
         state: &HttpState,
     ) -> Result<Self, Self::Rejection> {
-        let bearer = bearer_token(parts)?;
+        let bearer = bearer_token(&parts.headers)?;
 
         // Verify only. The session key and expiry `resolve_credential` also
         // returns feed the write path's session table; a read discards them.
@@ -129,10 +130,11 @@ impl FromRequestParts<HttpState> for Identity {
 
 /// Extract the raw bearer token from `Authorization: Bearer <token>`, or reject
 /// as `AccessTokenMissing` (the 401 both extractors share). The `?` at each call
-/// site converts the `IggyError` into the extractor's `AuthError`.
-fn bearer_token(parts: &Parts) -> Result<&str, IggyError> {
-    parts
-        .headers
+/// site converts the `IggyError` into the extractor's `AuthError`. Takes the
+/// header map (not `Parts`) so the forward middleware, which holds a full
+/// `Request`, runs the identical extraction.
+pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyError> {
+    headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix(BEARER))
@@ -147,8 +149,10 @@ fn bearer_token(parts: &Parts) -> Result<&str, IggyError> {
 /// the key is stable and collision-free while the raw secret never enters the
 /// table. The JWT verify is `async` and `!Send` (a trusted-issuer token may
 /// fetch the issuer's JWKS on a cache miss), so both call sites drive it inside
-/// a `SendWrapper`; the PAT check is local and synchronous.
-async fn resolve_credential(
+/// a `SendWrapper`; the PAT check is local and synchronous. Also the forward
+/// middleware's verify-only gate: a follower proves the bearer before relaying
+/// a request, without minting a session.
+pub(in crate::http) async fn resolve_credential(
     state: &HttpState,
     bearer: &str,
 ) -> Result<(String, u32, u64), AuthError> {

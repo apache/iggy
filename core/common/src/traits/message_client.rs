@@ -26,6 +26,8 @@ pub trait MessageClient {
     /// Poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
+    ///
+    /// Under the `vsr` feature, polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,

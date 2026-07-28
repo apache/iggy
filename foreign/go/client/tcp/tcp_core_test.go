@@ -30,6 +30,7 @@ import (
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 // emptyWireReq is an 8-byte wire payload for a zero-code request with empty body:
@@ -381,5 +382,108 @@ func TestDisconnect_ShutdownClientIsNotResurrected(t *testing.T) {
 	_, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
 	if !errors.Is(err, ierror.ErrClientShutdown) {
 		t.Errorf("got %v, want %v", err, ierror.ErrClientShutdown)
+	}
+}
+
+func TestSendBinaryRequest_FrameLayoutAndSuccess(t *testing.T) {
+	c, serverConn := newTestClient(t)
+	const code = uint32(60_000)
+	payload := []byte{0xAA, 0xBB, 0xCC}
+	body := []byte("opaque response")
+
+	type capturedFrame struct {
+		length uint32
+		code   uint32
+		body   []byte
+	}
+	captured := make(chan capturedFrame, 1)
+	go func() {
+		var lengthBuf [RequestInitialBytesLength]byte
+		if _, err := serverConn.Read(lengthBuf[:]); err != nil {
+			t.Errorf("server: read request length: %v", err)
+			return
+		}
+		length := binary.LittleEndian.Uint32(lengthBuf[:])
+		req := make([]byte, length)
+		if _, err := serverConn.Read(req); err != nil {
+			t.Errorf("server: read request body: %v", err)
+			return
+		}
+		captured <- capturedFrame{
+			length: length,
+			code:   binary.LittleEndian.Uint32(req[:4]),
+			body:   req[4:],
+		}
+
+		resp := make([]byte, 8+len(body))
+		binary.LittleEndian.PutUint32(resp[0:4], 0)
+		binary.LittleEndian.PutUint32(resp[4:8], uint32(len(body)))
+		copy(resp[8:], body)
+		if _, err := serverConn.Write(resp); err != nil {
+			t.Errorf("server: write response: %v", err)
+		}
+	}()
+
+	result, err := c.SendBinaryRequest(context.Background(), code, payload)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(result) != string(body) {
+		t.Errorf("got response %q, want %q", result, body)
+	}
+
+	frame := <-captured
+	wantLength := uint32(4 + len(payload))
+	if frame.length != wantLength {
+		t.Errorf("got length prefix=%d, want %d", frame.length, wantLength)
+	}
+	if frame.code != code {
+		t.Errorf("got code=%d, want %d", frame.code, code)
+	}
+	if !bytes.Equal(frame.body, payload) {
+		t.Errorf("got payload=%v, want %v", frame.body, payload)
+	}
+}
+
+func TestSendBinaryRequest_ErrorStatus(t *testing.T) {
+	c, serverConn := newTestClient(t)
+
+	go serverRespond(t, serverConn, uint32(ierror.InvalidCommandCode), nil)
+
+	_, err := c.SendBinaryRequest(context.Background(), 60_000, nil)
+	if !errors.Is(err, ierror.ErrInvalidCommand) {
+		t.Errorf("got %v, want %v", err, ierror.ErrInvalidCommand)
+	}
+}
+
+func TestSendBinaryRequest_SessionControlGuard(t *testing.T) {
+	c, serverConn := newTestClient(t)
+
+	wrote := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		if _, err := serverConn.Read(buf); err == nil {
+			close(wrote)
+		}
+	}()
+
+	guardedCodes := []uint32{
+		uint32(command.LoginUserCode),
+		uint32(command.LogoutUserCode),
+		uint32(command.LoginRegisterCode),
+		uint32(command.LoginWithAccessTokenCode),
+		uint32(command.LoginRegisterWithPATCode),
+	}
+	for _, guardedCode := range guardedCodes {
+		_, err := c.SendBinaryRequest(context.Background(), guardedCode, nil)
+		if !errors.Is(err, ierror.ErrInvalidCommand) {
+			t.Errorf("code %d: got %v, want %v", guardedCode, err, ierror.ErrInvalidCommand)
+		}
+	}
+
+	select {
+	case <-wrote:
+		t.Fatal("expected no bytes to be written to the wire for session-control codes")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
