@@ -3116,6 +3116,15 @@ fn make_metadata_commit_notifier(
 /// before journaling, so a committed prepare only ever carries the
 /// assignment-bearing variant. Kept as defense-in-depth against a future
 /// commit path that emits a bare op.
+///
+/// "Partition-shape" is not only the partition SET: the purge and truncate
+/// ops leave the set intact but advance per-partition state (purge
+/// generation, delete watermark) that only the reconciler enforces on disk.
+/// Omitting them defers the on-disk effect to the periodic safety tick,
+/// stretching a purge's client-visible tail to a full
+/// `reconcile_periodic_interval`. `DeleteSegments` is absent by design: the
+/// leader rewrites it into `TruncatePartition` before journaling, so no
+/// commit ever carries it.
 const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
     matches!(
         op,
@@ -3126,6 +3135,9 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
             | Operation::DeleteTopic
             | Operation::DeleteStream
             | Operation::DeletePartitions
+            | Operation::PurgeStream
+            | Operation::PurgeTopic
+            | Operation::TruncatePartition
     )
 }
 
@@ -3148,6 +3160,29 @@ mod tests {
             config_default, built_in,
             "[cluster] heartbeat_timeout default drifted from \
              TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+        );
+    }
+
+    #[test]
+    fn reconciler_driven_ops_broadcast_a_commit_tick() {
+        // These commit without touching the partition set, so nothing else
+        // signals the reconciler: `reconcile_partition_purges` and
+        // `reconcile_segment_truncations` are the only code that turns them
+        // into on-disk effect, and they run only when a pass runs. Dropping
+        // one from the filter silently downgrades it to the periodic tick.
+        for op in [
+            Operation::PurgeStream,
+            Operation::PurgeTopic,
+            Operation::TruncatePartition,
+        ] {
+            assert!(
+                operation_triggers_partition_reconcile(op),
+                "{op:?} is enforced by the reconciler and must wake it on commit"
+            );
+        }
+        assert!(
+            !operation_triggers_partition_reconcile(Operation::CreateUser),
+            "ops with no partition-shape effect must stay off the broadcast"
         );
     }
 
