@@ -29,6 +29,9 @@ use configs::ConfigEnv;
 use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
+use std::fmt;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 use std::time::Duration;
 
 /// The primary heartbeats roughly every second (`PING_TICKS`); a window at
@@ -39,6 +42,13 @@ pub const MIN_CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 /// is KDF-derived from these bytes at use-site, so any encoding clearing this
 /// length is accepted.
 const MIN_SHARED_SECRET_LEN: usize = 32;
+
+/// DNS caps a full name at 255 octets on the wire, which leaves 253
+/// characters of presentation text (RFC 1035).
+const MAX_HOSTNAME_LEN: usize = 253;
+
+/// Per-label limit from RFC 1035.
+const MAX_HOSTNAME_LABEL_LEN: usize = 63;
 
 /// serde fallback for configs written before the field existed; the value
 /// itself lives in `core/server-ng/config.toml` like every other default.
@@ -144,9 +154,15 @@ pub struct ClusterTlsConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterNodeConfig {
     pub name: String,
     pub ip: String,
+    /// Optional client-facing address: a literal IP or a DNS hostname,
+    /// validated as [`AdvertisedAddress`] at boot. Replica traffic continues
+    /// to use [`Self::ip`].
+    #[serde(default)]
+    pub advertised_address: Option<String>,
     /// Numeric replica ID for VSR consensus (0-based).
     ///
     /// Must be unique across [`ClusterConfig::nodes`] and strictly less than
@@ -155,6 +171,13 @@ pub struct ClusterNodeConfig {
     pub ports: TransportPorts,
 }
 
+/// Per-node listener ports advertised in the cluster roster. In cluster mode
+/// the roster is the single source of ports: every enabled transport needs
+/// an explicit per-node port (validated at startup, no fallback to the
+/// transport's top-level `address` port). The roster entry's `ip` is the
+/// advertised address only: ws/quic/http bind the interface from their own
+/// `address` config, and followers forward HTTP requests to the primary at
+/// `ip:http`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, ConfigEnv)]
 pub struct TransportPorts {
     pub tcp: Option<u16>,
@@ -165,17 +188,175 @@ pub struct TransportPorts {
     pub tcp_replica: Option<u16>,
 }
 
+/// A validated client-facing node address: a literal IP or a DNS hostname.
+///
+/// Hostnames follow RFC 1123: ASCII letters, digits and hyphens in labels of
+/// 1-63 characters that do not start or end with a hyphen, at most
+/// [`MAX_HOSTNAME_LEN`] characters total, no port and no trailing dot. Names
+/// consisting solely of digits and dots are rejected as malformed IPv4 rather
+/// than accepted as hostnames, so `10.0.0.256` fails loudly instead of being
+/// handed to DNS. Hostnames normalize to lowercase and IPs to their canonical
+/// form ([`IpAddr`]), so textual variants of one address (`Broker.Example.COM`,
+/// `2001:DB8::1`, `[2001:db8::1]`) compare equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AdvertisedAddress {
+    Ip(IpAddr),
+    Hostname(String),
+}
+
+impl AdvertisedAddress {
+    /// Render `host:port` for a URL or endpoint listing, bracketing IPv6
+    /// hosts (`[::1]:8080`) so the port separator stays unambiguous.
+    pub fn authority(&self, port: u16) -> String {
+        match self {
+            Self::Ip(ip) => SocketAddr::new(*ip, port).to_string(),
+            Self::Hostname(hostname) => format!("{hostname}:{port}"),
+        }
+    }
+}
+
+impl FromStr for AdvertisedAddress {
+    type Err = AdvertisedAddressError;
+
+    fn from_str(address: &str) -> Result<Self, Self::Err> {
+        if address.is_empty() {
+            return Err(AdvertisedAddressError::Empty);
+        }
+        if let Ok(ip) = address.parse::<IpAddr>() {
+            return Ok(Self::Ip(ip));
+        }
+        // URL-style bracketed IPv6 (`[2001:db8::1]`) is unambiguous; accept
+        // it and store the inner address.
+        if let Some(inner) = address
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            && let Ok(ip) = inner.parse::<Ipv6Addr>()
+        {
+            return Ok(Self::Ip(IpAddr::V6(ip)));
+        }
+        if let Some((host, port)) = address.rsplit_once(':') {
+            // `host:port` and `[v6]:port` are the common misconfigurations;
+            // anything else with a colon can only be a broken IPv6 literal,
+            // since ':' never appears in a hostname.
+            let bracketed_host = host.starts_with('[') && host.ends_with(']');
+            if !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (bracketed_host || !host.contains(':'))
+            {
+                return Err(AdvertisedAddressError::PortNotAllowed);
+            }
+            return Err(AdvertisedAddressError::MalformedIpv6);
+        }
+        if address.len() > MAX_HOSTNAME_LEN {
+            return Err(AdvertisedAddressError::HostnameTooLong {
+                length: address.len(),
+            });
+        }
+        let mut all_labels_numeric = true;
+        for label in address.split('.') {
+            if label.is_empty() {
+                return Err(AdvertisedAddressError::EmptyLabel);
+            }
+            if label.len() > MAX_HOSTNAME_LABEL_LEN {
+                return Err(AdvertisedAddressError::LabelTooLong {
+                    label: label.to_owned(),
+                });
+            }
+            if label.starts_with('-') || label.ends_with('-') {
+                return Err(AdvertisedAddressError::LabelHyphen {
+                    label: label.to_owned(),
+                });
+            }
+            if let Some(character) = label
+                .chars()
+                .find(|character| !character.is_ascii_alphanumeric() && *character != '-')
+            {
+                return Err(AdvertisedAddressError::InvalidCharacter { character });
+            }
+            all_labels_numeric &= label.bytes().all(|byte| byte.is_ascii_digit());
+        }
+        if all_labels_numeric {
+            return Err(AdvertisedAddressError::MalformedIpv4);
+        }
+        // DNS resolution is case-insensitive; normalizing here makes equality
+        // (and thus endpoint-conflict detection) case-insensitive too.
+        Ok(Self::Hostname(address.to_ascii_lowercase()))
+    }
+}
+
+impl fmt::Display for AdvertisedAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(ip) => write!(formatter, "{ip}"),
+            Self::Hostname(hostname) => write!(formatter, "{hostname}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvertisedAddressError {
+    Empty,
+    PortNotAllowed,
+    MalformedIpv4,
+    MalformedIpv6,
+    HostnameTooLong { length: usize },
+    EmptyLabel,
+    LabelTooLong { label: String },
+    LabelHyphen { label: String },
+    InvalidCharacter { character: char },
+}
+
+impl fmt::Display for AdvertisedAddressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "address cannot be empty"),
+            Self::PortNotAllowed => write!(
+                formatter,
+                "address must not include a port; ports are configured in cluster.nodes.ports"
+            ),
+            Self::MalformedIpv4 => write!(
+                formatter,
+                "address consists only of digits and dots but is not a valid IPv4 address"
+            ),
+            Self::MalformedIpv6 => write!(
+                formatter,
+                "address contains ':' but is not a valid IPv6 address, and ':' cannot appear in a hostname"
+            ),
+            Self::HostnameTooLong { length } => write!(
+                formatter,
+                "hostname is {length} characters long; the limit is {MAX_HOSTNAME_LEN}"
+            ),
+            Self::EmptyLabel => write!(
+                formatter,
+                "hostname contains an empty label (leading, trailing, or doubled dot)"
+            ),
+            Self::LabelTooLong { label } => write!(
+                formatter,
+                "hostname label '{label}' exceeds {MAX_HOSTNAME_LABEL_LEN} characters"
+            ),
+            Self::LabelHyphen { label } => write!(
+                formatter,
+                "hostname label '{label}' cannot start or end with a hyphen"
+            ),
+            Self::InvalidCharacter { character } => write!(
+                formatter,
+                "character '{character}' is not allowed in a hostname (allowed: ASCII letters, digits, '-', '.')"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdvertisedAddressError {}
+
 /// Whether cluster-wide JWT key material exists: a configured `http.jwt`
 /// secret, or the signing key derived from the cluster PSK. When it does, a
 /// bearer minted on any node verifies on every node - the invariant
 /// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
 /// themselves; this covers only the key material.
 ///
-/// Single source for both the boot-time config validator and the server-ng
-/// runtime forwarding gate. If the two ever disagree the validator's roster
-/// http-port guarantee is silently bypassed: forwarding would activate against
-/// a node the validator never required to expose an http port, and every
-/// forward through it fails closed with a 503.
+/// Forwarding targets resolve from the roster (`ip:ports.http`); the config
+/// validator unconditionally requires a roster port for every enabled
+/// transport, so a forward never dials a node without a declared http port.
 pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
     cluster.enabled
         && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
@@ -226,6 +407,8 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
         let mut used_endpoints = std::collections::HashSet::new();
+        let mut used_advertised_endpoints = std::collections::HashSet::new();
+        let mut used_raw_advertised_endpoints = std::collections::HashSet::new();
 
         for node in &self.nodes {
             if node.name.trim().is_empty() {
@@ -265,17 +448,17 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            let port_list = [
+            let client_ports = [
                 ("TCP", node.ports.tcp),
                 ("QUIC", node.ports.quic),
                 ("HTTP", node.ports.http),
                 ("WebSocket", node.ports.websocket),
-                ("TCP_REPLICA", node.ports.tcp_replica),
             ];
+            let replica_port = ("TCP_REPLICA", node.ports.tcp_replica);
 
-            for (name, port_opt) in &port_list {
+            for (name, port_opt) in client_ports.into_iter().chain([replica_port]) {
                 if let Some(port) = port_opt {
-                    if *port == 0 {
+                    if port == 0 {
                         eprintln!(
                             "Invalid cluster configuration: {} port cannot be 0 for node '{}'",
                             name, node.name
@@ -287,6 +470,51 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                     if !used_endpoints.insert(endpoint.clone()) {
                         eprintln!(
                             "Invalid cluster configuration: port conflict - {endpoint} is already bound (node '{}', transport {name})",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                }
+            }
+
+            // An advertised address must parse strictly (IP or RFC 1123
+            // hostname): the value is handed verbatim to every client via
+            // cluster metadata and redirect URLs, so a bad one poisons them
+            // all. The roster `ip` predates this check and is only validated
+            // as non-empty (Docker service names with underscores exist in
+            // the wild), so when it backs the client endpoints an unparsable
+            // value falls back to raw-string comparison instead of failing
+            // boot.
+            let client_address = match node.advertised_address.as_deref() {
+                Some(advertised_address) => match advertised_address.parse::<AdvertisedAddress>() {
+                    Ok(address) => Some(address),
+                    Err(error) => {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_address '{advertised_address}' for node '{}': {error}",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                },
+                None => node.ip.parse::<AdvertisedAddress>().ok(),
+            };
+
+            for (name, port) in &client_ports {
+                if let Some(port) = port {
+                    let (endpoint, inserted) = match &client_address {
+                        Some(address) => (
+                            address.authority(*port),
+                            used_advertised_endpoints.insert((address.clone(), *port)),
+                        ),
+                        None => {
+                            let endpoint = format!("{}:{port}", node.ip);
+                            let inserted = used_raw_advertised_endpoints.insert(endpoint.clone());
+                            (endpoint, inserted)
+                        }
+                    };
+                    if !inserted {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised client endpoint conflict - {endpoint} is already used (node '{}', transport {name})",
                             node.name
                         );
                         return Err(ConfigurationError::InvalidConfigurationValue);
@@ -380,6 +608,104 @@ mod tests {
             "shared_secret field present in serialized config: {serialized}"
         );
     }
+
+    #[test]
+    fn cluster_node_rejects_unknown_fields() {
+        let error = serde_json::from_str::<ClusterNodeConfig>(
+            r#"{
+                "name": "node-0",
+                "ip": "10.0.0.1",
+                "advertise_address": "203.0.113.1",
+                "replica_id": 0,
+                "ports": {}
+            }"#,
+        )
+        .expect_err("misspelled advertised_address must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `advertise_address`"),
+            "unexpected deserialization error: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod advertised_address_tests {
+    use super::*;
+
+    #[test]
+    fn parses_ip_literals_to_canonical_form() {
+        assert_eq!(
+            "203.0.113.1".parse::<AdvertisedAddress>(),
+            Ok(AdvertisedAddress::Ip("203.0.113.1".parse().unwrap()))
+        );
+        for equivalent_address in ["2001:DB8::1", "2001:db8:0:0:0:0:0:1", "[2001:db8::1]"] {
+            assert_eq!(
+                equivalent_address.parse::<AdvertisedAddress>(),
+                Ok(AdvertisedAddress::Ip("2001:db8::1".parse().unwrap())),
+                "'{equivalent_address}' must parse to canonical 2001:db8::1"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_hostname_to_lowercase() {
+        let address = "Broker-1.Example.COM".parse::<AdvertisedAddress>();
+        assert_eq!(
+            address,
+            Ok(AdvertisedAddress::Hostname(
+                "broker-1.example.com".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn authority_brackets_ipv6_hosts_only() {
+        let cases = [
+            ("203.0.113.1", "203.0.113.1:8090"),
+            ("2001:db8::1", "[2001:db8::1]:8090"),
+            ("broker-1.example.com", "broker-1.example.com:8090"),
+        ];
+        for (host, expected_authority) in cases {
+            let address = host.parse::<AdvertisedAddress>().expect("valid address");
+            assert_eq!(address.authority(8090), expected_authority);
+        }
+    }
+
+    #[test]
+    fn rejects_port_suffixes() {
+        for address_with_port in ["example.com:8090", "10.0.0.1:8090", "[2001:db8::1]:8090"] {
+            assert_eq!(
+                address_with_port.parse::<AdvertisedAddress>(),
+                Err(AdvertisedAddressError::PortNotAllowed),
+                "'{address_with_port}' must be rejected as host:port"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dotted_numeric_strings_as_malformed_ipv4() {
+        for malformed_ip in ["10.0.0.256", "192.168.1", "12345"] {
+            assert_eq!(
+                malformed_ip.parse::<AdvertisedAddress>(),
+                Err(AdvertisedAddressError::MalformedIpv4),
+                "'{malformed_ip}' must not pass as a hostname"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_broken_ipv6_literals() {
+        for broken_ipv6 in ["2001:db8:::1", "[2001:db8::zz]", "::1::2"] {
+            assert_eq!(
+                broken_ipv6.parse::<AdvertisedAddress>(),
+                Err(AdvertisedAddressError::MalformedIpv6),
+                "'{broken_ipv6}' must be rejected as malformed IPv6"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +716,7 @@ mod cluster_validate_tests {
         ClusterNodeConfig {
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
+            advertised_address: None,
             replica_id: id,
             ports: TransportPorts::default(),
         }
@@ -511,6 +838,147 @@ mod cluster_validate_tests {
         };
         let c = cfg(vec![n1, n2]);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_advertised_client_endpoint() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("203.0.113.1".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = n1.advertised_address.clone();
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_equivalent_ipv6_advertised_client_endpoints() {
+        for equivalent_address in ["2001:DB8::1", "2001:db8:0:0:0:0:0:1", "[2001:db8::1]"] {
+            let mut n1 = node("n1", 0);
+            n1.ip = "10.0.0.1".to_owned();
+            n1.advertised_address = Some("2001:db8::1".to_owned());
+            n1.ports.tcp = Some(8090);
+            let mut n2 = node("n2", 1);
+            n2.ip = "10.0.0.2".to_owned();
+            n2.advertised_address = Some(equivalent_address.to_owned());
+            n2.ports.tcp = Some(8090);
+
+            assert!(
+                cfg(vec![n1, n2]).validate().is_err(),
+                "{equivalent_address} must conflict with 2001:db8::1"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_equivalent_ipv6_client_endpoints_from_node_ip() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "2001:db8::1".to_owned();
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "2001:db8:0:0:0:0:0:1".to_owned();
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_distinct_advertised_client_endpoints() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("203.0.113.1".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("203.0.113.2".to_owned());
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_hostname_advertised_address() {
+        let mut n1 = node("n1", 0);
+        n1.advertised_address = Some("iggy-node-1.example.com".to_owned());
+        n1.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_advertised_addresses() {
+        let oversized_label = format!("{}.example.com", "a".repeat(64));
+        let oversized_hostname = format!("{}example.com", "a.".repeat(130));
+        for advertised_address in [
+            "",
+            " 203.0.113.1",
+            "10.0.0.256",
+            "192.168.1",
+            "example.com:8090",
+            "[2001:db8::1]:8090",
+            "2001:db8:::1",
+            "iggy_node.example.com",
+            "-node.example.com",
+            "node-.example.com",
+            ".example.com",
+            "example..com",
+            "example.com.",
+            "ex\u{e4}mple.com",
+            oversized_label.as_str(),
+            oversized_hostname.as_str(),
+        ] {
+            let mut n1 = node("n1", 0);
+            n1.advertised_address = Some(advertised_address.to_owned());
+
+            assert!(
+                cfg(vec![n1, node("n2", 1)]).validate().is_err(),
+                "'{advertised_address}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_case_variant_hostname_advertised_endpoints() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("broker.example.com".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("Broker.Example.COM".to_owned());
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_node_ip_hostname_clashing_with_advertised_hostname() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("broker.example.com".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "broker.example.com".to_owned();
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_distinct_hostname_advertised_endpoints() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("broker-1.example.com".to_owned());
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("broker-2.example.com".to_owned());
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
     }
 
     #[test]
