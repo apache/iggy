@@ -642,12 +642,21 @@ ca_file = ""
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
 #
-# 'ip' is the address the cluster advertises for the node (cluster metadata,
-# follower-to-primary HTTP forwarding); it is not the bind interface for
-# quic/http/websocket, which comes from each transport's own 'address'
-# setting above. 'ports' is the single source of listener ports in cluster
-# mode: every enabled transport needs an explicit per-node port, otherwise
-# the server refuses to start.
+# 'ip' is the node's roster address. Replica-to-replica traffic,
+# follower-to-primary HTTP forwarding, and the TCP listener use it. It is not
+# the bind interface for quic/http/websocket, which comes from each transport's
+# own 'address' setting above.
+#
+# Each node may also set 'advertised_address': the client-facing address
+# handed out in cluster metadata and leader redirects. Set it when 'ip' is
+# a private replica-network address unreachable by clients (Docker,
+# Kubernetes, NAT). Accepts a literal IPv4/IPv6 address or a DNS hostname
+# (RFC 1123: ASCII letters, digits, '-' and '.'; no port, no trailing dot).
+# When unset, clients receive 'ip'.
+#
+# In cluster mode, 'ports' is the single source of listener ports: every
+# enabled transport needs an explicit per-node port, otherwise the server
+# refuses to start.
 [[cluster.nodes]]
 name = "iggy-node-1"
 ip = "127.0.0.1"
@@ -664,6 +673,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
+# advertised_address = "iggy-node-3.example.com"
 # replica_id = 2
 # ports = { tcp = 8092, quic = 8082, http = 3002, websocket = 8094, tcp_replica = 9092 }
 

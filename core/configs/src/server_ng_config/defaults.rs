@@ -84,6 +84,7 @@ impl Default for ClusterConfig {
                 .map(|node| ClusterNodeConfig {
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
+                    advertised_address: None,
                     replica_id: u8::try_from(node.replica_id).expect(
                         "static_toml replica_id must fit in u8 (0..=255); \
                          fix core/server-ng/config.toml",

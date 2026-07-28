@@ -25,6 +25,7 @@ use axum::Json;
 use axum::http::header::{LOCATION, RETRY_AFTER};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use configs::ng_cluster::{AdvertisedAddress, ClusterNodeConfig};
 use iggy_binary_protocol::Operation;
 use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
@@ -500,39 +501,56 @@ pub(in crate::http) fn primary_redirect_location(
     scheme: &str,
     path_and_query: &str,
 ) -> Option<String> {
-    let socket = primary_http_socket(roster, primary_index)?;
-    Some(format!("{scheme}://{socket}{path_and_query}"))
+    let authority = primary_advertised_http_authority(roster, primary_index)?;
+    Some(format!("{scheme}://{authority}{path_and_query}"))
 }
 
 /// Resolve the VSR primary's HTTP socket from the static roster: the node
-/// whose `replica_id` equals `primary_index`, its `ports.http`, and its `ip`
-/// parsed strictly. `None` on any miss so callers fail closed. Formatting the
-/// returned [`SocketAddr`] brackets an IPv6 host (`[::1]:8080`) rather than
-/// leaving it ambiguous.
+/// whose `replica_id` equals `primary_index`, its `ports.http`, and its private
+/// roster `ip` parsed strictly. Internal replica forwarding uses this address.
 pub(in crate::http) fn primary_http_socket(
     roster: &ClusterRoster,
     primary_index: u8,
 ) -> Option<SocketAddr> {
+    let (node, http_port) = primary_node(roster, primary_index)?;
+    let ip = node.ip.parse::<IpAddr>().ok()?;
+    Some(SocketAddr::new(ip, http_port))
+}
+
+/// Resolve the client-facing HTTP authority (`host:port`) for a redirect. The
+/// advertised address is preferred, with the private roster IP retained as
+/// the compatibility fallback. [`AdvertisedAddress::authority`] brackets IPv6
+/// hosts and passes hostnames through, so the redirect URL stays valid; a
+/// host that is neither a valid IP nor a valid hostname yields `None` so
+/// callers fail closed.
+fn primary_advertised_http_authority(roster: &ClusterRoster, primary_index: u8) -> Option<String> {
+    let (node, http_port) = primary_node(roster, primary_index)?;
+    let host = node.advertised_address.as_deref().unwrap_or(&node.ip);
+    let address = host.parse::<AdvertisedAddress>().ok()?;
+    Some(address.authority(http_port))
+}
+
+fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ClusterNodeConfig, u16)> {
     let node = roster
         .nodes
         .iter()
         .find(|node| node.replica_id == primary_index)?;
     let http_port = node.ports.http?;
-    let ip = node.ip.parse::<IpAddr>().ok()?;
-    Some(SocketAddr::new(ip, http_port))
+    Some((node, http_port))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use configs::ng_cluster::{ClusterNodeConfig, TransportPorts};
+    use configs::ng_cluster::TransportPorts;
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
             name: format!("node-{replica_id}"),
             ip: ip.to_owned(),
+            advertised_address: None,
             replica_id,
             ports: TransportPorts {
                 tcp: None,
@@ -611,6 +629,42 @@ mod tests {
         assert_eq!(
             primary_redirect_location(&roster, 0, "http", READ_PATH),
             Some("http://[::1]:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_uses_advertised_address() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("2001:db8::1".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            Some("https://[2001:db8::1]:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_uses_advertised_hostname() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("broker-1.example.com".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            Some("https://broker-1.example.com:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_http_socket_uses_private_roster_ip() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("203.0.113.1".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_http_socket(&roster, 0),
+            Some("10.0.0.1:8080".parse().expect("valid socket address"))
         );
     }
 
