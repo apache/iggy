@@ -19,7 +19,8 @@ use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
-use iggy_binary_protocol::consensus::PrepareHeader;
+use consensus::{CLIENTS_TABLE_MAX, ClientTable, build_reply_message, build_reply_message_with};
+use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use server_common::Message;
@@ -86,6 +87,13 @@ pub struct RecoveredMetadata<M> {
     pub journal: PrepareJournal,
     pub snapshot: Option<IggySnapshot>,
     pub mux_stm: M,
+    /// Client table rebuilt from the replayed committed prefix: registers
+    /// re-mint epochs in apply order, replies re-cache byte-identically
+    /// (`build_reply_message*` reads only the prepare header + deterministic
+    /// apply output). Sessions whose register fell below the snapshot floor
+    /// are NOT recovered - the table has no checkpoint artifact yet
+    /// (IGGY-137); those clients re-register and their epoch restarts at 1.
+    pub client_table: ClientTable,
     /// `None` means no snapshot existed and no journal entries were replayed.
     /// `Some(op)` is the highest op applied, either from the snapshot or journal replay.
     ///
@@ -105,7 +113,9 @@ pub struct RecoveredMetadata<M> {
 /// 1. Load snapshot from `{data_dir}/metadata/snapshot.bin` if present
 /// 2. Restore state machine from snapshot, or initialize empty state
 /// 3. Open WAL at `{data_dir}/metadata/journal.wal`, scan and rebuild index
-/// 4. Replay journal entries from the first post-snapshot op through the state machine
+/// 4. Replay journal entries from the first post-snapshot op through the
+///    state machine, rebuilding the client table alongside (registers mint
+///    epochs, replies re-cache) exactly as the commit paths did live
 /// 5. Return the assembled `RecoveredMetadata`
 ///
 /// Only the owning shard (shard 0) should call this. Peer shards receive
@@ -188,6 +198,7 @@ where
             .fold(snapshot_floor, u64::max)
     };
 
+    let mut client_table = ClientTable::new(CLIENTS_TABLE_MAX);
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
     for header in &headers_to_replay {
@@ -200,6 +211,47 @@ where
             continue;
         }
 
+        // Register/Logout mutate the client table and skip the state
+        // machine, mirroring the commit paths (`on_ack` / `commit_journal`).
+        //
+        // Epochs come back identical on every replica: they are the register's
+        // own commit op, so replay reads them out of the log rather than
+        // deriving them from replay order.
+        //
+        // Watermarks do NOT, and this is a known gap rather than an invariant.
+        // Replay starts at THIS node's snapshot floor, and checkpointing is
+        // node-local (`checkpoint_if_needed` fires on local journal occupancy),
+        // so replicas cross the floor at different ops. If a client's earlier
+        // register fell below this node's floor while a later one survived,
+        // replay takes `commit_register`'s fresh-entry branch and the entry
+        // returns with `watermark = 0`, where a peer that replayed both took
+        // the rebind branch and kept it. The fence still passes, so nothing is
+        // evicted, and the same request id a peer answers `Duplicate` gets
+        // answered `New` here and re-executed -- exactly-once degrading to
+        // at-least-once, silently.
+        //
+        // Unobservable today (no shipping client re-presents a recovered
+        // `client_id`), and closed by putting the table in the snapshot so
+        // replay no longer has to reconstruct it. Until then a caught-up
+        // primary is authoritative for its OWN table only, which is why
+        // `request_preflight`'s catch-up gate cannot bridge this (see its
+        // rustdoc).
+        if header.operation == Operation::Register {
+            let reply = build_reply_message(header, &bytes::Bytes::new());
+            client_table.commit_register(header.client, header.user_id, reply);
+            last_applied_op = Some(header.op);
+            continue;
+        }
+        if header.operation == Operation::Logout {
+            client_table.remove_client(header.client);
+            // TODO: the commit paths also run `remove_consumer_group_member`
+            // here; recovery has no `StreamsFrontend` bound, so replayed
+            // logouts leave stale group members (pre-existing, harmless for
+            // dead connections but a divergence from the live apply).
+            last_applied_op = Some(header.op);
+            continue;
+        }
+
         let entry = journal.entry_at(header).await?.ok_or_else(|| {
             RecoveryError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -209,6 +261,20 @@ where
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
         let reply = mux_stm.gated_update(entry)?;
+        // Re-cache the reply exactly like the commit paths: same prepare
+        // header + deterministic apply output = the original bytes. Skipped
+        // when the session is absent (server-originated ops, or the client
+        // was evicted / registered below the snapshot floor).
+        if client_table.get_epoch(header.client).is_some() {
+            let cached = build_reply_message_with(header, reply.reply_body_len(), |dst| {
+                reply.write_reply_body(dst);
+            });
+            // Skips (never panics) on a stale-request replay: capacity
+            // eviction is replica-local and unlogged, so a WAL can legitimately
+            // replay a lower request id onto a preserved watermark. Recovery
+            // must boot from such a WAL, not refuse it.
+            let _ = client_table.commit_reply(header.client, cached);
+        }
         tracing::debug!(
             target: "iggy.metadata.diag",
             op = header.op,
@@ -224,6 +290,7 @@ where
         journal,
         snapshot,
         mux_stm,
+        client_table,
         last_applied_op,
         last_journaled_op,
     })
@@ -261,6 +328,31 @@ mod tests {
         header.op = op;
         header.commit = commit;
         header.operation = Operation::CreateStream;
+        Message::try_from(buffer).unwrap()
+    }
+
+    /// A client-attributed prepare (Register / app op / Logout) as the
+    /// admission path stamps it.
+    fn make_client_prepare(
+        op: u64,
+        operation: Operation,
+        client: u128,
+        user_id: u32,
+        request: u64,
+    ) -> Message<PrepareHeader> {
+        let total_size = HEADER_SIZE;
+        let mut buffer = Owned::<4096>::zeroed(total_size);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.size = total_size as u32;
+        header.command = Command2::Prepare;
+        header.op = op;
+        header.commit = op.saturating_sub(1);
+        header.operation = operation;
+        header.client = client;
+        header.user_id = user_id;
+        header.request = request;
         Message::try_from(buffer).unwrap()
     }
 
@@ -420,6 +512,182 @@ mod tests {
                 .map(IggySnapshot::sequence_number),
             Some(5)
         );
+    }
+
+    // The watermark half of table recovery does NOT survive a checkpoint, and
+    // this pins that as a fact rather than a comment. Shape: a client registers,
+    // commits request 1, a checkpoint lands past that register, then the client
+    // rebinds. Replay starts above the floor, so it never sees the first
+    // register: `commit_register` takes its fresh-entry branch and the entry
+    // comes back with watermark 0, while a peer whose floor sat lower replayed
+    // both registers, took the rebind branch, and kept watermark 1.
+    //
+    // Consequence, once a client re-presents a recovered id: the same request
+    // that peer answers `Duplicate` is `New` here and gets re-executed. The
+    // fence is unaffected -- epochs are op-derived, so this node still returns
+    // the second register's op.
+    //
+    // Red/green for the table-in-snapshot work: when the table ships in the
+    // checkpoint, the watermark assertion below flips to `Some(1)`.
+    #[compio::test]
+    async fn recover_loses_the_watermark_when_a_checkpoint_hides_the_first_register() {
+        const CLIENT: u128 = 0x1337;
+        const USER: u32 = 7;
+        const FLOOR: u64 = 2;
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        // Ops 1..=2 are below the floor and are never replayed: the client's
+        // first Register and the request that advanced its watermark.
+        IggySnapshot::new(FLOOR)
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for entry in [
+                make_client_prepare(1, Operation::Register, CLIENT, USER, 0),
+                make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1),
+                // The rebind, above the floor, so replay does see this one.
+                make_client_prepare(3, Operation::Register, CLIENT, USER, 0),
+            ] {
+                journal.append(entry).await.unwrap();
+            }
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            true,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let table = &recovered.client_table;
+        assert_eq!(
+            table.get_epoch(CLIENT),
+            Some(3),
+            "the fence is op-derived, so it survives the checkpoint intact"
+        );
+        assert_eq!(
+            table.get_watermark(CLIENT),
+            Some(0),
+            "KNOWN GAP: the pre-floor watermark is lost, so request 1 reads as New \
+             here while a lower-floor peer answers it as a duplicate"
+        );
+    }
+
+    // The IGGY-137 restart contract: a rebooted node must remember where
+    // each client left off. Replay re-mints the epoch, restores the
+    // watermark, and re-caches the reply so a retry of the last committed
+    // request id dedups instead of re-executing or silently dropping.
+    #[compio::test]
+    async fn recover_rebuilds_client_table_from_wal() {
+        use consensus::client_table::RequestStatus;
+
+        const CLIENT: u128 = 0x1337;
+        const USER: u32 = 7;
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(1, Operation::Register, CLIENT, USER, 0))
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(
+                    2,
+                    Operation::CreateStream,
+                    CLIENT,
+                    USER,
+                    1,
+                ))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        // Solo: every journaled op is committed.
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            true,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let table = &recovered.client_table;
+        assert_eq!(table.get_epoch(CLIENT), Some(1), "register minted epoch 1");
+        assert_eq!(table.get_user_id(CLIENT), Some(USER));
+        assert_eq!(
+            table.get_watermark(CLIENT),
+            Some(1),
+            "committed request 1 restored the watermark"
+        );
+        match table.check_request(CLIENT, 1, 1, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 1, "retry replays the cached reply");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        assert!(
+            matches!(table.check_request(CLIENT, 1, 2, 0), RequestStatus::New),
+            "the next request id is admitted"
+        );
+    }
+
+    // A replayed Logout removes the entry, mirroring the commit paths.
+    #[compio::test]
+    async fn recover_replays_logout_as_session_removal() {
+        const CLIENT: u128 = 0x1337;
+        const USER: u32 = 7;
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(1, Operation::Register, CLIENT, USER, 0))
+                .await
+                .unwrap();
+            journal
+                .append(make_client_prepare(2, Operation::Logout, CLIENT, USER, 1))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            true,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.client_table.get_epoch(CLIENT),
+            None,
+            "logged-out session must not be resurrected"
+        );
+        assert_eq!(recovered.last_applied_op, Some(2));
     }
 
     #[test]

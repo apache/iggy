@@ -548,4 +548,30 @@ mod tests {
         assert!(mgr.get_session(c1).is_none());
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
     }
+    // Every disconnect releases its consensus session, group member or not.
+    // Holding the slot open for a resume window instead leaked it: the sweep
+    // that would have collected it rides the heartbeat verifier, which only
+    // runs when `heartbeat.enabled` is set, and that ships false -- so the
+    // slot survived for the process lifetime and pushed the client table
+    // toward capacity eviction, which silently erases dedup watermarks.
+    #[test]
+    fn disconnect_releases_the_bound_session_for_logout() {
+        let mut mgr = SessionManager::new();
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5100), ClientTransportKind::Tcp);
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 7).unwrap();
+
+        assert_eq!(
+            mgr.remove_connection(conn),
+            Some((100, 7)),
+            "the disconnect must hand back (client_id, epoch) so the caller can log it out"
+        );
+        assert!(mgr.get_session(conn).is_none());
+        assert_eq!(
+            mgr.remove_connection(conn),
+            None,
+            "a second disconnect has nothing left to release"
+        );
+    }
 }

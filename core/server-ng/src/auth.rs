@@ -221,7 +221,10 @@ where
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
     let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
-        Ok(session) => session,
+        // The wire reply carries only the fence epoch; the SDK numbers its
+        // own requests, so the bind watermark is not surfaced (see the
+        // BoundSession doc for who does consume it).
+        Ok(bound) => bound.epoch,
         Err(error) => {
             return Err(LoginRegisterError::Transient(error));
         }

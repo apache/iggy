@@ -65,11 +65,6 @@ use crate::server_error::ServerNgError;
 const ALPN_H2: &[u8] = b"h2";
 const ALPN_HTTP11: &[u8] = b"http/1.1";
 
-/// Handshake wall-clock bound for the accept pump. The HTTP listener has no
-/// `MessageBusConfig` to source it from, so it mirrors the binary
-/// transports' `DEFAULT_HANDSHAKE_GRACE` directly.
-const HTTP_TLS_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
-
 /// Depth of the handshaken-connection channel between the accept pump and
 /// the serve loop. The serve loop drains one per accept and immediately
 /// spawns a per-connection hyper task, so it rarely fills; the bound keeps
@@ -101,16 +96,26 @@ pub fn load_http_tls_server_config(
 
 /// Bind the accept pump: build the acceptor, spawn the pump task, and hand
 /// back the handshaken-connection receiver for [`serve`] plus the pump's
-/// join handle for the caller to track.
+/// join handle for the caller to track. `handshake_grace` bounds each
+/// connection's TLS handshake; the caller sources it from
+/// `MessageBusConfig::handshake_grace` so the HTTPS listener shares the same
+/// slowloris budget as the binary transports.
 pub fn spawn_accept_pump(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
+    handshake_grace: Duration,
     shutdown: ShutdownToken,
 ) -> (Receiver<Handshaken>, JoinHandle<()>) {
     let (connections_tx, connections_rx) =
         async_channel::bounded::<Handshaken>(ACCEPT_CHANNEL_DEPTH);
     let acceptor = TlsAcceptor::from(config);
-    let pump = compio::runtime::spawn(accept_pump(listener, acceptor, connections_tx, shutdown));
+    let pump = compio::runtime::spawn(accept_pump(
+        listener,
+        acceptor,
+        connections_tx,
+        handshake_grace,
+        shutdown,
+    ));
     (connections_rx, pump)
 }
 
@@ -205,6 +210,7 @@ async fn accept_pump(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     connections: Sender<Handshaken>,
+    handshake_grace: Duration,
     shutdown: ShutdownToken,
 ) {
     loop {
@@ -214,7 +220,9 @@ async fn accept_pump(
                 break;
             }
             result = listener.accept().fuse() => match result {
-                Ok((stream, peer)) => spawn_handshake(&acceptor, &connections, stream, peer),
+                Ok((stream, peer)) => {
+                    spawn_handshake(&acceptor, &connections, handshake_grace, stream, peer);
+                }
                 Err(error) => error!(%error, "server-ng HTTPS accept failed"),
             },
         }
@@ -228,13 +236,14 @@ async fn accept_pump(
 fn spawn_handshake(
     acceptor: &TlsAcceptor,
     connections: &Sender<Handshaken>,
+    handshake_grace: Duration,
     stream: TcpStream,
     peer: SocketAddr,
 ) {
     let acceptor = acceptor.clone();
     let connections = connections.clone();
     compio::runtime::spawn(async move {
-        match compio::time::timeout(HTTP_TLS_HANDSHAKE_GRACE, acceptor.accept(stream)).await {
+        match compio::time::timeout(handshake_grace, acceptor.accept(stream)).await {
             Ok(Ok(tls)) => {
                 // Drop on send error: the channel is closed only at
                 // shutdown, when the serve loop is already tearing down.
@@ -242,7 +251,7 @@ fn spawn_handshake(
             }
             Ok(Err(error)) => debug!(%peer, %error, "server-ng HTTPS handshake failed"),
             Err(_elapsed) => {
-                debug!(%peer, grace = ?HTTP_TLS_HANDSHAKE_GRACE, "server-ng HTTPS handshake timed out");
+                debug!(%peer, grace = ?handshake_grace, "server-ng HTTPS handshake timed out");
             }
         }
     })

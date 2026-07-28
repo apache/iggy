@@ -52,11 +52,12 @@ use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
+use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
@@ -161,14 +162,19 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// connection homes on a peer shard, that shard verifies credentials and
 /// owns the session locally, but the consensus proposal (`Register` /
 /// `Logout`) must execute on shard 0. The peer hands just that step here
-/// and awaits the committed op number over `reply` (`None` = transient
-/// submit failure; all `MetadataSubmitError` variants are transient by
-/// contract, so the caller retries rather than distinguishing them).
+/// and awaits the outcome over `reply`. `Register` carries the submit error
+/// verbatim because one variant
+/// (`MetadataSubmitError::ClientIdOwnedByAnotherUser`) is terminal and must
+/// not be retried; the remaining variants are transient by contract.
 pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
         user_id: u32,
-        reply: Sender<Option<u64>>,
+        /// The committed bind, or the submit error verbatim. The error must
+        /// survive the hop: the ownership refusal is TERMINAL, and flattening it
+        /// into "no reply" makes the login look transient, which costs the
+        /// client a retry storm of full password verifications.
+        reply: Sender<Result<BoundSession, MetadataSubmitError>>,
     },
     Logout {
         vsr_client_id: u128,
@@ -708,12 +714,16 @@ impl ShardFrame {
     }
 }
 
-/// Prepares served per `RequestPrepares` round. The per-peer bus queues
-/// are bounded (`peer_queue_capacity`, 256 by default) and overrun frames
-/// drop silently, so an unbounded burst loses its own tail; the receiver
-/// pulls the window chunk by chunk instead (each walked `RepairDone`
-/// immediately requests the next chunk while progress holds).
-const REPAIR_CHUNK_MAX: u64 = 128;
+/// Prepares served per `RequestPrepares` round.
+///
+/// The per-peer bus queues are bounded (`peer_queue_capacity`, 256 by default)
+/// and overrun frames drop silently, so an unbounded burst loses its own tail;
+/// the receiver pulls the window chunk by chunk instead (each walked
+/// `RepairDone` immediately requests the next chunk while progress holds).
+///
+/// Runtime default; server-ng overrides the live ceiling per shard from
+/// `[cluster] repair_chunk_max` at bootstrap.
+pub const REPAIR_CHUNK_MAX: u64 = 128;
 
 /// One in-flight metadata journal-repair stream (shard 0 only).
 #[derive(Debug, Clone, Copy)]
@@ -824,6 +834,16 @@ where
     /// `ReconcileOp::InsertOwned` lands. Bounded per namespace; overflow
     /// drops the frame (at-least-once: client/primary retries recover).
     pending_partition_frames: RefCell<HashMap<IggyNamespace, Vec<Message<GenericHeader>>>>,
+
+    /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
+    /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
+    /// `[cluster] repair_chunk_max` at bootstrap.
+    repair_chunk_max: Cell<u64>,
+
+    /// Live stalled-repair retry threshold in consensus ticks. Defaults to
+    /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
+    /// `[cluster] repair_retry_interval` at bootstrap.
+    repair_retry_ticks: Cell<u32>,
 }
 
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -916,7 +936,23 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(HashMap::new()),
             metadata_repair: RefCell::new(None),
+            repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
+            repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
         })
+    }
+
+    /// Override the stalled-repair retry threshold (consensus ticks) from
+    /// configuration. Called once per shard at bootstrap; the simulator and
+    /// tests keep the compile-time [`partitions::REPAIR_RETRY_TICKS`] default.
+    pub fn set_repair_retry_ticks(&self, ticks: u32) {
+        self.repair_retry_ticks.set(ticks);
+    }
+
+    /// Override the per-round repair-serving chunk ceiling from configuration.
+    /// Called once per shard at bootstrap; the simulator and tests keep the
+    /// compile-time [`REPAIR_CHUNK_MAX`] default.
+    pub fn set_repair_chunk_max(&self, chunk: u64) {
+        self.repair_chunk_max.set(chunk);
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1123,6 +1159,8 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(HashMap::new()),
             metadata_repair: RefCell::new(None),
+            repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
+            repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
         }
     }
 
@@ -2036,6 +2074,9 @@ where
     {
         let header = *msg.header();
         let target = header.replica;
+        // Snapshot the config-overridable chunk ceiling once; both plane
+        // branches below serve the same per-round window.
+        let repair_chunk_max = self.repair_chunk_max.get();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
             && consensus.namespace() == header.namespace
@@ -2097,7 +2138,7 @@ where
                 )
                 .await;
             }
-            let chunk_end = to_op.min(from_op.saturating_add(REPAIR_CHUNK_MAX - 1));
+            let chunk_end = to_op.min(from_op.saturating_add(repair_chunk_max - 1));
             let mut served_through = from_op.saturating_sub(1);
             for op in from_op..=chunk_end {
                 #[allow(clippy::cast_possible_truncation)]
@@ -2157,7 +2198,7 @@ where
             .await;
             from_op = retained_from;
         }
-        let chunk_end = to_op.min(from_op.saturating_add(REPAIR_CHUNK_MAX - 1));
+        let chunk_end = to_op.min(from_op.saturating_add(repair_chunk_max - 1));
         let mut served_through = from_op.saturating_sub(1);
         for op in from_op..=chunk_end {
             let Some(entry) = partition.log.journal().inner.repair_entry(op) else {
@@ -2541,6 +2582,7 @@ where
             >,
     {
         let partitions = self.plane.partitions();
+        let repair_retry_ticks = self.repair_retry_ticks.get();
         // Fan out over every group (each partition's heartbeat/retransmit timer
         // must advance), so the keyed single-namespace lookup the control-frame
         // handlers use does not apply here. The namespaces are snapshotted into
@@ -2579,7 +2621,7 @@ where
                         return None;
                     }
                     session.idle_ticks += 1;
-                    if session.idle_ticks < partitions::REPAIR_RETRY_TICKS {
+                    if session.idle_ticks < repair_retry_ticks {
                         return None;
                     }
                     session.idle_ticks = 0;
@@ -2693,6 +2735,7 @@ where
 
         // Stall retry, mirroring `tick_partitions`: a lost repair frame must
         // not wedge the session forever.
+        let repair_retry_ticks = self.repair_retry_ticks.get();
         let stalled = {
             let mut session = self.metadata_repair.borrow_mut();
             session.as_mut().and_then(|session| {
@@ -2700,7 +2743,7 @@ where
                     return None;
                 }
                 session.idle_ticks += 1;
-                if session.idle_ticks < partitions::REPAIR_RETRY_TICKS {
+                if session.idle_ticks < repair_retry_ticks {
                     return None;
                 }
                 session.idle_ticks = 0;
