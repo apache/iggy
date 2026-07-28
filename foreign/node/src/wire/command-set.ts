@@ -213,26 +213,6 @@ const SESSION_CONTROL_CODES = new Set([
 
 const INVALID_COMMAND_ERROR_CODE = 3;
 
-/**
- * How a raw binary request executes on the server.
- *
- * Classic framing carries no operation field, while VSR framing uses this
- * declaration to route unknown extension codes.
- */
-export const BINARY_REQUEST_KIND = {
-  NonReplicated: 'non_replicated',
-  Replicated: 'replicated'
-} as const;
-
-/** PascalCase alias for enum-style call sites. */
-export const BinaryRequestKind = BINARY_REQUEST_KIND;
-
-export type BinaryRequestKind =
-  typeof BINARY_REQUEST_KIND[keyof typeof BINARY_REQUEST_KIND];
-
-const BINARY_REQUEST_KINDS: ReadonlySet<string> =
-  new Set(Object.values(BINARY_REQUEST_KIND));
-
 export abstract class AbstractAPI {
   clientProvider: ClientProvider;
 
@@ -264,24 +244,21 @@ export abstract class CommandAPI extends AbstractAPI {
    * Sends a command code with a payload and returns the raw response payload.
    * Session-control codes are rejected with an invalid-command error.
    *
-   * @param kind - How the command executes
    * @param code - Command code to send
    * @param payload - Raw command payload
    * @returns Raw response payload
    */
   async sendBinaryRequest(
-    kind: BinaryRequestKind,
     code: number,
     payload: Buffer
   ): Promise<Buffer> {
-    if (!BINARY_REQUEST_KINDS.has(kind) || SESSION_CONTROL_CODES.has(code))
+    if (SESSION_CONTROL_CODES.has(code))
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
     const requestPayload = Buffer.from(payload);
     const response = await (await this.clientProvider()).sendCommand(
       code,
-      requestPayload,
-      { rawKind: kind }
+      requestPayload
     );
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }

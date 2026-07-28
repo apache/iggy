@@ -36,11 +36,7 @@ Classic framing remains the default. Select VSR explicitly when connecting to
 an Iggy VSR server:
 
 ```typescript
-import {
-  BinaryRequestKind,
-  SimpleClient,
-  getRawClient,
-} from "apache-iggy";
+import { SimpleClient, getRawClient } from "apache-iggy";
 
 const config = {
   protocol: "vsr" as const,
@@ -50,15 +46,15 @@ const config = {
 };
 const client = new SimpleClient(getRawClient(config));
 const response = await client.sendBinaryRequest(
-  BinaryRequestKind.NonReplicated,
   60_000,
   Buffer.from("opaque mutation"),
 );
 ```
 
-VSR is a runtime protocol choice in Node.js, not a build feature. Custom
-non-replicated codes use `Operation::NonReplicated`; custom replicated codes
-are rejected until a server-side replicated extension registry exists.
+VSR is a runtime protocol choice in Node.js, not a build feature. Codes absent
+from the SDK command table use `Operation::NonReplicated` and carry the command
+code in the request header's reserved field. The server remains authoritative
+for classifying or rejecting extension commands.
 
 The same npm package supports both framing modes. VSR currently supports TCP
 only and restricts `Client` to one pooled connection because authentication,
@@ -77,37 +73,10 @@ new session. Transient not-committed responses retry the exact encoded request
 within one bounded deadline. A disconnected mutation is never replayed under a
 new session.
 
-`sendBinaryRequest` has one intentionally breaking signature:
-
-```typescript
-sendBinaryRequest(
-  kind: BinaryRequestKind,
-  code: number,
-  payload: Buffer,
-): Promise<Buffer>
-```
-
-Migrate calls from:
-
-```typescript
-await client.sendBinaryRequest(code, payload);
-```
-
-to:
-
-```typescript
-await client.sendBinaryRequest(
-  BinaryRequestKind.NonReplicated,
-  code,
-  payload,
-);
-```
-
-There is no compatibility overload or `sendBinaryRequestWithKind` method.
-Known command tables remain authoritative under VSR: a conflicting declaration
-is rejected, unknown non-replicated codes reach the server, and unknown
-replicated codes fail locally until the extension registry exists. The kind is
-not serialized by classic framing, so classic request bytes remain unchanged.
+`sendBinaryRequest(code, payload)` has the same signature under classic and
+VSR framing. Known replicated commands use their registered operation, while
+unknown codes reach the server as non-replicated requests. Classic request
+bytes remain unchanged.
 
 The client includes its npm package version and the binary protocol crate
 version in VSR registration. An incompatible server rejects registration with

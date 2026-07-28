@@ -17,9 +17,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { BINARY_REQUEST_KIND } from '../command-set.js';
 import { COMMAND_CODE } from '../command.code.js';
-import { ResponseError } from '../error.utils.js';
 import {
   isInternal,
   isKnownOperation,
@@ -62,13 +60,8 @@ const replicated = new Map<number, number>([
 
 describe('VSR operation classification', () => {
   it('matches every replicated command operation', () => {
-    for (const [code, operation] of replicated) {
+    for (const [code, operation] of replicated)
       assert.equal(operationForCode(code), operation);
-      assert.equal(
-        operationForCode(code, BINARY_REQUEST_KIND.Replicated),
-        operation
-      );
-    }
   });
 
   it('classifies every other known command as non-replicated', () => {
@@ -79,59 +72,13 @@ describe('VSR operation classification', () => {
     }
   });
 
-  it('keeps standard command tables authoritative', () => {
-    assert.throws(
-      () => operationForCode(
-        COMMAND_CODE.GetStats,
-        BINARY_REQUEST_KIND.Replicated
-      ),
-      (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 3
-    );
-    assert.throws(
-      () => operationForCode(
-        COMMAND_CODE.CreateStream,
-        BINARY_REQUEST_KIND.NonReplicated
-      ),
-      (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 3
-    );
-  });
-
-  it('forwards only unknown non-replicated extensions', () => {
-    assert.equal(
-      operationForCode(60_001, BINARY_REQUEST_KIND.NonReplicated),
-      Operation.NonReplicated
-    );
-    assert.throws(
-      () => operationForCode(60_001, BINARY_REQUEST_KIND.Replicated),
-      (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 5
-    );
-    assert.throws(
-      () => operationForCode(60_001),
-      (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 3
-    );
+  it('forwards unknown extension codes as non-replicated', () => {
+    assert.equal(operationForCode(60_001), Operation.NonReplicated);
+    assert.equal(operationForCode(1_000_104), Operation.NonReplicated);
   });
 
   it('routes logout through its consensus operation', () => {
     assert.equal(operationForCode(COMMAND_CODE.LogoutUser), Operation.Logout);
-    assert.equal(
-      operationForCode(
-        COMMAND_CODE.LogoutUser,
-        BINARY_REQUEST_KIND.Replicated
-      ),
-      Operation.Logout
-    );
-    assert.throws(
-      () => operationForCode(
-        COMMAND_CODE.LogoutUser,
-        BINARY_REQUEST_KIND.NonReplicated
-      ),
-      (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 3
-    );
   });
 
   it('pins operation class predicates', () => {

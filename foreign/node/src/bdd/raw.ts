@@ -17,7 +17,6 @@
 
 import assert from 'node:assert/strict';
 import { Then, When } from '@cucumber/cucumber';
-import { BINARY_REQUEST_KIND } from '../wire/command-set.js';
 import type { TestWorld } from './world.js';
 
 When(
@@ -25,7 +24,6 @@ When(
   async function (this: TestWorld, code: number) {
     try {
       this.rawResponse = await this.client.sendBinaryRequest(
-        BINARY_REQUEST_KIND.NonReplicated,
         code,
         Buffer.alloc(0)
       );

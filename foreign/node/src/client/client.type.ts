@@ -19,7 +19,6 @@
 import type { Readable } from 'stream';
 import { type TcpSocketConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
-import type { BinaryRequestKind } from '../wire/command-set.js';
 
 /**
  * TCP socket connection options.
@@ -49,9 +48,7 @@ export type SendCommandOptions = {
   /** Whether the response uses the standard command response decoder */
   handleResponse?: boolean,
   /** Whether to append rather than prepend the command to the queue */
-  last?: boolean,
-  /** Execution model supplied by the public raw-request API */
-  rawKind?: BinaryRequestKind
+  last?: boolean
 };
 
 /**

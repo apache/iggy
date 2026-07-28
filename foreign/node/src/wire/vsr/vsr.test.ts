@@ -18,7 +18,6 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { BINARY_REQUEST_KIND } from '../command-set.js';
 import { ResponseError } from '../error.utils.js';
 import { HEADER_SIZE, REQUEST_OFFSET } from './header.js';
 import { prepareVsrCommand, VsrSession } from './index.js';
@@ -29,27 +28,11 @@ describe('VSR custom request framing', () => {
   it('encodes a custom non-replicated code and opaque payload', () => {
     const session = new VsrSession();
     const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
-    const frame = session.encode(
-      60_000,
-      payload,
-      BINARY_REQUEST_KIND.NonReplicated
-    );
+    const frame = session.encode(60_000, payload);
 
     assert.equal(frame.readUInt8(REQUEST_OFFSET.operation), Operation.NonReplicated);
     assert.equal(frame.readUInt32LE(REQUEST_OFFSET.reserved), 60_000);
     assert.deepEqual(frame.subarray(256), payload);
-  });
-
-  it('rejects a custom replicated code without a server registry', () => {
-    const session = new VsrSession();
-    assert.throws(
-      () => session.encode(
-        60_000,
-        Buffer.alloc(0),
-        BINARY_REQUEST_KIND.Replicated
-      ),
-      /Feature is unavailable/
-    );
   });
 
   it('does not consume a request ID when local routing fails', () => {
@@ -95,8 +78,7 @@ describe('VSR custom request framing', () => {
     session.bind(42n);
     const custom = session.encode(
       60_001,
-      Buffer.alloc(0),
-      BINARY_REQUEST_KIND.NonReplicated
+      Buffer.alloc(0)
     );
     assert.equal(custom.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
 

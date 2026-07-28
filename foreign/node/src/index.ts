@@ -23,8 +23,6 @@ export {
   Partitioning,
   HeaderValue,
   HeaderKeyFactory,
-  BINARY_REQUEST_KIND,
-  BinaryRequestKind,
 } from "./wire/index.js";
 
 export * from "./client/index.js";

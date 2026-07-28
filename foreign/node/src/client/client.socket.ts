@@ -23,7 +23,6 @@ import type {
   PasswordCredentials, Protocol, RawClient, SendCommandOptions,
   TokenCredentials
 } from '../client/client.type.js';
-import type { BinaryRequestKind } from '../wire/command-set.js';
 import { handleResponse } from './client.utils.js';
 import { ResponseError, responseError } from '../wire/error.utils.js';
 import { debug } from './client.debug.js';
@@ -64,8 +63,6 @@ type Job = {
   payload: Buffer,
   /** Whether to parse the response */
   handleResponse: boolean,
-  /** Execution model declared by a raw request */
-  kind?: BinaryRequestKind,
   /** Promise resolve function */
   resolve: (v: CommandResponse | PromiseLike<CommandResponse>) => void,
   /** Promise reject function */
@@ -108,10 +105,10 @@ export class CommandResponseStream extends EventEmitter {
    */
   constructor(options: ClientConfig) {
     super();
-    const normalized = normalizeClientConfig(options);
-    this.options = normalized;
-    this.protocol = normalized.protocol;
-    this.connection = new IggyConnection(normalized);
+    const normalizedConfig = normalizeClientConfig(options);
+    this.options = normalizedConfig;
+    this.protocol = normalizedConfig.protocol;
+    this.connection = new IggyConnection(normalizedConfig);
     this.busy = false;
     this.isAuthenticated = false;
     this._execQueue = [];
@@ -146,7 +143,7 @@ export class CommandResponseStream extends EventEmitter {
    *
    * @param command - Command code to send
    * @param payload - Command payload buffer
-   * @param options - Response, queue, and raw-request options
+   * @param options - Response and queue options
    * @returns Promise resolving to the command response
    */
   async sendCommand(
@@ -158,8 +155,7 @@ export class CommandResponseStream extends EventEmitter {
     try {
       const {
         handleResponse = true,
-        last = true,
-        rawKind
+        last = true
       } = options;
 
       if (!this.connection.connected)
@@ -182,7 +178,6 @@ export class CommandResponseStream extends EventEmitter {
           command,
           payload,
           handleResponse,
-          kind: rawKind,
           resolve,
           reject
         };
@@ -210,9 +205,9 @@ export class CommandResponseStream extends EventEmitter {
     while (this._execQueue.length > 0 && this.connection.socket.writable) {
       const next = this._execQueue.shift();
       if (!next) break;
-      const { command, payload, handleResponse, kind, resolve, reject } = next;
+      const { command, payload, handleResponse, resolve, reject } = next;
       try {
-        resolve(await this._processNext(command, payload, handleResponse, kind));
+        resolve(await this._processNext(command, payload, handleResponse));
       } catch (err) {
         reject(err);
       }
@@ -241,12 +236,11 @@ export class CommandResponseStream extends EventEmitter {
   _processNext(
     command: number,
     payload: Buffer,
-    handleResp = true,
-    kind?: BinaryRequestKind
+    handleResp = true
   ): Promise<CommandResponse> {
     if (this.options.protocol !== 'vsr')
       return this._processClassic(command, payload, handleResp);
-    return this._processVsr(command, payload, handleResp, kind);
+    return this._processVsr(command, payload, handleResp);
   }
 
   private async _processClassic(
@@ -268,17 +262,12 @@ export class CommandResponseStream extends EventEmitter {
   private async _processVsr(
     command: number,
     payload: Buffer,
-    handleResp: boolean,
-    kind?: BinaryRequestKind
+    handleResp: boolean
   ): Promise<CommandResponse> {
     try {
       const prepared = prepareVsrCommand(command, payload);
       // A transient retry must preserve all request identity fields.
-      const frame = this.vsrSession.encode(
-        prepared.command,
-        prepared.payload,
-        kind
-      );
+      const frame = this.vsrSession.encode(prepared.command, prepared.payload);
       const deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS;
       let parsed: CommandResponse;
       while (true) {

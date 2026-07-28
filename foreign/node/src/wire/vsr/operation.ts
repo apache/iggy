@@ -23,8 +23,6 @@
  */
 
 import { COMMAND_CODE } from '../command.code.js';
-import { BINARY_REQUEST_KIND, type BinaryRequestKind } from '../command-set.js';
-import { responseError } from '../error.utils.js';
 
 /** `Operation` discriminants a client sends or receives. */
 export const Operation = {
@@ -70,15 +68,10 @@ const INTERNAL_START = 64;
 const METADATA_START = 128;
 const PARTITION_START = 160;
 
-/** `IggyError::InvalidCommand` numeric code. */
-export const ERROR_CODE_INVALID_COMMAND = 3;
-/** `IggyError::FeatureUnavailable` numeric code. */
-export const ERROR_CODE_FEATURE_UNAVAILABLE = 5;
-
 /**
  * Replicated command code to `Operation` mapping, the client half of the
- * dispatch table. Codes absent here are non-replicated when the classic
- * command set knows them, unknown otherwise.
+ * dispatch table. Codes absent here are sent as non-replicated so the server
+ * remains authoritative for extension commands unknown to this SDK build.
  */
 const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.CreateUser, Operation.CreateUser],
@@ -109,10 +102,6 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.JoinGroup, Operation.JoinConsumerGroup],
   [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup]
 ]);
-
-/** Classic command codes known to the SDK. */
-const KNOWN_COMMAND_CODES: ReadonlySet<number> =
-  new Set(Object.values(COMMAND_CODE));
 
 const KNOWN_OPERATIONS: ReadonlySet<number> =
   new Set(Object.values(Operation));
@@ -155,52 +144,15 @@ export const isResultFramed = (operation: number): boolean =>
   operation === Operation.DeleteConsumerOffset2;
 
 /**
- * Picks the header operation for a command code, honoring the caller's
- * declaration only where the protocol tables have nothing to say. Standard
- * codes resolve first so a caller cannot redirect a shipped command into the
- * other execution model. Port of `operation_for_code` in
- * `core/sdk/src/vsr.rs`, extended with the raw declaration rules for
- * unknown extension codes.
- *
- * @throws Error with the invalid-command code for a conflicting declaration
- *   or an undeclared unknown code, and feature-unavailable for an unknown
- *   code declared replicated.
+ * Picks the header operation for a command code. Unknown extension codes are
+ * sent as non-replicated with their command code in the reserved header field,
+ * allowing the server to classify or reject them.
  */
-export const operationForCode = (
-  code: number,
-  kind?: BinaryRequestKind
-): number => {
+export const operationForCode = (code: number): number => {
   // The dispatch table files logout as non-replicated, but VSR routes it
   // through its own consensus operation; the raw API blocks code 39 before
   // classification, so only the typed logout path reaches this branch.
   if (code === COMMAND_CODE.LogoutUser)
-    return acceptDeclaration(code, Operation.Logout, kind);
-
-  const replicated = REPLICATED_OPERATION.get(code);
-  if (replicated !== undefined)
-    return acceptDeclaration(code, replicated, kind);
-
-  if (KNOWN_COMMAND_CODES.has(code))
-    return acceptDeclaration(code, Operation.NonReplicated, kind);
-
-  if (kind === BINARY_REQUEST_KIND.NonReplicated)
-    return Operation.NonReplicated;
-  if (kind === BINARY_REQUEST_KIND.Replicated)
-    // A replicated extension needs a server-side handler registry that does
-    // not exist yet; failing closed beats a half-supported frame.
-    throw responseError(code, ERROR_CODE_FEATURE_UNAVAILABLE);
-  throw responseError(code, ERROR_CODE_INVALID_COMMAND);
-};
-
-const acceptDeclaration = (
-  code: number,
-  operation: number,
-  kind?: BinaryRequestKind
-): number => {
-  if (kind === undefined) return operation;
-  const standard = operation === Operation.NonReplicated ?
-    BINARY_REQUEST_KIND.NonReplicated :
-    BINARY_REQUEST_KIND.Replicated;
-  if (kind === standard) return operation;
-  throw responseError(code, ERROR_CODE_INVALID_COMMAND);
+    return Operation.Logout;
+  return REPLICATED_OPERATION.get(code) ?? Operation.NonReplicated;
 };

@@ -18,7 +18,6 @@
 
 import { createRequire } from 'node:module';
 import type { CommandResponse } from '../../client/client.type.js';
-import type { BinaryRequestKind } from '../command-set.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
 import { HEADER_SIZE, encodeRequestHeader } from './header.js';
@@ -59,10 +58,10 @@ export class VsrSession {
     this.state.bind(session);
   }
 
-  encode(command: number, payload: Buffer, kind?: BinaryRequestKind): Buffer {
+  encode(command: number, payload: Buffer): Buffer {
     const operation = registerCommand(command)
       ? Operation.Register
-      : operationForCode(command, kind);
+      : operationForCode(command);
     const namespace = namespaceForRequest(command, payload, operation);
     const size = HEADER_SIZE + payload.length;
     if (!Number.isSafeInteger(size) || size > MAX_U32)

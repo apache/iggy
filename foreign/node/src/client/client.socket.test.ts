@@ -22,7 +22,6 @@ import type { AddressInfo, Socket } from 'node:net';
 import { createServer, type Server } from 'node:net';
 import { describe, it } from 'node:test';
 import { COMMAND_CODE } from '../wire/command.code.js';
-import { BINARY_REQUEST_KIND } from '../wire/command-set.js';
 import { ResponseError } from '../wire/error.utils.js';
 import {
   Command2,
@@ -194,8 +193,7 @@ describe('VSR client socket', () => {
     try {
       const response = await client.sendCommand(
         60_001,
-        Buffer.from('opaque'),
-        { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+        Buffer.from('opaque')
       );
       assert.equal(response.status, 0);
 
@@ -242,8 +240,7 @@ describe('VSR client socket', () => {
     try {
       const response = await client.sendCommand(
         60_002,
-        Buffer.from('retry-me'),
-        { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+        Buffer.from('retry-me')
       );
       assert.equal(attempts, 2);
       assert.deepEqual(response.data, Buffer.from('done'));
@@ -273,8 +270,7 @@ describe('VSR client socket', () => {
       await assert.rejects(
         () => client.sendCommand(
           60_003,
-          Buffer.alloc(0),
-          { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+          Buffer.alloc(0)
         ),
         (error: unknown) =>
           error instanceof ResponseError && error.errorCode === 40
@@ -300,8 +296,7 @@ describe('VSR client socket', () => {
       await assert.rejects(
         () => client.sendCommand(
           60_004,
-          Buffer.alloc(0),
-          { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+          Buffer.alloc(0)
         )
       );
       assert.equal(client.isAuthenticated, false);
@@ -334,8 +329,7 @@ describe('VSR client socket', () => {
     try {
       const response = await client.sendCommand(
         60_005,
-        Buffer.alloc(0),
-        { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+        Buffer.alloc(0)
       );
       assert.equal(response.status, 0);
       const followerOperations = follower.frames.map(
@@ -369,15 +363,13 @@ describe('VSR client socket', () => {
       await assert.rejects(
         () => client.sendCommand(
           60_006,
-          Buffer.alloc(0),
-          { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+          Buffer.alloc(0)
         )
       );
       await assert.rejects(
         () => client.sendCommand(
           60_006,
-          Buffer.alloc(0),
-          { rawKind: BINARY_REQUEST_KIND.NonReplicated }
+          Buffer.alloc(0)
         )
       );
     } finally {
