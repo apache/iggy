@@ -1,0 +1,165 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The durable VSR state: the consensus numbers a replica must recover from its
+//! own disk after a crash, rather than infer from the WAL or relearn from a
+//! peer.
+//!
+//! The payload `journal::superblock` persists. Consensus owns its meaning and
+//! byte layout; the superblock adds framing, versioning, and integrity.
+//!
+//! Fixed little-endian, so it is byte-identical across replicas and stable
+//! across restarts. Field order is load-bearing: reorders and width changes are
+//! breaking and must ride a superblock version bump.
+
+use std::fmt;
+
+/// Number of bytes [`VsrState::to_bytes`] produces and [`VsrState::try_from`]
+/// expects: `cluster`(16) + `replica_id`(1) + `replica_count`(1) + `view`(4)
+/// + `log_view`(4) + `commit_max`(8) + `checkpoint_op`(8)
+/// + `checkpoint_checksum`(16).
+pub const ENCODED_LEN: usize = 58;
+
+/// The durable consensus state of one replica for one consensus group.
+///
+/// A view a replica acted in must survive a crash, or it can re-participate in
+/// an old view and split the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsrState {
+    /// Cluster this superblock belongs to. Recovery rejects a mismatch (a copied
+    /// or misplaced data directory).
+    pub cluster: u128,
+    /// Replica index this superblock belongs to. Recovery rejects a mismatch.
+    pub replica_id: u8,
+    /// Cluster size at write time.
+    pub replica_count: u8,
+    /// Current view.
+    pub view: u32,
+    /// Latest view in which this replica changed its head (adopted a `StartView`
+    /// as a backup, or completed a DVC quorum as primary). `log_view <= view`.
+    pub log_view: u32,
+    /// Highest op known committed by the cluster at write time.
+    pub commit_max: u64,
+    /// Op of the paired checkpoint (the metadata snapshot's sequence number).
+    pub checkpoint_op: u64,
+    /// Integrity tag of the paired checkpoint, detecting a torn
+    /// snapshot/superblock pairing across a crash.
+    pub checkpoint_checksum: u128,
+}
+
+impl VsrState {
+    /// Encode to the fixed little-endian on-disk layout.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; ENCODED_LEN] {
+        let mut out = [0u8; ENCODED_LEN];
+        out[0..16].copy_from_slice(&self.cluster.to_le_bytes());
+        out[16] = self.replica_id;
+        out[17] = self.replica_count;
+        out[18..22].copy_from_slice(&self.view.to_le_bytes());
+        out[22..26].copy_from_slice(&self.log_view.to_le_bytes());
+        out[26..34].copy_from_slice(&self.commit_max.to_le_bytes());
+        out[34..42].copy_from_slice(&self.checkpoint_op.to_le_bytes());
+        out[42..58].copy_from_slice(&self.checkpoint_checksum.to_le_bytes());
+        out
+    }
+}
+
+impl TryFrom<&[u8]> for VsrState {
+    type Error = VsrStateError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        // One length check up front puts every field slice below in bounds by
+        // construction, so the `try_into`s cannot fail.
+        let bytes: &[u8; ENCODED_LEN] =
+            bytes.try_into().map_err(|_| VsrStateError::WrongLength {
+                expected: ENCODED_LEN,
+                actual: bytes.len(),
+            })?;
+        Ok(Self {
+            cluster: u128::from_le_bytes(field(bytes, 0)),
+            replica_id: bytes[16],
+            replica_count: bytes[17],
+            view: u32::from_le_bytes(field(bytes, 18)),
+            log_view: u32::from_le_bytes(field(bytes, 22)),
+            commit_max: u64::from_le_bytes(field(bytes, 26)),
+            checkpoint_op: u64::from_le_bytes(field(bytes, 34)),
+            checkpoint_checksum: u128::from_le_bytes(field(bytes, 42)),
+        })
+    }
+}
+
+/// Copy a fixed-width field out of the length-validated record. Always in bounds
+/// for a `[u8; ENCODED_LEN]`, so the slice conversion is infallible.
+fn field<const N: usize>(bytes: &[u8; ENCODED_LEN], start: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[start..start + N]);
+    out
+}
+
+/// Failure decoding a [`VsrState`] from bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsrStateError {
+    /// The byte slice was not exactly [`ENCODED_LEN`] long.
+    WrongLength { expected: usize, actual: usize },
+}
+
+impl fmt::Display for VsrStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongLength { expected, actual } => {
+                write!(f, "VsrState needs {expected} bytes, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VsrStateError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_distinct_fields_when_to_bytes_should_pin_offsets_and_round_trip() {
+        // Guards the on-disk layout: a reorder or width change trips this, forcing a
+        // deliberate superblock version bump. Distinct per-field values make a swap
+        // between two same-width fields observable.
+        let state = VsrState {
+            cluster: 1,
+            replica_id: 2,
+            replica_count: 5,
+            view: 3,
+            log_view: 4,
+            commit_max: 6,
+            checkpoint_op: 7,
+            checkpoint_checksum: 8,
+        };
+        let bytes = state.to_bytes();
+        assert_eq!(bytes.len(), ENCODED_LEN);
+        assert_eq!(bytes[0], 1, "cluster low byte");
+        assert_eq!(bytes[16], 2, "replica_id");
+        assert_eq!(bytes[17], 5, "replica_count");
+        assert_eq!(bytes[18], 3, "view low byte");
+        assert_eq!(bytes[22], 4, "log_view low byte");
+        assert_eq!(bytes[26], 6, "commit_max low byte");
+        assert_eq!(bytes[34], 7, "checkpoint_op low byte");
+        assert_eq!(bytes[42], 8, "checkpoint_checksum low byte");
+
+        assert_eq!(VsrState::try_from(&bytes[..]).unwrap(), state);
+        assert!(VsrState::try_from(&bytes[..ENCODED_LEN - 1]).is_err());
+    }
+}

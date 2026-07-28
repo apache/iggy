@@ -20,8 +20,9 @@ use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
     PlaneKind, PrepareLogEvent, Project, ReplicaLogContext, SimEventKind, StoredDvc,
-    ViewChangeLogEvent, ViewChangeReason, dvc_count, dvc_max_commit, dvc_quorum_array_empty,
-    dvc_record, dvc_reset, dvc_select_winner, emit_replica_event, emit_sim_event,
+    ViewChangeLogEvent, ViewChangeReason, VsrState, dvc_count, dvc_max_commit,
+    dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner, emit_replica_event,
+    emit_sim_event,
 };
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
@@ -30,6 +31,7 @@ use iggy_binary_protocol::{
     ReplyHeader, RequestHeader, RequestStartViewHeader, StartViewChangeHeader, StartViewHeader,
 };
 use iggy_common::IggyTimestamp;
+use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
@@ -696,10 +698,15 @@ pub enum VsrAction {
     /// out of the probed-primary election path.
     SendRequestStartView { view: u32, namespace: u64 },
     /// Send `StartView` to all backups (as new primary).
+    ///
+    /// `incarnation` echoes the requester's nonce when this answers a
+    /// `RequestStartView` probe (freshness proof), and is `0` on an unsolicited
+    /// send at view-change completion (carries no freshness claim).
     SendStartView {
         view: u32,
         op: u64,
         commit: u64,
+        incarnation: u128,
         namespace: u64,
     },
     /// Send `PrepareOK` for each op in `[from_op, to_op]` that is present in the WAL.
@@ -788,6 +795,21 @@ where
     // * `replica.log_view ≥ replica.log_view_durable`
     // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
+    /// The `view` last made durable in the superblock. `view_durable <= view`; a
+    /// view-scoped message must not leave until they are equal, or a crash could
+    /// recover an older view than one this replica already acted in (split brain).
+    /// Advanced by [`Self::mark_superblock_durable`].
+    view_durable: Cell<u32>,
+    /// The `log_view` last made durable in the superblock. Realizes the
+    /// long-standing invariant `log_view >= log_view_durable`.
+    log_view_durable: Cell<u32>,
+    /// Per-boot incarnation nonce, stamped on outbound `RequestStartView` probes
+    /// and echoed in the answering `StartView`, so a recovering replica ignores a
+    /// `StartView` from a previous incarnation still in flight (see the
+    /// [`Self::handle_start_view`] recovering-status guard). `0` means unset
+    /// (partition plane, tests), leaving the guard inert. Set by
+    /// [`Self::set_incarnation`] at boot, before `init`.
+    incarnation: Cell<u128>,
     /// Commit point the recovered WAL suffix must re-reach before admitting
     /// client requests as primary (`0` = no recovered suffix pending).
     recovery_barrier: Cell<u64>,
@@ -925,6 +947,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             namespace,
             view: Cell::new(0),
             log_view: Cell::new(0),
+            view_durable: Cell::new(0),
+            log_view_durable: Cell::new(0),
+            incarnation: Cell::new(0),
             recovery_barrier: Cell::new(0),
             recovery_deadline: Cell::new(Duration::ZERO),
             ceded_primaryship: Cell::new(false),
@@ -1046,6 +1071,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn has_ceded_primaryship(&self) -> bool {
         self.ceded_primaryship.get()
+    }
+
+    /// Set the per-boot incarnation nonce, at boot before `init`. Production
+    /// supplies a random `u128`; the deterministic simulator supplies a
+    /// seed-derived value bumped per restart. See the `incarnation` field.
+    pub fn set_incarnation(&self, incarnation: u128) {
+        self.incarnation.set(incarnation);
+    }
+
+    /// This replica's per-boot incarnation nonce (`0` when unset). Stamped on
+    /// outbound `RequestStartView` probes by the shard.
+    #[must_use]
+    pub const fn incarnation(&self) -> u128 {
+        self.incarnation.get()
     }
 
     #[must_use]
@@ -1405,6 +1444,58 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn set_log_view(&self, log_view: u32) {
         self.log_view.set(log_view);
+    }
+
+    /// Snapshot the durable VSR state for the superblock. `view`, `log_view`,
+    /// `commit_max`, and the replica identity come from consensus; the caller
+    /// supplies the paired checkpoint, which consensus does not own.
+    #[must_use]
+    pub const fn vsr_state(&self, checkpoint_op: u64, checkpoint_checksum: u128) -> VsrState {
+        VsrState {
+            cluster: self.cluster,
+            replica_id: self.replica,
+            replica_count: self.replica_count,
+            view: self.view.get(),
+            log_view: self.log_view.get(),
+            commit_max: self.commit_max.get(),
+            checkpoint_op,
+            checkpoint_checksum,
+        }
+    }
+
+    /// True when the current `(view, log_view)` is not yet in the superblock, so a
+    /// view-scoped send would advertise a view a crash could lose. The split-brain
+    /// gate: the dispatcher persists first when this holds. `commit_max` is
+    /// excluded deliberately, since it advances on every commit and rides the
+    /// checkpoint write rather than each view change.
+    #[must_use]
+    pub const fn needs_superblock_persist(&self) -> bool {
+        self.view.get() != self.view_durable.get()
+            || self.log_view.get() != self.log_view_durable.get()
+    }
+
+    /// Record that the superblock now durably holds `(view, log_view)`: the exact
+    /// values written, NOT a re-read of the current in-memory view.
+    ///
+    /// The caller passes what it wrote because the in-memory view can advance
+    /// across the write's `.await`, when a concurrent checkpoint holds the
+    /// durability lock while the pump adopts a newer view via `handle_start_view`.
+    /// Re-reading `self.view` here would mark that newer, unwritten view durable,
+    /// and [`Self::needs_superblock_persist`] would wrongly report it safe to
+    /// send: the split-brain footgun this signature removes.
+    ///
+    /// Called after a successful write with the state written, and on boot with
+    /// the recovered `(view, log_view)`, durable by definition.
+    pub fn mark_superblock_durable(&self, view: u32, log_view: u32) {
+        debug_assert!(
+            view <= self.view.get() && log_view <= self.log_view.get(),
+            "durable (view={view}, log_view={log_view}) cannot exceed in-memory \
+             (view={}, log_view={})",
+            self.view.get(),
+            self.log_view.get(),
+        );
+        self.view_durable.set(view);
+        self.log_view_durable.set(log_view);
     }
 
     #[must_use]
@@ -2216,10 +2307,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if self.log_view.get() != self.view.get() {
             return Vec::new();
         }
+        // Echo the requester's incarnation so it can prove this StartView
+        // post-dates its restart (a probe reply, not a stale in-flight message).
         vec![VsrAction::SendStartView {
             view: self.view.get(),
             op: self.sequencer.current_sequence(),
             commit: self.commit_max.get(),
+            incarnation: header.incarnation,
             namespace: self.namespace,
         }]
     }
@@ -2281,6 +2375,31 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Ignore old views
         if msg_view < self.view.get() {
+            return Vec::new();
+        }
+
+        // Incarnation guard. While Recovering (probing after a restart), only adopt
+        // a StartView that is provably post-restart: a strictly newer view, a head
+        // at or past ours, or one echoing our current incarnation (a reply to our
+        // own probe). Otherwise it may be addressed to a previous incarnation still
+        // in flight, and adopting it could install a stale head and let this replica
+        // act in a view it will not remember after another crash. Inert when no
+        // incarnation is set (partition plane, tests).
+        let self_incarnation = self.incarnation.get();
+        if self.status.get() == Status::Recovering
+            && self_incarnation != 0
+            && msg_view <= self.view.get()
+            && msg_op < self.sequencer.current_sequence()
+            && header.incarnation != self_incarnation
+        {
+            tracing::debug!(
+                replica = self.replica,
+                view = msg_view,
+                op = msg_op,
+                incarnation = header.incarnation,
+                self_incarnation,
+                "ignoring StartView while recovering: stale incarnation"
+            );
             return Vec::new();
         }
 
@@ -2504,10 +2623,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         emit_replica_event(SimEventKind::PrimaryElected, &state);
         emit_replica_event(SimEventKind::ReplicaStateChanged, &state);
 
+        // Unsolicited StartView at view-change completion: no probe to answer,
+        // so it carries no incarnation (freshness comes from the newer view).
         let action = VsrAction::SendStartView {
             view: self.view.get(),
             op: new_op,
             commit: max_commit,
+            incarnation: 0,
             namespace: self.namespace,
         };
         emit_sim_event(
@@ -2704,6 +2826,18 @@ where
         // `VsrConsensus::next_monotonic_timestamp`.
         let timestamp = consensus.next_monotonic_timestamp();
 
+        // Seal the body integrity field over the payload past the 256-byte header
+        // (the client request bytes, carried through the transmute unchanged).
+        // Computed once by the primary and replicated verbatim, so every backup
+        // stores the same value and the scan verifies it after a crash. The body is
+        // never re-stamped (`restamp_prepare_view` patches only `view`), so this
+        // survives view-change retransmits. The header `checksum` and its `parent`
+        // chain stay `0`: activating them needs the retransmit path to re-seal a
+        // re-stamped header, a separate change.
+        let checksum_body = u128::from(calculate_checksum(
+            &self.as_slice()[size_of::<PrepareHeader>()..],
+        ));
+
         self.transmute_header(|old, new| {
             *new = PrepareHeader {
                 cluster: consensus.cluster,
@@ -2721,6 +2855,7 @@ where
                 timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
+                checksum_body,
                 // Copied verbatim: carries the stamped acting user for client
                 // ops (and the authenticated user on Register), so the in-apply
                 // RBAC gate resolves the same identity on every backup.
@@ -3172,5 +3307,132 @@ mod timestamp_clamp_tests {
             100_000,
             "a clock ahead of the log must stamp real time, not floor + 1"
         );
+    }
+
+    #[test]
+    fn given_recovering_replica_when_start_view_incarnation_foreign_should_ignore() {
+        // A StartView addressed to a PREVIOUS incarnation, still in flight when the
+        // replica crashed, must be ignored after restart, while the reply echoing
+        // the CURRENT incarnation is adopted. Otherwise the replica could act in a
+        // view it will not remember after another crash.
+        #[allow(clippy::cast_possible_truncation)]
+        fn make_start_view(
+            view: u32,
+            op: u64,
+            replica: u8,
+            incarnation: u128,
+        ) -> Message<StartViewHeader> {
+            let size = std::mem::size_of::<StartViewHeader>();
+            let mut msg = Message::<StartViewHeader>::new(size);
+            let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
+                &mut msg.as_mut_slice()[..size],
+            )
+            .expect("zeroed bytes are a valid StartViewHeader");
+            header.command = Command2::StartView;
+            header.cluster = 1;
+            header.view = view;
+            header.op = op;
+            header.commit = op;
+            header.replica = replica;
+            header.incarnation = incarnation;
+            header.namespace = METADATA_CONSENSUS_NAMESPACE;
+            header.size = size as u32;
+            msg
+        }
+
+        const CURRENT: u128 = 0xB;
+        const STALE: u128 = 0xA;
+
+        // Replica 0 of 3, recovered at view 1 with head op 5, still Recovering
+        // (probing). The primary for view 1 is replica 1 (view % replica_count),
+        // and log_view stays 0 so the equal-view-old-op skip does not fire.
+        let mut consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.set_incarnation(CURRENT);
+        consensus.set_view(1);
+        consensus.sequencer().set_sequence(5);
+        assert_eq!(consensus.status(), Status::Recovering);
+
+        // Same view, head behind ours, foreign incarnation: ignored.
+        let stale = make_start_view(1, 4, 1, STALE);
+        assert!(
+            consensus
+                .handle_start_view(PlaneKind::Metadata, stale.header())
+                .is_empty(),
+            "a StartView echoing a previous incarnation must be ignored while recovering"
+        );
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "an ignored StartView must not transition status"
+        );
+        assert_eq!(
+            consensus.view(),
+            1,
+            "an ignored StartView must not change the view"
+        );
+
+        // Same view and head but echoing our current incarnation: adopted, since
+        // the match proves the reply post-dates our restart.
+        let fresh = make_start_view(1, 4, 1, CURRENT);
+        assert!(
+            !consensus
+                .handle_start_view(PlaneKind::Metadata, fresh.header())
+                .is_empty(),
+            "a StartView echoing our current incarnation must be adopted"
+        );
+        assert_eq!(
+            consensus.status(),
+            Status::Normal,
+            "adopting a StartView transitions to Normal"
+        );
+    }
+
+    /// The split-brain gate's predicate: `view` and `log_view` each independently
+    /// make the superblock stale, and only a matching `mark_superblock_durable`
+    /// clears it. The simulator proves the withheld-send behavior end to end; this
+    /// pins the predicate the dispatch sites and the debug tripwire both read.
+    #[test]
+    fn given_view_change_when_needs_superblock_persist_should_track_durability() {
+        let mut consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        assert!(
+            !consensus.needs_superblock_persist(),
+            "fresh replica: view == view_durable == 0"
+        );
+
+        consensus.set_view(3);
+        assert!(
+            consensus.needs_superblock_persist(),
+            "view advanced but not yet persisted"
+        );
+
+        consensus.mark_superblock_durable(consensus.view(), consensus.log_view());
+        assert!(
+            !consensus.needs_superblock_persist(),
+            "marked durable clears the gate"
+        );
+
+        consensus.set_log_view(3);
+        assert!(
+            consensus.needs_superblock_persist(),
+            "log_view advanced but not yet persisted"
+        );
+
+        consensus.mark_superblock_durable(consensus.view(), consensus.log_view());
+        assert!(!consensus.needs_superblock_persist());
     }
 }

@@ -103,6 +103,16 @@ impl From<std::io::Error> for SnapshotError {
 
 /// The snapshot container for all metadata state machines.
 /// Each field corresponds to one state machine's serialized state.
+///
+/// Serialized-form invariant: every collection here and in the nested `*Snapshot`
+/// types must keep a deterministic order (`Vec` or `BTreeMap`, never an unordered
+/// `HashMap`/`HashSet`/`AHashMap`). Recovery trusts a checkpoint by recomputing
+/// `hash(encode(decode(disk)))` and comparing it to the persist-time
+/// `hash(encode(state))` (`recovery::verify_checkpoint_pairing`). An unordered
+/// collection reorders when decoded and re-encoded, so the checksums diverge and a
+/// healthy node refuses boot after a restart. Regression guards:
+/// `stream::tests::populated_streams_snapshot_reencode_is_byte_stable` and
+/// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
     /// Snapshot format version for forward/backward compatibility.
@@ -117,6 +127,12 @@ pub struct MetadataSnapshot {
     /// Streams state machine snapshot data (consumer groups are nested inside
     /// each topic).
     pub streams: Option<StreamsSnapshot>,
+    /// Client-table state (sessions + at-most-once dedup replies) at the checkpoint
+    /// op. Not a state machine, but folded in so a restart that drained the WAL
+    /// prefix still recovers pre-checkpoint sessions. `#[serde(default)]` so a
+    /// snapshot predating this field decodes as `None`.
+    #[serde(default)]
+    pub client_table: Option<consensus::ClientTableSnapshot>,
 }
 
 impl Default for MetadataSnapshot {
@@ -140,6 +156,7 @@ impl MetadataSnapshot {
             sequence_number,
             users: None,
             streams: None,
+            client_table: None,
         }
     }
 
@@ -317,6 +334,7 @@ mod tests {
         assert_eq!(decoded.sequence_number, 42);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
+        assert!(decoded.client_table.is_none());
     }
 
     #[test]

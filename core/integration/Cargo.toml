@@ -31,7 +31,7 @@ ignored = ["cfg_aliases"]
 ci-qemu = []
 default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
-vsr = ["iggy/vsr"]
+vsr = ["dep:consensus", "dep:journal", "iggy/vsr"]
 
 [dependencies]
 assert_cmd = { workspace = true }
@@ -43,6 +43,9 @@ bytes = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
+# vsr-only: decode a metadata replica's durable `VsrState` off disk in the
+# superblock recovery test.
+consensus = { workspace = true, optional = true }
 ctor = { workspace = true }
 deltalake = { workspace = true }
 dtor = { workspace = true }
@@ -58,6 +61,9 @@ iggy_common = { workspace = true }
 # `build_label` function — keeping the test and production label format in lock-step.
 iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
+# vsr-only: locate and decode the on-disk superblock slot files in the recovery
+# test (`SLOT_FILE_NAMES`, `decode_latest_payload`).
+journal = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
 lazy_static = { workspace = true }

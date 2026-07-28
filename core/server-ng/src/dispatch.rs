@@ -3030,6 +3030,7 @@ mod tests {
             Some(consensus),
             Some(journal),
             None,
+            None,
             TestMux::default(),
             None,
         );

@@ -54,7 +54,9 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
-use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+use server_common::sharding::{
+    IggyNamespace, METADATA_CONSENSUS_NAMESPACE, PartitionLocation, ShardId,
+};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
@@ -1924,7 +1926,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             return;
         }
 
@@ -1967,7 +1971,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             if actions
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
@@ -2023,7 +2029,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             // `dispatch_vsr_actions` deliberately no-ops `CommitJournal` (it
             // needs the plane); without this the ops a StartView marks
             // committed stay journaled-but-unapplied forever, because the
@@ -2152,7 +2160,13 @@ where
             match consensus.handle_commit(&header) {
                 CommitOutcome::Advanced => planes.0.commit_journal().await,
                 CommitOutcome::RespondStartView => {
-                    respond_start_view::<B, _, MJ>(consensus).await;
+                    // Durable-before-send: the StartView advertises this replica's
+                    // current view, so persist before answering, as the view-change
+                    // dispatch gate does. Withhold on failure; the stale peer keeps
+                    // heartbeating, so it re-triggers once the tick persists.
+                    if planes.0.persist_superblock_if_needed(consensus).await {
+                        respond_start_view::<B, _, MJ>(consensus).await;
+                    }
                 }
                 CommitOutcome::Accepted => {}
             }
@@ -2173,6 +2187,9 @@ where
         match consensus.handle_commit(&header) {
             CommitOutcome::Advanced => partition.commit_journal(config).await,
             CommitOutcome::RespondStartView => {
+                // Partition consensus is not superblock-durable yet, so there is no
+                // view to persist before answering here; the metadata arm above
+                // gates its StartView on the durable view.
                 respond_start_view::<B, _, MJ>(consensus).await;
             }
             CommitOutcome::Accepted => {}
@@ -2200,7 +2217,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             return;
         }
         let Some(partition) = planes
@@ -2874,7 +2893,9 @@ where
 
         let actions = consensus.tick(PlaneKind::Metadata);
 
-        dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+        if metadata.persist_superblock_if_needed(consensus).await {
+            dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+        }
 
         // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
         // no-op, so the timer-driven retransmit above cannot recover the
@@ -2954,10 +2975,13 @@ where
         namespace = consensus.namespace(),
         "answering stale-view heartbeat with StartView"
     );
+    // Unsolicited, answering a stale-view heartbeat rather than a probe, so there is
+    // no incarnation to echo; freshness comes from the receiver's view checks.
     let action = VsrAction::SendStartView {
         view: consensus.view(),
         op: consensus.sequencer().current_sequence(),
         commit: consensus.commit_max(),
+        incarnation: 0,
         namespace: consensus.namespace(),
     };
     dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
@@ -3024,6 +3048,34 @@ async fn dispatch_vsr_actions<B, P, J>(
         }
     };
 
+    // Centralized durable-before-send tripwire: a view-scoped message must never
+    // advertise a (view, log_view) the superblock has not recorded, or a crash could
+    // recover an older view than one a peer already saw, splitting the brain or
+    // losing a commit. Every metadata caller persists first (the view-change dispatch
+    // sites and the on_replicate / on_commit send gates), so this asserts they did
+    // rather than letting a future bypass through silently. Metadata plane only:
+    // partition consensus has no superblock, so its `needs_superblock_persist` is
+    // always dirty and it is exempt. `RequestStartView` is exempt too, being a probe
+    // that asks to LEARN the view rather than advertise it.
+    #[cfg(debug_assertions)]
+    if consensus.namespace() == METADATA_CONSENSUS_NAMESPACE {
+        for action in actions {
+            let advertises_view = matches!(
+                action,
+                VsrAction::SendStartViewChange { .. }
+                    | VsrAction::SendDoViewChange { .. }
+                    | VsrAction::SendStartView { .. }
+                    | VsrAction::SendPrepareOk { .. }
+            );
+            debug_assert!(
+                !advertises_view || !consensus.needs_superblock_persist(),
+                "durable-before-send violated: dispatching a view-scoped metadata action \
+                 while the superblock is behind the in-memory view {}",
+                consensus.view(),
+            );
+        }
+    }
+
     for action in actions {
         match action {
             VsrAction::SendStartViewChange { view, namespace } => {
@@ -3061,6 +3113,9 @@ async fn dispatch_vsr_actions<B, P, J>(
                 send(*target, msg.into_generic().into_frozen()).await;
             }
             VsrAction::SendRequestStartView { view, namespace } => {
+                // Stamp this replica's incarnation so the answering StartView can
+                // echo it, proving to us the reply post-dates our restart.
+                let incarnation = consensus.incarnation();
                 let msg =
                     Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
                         .transmute_header(|_, h: &mut RequestStartViewHeader| {
@@ -3068,6 +3123,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.view = *view;
+                            h.incarnation = incarnation;
                             h.namespace = *namespace;
                             h.size = size_of::<RequestStartViewHeader>() as u32;
                         });
@@ -3077,6 +3133,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 view,
                 op,
                 commit,
+                incarnation,
                 namespace,
             } => {
                 let msg = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
@@ -3087,6 +3144,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                         h.view = *view;
                         h.op = *op;
                         h.commit = *commit;
+                        h.incarnation = *incarnation;
                         h.namespace = *namespace;
                         h.size = size_of::<StartViewHeader>() as u32;
                     });

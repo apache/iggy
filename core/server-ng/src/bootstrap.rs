@@ -40,6 +40,7 @@ use consensus::{
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
+use consensus::VsrState;
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::defaults::{
@@ -48,6 +49,7 @@ use iggy_common::defaults::{
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
+use journal::superblock::DynSuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
@@ -935,6 +937,9 @@ async fn shard_main(
                     recovered.last_applied_op,
                     recovered.last_journaled_op,
                     recovered.client_table,
+                    recovered.superblock,
+                    recovered.recovered_state,
+                    recovered.snapshot_checkpoint,
                 )),
             )
         }
@@ -953,42 +958,71 @@ async fn shard_main(
     // Metadata consensus + journal + snapshot live only on shard 0.
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
     // so peer shards have no caller that reads `journal` or `snapshot`.
-    let (metadata_consensus, journal_for_metadata, snapshot_for_metadata, recovered_client_table) =
-        if let Some((journal, snapshot, last_applied_op, last_journaled_op, client_table)) =
-            owner_state
-        {
-            let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-            let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
-            let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
-            let consensus = restore_metadata_consensus(
-                &journal,
-                restored_op,
-                commit_watermark,
-                topology.cluster_id,
-                topology.self_replica_id,
-                topology.replica_count,
-                Rc::clone(&bus),
-                config.metadata.prepare_queue_depth,
-                cluster_heartbeat_ticks(config),
-                commit_broadcast_ticks(config),
-                prepare_retransmit_ticks(config),
-                view_change_retransmit_ticks(config),
-                view_change_status_ticks(config),
-                request_start_view_ticks(config),
-                config.cluster.view_probe_attempts_max,
-                recovery_barrier_deadline(
-                    config.cluster.heartbeat_timeout.get_duration(),
-                    config.cluster.view_change_status_timeout.get_duration(),
-                ),
-            );
-            (Some(consensus), Some(journal), snapshot, Some(client_table))
-        } else {
-            (None, None, None, None)
-        };
+    let (
+        metadata_consensus,
+        journal_for_metadata,
+        snapshot_for_metadata,
+        superblock_for_metadata,
+        checkpoint_seed,
+        recovered_client_table,
+    ) = if let Some((
+        journal,
+        snapshot,
+        last_applied_op,
+        last_journaled_op,
+        client_table,
+        superblock,
+        recovered_state,
+        snapshot_checkpoint,
+    )) = owner_state
+    {
+        let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
+        let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
+        let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
+        // `recover()` already opened the superblock, read `recovered_state`, and
+        // verified the on-disk snapshot against its checkpoint pairing BEFORE decoding
+        // it. Reuse that superblock rather than re-opening it, which would fork the
+        // ping-pong sequence counter. Consensus recovers its true (view, log_view)
+        // from `recovered_state` instead of inferring a stale view from the WAL.
+        let consensus = restore_metadata_consensus(
+            &journal,
+            restored_op,
+            commit_watermark,
+            topology.cluster_id,
+            topology.self_replica_id,
+            topology.replica_count,
+            Rc::clone(&bus),
+            config.metadata.prepare_queue_depth,
+            cluster_heartbeat_ticks(config),
+            commit_broadcast_ticks(config),
+            prepare_retransmit_ticks(config),
+            view_change_retransmit_ticks(config),
+            view_change_status_ticks(config),
+            request_start_view_ticks(config),
+            config.cluster.view_probe_attempts_max,
+            recovery_barrier_deadline(
+                config.cluster.heartbeat_timeout.get_duration(),
+                config.cluster.view_change_status_timeout.get_duration(),
+            ),
+            recovered_state,
+        );
+        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(superblock);
+        (
+            Some(consensus),
+            Some(journal),
+            snapshot,
+            Some(superblock),
+            snapshot_checkpoint,
+            Some(client_table),
+        )
+    } else {
+        (None, None, None, None, (0, 0), None)
+    };
     let metadata = ServerNgMetadata::new(
         metadata_consensus,
         journal_for_metadata,
         snapshot_for_metadata,
+        superblock_for_metadata,
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
@@ -997,15 +1031,20 @@ async fn shard_main(
     // table from scratch, so running it afterwards would drop every resumed
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
-    // Reinstall the sessions the WAL replay rebuilt, so a rebooted node
-    // dedups retries and admits continuations from clients that kept their
-    // identity across the restart (IGGY-137). Recovery sized this table from
-    // the same config value, so the install preserves the configured cap.
+    // Reinstall the sessions recovery restored from the checkpoint and the WAL
+    // suffix, so a rebooted node dedups retries and admits continuations from
+    // clients that kept their identity across the restart (IGGY-137). Recovery
+    // sized this table from the same config value, so the install preserves the
+    // configured cap.
     if let Some(client_table) = recovered_client_table {
         // Refusal (a client registered before this ran) keeps the live table
         // and is logged by the callee; boot continues either way.
         let _ = metadata.install_client_table(client_table);
     }
+    // Seed the coordinator's last-checkpoint pairing so the first post-boot
+    // view-change superblock write records the real (checkpoint_op, checksum)
+    // instead of (0, 0). No-op on peer shards, which have no coordinator.
+    metadata.seed_checkpoint_ref(checkpoint_seed.0, checkpoint_seed.1);
     // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
     // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
@@ -1880,6 +1919,7 @@ fn restore_metadata_consensus(
     request_start_view_ticks: u64,
     probe_attempts_max: u32,
     recovery_deadline: Duration,
+    recovered_state: Option<VsrState>,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         cluster_id,
@@ -1899,12 +1939,29 @@ fn restore_metadata_consensus(
     consensus.set_view_change_status_ticks(view_change_status_ticks);
     consensus.set_request_start_view_ticks(request_start_view_ticks);
     consensus.set_probe_attempts_max(probe_attempts_max);
+    // Fresh random incarnation each boot, so a StartView addressed to a previous
+    // incarnation still in flight is ignored (`handle_start_view` guard). `| 1`
+    // guarantees the non-zero the guard treats as set. The deterministic simulator
+    // overrides this with a seed-derived value bumped per restart.
+    consensus.set_incarnation(rand::random::<u128>() | 1);
 
     let last_header = journal
         .last_op()
         .and_then(|op| usize::try_from(op).ok())
         .and_then(|op| journal.header(op).map(|header| *header));
-    if let Some(header) = last_header {
+    // View and log_view come from the durable superblock when present. A present but
+    // unreadable superblock already refused boot in `recover()`, so reaching the
+    // `else` means it is genuinely absent: a fresh node, or one that took writes but
+    // never checkpointed or changed view. There, inferring the view from the last WAL
+    // prepare is safe, since the persist-before-send gate guarantees this replica
+    // never externalized a view beyond what a re-probe re-derives, and it re-probes
+    // as a backup below. log_view cannot be inferred and stays 0 until the next
+    // superblock write.
+    if let Some(state) = recovered_state {
+        consensus.set_view(state.view);
+        consensus.set_log_view(state.log_view);
+        consensus.mark_superblock_durable(state.view, state.log_view);
+    } else if let Some(header) = last_header {
         consensus.set_view(header.view);
     }
 
