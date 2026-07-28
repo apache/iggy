@@ -3350,6 +3350,7 @@ mod tests {
         configs::ng_cluster::ClusterNodeConfig {
             name: "node".to_owned(),
             ip: ip.to_owned(),
+            advertised_address: None,
             replica_id: 0,
             ports: configs::ng_cluster::TransportPorts {
                 tcp: Some(18070),
