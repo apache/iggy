@@ -50,9 +50,9 @@ use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
-use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
+use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
@@ -170,12 +170,11 @@ pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
         user_id: u32,
-        /// `Ok((epoch, watermark))` for a committed bind, or the submit error
-        /// verbatim. The error must survive the hop: the ownership refusal is
-        /// TERMINAL, and flattening it into "no reply" makes the login look
-        /// transient, which costs the client a retry storm of full password
-        /// verifications.
-        reply: Sender<Result<(u64, u64), MetadataSubmitError>>,
+        /// The committed bind, or the submit error verbatim. The error must
+        /// survive the hop: the ownership refusal is TERMINAL, and flattening it
+        /// into "no reply" makes the login look transient, which costs the
+        /// client a retry storm of full password verifications.
+        reply: Sender<Result<BoundSession, MetadataSubmitError>>,
     },
     Logout {
         vsr_client_id: u128,

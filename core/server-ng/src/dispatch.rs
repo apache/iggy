@@ -523,8 +523,7 @@ where
                         .plane
                         .metadata()
                         .submit_register_in_process(vsr_client_id, user_id)
-                        .await
-                        .map(|bound| (bound.epoch, bound.watermark));
+                        .await;
                     let _ = reply.try_send(bound);
                 }
                 shard::MetadataSubmit::Logout {
@@ -2125,19 +2124,17 @@ where
             .submit_register_in_process(vsr_client_id, user_id)
             .await;
     }
-    let (reply, rx) = shard::channel::<Result<(u64, u64), MetadataSubmitError>>(1);
+    let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
         reply,
     });
-    match rx.recv().await {
-        Ok(Ok((epoch, watermark))) => Ok(BoundSession { epoch, watermark }),
-        // The owner's error, preserved: `Canceled` is only for a dropped
-        // channel, where nothing came back to classify.
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(MetadataSubmitError::Canceled),
-    }
+    // The owner's outcome, verbatim in both directions. `Canceled` is only for a
+    // dropped channel, where nothing came back to classify.
+    rx.recv()
+        .await
+        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
 }
 
 /// Logout counterpart of [`submit_register_on_owner`].
