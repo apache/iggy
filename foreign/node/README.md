@@ -30,6 +30,89 @@ npm i --save apache-iggy
 
 ## basic usage
 
+### VSR framing
+
+Classic framing remains the default. Select VSR explicitly when connecting to
+an Iggy VSR server:
+
+```typescript
+import {
+  BinaryRequestKind,
+  SimpleClient,
+  getRawClient,
+} from "apache-iggy";
+
+const config = {
+  protocol: "vsr" as const,
+  transport: "TCP" as const,
+  options: { host: "127.0.0.1", port: 8090 },
+  credentials: { username: "iggy", password: "iggy" },
+};
+const client = new SimpleClient(getRawClient(config));
+const response = await client.sendBinaryRequest(
+  BinaryRequestKind.NonReplicated,
+  60_000,
+  Buffer.from("opaque mutation"),
+);
+```
+
+VSR is a runtime protocol choice in Node.js, not a build feature. Custom
+non-replicated codes use `Operation::NonReplicated`; custom replicated codes
+are rejected until a server-side replicated extension registry exists.
+
+The same npm package supports both framing modes. VSR currently supports TCP
+only and restricts `Client` to one pooled connection because authentication,
+request sequencing, and consumer-group assignments belong to one consensus
+session. Configurations requesting VSR over TLS or more than one pooled
+connection fail before a socket is opened.
+
+Response frames larger than `maxResponseFrameSize` (default 64 MiB) are
+rejected and close the connection under both framing modes. Raise the limit
+in the client configuration when polling very large batches.
+
+VSR authentication translates the existing password and personal-access-token
+login APIs into the register handshake required by the consensus protocol. A
+disconnect or eviction invalidates the session, and later work must register a
+new session. Transient not-committed responses retry the exact encoded request
+within one bounded deadline. A disconnected mutation is never replayed under a
+new session.
+
+`sendBinaryRequest` has one intentionally breaking signature:
+
+```typescript
+sendBinaryRequest(
+  kind: BinaryRequestKind,
+  code: number,
+  payload: Buffer,
+): Promise<Buffer>
+```
+
+Migrate calls from:
+
+```typescript
+await client.sendBinaryRequest(code, payload);
+```
+
+to:
+
+```typescript
+await client.sendBinaryRequest(
+  BinaryRequestKind.NonReplicated,
+  code,
+  payload,
+);
+```
+
+There is no compatibility overload or `sendBinaryRequestWithKind` method.
+Known command tables remain authoritative under VSR: a conflicting declaration
+is rejected, unknown non-replicated codes reach the server, and unknown
+replicated codes fail locally until the extension registry exists. The kind is
+not serialized by classic framing, so classic request bytes remain unchanged.
+
+The client includes its npm package version and the binary protocol crate
+version in VSR registration. An incompatible server rejects registration with
+a protocol-version error instead of accepting a mismatched wire contract.
+
 ```ts
 import { Client } from "apache-iggy";
 
@@ -60,7 +143,8 @@ npm run build
 
 ### test
 
-note: use env var `IGGY_TCP_ADDRESS="host:port"` to set server address for bdd and e2e tests.
+note: use env var `IGGY_TCP_ADDRESS="host:port"` to set the server
+address for bdd and e2e tests.
 
 #### unit tests
 

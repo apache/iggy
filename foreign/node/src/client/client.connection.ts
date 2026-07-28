@@ -23,6 +23,8 @@ import { connect as TLSConnect } from 'node:tls';
 import type { ClientConfig, TlsOption, TcpOption, ReconnectOption } from "./client.type.js"
 import { serializeCommand } from './client.utils.js';
 import { debug } from './client.debug.js';
+import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from './client.config.js';
+import { extractResponseFrames } from './client.frame.js';
 
 
 /**
@@ -113,6 +115,8 @@ export class IggyConnection extends EventEmitter {
   private reconnectOption: ReconnectOption;
   /** Number of reconnection attempts made */
   private reconnectCount: number;
+  /** Shared promise for concurrent callers waiting on one connection attempt */
+  private connectPromise?: Promise<this>;
 
   /** Buffer for incomplete response data */
   private readBuffers: Buffer;
@@ -125,54 +129,86 @@ export class IggyConnection extends EventEmitter {
   constructor(config: ClientConfig) {
     super();
     this.config = config;
-    this.socket = getTransport(config);
     this.connected = false;
     this.connecting = false;
     this.ending = false;
     this.waitingResponseEnd = false;
     this.reconnectOption = { ...DefaultReconnectOption, ...config.reconnect };
     this.reconnectCount = 0;
+    this.connectPromise = undefined;
     this.readBuffers = Buffer.allocUnsafe(0);
+    this.socket = this._installSocket(getTransport(config));
+  }
+
+  /**
+   * Attaches the lifecycle listeners exactly once per socket instance.
+   * Attaching them in `connect()` would stack duplicate handlers whenever a
+   * failed attempt is retried on the same socket.
+   */
+  private _installSocket(socket: Socket): Socket {
+    socket.on('data', this._onData.bind(this));
+
+    socket.on('error', (err: SocketError) => {
+      debug('socket/error event', err, err.code, this.ending);
+      if (this.ending && (err?.code === 'ECONNRESET' || err?.code === 'EPIPE'))
+        return
+      this.emit('error', err);
+    });
+
+    socket.once('close', (hadError?: boolean) => {
+      debug('socket/close event', hadError);
+      this.connected = false;
+      this.connecting = false;
+      this.connectPromise = undefined;
+      this.emit('disconnected', hadError);
+      if (!this.ending)
+        void this.reconnect();
+    });
+    return socket;
   }
 
   /**
    * Establishes the connection to the server.
-   * Sets up event handlers for data, errors, and disconnection.
    *
    * @returns Promise that resolves when connected
    */
-  connect() {
+  connect(): Promise<this> {
+    if (this.connected)
+      return Promise.resolve(this);
+    if (this.connectPromise)
+      return this.connectPromise;
+    // A reconnect is waiting out its backoff; the current socket is dead and
+    // waiting on it would never settle.
+    if (this.connecting)
+      return Promise.reject(
+        new Error('connection attempt already in progress')
+      );
+    if (this.socket.destroyed)
+      this.socket = this._installSocket(getTransport(this.config));
+
     this.connecting = true;
 
-    this.socket.on('data', this._onData.bind(this));
-
-    this.socket.on('error', async (err: SocketError) => {
-      debug('socket/error event', err, err.code, this.ending);
-      // errors about disconnections should be ignored during disconnect
-      if (this.ending && (err?.code === 'ECONNRESET' || err?.code === 'EPIPE'))
-        return
-
-      this.reconnect(err);
-    });
-
-    this.socket.once('end', async (hadError?: boolean) => {
-      debug('socket/close#END event', hadError);
-      this.connected = false;
-      this.emit('disconnected', hadError);
-      this.reconnect();
-    });
-
-
-    return new Promise((resolve /**, reject*/) => {
-      this.socket.once('connect', () => {
+    this.connectPromise = new Promise<this>((resolve, reject) => {
+      const rejectConnect = (error: Error) => {
+        this.socket.removeListener('connect', resolveConnect);
+        this.connecting = false;
+        this.connectPromise = undefined;
+        reject(error);
+      };
+      const resolveConnect = () => {
+        this.socket.removeListener('error', rejectConnect);
         debug('socket/connect event');
         this.connected = true;
         this.connecting = false;
         this.reconnectCount = 0;
+        this.connectPromise = undefined;
         this.emit('connect');
         resolve(this);
-      });
+      };
+      this.socket.once('error', rejectConnect);
+      this.socket.once('connect', resolveConnect);
     });
+    return this.connectPromise;
   }
 
   /**
@@ -182,6 +218,9 @@ export class IggyConnection extends EventEmitter {
    * @param err - Optional error that triggered the reconnection
    */
   async reconnect(err?: Error) {
+    if (this.ending || this.connected || this.connecting)
+      return;
+
     const { enabled, interval, maxRetries } = this.reconnectOption
     debug(
       'reconnect# event/reconnect?', {
@@ -191,7 +230,7 @@ export class IggyConnection extends EventEmitter {
     }
     );
 
-    if (!enabled || this.reconnectCount > maxRetries) {
+    if (!enabled || this.reconnectCount >= maxRetries) {
       debug(`reconnect reached maxRetries of ${maxRetries}`, err);
       return this.emit(
         'error',
@@ -204,8 +243,45 @@ export class IggyConnection extends EventEmitter {
     /** recreate socket */
     this.connecting = true;
     this.reconnectCount += 1;
-    this.socket = await recreate(this.config, interval);
-    this.connect();
+    this.socket = this._installSocket(await recreate(this.config, interval));
+    this.connecting = false;
+    try {
+      await this.connect();
+    } catch (error) {
+      debug('reconnect attempt failed', error);
+    }
+  }
+
+  async redirect(host: string, port: number) {
+    this.socket.removeAllListeners();
+    this.socket.destroy();
+    this.connected = false;
+    this.connecting = false;
+    this.connectPromise = undefined;
+    this._endResponseWait();
+    // The old socket's close handler was just detached, so surface the drop
+    // to any in-flight exchange and queued work ourselves.
+    this.emit('disconnected', false);
+    this.config.options = { ...this.config.options, host, port };
+    this.socket = this._installSocket(getTransport(this.config));
+    await this.connect();
+  }
+
+  abort(): void {
+    this._endResponseWait();
+    this.socket.destroy();
+  }
+
+  isConnectedTo(host: string, port: number): boolean {
+    const target = normalizeHost(host);
+    if (this.socket.remotePort === port &&
+        normalizeHost(this.socket.remoteAddress) === target)
+      return true;
+    // A roster may advertise a DNS name while the socket reports a resolved
+    // address; falling back to the configured endpoint avoids a redirect to
+    // the peer the client is already connected to.
+    return this.config.options.port === port &&
+      normalizeHost(this.config.options.host) === target;
   }
 
   /**
@@ -239,47 +315,28 @@ export class IggyConnection extends EventEmitter {
       this.waitingResponseEnd
     );
 
-    // Append new data to any buffered data
-    if (this.waitingResponseEnd && this.readBuffers.length > 0) {
-      data = Buffer.concat([this.readBuffers, data]);
+    const buffered = this.waitingResponseEnd && this.readBuffers.length > 0
+      ? Buffer.concat([this.readBuffers, data])
+      : data;
+
+    try {
+      const extracted = extractResponseFrames(
+        this.config.protocol ?? 'classic',
+        buffered,
+        this.config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE
+      );
+      this.readBuffers = extracted.remainder;
+      this.waitingResponseEnd = extracted.remainder.length > 0;
+      for (const response of extracted.frames)
+        this.emit('response', response);
+    } catch (error) {
+      this._endResponseWait();
+      this.emit(
+        'error',
+        error instanceof Error ? error : new Error(String(error))
+      );
+      this.socket.destroy();
     }
-
-    // Keep processing while we have enough data
-    let offset = 0;
-
-    while (offset < data.length) {
-      const remaining = data.length - offset;
-
-      // Need at least 8 bytes for the header (4 bytes status + 4 bytes length)
-      if (remaining < 8) {
-        // Buffer the incomplete header and wait for more data
-        this.waitingResponseEnd = true;
-        this.readBuffers = data.subarray(offset);
-        return;
-      }
-
-      // Read the header
-      const responseSize = data.readUInt32LE(offset + 4);
-      const totalSize = 8 + responseSize;
-
-      // Check if we have the complete response (header + payload)
-      if (remaining < totalSize) {
-        // Buffer the incomplete response and wait for more data
-        this.waitingResponseEnd = true;
-        this.readBuffers = data.subarray(offset);
-        return;
-      }
-
-      // We have a complete response, extract it and emit
-      const response = data.subarray(offset, offset + totalSize);
-      this.emit('response', response);
-
-      // Move to the next response
-      offset += totalSize;
-    }
-
-    // All data processed, reset buffers
-    this._endResponseWait();
   }
 
   /**
@@ -289,8 +346,19 @@ export class IggyConnection extends EventEmitter {
    * @param payload - Command payload
    * @returns True if the write was successful
    */
-  writeCommand(command: number, payload: Buffer): boolean {
+  writeCommand(command: number, payload: Buffer): void {
     const cmd = serializeCommand(command, payload);
-    return this.socket.write(cmd);
+    this.socket.write(cmd);
+  }
+
+  writeFrame(frame: Buffer): void {
+    this.socket.write(frame);
   }
 }
+
+const normalizeHost = (host?: string): string => {
+  const normalized = (host ?? '').toLowerCase().replace(/^::ffff:/, '');
+  return normalized === 'localhost' || normalized === '::1'
+    ? '127.0.0.1'
+    : normalized;
+};

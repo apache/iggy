@@ -19,6 +19,7 @@
 import type { Readable } from 'stream';
 import { type TcpSocketConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
+import type { BinaryRequestKind } from '../wire/command-set.js';
 
 /**
  * TCP socket connection options.
@@ -44,14 +45,27 @@ export type CommandResponse = {
   data: Buffer
 };
 
+export type SendCommandOptions = {
+  /** Whether the response uses the standard command response decoder */
+  handleResponse?: boolean,
+  /** Whether to append rather than prepend the command to the queue */
+  last?: boolean,
+  /** Execution model supplied by the public raw-request API */
+  rawKind?: BinaryRequestKind
+};
+
 /**
  * Low-level client interface for communicating with the Iggy server.
  * Provides direct access to command sending and event handling.
  */
 export type RawClient = {
+  /** Server wire protocol used by this connection */
+  readonly protocol: Protocol,
   /** Sends a command to the server and returns the response */
   sendCommand: (
-    code: number, payload: Buffer, handleResponse?: boolean
+    code: number,
+    payload: Buffer,
+    options?: SendCommandOptions
   ) => Promise<CommandResponse>,
   /** Whether the client has been authenticated */
   isAuthenticated: boolean
@@ -101,6 +115,9 @@ export type ReconnectOption = {
  */
 export type TransportOption = TcpOption | TlsOption;
 
+/** Server wire protocol. */
+export type Protocol = 'classic' | 'vsr';
+
 /**
  * Token-based authentication credentials.
  */
@@ -139,6 +156,8 @@ export type PoolSizeOption = {
  * Complete client configuration for connecting to the Iggy server.
  */
 export type ClientConfig = {
+  /** Server wire protocol (default: classic) */
+  protocol?: Protocol,
   /** Transport protocol to use (TCP or TLS) */
   transport: TransportType,
   /** Transport-specific connection options */
@@ -150,5 +169,7 @@ export type ClientConfig = {
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
   /** Interval for sending heartbeat pings in milliseconds */
-  heartbeatInterval?: number
+  heartbeatInterval?: number,
+  /** Maximum accepted response frame size in bytes */
+  maxResponseFrameSize?: number
 }

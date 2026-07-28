@@ -21,6 +21,7 @@ import type { RawClient, ClientConfig } from "./client.type.js"
 import { getRawClient } from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
+import { normalizeClientConfig } from './client.config.js';
 
 
 /**
@@ -79,9 +80,10 @@ export class Client extends CommandAPI {
    * @param config - Client configuration
    */
   constructor(config: ClientConfig) {
-    const pcp = poolClientProvider(config);
+    const normalized = normalizeClientConfig(config);
+    const pcp = poolClientProvider(normalized);
     super(pcp);
-    this._config = config;
+    this._config = normalized;
     this._pool = pcp._pool;
   };
 
@@ -123,8 +125,9 @@ export class SingleClient extends CommandAPI {
    * @param config - Client configuration
    */
   constructor(config: ClientConfig) {
-    super(singleClientProvider(config));
-    this._config = config;
+    const normalized = normalizeClientConfig(config);
+    super(singleClientProvider(normalized));
+    this._config = normalized;
   }
 
   /**
@@ -169,6 +172,6 @@ export class SimpleClient extends CommandAPI {
  * @returns SimpleClient instance
  */
 export const getClient = async (config: ClientConfig) => {
-  const cli = getRawClient(config);
+  const cli = getRawClient(normalizeClientConfig(config));
   return new SimpleClient(cli);
 };
