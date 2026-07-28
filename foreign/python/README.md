@@ -58,6 +58,38 @@ maturin develop
 pytest tests/ -v # Run tests (requires iggy-server running)
 ```
 
+## Client Configuration
+
+`IggyClient` takes either a server address or a `TcpConfig`. Configuring `auto_login`
+lets the SDK replay the credentials whenever it reconnects, so a session dropped by a
+server restart is recovered instead of surfacing as `Unauthenticated`:
+
+```python
+from datetime import timedelta
+
+from apache_iggy import AutoLogin, IggyClient, TcpConfig, TcpReconnectionConfig
+
+client = IggyClient(
+    TcpConfig(
+        server_address="127.0.0.1:8090",
+        auto_login=AutoLogin.username_password("iggy", "iggy"),
+        reconnection=TcpReconnectionConfig(
+            enabled=True,
+            max_retries=10,
+            interval=timedelta(seconds=2),
+            reestablish_after=timedelta(seconds=30),
+        ),
+        heartbeat_interval=timedelta(seconds=5),
+    )
+)
+await client.connect()
+```
+
+`TcpConfig` also carries `tls_enabled`, `tls_domain`, `tls_ca_file`,
+`tls_validate_certificate` and `nodelay`. Every field is keyword-only and defaults to the
+same value the Rust SDK uses. `IggyClient.from_connection_string(...)` remains available
+for the same settings in string form.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.
