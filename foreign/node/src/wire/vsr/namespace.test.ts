@@ -248,4 +248,80 @@ describe('VSR namespace routing', () => {
       ResponseError
     );
   });
+
+  it('rejects malformed consumer-offset and delete-segment payloads', () => {
+    const offsetPayload = serializeStoreOffset(
+      1,
+      2,
+      Consumer.Single,
+      3,
+      99n
+    );
+    const invalidConsumerKind = Buffer.from(offsetPayload);
+    invalidConsumerKind.writeUInt8(0, 0);
+    assert.throws(
+      () => namespaceForRequest(
+        COMMAND_CODE.StoreOffset,
+        invalidConsumerKind,
+        Operation.StoreConsumerOffset
+      ),
+      ResponseError
+    );
+    for (let length = 1; length < 20; length += 1)
+      assert.throws(
+        () => namespaceForRequest(
+          COMMAND_CODE.StoreOffset,
+          offsetPayload.subarray(0, length),
+          Operation.StoreConsumerOffset
+        ),
+        ResponseError
+      );
+
+    const deletePayload = Buffer.concat([
+      serializeIdentifier(1),
+      serializeIdentifier(2),
+      Buffer.from([3, 0, 0, 0])
+    ]);
+    for (let length = 0; length < deletePayload.length; length += 1)
+      assert.throws(
+        () => namespaceForRequest(
+          COMMAND_CODE.DeleteSegments,
+          deletePayload.subarray(0, length),
+          Operation.DeleteSegments
+        ),
+        ResponseError
+      );
+  });
+
+  it('defers named offset and delete-segment routing to the server', () => {
+    const offsetPayload = serializeStoreOffset(
+      'stream',
+      'topic',
+      Consumer.Single,
+      3,
+      99n
+    );
+    assert.equal(
+      namespaceForRequest(
+        COMMAND_CODE.StoreOffset,
+        offsetPayload,
+        Operation.StoreConsumerOffset
+      ),
+      0n
+    );
+
+    const deletePayload = Buffer.concat([
+      serializeIdentifier('stream'),
+      serializeIdentifier('topic'),
+      Buffer.from([3, 0, 0, 0])
+    ]);
+    assert.equal(
+      namespaceForRequest(
+        COMMAND_CODE.DeleteSegments,
+        deletePayload,
+        Operation.DeleteSegments
+      ),
+      0n
+    );
+  });
 });

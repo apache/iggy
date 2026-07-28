@@ -45,6 +45,22 @@ describe('ConsensusSession', () => {
     assert.equal(session.currentRequestId(), 3n);
   });
 
+  it('rejects request IDs before binding and after exhaustion', () => {
+    const session = new ConsensusSession(7n);
+    assert.throws(
+      () => session.nextRequestId(),
+      /before bind/
+    );
+    session.bind(42n);
+    (
+      session as unknown as { requestCounter: bigint }
+    ).requestCounter = 0xFFFF_FFFF_FFFF_FFFFn;
+    assert.throws(
+      () => session.nextRequestId(),
+      /counter exhausted/
+    );
+  });
+
   it('rearms registration with a fresh client ID', () => {
     const session = new ConsensusSession(7n);
     session.beginRegister();

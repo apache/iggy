@@ -23,6 +23,8 @@ import { HEADER_SIZE, REQUEST_OFFSET } from './header.js';
 import { prepareVsrCommand, VsrSession } from './index.js';
 import { Operation } from './operation.js';
 import { COMMAND_CODE } from '../command.code.js';
+import { serializeSendMessages } from '../message/message.utils.js';
+import { Partitioning } from '../message/partitioning.utils.js';
 
 describe('VSR custom request framing', () => {
   it('encodes a custom non-replicated code and opaque payload', () => {
@@ -73,6 +75,28 @@ describe('VSR custom request framing', () => {
     );
   });
 
+  it('converts legacy token login to VSR registration', () => {
+    const token = Buffer.from('secret');
+    const prepared = prepareVsrCommand(
+      COMMAND_CODE.LoginWithAccessToken,
+      Buffer.concat([Buffer.from([token.length]), token])
+    );
+    assert.equal(
+      prepared.command,
+      COMMAND_CODE.LoginRegisterWithAccessToken
+    );
+    assert.ok(prepared.payload.includes(token));
+
+    const frame = new VsrSession(7n).encode(
+      prepared.command,
+      prepared.payload
+    );
+    assert.equal(
+      frame.readUInt8(REQUEST_OFFSET.operation),
+      Operation.Register
+    );
+  });
+
   it('does not advance for non-replicated or partition operations', () => {
     const session = new VsrSession(7n);
     session.bind(42n);
@@ -81,6 +105,21 @@ describe('VSR custom request framing', () => {
       Buffer.alloc(0)
     );
     assert.equal(custom.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
+
+    const partition = session.encode(
+      COMMAND_CODE.SendMessages,
+      serializeSendMessages(
+        1,
+        2,
+        [],
+        Partitioning.PartitionId(3)
+      )
+    );
+    assert.equal(
+      partition.readUInt8(REQUEST_OFFSET.operation),
+      Operation.SendMessages
+    );
+    assert.equal(partition.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
 
     const metadata = session.encode(
       COMMAND_CODE.CreateStream,
