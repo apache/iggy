@@ -1759,15 +1759,15 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         assert!(shard.plane.partitions().contains(&ns));
 
-        // Two groups: "dead" gets id 1, "live" gets id 2 (per-topic monotonic).
+        // Two groups: "dead" gets id 0, "live" gets id 1 (per-topic monotonic).
         let stm = &shard.plane.metadata().mux_stm;
         seed_create_consumer_group(stm, 3, 0, 0, "dead");
         seed_create_consumer_group(stm, 4, 0, 0, "live");
 
         // Offsets are keyed by the monotonic group id (the id the store path is
         // rewritten to and the read path / live-set resolve), not the name hash.
-        let dead_key: u32 = 1;
-        let live_key: u32 = 2;
+        let dead_key: u32 = 0;
+        let live_key: u32 = 1;
         {
             let partitions = shard.plane.partitions();
             let partition = partitions.get_by_ns(&ns).expect("partition materialised");
@@ -1781,8 +1781,8 @@ mod tests {
             );
         }
 
-        // Delete the "dead" group (id 1); "live" (id 2) stays.
-        seed_delete_consumer_group(stm, 5, 0, 0, 1);
+        // Delete the "dead" group (id 0); "live" (id 1) stays.
+        seed_delete_consumer_group(stm, 5, 0, 0, 0);
         reconcile_pass(&ctx).await;
 
         let partitions = shard.plane.partitions();
@@ -1815,10 +1815,10 @@ mod tests {
             vec![assignment(0, 1), assignment(1, 2)],
         );
         seed_create_consumer_group(&mux, 3, 0, 0, "cg");
-        // Single member owns every partition (group id 1, the first in topic).
-        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
+        // Single member owns every partition (group id 0, the first in topic).
+        seed_join_consumer_group(&mux, 4, 0, 0, 0, 100);
 
-        let group = WireIdentifier::numeric(1);
+        let group = WireIdentifier::numeric(0);
         let stream = WireIdentifier::numeric(0);
         let topic = WireIdentifier::numeric(0);
         let assigned = |mux: &TestMux| -> Vec<u32> {
@@ -1888,13 +1888,13 @@ mod tests {
             "topic-dc",
             vec![assignment(0, 1), assignment(1, 2)],
         );
-        seed_create_consumer_group(&mux, 3, 0, 0, "cg"); // group id 1
-        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
-        seed_join_consumer_group(&mux, 5, 0, 0, 1, 200);
+        seed_create_consumer_group(&mux, 3, 0, 0, "cg"); // group id 0
+        seed_join_consumer_group(&mux, 4, 0, 0, 0, 100);
+        seed_join_consumer_group(&mux, 5, 0, 0, 0, 200);
 
         let stream = WireIdentifier::numeric(0);
         let topic = WireIdentifier::numeric(0);
-        let group = WireIdentifier::numeric(1);
+        let group = WireIdentifier::numeric(0);
         let assigned = |client: u128| -> Option<Vec<u32>> {
             mux.streams()
                 .consumer_group_member_assignment(&stream, &topic, &group, client)

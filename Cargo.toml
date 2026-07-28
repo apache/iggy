@@ -146,7 +146,7 @@ csv = "1.4.0"
 ctor = "1.0.9"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
-cyper = { version = "0.9.0", features = ["rustls"], default-features = false }
+cyper = { version = "0.9.0", features = ["rustls", "stream"], default-features = false }
 cyper-axum = { version = "0.9.0" }
 cyper-core = { version = "0.9.0", default-features = false }
 darling = "0.23"
