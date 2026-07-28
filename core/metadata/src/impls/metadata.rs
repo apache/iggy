@@ -57,7 +57,7 @@ use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 fn freeze_client_reply(
     message: Message<GenericHeader>,
@@ -1179,44 +1179,66 @@ where
         let snapshot = IggySnapshot::decode(snapshot_bytes)?;
         let snapshot_seq = snapshot.sequence_number();
 
-        if let Some(coordinator) = &self.coordinator {
-            snapshot.persist(&coordinator.snapshot_path())?;
+        // Checkpoints are node-local, so a healthy serving primary can offer
+        // a snapshot BEHIND this replica's own applied frontier (each node
+        // snapshots at its own watermark; a backup checkpoints an op or two
+        // below the primary it later replaces). Restoring such a snapshot
+        // would rewind the STM below `commit_min` with no way back: the
+        // commit walk never revisits ops it already counted as applied, so
+        // the rewound-over effects would be lost until the next transfer.
+        // Keep the local STM (it is a superset) and let tail repair cover
+        // `(commit_min, commit_op]`. The client table still installs below:
+        // it comes from the serving primary's LIVE state at `table_frontier
+        // == commit_op`, which is never behind this replica.
+        let local_applied = consensus.commit_min();
+        let snapshot_ahead = snapshot_seq > local_applied;
+        if snapshot_ahead {
+            if let Some(coordinator) = &self.coordinator {
+                snapshot.persist(&coordinator.snapshot_path())?;
+            } else {
+                tracing::warn!(
+                    snapshot_seq,
+                    "installing state transfer without a snapshot coordinator; \
+                     the transferred state will not survive a further restart"
+                );
+            }
+
+            self.mux_stm
+                .restore_snapshot_in_place(snapshot.snapshot())?;
         } else {
-            tracing::warn!(
+            tracing::info!(
                 snapshot_seq,
-                "installing state transfer without a snapshot coordinator; \
-                 the transferred state will not survive a further restart"
+                local_applied,
+                "transferred snapshot at or below the local applied frontier; \
+                 keeping the local state machine and installing the table only"
             );
         }
-
-        self.mux_stm
-            .restore_snapshot_in_place(snapshot.snapshot())?;
 
         *self.client_table.borrow_mut() = client_table;
         self.client_table_frontier.set(table_frontier);
 
-        // Entries at or below the installed floor are superseded by the
-        // snapshot; without this the journal's wrap-eviction assert trips
-        // on pre-transfer residents the next time slots recycle.
-        if let Some(journal) = &self.journal {
-            let handle = journal.handle();
-            if snapshot_seq > handle.snapshot_op() {
-                handle.set_snapshot_op(snapshot_seq);
+        if snapshot_ahead {
+            // Entries at or below the installed floor are superseded by the
+            // snapshot; without this the journal's wrap-eviction assert trips
+            // on pre-transfer residents the next time slots recycle.
+            if let Some(journal) = &self.journal {
+                let handle = journal.handle();
+                if snapshot_seq > handle.snapshot_op() {
+                    handle.set_snapshot_op(snapshot_seq);
+                }
+            }
+
+            // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
+            // frontier (this is the op-jump the tail repair resumes from) and
+            // let the announced commit point pull the walk target forward.
+            consensus.set_commit_floor(snapshot_seq);
+            if snapshot_seq > consensus.sequencer().current_sequence() {
+                consensus.sequencer().set_sequence(snapshot_seq);
             }
         }
-
-        // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
-        // frontier (this is the op-jump the tail repair resumes from) and
-        // let the announced commit point pull the walk target forward.
-        if snapshot_seq > consensus.commit_min() {
-            consensus.set_commit_floor(snapshot_seq);
-        }
         consensus.advance_commit_max(commit_op);
-        if snapshot_seq > consensus.sequencer().current_sequence() {
-            consensus.sequencer().set_sequence(snapshot_seq);
-        }
 
-        Ok(snapshot_seq)
+        Ok(snapshot_seq.max(local_applied))
     }
 
     /// Submit `Register` from in-process, await commit. Wire reply still fires
@@ -2420,7 +2442,10 @@ where
             .await
         {
             Ok(true) => {
-                debug!(
+                // Info, not debug: checkpoints are rare and change what a
+                // restart can recover locally, and spec tests pin checkpoint
+                // placement through this line (`metadata_checkpoint_restart`).
+                info!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),

@@ -192,10 +192,23 @@ impl ServerHandle {
     /// this node (e.g. a follower completing a state transfer).
     #[must_use]
     pub fn stdout_contains(&self, marker: &str) -> bool {
+        self.stdout_occurrences(marker) > 0
+    }
+
+    /// Number of times `marker` appears in this node's stdout log. The log
+    /// file is TRUNCATED on every (re)start (it captures one process run),
+    /// so counts never carry across a restart; a marker seen after
+    /// `restart_server` was logged by the new process.
+    ///
+    /// ANSI escape sequences are stripped before matching: the server colors
+    /// its tracing fields, so a `key=value` marker never matches the raw
+    /// bytes (`key\x1b[0m\x1b[2m=\x1b[0m value`).
+    #[must_use]
+    pub fn stdout_occurrences(&self, marker: &str) -> usize {
         self.stdout_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .is_some_and(|log| log.contains(marker))
+            .map_or(0, |log| strip_ansi(&log).matches(marker).count())
     }
 
     /// Returns a `ClientBuilder` using the test transport.
@@ -994,6 +1007,25 @@ impl Drop for ServerHandle {
         let _ = self.stop();
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
+}
+
+/// Drop ANSI escape sequences (`ESC [ ... <letter>`) so log markers match
+/// the text an operator sees, not the color codes around it.
+fn strip_ansi(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(current) = chars.next() {
+        if current == '\u{1b}' {
+            for escaped in chars.by_ref() {
+                if escaped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(current);
+        }
+    }
+    out
 }
 
 fn generate_test_certificates(cert_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
