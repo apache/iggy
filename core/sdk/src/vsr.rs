@@ -88,7 +88,7 @@ pub(crate) fn encode_request_header(
             (Operation::Register, session.begin_register(), 0)
         }
         _ => {
-            let operation = operation_for_code(code)?;
+            let operation = operation_for_code(code);
             // NonReplicated ops (ping, reads) bypass server-side dedup --
             // `ClientTable` only tracks request_ids for replicated ops. If
             // they consumed the monotonic counter, the next replicated
@@ -153,20 +153,17 @@ pub(crate) fn encode_request_header(
     Ok((header, total_size))
 }
 
-fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
+/// `COMMAND_TABLE` is a protocol registry, not a per-server capability list, so
+/// an SDK build cannot know which codes a given server implements. The server is
+/// the authority: an unmapped code is forwarded as non-replicated (the code
+/// rides `RequestHeader.reserved`, which that path already stamps) and the
+/// server answers with a proper error if it does not know it.
+fn operation_for_code(code: u32) -> Operation {
     if code == LOGOUT_USER_CODE {
-        return Ok(Operation::Logout);
+        return Operation::Logout;
     }
 
-    if let Some(operation) = Operation::from_command_code(code) {
-        return Ok(operation);
-    }
-
-    match iggy_binary_protocol::dispatch::lookup_command(code) {
-        Some(meta) if !meta.is_replicated() => Ok(Operation::NonReplicated),
-        Some(_) => Err(IggyError::UnknownReplicatedCommand(code)),
-        None => Err(IggyError::InvalidCommand),
-    }
+    Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
@@ -690,6 +687,54 @@ mod tests {
             GET_STREAM_CODE
         );
         assert_eq!(header.session, 99);
+    }
+
+    #[test]
+    fn unknown_code_encodes_as_non_replicated_and_carries_the_code() {
+        // An extended server may implement codes this SDK build has never heard
+        // of. The registry is not a capability list, so the request must reach
+        // the server rather than fail at encode time.
+        const UNKNOWN_CODE: u32 = 60_000;
+        assert!(
+            iggy_binary_protocol::dispatch::lookup_command(UNKNOWN_CODE).is_none(),
+            "test needs a code absent from COMMAND_TABLE"
+        );
+
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let bytes = encode_contiguous_request(&mut session, UNKNOWN_CODE, &Bytes::new()).unwrap();
+        let header = decode_request_header(&bytes);
+
+        assert_eq!(header.operation, Operation::NonReplicated);
+        assert_eq!(
+            u32::from_le_bytes(
+                header.reserved[NON_REPLICATED_CODE_RANGE]
+                    .try_into()
+                    .unwrap()
+            ),
+            UNKNOWN_CODE
+        );
+    }
+
+    #[test]
+    fn no_replicated_command_ever_resolves_to_non_replicated() {
+        // The safety asymmetry that makes forwarding unknown codes acceptable:
+        // an unknown code is the server's business, but a *known* replicated
+        // command sent as non-replicated would apply on one node only and
+        // silently diverge the replicas. Swept over the whole registry so a
+        // future entry cannot regress it.
+        for meta in iggy_binary_protocol::dispatch::COMMAND_TABLE {
+            if !meta.is_replicated() {
+                continue;
+            }
+            assert_ne!(
+                operation_for_code(meta.code),
+                Operation::NonReplicated,
+                "replicated command {} ({}) must never encode as NonReplicated",
+                meta.name,
+                meta.code
+            );
+        }
     }
 
     #[test]
