@@ -16,7 +16,6 @@
 // under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
@@ -24,11 +23,11 @@ use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
     AutoCommitWhen as RustAutoCommitWhen, ConsumerGroup as RustConsumerGroup,
     ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyDuration,
-    IggyError, ReceivedMessage,
+    ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyError,
+    ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
-use pyo3::types::{PyDelta, PyDeltaAccess};
+use pyo3::types::PyDelta;
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
@@ -39,6 +38,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
+use crate::duration::py_delta_to_iggy_duration;
 use crate::identifier::PyIdentifier;
 use crate::receive_message::ReceiveMessage;
 
@@ -515,13 +515,4 @@ impl PyStubType for AutoCommitAfter {
     fn type_output() -> TypeInfo {
         TypeInfo::unqualified("AutoCommitAfter")
     }
-}
-
-pub fn py_delta_to_iggy_duration(delta1: &Py<PyDelta>) -> IggyDuration {
-    Python::attach(|py| {
-        let delta = delta1.bind(py);
-        let seconds = (delta.get_days() * 60 * 60 * 24 + delta.get_seconds()) as u64;
-        let nanos = (delta.get_microseconds() * 1_000) as u32;
-        IggyDuration::new(Duration::new(seconds, nanos))
-    })
 }

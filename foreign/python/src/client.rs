@@ -29,10 +29,12 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::config::PyClientConfig;
 use crate::consumer::{
     AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
-    IggyConsumer, py_delta_to_iggy_duration,
+    IggyConsumer,
 };
+use crate::duration::py_delta_to_iggy_duration;
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
@@ -55,17 +57,41 @@ pub struct IggyClient {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address.
+    /// Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
     /// This initializes a new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
+    ///
+    /// Args:
+    ///     conn: Either a `host:port` address, or a `TcpConfig` carrying the full
+    ///         transport configuration. Defaults to `127.0.0.1:8090` with auto-login
+    ///         disabled.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the address is not a valid `host:port` pair, or if the
+    ///         client cannot be built.
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>,
+        #[gen_stub(override_type(type_repr = "TcpConfig | builtins.str | None"))] conn: Option<
+            PyClientConfig,
+        >,
     ) -> PyResult<Self> {
+        let config = match conn {
+            Some(PyClientConfig::Config(config)) => config.client_config(),
+            Some(PyClientConfig::ServerAddress(server_address)) => Arc::new(
+                TcpClientConfigBuilder::new()
+                    .with_server_address(server_address)
+                    .build()
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?,
+            ),
+            None => Arc::new(TcpClientConfig::default()),
+        };
+        let tcp_client = TcpClient::create(config)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         let client = IggyClientBuilder::new()
-            .with_tcp()
-            .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
+            .with_client(ClientWrapper::Tcp(tcp_client))
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(IggyClient {

@@ -29,6 +29,7 @@ __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
+    "AutoLogin",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
@@ -38,6 +39,8 @@ __all__ = [
     "ReceiveMessage",
     "SendMessage",
     "StreamDetails",
+    "TcpConfig",
+    "TcpReconnectionConfig",
     "Topic",
     "TopicDetails",
     "UserInfo",
@@ -239,6 +242,41 @@ class AutoCommitWhen:
     ...
 
 @typing.final
+class AutoLogin:
+    r"""
+    The credentials replayed by the client every time it (re)connects.
+
+    `IggyClient` only recovers a lost session when it has credentials to replay,
+    so a long-running consumer should pass one of the enabled variants.
+    """
+    @property
+    def enabled(self) -> builtins.bool:
+        r"""
+        Whether automatic login is enabled.
+        """
+    @property
+    def username(self) -> builtins.str | None:
+        r"""
+        The username to log in with, or `None` for the disabled and token variants.
+        """
+    @staticmethod
+    def disabled() -> AutoLogin:
+        r"""
+        No automatic login. `login_user()` must be called by hand after every connect.
+        """
+    @staticmethod
+    def username_password(username: builtins.str, password: builtins.str) -> AutoLogin:
+        r"""
+        Log in with the given username and password on every connect.
+        """
+    @staticmethod
+    def personal_access_token(token: builtins.str) -> AutoLogin:
+        r"""
+        Log in with the given personal access token on every connect.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class ConsumerGroup:
     @property
     def id(self) -> builtins.int:
@@ -314,11 +352,20 @@ class IggyClient:
     It wraps the RustIggyClient and provides asynchronous functionality
     through the contained runtime.
     """
-    def __new__(cls, conn: builtins.str | None = None) -> IggyClient:
+    def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address.
+        Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
+
+        Args:
+            conn: Either a `host:port` address, or a `TcpConfig` carrying the full
+                transport configuration. Defaults to `127.0.0.1:8090` with auto-login
+                disabled.
+
+        Raises:
+            PyRuntimeError: If the address is not a valid `host:port` pair, or if the
+                client cannot be built.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
@@ -915,6 +962,100 @@ class StreamDetails:
     def messages_count(self) -> builtins.int: ...
     @property
     def topics_count(self) -> builtins.int: ...
+
+@typing.final
+class TcpConfig:
+    r"""
+    Configuration for the TCP transport, accepted by `IggyClient(...)`.
+
+    Mirrors `TcpClientConfig` in the Rust SDK. Every field is keyword-only and
+    falls back to the same default the Rust SDK uses.
+    """
+    @property
+    def server_address(self) -> builtins.str: ...
+    @property
+    def auto_login(self) -> AutoLogin: ...
+    @property
+    def reconnection(self) -> TcpReconnectionConfig: ...
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    @property
+    def tls_enabled(self) -> builtins.bool: ...
+    @property
+    def tls_domain(self) -> builtins.str: ...
+    @property
+    def tls_ca_file(self) -> builtins.str | None: ...
+    @property
+    def tls_validate_certificate(self) -> builtins.bool: ...
+    @property
+    def nodelay(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        auto_login: AutoLogin | None = None,
+        reconnection: TcpReconnectionConfig | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+        tls_enabled: builtins.bool = False,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool = True,
+        nodelay: builtins.bool = False,
+    ) -> TcpConfig:
+        r"""
+        Constructs a TCP configuration, defaulting every unset field to the value
+        the Rust SDK uses.
+
+        Args:
+            server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
+            auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+            tls_enabled: Whether to connect over TLS.
+            tls_domain: Domain to validate the certificate against. Empty means it is
+                taken from `server_address`.
+            tls_ca_file: Path to the CA file for TLS.
+            tls_validate_certificate: Whether to validate the server certificate.
+            nodelay: Disable the Nagle algorithm for the TCP socket.
+
+        Raises:
+            PyValueError: If `server_address` is not a valid `host:port` pair.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class TcpReconnectionConfig:
+    r"""
+    How the TCP client reconnects after the connection to the server is lost.
+    """
+    @property
+    def enabled(self) -> builtins.bool: ...
+    @property
+    def max_retries(self) -> builtins.int | None: ...
+    @property
+    def interval(self) -> datetime.timedelta: ...
+    @property
+    def reestablish_after(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        enabled: builtins.bool = True,
+        max_retries: builtins.int | None = None,
+        interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+    ) -> TcpReconnectionConfig:
+        r"""
+        Constructs a reconnection policy, defaulting every unset field to the
+        value the Rust SDK uses.
+
+        Args:
+            enabled: Whether to reconnect at all.
+            max_retries: Attempts before giving up, or `None` for unlimited.
+            interval: Delay between attempts. Defaults to 1 second.
+            reestablish_after: Cooldown before reconnecting after a previously
+                successful connection. Defaults to 5 seconds.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class Topic:

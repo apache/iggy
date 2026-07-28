@@ -16,7 +16,9 @@
 // under the License.
 
 pub mod client;
+mod config;
 mod consumer;
+mod duration;
 mod identifier;
 mod receive_message;
 mod send_message;
@@ -25,6 +27,7 @@ mod topic;
 mod user;
 
 use client::IggyClient;
+use config::{AutoLogin, TcpConfig, TcpReconnectionConfig};
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
@@ -42,6 +45,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessage>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<AutoLogin>()?;
+    m.add_class::<TcpConfig>()?;
+    m.add_class::<TcpReconnectionConfig>()?;
     m.add_class::<StreamDetails>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
