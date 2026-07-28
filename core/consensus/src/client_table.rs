@@ -237,7 +237,9 @@ impl ClientTable {
     }
 
     /// Check a request against the table. Epoch fence first, then the
-    /// watermark. For Register, use [`Self::check_register`].
+    /// watermark. Register does not come through here: every bind proposes
+    /// unconditionally so its fence actually moves, see
+    /// [`Self::commit_register`].
     ///
     /// `request_checksum` is the request's integrity stamp; zero (unstamped)
     /// disables the reuse check.

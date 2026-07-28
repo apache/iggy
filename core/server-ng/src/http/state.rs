@@ -43,8 +43,8 @@ use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
 use crate::http::session::{
-    BarrierEntry, FIRST_REQUEST_ID, HttpSession, MAX_HTTP_SESSIONS, RegistrationBarrier,
-    forget_if_same, live_entry, sweep_expired,
+    BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, MAX_HTTP_SESSIONS,
+    RegistrationBarrier, forget_if_same, live_entry, sweep_expired,
 };
 
 /// Response header carrying the current VSR view number. Stamped by
@@ -194,9 +194,58 @@ impl HttpInner {
         live_entry(&self.sessions.borrow(), key, now_secs)
     }
 
-    /// Mint a shard-0 client id and run the VSR `Register` for a fresh session.
-    /// Holds no table borrow; the caller inserts the result under `key`.
+    /// Mint a shard-0 client id and run the VSR `Register` for a fresh session,
+    /// retrying on a fresh id if the minted one turns out to be taken.
+    ///
+    /// The minter is a per-process counter reseeded from the client table at
+    /// boot, so a fresh mint normally lands on a free id. Two situations break
+    /// that, and neither is predictable from here: a promoted primary mints
+    /// from a counter with no relationship to the ids its predecessor
+    /// committed, and in a cluster every node counts independently. Landing on
+    /// an occupied entry is therefore reactive to detect and cheap to fix --
+    /// mint again. Bounded, because a run of collisions means the counter is
+    /// wrong rather than unlucky, and looping would hide that.
+    ///
+    /// The two collision signals are asymmetric. A different owner is refused
+    /// terminally by the register ownership gate. The SAME user is not refused
+    /// at all -- it rebinds, silently inheriting a watermark written by another
+    /// of that user's sessions, which would make this session's first writes
+    /// read as duplicates and answer them from the other session's cache. A
+    /// non-zero watermark on what should be a brand-new session is exactly that
+    /// tell.
     async fn register_session(
+        &self,
+        key: String,
+        user_id: u32,
+        expiry: u64,
+    ) -> Result<Rc<HttpSession>, AuthError> {
+        /// Enough to ride out a promotion-era counter overlap; beyond this the
+        /// minter is misconfigured and the 503 is the honest answer.
+        const MINT_ATTEMPTS: u8 = 3;
+
+        for attempt in 1..=MINT_ATTEMPTS {
+            match self
+                .register_session_once(key.clone(), user_id, expiry)
+                .await
+            {
+                Ok(session) => return Ok(session),
+                Err(AuthError::SessionIdOwnedByAnotherUser | AuthError::SessionIdTaken)
+                    if attempt < MINT_ATTEMPTS =>
+                {
+                    warn!(
+                        attempt,
+                        "server-ng HTTP: minted client id was already registered; re-minting"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AuthError::SessionUnavailable)
+    }
+
+    /// One mint-and-Register attempt. `SessionIdTaken` means the id was live
+    /// under this same user, so the caller should mint a different one.
+    async fn register_session_once(
         &self,
         key: String,
         user_id: u32,
@@ -206,6 +255,21 @@ impl HttpInner {
             .shard
             .coordinator()
             .ok_or(AuthError::SessionUnavailable)?;
+        // Refold the client table into the minter if this is the first mint of
+        // the current view. Cheap and skipped within a view, and it is what
+        // stops a PROMOTED primary from minting against ids its predecessor
+        // committed from an unrelated counter -- the table is replicated, the
+        // counter is per process. Boot does the same call (`bootstrap`); this
+        // one covers every later view.
+        {
+            let metadata = self.shard.plane.metadata();
+            if let Some(consensus) = metadata.consensus.as_ref() {
+                coordinator.seed_client_sequence(
+                    consensus.view(),
+                    metadata.client_table.borrow().client_ids(),
+                );
+            }
+        }
         // Reuse the TCP accept path's minter: it draws from the same shard-0
         // `client_seq`, so an HTTP session id can never collide with a TCP
         // virtual client's and the shard-0 tag (top 16 bits == 0) is preserved.
@@ -250,26 +314,43 @@ impl HttpInner {
                     MetadataSubmitError::NotPrimary
                     | MetadataSubmitError::NotCaughtUp
                     | MetadataSubmitError::PipelineFull => AuthError::SessionNotAccepted,
-                    _ => AuthError::SessionUnavailable,
+                    // Terminal, and the only variant here that is: retrying
+                    // anywhere cannot make the id free. Kept off the 503 path
+                    // so the caller's HTTP stack does not auto-retry forever.
+                    MetadataSubmitError::ClientIdOwnedByAnotherUser => {
+                        AuthError::SessionIdOwnedByAnotherUser
+                    }
+                    // `InProgress` / `Canceled` mean a prepare may still
+                    // commit cluster-wide, so the outcome is unknown rather
+                    // than terminal. A future variant lands here too: 503 is
+                    // the safe default, since it never asserts a refusal the
+                    // server did not make.
+                    MetadataSubmitError::InProgress | MetadataSubmitError::Canceled | _ => {
+                        AuthError::SessionUnavailable
+                    }
                 }
             })?;
-        // Number from above the entry's watermark, not from 1. The gateway is
-        // the one client whose request counter lives in the process that
-        // restarts: after a reboot the id minter can re-mint this client id
-        // for the same user, binding to the recovered entry -- numbering from
-        // FIRST_REQUEST_ID would then read as duplicates and answer this
-        // session's writes with the previous boot's cached replies. A fresh
-        // entry has watermark 0, so this is FIRST_REQUEST_ID there.
-        let next_request = bound.watermark + 1;
-        debug_assert!(next_request >= FIRST_REQUEST_ID);
+        // A fresh mint must land on a fresh entry, so a watermark it did not
+        // write means the id was already registered to this same user (see
+        // `register_session`). Rebinding onto it would inherit that session's
+        // dedup history; hand the id back instead and let the caller re-mint.
+        if bound.watermark != FRESH_ENTRY_WATERMARK {
+            warn!(
+                client_id,
+                user_id,
+                watermark = bound.watermark,
+                "server-ng HTTP: minted client id already had a committed session for this user"
+            );
+            return Err(AuthError::SessionIdTaken);
+        }
         Ok(Rc::new(HttpSession {
             key,
             client_id,
             session: bound.epoch,
             user_id,
             expiry,
-            gate: Mutex::new(next_request),
-            data_request: Cell::new(next_request),
+            gate: Mutex::new(FIRST_REQUEST_ID),
+            data_request: Cell::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         }))

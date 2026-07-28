@@ -163,11 +163,19 @@ pub struct RequestHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    /// Session fence epoch, handed to the client by its `Register` reply and
-    /// echoed on every subsequent request. Bumped by the server on each
-    /// committed re-register of the same `client`, so a request stamped with an
-    /// older value is a zombie from before a rebind and gets fenced. Unrelated
-    /// to op numbers: nothing in it derives from the consensus log.
+    /// Session fence epoch: the commit op of the latest committed `Register`
+    /// for this `client`. Handed to the client by that register's reply and
+    /// echoed on every subsequent request.
+    ///
+    /// Every bind commits a `Register`, so each rebind of the same `client`
+    /// carries a strictly higher value, and a request stamped with an older one
+    /// is a zombie from before that rebind and gets fenced. Being a log
+    /// position rather than a counter is what makes it non-regressing: it
+    /// cannot restart low after the server drops an entry and the client
+    /// registers again.
+    ///
+    /// Zero on `Register` itself (the client has no epoch to echo yet) and on
+    /// sessionless ops; header validation enforces both.
     pub session: u64,
     /// Acting user id, stamped by the metadata primary at admission for every
     /// gated client op so the in-apply RBAC gate resolves the same identity on

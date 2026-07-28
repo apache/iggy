@@ -1218,8 +1218,19 @@ async fn shard_main(
             .expect("shard 0 always has a coordinator attached by the builder");
         // Reseed the client-id minter above every recovered entry before any
         // listener accepts. The counter is per process; the table it must not
-        // collide with was rebuilt from the previous boot's WAL.
-        coord.seed_client_sequence(shard.plane.metadata().client_table.borrow().client_ids());
+        // collide with was rebuilt from the previous boot's WAL. Keyed by view
+        // so a later promotion refolds the table (the minting path calls the
+        // same method, see `HttpInner::register_session_once`).
+        let boot_view = shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .map_or(0, consensus::VsrConsensus::view);
+        coord.seed_client_sequence(
+            boot_view,
+            shard.plane.metadata().client_table.borrow().client_ids(),
+        );
         let on_client_request =
             make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
         let (accepted_replica, dialed_replica) =

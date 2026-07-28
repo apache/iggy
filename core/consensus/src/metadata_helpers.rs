@@ -73,6 +73,21 @@ pub enum PreflightOutcome {
 /// `session` is the wire `session` field, which carries the entry's fence
 /// epoch; `request_checksum` is the request's integrity stamp (zero =
 /// unstamped, disables the reuse check).
+///
+/// ## What the catch-up gate below does and does not establish
+///
+/// It says this replica has APPLIED everything it holds and its log suffix has
+/// re-earned quorum, which is what makes the eviction decisions below safe
+/// against a stale in-memory table on a freshly promoted primary.
+///
+/// It says nothing about how the table was BUILT. Every clause of
+/// `is_caught_up_primary` is about the log; recovery, meanwhile, replays from
+/// this node's snapshot floor, and checkpointing is node-local, so two replicas
+/// reconstruct their tables from different starting points. Epochs survive that
+/// (they are op-derived), watermarks do not -- see
+/// `metadata::impls::recovery`. So a caught-up primary is authoritative for its
+/// own table, not for agreement with its peers' tables. Closing that needs the
+/// table in the snapshot, not a stronger gate here.
 pub fn request_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_table: &RefCell<ClientTable>,
@@ -126,11 +141,13 @@ where
         RequestStatus::Duplicate(cached_reply) => {
             PreflightOutcome::Replay(cached_reply.into_wire_bytes())
         }
-        // Session evicted under capacity pressure. SAFETY: catch-up gate makes
-        // this replica authoritative for session truth.
+        // Session evicted under capacity pressure. The catch-up gate makes this
+        // replica authoritative for its own committed session state, which is
+        // what an eviction frame reports.
         RequestStatus::NoSession => PreflightOutcome::Evict(EvictionReason::NoSession),
-        // Zombie holdover from before a re-register: terminal for that
-        // holder. SAFETY: catch-up gate makes this replica authoritative.
+        // Zombie holdover from before a re-register: terminal for that holder.
+        // Sound on any caught-up replica because the fence is op-derived, so
+        // every replica that applied this register holds the same value.
         RequestStatus::Fenced { current, received } => {
             tracing::debug!(
                 client_id,
@@ -234,7 +251,12 @@ where
 /// `true` -> dispatch. `false` -> absorbed (`AlreadyRegistered` replays cache;
 /// in-flight register silently dropped).
 #[allow(clippy::future_not_send)]
-pub fn register_preflight<B, P>(consensus: &VsrConsensus<B, P>, client_id: u128) -> bool
+pub fn register_preflight<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_table: &RefCell<ClientTable>,
+    client_id: u128,
+    user_id: u32,
+) -> bool
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
@@ -250,9 +272,9 @@ where
     }
 
     // Catch-up gate: new primary may have inherited Register(client, op=N)
-    // committed in WAL but not yet applied. Without gate, check_register
-    // returns New -> a second register commits -> the epoch bumps past the
-    // one the first register's reply handed the client, fencing a live
+    // committed in WAL but not yet applied. Without the gate this dispatches a
+    // second register, which commits at a later op -> the entry's fence moves
+    // past the one the first register's reply handed the client, fencing a live
     // client for no reason. SDK retry recovers post-catch-up.
     if !is_caught_up_primary(consensus) {
         tracing::debug!(
@@ -263,6 +285,30 @@ where
             commit_min = consensus.commit_min(),
             commit_max = consensus.commit_max(),
             "register_preflight: not caught up, drop"
+        );
+        return false;
+    }
+
+    // OWNERSHIP GATE. `commit_register`'s rebind branch overwrites the entry's
+    // `user_id`, and `resolve_acting_user_id` resolves authority for every
+    // replicated op from that field, so admitting a register for an entry
+    // another user owns would hand the caller that user's authority. Refuse by
+    // dropping it: this runs on the wire ingress and on the promotion of a
+    // queued register, neither of which has a caller to return a typed error
+    // to. The in-process submit checks the same condition first and does
+    // return one (`ClientIdOwnedByAnotherUser`), so a client that reaches here
+    // and is dropped retries into that terminal answer.
+    //
+    // Correct to decide here because the catch-up gate above already
+    // established this replica as authoritative for session truth.
+    if let Some(owner) = client_table.borrow().get_user_id(client_id)
+        && owner != user_id
+    {
+        tracing::warn!(
+            client_id,
+            presented_user = user_id,
+            entry_owner = owner,
+            "register_preflight: dropping register for an entry owned by another user"
         );
         return false;
     }
@@ -502,7 +548,7 @@ mod tests {
         client_table.borrow_mut().commit_reply(client_id, app_reply);
 
         assert!(
-            register_preflight(&consensus, client_id),
+            register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID),
             "rebind must dispatch so commit_register bumps the fence epoch"
         );
         let sends = consensus.message_bus().client_sends.borrow();
@@ -714,6 +760,41 @@ mod tests {
         );
     }
 
+    // The promotion path and the wire ingress both land here, and neither has
+    // a caller to return a typed error to, so an entry owned by another user is
+    // refused by dropping the register. Without this a register queued while
+    // the primary was catching up would commit at promotion and
+    // `commit_register` would overwrite the entry's `user_id`, handing the
+    // presenter that user's authority.
+    #[test]
+    fn register_preflight_drops_a_register_for_another_users_entry() {
+        const OWNER: u32 = ACTING_USER_ID;
+        const IMPOSTOR: u32 = ACTING_USER_ID + 1;
+
+        let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let client_table = fresh_client_table();
+        let client_id: u128 = 0xBEEF;
+        let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
+        client_table
+            .borrow_mut()
+            .commit_register(client_id, OWNER, initial_reply);
+
+        assert!(
+            !register_preflight(&consensus, &client_table, client_id, IMPOSTOR),
+            "a register for another user's entry must not dispatch"
+        );
+        assert!(
+            register_preflight(&consensus, &client_table, client_id, OWNER),
+            "the owner's own rebind must still dispatch"
+        );
+        assert_eq!(
+            client_table.borrow().get_user_id(client_id),
+            Some(OWNER),
+            "the refused register must not have touched the entry"
+        );
+    }
+
     // Watermark jump: request numbers above the watermark dispatch even
     // when non-contiguous (there is no RequestGap).
     #[test]
@@ -754,9 +835,10 @@ mod tests {
         consensus.advance_commit_max(5);
         assert_ne!(consensus.commit_min(), consensus.commit_max());
 
+        let client_table = fresh_client_table();
         let client_id: u128 = 0xC0DE;
 
-        let result = register_preflight(&consensus, client_id);
+        let result = register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID);
         assert!(!result, "register dispatch must short-circuit");
 
         let sends = consensus.message_bus().client_sends.borrow();
@@ -794,9 +876,10 @@ mod tests {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         consensus.init();
 
+        let client_table = fresh_client_table();
         let client_id: u128 = 0xC0DE;
 
-        let result = register_preflight(&consensus, client_id);
+        let result = register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID);
         assert!(result, "New client proceeds through consensus");
 
         let sends = consensus.message_bus().client_sends.borrow();

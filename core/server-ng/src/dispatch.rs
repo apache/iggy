@@ -112,17 +112,6 @@ use tracing::{debug, warn};
 pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 
-/// How long a disconnected session's client-table slot is held open for the
-/// client to reconnect and resume onto it before the sweeper reclaims it.
-///
-/// Resume runs through the login path, so the window only has to cover a
-/// reconnect plus a re-login -- seconds. It is generous by an order of
-/// magnitude so a client riding out a view change still lands inside it, and
-/// still bounded so cumulative connects cannot push the client table to its
-/// capacity-eviction point (every eviction silently erases a watermark).
-/// Swept by `run_heartbeat_verifier`, whose tick is far shorter than this.
-const SESSION_RECLAIM_GRACE: std::time::Duration = std::time::Duration::from_mins(1);
-
 pub(crate) fn make_client_request_handler<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -147,12 +136,7 @@ where
                 .borrow_mut()
                 .remove_connection(client_id)
             {
-                submit_disconnect_logout(
-                    Rc::clone(&shard_for_disconnect),
-                    &sessions_for_disconnect,
-                    vsr_client_id,
-                    session,
-                );
+                submit_disconnect_logout(Rc::clone(&shard_for_disconnect), vsr_client_id, session);
             }
         }));
     Rc::new(move |client_id, message| {
@@ -480,7 +464,7 @@ where
             .remove_connection(client_id)
             && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
         {
-            submit_disconnect_logout(shard, &sessions_for_disconnect, vsr_client_id, session);
+            submit_disconnect_logout(shard, vsr_client_id, session);
         }
     }));
     Rc::new(move |client_id, message| {
@@ -540,7 +524,6 @@ where
                         .metadata()
                         .submit_register_in_process(vsr_client_id, user_id)
                         .await
-                        .ok()
                         .map(|bound| (bound.epoch, bound.watermark));
                     let _ = reply.try_send(bound);
                 }
@@ -1584,34 +1567,6 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
             }
         }
 
-        // Reclaim sessions whose resume window elapsed. A disconnect defers
-        // rather than logs out (see `submit_disconnect_logout`) so a
-        // reconnecting client can resume onto its entry through the login
-        // path; without this sweep those slots would accumulate per
-        // cumulative connect and push the client table into capacity
-        // eviction, which silently erases dedup watermarks.
-        let reclaims = sessions
-            .borrow_mut()
-            .take_expired_reclaims(std::time::Instant::now());
-        for (vsr_client_id, session) in reclaims {
-            debug!(
-                vsr_client_id,
-                "session resume window elapsed; reclaiming client-table slot"
-            );
-            // Re-arm before submitting. The submit is spawned and can fail
-            // transiently (view change, full pipeline), and `take_expired_reclaims`
-            // has already dropped the entry, so without this a failed submit
-            // leaks the slot until capacity eviction. The spawned task clears
-            // the entry once the `Logout` commits.
-            sessions.borrow_mut().defer_reclaim(
-                vsr_client_id,
-                session,
-                SESSION_RECLAIM_GRACE,
-                std::time::Instant::now(),
-            );
-            submit_session_logout(Rc::clone(&shard), &sessions, vsr_client_id, session);
-        }
-
         shard.bus.sleep(interval).await;
     }
 }
@@ -1632,7 +1587,7 @@ async fn evict_stale_client<B, MJ, S>(
 {
     let bound = sessions.borrow_mut().remove_connection(transport_client_id);
     if let Some((vsr_client_id, session)) = bound {
-        submit_disconnect_logout(Rc::clone(shard), sessions, vsr_client_id, session);
+        submit_disconnect_logout(Rc::clone(shard), vsr_client_id, session);
     }
     let ctx = shard.plane.metadata().consensus.as_ref().map_or(
         consensus::EvictionContext {
@@ -2170,15 +2125,18 @@ where
             .submit_register_in_process(vsr_client_id, user_id)
             .await;
     }
-    let (reply, rx) = shard::channel::<Option<(u64, u64)>>(1);
+    let (reply, rx) = shard::channel::<Result<(u64, u64), MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
         reply,
     });
     match rx.recv().await {
-        Ok(Some((epoch, watermark))) => Ok(BoundSession { epoch, watermark }),
-        _ => Err(MetadataSubmitError::Canceled),
+        Ok(Ok((epoch, watermark))) => Ok(BoundSession { epoch, watermark }),
+        // The owner's error, preserved: `Canceled` is only for a dropped
+        // channel, where nothing came back to classify.
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(MetadataSubmitError::Canceled),
     }
 }
 
@@ -2452,62 +2410,26 @@ where
     ))
 }
 
-/// Disconnect policy: reclaim now, or hold the slot open for a resume window.
+/// Release the client-table slot for a disconnected transport, cluster-wide.
 ///
-/// The local `SessionManager` connection is already dropped by the caller.
-/// A consumer-group member is logged out immediately -- the group must
-/// rebalance off a dead consumer without waiting. Anything else has its
-/// reclaim DEFERRED by [`SESSION_RECLAIM_GRACE`], because session resume runs
-/// through the login path: a reconnecting client re-authenticates under its
-/// previous `client_id` and the committed rebind adopts the existing entry
-/// while keeping its watermark and reply ring intact, which only works while
-/// that entry still exists.
+/// The local `SessionManager` connection is already dropped by the caller;
+/// this is what drops the replicated entry, so a peer replica does not keep an
+/// orphaned session until it evicts one under capacity pressure.
 ///
-/// The deferral is swept by `run_heartbeat_verifier`, which calls
-/// [`submit_session_logout`] directly once the window elapses. Holding slots
-/// indefinitely instead would move the client table's eviction point from
-/// concurrent connections to CUMULATIVE connects, and every capacity eviction
-/// silently erases a dedup watermark.
-#[allow(clippy::future_not_send)]
-fn submit_disconnect_logout<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    vsr_client_id: u128,
-    session: u64,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-{
-    let is_group_member = !shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .consumer_group_memberships(vsr_client_id)
-        .is_empty();
-    if is_group_member {
-        submit_session_logout(shard, sessions, vsr_client_id, session);
-        return;
-    }
-    debug!(
-        vsr_client_id,
-        grace = ?SESSION_RECLAIM_GRACE,
-        "transport disconnected; holding session for resume, then reclaiming"
-    );
-    sessions.borrow_mut().defer_reclaim(
-        vsr_client_id,
-        session,
-        SESSION_RECLAIM_GRACE,
-        std::time::Instant::now(),
-    );
-}
-
-/// Submit a session-matched `Logout` unconditionally, releasing the
-/// `ClientTable` slot on every replica (shard 0 included, since shard 0 is
-/// itself a replica).
+/// Unconditional, and deliberately so. Holding the slot open for a grace
+/// window would let a reconnecting client resume onto its entry with its
+/// watermark and reply ring intact, but nothing in tree re-presents a
+/// `client_id` after a disconnect (the Rust SDK mints a fresh one on
+/// re-login), so the window buys nothing today and the slot it holds is not
+/// free: the client table's eviction point moves from concurrent connections
+/// to CUMULATIVE connects, and every capacity eviction silently erases a
+/// dedup watermark.
 ///
+/// A resume window becomes worth having once SDK-side identity stability
+/// lands, at which point it needs a timer of its own -- riding the heartbeat
+/// verifier is not an option, since that only runs when `heartbeat.enabled`
+/// is set and `collect_stale` keys off the heartbeat interval, so ungating it
+/// would mass-evict consumer-group members on a deployment that does not ping.
 /// Deliberately does NOT drop the local `ClientTable` slot first:
 /// `submit_logout_*` short-circuits when the slot is already gone, so a
 /// pre-emptive local removal would suppress the `Logout` and leave peer
@@ -2516,9 +2438,8 @@ fn submit_disconnect_logout<B, MJ, S>(
 /// shard 0 and forwards for peer-homed connections; its session guard drops a
 /// stale logout for a reused client id.
 #[allow(clippy::future_not_send)]
-fn submit_session_logout<B, MJ, S>(
+fn submit_disconnect_logout<B, MJ, S>(
     shard: Rc<ShellShard<B, MJ, S>>,
-    sessions: &Rc<RefCell<SessionManager>>,
     vsr_client_id: u128,
     session: u64,
 ) where
@@ -2534,23 +2455,16 @@ fn submit_session_logout<B, MJ, S>(
     const DISCONNECT_LOGOUT_REQUEST_ID: u64 = u64::MAX;
 
     let bus = shard.bus.clone();
-    let sessions = Rc::clone(sessions);
     bus.spawn(async move {
-        match submit_logout_on_owner(&shard, vsr_client_id, session, DISCONNECT_LOGOUT_REQUEST_ID)
-            .await
+        if let Err(error) =
+            submit_logout_on_owner(&shard, vsr_client_id, session, DISCONNECT_LOGOUT_REQUEST_ID)
+                .await
         {
-            // Slot released cluster-wide; drop the bookkeeping that would
-            // otherwise re-submit on the next sweep.
-            Ok(_) => sessions.borrow_mut().complete_reclaim(vsr_client_id),
-            // Leave the re-armed reclaim in place so the sweeper retries. A
-            // repeat is harmless: `submit_logout_*` short-circuits once the
-            // slot is gone, and its session guard drops a stale logout for a
-            // reused client id.
-            Err(error) => warn!(
+            warn!(
                 vsr_client_id,
                 ?error,
-                "session logout submit failed; retrying after the reclaim grace"
-            ),
+                "disconnect logout submit failed; peer slots may linger until eviction"
+            );
         }
     });
 }

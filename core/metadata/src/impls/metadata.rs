@@ -50,7 +50,7 @@ use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::iobuf::Frozen;
+use server_common::iobuf::{Frozen, Owned};
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
@@ -689,13 +689,14 @@ where
         let request = message.header().request;
         let request_checksum = message.header().request_checksum;
         let operation = message.header().operation;
+        let user_id = message.header().user_id;
 
         // Preflight first: dedup, eviction sends, cached-reply replay all
         // must run regardless of pipeline pressure. Wire-path ingress has no
         // home-shard transport context, so resends fall back to the
         // consensus-plane (best-effort by VSR id).
         let dispatch = if operation == Operation::Register {
-            register_preflight(consensus, client_id)
+            register_preflight(consensus, &self.client_table, client_id, user_id)
         } else {
             let outcome = request_preflight(
                 consensus,
@@ -1088,6 +1089,12 @@ where
             .as_ref()
             .expect("submit_register_in_process: consensus only exists on shard 0");
 
+        // Wrong node: waiting or queueing cannot fix that, the client must
+        // re-route to the primary.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return Err(MetadataSubmitError::NotPrimary);
+        }
+
         // OWNERSHIP GATE: the login frame's `client` field is caller-supplied,
         // and `resolve_acting_user_id` resolves authority for every replicated
         // op from this entry, so rebinding someone else's entry would run the
@@ -1095,7 +1102,17 @@ where
         // its `user_id`). Refuse unless the authenticated user owns it.
         // Terminal (see `ClientIdOwnedByAnotherUser`). An owned entry falls
         // through: the rebind must commit so the epoch actually moves.
-        {
+        //
+        // Only a CAUGHT-UP primary may issue it, like both sibling readers of
+        // this table (`request_preflight` and `register_preflight`, which gate
+        // the same way): the refusal is terminal, so a lagging or diverged
+        // replica answering it would deny a legitimate login off state it has
+        // not finished applying, and the client would never learn to redirect.
+        // Not caught up therefore SKIPS the check rather than refusing -- the
+        // register goes on to park in the request queue below, and
+        // `register_preflight` re-applies this gate when the commit path
+        // promotes it, by which point the table is authoritative.
+        if is_caught_up_primary(consensus) {
             let table = self.client_table.borrow();
             if let Some(owner) = table.get_user_id(client_id)
                 && owner != user_id
@@ -1109,12 +1126,6 @@ where
                 );
                 return Err(MetadataSubmitError::ClientIdOwnedByAnotherUser);
             }
-        }
-
-        // Wrong node: waiting or queueing cannot fix that, the client must
-        // re-route to the primary.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
-            return Err(MetadataSubmitError::NotPrimary);
         }
 
         // Mirror wire-path register_preflight: a racing second prepare would
@@ -1140,14 +1151,20 @@ where
             "build_register_request_message produced a header that fails validate()"
         );
 
-        // Catch-up gate (Register only: admitting one while a committed op
-        // is still unapplied risks a double-register epoch bump) or
-        // prepare queue full: absorb into the request queue instead of
-        // bouncing with a transient error. The queued
-        // entry carries this caller's reply subscriber; the commit path
-        // promotes it (`drain_request_queue_into_prepares`, which re-runs
-        // `register_preflight`) as soon as the in-flight batch drains, and
-        // the await below resolves exactly like the direct dispatch would.
+        // Fence floor, snapshotted BEFORE dispatch. This register's op is
+        // assigned above the journal tail, so it is strictly greater than
+        // `commit_max` is now -- which is what lets the cancel path below tell
+        // OUR fence from an older entry's that happened to survive.
+        let epoch_floor = consensus.commit_max();
+
+        // Not caught up (admitting a register while a committed op is still
+        // unapplied risks a double-register fence bump) or prepare queue full:
+        // absorb into the request queue instead of bouncing with a transient
+        // error. The queued entry carries this caller's reply subscriber; the
+        // commit path promotes it (`drain_request_queue_into_prepares`, which
+        // re-runs `register_preflight` and so applies the ownership gate) as
+        // soon as the in-flight batch drains, and the await below resolves
+        // exactly like the direct dispatch would.
         if !is_caught_up_primary(consensus) || consensus.pipeline().borrow().is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
             if consensus
@@ -1159,14 +1176,17 @@ where
                 // Both queues full: honest terminal backpressure.
                 return Err(MetadataSubmitError::PipelineFull);
             }
-            // Commit and cancel share one recovery: read the table. On
-            // commit, `commit_register` moved the entry's fence (the reply header
-            // carries neither epoch nor watermark). On a view-change cancel
-            // or promotion-time rejection the re-read is correct-by-VSR: an
-            // inherited Register applied via `commit_journal` between cancel
-            // and read stamps the same op-derived epoch on every replica.
-            let _ = receiver.await;
-            return self.bound_session(client_id);
+            return match receiver.await {
+                // The reply's `commit` IS the fence `commit_register` just
+                // stored (`build_reply_message` stamps it from the prepare's
+                // op), so take it from there rather than re-reading the table.
+                Ok(reply) => {
+                    self.bound_session(client_id, Some(reply.header().commit), epoch_floor)
+                }
+                // Entry dropped before commit: view-change reset, or a
+                // promotion-time preflight rejection.
+                Err(Canceled) => self.bound_session(client_id, None, epoch_floor),
+            };
         }
         // `prepare_request` only fails on `!is_client_allowed`; Register is
         // allowed, so unreachable. Panic loudly on regression instead of
@@ -1175,18 +1195,39 @@ where
             .prepare_request(request)
             .expect("Operation::Register is client-allowed; prepare projection cannot fail");
 
-        // Same commit/cancel collapse as the queued path above.
-        let _ = self.dispatch_prepare_and_await(consensus, prepare).await;
-        self.bound_session(client_id)
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => self.bound_session(client_id, Some(reply.header().commit), epoch_floor),
+            Err(Canceled) => self.bound_session(client_id, None, epoch_floor),
+        }
     }
 
-    /// Read a client's post-commit bind state (fence epoch + watermark) in one
-    /// borrow. `Canceled` when the entry is absent: the register was canceled
-    /// before commit, or the entry was evicted in between.
-    fn bound_session(&self, client_id: u128) -> Result<BoundSession, MetadataSubmitError> {
+    /// Assemble the bind result in one table borrow.
+    ///
+    /// `committed_epoch` is `Some` when this call's own Register committed, in
+    /// which case the fence comes from the reply that carries it. `None` is the
+    /// view-change cancel path, where the fence has to be read back -- and is
+    /// only ours if it sits above `epoch_floor`. An entry at or below the floor
+    /// predates this register, so returning its epoch would hand the caller a
+    /// fence that never moved, and nothing downstream would notice: a stale
+    /// epoch satisfies `check_request`'s equality test, so there is no `Fenced`
+    /// and no `EpochAhead` to surface it. `Canceled` instead, and the retry
+    /// gets a real bind.
+    ///
+    /// `Canceled` also covers an absent entry (evicted between commit and
+    /// read).
+    fn bound_session(
+        &self,
+        client_id: u128,
+        committed_epoch: Option<u64>,
+        epoch_floor: u64,
+    ) -> Result<BoundSession, MetadataSubmitError> {
         let table = self.client_table.borrow();
-        table
-            .get_epoch(client_id)
+        let epoch = committed_epoch.or_else(|| {
+            table
+                .get_epoch(client_id)
+                .filter(|&epoch| epoch > epoch_floor)
+        });
+        epoch
             .zip(table.get_watermark(client_id))
             .map(|(epoch, watermark)| BoundSession { epoch, watermark })
             .ok_or(MetadataSubmitError::Canceled)
@@ -1217,13 +1258,11 @@ where
                 ) {
                     return Some(Ok(refusal));
                 }
+                let owned =
+                    Owned::<{ server_common::MESSAGE_ALIGN }>::copy_from_slice(reply.as_slice());
                 Some(
-                    server_common::Message::<GenericHeader>::try_from(
-                        server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::copy_from_slice(
-                            reply.as_slice(),
-                        ),
-                    )
-                    .map_err(|_| MetadataSubmitError::Canceled),
+                    Message::<GenericHeader>::try_from(owned)
+                        .map_err(|_| MetadataSubmitError::Canceled),
                 )
             }
             PreflightOutcome::Evict(reason) => {
@@ -2095,12 +2134,13 @@ where
             let request = req.message.header().request;
             let request_checksum = req.message.header().request_checksum;
             let operation = req.message.header().operation;
+            let user_id = req.message.header().user_id;
             // If preflight or projection rejects below, dropping `req` (and
             // the sender taken from it) wakes an in-process awaiter with
             // `Canceled`; its submit path re-checks the client table.
             let reply_sender = req.take_reply_sender();
             let dispatch = if operation == Operation::Register {
-                register_preflight(consensus, client_id)
+                register_preflight(consensus, &self.client_table, client_id, user_id)
             } else {
                 let outcome = request_preflight(
                     consensus,

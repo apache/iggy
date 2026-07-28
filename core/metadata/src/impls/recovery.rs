@@ -213,8 +213,29 @@ where
 
         // Register/Logout mutate the client table and skip the state
         // machine, mirroring the commit paths (`on_ack` / `commit_journal`).
-        // Replaying them from a fresh table in apply order re-mints the same
-        // epochs every replica derived live.
+        //
+        // Epochs come back identical on every replica: they are the register's
+        // own commit op, so replay reads them out of the log rather than
+        // deriving them from replay order.
+        //
+        // Watermarks do NOT, and this is a known gap rather than an invariant.
+        // Replay starts at THIS node's snapshot floor, and checkpointing is
+        // node-local (`checkpoint_if_needed` fires on local journal occupancy),
+        // so replicas cross the floor at different ops. If a client's earlier
+        // register fell below this node's floor while a later one survived,
+        // replay takes `commit_register`'s fresh-entry branch and the entry
+        // returns with `watermark = 0`, where a peer that replayed both took
+        // the rebind branch and kept it. The fence still passes, so nothing is
+        // evicted, and the same request id a peer answers `Duplicate` gets
+        // answered `New` here and re-executed -- exactly-once degrading to
+        // at-least-once, silently.
+        //
+        // Unobservable today (no shipping client re-presents a recovered
+        // `client_id`), and closed by putting the table in the snapshot so
+        // replay no longer has to reconstruct it. Until then a caught-up
+        // primary is authoritative for its OWN table only, which is why
+        // `request_preflight`'s catch-up gate cannot bridge this (see its
+        // rustdoc).
         if header.operation == Operation::Register {
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table.commit_register(header.client, header.user_id, reply);
@@ -490,6 +511,75 @@ mod tests {
                 .as_ref()
                 .map(IggySnapshot::sequence_number),
             Some(5)
+        );
+    }
+
+    // The watermark half of table recovery does NOT survive a checkpoint, and
+    // this pins that as a fact rather than a comment. Shape: a client registers,
+    // commits request 1, a checkpoint lands past that register, then the client
+    // rebinds. Replay starts above the floor, so it never sees the first
+    // register: `commit_register` takes its fresh-entry branch and the entry
+    // comes back with watermark 0, while a peer whose floor sat lower replayed
+    // both registers, took the rebind branch, and kept watermark 1.
+    //
+    // Consequence, once a client re-presents a recovered id: the same request
+    // that peer answers `Duplicate` is `New` here and gets re-executed. The
+    // fence is unaffected -- epochs are op-derived, so this node still returns
+    // the second register's op.
+    //
+    // Red/green for the table-in-snapshot work: when the table ships in the
+    // checkpoint, the watermark assertion below flips to `Some(1)`.
+    #[compio::test]
+    async fn recover_loses_the_watermark_when_a_checkpoint_hides_the_first_register() {
+        const CLIENT: u128 = 0x1337;
+        const USER: u32 = 7;
+        const FLOOR: u64 = 2;
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        // Ops 1..=2 are below the floor and are never replayed: the client's
+        // first Register and the request that advanced its watermark.
+        IggySnapshot::new(FLOOR)
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for entry in [
+                make_client_prepare(1, Operation::Register, CLIENT, USER, 0),
+                make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1),
+                // The rebind, above the floor, so replay does see this one.
+                make_client_prepare(3, Operation::Register, CLIENT, USER, 0),
+            ] {
+                journal.append(entry).await.unwrap();
+            }
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            true,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let table = &recovered.client_table;
+        assert_eq!(
+            table.get_epoch(CLIENT),
+            Some(3),
+            "the fence is op-derived, so it survives the checkpoint intact"
+        );
+        assert_eq!(
+            table.get_watermark(CLIENT),
+            Some(0),
+            "KNOWN GAP: the pre-floor watermark is lost, so request 1 reads as New \
+             here while a lower-floor peer answers it as a duplicate"
         );
     }
 

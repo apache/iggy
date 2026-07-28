@@ -39,10 +39,12 @@
 //!    the pre-restart epoch are fenced zombies. There is deliberately no
 //!    credential-free rebind; `given_live_session_when_unauthenticated_peer_*`
 //!    pins that.
-//! 3. Sessions survive transport disconnect: `submit_disconnect_logout`
-//!    tears down only consumer-group members (the group must rebalance off
-//!    a dead consumer); everything else keeps its slot for resume until an
-//!    explicit `Logout` or capacity eviction.
+//! 3. A crash leaves no `Logout` behind. Every transport disconnect releases
+//!    its session (`submit_disconnect_logout`), so what makes the entry
+//!    survivable is that the process died with the connection still open --
+//!    hence these tests restart before closing the socket. Holding the slot
+//!    open past a graceful disconnect would make resume work there too, but
+//!    it needs a timer of its own; see that function's rustdoc.
 //!
 //! The Rust SDK cannot drive this yet: it resets its `ConsensusSession` on
 //! every disconnect and re-registers under a fresh identity (the
@@ -120,9 +122,20 @@ async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     let (mut stream, session) = register(addr).await;
     let create_stream = create_stream_payload("iggy137-dedup");
     let committed = commit_request(&mut stream, session, 1, &create_stream).await;
-    drop(stream);
 
+    // Restart BEFORE dropping the socket, because the ordering is the scenario.
+    // A crash takes the process down with the connection still open, so no
+    // `Logout` is committed and the session is still in the WAL for replay to
+    // rebuild. Closing first would model a graceful goodbye instead, and a
+    // graceful disconnect ends the session by design
+    // (`submit_disconnect_logout` releases the slot).
+    //
+    // Deterministic, not a race: the harness stops the node with SIGTERM, and
+    // the per-connection cleanup in the bus installer skips `remove_client_meta`
+    // once the bus token is triggered -- so a shutdown fires no
+    // connection-lost callback for any still-open socket.
     harness.restart_server().await.unwrap();
+    drop(stream);
 
     // The reply for request 1 was already delivered, but the client cannot
     // know that in the crash window; retrying the same id must converge on
@@ -147,9 +160,9 @@ async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
     )
     .await;
 
-    drop(stream);
-
+    // Crash ordering, see the sibling test.
     harness.restart_server().await.unwrap();
+    drop(stream);
 
     // Continuation, not retry: the session advances to the next id. A node
     // that forgot the watermark sees request 2 on an unknown session and

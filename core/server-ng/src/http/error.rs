@@ -160,6 +160,21 @@ pub(in crate::http) enum AuthError {
     /// way.
     SessionNotAccepted,
     SessionUnavailable,
+    /// The `client_id` this gateway minted already has a committed session
+    /// owned by a DIFFERENT user, so the Register was refused terminally.
+    ///
+    /// Distinct from [`Self::SessionUnavailable`] because the status code is
+    /// the whole point: 503 is about the most auto-retried status there is and
+    /// no foreign SDK special-cases it, so rendering a permanent, deterministic
+    /// refusal as 503 hands the caller's HTTP stack a retry loop it can never
+    /// escape. 409 says the id is taken and stops it.
+    SessionIdOwnedByAnotherUser,
+    /// The minted `client_id` already had a committed session for this SAME
+    /// user, so the Register rebound onto it instead of creating one. Internal
+    /// to the mint retry in `register_session` and never rendered: the caller
+    /// mints a different id. Present as a variant so the retry cannot confuse
+    /// it with a terminal cross-user refusal.
+    SessionIdTaken,
 }
 
 impl From<IggyError> for AuthError {
@@ -186,7 +201,18 @@ impl IntoResponse for AuthError {
             // Transient server condition -> 503, retryable by the CLIENT only
             // (a forwarder must not re-issue an unknown-outcome Register under
             // this node's session budget on the caller's behalf).
-            Self::SessionUnavailable => service_unavailable(),
+            // `SessionIdTaken` only escapes the mint retry when every attempt
+            // collided, which means the minter is wrong rather than unlucky --
+            // same unknown-outcome answer as a canceled Register.
+            Self::SessionUnavailable | Self::SessionIdTaken => service_unavailable(),
+            // Terminal: retrying cannot change the answer, and admitting it
+            // would run this caller's replicated ops under the entry owner's
+            // authority.
+            Self::SessionIdOwnedByAnotherUser => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::from_error(&IggyError::InvalidClientId)),
+            )
+                .into_response(),
         }
     }
 }
@@ -633,5 +659,30 @@ mod tests {
         let response = CustomError::from(IggyError::UserAlreadyExists).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key(RETRY_AFTER));
+    }
+
+    // The ownership refusal is permanent and deterministic. Rendering it as
+    // 503 would hand the caller's HTTP stack a retry loop it can never escape
+    // (no foreign SDK special-cases 503), so the status is load-bearing.
+    #[test]
+    fn owned_client_id_renders_as_terminal_conflict() {
+        let response = AuthError::SessionIdOwnedByAnotherUser.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            response.headers().get(RETRY_AFTER).is_none(),
+            "a terminal refusal must not advertise a retry"
+        );
+    }
+
+    // Its siblings stay retryable, so the split is visible in one place.
+    #[test]
+    fn unknown_outcome_registers_stay_retryable() {
+        for error in [AuthError::SessionUnavailable, AuthError::SessionNotAccepted] {
+            let status = error.into_response().status();
+            assert!(
+                status.is_server_error(),
+                "an unknown commit outcome must stay retryable, got {status}"
+            );
+        }
     }
 }
