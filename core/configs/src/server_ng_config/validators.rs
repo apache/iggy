@@ -442,6 +442,7 @@ mod tests {
         ClusterNodeConfig {
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
+            advertised_address: None,
             replica_id,
             ports: TransportPorts {
                 tcp: Some(8090 + u16::from(replica_id)),
