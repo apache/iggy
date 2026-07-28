@@ -1280,12 +1280,13 @@ impl ConsensusHeader for RepairRangeReplyHeader {
     }
 }
 
-// State transfer (metadata plane): descriptor + chunk pull frames.
-
-/// Artifact id for the metadata snapshot bytes (`snapshot.bin` content).
-pub const STATE_TRANSFER_ARTIFACT_SNAPSHOT: u8 = 0;
-/// Artifact id for the encoded client table.
-pub const STATE_TRANSFER_ARTIFACT_TABLE: u8 = 1;
+// State transfer: descriptor + chunk pull frames.
+//
+// Plane-agnostic: the descriptor's BODY carries a state manifest (see the
+// consensus crate's `state_manifest`) listing N artifacts, and the chunk
+// frames address bytes by `(manifest index, offset)`. The metadata plane
+// ships two artifacts (snapshot + client table); the partition plane ships
+// its own set (segment logs, offsets) through the same frames.
 
 // RequestStateTransferHeader - restarted replica -> current primary
 
@@ -1349,11 +1350,12 @@ impl ConsensusHeader for RequestStateTransferHeader {
 
 /// The transfer target descriptor.
 ///
-/// Carries artifact lengths + checksums and the frontiers the receiver
-/// installs at. `available == 0` means the serving peer cannot serve right
-/// now (not a caught-up primary, or it has never checkpointed, so the
-/// requester's journal repair can cover the whole gap); every other field is
-/// meaningful only when `available == 1`.
+/// The artifact list rides the BODY as an encoded state manifest (`size`
+/// spans header + manifest); the header carries only the session nonce and
+/// the serving peer's applied frontier. `available == 0` means the serving
+/// peer cannot serve right now (not a caught-up primary, or it has never
+/// checkpointed, so the requester's journal repair can cover the whole gap)
+/// and the frame is header-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StateTransferTargetHeader {
@@ -1371,21 +1373,9 @@ pub struct StateTransferTargetHeader {
     /// Serving primary's applied frontier (`commit_min`) when the descriptor
     /// was built. The receiver's tail repair targets past this.
     pub commit_op: u64,
-    /// `sequence_number` of the offered snapshot; the receiver's applied
-    /// frontier after install.
-    pub snapshot_seq: u64,
-    pub snapshot_len: u64,
-    /// `XxHash3_64` over the snapshot bytes.
-    pub snapshot_checksum: u64,
-    /// Client-table mutations at or below this op are already reflected in
-    /// the offered table; the receiver's commit walk skips them.
-    pub table_frontier: u64,
-    pub table_len: u64,
-    /// `XxHash3_64` over the encoded table bytes.
-    pub table_checksum: u64,
     pub namespace: u64,
     pub available: u8,
-    pub reserved: [u8; 47],
+    pub reserved: [u8; 95],
 }
 const _: () = {
     assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
@@ -1393,7 +1383,7 @@ const _: () = {
         offset_of!(StateTransferTargetHeader, nonce)
             == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 47]>() == HEADER_SIZE);
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {
@@ -1418,6 +1408,13 @@ impl ConsensusHeader for StateTransferTargetHeader {
         if self.available > 1 {
             return Err(ConsensusError::InvalidField(
                 "available must be 0 or 1".to_string(),
+            ));
+        }
+        // Unavailable is a bare refusal; a manifest body on it would be
+        // ambiguous (which offer would the chunks belong to?).
+        if self.available == 0 && self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidField(
+                "unavailable descriptor must be header-only".to_string(),
             ));
         }
         Ok(())
@@ -1447,9 +1444,10 @@ pub struct RequestStateChunkHeader {
     pub offset: u64,
     pub namespace: u64,
     pub len: u32,
-    /// [`STATE_TRANSFER_ARTIFACT_SNAPSHOT`] or [`STATE_TRANSFER_ARTIFACT_TABLE`].
-    pub artifact: u8,
-    pub reserved: [u8; 91],
+    /// Index into the offered state manifest. Range-checked by the serving
+    /// handler against the cached offer (the header cannot know the count).
+    pub artifact: u32,
+    pub reserved: [u8; 88],
 }
 const _: () = {
     assert!(size_of::<RequestStateChunkHeader>() == HEADER_SIZE);
@@ -1457,7 +1455,7 @@ const _: () = {
         offset_of!(RequestStateChunkHeader, nonce)
             == offset_of!(RequestStateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestStateChunkHeader, reserved) + size_of::<[u8; 91]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestStateChunkHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for RequestStateChunkHeader {
@@ -1482,11 +1480,6 @@ impl ConsensusHeader for RequestStateChunkHeader {
         if self.len == 0 {
             return Err(ConsensusError::InvalidField(
                 "chunk len must be non-zero".to_string(),
-            ));
-        }
-        if self.artifact > STATE_TRANSFER_ARTIFACT_TABLE {
-            return Err(ConsensusError::InvalidField(
-                "unknown state transfer artifact".to_string(),
             ));
         }
         Ok(())
@@ -1516,9 +1509,10 @@ pub struct StateChunkHeader {
     pub nonce: u128,
     pub offset: u64,
     pub namespace: u64,
-    /// [`STATE_TRANSFER_ARTIFACT_SNAPSHOT`] or [`STATE_TRANSFER_ARTIFACT_TABLE`].
-    pub artifact: u8,
-    pub reserved: [u8; 95],
+    /// Index into the offered state manifest. Range-checked by the receiving
+    /// handler against its accepted manifest.
+    pub artifact: u32,
+    pub reserved: [u8; 92],
 }
 const _: () = {
     assert!(size_of::<StateChunkHeader>() == HEADER_SIZE);
@@ -1526,7 +1520,7 @@ const _: () = {
         offset_of!(StateChunkHeader, nonce)
             == offset_of!(StateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateChunkHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
+    assert!(offset_of!(StateChunkHeader, reserved) + size_of::<[u8; 92]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateChunkHeader {
@@ -1551,11 +1545,6 @@ impl ConsensusHeader for StateChunkHeader {
         if (self.size as usize) < HEADER_SIZE {
             return Err(ConsensusError::InvalidField(
                 "state chunk size below header size".to_string(),
-            ));
-        }
-        if self.artifact > STATE_TRANSFER_ARTIFACT_TABLE {
-            return Err(ConsensusError::InvalidField(
-                "unknown state transfer artifact".to_string(),
             ));
         }
         Ok(())

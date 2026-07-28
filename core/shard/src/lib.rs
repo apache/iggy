@@ -38,8 +38,8 @@ use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, STATE_TRANSFER_ARTIFACT_SNAPSHOT, STATE_TRANSFER_ARTIFACT_TABLE,
-    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+    StateTransferTargetHeader,
 };
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
@@ -745,16 +745,19 @@ struct MetadataRepairSession {
 /// message cap is far above this.
 const STATE_CHUNK_LEN: u32 = 256 * 1024;
 
-/// The accepted target descriptor of a state transfer, copied out of the
-/// `StateTransferTarget` frame.
-#[derive(Debug, Clone, Copy)]
-struct StateTransferTargetInfo {
-    commit_op: u64,
-    snapshot_len: u64,
-    snapshot_checksum: u64,
-    table_frontier: u64,
-    table_len: u64,
-    table_checksum: u64,
+/// One artifact of an accepted transfer target: its manifest entry plus the
+/// bytes received so far (chunks are sequential, so `buf.len()` doubles as
+/// the next request offset).
+#[derive(Debug)]
+struct ArtifactProgress {
+    entry: consensus::StateArtifact,
+    buf: Vec<u8>,
+}
+
+impl ArtifactProgress {
+    const fn complete(&self) -> bool {
+        self.buf.len() as u64 == self.entry.len
+    }
 }
 
 /// One in-flight metadata state transfer (shard 0 only): a cluster-restart
@@ -765,15 +768,16 @@ struct MetadataTransferSession {
     nonce: u128,
     /// Serving primary; also the stall re-request target.
     peer: u8,
-    /// `None` until the `StateTransferTarget` descriptor is accepted.
-    target: Option<StateTransferTargetInfo>,
-    /// Snapshot bytes received so far (chunks are sequential, so the length
-    /// doubles as the next request offset).
-    snapshot: Vec<u8>,
-    /// Encoded client-table bytes received so far.
-    table: Vec<u8>,
-    /// Ticks with no frame progress; at [`partitions::REPAIR_RETRY_TICKS`]
-    /// the missing piece is re-requested.
+    /// Serving peer's applied frontier from the accepted descriptor.
+    commit_op: u64,
+    /// Empty until the `StateTransferTarget` manifest is accepted, then one
+    /// entry per offered artifact, pulled in manifest order.
+    artifacts: Vec<ArtifactProgress>,
+    /// Whether a descriptor has been accepted (an accepted EMPTY manifest is
+    /// distinguishable from "still waiting").
+    target_accepted: bool,
+    /// Ticks with no frame progress; at the configured repair-retry
+    /// threshold the missing piece is re-requested.
     idle_ticks: u32,
 }
 
@@ -1985,9 +1989,9 @@ where
                 *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
                     nonce,
                     peer: header.replica,
-                    target: None,
-                    snapshot: Vec::new(),
-                    table: Vec::new(),
+                    commit_op: 0,
+                    artifacts: Vec::new(),
+                    target_accepted: false,
                     idle_ticks: 0,
                 });
                 tracing::info!(
@@ -2750,9 +2754,10 @@ where
             .await;
     }
 
-    /// Answer a `RequestStateTransfer`: `offer = None` sends
+    /// Answer a `RequestStateTransfer`: `offer = None` sends a header-only
     /// `available = 0` (the requester falls back to journal repair or
-    /// retries elsewhere).
+    /// retries elsewhere); an offer ships its encoded state manifest as the
+    /// frame body.
     #[allow(
         clippy::future_not_send,
         clippy::cast_possible_truncation,
@@ -2769,25 +2774,25 @@ where
     ) where
         B: MessageBus,
     {
-        let msg = Message::<StateTransferTargetHeader>::new(size_of::<StateTransferTargetHeader>())
-            .transmute_header(|_, h: &mut StateTransferTargetHeader| {
-                h.command = Command2::StateTransferTarget;
-                h.cluster = cluster;
-                h.replica = self_id;
-                h.nonce = nonce;
-                h.namespace = namespace;
-                h.size = size_of::<StateTransferTargetHeader>() as u32;
-                if let Some(offer) = offer {
-                    h.available = 1;
-                    h.commit_op = offer.commit_op;
-                    h.snapshot_seq = offer.snapshot_seq;
-                    h.snapshot_len = offer.snapshot.len() as u64;
-                    h.snapshot_checksum = state_artifact_checksum(&offer.snapshot);
-                    h.table_frontier = offer.table_frontier;
-                    h.table_len = offer.table.len() as u64;
-                    h.table_checksum = state_artifact_checksum(&offer.table);
-                }
-            });
+        let manifest = offer.map(|offer| consensus::encode_state_manifest(&offer.artifacts));
+        let total_size =
+            size_of::<StateTransferTargetHeader>() + manifest.as_ref().map_or(0, Vec::len);
+        let mut msg = Message::<StateTransferTargetHeader>::new(total_size);
+        if let Some(manifest) = &manifest {
+            msg.as_mut_slice()[size_of::<StateTransferTargetHeader>()..].copy_from_slice(manifest);
+        }
+        let msg = msg.transmute_header(|_, h: &mut StateTransferTargetHeader| {
+            h.command = Command2::StateTransferTarget;
+            h.cluster = cluster;
+            h.replica = self_id;
+            h.nonce = nonce;
+            h.namespace = namespace;
+            h.size = total_size as u32;
+            if let Some(offer) = offer {
+                h.available = 1;
+                h.commit_op = offer.commit_op;
+            }
+        });
         let _ = self
             .bus
             .send_to_replica(target, msg.into_generic().into_frozen())
@@ -2806,7 +2811,7 @@ where
         target: u8,
         nonce: u128,
         namespace: u64,
-        artifact: u8,
+        artifact: u32,
         offset: u64,
         len: u32,
     ) where
@@ -2865,9 +2870,8 @@ where
                 shard = self.id,
                 requester = header.replica,
                 commit_op = offer.commit_op,
-                snapshot_seq = offer.snapshot_seq,
-                snapshot_len = offer.snapshot.len(),
-                table_len = offer.table.len(),
+                artifacts = offer.artifacts.len(),
+                total_len = offer.artifacts.iter().map(|a| a.len).sum::<u64>(),
                 "serving metadata state transfer"
             );
             self.send_state_transfer_target(
@@ -2922,6 +2926,8 @@ where
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
+            > + metadata::stm::snapshot::RestoreSnapshotInPlace<
+                metadata::stm::snapshot::MetadataSnapshot,
             >,
     {
         /// Alloc cap per artifact: a corrupt length field must not OOM the
@@ -2965,11 +2971,27 @@ where
             return;
         }
 
-        if header.snapshot_len > ARTIFACT_LEN_MAX || header.table_len > ARTIFACT_LEN_MAX {
+        // The manifest rides the body; a well-formed available=1 descriptor
+        // always carries one (an empty manifest still encodes its envelope).
+        let manifest = match consensus::decode_state_manifest(
+            &msg.as_slice()[size_of::<StateTransferTargetHeader>()..header.size as usize],
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::error!(
+                    shard = self.id,
+                    peer = header.replica,
+                    %error,
+                    "state transfer descriptor manifest undecodable; ignoring"
+                );
+                return;
+            }
+        };
+        if let Some(oversized) = manifest.iter().find(|entry| entry.len > ARTIFACT_LEN_MAX) {
             tracing::error!(
                 shard = self.id,
-                snapshot_len = header.snapshot_len,
-                table_len = header.table_len,
+                kind = oversized.kind,
+                len = oversized.len,
                 "state transfer descriptor exceeds artifact cap; ignoring"
             );
             return;
@@ -2980,23 +3002,22 @@ where
             let Some(session) = session.as_mut() else {
                 return;
             };
-            if session.target.is_some() {
+            if session.target_accepted {
                 // Duplicate descriptor (stall retry crossed the original).
                 return;
             }
-            session.target = Some(StateTransferTargetInfo {
-                commit_op: header.commit_op,
-                snapshot_len: header.snapshot_len,
-                snapshot_checksum: header.snapshot_checksum,
-                table_frontier: header.table_frontier,
-                table_len: header.table_len,
-                table_checksum: header.table_checksum,
-            });
+            session.target_accepted = true;
+            session.commit_op = header.commit_op;
             // Under ARTIFACT_LEN_MAX (checked above), so the casts hold.
             #[allow(clippy::cast_possible_truncation)]
             {
-                session.snapshot = Vec::with_capacity(header.snapshot_len as usize);
-                session.table = Vec::with_capacity(header.table_len as usize);
+                session.artifacts = manifest
+                    .iter()
+                    .map(|&entry| ArtifactProgress {
+                        entry,
+                        buf: Vec::with_capacity(entry.len as usize),
+                    })
+                    .collect();
             }
             session.idle_ticks = 0;
         }
@@ -3006,18 +3027,17 @@ where
         tracing::info!(
             shard = self.id,
             peer = header.replica,
-            snapshot_seq = header.snapshot_seq,
-            snapshot_len = header.snapshot_len,
-            table_len = header.table_len,
+            artifacts = manifest.len(),
+            total_len = manifest.iter().map(|entry| entry.len).sum::<u64>(),
             commit_op = header.commit_op,
             "state transfer target accepted; fetching"
         );
-        self.request_pending_state_chunk().await;
+        self.on_transfer_progress().await;
     }
 
-    /// Ask for the next missing chunk of the in-flight transfer (snapshot
-    /// first, then table). No-op when nothing is missing or no target is
-    /// accepted yet; also the stall-retry re-request.
+    /// Ask for the next missing chunk of the in-flight transfer (artifacts
+    /// pulled in manifest order). No-op when nothing is missing or no
+    /// manifest is accepted yet; also the stall-retry re-request.
     #[allow(clippy::future_not_send)]
     async fn request_pending_state_chunk(&self)
     where
@@ -3030,26 +3050,20 @@ where
         let request = {
             let session = self.metadata_transfer.borrow();
             session.as_ref().and_then(|session| {
-                let target = session.target.as_ref()?;
-                let (artifact, offset, remaining) =
-                    if (session.snapshot.len() as u64) < target.snapshot_len {
-                        (
-                            STATE_TRANSFER_ARTIFACT_SNAPSHOT,
-                            session.snapshot.len() as u64,
-                            target.snapshot_len - session.snapshot.len() as u64,
-                        )
-                    } else if (session.table.len() as u64) < target.table_len {
-                        (
-                            STATE_TRANSFER_ARTIFACT_TABLE,
-                            session.table.len() as u64,
-                            target.table_len - session.table.len() as u64,
-                        )
-                    } else {
-                        return None;
-                    };
+                if !session.target_accepted {
+                    return None;
+                }
+                let (index, artifact) = session
+                    .artifacts
+                    .iter()
+                    .enumerate()
+                    .find(|(_, artifact)| !artifact.complete())?;
+                let offset = artifact.buf.len() as u64;
+                let remaining = artifact.entry.len - offset;
                 #[allow(clippy::cast_possible_truncation)]
                 let len = remaining.min(u64::from(STATE_CHUNK_LEN)) as u32;
-                Some((session.nonce, session.peer, artifact, offset, len))
+                #[allow(clippy::cast_possible_truncation)]
+                Some((session.nonce, session.peer, index as u32, offset, len))
             })
         };
         if let Some((nonce, peer, artifact, offset, len)) = request {
@@ -3095,11 +3109,9 @@ where
                 .get(&header.replica)
                 .filter(|served| served.nonce == header.nonce);
             served.map_or(Some(ChunkReply::UnknownOffer), |served| {
-                let artifact_bytes = if header.artifact == STATE_TRANSFER_ARTIFACT_SNAPSHOT {
-                    &served.offer.snapshot
-                } else {
-                    &served.offer.table
-                };
+                // Manifest-index addressing: an index past the offer is a
+                // requester bug (or a stale frame) and is dropped below.
+                let artifact_bytes = served.offer.payloads.get(header.artifact as usize)?;
                 let start = header.offset as usize;
                 let end = start.saturating_add(header.len as usize);
                 artifact_bytes
@@ -3187,43 +3199,75 @@ where
             return;
         }
 
-        let complete = {
+        {
             let mut session = self.metadata_transfer.borrow_mut();
             let Some(session) = session.as_mut() else {
                 return;
             };
-            if session.nonce != header.nonce {
+            if session.nonce != header.nonce || !session.target_accepted {
                 return;
             }
-            let Some(target) = session.target else {
+            let Some(artifact) = session.artifacts.get_mut(header.artifact as usize) else {
                 return;
             };
             let payload = &msg.as_slice()[size_of::<StateChunkHeader>()..header.size as usize];
-            let (buf, expected_len) = if header.artifact == STATE_TRANSFER_ARTIFACT_SNAPSHOT {
-                (&mut session.snapshot, target.snapshot_len)
-            } else {
-                (&mut session.table, target.table_len)
-            };
             // Chunks are pulled sequentially with one in flight; anything
             // else is a duplicate or reorder and is dropped (the stall retry
             // re-requests from the current frontier).
-            if header.offset != buf.len() as u64 {
+            if header.offset != artifact.buf.len() as u64 {
                 return;
             }
-            if buf.len() as u64 + payload.len() as u64 > expected_len {
+            if artifact.buf.len() as u64 + payload.len() as u64 > artifact.entry.len {
                 tracing::warn!(
                     shard = self.id,
                     artifact = header.artifact,
-                    "state chunk overruns the declared artifact length; dropping session"
+                    "state chunk overruns the declared artifact length; dropping frame"
                 );
                 return;
             }
-            buf.extend_from_slice(payload);
+            artifact.buf.extend_from_slice(payload);
             session.idle_ticks = 0;
-            session.snapshot.len() as u64 == target.snapshot_len
-                && session.table.len() as u64 == target.table_len
-        };
+        }
+        self.on_transfer_progress().await;
+    }
 
+    /// Drive the in-flight transfer forward: request the next missing chunk,
+    /// or - once every artifact is complete - verify, decode, and install.
+    /// Shared by descriptor acceptance and chunk arrival, so a manifest whose
+    /// artifacts are already complete (all empty) installs without waiting
+    /// for a chunk that will never come.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn on_transfer_progress(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: StreamsFrontend
+            + StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = metadata::stm::result::ApplyReply,
+                Error = iggy_common::IggyError,
+            > + metadata::stm::snapshot::RestoreSnapshotInPlace<
+                metadata::stm::snapshot::MetadataSnapshot,
+            >,
+    {
+        let planes = self.plane.inner();
+        let Some(ref consensus) = planes.0.consensus else {
+            return;
+        };
+        let complete = {
+            let session = self.metadata_transfer.borrow();
+            match session.as_ref() {
+                Some(session) if session.target_accepted => {
+                    session.artifacts.iter().all(ArtifactProgress::complete)
+                }
+                _ => return,
+            }
+        };
         if !complete {
             self.request_pending_state_chunk().await;
             return;
@@ -3235,14 +3279,50 @@ where
             .borrow_mut()
             .take()
             .expect("session checked above");
-        let target = session.target.expect("target checked above");
         let peer = session.peer;
+        let commit_op = session.commit_op;
 
-        let snapshot_ok = state_artifact_checksum(&session.snapshot) == target.snapshot_checksum;
-        let table_ok = state_artifact_checksum(&session.table) == target.table_checksum;
-        let table = if snapshot_ok && table_ok {
-            match consensus::ClientTable::decode(&session.table, self.clients_table_max.get()) {
-                Ok(table) => Some(table),
+        // Per-artifact integrity, then pick the pieces this plane installs.
+        // Unknown kinds are refused rather than skipped: an artifact the
+        // serving peer thought worth shipping but this receiver cannot
+        // install would otherwise be silently dropped.
+        let mut snapshot: Option<Vec<u8>> = None;
+        let mut table: Option<(Vec<u8>, u64)> = None;
+        let mut damaged = false;
+        for (index, artifact) in session.artifacts.into_iter().enumerate() {
+            let actual = consensus::state_artifact_checksum(&artifact.buf);
+            if actual != artifact.entry.checksum {
+                tracing::error!(
+                    shard = self.id,
+                    artifact = index,
+                    kind = artifact.entry.kind,
+                    "state transfer artifact checksum mismatch"
+                );
+                damaged = true;
+                break;
+            }
+            match artifact.entry.kind {
+                consensus::artifact_kind::METADATA_SNAPSHOT => snapshot = Some(artifact.buf),
+                consensus::artifact_kind::CLIENT_TABLE => {
+                    table = Some((artifact.buf, artifact.entry.frontier));
+                }
+                kind => {
+                    tracing::error!(
+                        shard = self.id,
+                        kind,
+                        "state transfer manifest carries a kind this plane cannot install"
+                    );
+                    damaged = true;
+                    break;
+                }
+            }
+        }
+
+        let decoded = if damaged {
+            None
+        } else if let (Some(snapshot), Some((table_bytes, table_frontier))) = (snapshot, table) {
+            match consensus::ClientTable::decode(&table_bytes, self.clients_table_max.get()) {
+                Ok(table) => Some((snapshot, table, table_frontier)),
                 Err(error) => {
                     tracing::error!(shard = self.id, %error, "transferred client table undecodable");
                     None
@@ -3251,14 +3331,12 @@ where
         } else {
             tracing::error!(
                 shard = self.id,
-                snapshot_ok,
-                table_ok,
-                "state transfer artifact checksum mismatch"
+                "state transfer manifest is missing the snapshot or client table artifact"
             );
             None
         };
 
-        let Some(table) = table else {
+        let Some((snapshot, table, table_frontier)) = decoded else {
             // Damaged in transit: restart the session from scratch against
             // the same peer (fresh nonce; the peer re-offers).
             if consensus.state_transfer_stage() == consensus::StateTransferStage::Fetching {
@@ -3268,9 +3346,9 @@ where
             *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
                 nonce,
                 peer,
-                target: None,
-                snapshot: Vec::new(),
-                table: Vec::new(),
+                commit_op: 0,
+                artifacts: Vec::new(),
+                target_accepted: false,
                 idle_ticks: 0,
             });
             self.send_request_state_transfer(consensus, peer, nonce)
@@ -3279,19 +3357,17 @@ where
         };
 
         consensus.set_state_transfer_stage(consensus::StateTransferStage::Installing);
-        match planes.0.install_state_transfer(
-            &session.snapshot,
-            table,
-            target.table_frontier,
-            target.commit_op,
-        ) {
+        match planes
+            .0
+            .install_state_transfer(&snapshot, table, table_frontier, commit_op)
+        {
             Ok(snapshot_seq) => {
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
                 tracing::info!(
                     shard = self.id,
                     snapshot_seq,
-                    commit_op = target.commit_op,
-                    table_frontier = target.table_frontier,
+                    commit_op,
+                    table_frontier,
                     "metadata state transfer installed; handing tail to journal repair"
                 );
                 // Walk whatever is already walkable, then let repair fetch
@@ -3490,7 +3566,7 @@ where
                     return None;
                 }
                 session.idle_ticks = 0;
-                Some((session.peer, session.nonce, session.target.is_some()))
+                Some((session.peer, session.nonce, session.target_accepted))
             })
         };
         if let Some((peer, nonce, target_accepted)) = transfer_stalled {
@@ -3578,15 +3654,6 @@ where
         namespace: consensus.namespace(),
     };
     dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
-}
-
-/// Artifact-level integrity stamp for state transfer (descriptor checksums;
-/// chunks themselves carry none).
-fn state_artifact_checksum(bytes: &[u8]) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = twox_hash::XxHash3_64::new();
-    hasher.write(bytes);
-    hasher.finish()
 }
 
 /// Re-stamp a stored prepare with the current view before retransmission.

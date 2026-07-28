@@ -1080,14 +1080,12 @@ pub struct StateTransferOffer {
     /// Serving primary's applied frontier when the offer was built; the
     /// receiver's tail repair targets past this.
     pub commit_op: u64,
-    /// `sequence_number` of the offered snapshot bytes.
-    pub snapshot_seq: u64,
-    pub snapshot: Vec<u8>,
-    /// [`ClientTable::encode`] output.
-    pub table: Vec<u8>,
-    /// Client-table mutations at or below this op are in `table` already;
-    /// the receiver's commit walk skips them.
-    pub table_frontier: u64,
+    /// Manifest entries, index-aligned with `payloads`. Metadata plane:
+    /// `[METADATA_SNAPSHOT (frontier = sequence_number),
+    ///   CLIENT_TABLE (frontier = commit_min at encode)]`.
+    pub artifacts: Vec<consensus::StateArtifact>,
+    /// Artifact bytes, chunk-served by `(manifest index, offset)`.
+    pub payloads: Vec<Vec<u8>>,
 }
 
 impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
@@ -1127,10 +1125,19 @@ where
         let table = self.client_table.borrow().encode();
         Some(StateTransferOffer {
             commit_op,
-            snapshot_seq,
-            snapshot,
-            table,
-            table_frontier: commit_op,
+            artifacts: vec![
+                consensus::StateArtifact::for_bytes(
+                    consensus::artifact_kind::METADATA_SNAPSHOT,
+                    snapshot_seq,
+                    &snapshot,
+                ),
+                consensus::StateArtifact::for_bytes(
+                    consensus::artifact_kind::CLIENT_TABLE,
+                    commit_op,
+                    &table,
+                ),
+            ],
+            payloads: vec![snapshot, table],
         })
     }
 

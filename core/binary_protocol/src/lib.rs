@@ -75,9 +75,8 @@ pub use consensus::{
     EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
     RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, SIZE_FIELD_OFFSET, STATE_TRANSFER_ARTIFACT_SNAPSHOT,
-    STATE_TRANSFER_ARTIFACT_TABLE, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader, read_size_field, result_code, result_section_len,
+    RequestStateTransferHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, read_size_field, result_code, result_section_len,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

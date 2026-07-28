@@ -149,6 +149,11 @@ where
 
 pub mod client_table;
 pub use client_table::{CachedReply, ClientTable, CommitReply};
+pub mod state_manifest;
+pub use state_manifest::{
+    StateArtifact, StateManifestError, artifact_kind, decode_state_manifest, encode_state_manifest,
+    state_artifact_checksum,
+};
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
