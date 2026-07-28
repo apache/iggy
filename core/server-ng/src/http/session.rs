@@ -37,13 +37,21 @@ use tokio::sync::Mutex;
 ///
 /// Bounded by the shared VSR client table: HTTP sessions and the TCP/QUIC/WS
 /// virtual clients all Register into the one [`CLIENTS_TABLE_MAX`]-slot table,
-/// which LRU-evicts the oldest client when full. Capping HTTP at half that
-/// bound keeps this plane from crowding the others out and keeps the combined
-/// steady state under the shared bound, so a live idle HTTP session is not
-/// routinely evicted consensus-side. The residual eviction race (both planes
-/// busy) degrades gracefully: an evicted session's next control write is
-/// classified as an eviction and re-registers (see [`HttpInner::forget_session`]).
+/// which evicts the oldest-committed client when full. Capping HTTP at half
+/// that bound keeps this plane from crowding the others out and keeps the
+/// combined steady state under the shared bound, so a live idle HTTP session
+/// is not routinely evicted consensus-side. The non-HTTP half tracks live
+/// connections because every transport disconnect logs its session out
+/// (`submit_disconnect_logout`), so occupancy there is concurrent, not
+/// cumulative. The residual eviction race (both planes busy) degrades
+/// gracefully: an evicted session's next control write is classified as an
+/// eviction and re-registers (see [`HttpInner::forget_session`]).
 pub(in crate::http) const MAX_HTTP_SESSIONS: usize = CLIENTS_TABLE_MAX / 2;
+
+/// Watermark a brand-new client-table entry carries: no application request
+/// has committed under it yet. A fresh mint that comes back with anything else
+/// bound to an entry that already existed (see `HttpInner::register_session`).
+pub(in crate::http) const FRESH_ENTRY_WATERMARK: u64 = 0;
 
 /// First per-session request id the write path hands out. VSR request numbers
 /// are 1-based and strictly increasing within a session.

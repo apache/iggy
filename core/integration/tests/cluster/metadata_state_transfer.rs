@@ -74,11 +74,13 @@ async fn given_checkpointed_cluster_when_node_restarts_should_state_transfer_met
     // Functional: the session (registered below every snapshot floor by now)
     // still continues cluster-wide.
     let addrs = tcp_addrs(harness);
+    // A continuation is a fresh op, so there is no cached reply to compare.
     resume_request(
         &addrs,
         session,
         OPS_BEFORE_RESTART + 1,
         &create_stream_payload("iggy-transfer-continuation"),
+        None,
     )
     .await;
 

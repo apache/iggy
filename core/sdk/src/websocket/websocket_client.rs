@@ -774,11 +774,7 @@ impl WebSocketClient {
                     // Server could not commit yet but answered with a complete
                     // frame; the lockstep stream is in sync, so replay the same
                     // request id on this connection after a short pause.
-<<<<<<< Updated upstream
                     Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
-=======
-                    Err(IggyError::TransientNotCommitted)
->>>>>>> Stashed changes
                         if tokio::time::Instant::now() < retry_deadline =>
                     {
                         let remaining =

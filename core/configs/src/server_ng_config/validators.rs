@@ -26,7 +26,6 @@
 //! net.
 
 use super::COMPONENT_NG;
-use super::cluster::http_forwarding_key_material;
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
@@ -138,21 +137,29 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // Without key material forwarding is disabled (followers answer a
-        // transient 503) and the server still boots, so it is not required
-        // here. When it IS present the operator opted into forwarding, and the
-        // roster must support it: a node listed without an http port would
-        // silently degrade every forward through it to a fail-closed 503.
-        let http_forwarding_active =
-            self.http.enabled && http_forwarding_key_material(&self.http.jwt, &self.cluster);
-        if http_forwarding_active {
+        // Cluster mode has no port fallbacks: the roster is the single source
+        // of listener ports, so every enabled transport needs an explicit
+        // per-node port. Falling back to the port of a transport's top-level
+        // `address` would hand two same-host nodes the same socket and fail
+        // only at bind time, and a portless node would silently degrade every
+        // follower-to-primary HTTP forward through it to a fail-closed 503.
+        if self.cluster.enabled {
             for node in &self.cluster.nodes {
-                if node.ports.http.is_none() {
-                    eprintln!(
-                        "cluster node '{}' has no ports.http; every node needs one when http.enabled so followers can forward to the primary",
-                        node.name
-                    );
-                    return Err(ConfigurationError::InvalidConfigurationValue);
+                let required_ports = [
+                    ("tcp", true, node.ports.tcp),
+                    ("quic", self.quic.enabled, node.ports.quic),
+                    ("http", self.http.enabled, node.ports.http),
+                    ("websocket", self.websocket.enabled, node.ports.websocket),
+                    ("tcp_replica", true, node.ports.tcp_replica),
+                ];
+                for (transport, enabled, port) in required_ports {
+                    if enabled && port.is_none() {
+                        eprintln!(
+                            "cluster node '{}' has no ports.{transport}; cluster mode requires an explicit roster port for every enabled transport",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
                 }
             }
         }
@@ -435,12 +442,13 @@ mod tests {
         ClusterNodeConfig {
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
+            advertised_address: None,
             replica_id,
             ports: TransportPorts {
                 tcp: Some(8090 + u16::from(replica_id)),
-                quic: None,
+                quic: Some(8080 + u16::from(replica_id)),
                 http,
-                websocket: None,
+                websocket: Some(8070 + u16::from(replica_id)),
                 tcp_replica: Some(9090 + u16::from(replica_id)),
             },
         }
@@ -466,11 +474,35 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    // Without key material forwarding is off, so the roster http-port
-    // requirement does not apply either.
+    // Cluster mode has no port fallbacks, so a portless roster node is
+    // invalid even when forwarding is off (keyless).
     #[test]
-    fn validate_accepts_keyless_cluster_http_with_portless_roster_node() {
+    fn validate_rejects_keyless_cluster_http_with_portless_roster_node() {
         let cfg = clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    // The explicit-port rule covers every enabled transport, not just http.
+    #[test]
+    fn validate_rejects_cluster_node_without_port_for_enabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = true;
+        cfg.cluster.nodes[1].ports.quic = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    // A disabled transport never binds, so its roster port may stay unset.
+    #[test]
+    fn validate_accepts_cluster_node_without_port_for_disabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = false;
+        cfg.cluster.nodes[1].ports.quic = None;
         assert!(cfg.validate().is_ok());
     }
 
@@ -494,14 +526,5 @@ mod tests {
         cfg.cluster.auth.enabled = true;
         cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_cluster_http_when_a_roster_node_has_no_http_port() {
-        let mut cfg =
-            clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
-        cfg.cluster.auth.enabled = true;
-        cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
-        assert!(cfg.validate().is_err());
     }
 }

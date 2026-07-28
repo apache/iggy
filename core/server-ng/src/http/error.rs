@@ -25,6 +25,7 @@ use axum::Json;
 use axum::http::header::{LOCATION, RETRY_AFTER};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use configs::ng_cluster::{AdvertisedAddress, ClusterNodeConfig};
 use iggy_binary_protocol::Operation;
 use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
@@ -160,6 +161,21 @@ pub(in crate::http) enum AuthError {
     /// way.
     SessionNotAccepted,
     SessionUnavailable,
+    /// The `client_id` this gateway minted already has a committed session
+    /// owned by a DIFFERENT user, so the Register was refused terminally.
+    ///
+    /// Distinct from [`Self::SessionUnavailable`] because the status code is
+    /// the whole point: 503 is about the most auto-retried status there is and
+    /// no foreign SDK special-cases it, so rendering a permanent, deterministic
+    /// refusal as 503 hands the caller's HTTP stack a retry loop it can never
+    /// escape. 409 says the id is taken and stops it.
+    SessionIdOwnedByAnotherUser,
+    /// The minted `client_id` already had a committed session for this SAME
+    /// user, so the Register rebound onto it instead of creating one. Internal
+    /// to the mint retry in `register_session` and never rendered: the caller
+    /// mints a different id. Present as a variant so the retry cannot confuse
+    /// it with a terminal cross-user refusal.
+    SessionIdTaken,
 }
 
 impl From<IggyError> for AuthError {
@@ -186,7 +202,18 @@ impl IntoResponse for AuthError {
             // Transient server condition -> 503, retryable by the CLIENT only
             // (a forwarder must not re-issue an unknown-outcome Register under
             // this node's session budget on the caller's behalf).
-            Self::SessionUnavailable => service_unavailable(),
+            // `SessionIdTaken` only escapes the mint retry when every attempt
+            // collided, which means the minter is wrong rather than unlucky --
+            // same unknown-outcome answer as a canceled Register.
+            Self::SessionUnavailable | Self::SessionIdTaken => service_unavailable(),
+            // Terminal: retrying cannot change the answer, and admitting it
+            // would run this caller's replicated ops under the entry owner's
+            // authority.
+            Self::SessionIdOwnedByAnotherUser => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::from_error(&IggyError::InvalidClientId)),
+            )
+                .into_response(),
         }
     }
 }
@@ -500,39 +527,56 @@ pub(in crate::http) fn primary_redirect_location(
     scheme: &str,
     path_and_query: &str,
 ) -> Option<String> {
-    let socket = primary_http_socket(roster, primary_index)?;
-    Some(format!("{scheme}://{socket}{path_and_query}"))
+    let authority = primary_advertised_http_authority(roster, primary_index)?;
+    Some(format!("{scheme}://{authority}{path_and_query}"))
 }
 
 /// Resolve the VSR primary's HTTP socket from the static roster: the node
-/// whose `replica_id` equals `primary_index`, its `ports.http`, and its `ip`
-/// parsed strictly. `None` on any miss so callers fail closed. Formatting the
-/// returned [`SocketAddr`] brackets an IPv6 host (`[::1]:8080`) rather than
-/// leaving it ambiguous.
+/// whose `replica_id` equals `primary_index`, its `ports.http`, and its private
+/// roster `ip` parsed strictly. Internal replica forwarding uses this address.
 pub(in crate::http) fn primary_http_socket(
     roster: &ClusterRoster,
     primary_index: u8,
 ) -> Option<SocketAddr> {
+    let (node, http_port) = primary_node(roster, primary_index)?;
+    let ip = node.ip.parse::<IpAddr>().ok()?;
+    Some(SocketAddr::new(ip, http_port))
+}
+
+/// Resolve the client-facing HTTP authority (`host:port`) for a redirect. The
+/// advertised address is preferred, with the private roster IP retained as
+/// the compatibility fallback. [`AdvertisedAddress::authority`] brackets IPv6
+/// hosts and passes hostnames through, so the redirect URL stays valid; a
+/// host that is neither a valid IP nor a valid hostname yields `None` so
+/// callers fail closed.
+fn primary_advertised_http_authority(roster: &ClusterRoster, primary_index: u8) -> Option<String> {
+    let (node, http_port) = primary_node(roster, primary_index)?;
+    let host = node.advertised_address.as_deref().unwrap_or(&node.ip);
+    let address = host.parse::<AdvertisedAddress>().ok()?;
+    Some(address.authority(http_port))
+}
+
+fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ClusterNodeConfig, u16)> {
     let node = roster
         .nodes
         .iter()
         .find(|node| node.replica_id == primary_index)?;
     let http_port = node.ports.http?;
-    let ip = node.ip.parse::<IpAddr>().ok()?;
-    Some(SocketAddr::new(ip, http_port))
+    Some((node, http_port))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use configs::ng_cluster::{ClusterNodeConfig, TransportPorts};
+    use configs::ng_cluster::TransportPorts;
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
             name: format!("node-{replica_id}"),
             ip: ip.to_owned(),
+            advertised_address: None,
             replica_id,
             ports: TransportPorts {
                 tcp: None,
@@ -615,6 +659,42 @@ mod tests {
     }
 
     #[test]
+    fn primary_redirect_location_uses_advertised_address() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("2001:db8::1".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            Some("https://[2001:db8::1]:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_uses_advertised_hostname() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("broker-1.example.com".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            Some("https://broker-1.example.com:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_http_socket_uses_private_roster_ip() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("203.0.113.1".to_owned());
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_http_socket(&roster, 0),
+            Some("10.0.0.1:8080".parse().expect("valid socket address"))
+        );
+    }
+
+    #[test]
     fn transient_not_committed_renders_503_with_retry_after() {
         let response = CustomError::from(IggyError::TransientNotCommitted).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -633,5 +713,30 @@ mod tests {
         let response = CustomError::from(IggyError::UserAlreadyExists).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key(RETRY_AFTER));
+    }
+
+    // The ownership refusal is permanent and deterministic. Rendering it as
+    // 503 would hand the caller's HTTP stack a retry loop it can never escape
+    // (no foreign SDK special-cases 503), so the status is load-bearing.
+    #[test]
+    fn owned_client_id_renders_as_terminal_conflict() {
+        let response = AuthError::SessionIdOwnedByAnotherUser.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            response.headers().get(RETRY_AFTER).is_none(),
+            "a terminal refusal must not advertise a retry"
+        );
+    }
+
+    // Its siblings stay retryable, so the split is visible in one place.
+    #[test]
+    fn unknown_outcome_registers_stay_retryable() {
+        for error in [AuthError::SessionUnavailable, AuthError::SessionNotAccepted] {
+            let status = error.into_response().status();
+            assert!(
+                status.is_server_error(),
+                "an unknown commit outcome must stay retryable, got {status}"
+            );
+        }
     }
 }

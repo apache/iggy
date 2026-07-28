@@ -1275,7 +1275,6 @@ pub(crate) fn build_login_register_reply(
     user_id: u32,
 ) -> Message<ReplyHeader> {
     // Result-framed like every metadata reply: a zero result-count (success)
-<<<<<<< Updated upstream
     // followed by the `LoginRegisterResponse` payload. A transient Register
     // instead ships a `[count=1][index=0][TransientNotCommitted]` frame
     // (`build_transient_reply`), which the SDK decodes and replays. The matching
@@ -1291,28 +1290,11 @@ pub(crate) fn build_login_register_reply(
     body.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
     body.extend_from_slice(&payload);
     build_reply_from_bytes(
-=======
-    // followed by the `[user_id][session]` payload. A transient Register instead
-    // ships a `[count=1][index=0][TransientNotCommitted]` frame
-    // (`build_transient_reply`), which the SDK decodes and replays. The matching
-    // strip is in the SDK `split_metadata_result` (Register is result-framed).
-    build_reply_with_body(
->>>>>>> Stashed changes
         request_header,
         client_id,
         session,
         commit,
-<<<<<<< Updated upstream
         &Bytes::from(body),
-=======
-        RESULT_COUNT_LEN + 12,
-        |body| {
-            body[..RESULT_COUNT_LEN].copy_from_slice(&0u32.to_le_bytes());
-            body[RESULT_COUNT_LEN..RESULT_COUNT_LEN + 4].copy_from_slice(&user_id.to_le_bytes());
-            body[RESULT_COUNT_LEN + 4..RESULT_COUNT_LEN + 12]
-                .copy_from_slice(&session.to_le_bytes());
-        },
->>>>>>> Stashed changes
     )
 }
 
@@ -1385,7 +1367,6 @@ pub(crate) fn build_raw_pat_reply(
         return Ok(committed);
     }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
-<<<<<<< Updated upstream
     let response = RawPersonalAccessTokenResponse { token };
     // The SDK strips a leading result section from every metadata reply
     // (`split_metadata_result`), so the spliced body must carry the success
@@ -1394,19 +1375,6 @@ pub(crate) fn build_raw_pat_reply(
     let mut body = BytesMut::with_capacity(RESULT_COUNT_LEN + response.encoded_size());
     body.put_u32_le(0);
     response.encode(&mut body);
-=======
-    let token_payload = RawPersonalAccessTokenResponse { token }.to_bytes();
-    // Metadata reply bodies are framed `[result_count:u32][payload]`; a success
-    // is `count == 0` followed by the payload (see `ApplyReply::write_reply_body`
-    // / `result_code`). The committed reply carried an empty payload with this
-    // same framing, so reproduce it here - prepend the zero result-count rather
-    // than shipping a bare `RawPersonalAccessTokenResponse`, which the client
-    // would misread as the result-count and reject as a bogus error.
-    let mut framed = Vec::with_capacity(RESULT_COUNT_LEN + token_payload.len());
-    framed.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
-    framed.extend_from_slice(&token_payload);
-    let body = Bytes::from(framed);
->>>>>>> Stashed changes
     let reply = build_reply_from_bytes(
         request_header,
         request_header.client,

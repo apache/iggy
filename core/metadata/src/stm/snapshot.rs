@@ -408,7 +408,10 @@ mod tests {
                                 purge_generation: 0,
                             }],
                             consumer_groups: Vec::new(),
-                            next_consumer_group_id: 1,
+                            // Nonzero and distinct from every id above so the
+                            // roundtrip assert below proves the field survives
+                            // instead of matching a default.
+                            next_consumer_group_id: 5,
                         },
                     )],
                 },
@@ -435,6 +438,9 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
+        // the field were dropped from the wire format, so pin its survival.
+        assert_eq!(topic.next_consumer_group_id, 5);
     }
 
     #[test]

@@ -25,15 +25,11 @@ use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
-    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, EvictionContext, Pipeline,
-    PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
-    RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
-    apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-<<<<<<< Updated upstream
-    build_reply_message_with, build_result_rejection_reply, emit_sim_event,
-=======
-    build_reply_message_with, build_transient_reply, drain_committable_prefix, emit_sim_event,
->>>>>>> Stashed changes
+    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, CommitReply, Consensus,
+    EvictionContext, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome,
+    Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
+    ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane, build_eviction_message,
+    build_reply_message, build_reply_message_with, build_result_rejection_reply, emit_sim_event,
     fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
     register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
@@ -56,6 +52,7 @@ use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::iobuf::{Frozen, Owned};
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
@@ -403,6 +400,21 @@ impl Drop for LocalGateGuard<'_> {
 /// [`IggyMetadata::submit_request_in_process`], and
 /// [`IggyMetadata::submit_delete_personal_access_token_in_process`]. Every variant is
 /// transient: the caller retries on a later attempt, and the login/register
+/// A committed bind, as returned by
+/// [`IggyMetadata::submit_register_in_process`].
+///
+/// `epoch` is the fence the client must echo in the wire `session` field
+/// (the register's commit op). `watermark` is the entry's highest committed
+/// request number: 0 for a fresh session, the inherited value on a resume.
+/// Callers that kept their own counter can ignore it; the HTTP gateway --
+/// whose counter lives in the process that restarted -- seeds its
+/// per-session numbering at `watermark + 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundSession {
+    pub epoch: u64,
+    pub watermark: u64,
+}
+
 /// handler wraps them in `LoginRegisterError::Transient` so the SDK
 /// read-timeout replays.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +435,28 @@ pub enum MetadataSubmitError {
     /// the pipeline). The caller retries; the SDK read-timeout replay reaches
     /// the new primary.
     Canceled,
+    /// The presented `client_id` already has a table entry owned by a
+    /// DIFFERENT user. TERMINAL, unlike every sibling: retrying cannot help,
+    /// and admitting it would run the caller's replicated ops under the
+    /// entry owner's authority (`resolve_acting_user_id` reads the table).
+    ///
+    /// Reachable two ways, both of which this refusal closes:
+    /// - a caller authenticating with its own valid credentials while
+    ///   presenting someone else's `client_id` (the login frame's `client`
+    ///   field is caller-supplied);
+    /// - after a restart, when WAL-replay recovery has rebuilt entries under
+    ///   the previous boot's ids while the HTTP id minter restarts at 1, so
+    ///   an honest login lands on a recovered entry owned by another user.
+    ClientIdOwnedByAnotherUser,
+}
+
+impl MetadataSubmitError {
+    /// Whether a retry (here, or against another replica) could succeed.
+    /// Every variant is transient by contract except the ownership refusal.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        !matches!(self, Self::ClientIdOwnedByAnotherUser)
+    }
 }
 
 impl std::fmt::Display for MetadataSubmitError {
@@ -433,6 +467,9 @@ impl std::fmt::Display for MetadataSubmitError {
             Self::PipelineFull => f.write_str("metadata prepare queue is full"),
             Self::InProgress => f.write_str("another in-flight prepare from this client"),
             Self::Canceled => f.write_str("view change canceled the pending prepare"),
+            Self::ClientIdOwnedByAnotherUser => {
+                f.write_str("client id already registered to a different user")
+            }
         }
     }
 }
@@ -575,8 +612,30 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     /// committed session state. (State transfer replaces a LIVE table via
     /// [`IggyMetadata::install_state_transfer`], which also stamps the
     /// frontier.)
-    pub fn install_client_table(&self, client_table: ClientTable) {
-        *self.client_table.borrow_mut() = client_table;
+    ///
+    /// Refuses (leaving the live table in place) when the current table
+    /// already holds sessions, which means a client registered before recovery
+    /// installed its table. Dropping those entries would leave each client
+    /// holding an epoch the table no longer knows, so its next request reads
+    /// as `NoSession`. A refusal is deliberately not a panic: this runs on the
+    /// boot path, where taking the node down is a worse outcome than booting
+    /// with the sessions it already has.
+    ///
+    /// # Returns
+    /// `true` when the recovered table was installed.
+    pub fn install_client_table(&self, client_table: ClientTable) -> bool {
+        let mut current = self.client_table.borrow_mut();
+        if current.count() > 0 {
+            error!(
+                live_sessions = current.count(),
+                recovered_sessions = client_table.count(),
+                "install_client_table: refusing to replace a table that already holds sessions; \
+                 keeping the live one"
+            );
+            return false;
+        }
+        *current = client_table;
+        true
     }
 
     /// Client-table mutations at or below the frontier are already in the
@@ -658,13 +717,14 @@ where
         let request = message.header().request;
         let request_checksum = message.header().request_checksum;
         let operation = message.header().operation;
+        let user_id = message.header().user_id;
 
         // Preflight first: dedup, eviction sends, cached-reply replay all
         // must run regardless of pipeline pressure. Wire-path ingress has no
         // home-shard transport context, so resends fall back to the
         // consensus-plane (best-effort by VSR id).
         let dispatch = if operation == Operation::Register {
-            register_preflight(consensus, &self.client_table, client_id).await
+            register_preflight(consensus, &self.client_table, client_id, user_id)
         } else {
             let outcome = request_preflight(
                 consensus,
@@ -789,7 +849,6 @@ where
         // Durable here but not yet committed, and the primary is retransmitting
         // it: our original PrepareOk was lost (e.g. the primary's inbox
         // overflowed under a client burst). Re-forward the tail down the chain
-<<<<<<< Updated upstream
         // so a downstream replica that missed it recovers, then re-ack ONLY
         // the retransmitted op. The primary's retransmit cycle walks every
         // un-acked op in the window (`retransmit_targets`), so a lost ack for
@@ -798,16 +857,6 @@ where
         // backups, which can overflow the primary's inbox -- the very failure
         // this path recovers from. Both downstream and primary are idempotent
         // on a duplicate (replica, op).
-=======
-        // so a downstream replica that missed it recovers, then re-ack every
-        // op in our uncommitted prepared suffix - not just this one. Acks are
-        // tracked per-op (see `ack_quorum_reached`), and the primary's commit
-        // frontier only advances over a contiguous quorum-acked prefix, so a
-        // lost ack for a lower op keeps that prefix pinned even after we re-ack
-        // the tail. Re-acking the whole suffix the backup holds restores
-        // quorum on the gap. Bounded by the pipeline depth; both downstream
-        // and primary are idempotent on a duplicate (replica, op).
->>>>>>> Stashed changes
         #[allow(clippy::cast_possible_truncation)]
         if journal.handle().header(header.op as usize).is_some() {
             warn!(
@@ -818,23 +867,10 @@ where
                 op = header.op,
                 commit = consensus.commit_max(),
                 operation = ?header.operation,
-<<<<<<< Updated upstream
                 "journal already holds prepare, re-forwarding + re-acking it"
             );
             self.replicate(&message).await;
             self.send_prepare_ok(&header).await;
-=======
-                "journal already holds prepare, re-forwarding + re-acking suffix"
-            );
-            self.replicate(&message).await;
-            for op in (consensus.commit_max() + 1)..=header.op {
-                if let Some(suffix_header) =
-                    journal.handle().header(op as usize).map(|header| *header)
-                {
-                    self.send_prepare_ok(&suffix_header).await;
-                }
-            }
->>>>>>> Stashed changes
             return;
         }
 
@@ -1178,44 +1214,83 @@ where
     /// Submit `Register` from in-process, await commit. Wire reply still fires
     /// via `message_bus.send_to_client`; subscriber is additive.
     ///
+    /// Every bind proposes -- there is deliberately no fast path returning an
+    /// existing entry's state. A bind is a fencing event: only a committed
+    /// Register moves the entry's epoch (to the register's commit op), and
+    /// that bump is what fences the previous holder of this session
+    /// (`RequestStatus::Fenced`). Short-circuiting a rebind would leave two
+    /// live holders sharing one fence, the zombie scenario the epoch exists
+    /// to kill. Rebinding onto an existing entry preserves its watermark and
+    /// reply ring, which is how session resume works.
+    ///
     /// # Returns
-    /// Session number (= commit op). Idempotent: existing session short-circuits.
+    /// [`BoundSession`]: the fence epoch the client must stamp into `session`,
+    /// plus the entry's current watermark so a caller that lost its position
+    /// (the HTTP gateway after a restart) can resume numbering above it.
     ///
     /// # Errors
-    /// [`MetadataSubmitError`] (all transient): `NotPrimary`, `NotCaughtUp`,
-    /// `PipelineFull`, `InProgress`, `Canceled`. `Canceled` dominates on view
-    /// change; new primary inherits via `commit_journal`, SDK retries.
+    /// [`MetadataSubmitError`]. All transient except
+    /// `ClientIdOwnedByAnotherUser`, which is terminal: `NotPrimary`,
+    /// `NotCaughtUp`, `PipelineFull`, `InProgress`, `Canceled`. `Canceled`
+    /// dominates on view change; the new primary inherits via
+    /// `commit_journal` and the SDK retries.
     ///
     /// # Panics
     /// On `client_id == 0` or shard without consensus.
     ///
     /// # Safety
-    /// Catch-up gate load-bearing: dispatch with `commit_min < commit_max`
-    /// produces two register entries and panics on replay.
+    /// Catch-up gate load-bearing: a Register dispatched with
+    /// `commit_min < commit_max` can double-commit against an inherited one,
+    /// fencing the live client's fresh reply for no reason.
     #[allow(clippy::future_not_send)]
     pub async fn submit_register_in_process(
         &self,
         client_id: u128,
         user_id: u32,
-    ) -> Result<u64, MetadataSubmitError> {
+    ) -> Result<BoundSession, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let consensus = self
             .consensus
             .as_ref()
             .expect("submit_register_in_process: consensus only exists on shard 0");
 
-        // Idempotent fast path: existing entry skips pipeline + wire-reply.
-        // Returns the current epoch without bumping it; rebind-bumps-epoch
-        // (zombie fencing per reconnect) arrives with the stable-session-id
-        // auth flow, which commits a Register per bind.
-        if let Some(epoch) = self.client_table.borrow().get_epoch(client_id) {
-            return Ok(epoch);
-        }
-
         // Wrong node: waiting or queueing cannot fix that, the client must
         // re-route to the primary.
         if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Err(MetadataSubmitError::NotPrimary);
+        }
+
+        // OWNERSHIP GATE: the login frame's `client` field is caller-supplied,
+        // and `resolve_acting_user_id` resolves authority for every replicated
+        // op from this entry, so rebinding someone else's entry would run the
+        // caller's ops under that user (and `commit_register` would clobber
+        // its `user_id`). Refuse unless the authenticated user owns it.
+        // Terminal (see `ClientIdOwnedByAnotherUser`). An owned entry falls
+        // through: the rebind must commit so the epoch actually moves.
+        //
+        // Only a CAUGHT-UP primary may issue it, like both sibling readers of
+        // this table (`request_preflight` and `register_preflight`, which gate
+        // the same way): the refusal is terminal, so a lagging or diverged
+        // replica answering it would deny a legitimate login off state it has
+        // not finished applying, and the client would never learn to redirect.
+        // Not caught up therefore SKIPS the check rather than refusing -- the
+        // register goes on to park in the request queue below, and
+        // `register_preflight` re-applies this gate when the commit path
+        // promotes it, by which point the table is authoritative.
+        if is_caught_up_primary(consensus) {
+            let table = self.client_table.borrow();
+            if let Some(owner) = table.get_user_id(client_id)
+                && owner != user_id
+            {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    client_id,
+                    authenticated_user = user_id,
+                    entry_owner = owner,
+                    "refusing register: client id is registered to a different user"
+                );
+                return Err(MetadataSubmitError::ClientIdOwnedByAnotherUser);
+            }
         }
 
         // Mirror wire-path register_preflight: a racing second prepare would
@@ -1241,14 +1316,20 @@ where
             "build_register_request_message produced a header that fails validate()"
         );
 
-        // Catch-up gate (Register only: admitting one while a committed op
-        // is still unapplied risks a double-register epoch bump) or
-        // prepare queue full: absorb into the request queue instead of
-        // bouncing with a transient error. The queued
-        // entry carries this caller's reply subscriber; the commit path
-        // promotes it (`drain_request_queue_into_prepares`, which re-runs
-        // `register_preflight`) as soon as the in-flight batch drains, and
-        // the await below resolves exactly like the direct dispatch would.
+        // Fence floor, snapshotted BEFORE dispatch. This register's op is
+        // assigned above the journal tail, so it is strictly greater than
+        // `commit_max` is now -- which is what lets the cancel path below tell
+        // OUR fence from an older entry's that happened to survive.
+        let epoch_floor = consensus.commit_max();
+
+        // Not caught up (admitting a register while a committed op is still
+        // unapplied risks a double-register fence bump) or prepare queue full:
+        // absorb into the request queue instead of bouncing with a transient
+        // error. The queued entry carries this caller's reply subscriber; the
+        // commit path promotes it (`drain_request_queue_into_prepares`, which
+        // re-runs `register_preflight` and so applies the ownership gate) as
+        // soon as the in-flight batch drains, and the await below resolves
+        // exactly like the direct dispatch would.
         if !is_caught_up_primary(consensus) || consensus.pipeline().borrow().is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
             if consensus
@@ -1261,21 +1342,15 @@ where
                 return Err(MetadataSubmitError::PipelineFull);
             }
             return match receiver.await {
-                // The commit's `commit_register` minted the epoch; read it
-                // from the table (the reply header does not carry it).
-                Ok(_reply) => self
-                    .client_table
-                    .borrow()
-                    .get_epoch(client_id)
-                    .ok_or(MetadataSubmitError::Canceled),
-                // Entry dropped before commit: view-change reset or a
-                // promotion-time preflight rejection. Same re-check as the
-                // direct path's cancel arm below.
-                Err(Canceled) => self
-                    .client_table
-                    .borrow()
-                    .get_epoch(client_id)
-                    .ok_or(MetadataSubmitError::Canceled),
+                // The reply's `commit` IS the fence `commit_register` just
+                // stored (`build_reply_message` stamps it from the prepare's
+                // op), so take it from there rather than re-reading the table.
+                Ok(reply) => {
+                    self.bound_session(client_id, Some(reply.header().commit), epoch_floor)
+                }
+                // Entry dropped before commit: view-change reset, or a
+                // promotion-time preflight rejection.
+                Err(Canceled) => self.bound_session(client_id, None, epoch_floor),
             };
         }
         // `prepare_request` only fails on `!is_client_allowed`; Register is
@@ -1286,26 +1361,100 @@ where
             .expect("Operation::Register is client-allowed; prepare projection cannot fail");
 
         match self.dispatch_prepare_and_await(consensus, prepare).await {
-            // The commit's `commit_register` minted the epoch; read it from
-            // the table (the reply header does not carry it).
-            Ok(_reply) => self
-                .client_table
-                .borrow()
+            Ok(reply) => self.bound_session(client_id, Some(reply.header().commit), epoch_floor),
+            Err(Canceled) => self.bound_session(client_id, None, epoch_floor),
+        }
+    }
+
+    /// Assemble the bind result in one table borrow.
+    ///
+    /// `committed_epoch` is `Some` when this call's own Register committed, in
+    /// which case the fence comes from the reply that carries it. `None` is the
+    /// view-change cancel path, where the fence has to be read back -- and is
+    /// only ours if it sits above `epoch_floor`. An entry at or below the floor
+    /// predates this register, so returning its epoch would hand the caller a
+    /// fence that never moved, and nothing downstream would notice: a stale
+    /// epoch satisfies `check_request`'s equality test, so there is no `Fenced`
+    /// and no `EpochAhead` to surface it. `Canceled` instead, and the retry
+    /// gets a real bind.
+    ///
+    /// `Canceled` also covers an absent entry (evicted between commit and
+    /// read).
+    fn bound_session(
+        &self,
+        client_id: u128,
+        committed_epoch: Option<u64>,
+        epoch_floor: u64,
+    ) -> Result<BoundSession, MetadataSubmitError> {
+        let table = self.client_table.borrow();
+        let epoch = committed_epoch.or_else(|| {
+            table
                 .get_epoch(client_id)
-                .ok_or(MetadataSubmitError::Canceled),
-            Err(Canceled) => {
-                // View-change cancel. Re-check is correct-by-VSR: any
-                // inherited Register applied via local commit_journal between
-                // cancel and read mints the same epoch on every replica
-                // (`commit_register` counts in apply order, deterministic).
-                // Own surviving Register would have routed through
-                // `AlreadyRegistered` against the same entry, so no "this
-                // primary vs inherited primary" split.
-                self.client_table
-                    .borrow()
-                    .get_epoch(client_id)
-                    .ok_or(MetadataSubmitError::Canceled)
+                .filter(|&epoch| epoch > epoch_floor)
+        });
+        epoch
+            .zip(table.get_watermark(client_id))
+            .map(|(epoch, watermark)| BoundSession { epoch, watermark })
+            .ok_or(MetadataSubmitError::Canceled)
+    }
+
+    /// Turn a non-`Dispatch` [`PreflightOutcome`] into the answer the home
+    /// shard writes to the originating socket, or `None` to dispatch.
+    ///
+    /// Shard 0 cannot route by the VSR consensus `client_id` (its top bits are
+    /// random, not home-shard routing bits), so the frame is returned to the
+    /// home shard rather than sent from here;
+    /// `handle_client_request` writes it by transport id, exactly like a fresh
+    /// commit.
+    fn answer_preflight(
+        consensus: &VsrConsensus<B>,
+        request_header: &RequestHeader,
+        outcome: PreflightOutcome,
+    ) -> Option<Result<Message<GenericHeader>, MetadataSubmitError>> {
+        let client_id = request_header.client;
+        match outcome {
+            PreflightOutcome::Dispatch => None,
+            PreflightOutcome::Replay(reply) => {
+                if let Some(refusal) = unreplayable_secret_refusal(
+                    request_header,
+                    &reply,
+                    consensus.commit_max(),
+                    client_id,
+                ) {
+                    return Some(Ok(refusal));
+                }
+                let owned =
+                    Owned::<{ server_common::MESSAGE_ALIGN }>::copy_from_slice(reply.as_slice());
+                Some(
+                    Message::<GenericHeader>::try_from(owned)
+                        .map_err(|_| MetadataSubmitError::Canceled),
+                )
             }
+            PreflightOutcome::Evict(reason) => {
+                let ctx = EvictionContext::from_consensus(consensus);
+                Some(Ok(
+                    build_eviction_message(ctx, client_id, reason).into_generic()
+                ))
+            }
+            // In-flight prepare from this client: replaying the same request_id
+            // is absorbed until the original commits, then served from cache.
+            PreflightOutcome::NotReady => Some(Ok(build_result_rejection_reply(
+                request_header,
+                consensus.commit_max(),
+                IggyError::TransientNotCommitted.as_code(),
+            )
+            .into_generic())),
+            // Terminal refusal with a correlated reply so the SDK surfaces the
+            // typed error instead of blocking until its read timeout.
+            PreflightOutcome::Reject(code) => Some(Ok(build_result_rejection_reply(
+                request_header,
+                consensus.commit_max(),
+                code,
+            )
+            .into_generic())),
+            // Client-bug shapes (future epoch, id reused for a different
+            // operation): replaying cannot help, so the home shard stays silent.
+            PreflightOutcome::Drop => Some(Err(MetadataSubmitError::Canceled)),
         }
     }
 
@@ -1631,7 +1780,6 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-<<<<<<< Updated upstream
         // Not-primary is transient: the same request replayed against the
         // current primary commits fine. Reply with the explicit transient
         // frame (relayed to the socket by the home shard) so the client
@@ -1651,19 +1799,6 @@ where
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotAccepted.as_code(),
-=======
-        // Not-primary / not-caught-up is transient: the same request replayed
-        // once a primary is caught up commits fine. Reply with the explicit
-        // `TransientNotCommitted` frame (relayed to the socket by the home shard)
-        // so the client replays immediately rather than waiting out its
-        // read-timeout. The frame keeps the lockstep TCP/WS stream in framing
-        // sync, so the client resends on the same connection (session intact).
-        if !is_caught_up_primary(consensus) {
-            return Ok(build_transient_reply(
-                &request_header,
-                consensus.commit_max(),
-                IggyError::TransientNotCommitted.as_code(),
->>>>>>> Stashed changes
             )
             .into_generic());
         }
@@ -1673,52 +1808,20 @@ where
         // routing), so a Replay/Evict/NotReady is returned to the home shard as
         // the reply -- `handle_client_request` writes it to the originating
         // socket by transport id, exactly like a fresh commit. Drop (client-bug
-<<<<<<< Updated upstream
         // already-applied / future-epoch) surfaces as Canceled so the home
         // shard stays silent.
-        match request_preflight(
+        let outcome = request_preflight(
             consensus,
             &self.client_table,
             client_id,
             session,
             request,
             request_checksum,
-        ) {
-=======
-        // stale/gap) surfaces as Canceled so the home shard stays silent.
-        match request_preflight(consensus, &self.client_table, client_id, session, request) {
->>>>>>> Stashed changes
-            PreflightOutcome::Dispatch => {}
-            PreflightOutcome::Replay(reply) => {
-                return server_common::Message::<GenericHeader>::try_from(
-                    server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::copy_from_slice(
-                        reply.as_slice(),
-                    ),
-                )
-                .map_err(|_| MetadataSubmitError::Canceled);
-            }
-            PreflightOutcome::Evict(reason) => {
-                let ctx = EvictionContext::from_consensus(consensus);
-                return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
-            }
-            // In-flight prepare from this client: replaying the same request_id
-            // is absorbed until the original commits, then served from cache.
-            PreflightOutcome::NotReady => {
-<<<<<<< Updated upstream
-                return Ok(build_result_rejection_reply(
-=======
-                return Ok(build_transient_reply(
->>>>>>> Stashed changes
-                    &request_header,
-                    consensus.commit_max(),
-                    IggyError::TransientNotCommitted.as_code(),
-                )
-                .into_generic());
-            }
-            PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
+        );
+        if let Some(answer) = Self::answer_preflight(consensus, &request_header, outcome) {
+            return answer;
         }
 
-<<<<<<< Updated upstream
         // Prepare queue full: backpressure, not failure. Absorb into the
         // request queue with this caller's reply subscriber; the commit
         // path promotes it as slots free up and the await below resolves
@@ -1751,16 +1854,6 @@ where
                 )
                 .into_generic()),
             };
-=======
-        // Pipeline full: backpressure, not failure. Tell the client to replay.
-        if consensus.pipeline().borrow().is_full() {
-            return Ok(build_transient_reply(
-                &request_header,
-                consensus.commit_max(),
-                IggyError::TransientNotCommitted.as_code(),
-            )
-            .into_generic());
->>>>>>> Stashed changes
         }
 
         // The acting-user RBAC stamp lives in the shared `prepare_request`
@@ -1781,11 +1874,7 @@ where
         // so reply with the transient frame rather than staying silent.
         match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.into_generic()),
-<<<<<<< Updated upstream
             Err(Canceled) => Ok(build_result_rejection_reply(
-=======
-            Err(Canceled) => Ok(build_transient_reply(
->>>>>>> Stashed changes
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotCommitted.as_code(),
@@ -1875,11 +1964,7 @@ where
         let Some(consensus) = self.consensus.as_ref() else {
             return;
         };
-<<<<<<< Updated upstream
         if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
-=======
-        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_syncing() {
->>>>>>> Stashed changes
             return;
         }
         let Some(journal) = self.journal.as_ref() else {
@@ -1912,7 +1997,6 @@ where
             return;
         }
 
-<<<<<<< Updated upstream
         // Interleave push + drain per header instead of push-all-then-drain-once:
         // each `on_ack` below can promote a full window of buffered requests
         // (`drain_request_queue_into_prepares`), and every promoted prepare
@@ -1945,14 +2029,6 @@ where
             return false;
         }
         for message in loopback.drain(..) {
-=======
-        for header in &headers {
-            self.send_prepare_ok(header).await;
-        }
-        let mut loopback = Vec::new();
-        consensus.drain_loopback_into(&mut loopback);
-        for message in loopback {
->>>>>>> Stashed changes
             match message.header().command {
                 Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
@@ -1967,7 +2043,6 @@ where
                 ),
             }
         }
-<<<<<<< Updated upstream
         true
     }
 
@@ -2058,13 +2133,10 @@ where
                 // Register: commit_register creates session, no SM.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    let in_flight =
-                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
                     self.client_table.borrow_mut().commit_register(
                         prepare_header.client,
                         prepare_header.user_id,
                         reply.clone(),
-                        in_flight,
                     );
                 }
                 reply
@@ -2105,24 +2177,15 @@ where
                     build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
                         apply.write_reply_body(dst);
                     });
-                // Cache only if session exists. Client evicted between
-                // prepare and commit: skip cache (`commit_reply` no-ops),
-                // wire reply still ships.
-                let epoch = self.client_table.borrow().get_epoch(prepare_header.client);
-                if !self.client_table_mutation_allowed(prepare_header.op) {
-                    // Already reflected in the state-transferred table.
-                } else if let Some(epoch) = epoch {
-                    self.client_table.borrow_mut().commit_reply(
-                        prepare_header.client,
-                        epoch,
-                        reply.clone(),
-                    );
-                } else {
-                    tracing::trace!(
-                        client = prepare_header.client,
-                        op = prepare_header.op,
-                        "on_ack: client evicted while being prepared; emitting reply but skipping cache"
-                    );
+                // Best-effort cache; the wire reply ships either way. Ops at
+                // or below the state-transfer frontier are already reflected
+                // in the transferred table and are skipped.
+                if self.client_table_mutation_allowed(prepare_header.op) {
+                    let outcome = self
+                        .client_table
+                        .borrow_mut()
+                        .commit_reply(prepare_header.client, reply.clone());
+                    log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
                 }
                 reply
             };
@@ -2220,12 +2283,6 @@ where
 
     /// Promote buffered requests into free prepare slots after a commit
     /// batch drains.
-=======
-    }
-
-    /// Promote up to `slots_freed` buffered requests into prepares after
-    /// `on_ack` commits a prefix.
->>>>>>> Stashed changes
     ///
     /// # Safety
     /// Re-preflight per iteration: `commit_journal` may have advanced the
@@ -2253,12 +2310,13 @@ where
             let request = req.message.header().request;
             let request_checksum = req.message.header().request_checksum;
             let operation = req.message.header().operation;
+            let user_id = req.message.header().user_id;
             // If preflight or projection rejects below, dropping `req` (and
             // the sender taken from it) wakes an in-process awaiter with
             // `Canceled`; its submit path re-checks the client table.
             let reply_sender = req.take_reply_sender();
             let dispatch = if operation == Operation::Register {
-                register_preflight(consensus, &self.client_table, client_id).await
+                register_preflight(consensus, &self.client_table, client_id, user_id)
             } else {
                 let outcome = request_preflight(
                     consensus,
@@ -2609,13 +2667,10 @@ where
                 // Register: commit_register creates session, no SM.
                 if self.client_table_mutation_allowed(header.op) {
                     let reply = build_reply_message(&header, &bytes::Bytes::new());
-                    let in_flight =
-                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
                     self.client_table.borrow_mut().commit_register(
                         header.client,
                         header.user_id,
                         reply,
-                        in_flight,
                     );
                 }
             } else if header.operation == Operation::Logout {
@@ -2645,21 +2700,17 @@ where
                 let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
                     apply.write_reply_body(dst);
                 });
-                // Cache only if session still exists. WAL replay may carry a
-                // reply for a later-evicted client; `commit_reply` no-ops.
-                let epoch = self.client_table.borrow().get_epoch(header.client);
-                if !self.client_table_mutation_allowed(header.op) {
-                    // Already reflected in the state-transferred table.
-                } else if let Some(epoch) = epoch {
-                    self.client_table
+                // Best-effort cache; WAL replay may carry a reply for a
+                // later-evicted client, and replica-local eviction makes a
+                // stale-request replay reachable. Both are skips, not faults.
+                // Ops at or below the state-transfer frontier are already
+                // reflected in the transferred table and are skipped.
+                if self.client_table_mutation_allowed(header.op) {
+                    let outcome = self
+                        .client_table
                         .borrow_mut()
-                        .commit_reply(header.client, epoch, reply);
-                } else {
-                    tracing::trace!(
-                        client = header.client,
-                        op = op,
-                        "commit_journal: client evicted while being prepared; skipping cache"
-                    );
+                        .commit_reply(header.client, reply);
+                    log_commit_reply_outcome(outcome, header.client, op);
                 }
             }
             consensus.advance_commit_min(op);
@@ -2833,11 +2884,10 @@ where
 /// Build a `TruncatePartition` request attributed to the originating client.
 ///
 /// Replicated through the standard client-request path so the commit records
-/// `(client, session, request)` in the `ClientTable`. The client numbers
-/// `DeleteSegments` in the same monotonic request sequence as every other
-/// metadata op, so attributing the truncate to an internal id (or skipping the
-/// commit) leaves a hole that fails the next op's `request == committed + 1`
-/// preflight.
+/// `(client, session, request)` in the `ClientTable` and advances that
+/// session's watermark. Attributing the truncate to an internal id (or
+/// skipping the commit) would leave this request id unrecorded, so the
+/// client's own retry of it would re-execute instead of deduping.
 ///
 /// `template` is the client's own `DeleteSegments` header: it supplies the wire
 /// `cluster` / `view` / `release` and the client's `request` number.
@@ -3021,6 +3071,86 @@ fn resolve_acting_user_id(
         .map(Some)
 }
 
+/// Surface a non-`Cached` [`CommitReply`]. Both non-cached outcomes are
+/// expected under replica-local eviction, so they are diagnostics, never
+/// faults: the wire reply already shipped and only this entry's dedup is
+/// degraded.
+fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
+    match outcome {
+        CommitReply::Cached => {}
+        CommitReply::NoEntry => tracing::trace!(
+            target: "iggy.metadata.diag",
+            client_id,
+            op,
+            "commit_reply: client evicted while being prepared; reply shipped, cache skipped"
+        ),
+        CommitReply::SkippedRegression { stored, received } => warn!(
+            target: "iggy.metadata.diag",
+            client_id,
+            op,
+            stored,
+            received,
+            "commit_reply: committed op is older than the cached entry \
+             (replica-local eviction replayed out of order); cache skipped"
+        ),
+    }
+}
+
+/// Refusal reply for a replayed request whose committed answer carried a
+/// secret the cache cannot reproduce; `None` when the cached reply is safe to
+/// replay verbatim.
+///
+/// Only `CreatePersonalAccessToken` qualifies today. Its raw secret is
+/// deliberately never replicated (minting inside the apply would re-roll
+/// `ring::rand` per replica and diverge the token index; see
+/// `CreatePersonalAccessTokenRequest::apply`), so the committed reply is
+/// `ApplyReply::ok(Bytes::new())` and the cache holds no token. The secret
+/// existed only on the wire of the original reply, spliced in by
+/// `build_raw_pat_reply`, and is unrecoverable once that reply is lost.
+/// Meanwhile the ingress rewrite has already minted a FRESH secret for the
+/// replayed frame whose hash never reached consensus, so serving the cached
+/// success would splice that orphan onto it and hand the caller a credential
+/// that authenticates against nothing.
+///
+/// `PersonalAccessTokenAlreadyExists` is the honest code: the original create
+/// committed, so the name IS taken, and the remedy it implies (delete by name,
+/// then recreate) is exactly right.
+///
+/// A cached REJECTION replays untouched: it carries no secret, so serving it
+/// is both safe and useful.
+fn unreplayable_secret_refusal(
+    request_header: &RequestHeader,
+    cached: &Frozen<{ server_common::MESSAGE_ALIGN }>,
+    commit: u64,
+    client_id: u128,
+) -> Option<Message<GenericHeader>> {
+    if request_header.operation != Operation::CreatePersonalAccessToken {
+        return None;
+    }
+    let cached_body = cached
+        .as_slice()
+        .get(size_of::<ReplyHeader>()..)
+        .unwrap_or_default();
+    if iggy_binary_protocol::result_code(cached_body) != Some(0) {
+        return None;
+    }
+    warn!(
+        target: "iggy.metadata.diag",
+        client_id,
+        request = request_header.request,
+        "refusing replayed CreatePersonalAccessToken: the committed secret is \
+         unrecoverable and a re-minted one would not match the stored hash"
+    );
+    Some(
+        build_result_rejection_reply(
+            request_header,
+            commit,
+            IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code(),
+        )
+        .into_generic(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3166,6 +3296,73 @@ mod tests {
         }
     }
 
+    // The login frame's `client` field is caller-supplied and
+    // `resolve_acting_user_id` resolves authority from the entry it names, so
+    // the register ownership gate must refuse an entry owned by another user
+    // rather than resume the caller onto it. Two shapes reach this: a caller
+    // presenting someone else's id with its own valid credentials, and an
+    // honest login landing on a recovered entry after a restart (the HTTP id
+    // minter restarts at 1 while WAL replay rebuilds the previous boot's
+    // entries).
+    #[compio::test]
+    async fn register_gate_refuses_an_entry_owned_by_another_user() {
+        const CLIENT: u128 = 1;
+        const OWNER: u32 = 7;
+        const IMPOSTOR: u32 = 9;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        md.client_table
+            .borrow_mut()
+            .commit_register(CLIENT, OWNER, register_reply(CLIENT, 1));
+
+        assert_eq!(
+            md.submit_register_in_process(CLIENT, IMPOSTOR).await,
+            Err(MetadataSubmitError::ClientIdOwnedByAnotherUser),
+            "a different user must not be resumed onto this entry"
+        );
+        assert!(
+            !MetadataSubmitError::ClientIdOwnedByAnotherUser.is_transient(),
+            "the refusal is terminal; retrying anywhere cannot help"
+        );
+        assert_eq!(
+            md.client_table.borrow().get_user_id(CLIENT),
+            Some(OWNER),
+            "the refused attempt must not rewrite the entry's owner"
+        );
+
+        // The owner itself passes the gate. Its rebind now goes through
+        // consensus (a bind is a fencing event), which this NoopBus harness
+        // never commits -- so passing the gate is observable as Pending,
+        // while a refusal resolves immediately.
+        let mut rebind = std::pin::pin!(md.submit_register_in_process(CLIENT, OWNER));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            rebind.as_mut().poll(&mut cx).is_pending(),
+            "the owner's rebind must pass the gate and dispatch"
+        );
+    }
+
     #[test]
     fn resolve_acting_user_id_stamps_from_client_table() {
         // A gated client op takes the acting user from the committed session,
@@ -3174,9 +3371,7 @@ mod tests {
         const SESSION: u64 = 10;
         const ACTING_USER: u32 = 7;
         let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
-        table.commit_register(CLIENT, ACTING_USER, register_reply(CLIENT, SESSION), |_| {
-            false
-        });
+        table.commit_register(CLIENT, ACTING_USER, register_reply(CLIENT, SESSION));
         let client_table = RefCell::new(table);
 
         match resolve_acting_user_id(Operation::CreateStream, CLIENT, &client_table) {
@@ -3288,7 +3483,6 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
-            |_| false,
         );
 
         let prepare = plane
@@ -3322,7 +3516,6 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
-            |_| false,
         );
 
         // `create_topic_request` builds the body with `message_expiry == 0`.
@@ -3373,6 +3566,139 @@ mod tests {
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
         fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    /// A replayed `CreatePersonalAccessToken` must be refused, not served from
+    /// the dedup cache: the committed secret is unrecoverable (never
+    /// replicated) and the rewrite has already minted a fresh one whose hash
+    /// never reached consensus, so replaying would hand back a credential that
+    /// authenticates against nothing. A cached REJECTION still replays -- it
+    /// carries no secret.
+    #[compio::test]
+    async fn replayed_pat_create_is_refused_but_other_replays_pass_through() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        md.client_table
+            .borrow_mut()
+            .commit_register(CLIENT, USER, register_reply(CLIENT, 1));
+
+        // Cache a committed SUCCESS for request 1 under the PAT operation,
+        // exactly as the commit path would (empty apply body + result section).
+        let pat_success = committed_reply(CLIENT, 1, Operation::CreatePersonalAccessToken, 0);
+        md.client_table
+            .borrow_mut()
+            .commit_reply(CLIENT, pat_success);
+
+        // Replaying request 1 as a PAT create must NOT return the cached
+        // success; it must refuse with the name-taken code.
+        let reply = md
+            .submit_request_in_process(pat_create_request(CLIENT, 1))
+            .await
+            .expect("refusal is a reply, not a submit error");
+        let body = &reply.as_slice()[size_of::<ReplyHeader>()..];
+        assert_eq!(
+            iggy_binary_protocol::result_code(body),
+            Some(IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code()),
+            "a replayed PAT create must be refused, never answered from cache"
+        );
+
+        // A cached REJECTION for the same operation carries no secret, so it
+        // replays untouched.
+        let rejected_code = IggyError::InvalidPersonalAccessTokenExpiry.as_code();
+        let pat_rejection = committed_reply(
+            CLIENT,
+            2,
+            Operation::CreatePersonalAccessToken,
+            rejected_code,
+        );
+        md.client_table
+            .borrow_mut()
+            .commit_reply(CLIENT, pat_rejection);
+        let reply = md
+            .submit_request_in_process(pat_create_request(CLIENT, 2))
+            .await
+            .expect("cached rejection replays");
+        let body = &reply.as_slice()[size_of::<ReplyHeader>()..];
+        assert_eq!(
+            iggy_binary_protocol::result_code(body),
+            Some(rejected_code),
+            "a cached PAT rejection is safe to replay verbatim"
+        );
+    }
+
+    /// Committed-reply fixture shaped like the commit path's output: a result
+    /// section carrying `code`, no payload.
+    fn committed_reply(
+        client: u128,
+        request: u64,
+        operation: Operation,
+        code: u32,
+    ) -> Message<ReplyHeader> {
+        let mut body = bytes::BytesMut::new();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&code.to_le_bytes());
+        let header_size = size_of::<ReplyHeader>();
+        let total = header_size + body.len();
+        let mut reply = Message::<ReplyHeader>::new(total);
+        {
+            let slice = reply.as_mut_slice();
+            slice[header_size..total].copy_from_slice(&body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<ReplyHeader>(&mut slice[..header_size]);
+            *header = ReplyHeader {
+                client,
+                request,
+                commit: request,
+                size: u32::try_from(total).unwrap(),
+                command: Command2::Reply,
+                operation,
+                ..Default::default()
+            };
+        }
+        reply
+    }
+
+    fn pat_create_request(client: u128, request: u64) -> Message<RequestHeader> {
+        let header_size = size_of::<RequestHeader>();
+        let mut message = Message::<RequestHeader>::new(header_size);
+        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut message.as_mut_slice()[..header_size],
+        );
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::CreatePersonalAccessToken,
+            size: u32::try_from(header_size).unwrap(),
+            client,
+            session: 1,
+            request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..Default::default()
+        };
+        message
     }
 
     fn create_stream_request(client: u128, request: u64, name: &str) -> Message<RequestHeader> {
@@ -3457,7 +3783,6 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
-            |_| false,
         );
 
         // Three prepares through the real primary path: pipeline entry, WAL
@@ -3607,7 +3932,6 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
-            |_| false,
         );
 
         // Fill to one op under the boundary through the real primary path,
@@ -3754,7 +4078,6 @@ mod tests {
                 client,
                 ACTING_USER,
                 register_reply(client, SESSION),
-                |_| false,
             );
         }
 
@@ -3878,7 +4201,6 @@ mod tests {
             CLIENT_B,
             ACTING_USER,
             register_reply(CLIENT_B, SESSION),
-            |_| false,
         );
 
         // B's op journaled + self-acked; park its commit mid-window.
@@ -3952,12 +4274,15 @@ mod tests {
         }
         assert_eq!(
             outcome.expect("absorbed register must resolve"),
-            Ok(1),
-            "queued register commits with the next batch; first bind mints epoch 1"
+            Ok(BoundSession {
+                epoch: 2,
+                watermark: 0
+            }),
+            "queued register commits with the next batch; the bind fences at its commit op"
         );
         assert_eq!(
             md.client_table.borrow().get_epoch(CLIENT_C),
-            Some(1),
+            Some(2),
             "entry created by the promoted register"
         );
     }
@@ -4011,7 +4336,6 @@ mod tests {
             CLIENT_B,
             ACTING_USER,
             register_reply(CLIENT_B, SESSION),
-            |_| false,
         );
 
         // B's op journaled + self-acked; park its commit driver mid-window
@@ -4083,8 +4407,14 @@ mod tests {
             }
             compio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert_eq!(outcome.expect("promoted register must resolve"), Ok(1));
-        assert_eq!(md.client_table.borrow().get_epoch(CLIENT_C), Some(1));
+        assert_eq!(
+            outcome.expect("promoted register must resolve"),
+            Ok(BoundSession {
+                epoch: 2,
+                watermark: 0
+            })
+        );
+        assert_eq!(md.client_table.borrow().get_epoch(CLIENT_C), Some(2));
         assert!(is_caught_up_primary(consensus));
     }
 }

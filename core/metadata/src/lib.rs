@@ -22,7 +22,9 @@ pub mod permissioner;
 pub mod stm;
 
 // Re-export IggyMetadata for use in other modules
-pub use impls::metadata::{CommitNotifier, IggyMetadata, MetadataSubmitError, StateTransferOffer};
+pub use impls::metadata::{
+    BoundSession, CommitNotifier, IggyMetadata, MetadataSubmitError, StateTransferOffer,
+};
 
 // Re-export MuxStateMachine for use in other modules
 pub use stm::mux::MuxStateMachine;

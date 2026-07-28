@@ -25,7 +25,6 @@ use crate::bootstrap::{ShellBus, ShellShard};
 use crate::dispatch::submit_register_on_owner;
 use crate::login_register::LoginRegisterError;
 use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
-<<<<<<< Updated upstream
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use consensus::{MetadataHandle, build_result_rejection_reply};
 use iggy_binary_protocol::PrepareHeader;
@@ -35,13 +34,6 @@ use iggy_common::defaults::{
 };
 use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
 use journal::{Journal, JournalHandle};
-=======
-use crate::session_manager::SessionManager;
-use consensus::{MetadataHandle, build_transient_reply};
-use iggy_binary_protocol::RequestHeader;
-use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
-use message_bus::MessageBus;
->>>>>>> Stashed changes
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use server_common::crypto;
@@ -229,7 +221,10 @@ where
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
     let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
-        Ok(session) => session,
+        // The wire reply carries only the fence epoch; the SDK numbers its
+        // own requests, so the bind watermark is not surfaced (see the
+        // BoundSession doc for who does consume it).
+        Ok(bound) => bound.epoch,
         Err(error) => {
             return Err(LoginRegisterError::Transient(error));
         }
@@ -314,7 +309,6 @@ pub(crate) async fn surface_login_failure<B, MJ, S>(
 /// same login on the same connection. Only call for transient errors -- see
 /// [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
-<<<<<<< Updated upstream
 async fn send_login_transient_reply<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     transport_client_id: u128,
@@ -333,18 +327,6 @@ async fn send_login_transient_reply<B, MJ, S>(
         request_header,
         commit,
         IggyError::TransientNotAccepted.as_code(),
-=======
-async fn send_login_transient_reply(
-    shard: &Rc<ServerNgShard>,
-    transport_client_id: u128,
-    request_header: &RequestHeader,
-) {
-    let commit = current_metadata_commit(shard);
-    let reply = build_transient_reply(
-        request_header,
-        commit,
-        IggyError::TransientNotCommitted.as_code(),
->>>>>>> Stashed changes
     );
     if let Err(error) = shard
         .bus

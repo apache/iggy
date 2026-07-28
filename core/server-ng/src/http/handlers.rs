@@ -1411,8 +1411,8 @@ pub(in crate::http) async fn delete_user(
 /// replicated), and verifies `current_password` against the target's stored
 /// hash. A wrong current password is not denied pre-consensus: the op still
 /// commits, carrying an empty new-password hash the replicated apply turns into
-/// an `InvalidCredentials` no-op (surfaced here as 400), so the caller's request
-/// sequence stays contiguous.
+/// an `InvalidCredentials` no-op (surfaced here as 400), so the failure is
+/// recorded against the caller's request id like any other committed outcome.
 pub(in crate::http) async fn change_password(
     State(state): State<HttpState>,
     identity: Authenticated,

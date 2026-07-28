@@ -47,10 +47,20 @@ const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 // the retry from the current ConsensusSession. If disconnect created a fresh VSR
 // client/session, the retried request gets a new (client_id, request_id) tuple, so
 // server-side deduplication cannot match a mutation that may already have committed
-// before the transport failure. The server now rebinds a transport that presents
-// its old (client, session) identity (`try_resume_session`), so the fix here is
-// to keep the ConsensusSession across reconnects and retry replicated writes
-// under the same (client_id, request_id) instead of re-registering fresh.
+// before the transport failure.
+//
+// The fix is to keep the ConsensusSession's client_id and request counter across
+// reconnects and retry replicated writes under the same (client_id, request_id)
+// instead of re-registering fresh. Resume happens through the LOGIN path: the
+// reconnecting client re-authenticates presenting its previous client_id, the
+// server verifies the authenticated user owns that entry, and the rebind commits
+// a Register that adopts the entry with its watermark and reply ring intact. Note
+// the epoch changes -- the rebind moves the fence to the new register's op -- so
+// the session field must be taken from the new login reply, not carried over.
+//
+// There is deliberately no credential-free rebind: presenting (client, session)
+// on an unauthenticated transport is refused, since that pair is a dedup key and
+// never a bearer token.
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,
@@ -274,19 +284,12 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
     // login decodes to `TransientNotCommitted` and the SDK replays it. The one
     // exception is a terminal failure, which ships an empty body (no result
     // section) and is passed through to fail the typed `LoginRegisterResponse`
-<<<<<<< Updated upstream
     // decode. `Operation::is_result_framed` is the shared source of truth with
     // the server-side encode sites; the Register empty-body-is-terminal nuance
     // is the one SDK-side addition. Other reads, data-plane ops, and Logout
     // carry no result section and pass through untouched.
     let result_framed =
         operation.is_result_framed() || (operation == Operation::Register && !body.is_empty());
-=======
-    // decode. Reads, the partition data plane, and Logout carry no result
-    // section and pass through untouched.
-    let result_framed =
-        operation.is_metadata() || (operation == Operation::Register && !body.is_empty());
->>>>>>> Stashed changes
     if !result_framed {
         return Ok(body);
     }

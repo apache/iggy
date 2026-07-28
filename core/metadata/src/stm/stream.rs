@@ -179,10 +179,11 @@ pub struct Topic {
     /// key (keyed by group id) can't be inherited by a recreated group.
     ///
     /// Ceiling: the partition-plane offset key is `u32`, so a group id must stay
-    /// within `u32::MAX` (the wire rewrite in `server-ng` truncates to u32 and
-    /// `expect`s this). ~4 billion group creates on a single topic is
-    /// unreachable in practice, but the cap is real -- past it the wire id would
-    /// wrap and could collide with a live group's offset key.
+    /// within `u32::MAX` (the wire rewrite in `server-ng` clamps past-ceiling
+    /// ids to `u32::MAX` rather than panic). ~4 billion group creates on a
+    /// single topic is unreachable in practice, but the cap is real -- past it
+    /// clamped wire ids all collide on `u32::MAX`, including with a live
+    /// group's offset key.
     pub next_consumer_group_id: u64,
 }
 
@@ -201,7 +202,7 @@ impl Default for Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         }
     }
 }
@@ -229,7 +230,7 @@ impl Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         }
     }
 
@@ -548,9 +549,9 @@ impl StateHandler for TruncatePartitionRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         // The committed form of a client `DeleteSegments`: an unresolvable
-        // target commits as a rejection, keeping the client's request
-        // sequence contiguous (`request == committed + 1`) while surfacing
-        // the typed error an empty ack would swallow.
+        // target commits as a rejection, so the outcome is recorded against
+        // the client's request id (its retry dedups) while surfacing the
+        // typed error an empty ack would swallow.
         {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
@@ -1416,7 +1417,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -1872,17 +1873,14 @@ impl StreamsInner {
                         .iter()
                         .map(|(_, group_snap)| (Arc::from(group_snap.name.as_str()), group_snap.id))
                         .collect(),
-                    next_consumer_group_id: topic_snap
-                        .next_consumer_group_id
-                        .max(
-                            topic_snap
-                                .consumer_groups
-                                .iter()
-                                .map(|(id, _)| id + 1)
-                                .max()
-                                .unwrap_or(1),
-                        )
-                        .max(1),
+                    next_consumer_group_id: topic_snap.next_consumer_group_id.max(
+                        topic_snap
+                            .consumer_groups
+                            .iter()
+                            .map(|(id, _)| id + 1)
+                            .max()
+                            .unwrap_or(0),
+                    ),
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()

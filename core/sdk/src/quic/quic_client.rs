@@ -63,17 +63,6 @@ const NAME: &str = "Iggy";
 /// under lock per send, every later request on the client.
 const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-<<<<<<< Updated upstream
-=======
-/// Per-attempt response read timeout for the same-connection transient resend
-/// loop (see `send_raw`). A replicated submit the server can't yet commit is
-/// answered with silence; rather than wait the full `RESPONSE_READ_TIMEOUT`
-/// once, abandon the unanswered bidi after this shorter interval and resend the
-/// same request on a fresh stream. Bounded overall by `RESPONSE_READ_TIMEOUT`.
-#[cfg(feature = "vsr")]
-const TRANSIENT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
-
->>>>>>> Stashed changes
 /// Backoff before replaying a request the server answered with an explicit
 /// `TransientNotCommitted` frame (not-caught-up / in-flight / pipeline-full /
 /// view-change cancel). Unlike a silent timeout, this reply arrives promptly, so
@@ -741,7 +730,6 @@ impl QuicClient {
                     crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
                 trace!("Sending a QUIC VSR request of size {request_size} with code: {code}");
-<<<<<<< Updated upstream
                 // Same-connection transient resend, gated on the EXPLICIT
                 // `TransientNotCommitted` frame only. The server answers every
                 // transient submit with that frame (it is pre-commit by
@@ -755,20 +743,6 @@ impl QuicClient {
                 // back as terminal `ConsumerOffsetNotFound`). A silent deadline
                 // expiry surfaces `Disconnected` and takes the
                 // reconnect path in `send_raw_with_response`, same as TCP.
-=======
-                // Same-connection transient resend. A replicated submit the
-                // server cannot yet commit is answered with silence - it expects
-                // the client to replay. The connection and login session are
-                // intact; only this bidi went unanswered. So abandon it after a
-                // short read timeout and resend the SAME request header (same
-                // request id, so the server dedups/commits it idempotently) on a
-                // fresh bidi, bounded overall by `RESPONSE_READ_TIMEOUT`. This
-                // needs no reconnect or relogin, so it recovers transients even
-                // with auto-login disabled. Login/register is one-shot (a replay
-                // must mint a fresh session), so it is left to the reconnect path
-                // in `send_raw_with_response` and not resent here.
-                let allow_resend = !is_login_register_code(code);
->>>>>>> Stashed changes
                 let header_bytes = bytemuck::bytes_of(&request_header);
                 let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
                 loop {
@@ -795,23 +769,14 @@ impl QuicClient {
                     if remaining.is_zero() {
                         return Err(IggyError::Disconnected);
                     }
-<<<<<<< Updated upstream
                     match QuicClient::handle_response(
                         &mut recv,
                         response_buffer_size as usize,
                         remaining,
-=======
-                    let attempt_timeout = remaining.min(TRANSIENT_RETRY_INTERVAL);
-                    match QuicClient::handle_response(
-                        &mut recv,
-                        response_buffer_size as usize,
-                        attempt_timeout,
->>>>>>> Stashed changes
                     )
                     .await
                     {
                         Ok(reply) => return Ok(reply),
-<<<<<<< Updated upstream
                         // `TransientNotCommitted` = the server replied with an
                         // explicit retry frame because it could not commit yet
                         // (not-caught-up / in-flight / pipeline-full /
@@ -829,36 +794,6 @@ impl QuicClient {
                             let remaining =
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-=======
-                        // `Disconnected` = our read timed out (server never
-                        // answered). `EmptyResponse` = the server abandoned the
-                        // bidi (finished it with no body). `TransientNotCommitted`
-                        // = the server replied with an explicit retry frame
-                        // because it could not commit yet (not-caught-up /
-                        // in-flight / pipeline-full / view-change cancel). All
-                        // three mean "resend the same request on a fresh bidi";
-                        // the session stays intact so no reconnect/relogin needed.
-                        // Login/register resends on `TransientNotCommitted` too
-                        // (nothing committed -> the same Register replays
-                        // idempotently, no fresh session needed); for the silent
-                        // paths login still falls through to the reconnect+relogin
-                        // path in `send_raw_with_response`.
-                        Err(
-                            error @ (IggyError::Disconnected
-                            | IggyError::EmptyResponse
-                            | IggyError::TransientNotCommitted),
-                        ) if (allow_resend || error == IggyError::TransientNotCommitted)
-                            && tokio::time::Instant::now() < deadline =>
-                        {
-                            // The explicit frame returns promptly (no read
-                            // timeout elapsed), so pace the replay; the silent
-                            // paths already waited out `attempt_timeout`.
-                            if error == IggyError::TransientNotCommitted {
-                                let remaining = deadline
-                                    .saturating_duration_since(tokio::time::Instant::now());
-                                tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-                            }
->>>>>>> Stashed changes
                             warn!(
                                 "QUIC request code {code} not committed (transient); resending on a new stream"
                             );
