@@ -1,0 +1,234 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""
+Tests for the TCP client configuration surface.
+
+`TcpConfig`, `TcpReconnectionConfig` and `AutoLogin` mirror the Rust SDK
+types, so most of these assert that a value set from Python survives to the
+getters and that unset fields fall back to the Rust defaults. The last class
+proves the point of the configuration: with `auto_login` set, credentials are
+replayed on connect and no manual `login_user()` is needed.
+"""
+
+from datetime import timedelta
+
+import pytest
+
+from apache_iggy import AutoLogin, IggyClient, TcpConfig, TcpReconnectionConfig
+
+from .utils import get_server_config, wait_for_ping, wait_for_server
+
+
+class TestAutoLogin:
+    """Test the credentials carried into the client."""
+
+    def test_disabled_has_no_username(self):
+        """Test that the disabled variant carries no credentials."""
+        auto_login = AutoLogin.disabled()
+
+        assert auto_login.enabled is False
+        assert auto_login.username is None
+
+    def test_username_password_exposes_username_only(self):
+        """Test that the username is readable back but the password is not."""
+        auto_login = AutoLogin.username_password("iggy", "secret")
+
+        assert auto_login.enabled is True
+        assert auto_login.username == "iggy"
+        assert "secret" not in repr(auto_login)
+
+    def test_personal_access_token_hides_the_token(self):
+        """Test that a token login exposes neither a username nor the token."""
+        auto_login = AutoLogin.personal_access_token("secret-token")
+
+        assert auto_login.enabled is True
+        assert auto_login.username is None
+        assert "secret-token" not in repr(auto_login)
+
+
+class TestTcpReconnectionConfig:
+    """Test the reconnection policy."""
+
+    def test_defaults_match_the_rust_sdk(self):
+        """Test that an unconfigured policy reconnects forever, one second apart."""
+        reconnection = TcpReconnectionConfig()
+
+        assert reconnection.enabled is True
+        assert reconnection.max_retries is None
+        assert reconnection.interval == timedelta(seconds=1)
+        assert reconnection.reestablish_after == timedelta(seconds=5)
+
+    def test_every_field_round_trips(self):
+        """Test that each configured field is readable back unchanged."""
+        reconnection = TcpReconnectionConfig(
+            enabled=False,
+            max_retries=10,
+            interval=timedelta(milliseconds=250),
+            reestablish_after=timedelta(seconds=30),
+        )
+
+        assert reconnection.enabled is False
+        assert reconnection.max_retries == 10
+        assert reconnection.interval == timedelta(milliseconds=250)
+        assert reconnection.reestablish_after == timedelta(seconds=30)
+
+    def test_arguments_are_keyword_only(self):
+        """Test that the adjacent flags cannot be passed positionally."""
+        with pytest.raises(TypeError):
+            # pyrefly: ignore  # bad-argument-count
+            TcpReconnectionConfig(True)
+
+
+class TestTcpConfig:
+    """Test the transport configuration."""
+
+    def test_defaults_match_the_rust_sdk(self):
+        """Test that an unconfigured transport matches the Rust SDK defaults."""
+        config = TcpConfig()
+
+        assert config.server_address == "127.0.0.1:8090"
+        assert config.auto_login.enabled is False
+        assert config.reconnection.enabled is True
+        assert config.heartbeat_interval == timedelta(seconds=5)
+        assert config.tls_enabled is False
+        assert config.tls_domain == ""
+        assert config.tls_ca_file is None
+        assert config.tls_validate_certificate is True
+        assert config.nodelay is False
+
+    def test_every_field_round_trips(self):
+        """Test that each configured field is readable back unchanged."""
+        config = TcpConfig(
+            server_address="localhost:8090",
+            auto_login=AutoLogin.username_password("iggy", "iggy"),
+            reconnection=TcpReconnectionConfig(max_retries=3),
+            heartbeat_interval=timedelta(seconds=15),
+            tls_enabled=True,
+            tls_domain="localhost",
+            tls_ca_file="ca.pem",
+            tls_validate_certificate=False,
+            nodelay=True,
+        )
+
+        assert config.server_address == "localhost:8090"
+        assert config.auto_login.username == "iggy"
+        assert config.reconnection.max_retries == 3
+        assert config.heartbeat_interval == timedelta(seconds=15)
+        assert config.tls_enabled is True
+        assert config.tls_domain == "localhost"
+        assert config.tls_ca_file == "ca.pem"
+        assert config.tls_validate_certificate is False
+        assert config.nodelay is True
+
+    def test_arguments_are_keyword_only(self):
+        """Test that the address cannot be passed positionally."""
+        with pytest.raises(TypeError):
+            # pyrefly: ignore  # bad-argument-count
+            TcpConfig("127.0.0.1:8090")
+
+    def test_repr_hides_the_password(self):
+        """Test that the password does not leak through repr."""
+        config = TcpConfig(auto_login=AutoLogin.username_password("iggy", "secret"))
+
+        assert "secret" not in repr(config)
+
+    @pytest.mark.parametrize(
+        "invalid_address",
+        ["", "127.0.0.1", "127.0.0.1:not-a-port", "127.0.0.1:70000", "::1:8090"],
+    )
+    def test_invalid_server_address_is_rejected(self, invalid_address: str):
+        """Test that a malformed address fails at construction, not at connect."""
+        with pytest.raises(ValueError):
+            TcpConfig(server_address=invalid_address)
+
+
+class TestClientConstruction:
+    """Test what the client constructor accepts."""
+
+    def test_accepts_a_config(self):
+        """Test that a client can be built from a config object."""
+        assert IggyClient(TcpConfig(server_address="127.0.0.1:8090")) is not None
+
+    def test_accepts_an_address(self):
+        """Test that the address form still works."""
+        assert IggyClient("127.0.0.1:8090") is not None
+
+    def test_accepts_nothing(self):
+        """Test that the default address is used when no argument is given."""
+        assert IggyClient() is not None
+
+    def test_rejects_an_invalid_address(self):
+        """Test that a malformed address is rejected."""
+        with pytest.raises(RuntimeError):
+            IggyClient("nonsense")
+
+
+@pytest.mark.integration
+class TestAutoLoginAgainstServer:
+    """Test that configured credentials are actually replayed on connect."""
+
+    @pytest.mark.asyncio
+    async def test_auto_login_authenticates_without_login_user(self, unique_name):
+        """Test that a privileged call succeeds without a manual login_user()."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(
+            TcpConfig(
+                server_address=f"{host}:{port}",
+                auto_login=AutoLogin.username_password("iggy", "iggy"),
+            )
+        )
+        await client.connect()
+        await wait_for_ping(client)
+
+        stream_name = unique_name()
+        await client.create_stream(stream_name)
+        assert await client.get_stream(stream_name) is not None
+
+    @pytest.mark.asyncio
+    async def test_without_auto_login_a_privileged_call_is_unauthenticated(
+        self, unique_name
+    ):
+        """Test that the same call fails when no credentials are configured."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(TcpConfig(server_address=f"{host}:{port}"))
+        await client.connect()
+        await wait_for_ping(client)
+
+        with pytest.raises(RuntimeError):
+            await client.create_stream(unique_name())
+
+    @pytest.mark.asyncio
+    async def test_wrong_auto_login_credentials_fail(self):
+        """Test that bad configured credentials surface as a connect failure."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(
+            TcpConfig(
+                server_address=f"{host}:{port}",
+                auto_login=AutoLogin.username_password("iggy", "invalid-password"),
+                reconnection=TcpReconnectionConfig(enabled=False),
+            )
+        )
+
+        with pytest.raises(RuntimeError):
+            await client.connect()
