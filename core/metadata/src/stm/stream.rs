@@ -549,9 +549,9 @@ impl StateHandler for TruncatePartitionRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         // The committed form of a client `DeleteSegments`: an unresolvable
-        // target commits as a rejection, keeping the client's request
-        // sequence contiguous (`request == committed + 1`) while surfacing
-        // the typed error an empty ack would swallow.
+        // target commits as a rejection, so the outcome is recorded against
+        // the client's request id (its retry dedups) while surfacing the
+        // typed error an empty ack would swallow.
         {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(TruncatePartitionResult::StreamNotFound);

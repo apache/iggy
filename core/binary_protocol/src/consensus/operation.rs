@@ -30,7 +30,8 @@ pub enum Operation {
     /// Register a client session with the cluster. Goes through the same
     /// consensus pipeline (prepare/replicate/commit) as normal operations
     /// but skips state machine dispatch at commit time, the metadata
-    /// plane calls `commit_register` directly. Session number = commit op.
+    /// plane calls `commit_register` directly, which mints the session's
+    /// fence epoch (1 at first register, +1 per rebind).
     Register = 1,
 
     /// Non-replicated client request carried in VSR framing. The concrete

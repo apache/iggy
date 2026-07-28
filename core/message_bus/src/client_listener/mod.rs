@@ -130,7 +130,7 @@ pub async fn bind_nodelay_listener(
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let listener = socket
-        .listen(128)
+        .listen(libc::SOMAXCONN)
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener
