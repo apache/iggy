@@ -47,7 +47,14 @@ impl LoginRegisterError {
     /// terminal errors with an empty reply and stays silent on transient ones.
     #[must_use]
     pub(crate) const fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Transient(_))
+        match self {
+            // Not every submit failure is retryable: the ownership refusal
+            // (presented `client_id` belongs to another user) cannot be fixed
+            // by replaying anywhere, and surfacing it as transient would make
+            // the SDK spin on it forever.
+            Self::Transient(error) => !error.is_transient(),
+            _ => true,
+        }
     }
 }
 

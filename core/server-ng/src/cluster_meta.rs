@@ -28,7 +28,7 @@
 //! leader, but the full roster is still returned). The self-synthesized single
 //! node is the cluster-disabled fallback, shared by both callers.
 
-use configs::ng_cluster::{ClusterNodeConfig, TransportPorts};
+use configs::ng_cluster::{AdvertisedAddress, ClusterNodeConfig, TransportPorts};
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
 };
@@ -106,7 +106,7 @@ impl ClusterRoster {
                 .iter()
                 .map(|node| ClusterNode {
                     name: node.name.clone(),
-                    ip: node.ip.clone(),
+                    ip: client_host(node),
                     endpoints: ports_to_endpoints(&node.ports),
                     role: role_for(primary_index, node.replica_id),
                     status: ClusterNodeStatus::Healthy,
@@ -135,6 +135,18 @@ impl ClusterRoster {
     }
 }
 
+/// Client-facing host in normalized form (lowercase hostname, canonical IP),
+/// matching what boot validation compared and what redirect URLs render, so
+/// textual config variants of one address publish identical metadata. A
+/// roster `ip` that parses as neither (boot only requires it non-empty)
+/// passes through verbatim; a configured `advertised_address` always parses,
+/// validation rejects it otherwise.
+fn client_host(node: &ClusterNodeConfig) -> String {
+    let host = node.advertised_address.as_deref().unwrap_or(&node.ip);
+    host.parse::<AdvertisedAddress>()
+        .map_or_else(|_| host.to_owned(), |address| address.to_string())
+}
+
 const fn role_for(primary_index: Option<u8>, replica_id: u8) -> ClusterNodeRole {
     match primary_index {
         Some(primary) if primary == replica_id => ClusterNodeRole::Leader,
@@ -149,4 +161,69 @@ fn ports_to_endpoints(ports: &TransportPorts) -> TransportEndpoints {
         ports.http.unwrap_or(0),
         ports.websocket.unwrap_or(0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roster(advertised_address: Option<String>) -> ClusterRoster {
+        ClusterRoster {
+            enabled: true,
+            name: "test-cluster".to_owned(),
+            nodes: vec![ClusterNodeConfig {
+                name: "node-0".to_owned(),
+                ip: "10.0.0.1".to_owned(),
+                advertised_address,
+                replica_id: 0,
+                ports: TransportPorts::default(),
+            }],
+            self_ip: "127.0.0.1".to_owned(),
+            self_ports: TransportPorts::default(),
+            metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
+        }
+    }
+
+    #[test]
+    fn cluster_metadata_uses_advertised_address_when_configured() {
+        let metadata = roster(Some("203.0.113.10".to_owned())).cluster_metadata(Some(0));
+
+        assert_eq!(metadata.nodes[0].ip, "203.0.113.10");
+    }
+
+    #[test]
+    fn cluster_metadata_falls_back_to_replica_ip() {
+        let metadata = roster(None).cluster_metadata(Some(0));
+
+        assert_eq!(metadata.nodes[0].ip, "10.0.0.1");
+    }
+
+    #[test]
+    fn cluster_metadata_normalizes_advertised_hostname_to_lowercase() {
+        let metadata = roster(Some("Broker.Example.COM".to_owned())).cluster_metadata(Some(0));
+
+        assert_eq!(metadata.nodes[0].ip, "broker.example.com");
+    }
+
+    #[test]
+    fn cluster_metadata_canonicalizes_advertised_ipv6_address() {
+        for equivalent_address in ["2001:DB8::1", "[2001:db8::1]"] {
+            let metadata = roster(Some(equivalent_address.to_owned())).cluster_metadata(Some(0));
+
+            assert_eq!(
+                metadata.nodes[0].ip, "2001:db8::1",
+                "'{equivalent_address}' must publish canonical form"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_metadata_passes_unparsable_replica_ip_verbatim() {
+        let mut cluster_roster = roster(None);
+        cluster_roster.nodes[0].ip = "iggy_node".to_owned();
+
+        let metadata = cluster_roster.cluster_metadata(Some(0));
+
+        assert_eq!(metadata.nodes[0].ip, "iggy_node");
+    }
 }
