@@ -109,7 +109,9 @@ describe('VSR consumer-group polling', () => {
     await assert.rejects(
       () => pollMessages(async () => client)(groupRequest),
       (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 5006
+        error instanceof ResponseError &&
+        error.errorCode === 5006 &&
+        error.message.includes('message: Consumer group member not found')
     );
   });
 

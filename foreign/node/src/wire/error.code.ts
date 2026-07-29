@@ -189,7 +189,7 @@ export const translateErrorCode = (code: number): string => {
     case '5003': return "Failed to close file";
     case '5004': return "Failed to delete file";
     case '5005': return "Cannot read file";
-    case '5006': return "Invalid file size";
+    case '5006': return "Consumer group member not found";
     case '5007': return "Cannot create file";
     case '5008': return "Cannot rename file";
     case '5009': return "Cannot get file info";
