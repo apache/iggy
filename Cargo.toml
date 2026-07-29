@@ -85,7 +85,10 @@ aligned-vec = "0.6.4"
 anyhow = "1.0.104"
 apache-avro = "0.21.0"
 apple-native-keyring-store = { version = "1.0.1", features = ["keychain"] }
-argon2 = "0.5.3"
+# "std" is load-bearing: it cascades to rand_core/getrandom, which the
+# crypto module's `OsRng` import needs even when no sibling crate in the
+# build graph happens to enable it via feature unification.
+argon2 = { version = "0.5.3", features = ["std"] }
 # Pinned to 57 because iceberg 0.9.1 still requires arrow/parquet 57.
 arrow = "57.3.1"
 arrow-array = "57.3.1"
