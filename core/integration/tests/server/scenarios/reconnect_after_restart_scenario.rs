@@ -621,6 +621,15 @@ async fn poll_from_zero_until(
 pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
     const RING_OVERFLOW_OPS: u32 = 4300;
     const POST_RESTART_OPS: u32 = 50;
+    // The point of this scenario is overflowing the peers' evicted ring so
+    // RangeEvicted and the commit floor engage. The harness runs the server on
+    // the shipped default ring capacity; if that default ever reaches this op
+    // count the overflow stops happening and the test silently passes without
+    // covering the floor path. Fail loud instead.
+    const _: () = assert!(
+        RING_OVERFLOW_OPS as usize > configs::ng_partition::DEFAULT_EVICTED_RING_CAPACITY,
+        "RING_OVERFLOW_OPS must exceed the default evicted ring capacity, or this scenario no longer exercises RangeEvicted",
+    );
 
     let setup_client = harness
         .root_client()

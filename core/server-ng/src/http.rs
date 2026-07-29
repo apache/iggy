@@ -95,6 +95,7 @@ pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
+    clients_table_max: usize,
     cluster: &ClusterConfig,
     system_config: Arc<NgSystemConfig>,
     self_ports: TransportPorts,
@@ -152,6 +153,7 @@ pub async fn start(
             // never consulted here.
             metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
+        max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
         in_flight_writes: Cell::new(0),
         forward,
     }));
@@ -159,8 +161,12 @@ pub async fn start(
 
     if http_config.tls.enabled {
         let server_config = tls::load_http_tls_server_config(&http_config.tls)?;
-        let (connections, pump) =
-            tls::spawn_accept_pump(listener, server_config, shard.bus.token());
+        let (connections, pump) = tls::spawn_accept_pump(
+            listener,
+            server_config,
+            shard.bus.config().handshake_grace,
+            shard.bus.token(),
+        );
         shard.bus.track_background(pump);
         info!(address = %bound_addr, "server-ng HTTPS listener started");
         let handle = compio::runtime::spawn(tls::serve(connections, router, shard.bus.token()));

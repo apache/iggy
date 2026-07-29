@@ -56,8 +56,8 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {} }}",
-            self.prepare_queue_depth, self.journal_slots,
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {} }}",
+            self.prepare_queue_depth, self.journal_slots, self.clients_table_max,
         )
     }
 }
@@ -68,9 +68,7 @@ impl Display for MessageBusConfig {
             f,
             "{{ max_batch: {}, max_message_size: {}, peer_queue_capacity: {}, \
              reconnect_period: {}, close_peer_timeout: {}, close_grace: {}, \
-             handshake_grace: {}, ws_max_message_size: {:?}, \
-             ws_max_frame_size: {:?}, ws_write_buffer_size: {:?}, \
-             ws_accept_unmasked_frames: {} }}",
+             handshake_grace: {} }}",
             self.max_batch,
             self.max_message_size,
             self.peer_queue_capacity,
@@ -78,10 +76,6 @@ impl Display for MessageBusConfig {
             self.close_peer_timeout,
             self.close_grace,
             self.handshake_grace,
-            self.ws_max_message_size,
-            self.ws_max_frame_size,
-            self.ws_write_buffer_size,
-            self.ws_accept_unmasked_frames,
         )
     }
 }
