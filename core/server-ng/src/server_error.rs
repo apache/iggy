@@ -206,7 +206,14 @@ pub struct ShardJoinFailure {
 #[derive(Debug)]
 pub enum ShardJoinFailureKind {
     Error(Box<ServerNgError>),
-    Panic { message: String },
+    Panic {
+        message: String,
+    },
+    /// The shard thread never finished inside `shutdown_join_timeout`
+    /// and was abandoned so process exit is not blocked forever.
+    Wedged {
+        waited: std::time::Duration,
+    },
 }
 
 fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
@@ -222,6 +229,13 @@ fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
             }
             ShardJoinFailureKind::Panic { message } => {
                 let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
+            }
+            ShardJoinFailureKind::Wedged { waited } => {
+                let _ = write!(
+                    out,
+                    "shard {} wedged: thread still running after {waited:?}, abandoned",
+                    failure.shard_id
+                );
             }
         }
     }

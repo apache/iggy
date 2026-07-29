@@ -130,6 +130,34 @@ async fn wrong_key_rejects_peer() {
 }
 
 #[compio::test]
+async fn rotation_window_registers_mid_roll_peers() {
+    // Step-2 mid-roll of a PSK rotation: the acceptor already signs with the
+    // new key, the dialer still signs with the old one, and each carries the
+    // other key in its verify-only window. The mutual handshake must complete
+    // in both directions.
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor(
+        &acceptor,
+        Some(ReplicaAuth::new(SECRET_B).with_previous_secret(SECRET_A)),
+    )
+    .await;
+
+    let dialer = Rc::new(IggyMessageBus::new(0));
+    spawn_dialer(
+        &dialer,
+        Some(ReplicaAuth::new(SECRET_A).with_previous_secret(SECRET_B)),
+        addr,
+    )
+    .await;
+
+    wait_until(|| dialer.replicas().contains(1), Duration::from_secs(2)).await;
+    wait_until(|| acceptor.replicas().contains(0), Duration::from_secs(2)).await;
+
+    dialer.shutdown(Duration::from_secs(2)).await;
+    acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
+#[compio::test]
 async fn enforcement_rejects_legacy_peer() {
     // Acceptor requires auth; dialer speaks the legacy (no-nonce) protocol.
     let acceptor = Rc::new(IggyMessageBus::new(0));

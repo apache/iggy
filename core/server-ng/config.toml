@@ -684,6 +684,15 @@ enabled = false
 # logs, never persisted) over storing it on disk. Ignored when enabled = false.
 shared_secret = ""
 
+# Retiring pre-shared key, accepted for verification only during a rolling key
+# rotation (this node keeps signing with shared_secret). Rotate in three rolls:
+# 1) shared_secret = old + previous_shared_secret = new on every node,
+# 2) shared_secret = new + previous_shared_secret = old on every node,
+# 3) shared_secret = new alone. Leave empty outside a rotation. Same length
+# floor and env-var preference as shared_secret
+# (IGGY_CLUSTER_AUTH_PREVIOUS_SHARED_SECRET).
+previous_shared_secret = ""
+
 # Replica-to-replica TLS for the consensus (tcp_replica) port.
 [cluster.tls]
 # When true every replica connection is wrapped in TLS 1.3 (ALPN
@@ -795,6 +804,12 @@ shutdown_drain_timeout = "10 s"
 # cost; the default keeps shutdown observably prompt without measurable
 # scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
 shutdown_poll_interval = "50 ms"
+
+# Hard wall-clock deadline for joining shard threads at process exit. A
+# shard whose pump or listener wedges past this budget is abandoned with
+# an error log instead of blocking exit forever. Must be at least
+# shutdown_drain_timeout, or shards would be abandoned mid-drain.
+shutdown_join_timeout = "30 s"
 
 # Safety-tick cadence for the partition reconciliation loop. The reconciler
 # also wakes on every metadata commit from shard 0, so this only covers
