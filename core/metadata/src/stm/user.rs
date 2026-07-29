@@ -563,7 +563,7 @@ impl StateHandler for ChangePasswordRequest {
         // `verify_and_rewrite_change_password`): the accept path always
         // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
         // here (rather than denying pre-consensus) commits the op as a no-op,
-        // keeping the client's request sequence contiguous in the ClientTable.
+        // recording the request id in the ClientTable so a retry of it dedups.
         if self.new_password.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }

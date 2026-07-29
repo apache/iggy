@@ -2,6 +2,7 @@
 .project
 .settings/
 .gradle/
+.kotlin/
 build/
 out/
 

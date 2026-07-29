@@ -88,6 +88,26 @@ fn build_server_config(
     TestServerConfig::builder().extra_envs(extra_envs).build()
 }
 
+/// These matrices exercise retrieval, not replication: a single node keeps
+/// the wide permutation set cheap under a parallel nextest run, where an
+/// oversubscribed multi-node cluster stalls past the liveness window and
+/// elects a new primary mid-scenario, killing the client session.
+fn build_harness(
+    segment_size: &str,
+    cache_indexes: &str,
+    messages_required_to_save: &str,
+) -> TestHarness {
+    TestHarness::builder()
+        .server(build_server_config(
+            segment_size,
+            cache_indexes,
+            messages_required_to_save,
+        ))
+        .cluster_nodes(1)
+        .build()
+        .unwrap()
+}
+
 #[test_matrix(
     [segment_size_512b(), segment_size_1kb(), segment_size_10mb()],
     [cache_none(), cache_all(), cache_open_segment()],
@@ -100,14 +120,7 @@ async fn get_by_offset_scenario(
     cache_indexes: &str,
     messages_required_to_save: &str,
 ) {
-    let mut harness = TestHarness::builder()
-        .server(build_server_config(
-            segment_size,
-            cache_indexes,
-            messages_required_to_save,
-        ))
-        .build()
-        .unwrap();
+    let mut harness = build_harness(segment_size, cache_indexes, messages_required_to_save);
 
     harness.start().await.unwrap();
 
@@ -126,14 +139,7 @@ async fn get_by_timestamp_scenario(
     cache_indexes: &str,
     messages_required_to_save: &str,
 ) {
-    let mut harness = TestHarness::builder()
-        .server(build_server_config(
-            segment_size,
-            cache_indexes,
-            messages_required_to_save,
-        ))
-        .build()
-        .unwrap();
+    let mut harness = build_harness(segment_size, cache_indexes, messages_required_to_save);
 
     harness.start().await.unwrap();
 

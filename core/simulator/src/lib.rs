@@ -308,11 +308,11 @@ impl Simulator {
 
     /// Init a partition with its own consensus group on every live replica.
     ///
-    /// Mirrors the reconciler's outcome without running it: the partition
-    /// materialises only on its hash-owning shard, and every shard of the
-    /// replica gets the routing row (production seeds rows through
-    /// `ReconcileOp::{InsertOwned,InsertRouted}`; the epoch is 0 because
-    /// sim partitions have no created revision).
+    /// Mirrors the reconciler's outcome without running it: the namespace is
+    /// committed to metadata, the partition materialises only on its
+    /// hash-owning shard, and every shard of the replica gets the routing row
+    /// stamped with the committed `created_revision` (production seeds rows
+    /// through `ReconcileOp::{InsertOwned,InsertRouted}`).
     ///
     /// # Panics
     /// Panics if a replica's shard count does not fit `u32` (impossible:
@@ -326,10 +326,21 @@ impl Simulator {
             let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
             let owner = calculate_shard_assignment(&namespace, shard_count);
             replica.shards[usize::from(owner)].init_partition(namespace);
+            // Commit the namespace before stamping the rows: a partition the
+            // metadata plane never heard of is a shape production cannot
+            // produce, and the shard refuses to serve client traffic whose
+            // routing-row epoch it cannot match against a committed
+            // `created_revision`.
+            let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+            streams.seed_namespace(namespace, namespace.inner());
+            let epoch = streams
+                .created_revision_for_namespace(namespace)
+                .expect("namespace committed by the seed above");
             for shard in &replica.shards {
-                shard
-                    .shards_table()
-                    .insert(namespace, PartitionLocation::new(ShardId::new(owner), 0));
+                shard.shards_table().insert(
+                    namespace,
+                    PartitionLocation::new(ShardId::new(owner), epoch),
+                );
             }
         }
     }
@@ -344,17 +355,8 @@ impl Simulator {
     /// way `init_partition` bypasses it for the partition plane. Pair it with
     /// `init_partition` for the same namespace on the dispatch-shell poll path.
     ///
-    /// # Panics
-    /// Panics unless `namespace` addresses stream 0 / topic 0: the STM
-    /// assigns 0-based slab ids and the seed creates the first stream and
-    /// topic.
     #[allow(clippy::cast_possible_truncation)]
     pub fn seed_stream_topic_partition(&self, namespace: IggyNamespace) {
-        assert!(
-            namespace.stream_id() == 0 && namespace.topic_id() == 0,
-            "seed_stream_topic_partition: seeds the first stream/topic (slab 0), \
-             so namespace must address stream 0 / topic 0"
-        );
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
@@ -367,7 +369,7 @@ impl Simulator {
                 .metadata()
                 .mux_stm
                 .streams()
-                .seed_single_partition(namespace.partition_id() as u32, namespace.inner());
+                .seed_namespace(namespace, namespace.inner());
         }
     }
 

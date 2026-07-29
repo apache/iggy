@@ -40,5 +40,7 @@ foreign/node/.npm
 *.out
 go.work
 core/bench/dashboard/frontend/dist
+core/integration/tests/connectors/postgres/cdc_restart_connectors/*
+!core/integration/tests/connectors/postgres/cdc_restart_connectors/config.toml
 LICENSE-binary
 **/LICENSE-binary
