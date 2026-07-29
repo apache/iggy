@@ -339,6 +339,11 @@ where
                     {
                         self.dispatch_metadata_commit_tick();
                     }
+                    // A dropped `ReconcileApply` marker (full inbox at
+                    // `enqueue_reconcile_op`) otherwise strands staged ops on
+                    // a quiet shard until the next inbound frame's tail
+                    // drain; parked partition frames then never re-dispatch.
+                    self.apply_reconcile_ops();
                     consensus_tick.set(rearm_tick());
                 }
                 frame = self.inbox.recv().fuse() => {

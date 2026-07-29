@@ -84,21 +84,28 @@ fn build_server_config(
         "true".to_string(),
     );
     extra_envs.insert("IGGY_TCP_SOCKET_NODELAY".to_string(), "true".to_string());
-    // Under vsr these scenarios exercise retrieval, not failover, yet run
-    // on the default 3-node cluster. Under a parallel nextest run the box
-    // is oversubscribed and scheduling stalls exceed the 5s default
-    // liveness window, so backups elect a new primary mid-scenario and the
-    // client session dies with it (observed stalls reach ~20s; 60s rides
-    // them out). The knob exists only on server-ng: the legacy flavor's
-    // strict env provider aborts boot on unknown IGGY_ vars, so the gate
-    // is load-bearing.
-    #[cfg(feature = "vsr")]
-    extra_envs.insert(
-        "IGGY_CLUSTER_HEARTBEAT_TIMEOUT".to_string(),
-        "60s".to_string(),
-    );
 
     TestServerConfig::builder().extra_envs(extra_envs).build()
+}
+
+/// These matrices exercise retrieval, not replication: a single node keeps
+/// the wide permutation set cheap under a parallel nextest run, where an
+/// oversubscribed multi-node cluster stalls past the liveness window and
+/// elects a new primary mid-scenario, killing the client session.
+fn build_harness(
+    segment_size: &str,
+    cache_indexes: &str,
+    messages_required_to_save: &str,
+) -> TestHarness {
+    TestHarness::builder()
+        .server(build_server_config(
+            segment_size,
+            cache_indexes,
+            messages_required_to_save,
+        ))
+        .cluster_nodes(1)
+        .build()
+        .unwrap()
 }
 
 #[test_matrix(
@@ -113,14 +120,7 @@ async fn get_by_offset_scenario(
     cache_indexes: &str,
     messages_required_to_save: &str,
 ) {
-    let mut harness = TestHarness::builder()
-        .server(build_server_config(
-            segment_size,
-            cache_indexes,
-            messages_required_to_save,
-        ))
-        .build()
-        .unwrap();
+    let mut harness = build_harness(segment_size, cache_indexes, messages_required_to_save);
 
     harness.start().await.unwrap();
 
@@ -139,14 +139,7 @@ async fn get_by_timestamp_scenario(
     cache_indexes: &str,
     messages_required_to_save: &str,
 ) {
-    let mut harness = TestHarness::builder()
-        .server(build_server_config(
-            segment_size,
-            cache_indexes,
-            messages_required_to_save,
-        ))
-        .build()
-        .unwrap();
+    let mut harness = build_harness(segment_size, cache_indexes, messages_required_to_save);
 
     harness.start().await.unwrap();
 
