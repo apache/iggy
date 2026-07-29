@@ -523,11 +523,3 @@ components:
       - "ci-infrastructure"
     paths:
       - "gateways/**"
-    tasks:
-      - "check"
-      - "fmt"
-      - "clippy"
-      - "sort"
-      - "test-1"
-      - "test-2"
-      - "machete"
