@@ -19,7 +19,7 @@ use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
-use consensus::{CLIENTS_TABLE_MAX, ClientTable, build_reply_message, build_reply_message_with};
+use consensus::{ClientTable, build_reply_message, build_reply_message_with};
 use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
@@ -129,6 +129,11 @@ pub struct RecoveredMetadata<M> {
 /// replayed ops land on the same baseline (and the same slab ids) they were
 /// originally applied over. A snapshot already contains that baseline.
 ///
+/// `clients_table_max` sizes the rebuilt client table. It comes from
+/// `[metadata] clients_table_max`: the recovered table replaces the one the
+/// caller built, so reading the compile-time default here would make the knob
+/// inert on every restart.
+///
 /// `solo` marks a single-replica cluster: the quorum is 1/1, so every
 /// journaled op was committed the moment it was written and replay runs to
 /// the journal head. The embedded `commit` stamps cannot be used there: each
@@ -140,6 +145,7 @@ pub async fn recover<M>(
     data_dir: &Path,
     solo: bool,
     journal_slots: usize,
+    clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
@@ -198,7 +204,7 @@ where
             .fold(snapshot_floor, u64::max)
     };
 
-    let mut client_table = ClientTable::new(CLIENTS_TABLE_MAX);
+    let mut client_table = ClientTable::new(clients_table_max);
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
     for header in &headers_to_replay {
@@ -300,6 +306,7 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
     use server_common::iobuf::Owned;
@@ -363,6 +370,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -387,6 +395,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -421,6 +430,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -462,6 +472,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -498,6 +509,7 @@ mod tests {
             dir.path(),
             false,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -564,6 +576,7 @@ mod tests {
             dir.path(),
             true,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -624,6 +637,7 @@ mod tests {
             dir.path(),
             true,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await
@@ -678,6 +692,7 @@ mod tests {
             dir.path(),
             true,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
             |_| {},
         )
         .await

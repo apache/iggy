@@ -522,8 +522,6 @@ pub enum IggyError {
     AlreadyAuthenticated = 14000,
     #[error("VSR session value {0} is invalid (must be non-zero)")]
     InvalidSession(u64) = 14001,
-    #[error("Replicated command with unknown code {0}")]
-    UnknownReplicatedCommand(u32) = 14002,
     /// Packed protocol versions, see `iggy_binary_protocol::ProtocolVersion`.
     /// Field order: `(client_version, server_min, server_max)`.
     #[error(
