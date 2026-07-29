@@ -87,14 +87,23 @@ async fn assert_raw_round_trip(client: &IggyClient) {
                 .expect_err("session-control codes must be rejected by the raw path");
             assert_eq!(error, IggyError::InvalidCommand);
 
-            // VSR encoder is closed-world: unknown code rejected at encode time.
+            // An SDK build cannot know which codes a server implements, so an
+            // unknown one ships as non-replicated and the server decides. The
+            // follow-up ping is the point of the case: the server must answer
+            // with a deny frame, not drop the frame and leave the connection
+            // wedged until the read timeout.
             #[cfg(feature = "vsr")]
             {
                 let error = client
                     .send_binary_request(60_000, Bytes::new())
                     .await
-                    .expect_err("unknown code must be rejected under VSR");
+                    .expect_err("unknown code must be refused by the server");
                 assert_eq!(error, IggyError::InvalidCommand);
+
+                client
+                    .send_binary_request(PING_CODE, PingRequest.to_bytes())
+                    .await
+                    .expect("connection must survive an unknown code");
             }
 
             let error = client
