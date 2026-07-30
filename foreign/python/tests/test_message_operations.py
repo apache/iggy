@@ -314,10 +314,21 @@ class TestMessageOperations:
             ({"key": ""}, "Invalid header value"),
             ({"key": b""}, "Invalid header value"),
             ({"key": "x" * 256}, "Invalid header value"),
-            ({object(): "value"}, "User header keys must be"),
-            ({"key": object()}, "User header values must be"),
+            (
+                {object(): "value"},
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue",
+            ),
+            (
+                {"key": object()},
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue",
+            ),
             ({"key": 2**128}, "128-bit range"),
             ({"key": -(2**200)}, "128-bit range"),
+            ({"key": float("inf")}, "finite"),
+            ({"key": float("-inf")}, "finite"),
+            ({"key": float("nan")}, "finite"),
         ],
     )
     async def test_invalid_user_headers_are_rejected(self, headers, error):
@@ -346,6 +357,40 @@ class TestMessageOperations:
         """Test an explicit Float32 whose value overflows f32 is rejected."""
         with pytest.raises(ValueError, match="32-bit float"):
             Message("payload", user_headers={"k": HeaderValue.Float32(1e40)})
+
+    @pytest.mark.parametrize(
+        "kind,val_str",
+        [
+            (HeaderValue.Float32, "inf"),
+            (HeaderValue.Float32, "-inf"),
+            (HeaderValue.Float32, "nan"),
+            (HeaderValue.Float64, "inf"),
+            (HeaderValue.Float64, "-inf"),
+            (HeaderValue.Float64, "nan"),
+        ],
+    )
+    def test_non_finite_typed_header_value_is_rejected(self, kind, val_str):
+        """Test typed Float32/Float64 header values reject non-finite values."""
+        value = float(val_str)
+        with pytest.raises(ValueError, match="finite"):
+            UserHeaders({"k": kind(value)})
+
+    @pytest.mark.parametrize(
+        "kind,val_str",
+        [
+            (HeaderKey.Float32, "inf"),
+            (HeaderKey.Float32, "-inf"),
+            (HeaderKey.Float32, "nan"),
+            (HeaderKey.Float64, "inf"),
+            (HeaderKey.Float64, "-inf"),
+            (HeaderKey.Float64, "nan"),
+        ],
+    )
+    def test_non_finite_typed_header_key_is_rejected(self, kind, val_str):
+        """Test typed Float32/Float64 header keys reject non-finite values."""
+        value = float(val_str)
+        with pytest.raises(ValueError, match="finite"):
+            UserHeaders({kind(value): "v"})
 
     def test_mixed_typed_and_plain_headers_can_be_constructed(self):
         """Test each key/value pair is converted independently and can be mixed."""
@@ -436,6 +481,72 @@ class TestMessageOperations:
             }
         )
         with pytest.raises(ValueError, match="Distinct typed header keys"):
+            headers.to_scalar_dict()
+
+    def test_user_headers_construction_rejects_non_scalar_key(self):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue"
+            ),
+        ):
+            UserHeaders({object(): "value"})
+
+    def test_user_headers_construction_rejects_non_scalar_value(self):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue"
+            ),
+        ):
+            UserHeaders({"key": object()})
+
+    def test_user_headers_construction_rejects_invalid_keys_and_values(self):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue"
+            ),
+        ):
+            UserHeaders({object(): object()})
+
+    def test_user_headers_setitem_rejects_non_scalar_key(self):
+        headers = UserHeaders()
+        with pytest.raises(
+            ValueError,
+            match=(
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue"
+            ),
+        ):
+            headers[object()] = "value"
+
+    def test_user_headers_setitem_rejects_non_scalar_value(self):
+        headers = UserHeaders()
+        with pytest.raises(
+            ValueError,
+            match=(
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue"
+            ),
+        ):
+            headers["key"] = object()
+
+    def test_user_headers_to_scalar_dict_rejects_non_scalar_in_stored_data(
+        self,
+    ):
+        headers = UserHeaders()
+        dict.__setitem__(headers, object(), object())
+        with pytest.raises(
+            ValueError,
+            match=(
+                "User header must be str, bytes, bool, int, float, "
+                "HeaderKey, or HeaderValue"
+            ),
+        ):
             headers.to_scalar_dict()
 
     @pytest.mark.asyncio

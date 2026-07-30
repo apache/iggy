@@ -76,12 +76,7 @@ impl SendMessage {
             PyMessagePayload::Bytes(data) => Bytes::from(data.extract::<Vec<u8>>(py)?),
         };
         let user_headers = user_headers
-            .map(|headers| {
-                let headers = headers
-                    .cast::<pyo3::types::PyDict>()
-                    .map_err(|_| PyValueError::new_err("User headers must be a dictionary"))?;
-                py_user_headers_to_rust(py, headers)
-            })
+            .map(|headers| py_user_headers_to_rust(py, headers))
             .transpose()?;
         let inner = RustIggyMessage::builder()
             .maybe_id(id)

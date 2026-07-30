@@ -83,6 +83,10 @@ impl ReceiveMessage {
     }
 
     /// Retrieves user headers attached to the received message.
+    ///
+    /// Returns `None` when no headers are present or when the headers
+    /// on the wire are structurally malformed (those errors are logged
+    /// internally). Only known semantic decode errors raise `ValueError`.
     #[gen_stub(override_return_type(type_repr = "UserHeaders | None"))]
     pub fn user_headers<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, UserHeaders>>> {
         let Some(headers) = self
