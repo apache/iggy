@@ -60,9 +60,7 @@ pytest tests/ -v # Run tests (requires iggy-server running)
 
 ## Client Configuration
 
-`IggyClient` takes either a server address or a `TcpConfig`. Configuring `auto_login`
-lets the SDK replay the credentials whenever it reconnects, so a session dropped by a
-server restart is recovered instead of surfacing as `Unauthenticated`:
+`IggyClient` takes either a server address or a `TcpConfig`:
 
 ```python
 import asyncio
@@ -83,6 +81,11 @@ async def main():
                 reestablish_after=timedelta(seconds=30),
             ),
             heartbeat_interval=timedelta(seconds=5),
+            # tls_enabled=True,
+            # tls_domain="localhost",
+            # tls_ca_file="core/certs/iggy_ca_cert.pem",
+            # tls_validate_certificate=True,
+            # nodelay=True,
         )
     )
     await client.connect()
@@ -90,11 +93,6 @@ async def main():
 
 asyncio.run(main())
 ```
-
-`TcpConfig` also carries `tls_enabled`, `tls_domain`, `tls_ca_file`,
-`tls_validate_certificate` and `nodelay`. Every field is keyword-only and defaults to the
-same value the Rust SDK uses. `IggyClient.from_connection_string(...)` remains available
-for the same settings in string form.
 
 ## Examples
 
