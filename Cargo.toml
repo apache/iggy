@@ -37,6 +37,7 @@ members = [
     "core/connectors/sinks/delta_sink",
     "core/connectors/sinks/doris_sink",
     "core/connectors/sinks/elasticsearch_sink",
+    "core/connectors/sinks/fluss_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/influxdb_sink",
@@ -176,6 +177,7 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 file-operation = "0.8.28"
 flatbuffers = "25.12.19"
 flume = "0.12.0"
+fluss-rs = "0.1.0"
 fs2 = "0.4.3"
 futures = "0.3.33"
 futures-core = { version = "0.3.33", default-features = false }
