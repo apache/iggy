@@ -90,7 +90,7 @@ export type OffsetResponse = {
  * @param streamId - Stream identifier (ID or name)
  * @param topicId - Topic identifier (ID or name)
  * @param consumer - Consumer identifier (single or group)
- * @param partitionId - Partition ID (required for single consumer, optional for group)
+ * @param partitionId - Partition ID. VSR requires an explicit partition.
  * @returns Buffer containing serialized offset request
  * @throws Error if partitionId is null for single consumer kind
  */
@@ -134,7 +134,7 @@ export const serializeGetOffset = (
  * @param streamId - Stream identifier (ID or name)
  * @param topicId - Topic identifier (ID or name)
  * @param consumer - Consumer identifier (single or group)
- * @param partitionId - Partition ID (required for single consumer, optional for group)
+ * @param partitionId - Partition ID. VSR requires an explicit partition.
  * @param offset - Offset value to store
  * @returns Buffer containing serialized store offset request
  */

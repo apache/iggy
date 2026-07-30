@@ -18,6 +18,13 @@
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
+/** Stream, topic, and consumer-group identifiers. */
+export type TargetGroup = {
+  streamId: Id,
+  topicId: Id,
+  groupId: Id,
+};
+
 /**
  * Consumer group information.
  */
