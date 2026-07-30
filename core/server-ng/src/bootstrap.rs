@@ -797,8 +797,15 @@ fn run_shard_thread(
         .bind_memory()
         .map_err(|source| ServerNgError::MemoryAffinityFailed { shard_id, source })?;
 
-    let runtime = create_shard_executor()
-        .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
+    // `enrich_runtime_create_error` folds the io_uring remediation (raise
+    // `ulimit -l`, unblock seccomp, kernel-flag floor) into the error, so the
+    // guidance survives into the shard-join failure report instead of only
+    // stderr. Multi-shard boxes exhaust RLIMIT_MEMLOCK on per-shard rings
+    // before the bootstrap runtime does, so this path needs it most.
+    let runtime = create_shard_executor().map_err(|source| {
+        let source = server_common::diagnostics::enrich_runtime_create_error(source);
+        ServerNgError::ShardRuntimeCreateFailed { shard_id, source }
+    })?;
 
     let result = runtime.block_on(async move {
         // `shard_main`'s future grows past clippy's `large_futures` cap
