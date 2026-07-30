@@ -21,7 +21,7 @@ use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 /// A Python class representing a received message.
-/// This class wraps a Rust message, allowing for access to its payload and offset from Python.
+/// It provides access to the message payload and offset.
 #[pyclass]
 #[gen_stub_pyclass]
 pub struct ReceiveMessage {

@@ -43,8 +43,7 @@ use crate::identifier::PyIdentifier;
 use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
-/// It wraps the RustIggyConsumer and provides asynchronous functionality
-/// through the contained runtime.
+/// It provides asynchronous functionality through the contained runtime.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyConsumer {
@@ -94,7 +93,7 @@ impl IggyConsumer {
 
     /// Stores the provided offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
+    /// Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
     /// if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
@@ -116,7 +115,7 @@ impl IggyConsumer {
 
     /// Deletes the offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
+    /// Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
     /// if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
@@ -137,7 +136,7 @@ impl IggyConsumer {
 
     /// Asynchronously iterate over `ReceiveMessage`s.
     /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-    /// or a `PyRuntimeError` on failure.
+    /// or a `RuntimeError` on failure.
     /// Note: This method does not currently support `AutoCommit.After`.
     /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
     /// only the interval part is applied; the `after` mode is ignored.
@@ -149,7 +148,7 @@ impl IggyConsumer {
     }
 
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-    /// Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+    /// Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,

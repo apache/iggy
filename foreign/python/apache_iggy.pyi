@@ -349,8 +349,7 @@ class ConsumerGroupMember:
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
-    It wraps the RustIggyClient and provides asynchronous functionality
-    through the contained runtime.
+    It provides asynchronous functionality through the contained runtime.
     """
     def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
         r"""
@@ -364,7 +363,7 @@ class IggyClient:
                 disabled.
 
         Raises:
-            PyRuntimeError: If the address is not a valid `host:port` pair, or if the
+            RuntimeError: If the address is not a valid `host:port` pair, or if the
                 client cannot be built.
         """
     @classmethod
@@ -376,7 +375,7 @@ class IggyClient:
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
+        Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
         if the connection fails.
         """
     def login_user(
@@ -384,7 +383,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Logs in the user with the given credentials.
-        Returns `Ok(())` on success, or a PyRuntimeError on failure.
+        Returns `Ok(())` on success, or a RuntimeError on failure.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -400,8 +399,8 @@ class IggyClient:
             or `None` otherwise.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def get_users(self) -> collections.abc.Awaitable[list[UserInfo]]:
         r"""
@@ -411,7 +410,7 @@ class IggyClient:
             An awaitable that resolves to `list[UserInfo]`.
 
         Raises:
-            PyRuntimeError: If the request fails.
+            RuntimeError: If the request fails.
         """
     def create_user(
         self,
@@ -433,7 +432,7 @@ class IggyClient:
             An awaitable that resolves to the created `UserInfoDetails`.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            RuntimeError: If an argument is invalid or the request fails.
         """
     def update_user(
         self,
@@ -453,8 +452,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the user is updated.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def delete_user(
         self, user_id: builtins.str | builtins.int
@@ -469,25 +468,25 @@ class IggyClient:
             An awaitable that resolves to `None` when the user is deleted.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.
-        Returns Ok(()) on successful connection or a PyRuntimeError on failure.
+        Returns Ok(()) on successful connection or a RuntimeError on failure.
         """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
-        Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
+        Returns Ok(()) on successful stream creation or a RuntimeError on failure.
         """
     def get_stream(
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[StreamDetails | None]:
         r"""
         Gets stream by id.
-        Returns Option of stream details or a PyRuntimeError on failure.
+        Returns Option of stream details or a RuntimeError on failure.
         """
     def create_topic(
         self,
@@ -501,7 +500,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+        Returns Ok(()) on successful topic creation or a RuntimeError on failure.
         """
     def get_topic(
         self,
@@ -510,7 +509,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[TopicDetails | None]:
         r"""
         Gets topic by stream and id.
-        Returns Option of topic details or a PyRuntimeError on failure.
+        Returns Option of topic details or a RuntimeError on failure.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
@@ -525,7 +524,7 @@ class IggyClient:
             An awaitable that resolves to `list[Topic]`.
 
         Raises:
-            PyRuntimeError: If the identifier is invalid or the request fails.
+            RuntimeError: If the identifier is invalid or the request fails.
         """
     def update_topic(
         self,
@@ -556,7 +555,7 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            RuntimeError: If an argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -574,7 +573,7 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is deleted.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            RuntimeError: If an identifier is invalid or the request fails.
         """
     def purge_topic(
         self,
@@ -592,7 +591,7 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is purged.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            RuntimeError: If an identifier is invalid or the request fails.
         """
     def create_consumer_group(
         self,
@@ -612,8 +611,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the consumer group is created.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def get_consumer_group(
         self,
@@ -634,8 +633,8 @@ class IggyClient:
             or `None` otherwise.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def get_consumer_groups(
         self,
@@ -653,8 +652,8 @@ class IggyClient:
             An awaitable that resolves to `list[ConsumerGroup]`.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def delete_consumer_group(
         self,
@@ -674,8 +673,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the consumer group is deleted.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def join_consumer_group(
         self,
@@ -698,8 +697,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the client joins the consumer group.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
         """
     def leave_consumer_group(
         self,
@@ -724,8 +723,8 @@ class IggyClient:
             rejoin on their next poll.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
         """
     def send_messages(
         self,
@@ -736,7 +735,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+        Returns Ok(()) on successful sending or a RuntimeError on failure.
         """
     def poll_messages(
         self,
@@ -749,7 +748,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
         Polls for messages from the specified topic and partition.
-        Returns a list of received messages or a PyRuntimeError on failure.
+        Returns a list of received messages or a RuntimeError on failure.
         """
     def consumer_group(
         self,
@@ -770,7 +769,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
-        Returns the consumer or a PyRuntimeError on failure.
+        Returns the consumer or a RuntimeError on failure.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -789,15 +788,14 @@ class IggyClient:
             An awaitable that resolves to the raw response `bytes`.
 
         Raises:
-            PyRuntimeError: If the command cannot be sent or the server returns an error.
+            RuntimeError: If the command cannot be sent or the server returns an error.
         """
 
 @typing.final
 class IggyConsumer:
     r"""
     A Python class representing the Iggy consumer.
-    It wraps the RustIggyConsumer and provides asynchronous functionality
-    through the contained runtime.
+    It provides asynchronous functionality through the contained runtime.
     """
     def get_last_consumed_offset(
         self, partition_id: builtins.int
@@ -831,7 +829,7 @@ class IggyConsumer:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
+        Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
         if the operation fails.
         """
     def delete_offset(
@@ -840,14 +838,14 @@ class IggyConsumer:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
+        Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
         if the operation fails.
         """
     def iter_messages(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
         r"""
         Asynchronously iterate over `ReceiveMessage`s.
         Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-        or a `PyRuntimeError` on failure.
+        or a `RuntimeError` on failure.
         Note: This method does not currently support `AutoCommit.After`.
         For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
         only the interval part is applied; the `after` mode is ignored.
@@ -862,7 +860,7 @@ class IggyConsumer:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-        Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+        Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
         """
 
 class PollingStrategy:
@@ -901,7 +899,7 @@ class PollingStrategy:
 class ReceiveMessage:
     r"""
     A Python class representing a received message.
-    This class wraps a Rust message, allowing for access to its payload and offset from Python.
+    It provides access to the message payload and offset.
     """
     def payload(self) -> bytes:
         r"""
@@ -942,8 +940,6 @@ class ReceiveMessage:
 class SendMessage:
     r"""
     A Python class representing a message to be sent.
-    This class wraps a Rust message meant for sending, facilitating
-    the creation of such messages from Python and their subsequent use in Rust.
     """
     def __new__(cls, data: builtins.str | bytes) -> SendMessage:
         r"""
@@ -968,8 +964,7 @@ class TcpConfig:
     r"""
     Configuration for the TCP transport, accepted by `IggyClient(...)`.
 
-    Mirrors `TcpClientConfig` in the Rust SDK. Every field is keyword-only and
-    falls back to the same default the Rust SDK uses.
+    Every field is keyword-only and optional.
     """
     @property
     def server_address(self) -> builtins.str: ...
@@ -1003,8 +998,7 @@ class TcpConfig:
         nodelay: builtins.bool | None = None,
     ) -> TcpConfig:
         r"""
-        Constructs a TCP configuration, defaulting every unset field to the value
-        the Rust SDK uses.
+        Constructs a TCP configuration.
 
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
@@ -1021,7 +1015,7 @@ class TcpConfig:
                 leaving it on.
 
         Raises:
-            PyValueError: If `server_address` is not a valid `host:port` pair, or
+            ValueError: If `server_address` is not a valid `host:port` pair, or
                 if a duration is negative.
         """
     def __repr__(self) -> builtins.str: ...
@@ -1048,8 +1042,7 @@ class TcpReconnectionConfig:
         reestablish_after: datetime.timedelta | None = None,
     ) -> TcpReconnectionConfig:
         r"""
-        Constructs a reconnection policy, defaulting every unset field to the
-        value the Rust SDK uses.
+        Constructs a reconnection policy.
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
@@ -1059,7 +1052,7 @@ class TcpReconnectionConfig:
                 successful connection. Defaults to 5 seconds.
 
         Raises:
-            PyValueError: If a duration is negative.
+            ValueError: If a duration is negative.
         """
     def __repr__(self) -> builtins.str: ...
 

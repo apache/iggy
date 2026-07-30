@@ -120,8 +120,7 @@ pub struct TcpReconnectionConfig {
 #[gen_stub_pymethods]
 #[pymethods]
 impl TcpReconnectionConfig {
-    /// Constructs a reconnection policy, defaulting every unset field to the
-    /// value the Rust SDK uses.
+    /// Constructs a reconnection policy.
     ///
     /// Args:
     ///     enabled: Whether to reconnect at all. Defaults to enabled.
@@ -131,7 +130,7 @@ impl TcpReconnectionConfig {
     ///         successful connection. Defaults to 5 seconds.
     ///
     /// Raises:
-    ///     PyValueError: If a duration is negative.
+    ///     ValueError: If a duration is negative.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -200,8 +199,7 @@ impl TcpReconnectionConfig {
 
 /// Configuration for the TCP transport, accepted by `IggyClient(...)`.
 ///
-/// Mirrors `TcpClientConfig` in the Rust SDK. Every field is keyword-only and
-/// falls back to the same default the Rust SDK uses.
+/// Every field is keyword-only and optional.
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -221,8 +219,7 @@ impl TcpConfig {
 #[gen_stub_pymethods]
 #[pymethods]
 impl TcpConfig {
-    /// Constructs a TCP configuration, defaulting every unset field to the value
-    /// the Rust SDK uses.
+    /// Constructs a TCP configuration.
     ///
     /// Args:
     ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
@@ -239,7 +236,7 @@ impl TcpConfig {
     ///         leaving it on.
     ///
     /// Raises:
-    ///     PyValueError: If `server_address` is not a valid `host:port` pair, or
+    ///     ValueError: If `server_address` is not a valid `host:port` pair, or
     ///         if a duration is negative.
     #[new]
     #[pyo3(signature = (
