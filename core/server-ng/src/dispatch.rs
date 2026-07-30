@@ -1025,8 +1025,9 @@ async fn handle_get_me<B, MJ, S>(
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
-/// dispatch replies empty so the client fails fast instead of wedging on a
-/// silent drop.
+/// dispatch replies (empty for an unresolvable namespace, a nonzero status
+/// for denials and the exhausted routable wait) so the client fails fast
+/// instead of wedging on a silent drop.
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
@@ -1106,13 +1107,23 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
     // bounded wait; steady-state sends (row present, partition probed
     // once) skip it entirely.
     if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
+        // The op never reached the partition plane, so it is safe to re-issue
+        // anywhere -- the same contract the plane itself answers for a
+        // non-primary routing artifact. A status-0 empty reply here would
+        // fabricate a success ack for a write that hit no partition at all.
         warn!(
             transport_client_id,
             namespace,
             operation = ?header.operation,
-            "partition request not routable within budget; replying empty"
+            "partition request not routable within budget; replying transient"
         );
-        send_empty_partition_reply(shard, transport_client_id, &header).await;
+        send_partition_deny_reply(
+            shard,
+            transport_client_id,
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
         return;
     }
     // A group consumer-offset op carries the group NAME on the wire; the
@@ -1844,8 +1855,8 @@ async fn handle_sync_consumer_group<B, MJ, S>(
     .await;
 }
 
-/// Ack a partition op that cannot be routed (unresolved or never-
-/// materialised namespace) with an empty Reply. The SDK connection
+/// Ack a partition op whose namespace does not resolve (deleted stream /
+/// topic or unknown consumer group) with an empty Reply. The SDK connection
 /// processes replies in lockstep, so a silent drop wedges every
 /// subsequent request on that connection.
 #[allow(clippy::future_not_send)]
@@ -2775,8 +2786,14 @@ where
 mod tests {
     use super::*;
     use consensus::{LocalPipeline, Plane as _, PlaneKind, VsrConsensus};
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader};
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, WireName, WirePartitioning};
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::variadic;
     use journal::prepare_journal::PrepareJournal;
     use message_bus::client_listener::RequestHandler;
@@ -2789,6 +2806,7 @@ mod tests {
         ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
     };
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::StateMachine as _;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -2796,8 +2814,12 @@ mod tests {
     use server_common::iobuf::Frozen;
     use server_common::sharding::ShardId;
     use server_common::{MESSAGE_ALIGN, Message};
+    use shard::metrics::ShardMetrics;
     use shard::shards_table::PapayaShardsTable;
-    use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
+    use shard::{
+        IggyShard, LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology,
+        ShardFrame, ShardIdentity, shard_channel,
+    };
     use std::cell::RefCell;
     use std::future::Future;
     use std::mem::size_of;
@@ -2805,12 +2827,15 @@ mod tests {
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
     type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
+    /// `(target client id, reply frame bytes)` per `send_to_client` call.
+    type RecordedReplies = Rc<RefCell<Vec<(u128, Vec<u8>)>>>;
 
-    /// Records every client-bound reply instead of writing to a socket;
-    /// everything else is a no-op. The two `ShellBus` halves are stubbed.
+    /// Records every client-bound reply (target id + frame bytes) instead of
+    /// writing to a socket; everything else is a no-op. The two `ShellBus`
+    /// halves are stubbed.
     #[derive(Debug, Clone, Default)]
     struct SpyBus {
-        client_replies: Rc<RefCell<Vec<u128>>>,
+        client_replies: RecordedReplies,
     }
 
     #[allow(clippy::future_not_send)]
@@ -2819,9 +2844,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
-            self.client_replies.borrow_mut().push(client_id);
+            self.client_replies
+                .borrow_mut()
+                .push((client_id, data.as_slice().to_vec()));
             Ok(())
         }
         async fn send_to_replica(
@@ -3100,7 +3127,10 @@ mod tests {
         // left in silence — that silence is what a one-shot CLI reports as
         // "Problem with server logout / Disconnected".
         assert!(
-            bus.client_replies.borrow().contains(&TRANSPORT_A),
+            bus.client_replies
+                .borrow()
+                .iter()
+                .any(|(client, _)| *client == TRANSPORT_A),
             "logout must produce a reply frame to the client even while the \
              catch-up gate is closed (silence = CLI 'Disconnected', exit 1)"
         );
@@ -3109,6 +3139,277 @@ mod tests {
             None,
             "transport session must be unbound by a client-initiated logout; \
              the VSR slot may lapse to the eviction sweep"
+        );
+    }
+
+    /// A partition write whose routable wait exhausts (namespace committed,
+    /// but no reconciler ever seeds this shard's routing row -- the state a
+    /// teardown/rematerialise churn leaves behind) must answer a nonzero
+    /// retriable status. A status-0 empty reply is a fabricated success: the
+    /// SDK grades the send as acknowledged while zero bytes reached any
+    /// partition.
+    #[compio::test]
+    async fn unroutable_partition_send_must_reply_transient_error_not_success() {
+        const VSR_CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const TRANSPORT: u128 = 91;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "unroutable-send-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+        let md = shard.plane.metadata();
+
+        // Committed stream 0 / topic 0 / partition 0, applied straight into
+        // the STM: the namespace resolves and root authorizes, but no
+        // reconciler runs, so the shards table never gains a routing row and
+        // the routable wait exhausts its budget.
+        md.mux_stm.users().ensure_root_user("iggy", "hash");
+        let create_stream = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+        };
+        md.mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                VSR_CLIENT,
+                1,
+                &create_stream.to_bytes(),
+            ))
+            .unwrap();
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                compression_algorithm: 0,
+                message_expiry: 0,
+                max_topic_size: 0,
+                replication_factor: 1,
+                name: WireName::new("topic").unwrap(),
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        md.mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                VSR_CLIENT,
+                2,
+                &create_topic.to_bytes(),
+            ))
+            .unwrap();
+        assert!(
+            md.mux_stm
+                .streams()
+                .namespace_from_partition(
+                    &WireIdentifier::numeric(0),
+                    &WireIdentifier::numeric(0),
+                    0
+                )
+                .is_some(),
+            "seeded namespace must resolve, or the unresolved-namespace path \
+             would reply instead of the exhausted routable wait"
+        );
+
+        let send_header = SendMessagesHeader {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partitioning: WirePartitioning::PartitionId(0),
+            messages_count: 1,
+        };
+        let send_metadata = send_header.to_bytes();
+        let mut send_body = Vec::with_capacity(4 + send_metadata.len());
+        send_body.extend_from_slice(&u32::try_from(send_metadata.len()).unwrap().to_le_bytes());
+        send_body.extend_from_slice(&send_metadata);
+        let request = request_message(Operation::SendMessages, VSR_CLIENT, SESSION, 1, &send_body);
+
+        dispatch_partition_request(
+            &shard,
+            request,
+            VSR_CLIENT,
+            SESSION,
+            TRANSPORT,
+            Some(DEFAULT_ROOT_USER_ID),
+        )
+        .await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "one reply frame for the failed send");
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT, "reply must target the transport id");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::TransientNotAccepted.as_code(),
+            "an unroutable partition write must surface the retriable \
+             transient status; status 0 with an empty body grades as a \
+             successfully acknowledged send"
+        );
+    }
+
+    /// A send that reaches the owning shard while its namespace is
+    /// tombstoned (the teardown fence a delete/recreate churn sets before
+    /// the disk delete) must answer the retriable transient status. The
+    /// partition plane's own tombstone guard drops the frame without any
+    /// reply; the transports decode replies in lockstep, so that silence
+    /// wedges the connection until the SDK's response read-timeout.
+    #[compio::test]
+    async fn tombstoned_partition_send_must_reply_transient_error_not_silence() {
+        const TRANSPORT: u128 = 91;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "tombstoned-send-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.partitions().tombstone(namespace);
+
+        let request = request_message(Operation::SendMessages, TRANSPORT, SESSION, 1, &[])
+            .transmute_header(|header, new_header: &mut RequestHeader| {
+                *new_header = header;
+                new_header.namespace = namespace.inner();
+            });
+        shard.on_message(request.into_generic()).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a send into a tombstoned namespace must produce a reply frame; \
+             silence wedges the connection's lockstep decode"
+        );
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT, "reply must target the request's client");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::TransientNotAccepted.as_code(),
+            "a tombstoned-namespace send must surface the retriable transient \
+             status so the SDK replays it after the partition rematerialises"
+        );
+    }
+
+    /// A send parked for a namespace that is torn down before materialising
+    /// (create -> delete before the reconciler's `InsertOwned`) is discarded
+    /// on `ConfirmRemove`. The discard must stage the same retriable
+    /// transient deny toward the client -- through the shard's own pump as a
+    /// `ForwardClientSend` -- instead of dropping the request without any
+    /// reply.
+    #[compio::test]
+    async fn discarded_parked_partition_send_must_reply_transient_error_not_silence() {
+        const TRANSPORT: u128 = 91;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        // Real sender ring so the staged deny is observable: the test holds
+        // the receiving end of this shard's own channel.
+        let (sender, pump_rx) = shard_channel(0, 16);
+        let (_inbox_tx, inbox_rx) = shard_channel(0, 1);
+        let shard = TestShard::new(
+            ShardIdentity::new(0, "discarded-parked-send-test".to_string()),
+            bus.clone(),
+            Rc::new(|_, _| {}),
+            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_, _, _| {}),
+            metadata,
+            partitions,
+            vec![sender],
+            inbox_rx,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+            None,
+            ShardMetrics::for_shard(),
+        )
+        .expect("single-sender ring is canonically ordered");
+
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let request = request_message(Operation::SendMessages, TRANSPORT, SESSION, 1, &[])
+            .transmute_header(|header, new_header: &mut RequestHeader| {
+                *new_header = header;
+                new_header.namespace = namespace.inner();
+            });
+        // Namespace neither materialised nor tombstoned: the frame parks.
+        shard.on_message(request.into_generic()).await;
+
+        shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
+        shard.apply_reconcile_ops();
+
+        let mut denies = Vec::new();
+        while let Ok(frame) = pump_rx.try_recv() {
+            if let ShardFrame::Lifecycle(LifecycleFrame::ForwardClientSend { client_id, msg }) =
+                frame
+            {
+                denies.push((client_id, msg.as_slice().to_vec()));
+            }
+        }
+        assert_eq!(
+            denies.len(),
+            1,
+            "discarding a parked client request must stage exactly one deny \
+             reply; silence wedges the connection's lockstep decode"
+        );
+        let (client, frame) = &denies[0];
+        assert_eq!(*client, TRANSPORT, "deny must target the request's client");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::TransientNotAccepted.as_code(),
+            "a discarded parked send must surface the retriable transient \
+             status so the SDK replays it instead of timing out"
         );
     }
 }

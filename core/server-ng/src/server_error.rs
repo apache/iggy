@@ -48,7 +48,11 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create io_uring runtime for shard {shard_id}")]
+    // `{source}` is deliberately part of the Display text: the shard-join
+    // failure report and `%error` log fields print Display only, and the
+    // source carries the io_uring remediation folded in by
+    // `server_common::diagnostics::enrich_runtime_create_error`.
+    #[error("failed to create io_uring runtime for shard {shard_id}: {source}")]
     ShardRuntimeCreateFailed {
         shard_id: u16,
         #[source]
