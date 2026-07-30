@@ -26,14 +26,12 @@
 //! fields directly without per-call conversion.
 //!
 //! The WebSocket frame-layer config the bus consumes lives under the
-//! `[message_bus]` block (`ws_max_message_size`, `ws_max_frame_size`,
-//! `ws_write_buffer_size`, `ws_accept_unmasked_frames`). The schema's
-//! separate `[websocket]` block configures the legacy WS listener and
-//! is not read by the bus; the bus owns its own WS ceiling because the
-//! SDK-client plane has different cardinality and burst characteristics
-//! than the legacy listener (see `configs::server_ng_config::message_bus`).
+//! schema's `[websocket]` block (buffer sizes, message / frame
+//! ceilings, unmasked-frame acceptance): the bus IS server-ng's
+//! WS / WSS install path, so the listener section carries the frame
+//! tuning (see `configs::ng_websocket`).
 //! [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig)
-//! builds [`WebSocketConfig`] from those fields once at boot.
+//! folds that section into [`WebSocketConfig`] once at boot.
 //!
 //! Liveness detection is NOT done via TCP keepalive on the bus: SDK
 //! clients manage their own keepalive policy at the application layer,
@@ -180,9 +178,8 @@ pub struct MessageBusConfig {
     /// install path and into `WssTransportConn::ws_handshake` for WSS.
     /// Built once at boot by `build_ws_config` (see the
     /// [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig) impl below)
-    /// from the bus-owned `ws_*` fields under `[message_bus]`. The
-    /// schema's `[websocket]` block is intentionally NOT consulted
-    /// here; see this module's preamble for the rationale.
+    /// from the schema's `[websocket]` section, the live frame-tuning
+    /// source for server-ng's WS plane.
     ///
     /// The [`WebSocketConfig`] type is re-exported from `compio_ws`'s
     /// vendored `tungstenite` so callers do not need a direct dep on
@@ -222,7 +219,7 @@ impl From<&ServerNgConfig> for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
-            ws_config: build_ws_config(bus),
+            ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
         }
     }
@@ -274,27 +271,36 @@ impl Default for QuicTuning {
     }
 }
 
-/// Fold the bus's `ws_*` schema knobs into a single
+/// Fold the schema's `[websocket]` frame-tuning knobs into a single
 /// [`tungstenite::WebSocketConfig`].
 ///
-/// Each `Some` overrides the tungstenite default; `None` keeps the
-/// crate-wide default. Conversion to `usize` saturates on platforms
-/// where `IggyByteSize` would overflow, but the schema validator
-/// already constrains all sizes to fit in `u64`, and on supported
-/// targets `usize` is at least 32 bits, so saturation is unreachable
-/// in practice.
-fn build_ws_config(bus: &configs::message_bus::MessageBusConfig) -> WebSocketConfig {
+/// The standalone `tungstenite` crate may be a different major version
+/// than the one re-exported by `compio_ws`, so the conversion lives in
+/// this crate (next to the `compio_ws` dependency) and constructs the
+/// config through the re-export to guarantee type compatibility.
+///
+/// Each `Some` overrides the compio-ws default; `None` keeps it.
+/// Conversion to `usize` saturates on platforms where `IggyByteSize`
+/// would overflow, but on supported targets `usize` is at least 32
+/// bits, so saturation is unreachable in practice.
+fn build_ws_config(websocket: &configs::ng_websocket::WebSocketConfig) -> WebSocketConfig {
     let mut ws = WebSocketConfig::default();
-    if let Some(sz) = bus.ws_max_message_size {
-        ws = ws.max_message_size(Some(byte_size_to_usize(sz)));
+    if let Some(sz) = websocket.read_buffer_size {
+        ws = ws.read_buffer_size(byte_size_to_usize(sz));
     }
-    if let Some(sz) = bus.ws_max_frame_size {
-        ws = ws.max_frame_size(Some(byte_size_to_usize(sz)));
-    }
-    if let Some(sz) = bus.ws_write_buffer_size {
+    if let Some(sz) = websocket.write_buffer_size {
         ws = ws.write_buffer_size(byte_size_to_usize(sz));
     }
-    ws.accept_unmasked_frames(bus.ws_accept_unmasked_frames)
+    if let Some(sz) = websocket.max_write_buffer_size {
+        ws = ws.max_write_buffer_size(byte_size_to_usize(sz));
+    }
+    if let Some(sz) = websocket.max_message_size {
+        ws = ws.max_message_size(Some(byte_size_to_usize(sz)));
+    }
+    if let Some(sz) = websocket.max_frame_size {
+        ws = ws.max_frame_size(Some(byte_size_to_usize(sz)));
+    }
+    ws.accept_unmasked_frames(websocket.accept_unmasked_frames)
 }
 
 #[allow(clippy::cast_possible_truncation)]

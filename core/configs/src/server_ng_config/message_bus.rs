@@ -26,23 +26,21 @@
 //! Transport-section concerns the bus does NOT own:
 //!
 //! - TCP-TLS / WSS listen addresses derive from `[tcp]` + `[tcp.tls]`
-//!   and `[websocket]` + `[websocket.tls]` respectively. The future
-//!   wiring PR populates the bus's runtime listen-addr inputs from
-//!   those sections at bootstrap.
+//!   and `[websocket]` + `[websocket.tls]` respectively.
+//! - WebSocket frame-layer tuning (buffer sizes, message / frame
+//!   ceilings, unmasked-frame acceptance) lives in `[websocket]`
+//!   ([`super::websocket::WebSocketConfig`]): the bus IS server-ng's
+//!   WS / WSS install path, so the listener section carries the frame
+//!   tuning and the runtime folds it into a compio-ws
+//!   `WebSocketConfig` once at bus construction. The
+//!   `websocket.max_*` <= `message_bus.max_message_size` chain is
+//!   enforced as a cross-section check in
+//!   [`super::server_ng::ServerNgConfig`]'s validator.
 //!
-//! Tunables the bus owns directly:
-//!
-//! - Bus-internal abstractions the operator does not see anywhere else
-//!   in the schema (batch sizing, per-peer queue depth, close-grace,
-//!   reconnect period, handshake-grace).
-//! - WebSocket frame-layer tunables for the bus's WS / WSS install
-//!   path (`ws_max_message_size`, `ws_max_frame_size`,
-//!   `ws_write_buffer_size`, `ws_accept_unmasked_frames`). The bus
-//!   plane carries SDK-client traffic with cardinality and burst
-//!   characteristics distinct from the legacy `[websocket]` listener,
-//!   so the bus owns its own frame-layer ceiling rather than aliasing
-//!   the listener's. The runtime conversion folds these into a
-//!   `tungstenite::WebSocketConfig` once at bus construction.
+//! Tunables the bus owns directly: bus-internal abstractions the
+//! operator does not see anywhere else in the schema (batch sizing,
+//! per-peer queue depth, close-grace, reconnect period,
+//! handshake-grace).
 //!
 //! Liveness detection is NOT done via TCP keepalive on the bus: SDK
 //! clients manage their own keepalive policy; replica<->replica
@@ -124,46 +122,6 @@ pub struct MessageBusConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub handshake_grace: IggyDuration,
-
-    /// Hard upper bound on a single inbound WebSocket message
-    /// (post-fragment-reassembly). `None` keeps the tungstenite
-    /// default (currently 64 MiB). Threaded into
-    /// `tungstenite::WebSocketConfig::max_message_size` at bus
-    /// construction. Distinct from [`Self::max_message_size`], which
-    /// caps a single framed bus payload regardless of transport.
-    #[config_env(leaf)]
-    #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    pub ws_max_message_size: Option<IggyByteSize>,
-
-    /// Hard upper bound on a single inbound WebSocket frame
-    /// (pre-fragment-reassembly). `None` keeps the tungstenite default
-    /// (currently 16 MiB). Threaded into
-    /// `tungstenite::WebSocketConfig::max_frame_size` at bus
-    /// construction.
-    #[config_env(leaf)]
-    #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    pub ws_max_frame_size: Option<IggyByteSize>,
-
-    /// Target buffer size for batched WebSocket writes before tungstenite
-    /// flushes. `None` keeps the tungstenite default. Threaded into
-    /// `tungstenite::WebSocketConfig::write_buffer_size` at bus
-    /// construction.
-    #[config_env(leaf)]
-    #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    pub ws_write_buffer_size: Option<IggyByteSize>,
-
-    /// Whether the bus accepts unmasked frames from clients in violation
-    /// of RFC 6455 client-to-server framing rules. Default `false`
-    /// (strict). Set to `true` only for non-browser test clients that
-    /// emit unmasked frames; production deployments leave this at
-    /// `false`. Threaded into
-    /// `tungstenite::WebSocketConfig::accept_unmasked_frames` at bus
-    /// construction.
-    #[serde(default)]
-    pub ws_accept_unmasked_frames: bool,
 }
 
 impl Validatable<ConfigurationError> for MessageBusConfig {
@@ -201,40 +159,6 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
         }
         if self.reconnect_period.as_micros() == 0 {
             eprintln!("{COMPONENT_NG} message_bus.reconnect_period must be > 0");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        // WS frame chain: ws_max_frame_size <= ws_max_message_size <=
-        // max_message_size. The `Option<...>` knobs only enforce a ceiling
-        // when present; an absent value defers to tungstenite's default
-        // (which is itself <= 64 MiB and so satisfies the chain in practice).
-        if let (Some(frame), Some(message)) = (self.ws_max_frame_size, self.ws_max_message_size)
-            && frame.as_bytes_u64() > message.as_bytes_u64()
-        {
-            eprintln!(
-                "{COMPONENT_NG} message_bus.ws_max_frame_size ({}) exceeds ws_max_message_size ({})",
-                frame.as_bytes_u64(),
-                message.as_bytes_u64()
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if let Some(message) = self.ws_max_message_size
-            && message.as_bytes_u64() > self.max_message_size.as_bytes_u64()
-        {
-            eprintln!(
-                "{COMPONENT_NG} message_bus.ws_max_message_size ({}) exceeds max_message_size ({})",
-                message.as_bytes_u64(),
-                self.max_message_size.as_bytes_u64()
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if let Some(frame) = self.ws_max_frame_size
-            && frame.as_bytes_u64() > self.max_message_size.as_bytes_u64()
-        {
-            eprintln!(
-                "{COMPONENT_NG} message_bus.ws_max_frame_size ({}) exceeds max_message_size ({})",
-                frame.as_bytes_u64(),
-                self.max_message_size.as_bytes_u64()
-            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         Ok(())
@@ -318,38 +242,5 @@ mod tests {
         let mut c = baseline();
         c.reconnect_period = IggyDuration::from(std::time::Duration::ZERO);
         assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_ws_frame_size_above_ws_message_size() {
-        let mut c = baseline();
-        c.ws_max_message_size = Some(IggyByteSize::from(1024_u64));
-        c.ws_max_frame_size = Some(IggyByteSize::from(2048_u64));
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_ws_message_size_above_bus_max_message_size() {
-        let mut c = baseline();
-        c.max_message_size = IggyByteSize::from(1024_u64);
-        c.ws_max_message_size = Some(IggyByteSize::from(2048_u64));
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_ws_frame_size_above_bus_max_message_size() {
-        let mut c = baseline();
-        c.max_message_size = IggyByteSize::from(1024_u64);
-        c.ws_max_frame_size = Some(IggyByteSize::from(2048_u64));
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn accepts_ws_chain_in_ascending_order() {
-        let mut c = baseline();
-        c.max_message_size = IggyByteSize::from(64_u64 * 1024 * 1024);
-        c.ws_max_message_size = Some(IggyByteSize::from(32_u64 * 1024 * 1024));
-        c.ws_max_frame_size = Some(IggyByteSize::from(16_u64 * 1024 * 1024));
-        assert!(c.validate().is_ok());
     }
 }
