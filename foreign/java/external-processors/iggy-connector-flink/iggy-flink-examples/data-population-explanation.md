@@ -170,7 +170,8 @@ Use the base64 string in your JSON payload.
 
 ### Example 1: Simple text message
 
-Original text: "hello world"  
+Original text: "hello world"
+
 Base64: `aGVsbG8gd29ybGQ=`
 
 ```bash
