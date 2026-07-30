@@ -70,6 +70,8 @@ export type RawClient = {
   authenticate: (c: ClientCredentials) => Promise<boolean>
   /** Destroys the client connection */
   destroy: () => void,
+  /** Holds a pooled client across multiple command submissions */
+  hold?: () => () => void,
   /** Registers an event listener */
   on: (ev: string, cb: (e?: unknown) => void) => void
   /** Registers a one-time event listener */

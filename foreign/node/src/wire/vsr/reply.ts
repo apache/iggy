@@ -57,9 +57,12 @@ export class VsrEvictionError extends ResponseError {
  * committed result section for result-framed operations and mapping every
  * denial channel to a thrown error.
  */
-export const decodeResponse = (frame: Buffer): Buffer => {
+export const decodeResponse = (
+  frame: Buffer,
+  commandCode = 0
+): Buffer => {
   if (frame.length < HEADER_SIZE)
-    throw responseError(0, EMPTY_RESPONSE);
+    throw responseError(commandCode, EMPTY_RESPONSE);
 
   switch (peekCommand(frame)) {
     case Command2.Eviction:
@@ -67,24 +70,24 @@ export const decodeResponse = (frame: Buffer): Buffer => {
     case Command2.Reply:
       break;
     default:
-      throw responseError(0, INVALID_COMMAND);
+      throw responseError(commandCode, INVALID_COMMAND);
   }
 
   const size = readSize(frame);
   if (size < HEADER_SIZE || frame.length < size)
-    throw responseError(0, INVALID_COMMAND);
+    throw responseError(commandCode, INVALID_COMMAND);
 
   const status = readStatus(frame);
   // A pre-commit denial always ships an empty body; the status channel and
   // the committed result section are mutually exclusive.
   if (status !== 0)
-    throw responseError(0, status);
+    throw responseError(commandCode, status);
 
   const operation = readReplyOperation(frame);
   if (!isKnownOperation(operation))
-    throw responseError(0, INVALID_COMMAND);
+    throw responseError(commandCode, INVALID_COMMAND);
   const body = frame.subarray(HEADER_SIZE, size);
-  return splitMetadataResult(operation, body);
+  return splitMetadataResult(operation, body, commandCode);
 };
 
 /**
@@ -96,23 +99,27 @@ export const decodeResponse = (frame: Buffer): Buffer => {
  */
 export const splitMetadataResult = (
   operation: number,
-  body: Buffer
+  body: Buffer,
+  commandCode = 0
 ): Buffer => {
   const resultFramed = isResultFramed(operation) ||
     (operation === Operation.Register && body.length > 0);
   if (!resultFramed) return body;
 
   if (body.length < RESULT_COUNT_LEN)
-    throw responseError(0, INVALID_COMMAND);
+    throw responseError(commandCode, INVALID_COMMAND);
   const count = body.readUInt32LE(0);
   const sectionLength = RESULT_COUNT_LEN + count * RESULT_ENTRY_LEN;
   if (body.length < sectionLength)
-    throw responseError(0, INVALID_COMMAND);
-  if (count === 0)
-    return body.subarray(RESULT_COUNT_LEN);
-  // First entry: {index u32, result u32}; result shares the IggyError space.
-  const code = body.readUInt32LE(RESULT_COUNT_LEN + 4);
-  throw responseError(0, code);
+    throw responseError(commandCode, INVALID_COMMAND);
+  if (count > 0) {
+    // First entry: {index u32, result u32}. The result shares the
+    // IggyError space.
+    const code = body.readUInt32LE(RESULT_COUNT_LEN + 4);
+    if (code !== 0)
+      throw responseError(commandCode, code);
+  }
+  return body.subarray(sectionLength);
 };
 
 /**
@@ -120,7 +127,7 @@ export const splitMetadataResult = (
  * as `eviction_reason_to_error` in `core/common`. An invalid protocol window
  * degrades to an authentication error rather than trusting the remote frame.
  */
-export const evictionError = (frame: Buffer): Error => {
+export const evictionError = (frame: Buffer): VsrEvictionError => {
   const eviction = readEviction(frame);
   let errorCode: number;
   switch (eviction.reason) {

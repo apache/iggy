@@ -182,28 +182,16 @@ export const translateErrorCode = (code: number): string => {
     case '4027': return "Invalid message checksum: {0}, expected: {1}, for offset: {2}";
     case '4028': return "Cannot append message to segment at offset: {0}";
 
-    // STORAGE
-    case '5000': return "File not found";
-    case '5001': return "Failed to open file";
-    case '5002': return "Failed to write file";
-    case '5003': return "Failed to close file";
-    case '5004': return "Failed to delete file";
-    case '5005': return "Cannot read file";
+    // CONSUMER GROUP
+    case '5000': return "Consumer group ID not found";
+    case '5002': return "Invalid consumer group ID";
+    case '5003': return "Consumer group name not found";
+    case '5004': return "Consumer group name already exists";
+    case '5005': return "Invalid consumer group name";
     case '5006': return "Consumer group member not found";
-    case '5007': return "Cannot create file";
-    case '5008': return "Cannot rename file";
-    case '5009': return "Cannot get file info";
-    case '5010': return "Failed to create directory for file";
-    case '5011': return "Failed to create file for {0}";
-    case '5012': return "Failed to create backup for {0}";
-    case '5013': return "Failed to create file path for backup file: {0}";
-    case '5014': return "Failed to backup file: {0}";
-    case '5015': return "Failed to restore file: {0}";
-    case '5016': return "Failed to restore file path for backup file: {0}";
-    case '5017': return "Failed to delete backup file: {0}";
-    case '5018': return "Failed to delete directory for file: {0}";
-    case '5019': return "Failed to delete file: {0}";
-    case '5020': return "Failed to copy file: {0}";
+    case '5007': return "Cannot create consumer group info";
+    case '5008': return "Cannot delete consumer group info";
+    case '5009': return "Consumer group partition not owned";
 
     default: return 'error';
   }

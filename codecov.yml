@@ -62,7 +62,7 @@ flag_management:
     - name: php
       paths:
         - foreign/php/
-    - name: node-test
+    - name: node
       paths:
         - foreign/node/
     - name: node-e2e

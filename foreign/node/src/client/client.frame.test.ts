@@ -19,7 +19,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   extractResponseFrames,
-  ProtocolFrameError
+  ProtocolFrameError,
+  ResponseFrameDecoder
 } from './client.frame.js';
 import {
   Command2,
@@ -95,6 +96,7 @@ describe('extractResponseFrames', () => {
 
       assert.deepEqual(extracted.frames, [first, second]);
       assert.deepEqual(extracted.remainder, third.subarray(0, 3));
+      assert.equal(extracted.remainder.buffer, input.buffer);
     });
   }
 
@@ -123,5 +125,36 @@ describe('extractResponseFrames', () => {
       () => extractResponseFrames('classic', header, LIMIT),
       ProtocolFrameError
     );
+  });
+});
+
+describe('ResponseFrameDecoder', () => {
+  it('decodes bytewise input without losing coalesced frames', () => {
+    const decoder = new ResponseFrameDecoder('classic', LIMIT);
+    const first = classicFrame(Buffer.from('first'));
+    const second = classicFrame(Buffer.from('second'));
+    const input = Buffer.concat([first, second]);
+    const frames: Buffer[] = [];
+
+    for (const byte of input)
+      frames.push(...decoder.push(Buffer.from([byte])));
+
+    assert.deepEqual(frames, [first, second]);
+    assert.equal(decoder.hasBufferedData, false);
+  });
+
+  it('clears a partial frame', () => {
+    const decoder = new ResponseFrameDecoder('vsr', LIMIT);
+    decoder.push(vsrFrame(Buffer.from('body')).subarray(0, 100));
+    assert.equal(decoder.hasBufferedData, true);
+    decoder.clear();
+    assert.equal(decoder.hasBufferedData, false);
+  });
+
+  it('rejects an oversized frame as soon as its header is complete', () => {
+    const decoder = new ResponseFrameDecoder('classic', LIMIT);
+    const header = Buffer.alloc(8);
+    header.writeUInt32LE(LIMIT, 4);
+    assert.throws(() => decoder.push(header), ProtocolFrameError);
   });
 });

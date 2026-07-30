@@ -32,7 +32,7 @@ export type GetOffset = {
   topicId: Id,
   /** Consumer identifier (single or group) */
   consumer: Consumer,
-  /** Partition ID (required for single consumer, null for group) */
+  /** Partition ID. VSR requires the explicit partition returned by polling. */
   partitionId: number | null
 };
 

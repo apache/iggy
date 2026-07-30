@@ -34,7 +34,6 @@ import { joinGroup } from './consumer-group/join-group.command.js';
 import { getGroup } from './consumer-group/get-group.command.js';
 import { getGroups } from './consumer-group/get-groups.command.js';
 import { leaveGroup } from './consumer-group/leave-group.command.js';
-import { syncGroup } from './consumer-group/sync-group.command.js';
 import { deleteGroup } from './consumer-group/delete-group.command.js';
 import {
   ensureConsumerGroup, ensureConsumerGroupAndJoin
@@ -166,7 +165,6 @@ const groupAPI = (c: ClientProvider) => ({
   create: createGroup(c),
   join: joinGroup(c),
   leave: leaveGroup(c),
-  sync: syncGroup(c),
   delete: deleteGroup(c),
   ensure: ensureConsumerGroup(c),
   ensureAndJoin: ensureConsumerGroupAndJoin(c)

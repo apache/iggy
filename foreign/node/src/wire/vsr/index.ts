@@ -58,13 +58,17 @@ export class VsrSession {
     this.state.bind(session);
   }
 
+  get hasActivity(): boolean {
+    return this.state.hasActivity;
+  }
+
   encode(command: number, payload: Buffer): Buffer {
     const operation = registerCommand(command)
       ? Operation.Register
       : operationForCode(command);
     const namespace = namespaceForRequest(command, payload, operation);
     const size = HEADER_SIZE + payload.length;
-    if (!Number.isSafeInteger(size) || size > MAX_U32)
+    if (size > MAX_U32)
       throw new RangeError('VSR request exceeds the u32 frame-size limit');
 
     let request: bigint;
@@ -86,22 +90,24 @@ export class VsrSession {
     }
 
     const header = encodeRequestHeader({
-      size: HEADER_SIZE + payload.length,
+      size,
       client: this.state.clientId,
       request,
       operation,
       namespace,
       session,
-      ...(operation === Operation.NonReplicated
-        ? { nonReplicatedCode: command }
-        : {}),
+      nonReplicatedCode:
+        operation === Operation.NonReplicated ? command : undefined,
     });
     return payload.length === 0 ? header : Buffer.concat([header, payload]);
   }
 }
 
-export const decodeVsrResponse = (frame: Buffer): CommandResponse => {
-  const data = decodeResponse(frame);
+export const decodeVsrResponse = (
+  frame: Buffer,
+  commandCode = 0
+): CommandResponse => {
+  const data = decodeResponse(frame, commandCode);
   return { status: 0, length: data.length, data };
 };
 

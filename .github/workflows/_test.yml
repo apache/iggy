@@ -137,7 +137,9 @@ jobs:
             inputs.task == 'test' && 'unit' || inputs.task
             }}/lcov.info
           disable_search: true
-          flags: node-${{ inputs.task }}
+          flags: >-
+            ${{ inputs.task == 'test' && 'node' ||
+            format('node-{0}', inputs.task) }}
           fail_ci_if_error: false
           verbose: true
           override_pr: ${{ github.event.pull_request.number }}

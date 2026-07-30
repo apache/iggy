@@ -47,8 +47,7 @@ export const SYNC_GROUP = {
     const generation = response.data.readBigUInt64LE(0);
     const partitionsCount = response.data.readUInt32LE(8);
     const partitionsLength = partitionsCount * 4;
-    if (!Number.isSafeInteger(partitionsLength) ||
-        partitionsLength > response.data.length - 12)
+    if (partitionsLength > response.data.length - 12)
       throw new DeserializeError(
         'consumer group assignment partition list is truncated'
       );

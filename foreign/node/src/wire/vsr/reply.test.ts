@@ -17,6 +17,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError } from '../error.utils.js';
 import {
   Command2,
@@ -119,6 +120,18 @@ describe('VSR reply decoding', () => {
     );
   });
 
+  it('strips a non-empty successful result section', () => {
+    const body = Buffer.alloc(12 + 6);
+    body.writeUInt32LE(1, 0);
+    body.writeUInt32LE(7, 4);
+    body.writeUInt32LE(0, 8);
+    Buffer.from('stream').copy(body, 12);
+    assert.deepEqual(
+      decodeResponse(reply(Operation.CreateStream, body)),
+      Buffer.from('stream')
+    );
+  });
+
   it('surfaces the first committed result error', () => {
     const body = Buffer.alloc(20);
     body.writeUInt32LE(2, 0);
@@ -127,16 +140,22 @@ describe('VSR reply decoding', () => {
     body.writeUInt32LE(8, 12);
     body.writeUInt32LE(1010, 16);
     assert.throws(
-      () => splitMetadataResult(Operation.CreateStream, body),
+      () => splitMetadataResult(Operation.CreateStream, body, 202),
       (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 1009
+        error instanceof ResponseError &&
+        error.commandCode === 202 &&
+        error.errorCode === 1009
     );
   });
 
   it('rejects truncated result sections', () => {
-    assert.throws(
-      () => splitMetadataResult(Operation.CreateStream, Buffer.alloc(3)),
-      ResponseError
+    assert.throws(() => splitMetadataResult(
+      Operation.CreateStream,
+      Buffer.alloc(3),
+      COMMAND_CODE.CreateStream
+    ), (error: unknown) =>
+      error instanceof ResponseError &&
+      error.commandCode === COMMAND_CODE.CreateStream
     );
     const body = Buffer.alloc(4);
     body.writeUInt32LE(1, 0);

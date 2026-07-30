@@ -69,6 +69,17 @@ type Job = {
   reject: (e: unknown) => void
 };
 
+type ExchangeState = {
+  written: boolean
+};
+
+export class VsrResponseTimeoutError extends Error {
+  constructor(timeout: number) {
+    super(`timed out after ${timeout} ms waiting for VSR response`);
+    this.name = 'VsrResponseTimeoutError';
+    Object.setPrototypeOf(this, VsrResponseTimeoutError.prototype);
+  }
+}
 
 /**
  * Manages command execution and response handling for the Iggy server.
@@ -97,6 +108,8 @@ export class CommandResponseStream extends EventEmitter {
   userId?: number;
   /** Heartbeat interval timer handle */
   heartbeatIntervalHandler?: NodeJS.Timeout;
+  /** Whether a heartbeat ping is still awaiting its response */
+  private heartbeatInFlight: boolean;
 
   /**
    * Creates a new CommandResponseStream.
@@ -115,6 +128,7 @@ export class CommandResponseStream extends EventEmitter {
     this.vsrSession = new VsrSession();
     this.authenticationPromise = undefined;
     this.pendingSubmissions = 0;
+    this.heartbeatInFlight = false;
     this._init();
   };
 
@@ -126,11 +140,12 @@ export class CommandResponseStream extends EventEmitter {
     this.connection.on('error', (error: Error) => {
       this._failQueue(error);
     });
+    this.connection.on('eviction', (error: VsrEvictionError) => {
+      this._resetSession();
+      this.emit('eviction', error);
+    });
     this.connection.on('disconnected', () => {
-      this.isAuthenticated = false;
-      this.userId = undefined;
-      this.vsrSession.reset();
-      this.emit('sessionReset');
+      this._resetSession();
       this._failQueue(
         new Error('connection closed before queued commands were sent')
       );
@@ -161,14 +176,8 @@ export class CommandResponseStream extends EventEmitter {
       if (!this.connection.connected)
         await this.connection.connect()
 
-      if (this.options.protocol === 'vsr' &&
-          isLoginCommand(command) &&
-          this.isAuthenticated)
-        await this.sendCommand(
-          LOGOUT.code,
-          LOGOUT.serialize(),
-          { last: false }
-        );
+      if (this.options.protocol === 'vsr' && isLoginCommand(command))
+        await this._ensureVsrLeader();
 
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
         await this.authenticate(this.options.credentials);
@@ -240,6 +249,17 @@ export class CommandResponseStream extends EventEmitter {
   ): Promise<CommandResponse> {
     if (this.options.protocol !== 'vsr')
       return this._processClassic(command, payload, handleResp);
+    if (isLoginCommand(command) && this.isAuthenticated)
+      return this._processVsrLogin(command, payload, handleResp);
+    return this._processVsr(command, payload, handleResp);
+  }
+
+  private async _processVsrLogin(
+    command: number,
+    payload: Buffer,
+    handleResp: boolean
+  ): Promise<CommandResponse> {
+    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true);
     return this._processVsr(command, payload, handleResp);
   }
 
@@ -264,32 +284,42 @@ export class CommandResponseStream extends EventEmitter {
     payload: Buffer,
     handleResp: boolean
   ): Promise<CommandResponse> {
+    let requestWritten = false;
     try {
       const prepared = prepareVsrCommand(command, payload);
       // A transient retry must preserve all request identity fields.
       const frame = this.vsrSession.encode(prepared.command, prepared.payload);
       const deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS;
+      let lastTransientError: ResponseError | undefined;
       let parsed: CommandResponse;
       while (true) {
         const remaining = deadline - Date.now();
-        if (remaining <= 0)
-          throw new Error(
-            `timed out after ${VSR_RESPONSE_TIMEOUT_MS} ms ` +
-            'waiting for VSR response'
+        if (remaining <= 0) {
+          if (lastTransientError)
+            throw lastTransientError;
+          throw new VsrResponseTimeoutError(VSR_RESPONSE_TIMEOUT_MS);
+        }
+        const exchangeState = { written: false };
+        let response: Buffer;
+        try {
+          response = await this._exchange(
+            () => this.connection.writeFrame(frame),
+            remaining,
+            exchangeState
           );
-        const response = await this._exchange(
-          () => this.connection.writeFrame(frame),
-          remaining
-        );
+        } finally {
+          requestWritten ||= exchangeState.written;
+        }
         if (!handleResp)
           return response as unknown as CommandResponse;
         try {
-          parsed = decodeVsrResponse(response);
+          parsed = decodeVsrResponse(response, command);
           break;
         } catch (error) {
           if (!(error instanceof ResponseError) ||
               !isTransientVsrError(error.errorCode))
             throw error;
+          lastTransientError = error;
           const retryDelay = Math.min(
             VSR_RETRY_INTERVAL_MS,
             Math.max(0, deadline - Date.now())
@@ -307,35 +337,28 @@ export class CommandResponseStream extends EventEmitter {
         this.userId = parsed.data.readUInt32LE(0);
       }
       if (prepared.command === COMMAND_CODE.LogoutUser) {
-        this.isAuthenticated = false;
-        this.userId = undefined;
-        this.vsrSession.reset();
-        this.emit('sessionReset');
+        this._resetSession();
       }
       return parsed;
     } catch (error) {
-      if (error instanceof VsrEvictionError) {
-        this.isAuthenticated = false;
-        this.userId = undefined;
-        this.vsrSession.reset();
-        this.emit('sessionReset');
-      } else if (!(error instanceof ResponseError)) {
-        // A local failure after encoding may have consumed a request ID
-        // without a server verdict; keeping the session would leave a
-        // request-ID gap the primary silently drops. Register afresh instead
-        // of replaying an ambiguous request under the old session.
-        this.isAuthenticated = false;
-        this.userId = undefined;
-        this.vsrSession.reset();
-        this.emit('sessionReset');
-      }
+      // Once bytes were handed to the socket, a local transport or decode
+      // failure leaves the request outcome ambiguous. Register a fresh session
+      // rather than replaying that request under a different client identity.
+      if (!(error instanceof ResponseError) && requestWritten)
+        this._resetSession();
+      if (error instanceof VsrEvictionError)
+        throw error;
       if (error instanceof ResponseError)
         throw responseError(command, error.errorCode);
       throw error;
     }
   }
 
-  private _exchange(write: () => void, timeout?: number): Promise<Buffer> {
+  private _exchange(
+    write: () => void,
+    timeout?: number,
+    state?: ExchangeState
+  ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       let timeoutHandler: NodeJS.Timeout | undefined;
       const cleanup = () => {
@@ -343,6 +366,7 @@ export class CommandResponseStream extends EventEmitter {
           clearTimeout(timeoutHandler);
         this.connection.removeListener('error', errorCallback);
         this.connection.removeListener('disconnected', disconnectedCallback);
+        this.connection.removeListener('eviction', evictionCallback);
         this.connection.removeListener('response', responseCallback);
       };
       const errorCallback = (error: unknown) => {
@@ -353,6 +377,10 @@ export class CommandResponseStream extends EventEmitter {
         cleanup();
         reject(new Error('connection closed while waiting for response'));
       };
+      const evictionCallback = (error: VsrEvictionError) => {
+        cleanup();
+        reject(error);
+      };
       const responseCallback = (response: Buffer) => {
         cleanup();
         resolve(response);
@@ -361,14 +389,17 @@ export class CommandResponseStream extends EventEmitter {
         timeoutHandler = setTimeout(() => {
           cleanup();
           this.connection.abort();
-          reject(new Error(`timed out after ${timeout} ms waiting for VSR response`));
+          reject(new VsrResponseTimeoutError(timeout));
         }, timeout);
       }
       this.connection.once('error', errorCallback);
       this.connection.once('disconnected', disconnectedCallback);
+      this.connection.once('eviction', evictionCallback);
       this.connection.once('response', responseCallback);
       try {
         write();
+        if (state)
+          state.written = true;
       } catch (error) {
         cleanup();
         reject(error);
@@ -402,8 +433,10 @@ export class CommandResponseStream extends EventEmitter {
         await delay(100);
         continue;
       }
-      if (!this.connection.isConnectedTo(leader.ip, leader.endpoints.tcp))
+      if (!this.connection.isConnectedTo(leader.ip, leader.endpoints.tcp)) {
         await this.connection.redirect(leader.ip, leader.endpoints.tcp);
+        continue;
+      }
       return;
     }
     throw new Error('VSR cluster has no healthy leader');
@@ -417,6 +450,29 @@ export class CommandResponseStream extends EventEmitter {
   _failQueue(err: Error) {
     this._execQueue.forEach(({ reject }) => reject(err));
     this._execQueue = [];
+  }
+
+  private _resetSession(): void {
+    if (!this.isAuthenticated &&
+        this.userId === undefined &&
+        !this.vsrSession.hasActivity)
+      return;
+    this.isAuthenticated = false;
+    this.userId = undefined;
+    this.vsrSession.reset();
+    this.emit('sessionReset');
+  }
+
+  hold(): () => void {
+    this.pendingSubmissions += 1;
+    let released = false;
+    return () => {
+      if (released)
+        return;
+      released = true;
+      this.pendingSubmissions -= 1;
+      this._emitFinishQueue();
+    };
   }
 
   /**
@@ -440,8 +496,6 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private async _authenticate(creds: ClientCredentials): Promise<boolean> {
-    if (this.options.protocol === 'vsr')
-      await this._ensureVsrLeader();
     const r = ('token' in creds) ?
       await this._authWithToken(creds) :
       await this._authWithPassword(creds);
@@ -499,12 +553,16 @@ export class CommandResponseStream extends EventEmitter {
       return
 
     this.heartbeatIntervalHandler = setInterval(async () => {
-      if (this.connection.connected) {
+      if (this.connection.connected && !this.heartbeatInFlight) {
+        this.heartbeatInFlight = true;
         debug(`sending heartbeat ping (interval: ${interval} ms)`);
         try {
           await this.ping()
+          this.emit('heartbeat');
         } catch (error) {
           debug('heartbeat ping failed', error);
+        } finally {
+          this.heartbeatInFlight = false;
         }
       }
     }, interval);

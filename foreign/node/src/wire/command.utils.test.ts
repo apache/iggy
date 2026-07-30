@@ -14,22 +14,24 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
-export {
-  type Id,
-  PollingStrategy,
-  Consumer,
-  Partitioning,
-  HeaderValue,
-  HeaderKeyFactory,
-} from "./wire/index.js";
+import assert from 'node:assert/strict';
+import { it } from 'node:test';
+import { wrapCommand } from './command.utils.js';
 
-export * from "./client/index.js";
-export * from "./stream/index.js";
-export {
-  DeserializeError,
-  ResponseError
-} from './wire/error.utils.js';
-export { ProtocolFrameError } from './client/client.frame.js';
-export { VsrEvictionError } from './wire/vsr/reply.js';
+it('serializes before acquiring a pooled client', async () => {
+  let acquired = false;
+  const execute = wrapCommand<null, boolean>({
+    code: 1,
+    serialize: () => {
+      throw new Error('invalid request');
+    },
+    deserialize: () => true
+  })(async () => {
+    acquired = true;
+    throw new Error('client provider should not be called');
+  });
+
+  await assert.rejects(() => execute(null), /invalid request/);
+  assert.equal(acquired, false);
+});

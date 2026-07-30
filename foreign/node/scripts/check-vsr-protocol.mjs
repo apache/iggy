@@ -16,25 +16,11 @@
 // under the License.
 
 import assert from 'node:assert/strict';
-import { access, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const rootCandidates = [
-  resolve(import.meta.dirname, '../..'),
-  resolve(import.meta.dirname, '../../..')
-];
-let root;
-for (const candidate of rootCandidates) {
-  try {
-    await access(resolve(candidate, 'core/binary_protocol/src/codes.rs'));
-    root = candidate;
-    break;
-  } catch {
-    // Try the monorepo layout after the isolated test layout.
-  }
-}
-assert.ok(root, 'Apache Iggy repository root was not found');
+const root = resolve(import.meta.dirname, '../../..');
 const read = (path) => readFile(resolve(root, path), 'utf8');
 const nodeRoot = resolve(import.meta.dirname, '..');
 const readNode = (path) => readFile(resolve(nodeRoot, path), 'utf8');
@@ -45,9 +31,11 @@ const [
   rustHeader,
   rustCommand,
   rustOperation,
+  rustNamespace,
   rustProtocolCargo,
   nodeCodes,
   nodeHeader,
+  nodeNamespace,
   nodeOperation,
   nodeRegister,
 ] = await Promise.all([
@@ -56,9 +44,11 @@ const [
   read('core/binary_protocol/src/consensus/header.rs'),
   read('core/binary_protocol/src/consensus/command.rs'),
   read('core/binary_protocol/src/consensus/operation.rs'),
+  read('core/binary_protocol/src/namespace.rs'),
   read('core/binary_protocol/Cargo.toml'),
   readNode('src/wire/command.code.ts'),
   readNode('src/wire/vsr/header.ts'),
+  readNode('src/wire/vsr/namespace.ts'),
   readNode('src/wire/vsr/operation.ts'),
   readNode('src/wire/vsr/register.ts'),
 ]);
@@ -89,6 +79,14 @@ const enumValues = (source, pattern) =>
       Number(match[2])
     ])
   );
+const rustCodeValues = enumValues(
+  rustCodes,
+  /^pub const ([A-Z0-9_]+_CODE): u32 = ([0-9]+);$/gm
+);
+const nodeCodeValues = enumValues(
+  nodeCommandBlock,
+  /^\s*([A-Za-z0-9]+):\s*([0-9]+),/gm
+);
 const rustOperations = enumValues(
   rustOperation,
   /^\s+([A-Za-z0-9]+)\s*=\s*([0-9]+),$/gm
@@ -103,23 +101,70 @@ assert.deepEqual(
   'Node Operation differs from the Rust consensus enum'
 );
 
-const rustReplicated = new Set(
-  [...rustDispatch.matchAll(
-    /CommandMeta::replicated\([\s\S]*?Operation::([A-Za-z0-9]+)/g
-  )].map((match) => match[1])
-);
 const nodeReplicatedBlock =
   nodeOperation.match(
     /const REPLICATED_OPERATION[\s\S]*?new Map\(\[([\s\S]*?)\]\);/
   )?.[1] ?? '';
-const nodeReplicated = new Set(
-  [...nodeReplicatedBlock.matchAll(/Operation\.([A-Za-z0-9]+)/g)]
-    .map((match) => match[1])
-);
+const rustReplicated = [...rustDispatch.matchAll(
+  /CommandMeta::replicated\(\s*([A-Z0-9_]+),[\s\S]*?Operation::([A-Za-z0-9]+)/g
+)].map((match) => [
+  rustCodeValues.get(match[1]),
+  rustOperations.get(match[2])
+]).sort(([left], [right]) => left - right);
+const nodeReplicated = [...nodeReplicatedBlock.matchAll(
+  /\[COMMAND_CODE\.([A-Za-z0-9]+), Operation\.([A-Za-z0-9]+)\]/g
+)].map((match) => [
+  nodeCodeValues.get(match[1]),
+  nodeOperations.get(match[2])
+]).sort(([left], [right]) => left - right);
+assert.ok(rustReplicated.length > 0, 'Rust replicated command map was not found');
+assert.ok(nodeReplicated.length > 0, 'Node replicated command map was not found');
 assert.deepEqual(
   nodeReplicated,
   rustReplicated,
-  'Node replicated operations differ from the Rust dispatch table'
+  'Node replicated code-to-operation map differs from Rust dispatch'
+);
+
+const rustNamespaceValue = (name) => Number(
+  rustNamespace.match(
+    new RegExp(`pub const ${name}: usize = ([0-9_]+);`)
+  )?.[1].replaceAll('_', '')
+);
+const nodeNamespaceValue = (name) => Number(
+  nodeNamespace.match(
+    new RegExp(`const ${name} = ([0-9_]+);`)
+  )?.[1].replaceAll('_', '')
+);
+const namespaceLimits = new Map(
+  ['MAX_STREAMS', 'MAX_TOPICS', 'MAX_PARTITIONS'].map((name) => [
+    name,
+    rustNamespaceValue(name)
+  ])
+);
+for (const [name, value] of namespaceLimits) {
+  assert.ok(Number.isSafeInteger(value), `Rust ${name} was not found`);
+  assert.equal(
+    nodeNamespaceValue(name),
+    value,
+    `Node ${name} differs from Rust namespace layout`
+  );
+}
+
+const bitsRequired = (value) => BigInt(value).toString(2).length;
+const expectedTopicShift = bitsRequired(
+  namespaceLimits.get('MAX_PARTITIONS') - 1
+);
+const expectedStreamShift = expectedTopicShift +
+  bitsRequired(namespaceLimits.get('MAX_TOPICS') - 1);
+const namespaceModule = await import(
+  pathToFileURL(resolve(nodeRoot, 'dist/wire/vsr/namespace.js')).href
+);
+assert.equal(
+  namespaceModule.packNamespace(1, 1, 1),
+  (1n << BigInt(expectedStreamShift)) |
+    (1n << BigInt(expectedTopicShift)) |
+    1n,
+  'Node namespace shifts differ from Rust namespace layout'
 );
 
 const rustEvictionBlock =
@@ -282,20 +327,14 @@ for (const [name, value] of rustOperations) {
 const protocolVersion =
   rustProtocolCargo.match(/^version = "([0-9]+)\.([0-9]+)\.([0-9]+)/m);
 assert.ok(protocolVersion, 'binary protocol crate version is missing');
-const packedVersion =
-  Number(protocolVersion[1]) << 20 |
-  Number(protocolVersion[2]) << 10 |
-  Number(protocolVersion[3]);
 const nodePackedVersion = nodeRegister.match(
   /export const IGGY_PROTOCOL_VERSION =\s*\(([0-9]+) << 20\) \| \(([0-9]+) << 10\) \| ([0-9]+);/
 );
 assert.ok(nodePackedVersion, 'Node packed protocol version source changed');
-assert.equal(
-  Number(nodePackedVersion[1]) << 20 |
-    Number(nodePackedVersion[2]) << 10 |
-    Number(nodePackedVersion[3]),
-  packedVersion,
-  'Node protocol version differs from iggy_binary_protocol'
+assert.deepEqual(
+  [Number(nodePackedVersion[1]), Number(nodePackedVersion[2])],
+  [Number(protocolVersion[1]), Number(protocolVersion[2])],
+  'Node protocol major.minor differs from iggy_binary_protocol'
 );
 
 console.log('Node VSR protocol mirror matches Rust sources');

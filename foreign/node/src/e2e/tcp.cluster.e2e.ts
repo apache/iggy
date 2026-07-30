@@ -52,35 +52,12 @@ const expectedMeta = {
   ],
 };
 
-const expectedVsrMeta = {
-  name: "single-node",
-  nodes: [
-    {
-      name: "iggy-node",
-      ip: "127.0.0.1",
-      endpoints: {
-        tcp: 8090,
-        quic: 8080,
-        http: 3000,
-        websocket: 8092,
-      },
-      role: "Leader",
-      status: "Healthy",
-    },
-  ],
-};
-
 describe("e2e -> system", async () => {
   const c = getTestClient();
 
   it("e2e -> cluster::getClusterMetadata", async () => {
     const meta = await c.cluster.getClusterMetadata();
-    assert.deepEqual(
-      meta,
-      process.env.IGGY_TEST_PROTOCOL === "vsr"
-        ? expectedVsrMeta
-        : expectedMeta
-    );
+    assert.deepEqual(meta, expectedMeta);
   });
 
   after(() => {

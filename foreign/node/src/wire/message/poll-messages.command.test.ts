@@ -31,6 +31,7 @@ import {
   PollingStrategy
 } from './poll.utils.js';
 import {
+  NO_ASSIGNED_PARTITION,
   pollMessages,
   type PollMessages
 } from './poll-messages.command.js';
@@ -76,7 +77,8 @@ const groupRequest: PollMessages = {
 };
 
 const stubClient = (
-  responses: CommandResponse[]
+  responses: (CommandResponse | Error)[],
+  onCommand?: (command: number, emitter: EventEmitter) => void,
 ): {
   client: RawClient,
   emitter: EventEmitter,
@@ -89,9 +91,12 @@ const stubClient = (
     isAuthenticated: true,
     sendCommand: async (command: number, payload: Buffer) => {
       commands.push({ command, payload });
+      onCommand?.(command, emitter);
       const next = responses.shift();
       if (!next)
         throw new Error('unexpected command');
+      if (next instanceof Error)
+        throw next;
       return next;
     },
     authenticate: async () => true,
@@ -105,7 +110,11 @@ const stubClient = (
 
 describe('VSR consumer-group polling', () => {
   it('rejects a missing assignment', async () => {
-    const { client } = stubClient([response(Buffer.alloc(0))]);
+    const { client } = stubClient([
+      response(Buffer.alloc(0)),
+      response(Buffer.alloc(0)),
+      response(Buffer.alloc(0))
+    ]);
     await assert.rejects(
       () => pollMessages(async () => client)(groupRequest),
       (error: unknown) =>
@@ -115,11 +124,66 @@ describe('VSR consumer-group polling', () => {
     );
   });
 
+  it('joins when the initial sync has no membership', async () => {
+    const { client, commands } = stubClient([
+      response(Buffer.alloc(0)),
+      response(Buffer.alloc(0)),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+
+    assert.equal(
+      (await pollMessages(async () => client)(groupRequest)).partitionId,
+      7
+    );
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.JoinGroup,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
+  it('rejoins when sync reports a missing member after session reset', async () => {
+    const { client, emitter, commands } = stubClient([
+      assignment(1n, [4]),
+      pollResponse(4),
+      new ResponseError(COMMAND_CODE.SyncGroup, 5006),
+      response(Buffer.alloc(0)),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+    const poll = pollMessages(async () => client);
+
+    assert.equal((await poll(groupRequest)).partitionId, 4);
+    emitter.emit('sessionReset');
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.JoinGroup,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
   it('returns immediately for an empty assignment', async () => {
     const { client, commands } = stubClient([assignment(1n, [])]);
     assert.deepEqual(
       await pollMessages(async () => client)(groupRequest),
-      { partitionId: 0, currentOffset: 0n, count: 0, messages: [] }
+      {
+        partitionId: NO_ASSIGNED_PARTITION,
+        currentOffset: 0n,
+        count: 0,
+        messages: []
+      }
     );
     assert.deepEqual(
       commands.map(({ command }) => command),
@@ -127,26 +191,89 @@ describe('VSR consumer-group polling', () => {
     );
   });
 
-  it('reuses a generation cursor and clears it on session reset', async () => {
+  it('caches a cursor and refreshes it after a heartbeat', async () => {
     const responses = [
       assignment(1n, [4, 5]),
       pollResponse(4),
-      assignment(1n, [7]),
-      pollResponse(7),
+      pollResponse(5),
       assignment(2n, [8]),
       pollResponse(8)
     ];
     const { client, emitter, commands } = stubClient(responses);
     const poll = pollMessages(async () => client);
     assert.equal((await poll(groupRequest)).partitionId, 4);
-    assert.equal((await poll(groupRequest)).partitionId, 7);
-    emitter.emit('sessionReset');
+    assert.equal((await poll(groupRequest)).partitionId, 5);
+    emitter.emit('heartbeat');
     assert.equal((await poll(groupRequest)).partitionId, 8);
     assert.deepEqual(
       commands
         .filter(({ command }) => command === COMMAND_CODE.PollMessages)
         .map(({ payload }) => payload.readUInt32LE(20)),
-      [4, 7, 8]
+      [4, 5, 8]
+    );
+    assert.equal(
+      commands.filter(
+        ({ command }) => command === COMMAND_CODE.SyncGroup
+      ).length,
+      2
+    );
+  });
+
+  it('keeps the round-robin position across a heartbeat refresh', async () => {
+    const { client, emitter, commands } = stubClient([
+      assignment(1n, [4, 5]),
+      pollResponse(4),
+      assignment(1n, [4, 5]),
+      pollResponse(5)
+    ]);
+    const poll = pollMessages(async () => client);
+    assert.equal((await poll(groupRequest)).partitionId, 4);
+    emitter.emit('heartbeat');
+    assert.equal((await poll(groupRequest)).partitionId, 5);
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
+  it('retries a poll interrupted by a session reset', async () => {
+    let resetPending = true;
+    const { client, commands } = stubClient(
+      [
+        assignment(1n, [4]),
+        new Error('connection closed while waiting for response'),
+        response(Buffer.alloc(0)),
+        response(Buffer.alloc(0)),
+        assignment(2n, [7]),
+        pollResponse(7)
+      ],
+      (command, emitter) => {
+        if (command === COMMAND_CODE.PollMessages && resetPending) {
+          resetPending = false;
+          emitter.emit('sessionReset');
+        }
+      }
+    );
+
+    assert.equal(
+      (await pollMessages(async () => client)(groupRequest)).partitionId,
+      7
+    );
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.JoinGroup,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
     );
   });
 
@@ -160,7 +287,12 @@ describe('VSR consumer-group polling', () => {
     ]);
     assert.deepEqual(
       await pollMessages(async () => client)(groupRequest),
-      { partitionId: 0, currentOffset: 0n, count: 0, messages: [] }
+      {
+        partitionId: NO_ASSIGNED_PARTITION,
+        currentOffset: 0n,
+        count: 0,
+        messages: []
+      }
     );
     assert.deepEqual(
       commands
@@ -168,5 +300,124 @@ describe('VSR consumer-group polling', () => {
         .map(({ payload }) => payload.readUInt32LE(20)),
       [1, 2]
     );
+  });
+
+  it('rejoins when a cached poll reports a missing member', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [4]),
+      new ResponseError(COMMAND_CODE.PollMessages, 5006),
+      new ResponseError(COMMAND_CODE.SyncGroup, 5006),
+      response(Buffer.alloc(0)),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+
+    assert.equal(
+      (await pollMessages(async () => client)(groupRequest)).partitionId,
+      7
+    );
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.JoinGroup,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
+  it('resynchronizes when a cached poll reports stale ownership', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [4]),
+      new ResponseError(COMMAND_CODE.PollMessages, 5009),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+
+    assert.equal(
+      (await pollMessages(async () => client)(groupRequest)).partitionId,
+      7
+    );
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
+  it('uses kind-tagged cursor keys', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [7]),
+      pollResponse(7),
+      assignment(1n, [8]),
+      pollResponse(8)
+    ]);
+    const poll = pollMessages(async () => client);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.equal(
+      (await poll({
+        ...groupRequest,
+        streamId: '1',
+        topicId: '2',
+        consumer: Consumer.Group('3')
+      })).partitionId,
+      8
+    );
+    assert.equal(
+      commands.filter(
+        ({ command }) => command === COMMAND_CODE.SyncGroup
+      ).length,
+      2
+    );
+  });
+
+  it('refreshes an expired assignment without a heartbeat', async () => {
+    const realNow = Date.now;
+    const { client, commands } = stubClient([
+      assignment(1n, [7]),
+      pollResponse(7),
+      assignment(2n, [8]),
+      pollResponse(8)
+    ]);
+    const poll = pollMessages(async () => client);
+    try {
+      Date.now = () => 0;
+      assert.equal((await poll(groupRequest)).partitionId, 7);
+      Date.now = () => 5_000;
+      assert.equal((await poll(groupRequest)).partitionId, 8);
+      assert.equal(
+        commands.filter(
+          ({ command }) => command === COMMAND_CODE.SyncGroup
+        ).length,
+        2
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('holds the raw client for the complete multi-command poll', async () => {
+    let held = false;
+    const { client } = stubClient(
+      [assignment(1n, [7]), pollResponse(7)],
+      () => assert.equal(held, true)
+    );
+    client.hold = () => {
+      held = true;
+      return () => { held = false; };
+    };
+
+    assert.equal(
+      (await pollMessages(async () => client)(groupRequest)).partitionId,
+      7
+    );
+    assert.equal(held, false);
   });
 });

@@ -32,6 +32,7 @@ import {
   REQUEST_OFFSET
 } from '../wire/vsr/header.js';
 import { Operation } from '../wire/vsr/operation.js';
+import { VsrEvictionError } from '../wire/vsr/reply.js';
 import { CommandResponseStream } from './client.socket.js';
 import type { ClientConfig } from './client.type.js';
 
@@ -262,10 +263,19 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('resets the session and surfaces a typed error on eviction', async () => {
+  it('routes eviction out of band without desynchronizing replies', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_003) {
-        socket.write(evictionFrame(EvictionReason.NoSession));
+        socket.write(Buffer.concat([
+          evictionFrame(EvictionReason.NoSession),
+          replyFrame(Operation.NonReplicated, Buffer.from('stale'))
+        ]));
+        return;
+      }
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_014) {
+        socket.write(
+          replyFrame(Operation.NonReplicated, Buffer.from('fresh'))
+        );
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -273,17 +283,22 @@ describe('VSR client socket', () => {
     const client = new CommandResponseStream(vsrConfig(server.port));
     try {
       let sessionResets = 0;
+      let evictions = 0;
       client.on('sessionReset', () => { sessionResets += 1; });
+      client.on('eviction', () => { evictions += 1; });
       await assert.rejects(
         () => client.sendCommand(
           60_003,
           Buffer.alloc(0)
         ),
         (error: unknown) =>
-          error instanceof ResponseError && error.errorCode === 40
+          error instanceof VsrEvictionError && error.errorCode === 40
       );
       assert.ok(sessionResets >= 1);
+      assert.equal(evictions, 1);
       assert.equal(client.isAuthenticated, false);
+      const response = await client.sendCommand(60_014, Buffer.alloc(0));
+      assert.deepEqual(response.data, Buffer.from('fresh'));
     } finally {
       client.destroy();
       await server.close();
@@ -313,50 +328,54 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('redirects to the advertised leader before registering', async () => {
-    const leader = await startVsrServer(
-      (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
-    );
-    const follower = await startVsrServer((frame, socket) => {
-      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === COMMAND_CODE.GetClusterMetadata) {
+  it('redirects a direct login to the advertised leader before registering',
+    async () => {
+      const leader = await startVsrServer(
+        (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
+      );
+      const follower = await startVsrServer((frame, socket) => {
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            twoNodeMetadataBody(follower.port, leader.port)
+          ));
+          return;
+        }
         socket.write(replyFrame(
-          Operation.NonReplicated,
-          twoNodeMetadataBody(follower.port, leader.port)
+          frame.readUInt8(REQUEST_OFFSET.operation),
+          Buffer.alloc(0),
+          3
         ));
-        return;
+      });
+      const client = new CommandResponseStream(vsrConfig(follower.port));
+      try {
+        const response = await client.sendCommand(COMMAND_CODE.LoginUser,
+          Buffer.concat([
+            Buffer.from([4]),
+            Buffer.from('iggy'),
+            Buffer.from([4]),
+            Buffer.from('iggy')
+          ]));
+        assert.equal(response.status, 0);
+        assert.equal(client.isAuthenticated, true);
+        const followerOperations = follower.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        );
+        assert.deepEqual(followerOperations, [Operation.NonReplicated]);
+        const leaderOperations = leader.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        );
+        assert.deepEqual(leaderOperations, [
+          Operation.NonReplicated,
+          Operation.Register
+        ]);
+      } finally {
+        client.destroy();
+        await leader.close();
+        await follower.close();
       }
-      socket.write(replyFrame(
-        frame.readUInt8(REQUEST_OFFSET.operation),
-        Buffer.alloc(0),
-        3
-      ));
     });
-    const client = new CommandResponseStream(vsrConfig(follower.port));
-    try {
-      const response = await client.sendCommand(
-        60_005,
-        Buffer.alloc(0)
-      );
-      assert.equal(response.status, 0);
-      const followerOperations = follower.frames.map(
-        (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-      );
-      assert.deepEqual(followerOperations, [Operation.NonReplicated]);
-      const leaderOperations = leader.frames.map(
-        (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-      );
-      assert.ok(leaderOperations.includes(Operation.Register));
-      assert.equal(
-        leader.frames.at(-1)?.readUInt32LE(REQUEST_OFFSET.reserved),
-        60_005
-      );
-    } finally {
-      client.destroy();
-      await leader.close();
-      await follower.close();
-    }
-  });
 
   it('rejects instead of hanging while a connection attempt is unresolved', async () => {
     const server = await startVsrServer(() => {});
@@ -415,6 +434,46 @@ describe('VSR client socket', () => {
       assert.ok(operations.includes(Operation.Logout));
       assert.equal(sessionResets, 1);
       assert.equal(client.isAuthenticated, true);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('keeps logout and replacement login adjacent in the queue', async () => {
+    const server = await startVsrServer((frame, socket) => {
+      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+      if (code === 60_015) {
+        setTimeout(() => {
+          socket.write(
+            replyFrame(Operation.NonReplicated, Buffer.from('first'))
+          );
+        }, 10);
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      const first = client.sendCommand(60_015, Buffer.alloc(0));
+      const second = client.sendCommand(60_016, Buffer.alloc(0));
+      const login = client.sendCommand(
+        COMMAND_CODE.LoginUser,
+        Buffer.concat([
+          Buffer.from([4]),
+          Buffer.from('iggy'),
+          Buffer.from([4]),
+          Buffer.from('iggy')
+        ])
+      );
+      await Promise.all([first, second, login]);
+
+      const operations = server.frames.map(
+        (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+      );
+      const logoutIndex = operations.lastIndexOf(Operation.Logout);
+      assert.equal(operations[logoutIndex + 1], Operation.Register);
     } finally {
       client.destroy();
       await server.close();
@@ -507,6 +566,8 @@ describe('VSR client socket', () => {
     const realNow = Date.now;
     try {
       await client.authenticate(vsrConfig(server.port).credentials);
+      let sessionResets = 0;
+      client.on('sessionReset', () => { sessionResets += 1; });
       let now = 0;
       Date.now = () => {
         now += 30_001;
@@ -522,12 +583,51 @@ describe('VSR client socket', () => {
         ),
         false
       );
+      assert.equal(client.isAuthenticated, true);
+      assert.equal(sessionResets, 0);
     } finally {
       Date.now = realNow;
       client.destroy();
       await server.close();
     }
   });
+
+  it('keeps a typed transient error and session at its retry deadline',
+    async () => {
+      const server = await startVsrServer((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_017) {
+          socket.write(
+            replyFrame(Operation.NonReplicated, Buffer.alloc(0), 57)
+          );
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      const realNow = Date.now;
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+        let sessionResets = 0;
+        client.on('sessionReset', () => { sessionResets += 1; });
+        const times = [0, 1, 30_001];
+        Date.now = () => times.shift() ?? 30_001;
+
+        await assert.rejects(
+          () => client.sendCommand(60_017, Buffer.alloc(0)),
+          (error: unknown) =>
+            error instanceof ResponseError &&
+            error.commandCode === 60_017 &&
+            error.errorCode === 57
+        );
+        assert.equal(client.isAuthenticated, true);
+        assert.equal(sessionResets, 0);
+      } finally {
+        Date.now = realNow;
+        client.destroy();
+        await server.close();
+      }
+    }
+  );
 
   it('rejects a cluster without a healthy leader', async () => {
     const server = await startVsrServer((frame, socket) => {

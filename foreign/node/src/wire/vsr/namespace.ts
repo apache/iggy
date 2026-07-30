@@ -36,8 +36,10 @@ const INVALID_IDENTIFIER = 6;
 const MAX_STREAMS = 4096;
 const MAX_TOPICS = 4096;
 const MAX_PARTITIONS = 1_000_000;
-const STREAM_SHIFT = 32n;
-const TOPIC_SHIFT = 20n;
+const bitsRequired = (value: number): bigint =>
+  BigInt(BigInt(value).toString(2).length);
+const TOPIC_SHIFT = bitsRequired(MAX_PARTITIONS - 1);
+const STREAM_SHIFT = TOPIC_SHIFT + bitsRequired(MAX_TOPICS - 1);
 
 /**
  * Control-plane requests target the metadata replica (shard 0), selected by
@@ -122,7 +124,7 @@ const peekIdentifier = (payload: Buffer, offset: number): PeekedIdentifier => {
 };
 
 const validateField = (value: number, exclusiveMax: number): void => {
-  if (value >= exclusiveMax)
+  if (!Number.isInteger(value) || value < 0 || value >= exclusiveMax)
     throw responseError(0, INVALID_IDENTIFIER);
 };
 

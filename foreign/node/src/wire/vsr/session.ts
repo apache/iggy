@@ -25,11 +25,9 @@ const MAX_U64 = 0xFFFF_FFFF_FFFF_FFFFn;
  *
  * Each client instance generates an ephemeral random `clientId` (u128).
  * After a Register commits, the server assigns a `session` number (commit op
- * number). Replicated metadata requests advance a monotonic request id;
- * non-replicated and partition-plane requests read the current id without
- * advancing it, because the server's `ClientTable` only tracks ids for
- * replicated metadata ops and a consumed id would gap the next one, which the
- * primary silently drops (`RequestGap`).
+ * number). Replicated metadata requests advance a monotonic request watermark.
+ * Non-replicated and partition-plane requests reuse the current value because
+ * the server only applies request sequencing to replicated metadata.
  */
 export class ConsensusSession {
   private _clientId: bigint;
@@ -55,6 +53,12 @@ export class ConsensusSession {
 
   get isBound(): boolean {
     return this._session !== null;
+  }
+
+  get hasActivity(): boolean {
+    return this.registerConsumed ||
+      this._session !== null ||
+      this.requestCounter > 1n;
   }
 
   /** Binds the session after Register commits through consensus. */

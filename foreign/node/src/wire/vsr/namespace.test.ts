@@ -220,6 +220,21 @@ describe('VSR namespace routing', () => {
       );
   });
 
+  it('rejects negative and non-integer namespace fields', () => {
+    for (const [streamId, topicId, partitionId] of [
+      [-1, 0, 0],
+      [0, -1, 0],
+      [0, 0, -1],
+      [0.5, 0, 0],
+      [0, Number.NaN, 0]
+    ] as const)
+      assert.throws(
+        () => packNamespace(streamId, topicId, partitionId),
+        (error: unknown) =>
+          error instanceof ResponseError && error.errorCode === 6
+      );
+  });
+
   it('rejects malformed identifiers at every prefix boundary', () => {
     const payload = serializeSendMessages(
       1,
