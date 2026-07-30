@@ -50,7 +50,7 @@ use consensus::VsrState;
 use iggy::prelude::*;
 use integration::harness::{TestBinary, TestHarness};
 use integration::iggy_harness;
-use journal::superblock::{SLOT_FILE_NAMES, decode_latest_payload};
+use journal::superblock::{SLOT_FILE_NAMES, SuperblockContents, decode_slots};
 use tokio::time::sleep;
 
 const STREAM_NAME: &str = "view-durability-stream";
@@ -194,17 +194,28 @@ async fn leader_count(client: &IggyClient) -> Option<usize> {
 }
 
 /// Decode a node's durable metadata `VsrState` from its on-disk superblock, `None` if
-/// no valid record exists yet. Reads the two slot files with blocking I/O, since this
-/// is a tokio test off any compio runtime, and decodes them through the journal's own
+/// no record exists yet. Reads the two slot files with blocking I/O, since this is a
+/// tokio test off any compio runtime, and decodes them through the journal's own
 /// newest-verifying-wins selection, so the test sees exactly what
 /// `PingPongSuperblock::read_latest` would.
+///
+/// # Panics
+/// If a slot holds bytes that do not verify. No step here corrupts one, so that is a
+/// real durability bug; returning `None` would let the pollers below read it as "not
+/// written yet" and time out on a misleading message.
 fn read_superblock_state(data_path: &Path) -> Option<VsrState> {
     // `<data_dir>/metadata/` is where shard 0 opens its `PingPongSuperblock`.
     let dir = data_path.join("metadata");
     let slot_a = std::fs::read(dir.join(SLOT_FILE_NAMES[0])).ok();
     let slot_b = std::fs::read(dir.join(SLOT_FILE_NAMES[1])).ok();
-    let payload = decode_latest_payload(slot_a.as_deref(), slot_b.as_deref())?;
-    VsrState::try_from(payload.as_slice()).ok()
+    match decode_slots(slot_a.as_deref(), slot_b.as_deref()) {
+        SuperblockContents::Present(payload) => VsrState::try_from(payload.as_slice()).ok(),
+        SuperblockContents::Empty => None,
+        SuperblockContents::Unreadable { version } => panic!(
+            "superblock at {} is unreadable (version {version:?}); no test step corrupts it",
+            dir.display()
+        ),
+    }
 }
 
 /// Poll `node`'s superblock until it holds a settled advanced view, returning that

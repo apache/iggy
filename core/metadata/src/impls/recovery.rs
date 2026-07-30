@@ -63,12 +63,14 @@ pub enum RecoveryError {
     /// unrecoverable, so refuse boot rather than infer a stale view from the WAL and
     /// risk re-entering a superseded view.
     SuperblockUndecodable(VsrStateError),
-    /// Slots held bytes but none yielded a usable record: a torn write on every
-    /// copy, a checksum failure, or an unrecognized format version (carried in
-    /// `version` when that was the cause). A superblock was written and is now
-    /// unreadable, so refuse boot rather than treat the node as a fresh deployment.
-    /// An empty superblock is a different case, a genuinely fresh or
-    /// not-yet-checkpointed node, and is NOT an error.
+    /// The slots yield no record this build can trust: bytes that fail verification
+    /// on every copy, or one clean record beside a copy that does not verify, whose
+    /// lost `sequence` may have been the newer (`version` names an unrecognized
+    /// format version when that was the cause). A superblock was written and its
+    /// latest generation cannot be established, so refuse boot rather than treat the
+    /// node as fresh or read through to a superseded view. An empty superblock is a
+    /// different case, a genuinely fresh or not-yet-checkpointed node, and is NOT an
+    /// error.
     SuperblockUnreadable {
         version: Option<u16>,
     },
@@ -115,8 +117,8 @@ impl fmt::Display for RecoveryError {
             ),
             Self::SuperblockUnreadable { version: None } => write!(
                 f,
-                "superblock present but unreadable on every copy (torn write or checksum failure): \
-                 a written superblock is now corrupt, refusing boot"
+                "superblock present but a copy holds bytes that do not verify (bit-rot or a \
+                 checksum failure), so its latest generation cannot be established: refusing boot"
             ),
         }
     }
@@ -334,6 +336,19 @@ where
     let journal_path = metadata_dir.join("journal.wal");
     let watermark = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
     let journal = PrepareJournal::open_with_slots(&journal_path, watermark, journal_slots).await?;
+
+    // The scan replays entries no producer sealed rather than rejecting them, so
+    // report the count: an operator gets no other signal that these bodies were
+    // replayed on trust. Goes away once every node in the cluster seals.
+    let unsealed_entries = journal.unsealed_entry_count();
+    if unsealed_entries > 0 {
+        tracing::warn!(
+            unsealed_entries,
+            path = %journal_path.display(),
+            "metadata WAL holds entries without a body checksum; replayed unverified \
+             (written before body sealing, or replicated from a primary that predates it)"
+        );
+    }
 
     // Intentional fail-fast: a bad entry aborts recovery and the operator
     // must repair or truncate the WAL before the node can boot again.

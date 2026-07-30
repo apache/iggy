@@ -36,6 +36,19 @@ const HEADER_SIZE: usize = size_of::<PrepareHeader>();
 /// multi-GiB allocation during the WAL scan.
 const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 
+/// `checksum_body` of an entry no producer sealed: written by a build predating
+/// body sealing, or replicated from a primary predating it (backups journal the
+/// header verbatim, so the zero travels along). Indistinguishable from
+/// sealed-then-corrupted, so the scan skips verification and counts these rather
+/// than reject a WAL it cannot prove is damaged. Safe as a sentinel: `XxHash3_64`
+/// never returns `0`, not even for an empty body, which a sealed zero-length entry
+/// does carry.
+///
+/// Never re-sealed on receipt: the producer seals once and every replica stores that
+/// verbatim, so re-sealing locally would diverge the header bytes and break the
+/// parent chain in the TODO below.
+const CHECKSUM_BODY_UNSEALED: u128 = 0;
+
 /// Number of slots in the journal ring buffer.
 ///
 /// Must be larger than the maximum number of entries between consecutive
@@ -148,6 +161,10 @@ pub struct PrepareJournal {
     /// let more committed-but-unsnapshotted entries accumulate between
     /// checkpoints (more WAL churn headroom, more memory).
     slot_count: usize,
+    /// How many entries the opening scan accepted unverified because no producer
+    /// sealed them ([`CHECKSUM_BODY_UNSEALED`]). Fixed at `open`, since every later
+    /// entry comes from a sealing producer.
+    unsealed_entries: u64,
 }
 
 /// Captured cause of journal poisoning. `stage` names the drain step
@@ -311,6 +328,7 @@ impl PrepareJournal {
         let mut headers: Vec<Option<PrepareHeader>> = vec![None; slot_count];
         let mut offsets: Vec<Option<u64>> = vec![None; slot_count];
         let mut last_op: Option<u64> = None;
+        let mut unsealed_entries: u64 = 0;
         let mut pos: u64 = 0;
         let mut header_buf = vec![0u8; HEADER_SIZE];
         // Reused 16-aligned scratch (PrepareHeader has u128 fields). Avoids
@@ -361,55 +379,59 @@ impl PrepareJournal {
             // replicated verbatim so it agrees on every replica), catching a body
             // bit-flip that leaves the header structurally valid. A completed entry
             // after the corrupt one means interior bit-rot and refuses boot below;
-            // only a genuine torn tail is truncated.
+            // only a genuine torn tail is truncated. An unsealed entry has nothing to
+            // verify against and is skipped, not rejected: see
+            // [`CHECKSUM_BODY_UNSEALED`].
             //
-            // TODO(wal-integrity): two gaps remain in this scan's coverage.
-            // (a) No format/version gate on `checksum_body`. A WAL written before
-            //     this field was sealed carries `checksum_body == 0`, so every entry
-            //     fails and boot is refused. Fail-safe, no silent loss, but a hard
-            //     upgrade break with no migration path. Gate on a WAL/entry format
-            //     version before verifying, or treat a zero checksum as unsealed.
-            // (b) The header `checksum` and its `parent` chain stay unverified,
-            //     since the producer does not seal them yet (blocked on re-sealing
-            //     re-stamped retransmits), so a bit-flip in a structurally-valid
-            //     header field slips through. Recovery derives
-            //     `commit_watermark = max(header.commit)`, so a flipped `commit`
-            //     makes it apply prepared-but-uncommitted ops as committed, the very
-            //     ops a view change may have truncated cluster-wide, diverging this
-            //     replica. Seal and verify the header checksum + parent chain.
-            let body_len = (entry_size - HEADER_SIZE as u64) as usize;
-            // `read_at` (read_exact_at) fills the buffer to capacity, so it must
-            // hold exactly `body_len`. A prior buffer of the same length is reused
-            // as-is; any size change replaces it, since capacity cannot shrink in
-            // place and an oversized buffer would read past the entry.
-            if body_buf.len() != body_len {
-                body_buf = vec![0u8; body_len];
-            }
-            body_buf = storage.read_at(pos + HEADER_SIZE as u64, body_buf).await?;
-            if u128::from(XxHash3_64::oneshot(&body_buf)) != header.checksum_body {
-                // The header passed the structural checks above, so `entry_size` is
-                // trustworthy. Bytes following this entry mean a later append
-                // completed after it, so this is interior bit-rot of a durable
-                // entry, NOT a torn tail: one append+fsync per entry means a torn
-                // write can only be the final entry. Truncating forward would
-                // discard the committed entries that follow, so refuse boot. A
-                // cluster repairs the entry from a peer, and a solo node keeps its
-                // WAL for manual recovery instead of silently losing committed data.
-                if pos + entry_size < file_len {
-                    return Err(JournalError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "interior WAL corruption at pos {pos} (op {}, operation {:?}): \
-                             prepare body checksum mismatch with {} bytes of entries \
-                             following; refusing to truncate and discard the committed suffix",
-                            header.op,
-                            header.operation,
-                            file_len - (pos + entry_size),
-                        ),
-                    )));
+            // TODO(wal-integrity): the header `checksum` and its `parent` chain stay
+            // unverified, since the producer does not seal them yet (blocked on
+            // re-sealing re-stamped retransmits), so a bit-flip in a
+            // structurally-valid header field slips through. Recovery derives
+            // `commit_watermark = max(header.commit)`, so a flipped `commit` makes it
+            // apply prepared-but-uncommitted ops as committed, the very ops a view
+            // change may have truncated cluster-wide, diverging this replica. Seal
+            // and verify the header checksum + parent chain.
+            if header.checksum_body == CHECKSUM_BODY_UNSEALED {
+                // Skip the body read too, so a WAL written entirely by a pre-sealing
+                // build scans without touching its payload.
+                unsealed_entries += 1;
+            } else {
+                let body_len = (entry_size - HEADER_SIZE as u64) as usize;
+                // `read_at` (read_exact_at) fills the buffer to capacity, so it must
+                // hold exactly `body_len`. A prior buffer of the same length is
+                // reused as-is; any size change replaces it, since capacity cannot
+                // shrink in place and an oversized buffer would read past the entry.
+                if body_buf.len() != body_len {
+                    body_buf = vec![0u8; body_len];
                 }
-                truncate_or_fail(&storage, pos, "prepare body checksum mismatch at tail").await?;
-                break;
+                body_buf = storage.read_at(pos + HEADER_SIZE as u64, body_buf).await?;
+                if u128::from(XxHash3_64::oneshot(&body_buf)) != header.checksum_body {
+                    // The header passed the structural checks above, so `entry_size`
+                    // is trustworthy. Bytes following this entry mean a later append
+                    // completed after it, so this is interior bit-rot of a durable
+                    // entry, NOT a torn tail: one append+fsync per entry means a torn
+                    // write can only be the final entry. Truncating forward would
+                    // discard the committed entries that follow, so refuse boot. A
+                    // cluster repairs the entry from a peer, and a solo node keeps
+                    // its WAL for manual recovery instead of silently losing
+                    // committed data.
+                    if pos + entry_size < file_len {
+                        return Err(JournalError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "interior WAL corruption at pos {pos} (op {}, operation {:?}): \
+                                 prepare body checksum mismatch with {} bytes of entries \
+                                 following; refusing to truncate and discard the committed suffix",
+                                header.op,
+                                header.operation,
+                                file_len - (pos + entry_size),
+                            ),
+                        )));
+                    }
+                    truncate_or_fail(&storage, pos, "prepare body checksum mismatch at tail")
+                        .await?;
+                    break;
+                }
             }
 
             let slot = slot_for_op(header.op, slot_count);
@@ -442,6 +464,7 @@ impl PrepareJournal {
             poisoned: OnceCell::new(),
             drain_in_flight: Cell::new(false),
             slot_count,
+            unsealed_entries,
         })
     }
 
@@ -459,6 +482,13 @@ impl PrepareJournal {
     /// Highest op number in the index, or `None` if empty.
     pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    /// How many entries the opening scan replayed unverified
+    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// warns while it is not, so the fail-open stretch is visible to an operator.
+    pub const fn unsealed_entry_count(&self) -> u64 {
+        self.unsealed_entries
     }
 
     /// Advance the snapshot watermark. The caller must ensure `op` is
@@ -854,16 +884,30 @@ mod tests {
     use iggy_binary_protocol::consensus::Operation;
     use tempfile::tempdir;
 
+    /// An entry as the primary's `project` produces it: body checksum sealed.
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
+        make_entry(op, body_size, |body| u128::from(XxHash3_64::oneshot(body)))
+    }
+
+    /// An entry as a pre-sealing build wrote it, or as a pre-sealing primary
+    /// still replicates it: `checksum_body == 0`.
+    fn make_unsealed_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
+        make_entry(op, body_size, |_| CHECKSUM_BODY_UNSEALED)
+    }
+
+    fn make_entry(
+        op: u64,
+        body_size: usize,
+        seal: impl FnOnce(&[u8]) -> u128,
+    ) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total_size);
 
-        // Recognizable pattern, then seal its checksum so the scan accepts it (the
-        // primary seals this in `project`).
+        // Recognizable pattern, then seal over it so the scan accepts the entry.
         for (i, byte) in buffer.as_mut_slice()[HEADER_SIZE..].iter_mut().enumerate() {
             *byte = (op as u8).wrapping_add(i as u8);
         }
-        let checksum_body = u128::from(XxHash3_64::oneshot(&buffer.as_slice()[HEADER_SIZE..]));
+        let checksum_body = seal(&buffer.as_slice()[HEADER_SIZE..]);
 
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
@@ -946,6 +990,69 @@ mod tests {
         assert!(
             matches!(result, Err(JournalError::Io(_))),
             "interior body-checksum mismatch must refuse boot, not truncate the committed suffix"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_replays_unsealed_entries_and_counts_them() {
+        // A WAL from a pre-sealing build, or one a pre-sealing primary replicated:
+        // every entry carries `checksum_body == 0`. Verifying against that would fail
+        // every entry and brick the upgrade, so the scan replays them and reports how
+        // many it could not verify.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            for op in 1..=3u64 {
+                journal
+                    .append(make_unsealed_prepare(op, 64).deep_copy())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(3),
+            "an unsealed WAL must boot, not be rejected as corrupt"
+        );
+        assert_eq!(journal.unsealed_entry_count(), 3);
+    }
+
+    #[compio::test]
+    async fn scan_verifies_sealed_entries_alongside_unsealed_ones() {
+        // The sentinel must exempt only the entries carrying it: a rolling upgrade
+        // leaves both kinds in one WAL, and bit-rot in a sealed one must still be
+        // caught.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            // Op 1 from the old primary, ops 2 and 3 after it upgraded.
+            journal
+                .append(make_unsealed_prepare(1, BODY).deep_copy())
+                .await
+                .unwrap();
+            for op in 2..=3u64 {
+                journal
+                    .append(make_prepare(op, BODY).deep_copy())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Flip a byte in sealed op 2's body, one full entry plus one header in.
+        let entry_size = HEADER_SIZE + BODY;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[entry_size + HEADER_SIZE + 5] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = PrepareJournal::open(&path, 0).await;
+        assert!(
+            matches!(result, Err(JournalError::Io(_))),
+            "a sealed entry must still be verified when unsealed entries precede it"
         );
     }
 

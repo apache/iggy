@@ -29,6 +29,13 @@
 //! the other file stays an intact prior generation: an update can never destroy
 //! the last good record.
 //!
+//! By that same atomicity, a slot holding bytes that fail verification is bit-rot
+//! of a once-durable record, not an interrupted write. Its `sequence` is
+//! unreadable, so it may be the NEWER generation, and reading through it would
+//! hand consensus an older `view` / `log_view` than it already acted on. Such a
+//! slot yields [`SuperblockContents::Unreadable`] and blocks writes, so the next
+//! `write` cannot stamp a fresh sequence over the evidence.
+//!
 //! The record already carries the `version`, `sequence`, and
 //! `parent_checksum` an N-copy in-place quorum variant would need, so that
 //! migration stays contained to a second `impl SuperblockStore`.
@@ -66,8 +73,7 @@ const FILE_B: &str = "superblock.b";
 /// The two ping-pong slot file names under a superblock directory.
 ///
 /// Newest wins by `sequence`. Exposed so an off-runtime reader (tests, tooling)
-/// can read the slots with blocking I/O and decode them via
-/// [`decode_latest_payload`].
+/// can read the slots with blocking I/O and decode them via [`decode_slots`].
 pub const SLOT_FILE_NAMES: [&str; 2] = [FILE_A, FILE_B];
 
 /// Outcome of reading the latest record from a [`SuperblockStore`].
@@ -83,9 +89,10 @@ pub enum SuperblockContents {
     Empty,
     /// The newest checksum-clean record of a supported version.
     Present(Vec<u8>),
-    /// Slots held bytes but none yielded a usable record: torn write on every
-    /// copy, checksum failure, foreign file, or an unrecognized format version
-    /// (carried in `version` when that was the cause). Never "fresh".
+    /// No slot pair this build can trust: bytes that fail verification on every
+    /// copy, or one clean record beside a copy that does not verify, whose lost
+    /// `sequence` may have been the newer. `version` names an unrecognized format
+    /// version when that was the cause (a downgrade). Never "fresh".
     Unreadable { version: Option<u16> },
 }
 
@@ -169,6 +176,10 @@ pub struct PingPongSuperblock {
     /// Slot the next `write` targets: always the one NOT holding the latest
     /// record, so an interrupted write cannot corrupt the newest good copy.
     next_slot: Cell<Slot>,
+    /// Set at `open` when a slot held bytes that do not verify, which `write` then
+    /// refuses to overwrite (see the `write` impl). Fixed for the store's
+    /// lifetime: repair happens out of band.
+    degraded: bool,
     /// Debug tripwire for the single-writer contract (see the `write` impl).
     /// Set across the `.await`, so an overlapping second writer trips the assert
     /// instead of silently tearing a slot. Absent in release builds.
@@ -177,18 +188,27 @@ pub struct PingPongSuperblock {
 }
 
 impl PingPongSuperblock {
-    /// Open the superblock rooted at `dir`, which must already exist. Reads both
-    /// slots to resume the sequence counter and aim the next write at the staler
-    /// slot. Missing files mean a fresh store.
+    /// Open the superblock rooted at `dir`, which must already exist. Classifies
+    /// both slots to resume the sequence counter and aim the next write at the
+    /// staler slot. Missing files mean a fresh store.
+    ///
+    /// Succeeds even when a slot is unusable, so the caller reads the typed verdict
+    /// from [`SuperblockStore::read_latest`] rather than a bare I/O error. Writes
+    /// are refused in that state.
     ///
     /// # Errors
     /// I/O error if a slot file exists but cannot be read.
     pub async fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        let seq_a = read_sequence(&dir.join(FILE_A)).await?;
-        let seq_b = read_sequence(&dir.join(FILE_B)).await?;
+        let slot_a = read_slot(&dir.join(FILE_A)).await?;
+        let slot_b = read_slot(&dir.join(FILE_B)).await?;
+        let seq_a = sequence_of(&slot_a);
+        let seq_b = sequence_of(&slot_b);
 
-        // Latest sequence across both slots; a missing slot counts as 0.
+        // Latest sequence across both slots; a slot with no readable sequence counts
+        // as 0. Sound only because `degraded` then blocks every write: such a slot
+        // may hold a higher sequence, and reusing it would break the monotonicity
+        // that selects the latest record.
         let latest = seq_a.unwrap_or(0).max(seq_b.unwrap_or(0));
         // Aim the next write at the slot that does NOT hold the strictly-newest
         // record, so an interrupted write cannot clobber it. A tie or a fresh
@@ -204,6 +224,7 @@ impl PingPongSuperblock {
             dir,
             next_sequence: Cell::new(latest + 1),
             next_slot: Cell::new(next_slot),
+            degraded: has_unreadable_sequence(&slot_a) || has_unreadable_sequence(&slot_b),
             #[cfg(debug_assertions)]
             writing: Cell::new(false),
         })
@@ -212,6 +233,17 @@ impl PingPongSuperblock {
 
 impl SuperblockStore for PingPongSuperblock {
     async fn write(&self, payload: &[u8]) -> io::Result<()> {
+        // An unverifiable slot looks stale to the aiming logic in `open`, so this
+        // write would land on it and stamp `sequence = latest_valid + 1` over the
+        // only evidence, leaving two clean slots whose "newest" carries the OLDER
+        // payload: the regression `read_latest` refuses, laundered into durable
+        // state. Refuse until the slot is repaired out of band.
+        if self.degraded {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "superblock slot holds bytes that do not verify; refusing to write over it",
+            ));
+        }
         // Single-writer contract: callers MUST serialize `write` (the metadata
         // durability lock does). `sequence`/`slot` are read before the
         // `atomic_replace` await and committed after it, so two overlapping
@@ -296,21 +328,16 @@ fn parse_record(bytes: &[u8]) -> Option<(u64, Vec<u8>)> {
     Some((sequence, bytes[HEADER_LEN..checksum_start].to_vec()))
 }
 
-/// Decode the newer valid record's payload from the two slots' raw bytes.
+/// Reach the same verdict as [`PingPongSuperblock::read_latest`] from the two
+/// slots' raw bytes, without a runtime.
 ///
-/// Mirrors [`PingPongSuperblock::read_latest`]'s newest-verifying-wins selection
-/// without a runtime. `slot_a` / `slot_b` are the file contents read from
-/// [`SLOT_FILE_NAMES`], or `None` for a missing slot. `None` when neither holds a
-/// checksum-clean record of a known version.
+/// `slot_a` / `slot_b` are the file contents read from [`SLOT_FILE_NAMES`], or
+/// `None` for a missing slot. Shares the classification and selection rules with
+/// the async path, so an off-runtime reader (tests, tooling) cannot conclude
+/// `Present` where the server would refuse to boot.
 #[must_use]
-pub fn decode_latest_payload(slot_a: Option<&[u8]>, slot_b: Option<&[u8]>) -> Option<Vec<u8>> {
-    match (slot_a.and_then(parse_record), slot_b.and_then(parse_record)) {
-        (None, None) => None,
-        (Some((_, payload)), None) | (None, Some((_, payload))) => Some(payload),
-        (Some((seq_a, payload_a)), Some((seq_b, payload_b))) => {
-            Some(if seq_a >= seq_b { payload_a } else { payload_b })
-        }
-    }
+pub fn decode_slots(slot_a: Option<&[u8]>, slot_b: Option<&[u8]>) -> SuperblockContents {
+    combine_slots(classify_bytes(slot_a), classify_bytes(slot_b))
 }
 
 /// One slot's contents, classified. Separates "nothing here" from "something
@@ -326,6 +353,15 @@ enum SlotClass {
     UnsupportedVersion(u16),
     /// A checksum-clean record of the current version.
     Valid { sequence: u64, payload: Vec<u8> },
+}
+
+/// Classify one slot from raw bytes, `Absent` for a missing or empty slot.
+/// Mirrors [`read_slot`]'s treatment of a zero-length file.
+fn classify_bytes(bytes: Option<&[u8]>) -> SlotClass {
+    match bytes {
+        None | Some([]) => SlotClass::Absent,
+        Some(bytes) => classify(bytes),
+    }
 }
 
 /// Classify one slot's raw, non-empty bytes.
@@ -353,10 +389,22 @@ fn classify(bytes: &[u8]) -> SlotClass {
     }
 }
 
-/// Combine the two slots into one outcome. Newest valid record wins; a torn or
-/// unrecognized newer slot falls back to a valid older one. With no valid record
-/// anywhere: `Empty` iff both slots were absent, else `Unreadable`, reporting an
-/// unrecognized version over generic corruption since it points at a downgrade.
+/// Combine the two slots into one outcome.
+///
+/// Two valid records: higher `sequence` wins. One valid record beside an absent
+/// slot: that record, what a single write leaves behind. `Empty` only when both
+/// slots are absent, the one state a fresh deployment produces.
+///
+/// Everything else refuses boot with `Unreadable`, including a valid record beside
+/// a slot that holds bytes but does not verify. Such a slot is bit-rot, not a torn
+/// write (rename is atomic), and its `sequence` is gone, so it cannot be shown to
+/// be the older of the two. Falling back would walk `view` / `log_view` backwards
+/// and let this replica act twice in one view. An unrecognized version is reported
+/// over generic corruption, since it names a downgrade.
+///
+/// Two copies cannot do better: with no readable sequence the choice is refuse or
+/// risk regression. An N-copy quorum could repair in place instead, which the
+/// record's `sequence` and `parent_checksum` framing already allows for.
 fn combine_slots(a: SlotClass, b: SlotClass) -> SuperblockContents {
     match (a, b) {
         (
@@ -369,7 +417,8 @@ fn combine_slots(a: SlotClass, b: SlotClass) -> SuperblockContents {
                 payload: payload_b,
             },
         ) => SuperblockContents::Present(if seq_a >= seq_b { payload_a } else { payload_b }),
-        (SlotClass::Valid { payload, .. }, _) | (_, SlotClass::Valid { payload, .. }) => {
+        (SlotClass::Valid { payload, .. }, SlotClass::Absent)
+        | (SlotClass::Absent, SlotClass::Valid { payload, .. }) => {
             SuperblockContents::Present(payload)
         }
         (SlotClass::Absent, SlotClass::Absent) => SuperblockContents::Empty,
@@ -381,13 +430,19 @@ fn combine_slots(a: SlotClass, b: SlotClass) -> SuperblockContents {
     }
 }
 
-async fn read_sequence(path: &Path) -> io::Result<Option<u64>> {
-    // Only a valid record contributes a sequence; an absent, corrupt, or
-    // unrecognized-version slot counts as 0 when aiming the next write.
-    Ok(match read_slot(path).await? {
-        SlotClass::Valid { sequence, .. } => Some(sequence),
+/// The slot's `sequence`, or `None` when it holds no record this build can read.
+const fn sequence_of(slot: &SlotClass) -> Option<u64> {
+    match slot {
+        SlotClass::Valid { sequence, .. } => Some(*sequence),
         SlotClass::Absent | SlotClass::Corrupt | SlotClass::UnsupportedVersion(_) => None,
-    })
+    }
+}
+
+/// Whether the slot holds bytes whose generation is unknowable, so it cannot be
+/// ruled out as the newer. An absent slot never held a record to lose, so it is
+/// not one of these.
+const fn has_unreadable_sequence(slot: &SlotClass) -> bool {
+    matches!(slot, SlotClass::Corrupt | SlotClass::UnsupportedVersion(_))
 }
 
 async fn read_slot(path: &Path) -> io::Result<SlotClass> {
@@ -476,7 +531,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_newer_slot_corrupt_when_read_latest_should_fall_back_to_older() {
+    async fn given_one_slot_corrupt_when_read_latest_should_refuse_boot() {
         let dir = tempdir().unwrap();
         let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
         sb.write(b"first").await.unwrap(); // slot A, seq 1
@@ -488,9 +543,50 @@ mod tests {
         bytes[HEADER_LEN] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
+        // Falling back to slot A would serve `first`, a generation consensus already
+        // moved past. Nothing proves the corrupt slot was the older one, so refuse.
         assert_eq!(
-            present(sb.read_latest().await.unwrap()).as_deref(),
-            Some(&b"first"[..])
+            sb.read_latest().await.unwrap(),
+            SuperblockContents::Unreadable { version: None }
+        );
+    }
+
+    #[compio::test]
+    async fn given_corrupt_slot_when_reopen_should_refuse_write_and_keep_both_slots() {
+        // `open` aims the next write at the slot that looks stale, which is the
+        // corrupt one. Writing there would stamp `sequence = 2` over it, leaving two
+        // clean slots whose newest carries `first` and laundering the regression
+        // `read_latest` just refused. Writes stay blocked instead.
+        let dir = tempdir().unwrap();
+        {
+            let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
+            sb.write(b"first").await.unwrap(); // slot A, seq 1
+            sb.write(b"second").await.unwrap(); // slot B, seq 2
+        }
+        let path_b = dir.path().join(FILE_B);
+        let mut bytes = std::fs::read(&path_b).unwrap();
+        bytes[HEADER_LEN] ^= 0xFF;
+        std::fs::write(&path_b, &bytes).unwrap();
+        let before_a = std::fs::read(dir.path().join(FILE_A)).unwrap();
+        let before_b = std::fs::read(&path_b).unwrap();
+
+        let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
+        assert_eq!(
+            sb.read_latest().await.unwrap(),
+            SuperblockContents::Unreadable { version: None }
+        );
+        let error = sb.write(b"third").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(
+            std::fs::read(dir.path().join(FILE_A)).unwrap(),
+            before_a,
+            "the surviving record must be left untouched for out-of-band repair"
+        );
+        assert_eq!(
+            std::fs::read(&path_b).unwrap(),
+            before_b,
+            "the corrupt slot is the only evidence of the lost generation"
         );
     }
 
@@ -537,26 +633,49 @@ mod tests {
                 version: Some(bogus)
             }
         );
+
+        // A clean record beside it does not rescue the read: this build cannot
+        // sequence the unrecognized slot, so that slot may be the newer generation.
+        sb.write(b"newer").await.unwrap(); // slot B, current version
+        assert_eq!(
+            sb.read_latest().await.unwrap(),
+            SuperblockContents::Unreadable {
+                version: Some(bogus)
+            }
+        );
     }
 
     #[compio::test]
-    async fn given_two_writes_when_decode_latest_payload_from_disk_should_match_read_latest() {
-        // The off-runtime decoder must select the same record the async read path
+    async fn given_two_writes_when_decode_slots_from_disk_should_match_read_latest() {
+        // The off-runtime decoder must reach the same verdict the async read path
         // does: newer sequence wins across the two slots.
         let dir = tempdir().unwrap();
         let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
         sb.write(b"first").await.unwrap();
         sb.write(b"second").await.unwrap();
 
-        let slot_a = std::fs::read(dir.path().join(SLOT_FILE_NAMES[0])).ok();
-        let slot_b = std::fs::read(dir.path().join(SLOT_FILE_NAMES[1])).ok();
+        let read_slots = || {
+            let slot_a = std::fs::read(dir.path().join(SLOT_FILE_NAMES[0])).ok();
+            let slot_b = std::fs::read(dir.path().join(SLOT_FILE_NAMES[1])).ok();
+            decode_slots(slot_a.as_deref(), slot_b.as_deref())
+        };
+        assert_eq!(read_slots(), sb.read_latest().await.unwrap());
         assert_eq!(
-            decode_latest_payload(slot_a.as_deref(), slot_b.as_deref()).as_deref(),
-            present(sb.read_latest().await.unwrap()).as_deref(),
+            read_slots(),
+            SuperblockContents::Present(b"second".to_vec())
         );
+
+        // And it must refuse where the server would, not read through a corrupt slot
+        // to the older record.
+        let path = dir.path().join(SLOT_FILE_NAMES[1]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_LEN] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(read_slots(), sb.read_latest().await.unwrap());
         assert_eq!(
-            decode_latest_payload(slot_a.as_deref(), slot_b.as_deref()).as_deref(),
-            Some(&b"second"[..]),
+            read_slots(),
+            SuperblockContents::Unreadable { version: None }
         );
     }
 
