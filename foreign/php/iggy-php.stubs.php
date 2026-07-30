@@ -218,15 +218,15 @@ namespace Iggy {
         public function sendBinaryRequest(int $code, string $payload): string {}
 
         /**
-         * Sends messages to a topic.
+         * Sends messages to a topic and returns the commit confirmations.
          *
          * @param mixed $stream
          * @param mixed $topic
          * @param int $partition_id
          * @param array $messages
-         * @return void
+         * @return \Iggy\SendMessagesResponse
          */
-        public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): void {}
+        public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): \Iggy\SendMessagesResponse {}
     }
 
     /**
@@ -495,6 +495,44 @@ namespace Iggy {
          * @param string $data
          */
         public function __construct(string $data) {}
+    }
+
+    /**
+     * A PHP class representing where one partition's batch was committed.
+     */
+    class SendMessagesConfirmationResponse {
+        /**
+         * The offset assigned to the first message of the batch in this partition.
+         *
+         * @var int
+         */
+        public readonly int $base_offset;
+
+        public readonly int $partition_id;
+
+        public readonly int $stream_id;
+
+        public readonly int $topic_id;
+
+        public function __construct() {}
+    }
+
+    /**
+     * A PHP class representing the commit confirmations of a send.
+     */
+    class SendMessagesResponse {
+        /**
+         * One confirmation per partition the batch landed in.
+         *
+         * An empty list means the batch committed but the server reported no offsets.
+         * The confirmations are rebuilt on each getter call; cache the result in PHP if
+         * they will be read repeatedly.
+         *
+         * @var array
+         */
+        public readonly array $confirmations;
+
+        public function __construct() {}
     }
 
     class StreamDetails {

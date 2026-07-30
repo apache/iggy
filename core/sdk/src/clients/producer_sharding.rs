@@ -315,7 +315,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(10)
-            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
 
         let bb = BackgroundConfig::builder()
             .batch_length(10)
@@ -357,7 +357,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
 
         let bb = BackgroundConfig::builder()
             .batch_length(1000)
@@ -401,7 +401,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
 
         let bb = BackgroundConfig::builder()
             .batch_length(10)

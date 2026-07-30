@@ -44,6 +44,8 @@ __all__ = [
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
+    "SendMessagesConfirmationResponse",
+    "SendMessagesResponse",
     "StreamDetails",
     "StreamPermissions",
     "Topic",
@@ -1212,10 +1214,11 @@ class IggyClient:
         topic: builtins.str | builtins.int,
         partitioning: builtins.int,
         messages: list[SendMessage],
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+        Returns a SendMessagesResponse carrying the per-partition commit
+        confirmations, or a PyRuntimeError on failure.
         """
     def poll_messages(
         self,
@@ -1604,6 +1607,47 @@ class SendMessage:
         Constructs a new `SendMessage` instance from a string or bytes.
         This method allows for the creation of a `SendMessage` instance
         directly from Python using the provided string or bytes data.
+        """
+
+@typing.final
+class SendMessagesConfirmationResponse:
+    r"""
+    A Python class representing the commit confirmation for one partition
+    written by a send.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the stream the batch was written to.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the topic the batch was written to.
+        """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        Gets the identifier of the partition the batch was written to.
+        """
+    @property
+    def base_offset(self) -> builtins.int:
+        r"""
+        Gets the offset assigned to the first message of the batch in this partition.
+        """
+
+@typing.final
+class SendMessagesResponse:
+    r"""
+    A Python class representing the outcome of a successful send.
+    """
+    @property
+    def confirmations(self) -> builtins.list[SendMessagesConfirmationResponse]:
+        r"""
+        Gets the commit confirmations, one per partition the batch was written to.
+        A server that commits without reporting offsets yields either an empty
+        list or a single all-zero entry, so neither the length nor a zero
+        `base_offset` can be read as a real offset.
         """
 
 @typing.final

@@ -22,7 +22,7 @@ use crate::wire_conversions::{
 };
 use crate::{
     Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
-    PollingStrategy,
+    PollingStrategy, SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 #[cfg(feature = "vsr")]
 use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
@@ -253,6 +253,25 @@ async fn poll_group_messages<B: BinaryClient>(
     Ok(PolledMessages::empty())
 }
 
+/// Map a raw `SendMessages` reply body to its confirmation payload. An empty
+/// body means the batch was accepted but no offsets were reported: the legacy
+/// server answers that way, so absence must never surface as a decode failure.
+// TODO(hubcio): remove the zeroed-confirmation fallback once core/server is
+// retired in favor of core/server-ng, which always reports confirmations.
+pub fn decode_send_confirmations(response: &[u8]) -> Result<SendMessagesResponse, IggyError> {
+    if response.is_empty() {
+        return Ok(SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 0,
+                topic_id: 0,
+                partition_id: 0,
+                base_offset: 0,
+            }],
+        });
+    }
+    super::decode_response::<SendMessagesResponse>(response)
+}
+
 #[async_trait::async_trait]
 impl<B: BinaryClient> MessageClient for B {
     async fn poll_messages(
@@ -303,7 +322,7 @@ impl<B: BinaryClient> MessageClient for B {
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         fail_if_not_authenticated(self).await?;
         // VSR: resolve Balanced/MessagesKey to an explicit partition client-side.
         // An explicit `PartitionId` needs no resolution, so borrow the input
@@ -344,9 +363,10 @@ impl<B: BinaryClient> MessageClient for B {
             &wire_partitioning,
             &raw_messages,
         );
-        self.send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
+        let response = self
+            .send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
             .await?;
-        Ok(())
+        decode_send_confirmations(&response)
     }
 
     async fn flush_unsaved_buffer(
@@ -366,5 +386,83 @@ impl<B: BinaryClient> MessageClient for B {
         self.send_raw_with_response(FLUSH_UNSAVED_BUFFER_CODE, req.to_bytes())
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_send_confirmations;
+    use crate::{IggyError, SendMessagesConfirmationResponse, SendMessagesResponse};
+    use iggy_binary_protocol::codec::WireEncode;
+
+    fn response() -> SendMessagesResponse {
+        SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 1,
+                topic_id: 2,
+                partition_id: 3,
+                base_offset: 42,
+            }],
+        }
+    }
+
+    /// Legacy-server fallback: an empty body yields a zeroed confirmation, not
+    /// an error, until core/server is retired and the fallback with it.
+    #[test]
+    fn empty_body_is_a_zeroed_confirmation() {
+        let decoded = decode_send_confirmations(&[]).expect("empty body must not fail");
+        assert_eq!(
+            decoded.confirmations,
+            vec![SendMessagesConfirmationResponse {
+                stream_id: 0,
+                topic_id: 0,
+                partition_id: 0,
+                base_offset: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn populated_body_decodes() {
+        let expected = response();
+        let bytes = expected.to_bytes();
+        let decoded = decode_send_confirmations(&bytes).expect("valid payload must decode");
+        assert_eq!(decoded, expected);
+    }
+
+    /// A zero-count payload is a present-but-empty confirmation list, which is
+    /// not the same thing as the zeroed legacy fallback above.
+    #[test]
+    fn zero_count_body_decodes_to_present_empty_list() {
+        let bytes = SendMessagesResponse {
+            confirmations: vec![],
+        }
+        .to_bytes();
+        let decoded = decode_send_confirmations(&bytes).expect("zero-count payload must decode");
+        assert!(decoded.confirmations.is_empty());
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = response().to_bytes().to_vec();
+        bytes.push(0xFF);
+        assert!(matches!(
+            decode_send_confirmations(&bytes),
+            Err(IggyError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn truncated_body_is_rejected() {
+        let bytes = response().to_bytes();
+        for length in 1..bytes.len() {
+            assert!(
+                matches!(
+                    decode_send_confirmations(&bytes[..length]),
+                    Err(IggyError::InvalidFormat)
+                ),
+                "expected error for truncation at byte {length}"
+            );
+        }
     }
 }

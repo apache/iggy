@@ -47,8 +47,9 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
         messages.push_back(std::move(msg));
     }
 
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+    iggy::ffi::SendMessagesResponse sent;
+    ASSERT_NO_THROW(sent = client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                 "partition_id", partition_id_bytes(0), std::move(messages)));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(1), "offset", 0, 100, false);
@@ -56,6 +57,8 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     ASSERT_EQ(polled.partition_id, 0u) << "Polled partition_id mismatches the partition we sent to";
     ASSERT_EQ(polled.count, 10u);
     ASSERT_EQ(polled.messages.size(), 10u);
+    ASSERT_EQ(sent.confirmations.at(0).base_offset, polled.messages[0].offset)
+        << "Confirmed base_offset must name the first message of the batch";
     for (std::uint32_t i = 0; i < 10; i++) {
         ASSERT_EQ(polled.messages[i].offset, static_cast<std::uint64_t>(i));
         std::string expected = "test message " + std::to_string(i);

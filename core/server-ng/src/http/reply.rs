@@ -23,6 +23,7 @@ use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, HEADER_SIZE, result_code, result_section_len,
 };
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
+use iggy_binary_protocol::responses::messages::SendMessagesResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
@@ -34,21 +35,26 @@ use iggy_common::{
 };
 use message_bus::BusMessage;
 use server_common::Message;
+use tracing::warn;
 
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::login_register::LoginRegisterError;
 
 /// Discriminate a partition write reply. Partition replies carry no result
-/// section (success and denial are both empty-bodied), so the discriminators
-/// live in the header. `status` is read first: a nonzero value is the typed
-/// pre-commit denial (the partition primary's delete-of-missing-offset
-/// rejection, or a dispatch-time authorization denial) and renders through
-/// the legacy `IggyError -> status` map. With status 0, the reply's `op`
-/// splits the rest: a committed reply is built from its prepare header, whose
-/// op (the partition group's commit number) is always >= 1, while the
-/// pre-dispatch gate failures reply through `build_empty_reply` with 0 in
-/// that field. The gate reply cannot name which entity was missing, hence the
-/// generic legacy 404 body.
+/// section - a denial is empty-bodied and a committed body, where there is one,
+/// is the bare typed payload - so the discriminators live in the header.
+/// `status` is read first: a nonzero value is the typed pre-commit denial (the
+/// partition primary's delete-of-missing-offset rejection, or a dispatch-time
+/// authorization denial) and renders through the legacy `IggyError -> status`
+/// map. With status 0, the reply's `op` splits the rest: a committed reply is
+/// built from its prepare header, whose op (the partition group's commit
+/// number) is always >= 1, while the pre-dispatch gate failures reply through
+/// `build_empty_reply` with 0 in that field. The gate reply cannot name which
+/// entity was missing, hence the generic legacy 404 body.
+///
+/// Grading only. The committed body is read separately (see
+/// [`send_confirmations`]) because it is operation-specific: consumer-offset
+/// writes commit empty, a produce commits its confirmations.
 pub(in crate::http) fn classify_partition_reply(
     reply: &BusMessage,
 ) -> Result<(), PartitionWriteError> {
@@ -69,6 +75,43 @@ pub(in crate::http) fn classify_partition_reply(
         return Err(PartitionWriteError::NotFound);
     }
     Ok(())
+}
+
+/// The per-partition commit confirmations carried by a graded `SendMessages`
+/// reply, or `None` when the reply has no readable confirmation.
+///
+/// `None` is a normal outcome, never a failure: a peer whose partition plane
+/// does not stamp the payload commits with an empty body, and a body this build
+/// cannot decode is a shape mismatch. Neither unmakes the commit, so both fall
+/// back to the payload-less success response rather than failing a write that
+/// already landed.
+pub(in crate::http) fn send_confirmations(reply: &BusMessage) -> Option<SendMessagesResponse> {
+    let body = partition_reply_body(reply);
+    if body.is_empty() {
+        return None;
+    }
+    match SendMessagesResponse::decode_from(body) {
+        Ok(confirmations) => Some(confirmations),
+        Err(error) => {
+            warn!(
+                ?error,
+                "server-ng HTTP: undecodable send_messages commit confirmation"
+            );
+            None
+        }
+    }
+}
+
+/// A partition reply's body past the header, bounded by the header's `size`
+/// rather than by the buffer length: `size` is the frame's authoritative
+/// extent, and the typed decoders reject trailing bytes.
+fn partition_reply_body(reply: &BusMessage) -> &[u8] {
+    let size = reply
+        .as_slice()
+        .get(..HEADER_SIZE)
+        .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
+        .map_or(0, |header| header.size as usize);
+    reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default()
 }
 
 /// Classify a committed reply's leading result section and return the typed
@@ -216,6 +259,8 @@ mod tests {
     use bytes::Bytes;
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::PrepareHeader;
+    use iggy_binary_protocol::WireEncode;
+    use iggy_binary_protocol::responses::messages::SendMessagesConfirmationResponse;
 
     use crate::responses::{
         NonReplicatedResponse, build_deny_reply, build_empty_reply, build_reply_from_bytes,
@@ -427,6 +472,64 @@ mod tests {
             committed_payload(&rejected),
             Err(WriteError::Rejected(IggyError::UserAlreadyExists))
         ));
+    }
+
+    fn send_reply(body: &Bytes) -> BusMessage {
+        let prepare = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::SendMessages,
+            client: 42,
+            op: 1,
+            request: 1,
+            ..Default::default()
+        };
+        frozen(consensus::build_reply_message(&prepare, body))
+    }
+
+    #[test]
+    fn committed_send_reply_yields_its_confirmations() {
+        let response = SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 5,
+                partition_id: 7,
+                base_offset: 41,
+            }],
+        };
+        assert_eq!(
+            send_confirmations(&send_reply(&response.to_bytes())),
+            Some(response)
+        );
+    }
+
+    /// A zero-count body is a committed batch that reports no offsets, which is
+    /// distinct from the empty body below: it decodes, so the response carries
+    /// an empty confirmation list rather than falling back to no body at all.
+    #[test]
+    fn zero_count_commit_body_yields_empty_confirmations() {
+        let empty = SendMessagesResponse {
+            confirmations: Vec::new(),
+        };
+        assert_eq!(
+            send_confirmations(&send_reply(&empty.to_bytes())),
+            Some(empty)
+        );
+    }
+
+    /// A peer whose partition plane does not stamp the payload commits with an
+    /// empty body. The write still landed, so this is `None`, not an error, and
+    /// the handler answers its payload-less 201.
+    #[test]
+    fn empty_commit_body_yields_no_confirmations() {
+        assert_eq!(send_confirmations(&send_reply(&Bytes::new())), None);
+    }
+
+    /// Same fallback for a body this build cannot read: a shape mismatch must
+    /// not fail a produce that already committed.
+    #[test]
+    fn undecodable_commit_body_yields_no_confirmations() {
+        let truncated = Bytes::from_static(&[1, 0, 0, 0, 9]);
+        assert_eq!(send_confirmations(&send_reply(&truncated)), None);
     }
 
     /// The partition primary's typed pre-commit deny (delete of a missing

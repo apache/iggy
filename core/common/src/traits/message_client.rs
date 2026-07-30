@@ -17,6 +17,7 @@
 
 use crate::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
+    SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -43,13 +44,17 @@ pub trait MessageClient {
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to send the messages.
+    ///
+    /// Returns the per-partition commit confirmations. The legacy server
+    /// reports none (empty reply body); the confirmation then carries zeroed
+    /// ids and offset rather than failing the send.
     async fn send_messages(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError>;
+    ) -> Result<SendMessagesResponse, IggyError>;
 
     /// Force flush of the `unsaved_messages` buffer to disk, optionally fsyncing the data.
     #[allow(clippy::too_many_arguments)]

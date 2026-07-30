@@ -229,7 +229,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
 
         let msg = dummy_message(5);
         let config = BackgroundConfig::builder()
@@ -305,7 +305,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
 
         let msg = ShardMessage {
             stream: dummy_identifier(),

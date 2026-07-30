@@ -20,8 +20,11 @@ use bytes::Bytes;
 use iggy::prelude::{
     ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
     IggyMessage as RustIggyMessage, Partition as RustPartition,
-    PolledMessages as RustPolledMessages, Stream as RustStream, StreamDetails as RustStreamDetails,
-    Topic as RustTopic, TopicDetails as RustTopicDetails, Validatable,
+    PolledMessages as RustPolledMessages,
+    SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
+    SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
+    StreamDetails as RustStreamDetails, Topic as RustTopic, TopicDetails as RustTopicDetails,
+    Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::{
@@ -639,6 +642,32 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
                 .messages
                 .into_iter()
                 .map(ffi::IggyMessagePolled::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RustSendMessagesConfirmationResponse> for ffi::SendMessagesConfirmation {
+    fn from(confirmation: RustSendMessagesConfirmationResponse) -> Self {
+        ffi::SendMessagesConfirmation {
+            stream_id: confirmation.stream_id,
+            topic_id: confirmation.topic_id,
+            partition_id: confirmation.partition_id,
+            base_offset: confirmation.base_offset,
+        }
+    }
+}
+
+impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
+    fn from(response: RustSendMessagesResponse) -> Self {
+        // TODO(hubcio): a single all-zero confirmation is the SDK's stand-in for the empty
+        // body legacy core/server sends; remove that shape once core/server is retired in
+        // favor of core/server-ng, which always reports confirmations. Empty stays valid.
+        ffi::SendMessagesResponse {
+            confirmations: response
+                .confirmations
+                .into_iter()
+                .map(ffi::SendMessagesConfirmation::from)
                 .collect(),
         }
     }

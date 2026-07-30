@@ -28,6 +28,7 @@ use iggy_common::{Client, MessageClient, StreamClient, TopicClient};
 use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
+    SendMessagesResponse,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -41,13 +42,14 @@ use mockall::automock;
 
 #[cfg_attr(test, automock)]
 pub trait ProducerCoreBackend: Send + Sync + 'static {
+    /// Sends `msgs`, returning one confirmation per chunk, in chunk order.
     fn send_internal(
         &self,
         stream: &Identifier,
         topic: &Identifier,
         msgs: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> impl Future<Output = Result<(), IggyError>> + Send;
+    ) -> impl Future<Output = Result<Vec<SendMessagesResponse>, IggyError>> + Send;
 }
 
 pub struct ProducerCore {
@@ -183,7 +185,7 @@ impl ProducerCore {
         topic: &Identifier,
         partitioning: &Arc<Partitioning>,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         let client = self.client.read().await;
 
         let Some(max_retries) = self.send_retries_count else {
@@ -249,7 +251,7 @@ impl ProducerCore {
         topic: &Identifier,
         partitioning: &Arc<Partitioning>,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         let mut retries = 0;
         let mut timer: Option<Interval> = None;
 
@@ -258,7 +260,9 @@ impl ProducerCore {
                 .send_messages(stream, topic, partitioning, messages)
                 .await
             {
-                Ok(_) => return Ok(()),
+                // Only the attempt that finally succeeds yields a confirmation;
+                // failed attempts have none to report.
+                Ok(confirmation) => return Ok(confirmation),
                 Err(error) => {
                     retries += 1;
                     if retries > max_retries {
@@ -361,9 +365,9 @@ impl ProducerCoreBackend for ProducerCore {
         topic: &Identifier,
         mut msgs: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
         if msgs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         if let Err(err) = self.encrypt_messages(&mut msgs) {
@@ -391,30 +395,36 @@ impl ProducerCoreBackend for ProducerCore {
                     cfg.batch_length as usize
                 };
                 let mut index = 0;
+                let mut confirmations = Vec::with_capacity(msgs.len().div_ceil(max));
                 while index < msgs.len() {
                     let end = (index + max).min(msgs.len());
                     let chunk = &mut msgs[index..end];
 
-                    if let Err(err) = self.try_send_messages(stream, topic, &part, chunk).await {
-                        let failed_tail = msgs.split_off(index);
-                        return Err(self.make_failed_error(err, failed_tail));
+                    let sent = self.try_send_messages(stream, topic, &part, chunk).await;
+                    match sent {
+                        Ok(confirmation) => confirmations.push(confirmation),
+                        Err(err) => {
+                            let failed_tail = msgs.split_off(index);
+                            return Err(self.make_failed_error(err, failed_tail));
+                        }
                     }
                     self.last_sent_at
                         .store(IggyTimestamp::now().into(), ORDERING);
                     index = end;
                 }
+                Ok(confirmations)
             }
             // background send on
             _ => {
-                self.try_send_messages(stream, topic, &part, &mut msgs)
+                let confirmation = self
+                    .try_send_messages(stream, topic, &part, &mut msgs)
                     .await
                     .map_err(|err| self.make_failed_error(err, msgs))?;
                 self.last_sent_at
                     .store(IggyTimestamp::now().into(), ORDERING);
+                Ok(vec![confirmation])
             }
         }
-
-        Ok(())
     }
 }
 
@@ -496,17 +506,32 @@ impl IggyProducer {
         self.core.init().await
     }
 
-    pub async fn send(&self, messages: Vec<IggyMessage>) -> Result<(), IggyError> {
+    /// Sends `messages`, returning one commit confirmation per chunk the send
+    /// was split into, in chunk order. A retried chunk contributes only the
+    /// confirmation of the attempt that finally succeeded; against the legacy
+    /// server (no confirmation payload) the entries carry zeroed ids and
+    /// offset.
+    ///
+    /// A `background` producer always returns an empty vector: it hands the
+    /// messages to a dispatcher and returns before the send happens, so no
+    /// confirmation can reach this caller.
+    pub async fn send(
+        &self,
+        messages: Vec<IggyMessage>,
+    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
         if messages.is_empty() {
             trace!("No messages to send.");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let stream_id = self.core.stream_id.clone();
         let topic_id = self.core.topic_id.clone();
 
         match &self.dispatcher {
-            Some(disp) => disp.dispatch(messages, stream_id, topic_id, None).await,
+            Some(disp) => disp
+                .dispatch(messages, stream_id, topic_id, None)
+                .await
+                .map(|()| Vec::new()),
             None => {
                 self.core
                     .send_internal(&stream_id, &topic_id, messages, None)
@@ -515,28 +540,33 @@ impl IggyProducer {
         }
     }
 
-    pub async fn send_one(&self, message: IggyMessage) -> Result<(), IggyError> {
+    /// See [`IggyProducer::send`] for the confirmation semantics.
+    pub async fn send_one(
+        &self,
+        message: IggyMessage,
+    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
         self.send(vec![message]).await
     }
 
+    /// See [`IggyProducer::send`] for the confirmation semantics.
     pub async fn send_with_partitioning(
         &self,
         messages: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
         if messages.is_empty() {
             trace!("No messages to send.");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let stream_id = self.core.stream_id.clone();
         let topic_id = self.core.topic_id.clone();
 
         match &self.dispatcher {
-            Some(disp) => {
-                disp.dispatch(messages, stream_id, topic_id, partitioning)
-                    .await
-            }
+            Some(disp) => disp
+                .dispatch(messages, stream_id, topic_id, partitioning)
+                .await
+                .map(|()| Vec::new()),
             None => {
                 self.core
                     .send_internal(&stream_id, &topic_id, messages, partitioning)
@@ -545,20 +575,24 @@ impl IggyProducer {
         }
     }
 
+    /// See [`IggyProducer::send`] for the confirmation semantics.
     pub async fn send_to(
         &self,
         stream: Arc<Identifier>,
         topic: Arc<Identifier>,
         messages: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
         if messages.is_empty() {
             trace!("No messages to send.");
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         match &self.dispatcher {
-            Some(disp) => disp.dispatch(messages, stream, topic, partitioning).await,
+            Some(disp) => disp
+                .dispatch(messages, stream, topic, partitioning)
+                .await
+                .map(|()| Vec::new()),
             None => {
                 self.core
                     .send_internal(&stream, &topic, messages, partitioning)

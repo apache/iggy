@@ -19,11 +19,45 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { uuidv7, uuidv4 } from "uuidv7";
-import { SEND_MESSAGES, type SendMessages } from "./send-messages.command.js";
+import {
+  SEND_MESSAGES,
+  type SendMessages,
+  type SendMessagesConfirmation,
+} from "./send-messages.command.js";
 import { HeaderValue, HeaderKeyFactory } from "./header.utils.js";
+import { DeserializeError } from "../error.utils.js";
 
 const SUCCESS = 0;
-const ERROR = 1;
+
+const CONFIRMATION_SIZE = 20;
+
+const confirmation = (partitionId: number): SendMessagesConfirmation => ({
+  streamId: 1,
+  topicId: 2,
+  partitionId,
+  baseOffset: 42n,
+});
+
+const serializeConfirmations = (
+  confirmations: SendMessagesConfirmation[],
+): Buffer => {
+  const b = Buffer.allocUnsafe(4 + confirmations.length * CONFIRMATION_SIZE);
+  b.writeUInt32LE(confirmations.length, 0);
+  confirmations.forEach((c, index) => {
+    const at = 4 + index * CONFIRMATION_SIZE;
+    b.writeUInt32LE(c.streamId, at);
+    b.writeUInt32LE(c.topicId, at + 4);
+    b.writeUInt32LE(c.partitionId, at + 8);
+    b.writeBigUInt64LE(c.baseOffset, at + 12);
+  });
+  return b;
+};
+
+const response = (data: Buffer) => ({
+  status: SUCCESS,
+  length: data.length,
+  data,
+});
 
 describe("SendMessages", () => {
   describe("serialize", () => {
@@ -164,21 +198,75 @@ describe("SendMessages", () => {
 
   describe('deserialize', () => {
 
-    it('returns true when status is SUCCESS with empty data', () => {
-      const r = { status: SUCCESS, length: 0, data: Buffer.alloc(0) };
-      assert.equal(SEND_MESSAGES.deserialize(r), true);
+    it('reads one confirmation', () => {
+      const confirmations = [confirmation(3)];
+      const r = response(serializeConfirmations(confirmations));
+      assert.deepEqual(SEND_MESSAGES.deserialize(r), { confirmations });
     });
 
-    it('returns true when status is SUCCESS with non-empty server payload', () => {
-      // SendMessages server response includes data (e.g. partition/offset info).
-      // The deserializer must accept non-empty data unlike deserializeVoidResponse.
-      const r = { status: SUCCESS, length: 4, data: Buffer.from([1, 2, 3, 4]) };
-      assert.equal(SEND_MESSAGES.deserialize(r), true);
+    it('reads every confirmation of a multi-partition send', () => {
+      const confirmations = [confirmation(0), confirmation(1), confirmation(2)];
+      const r = response(serializeConfirmations(confirmations));
+      assert.deepEqual(SEND_MESSAGES.deserialize(r), { confirmations });
     });
 
-    it('returns false when status is an error code', () => {
-      const r = { status: ERROR, length: 0, data: Buffer.alloc(0) };
-      assert.equal(SEND_MESSAGES.deserialize(r), false);
+    it('reads the wire layout of a confirmation', () => {
+      const r = response(Buffer.from([
+        0x01, 0x00, 0x00, 0x00, // count
+        0x01, 0x00, 0x00, 0x00, // streamId
+        0x02, 0x00, 0x00, 0x00, // topicId
+        0x03, 0x00, 0x00, 0x00, // partitionId
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // baseOffset
+      ]));
+      assert.deepEqual(SEND_MESSAGES.deserialize(r), {
+        confirmations: [
+          { streamId: 1, topicId: 2, partitionId: 3, baseOffset: 4n }
+        ]
+      });
+    });
+
+    it('reads a committed send that reports no offsets as an empty list', () => {
+      const r = response(serializeConfirmations([]));
+      assert.deepEqual(SEND_MESSAGES.deserialize(r), { confirmations: [] });
+    });
+
+    it('substitutes a zeroed confirmation for an empty legacy server body', () => {
+      const r = response(Buffer.alloc(0));
+      assert.deepEqual(SEND_MESSAGES.deserialize(r), {
+        confirmations: [
+          { streamId: 0, topicId: 0, partitionId: 0, baseOffset: 0n }
+        ]
+      });
+    });
+
+    it('throws on a truncated body', () => {
+      const data = serializeConfirmations([confirmation(0), confirmation(1)]);
+      for (let i = 1; i < data.length; i += 1)
+        assert.throws(
+          () => SEND_MESSAGES.deserialize(response(data.subarray(0, i))),
+          DeserializeError,
+          `expected error for truncation at byte ${i}`
+        );
+    });
+
+    it('throws on trailing bytes', () => {
+      const data = Buffer.concat([
+        serializeConfirmations([confirmation(1)]),
+        Buffer.from([0xFF])
+      ]);
+      assert.throws(
+        () => SEND_MESSAGES.deserialize(response(data)),
+        DeserializeError
+      );
+    });
+
+    it('throws on a count no body could hold', () => {
+      const data = Buffer.alloc(4);
+      data.writeUInt32LE(0xFFFF_FFFF, 0);
+      assert.throws(
+        () => SEND_MESSAGES.deserialize(response(data)),
+        DeserializeError
+      );
     });
 
   });

@@ -23,6 +23,8 @@ use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
 use Iggy\SendMessage;
+use Iggy\SendMessagesConfirmationResponse;
+use Iggy\SendMessagesResponse;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -216,6 +218,39 @@ final class IggySdkTest extends TestCase
             $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
             assert_count(count($messages), $polled);
             assert_same($messages, collect_payloads($polled));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('sendMessages confirms the partition and base offset the batch committed at')]
+    public function testSendMessagesReportsCommitConfirmation(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('confirm-stream');
+        $topicName = unique_name('confirm-topic');
+        $partitionId = 0;
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+
+            $first = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-first')]);
+            assert_instance_of(SendMessagesResponse::class, $first);
+            assert_count(1, $first->confirmations);
+
+            $confirmation = $first->confirmations[0];
+            assert_instance_of(SendMessagesConfirmationResponse::class, $confirmation);
+            assert_same($partitionId, $confirmation->partition_id);
+            assert_same(0, $confirmation->base_offset, 'the first batch of an empty partition starts at offset 0');
+
+            // core/server answers a send with an empty body, which the SDK reports as a
+            // zeroed confirmation, so only a non-decreasing offset holds on every server.
+            $second = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-second')]);
+            assert_count(1, $second->confirmations);
+            assert_true(
+                $second->confirmations[0]->base_offset >= $confirmation->base_offset,
+                'expected the second send not to report a lower base offset',
+            );
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

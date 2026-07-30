@@ -48,7 +48,12 @@ describe('e2e -> message', async () => {
   };
 
   it('e2e -> message::send', async () => {
-    assert.ok(await c.message.send(msg));
+    const { confirmations } = await c.message.send(msg);
+    // Offset 0 on a fresh topic is the one value a server reporting real
+    // offsets and a legacy zeroed confirmation agree on.
+    assert.equal(confirmations.length, 1);
+    assert.equal(confirmations[0].partitionId, partitionId);
+    assert.equal(confirmations[0].baseOffset, 0n);
   });
 
   it('e2e -> message::poll/last', async () => {

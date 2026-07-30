@@ -17,7 +17,11 @@
 
 use bytes::Bytes;
 use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl};
-use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
+use iggy::prelude::{
+    IggyMessage as RustIggyMessage, IggyMessageHeader,
+    SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
+    SendMessagesResponse as RustSendMessagesResponse,
+};
 
 use crate::error::to_php_exception;
 
@@ -75,5 +79,76 @@ impl SendMessage {
     /// the payload will be read repeatedly.
     pub fn payload(&self) -> Binary<u8> {
         Binary::new(self.inner.payload.to_vec())
+    }
+}
+
+/// A PHP class representing the commit confirmations of a send.
+#[php_class]
+#[php(name = "Iggy\\SendMessagesResponse")]
+pub struct SendMessagesResponse {
+    pub(crate) inner: RustSendMessagesResponse,
+}
+
+impl From<RustSendMessagesResponse> for SendMessagesResponse {
+    fn from(inner: RustSendMessagesResponse) -> Self {
+        Self { inner }
+    }
+}
+
+#[php_impl]
+impl SendMessagesResponse {
+    /// One confirmation per partition the batch landed in.
+    ///
+    /// An empty list means the batch committed but the server reported no offsets.
+    /// The confirmations are rebuilt on each getter call; cache the result in PHP if
+    /// they will be read repeatedly.
+    // TODO(hubcio): a single all-zero confirmation is the SDK's stand-in for the empty
+    // body legacy core/server sends; remove that shape once core/server is retired in
+    // favor of core/server-ng, which always reports confirmations. Empty stays valid.
+    #[php(getter)]
+    pub fn confirmations(&self) -> Vec<SendMessagesConfirmationResponse> {
+        self.inner
+            .confirmations
+            .iter()
+            .cloned()
+            .map(SendMessagesConfirmationResponse::from)
+            .collect()
+    }
+}
+
+/// A PHP class representing where one partition's batch was committed.
+#[php_class]
+#[php(name = "Iggy\\SendMessagesConfirmationResponse")]
+pub struct SendMessagesConfirmationResponse {
+    pub(crate) inner: RustSendMessagesConfirmationResponse,
+}
+
+impl From<RustSendMessagesConfirmationResponse> for SendMessagesConfirmationResponse {
+    fn from(inner: RustSendMessagesConfirmationResponse) -> Self {
+        Self { inner }
+    }
+}
+
+#[php_impl]
+impl SendMessagesConfirmationResponse {
+    #[php(getter)]
+    pub fn stream_id(&self) -> u32 {
+        self.inner.stream_id
+    }
+
+    #[php(getter)]
+    pub fn topic_id(&self) -> u32 {
+        self.inner.topic_id
+    }
+
+    #[php(getter)]
+    pub fn partition_id(&self) -> u32 {
+        self.inner.partition_id
+    }
+
+    /// The offset assigned to the first message of the batch in this partition.
+    #[php(getter)]
+    pub fn base_offset(&self) -> u64 {
+        self.inner.base_offset
     }
 }

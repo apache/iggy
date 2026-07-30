@@ -31,7 +31,7 @@ use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
 
@@ -184,14 +184,14 @@ impl IggyClient {
         })
     }
 
-    /// Sends messages to a topic.
+    /// Sends messages to a topic and returns the commit confirmations.
     pub fn send_messages(
         &self,
         stream: PhpIdentifier,
         topic: PhpIdentifier,
         partition_id: u32,
         messages: Vec<&SendMessage>,
-    ) -> PhpResult {
+    ) -> PhpResult<SendMessagesResponse> {
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
         let partitioning = Partitioning::partition_id(partition_id);
@@ -205,6 +205,7 @@ impl IggyClient {
             inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
+                .map(SendMessagesResponse::from)
                 .map_err(to_php_exception)
         })
     }

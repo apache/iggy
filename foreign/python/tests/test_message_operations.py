@@ -69,6 +69,40 @@ class TestMessageOperations:
         )
 
     @pytest.mark.asyncio
+    async def test_send_messages_confirms_base_offset(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the send response reports the offset of the batch's first message."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        messages = [Message(f"Confirmation test {i}") for i in range(3)]
+        response = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=messages,
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.First(),
+            count=10,
+            auto_commit=True,
+        )
+
+        assert response.confirmations
+        assert response.confirmations[0].base_offset == polled_messages[0].offset()
+
+    @pytest.mark.asyncio
     async def test_send_and_poll_messages_as_bytes(
         self, iggy_client: IggyClient, unique_name
     ):

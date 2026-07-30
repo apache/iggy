@@ -19,6 +19,8 @@ mod cluster;
 mod consumer_groups;
 mod consumer_offsets;
 mod messages;
+
+pub use messages::decode_send_confirmations;
 mod partitions;
 mod personal_access_tokens;
 mod segments;

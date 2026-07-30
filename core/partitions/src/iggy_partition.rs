@@ -43,8 +43,11 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
+use iggy_binary_protocol::responses::messages::{
+    SendMessagesConfirmationResponse, SendMessagesResponse,
+};
 use iggy_binary_protocol::{
-    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireIdentifier,
+    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier,
 };
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
@@ -647,7 +650,9 @@ where
         let reply = build_reply_from_request(
             &self.consensus,
             &request_header,
-            committed_reply_body(request_header.operation),
+            // Consumer-offset ops only: `SendMessages` never reaches the
+            // `NoAck` fast path, so there are no batch offsets to confirm.
+            committed_reply_body(request_header.operation, request_header.namespace, None),
         );
         let reply_buffers = reply.into_generic().into_frozen();
         if let Err(error) = self
@@ -2230,7 +2235,11 @@ where
             if send_client_replies && !is_auto_commit_client(prepare_header.client) {
                 let reply = build_reply_message(
                     &prepare_header,
-                    &committed_reply_body(prepare_header.operation),
+                    &committed_reply_body(
+                        prepare_header.operation,
+                        prepare_header.namespace,
+                        committed_visible_offsets.get(&prepare_header.op),
+                    ),
                 );
                 let reply_buffers = reply.into_generic().into_frozen();
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
@@ -2393,6 +2402,7 @@ where
         }
 
         Ok(Some(CommittedBatchStats {
+            base_offset: batch.header.base_offset,
             end_offset: batch.header.base_offset + u64::from(message_count) - 1,
             message_count,
             size_bytes: batch.header.total_size() as u64,
@@ -3397,24 +3407,61 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
     .operation
 }
 
-/// Success reply body for a committed partition op. Result-framed ops
-/// (`Operation::is_result_framed`; on this plane the consumer-offset ops,
-/// whose rejections ship typed errors) must carry an explicit empty result
-/// section (`[count = 0]`) so the SDK's framed decode does not misread the
-/// payload; every other partition op replies with an empty body.
-const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
-    if operation.is_result_framed() {
-        bytes::Bytes::from_static(&[0, 0, 0, 0])
-    } else {
-        bytes::Bytes::new()
+/// Success reply body for a committed partition op.
+///
+/// `SendMessages` carries a [`SendMessagesResponse`] confirming where the batch
+/// landed. It is not result-framed, so its body is the payload itself; a
+/// `batch_stats` of `None` still ships a well-formed `count = 0` payload rather
+/// than an empty body, which the SDK cannot decode.
+///
+/// Result-framed ops (`Operation::is_result_framed`; on this plane the
+/// consumer-offset ops, whose rejections ship typed errors) must carry an
+/// explicit empty result section (`[count = 0]`) so the SDK's framed decode
+/// does not misread the payload; every other partition op replies with an
+/// empty body.
+fn committed_reply_body(
+    operation: Operation,
+    namespace: u64,
+    batch_stats: Option<&CommittedBatchStats>,
+) -> bytes::Bytes {
+    match operation {
+        Operation::SendMessages => send_messages_reply_body(namespace, batch_stats),
+        _ if operation.is_result_framed() => bytes::Bytes::from_static(&[0, 0, 0, 0]),
+        _ => bytes::Bytes::new(),
     }
+}
+
+/// One confirmation for the committed batch, or `count = 0` when its offsets
+/// could not be resolved (undecodable journal entry, or an empty batch).
+#[allow(clippy::cast_possible_truncation)]
+fn send_messages_reply_body(
+    namespace: u64,
+    batch_stats: Option<&CommittedBatchStats>,
+) -> bytes::Bytes {
+    let namespace = IggyNamespace::from_raw(namespace);
+    SendMessagesResponse {
+        confirmations: batch_stats
+            .map(|stats| SendMessagesConfirmationResponse {
+                // `IggyNamespace` packs the ids into 12/12/20 bits, so each
+                // component fits a `u32` by construction.
+                stream_id: namespace.stream_id() as u32,
+                topic_id: namespace.topic_id() as u32,
+                partition_id: namespace.partition_id() as u32,
+                base_offset: stats.base_offset,
+            })
+            .into_iter()
+            .collect(),
+    }
+    .to_bytes()
 }
 
 /// Committed-batch accounting surfaced at commit time so the aggregate stats
 /// (`messages_count`, `size_bytes`) advance with the visible offset rather than
-/// waiting on the threshold-gated disk persist.
+/// waiting on the threshold-gated disk persist, and so the `SendMessages` reply
+/// can confirm where the batch landed.
 #[derive(Clone, Copy)]
 struct CommittedBatchStats {
+    base_offset: u64,
     end_offset: u64,
     message_count: u32,
     size_bytes: u64,
@@ -4710,6 +4757,70 @@ mod tests {
         partition.complete_repair(&repair_config()).await;
 
         assert_eq!(partition.consensus().commit_min(), 0);
+    }
+
+    fn batch_stats(base_offset: u64, message_count: u32) -> CommittedBatchStats {
+        CommittedBatchStats {
+            base_offset,
+            end_offset: base_offset + u64::from(message_count) - 1,
+            message_count,
+            size_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn given_send_messages_when_offsets_resolved_should_confirm_base_offset() {
+        let namespace = IggyNamespace::new(3, 7, 5);
+        let stats = batch_stats(42, 3);
+
+        let body = committed_reply_body(Operation::SendMessages, namespace.inner(), Some(&stats));
+        let (response, consumed) = SendMessagesResponse::decode(&body).unwrap();
+
+        assert_eq!(consumed, body.len());
+        assert_eq!(
+            response.confirmations,
+            vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 7,
+                partition_id: 5,
+                base_offset: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn given_send_messages_when_offsets_unavailable_should_reply_zero_confirmations() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let body = committed_reply_body(Operation::SendMessages, namespace.inner(), None);
+
+        assert_eq!(&body[..], &[0, 0, 0, 0]);
+        let (response, _) = SendMessagesResponse::decode(&body).unwrap();
+        assert!(response.confirmations.is_empty());
+    }
+
+    #[test]
+    fn given_result_framed_operation_when_committed_should_reply_empty_result_section() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        // Batch stats belong to a `SendMessages` prepare and never leak here.
+        assert_eq!(
+            &committed_reply_body(
+                Operation::StoreConsumerOffset2,
+                namespace.inner(),
+                Some(&batch_stats(9, 1))
+            )[..],
+            &[0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn given_unframed_operation_when_committed_should_reply_empty_body() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        assert!(
+            committed_reply_body(Operation::DeleteSegments, namespace.inner(), None).is_empty()
+        );
     }
 }
 

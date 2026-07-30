@@ -145,6 +145,19 @@ mod ffi {
         messages: Vec<IggyMessagePolled>,
     }
 
+    struct SendMessagesConfirmation {
+        stream_id: u32,
+        topic_id: u32,
+        partition_id: u32,
+        // Offset assigned to the first message of the batch in this partition.
+        base_offset: u64,
+    }
+
+    struct SendMessagesResponse {
+        // Empty means the batch committed but the server reported no offsets.
+        confirmations: Vec<SendMessagesConfirmation>,
+    }
+
     struct StreamDetails {
         id: u32,
         created_at: u64,
@@ -461,7 +474,7 @@ mod ffi {
             partitioning_kind: String,
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
-        ) -> Result<()>;
+        ) -> Result<SendMessagesResponse>;
         fn flush_unsaved_buffer(
             self: &Client,
             stream_id: Identifier,

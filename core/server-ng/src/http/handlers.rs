@@ -63,6 +63,7 @@ use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
+use iggy_binary_protocol::responses::messages::SendMessagesResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::GetPersonalAccessTokensResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
@@ -105,7 +106,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
@@ -121,7 +122,7 @@ use crate::http::reads::{
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
-    decode_topic_details, decode_user_details, login_error_to_iggy,
+    decode_topic_details, decode_user_details, login_error_to_iggy, send_confirmations,
 };
 use crate::http::state::{HttpInner, HttpState};
 use crate::http::submit::{
@@ -1117,6 +1118,41 @@ pub(in crate::http) async fn get_consumer_offset(
     }
 }
 
+/// `POST .../messages` response body: one entry per partition the batch landed
+/// in. A list, not a single confirmation, so a future multi-partition produce
+/// needs no shape change. Local DTOs because the wire types carry no serde by
+/// design.
+#[derive(Debug, Serialize)]
+struct SendMessagesConfirmations {
+    confirmations: Vec<PartitionConfirmation>,
+}
+
+/// One partition's commit confirmation.
+#[derive(Debug, Serialize)]
+struct PartitionConfirmation {
+    stream_id: u32,
+    topic_id: u32,
+    partition_id: u32,
+    base_offset: u64,
+}
+
+impl From<SendMessagesResponse> for SendMessagesConfirmations {
+    fn from(response: SendMessagesResponse) -> Self {
+        Self {
+            confirmations: response
+                .confirmations
+                .into_iter()
+                .map(|confirmation| PartitionConfirmation {
+                    stream_id: confirmation.stream_id,
+                    topic_id: confirmation.topic_id,
+                    partition_id: confirmation.partition_id,
+                    base_offset: confirmation.base_offset,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// `POST /streams/{stream_id}/topics/{topic_id}/messages`: produce a batch of
 /// messages to a topic. The JSON body is the same `SendMessages` shape the
 /// legacy server accepts (partitioning + base64 messages); stream and topic
@@ -1127,8 +1163,9 @@ pub(in crate::http) async fn get_consumer_offset(
 /// on one credential are legal), and the committed reply comes back through
 /// the session's in-process reply slot rather than a submit return value.
 /// The default answers 201 + `Iggy-Durability: replicated-memory` only
-/// after the quorum commit; `?ack=none` answers 202 + `Iggy-Durability:
-/// none` immediately after dispatch.
+/// after the quorum commit, with the commit's per-partition confirmations as
+/// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
+/// after dispatch and can carry no confirmation, having awaited none.
 pub(in crate::http) async fn send_messages(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1155,21 +1192,28 @@ pub(in crate::http) async fn send_messages(
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
-            SendWrapper::new(partition_write_replicated(
+            let reply = SendWrapper::new(partition_write_replicated(
                 &state,
                 &identity.session,
                 Operation::SendMessages,
                 &body,
             ))
             .await?;
-            Ok((
-                StatusCode::CREATED,
-                [(
-                    DURABILITY_HEADER,
-                    HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
-                )],
-            )
-                .into_response())
+            let durability = [(
+                DURABILITY_HEADER,
+                HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
+            )];
+            // An unreadable confirmation still answers 201: the batch committed,
+            // only its offsets did not survive the reply.
+            match send_confirmations(&reply) {
+                Some(response) => Ok((
+                    StatusCode::CREATED,
+                    durability,
+                    Json(SendMessagesConfirmations::from(response)),
+                )
+                    .into_response()),
+                None => Ok((StatusCode::CREATED, durability).into_response()),
+            }
         }
         ProduceAck::None => {
             SendWrapper::new(produce_unacked(&state, &identity.session, &body)).await?;
@@ -1579,4 +1623,43 @@ fn issue_identity(inner: &HttpInner, user_id: u32) -> Result<Json<IdentityInfo>,
             expiry: generated.access_token_expiry,
         }),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use iggy_binary_protocol::responses::messages::SendMessagesConfirmationResponse;
+
+    /// Pins the produce response contract the SDKs decode: `snake_case` field
+    /// names and a numeric `base_offset`.
+    #[test]
+    fn confirmation_renders_the_pinned_json_shape() {
+        let response = SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 5,
+                partition_id: 7,
+                base_offset: 41,
+            }],
+        };
+        let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
+            .expect("confirmations serialize");
+        assert_eq!(
+            json,
+            r#"{"confirmations":[{"stream_id":3,"topic_id":5,"partition_id":7,"base_offset":41}]}"#
+        );
+    }
+
+    /// A commit that reports no offsets still renders the envelope, so the
+    /// field is always present for a caller that indexes into it.
+    #[test]
+    fn empty_confirmations_render_an_empty_list() {
+        let response = SendMessagesResponse {
+            confirmations: Vec::new(),
+        };
+        let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
+            .expect("confirmations serialize");
+        assert_eq!(json, r#"{"confirmations":[]}"#);
+    }
 }

@@ -18,6 +18,8 @@
 pub(crate) mod binary_auth;
 pub(crate) mod binary_client;
 mod binary_impls;
+
+pub use binary_impls::decode_send_confirmations;
 pub(crate) mod binary_transport;
 pub(crate) mod client;
 pub(crate) mod cluster_client;

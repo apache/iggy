@@ -36,7 +36,7 @@ use crate::error::{
 };
 use crate::message_iterator::MessageIterator;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesConfirmationResponse, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
 
@@ -58,6 +58,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<PollingStrategy>()
         .class::<ReceiveMessage>()
         .class::<SendMessage>()
+        .class::<SendMessagesConfirmationResponse>()
+        .class::<SendMessagesResponse>()
         .class::<StreamDetails>()
         .class::<TopicDetails>()
 }
