@@ -118,6 +118,8 @@ export class IggyConnection extends EventEmitter {
   private connectPromise?: Promise<this>;
   /** Shared promise for callers waiting on automatic reconnection */
   private reconnectPromise?: Promise<this>;
+  /** Endpoint the client was configured with, kept across leader redirects */
+  private readonly seedOptions: ClientConfig['options'];
 
   /** Incremental response frame decoder */
   private responseDecoder: ResponseFrameDecoder;
@@ -134,6 +136,7 @@ export class IggyConnection extends EventEmitter {
     this.connecting = false;
     this.ending = false;
     this.reconnectOption = { ...DefaultReconnectOption, ...config.reconnect };
+    this.seedOptions = { ...config.options };
     this.reconnectCount = 0;
     this.connectPromise = undefined;
     this.reconnectPromise = undefined;
@@ -193,7 +196,7 @@ export class IggyConnection extends EventEmitter {
       this._endResponseWait();
       this.emit('disconnected', hadError);
       if (!this.ending)
-        void this.reconnect();
+        void this.reconnect().catch(() => undefined);
     });
     return socket;
   }
@@ -299,22 +302,32 @@ export class IggyConnection extends EventEmitter {
     initialError?: Error
   ): Promise<this> {
     let lastError = initialError;
+    let expectedSocket = this.socket;
+    let attempt = 0;
     while (enabled && this.reconnectCount < maxRetries) {
       this.connecting = true;
       this.reconnectCount += 1;
-      const socketBeforeBackoff = this.socket;
       await waitForReconnect(interval);
       if (this.ending)
         throw new Error('connection is closed', { cause: lastError });
-      // A redirect may replace the socket during the backoff. Defer to the
-      // active connection instead of dialing the superseded endpoint.
-      if (this.connected || this.socket !== socketBeforeBackoff)
+      // A redirect may replace the socket at any point. Defer to the active
+      // connection instead of dialing the superseded endpoint.
+      if (this.connected || this.socket !== expectedSocket)
         return this.connect();
 
-      const socket = this._installSocket(getTransport(this.config));
+      const options = this._reconnectTarget(attempt);
+      attempt += 1;
+      const socket = this._installSocket(
+        getTransport({ ...this.config, options })
+      );
       this.socket = socket;
+      expectedSocket = socket;
       try {
-        return await this._waitForConnection(socket);
+        await this._waitForConnection(socket);
+        if (this.socket !== socket)
+          return this.connect();
+        this.config.options = options;
+        return this;
       } catch (error) {
         lastError = error instanceof Error
           ? error
@@ -330,23 +343,36 @@ export class IggyConnection extends EventEmitter {
     );
   }
 
+  /**
+   * Alternates reconnect dials between the current endpoint and the
+   * configured seed. After a leader redirect the current endpoint may die
+   * with the leader, and the seed is the way back to the rest of the cluster.
+   */
+  private _reconnectTarget(attempt: number): ClientConfig['options'] {
+    const current = this.config.options;
+    if (this.seedOptions.host === current.host &&
+        this.seedOptions.port === current.port)
+      return current;
+    return attempt % 2 === 0 ? current : this.seedOptions;
+  }
+
   async redirect(host: string, port: number) {
     const redirectedOptions = { ...this.config.options, host, port };
     const redirectedConfig = {
       ...this.config,
       options: redirectedOptions
     };
-    this.socket.removeAllListeners();
+    // Destroying the old socket settles any dial still waiting on it. Its
+    // lifecycle listeners stay attached but go inert once the socket is
+    // replaced below, so surface the drop to in-flight exchanges ourselves.
     this.socket.destroy();
     this.connected = false;
     this.connecting = false;
     this.connectPromise = undefined;
     this.reconnectPromise = undefined;
     this._endResponseWait();
-    // The old socket's close handler was just detached, so surface the drop
-    // to any in-flight exchange and queued work ourselves.
-    this.emit('disconnected', false);
     this.socket = this._installSocket(getTransport(redirectedConfig));
+    this.emit('disconnected', false);
     await this.connect();
     this.config.options = redirectedOptions;
   }

@@ -310,4 +310,146 @@ describe('IggyConnection', () => {
       }
     }
   );
+
+  it('exhausts consecutive failed retries without unhandled rejections',
+    async () => {
+      const server = await startServer();
+      let serverSocket: Socket | undefined;
+      server.on('connection', (socket) => {
+        serverSocket = socket;
+      });
+      const rejections: unknown[] = [];
+      const onUnhandled = (reason: unknown) => rejections.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+      const connection = new IggyConnection({
+        ...connectionConfig(server),
+        reconnect: { enabled: true, interval: 10, maxRetries: 3 }
+      });
+      try {
+        await connection.connect();
+        const exhausted = new Promise<Error>((resolve) => {
+          const onError = (error: Error) => {
+            if (!error.message.includes('reconnect maxRetries exceeded'))
+              return;
+            connection.removeListener('error', onError);
+            resolve(error);
+          };
+          connection.on('error', onError);
+        });
+        const closed = new Promise<void>(
+          (resolve) => server.close(() => resolve())
+        );
+        serverSocket?.destroy();
+        await closed;
+        const error = await exhausted;
+        assert.match(error.message, /reconnect maxRetries exceeded/);
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        assert.deepEqual(rejections, []);
+      } finally {
+        process.removeListener('unhandledRejection', onUnhandled);
+        connection._destroy();
+      }
+    }
+  );
+
+  it('falls back to the seed endpoint when a redirected leader dies',
+    async () => {
+      const seed = await startServer();
+      const seedPort = (seed.address() as AddressInfo).port;
+      const target = await startServer();
+      const targetPort = (target.address() as AddressInfo).port;
+      let targetSocket: Socket | undefined;
+      target.on('connection', (socket) => {
+        targetSocket = socket;
+      });
+      const connection = new IggyConnection({
+        ...connectionConfig(seed),
+        reconnect: { enabled: true, interval: 10, maxRetries: 4 }
+      });
+      connection.on('error', () => undefined);
+      try {
+        await connection.connect();
+        await connection.redirect('127.0.0.1', targetPort);
+        assert.equal(connection.config.options.port, targetPort);
+
+        const reconnected = new Promise<void>((resolve) => {
+          connection.once('connect', () => resolve());
+        });
+        const targetClosed = new Promise<void>(
+          (resolve) => target.close(() => resolve())
+        );
+        targetSocket?.destroy();
+        await targetClosed;
+        await reconnected;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(connection.connected, true);
+        assert.equal(connection.isConnectedTo('127.0.0.1', seedPort), true);
+        assert.equal(connection.config.options.port, seedPort);
+      } finally {
+        await closeConnection(connection, seed);
+      }
+    }
+  );
+
+  it('settles a dial in flight when a redirect replaces the socket',
+    async () => {
+      const seed = await startServer();
+      const target = await startServer();
+      const targetPort = (target.address() as AddressInfo).port;
+      const connection = new IggyConnection(connectionConfig(seed));
+      connection.on('error', () => undefined);
+      try {
+        const pending = connection.connect();
+        const redirected = connection.redirect('127.0.0.1', targetPort);
+        await assert.rejects(
+          () => pending,
+          /connection closed before it was established/
+        );
+        await redirected;
+        assert.equal(connection.connected, true);
+        assert.equal(connection.isConnectedTo('127.0.0.1', targetPort), true);
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => seed.close(() => resolve()));
+        await new Promise<void>((resolve) => target.close(() => resolve()));
+      }
+    }
+  );
+
+  it('shares the redirect dial with a disconnected listener',
+    async () => {
+      const seed = await startServer();
+      const target = await startServer();
+      const targetPort = (target.address() as AddressInfo).port;
+      let seedConnections = 0;
+      let targetConnections = 0;
+      seed.on('connection', () => {
+        seedConnections += 1;
+      });
+      target.on('connection', () => {
+        targetConnections += 1;
+      });
+      const connection = new IggyConnection(connectionConfig(seed));
+      connection.on('error', () => undefined);
+      let listenerConnection: Promise<IggyConnection> | undefined;
+      try {
+        await connection.connect();
+        connection.once('disconnected', () => {
+          listenerConnection = connection.connect();
+        });
+
+        await connection.redirect('127.0.0.1', targetPort);
+        assert.ok(listenerConnection);
+        assert.equal(await listenerConnection, connection);
+        assert.equal(connection.connected, true);
+        assert.equal(connection.isConnectedTo('127.0.0.1', targetPort), true);
+        assert.equal(seedConnections, 1);
+        assert.equal(targetConnections, 1);
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => seed.close(() => resolve()));
+        await new Promise<void>((resolve) => target.close(() => resolve()));
+      }
+    }
+  );
 });
