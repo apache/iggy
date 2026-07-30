@@ -153,13 +153,10 @@ impl Identifier {
     }
 
     /// Creates a new identifier from the given numeric value.
+    ///
+    /// Zero is a valid id: consumer groups are 0-based, and server-side slab
+    /// keys start at 0 (`Identifier::numeric(slab_key)` must never fail).
     pub fn numeric(value: u32) -> Result<Self, IggyError> {
-        /*
-        if value == 0 {
-            return Err(IggyError::InvalidIdentifier);
-        }
-        */
-
         Ok(Self {
             kind: IdKind::Numeric,
             length: 4,
@@ -318,6 +315,13 @@ mod tests {
     #[test]
     fn identifier_with_a_value_of_greater_than_zero_should_be_valid() {
         assert!(Identifier::numeric(1).is_ok());
+    }
+
+    #[test]
+    fn identifier_with_a_value_of_zero_should_be_valid() {
+        // 0-based consumer group ids and slab keys go over the wire as
+        // numeric identifiers; rejecting zero would break both.
+        assert!(Identifier::numeric(0).is_ok());
     }
 
     #[test]

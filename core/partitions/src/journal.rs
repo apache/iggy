@@ -177,6 +177,14 @@ where
     evicted_ring: UnsafeCell<VecDeque<(u64, JournalBuffer)>>,
     /// Running byte total of the buffers held by `evicted_ring`.
     evicted_ring_bytes: Cell<u64>,
+    /// Entry-count ceiling for `evicted_ring`. Defaults to
+    /// [`EVICTED_RING_CAPACITY`]; server-ng overrides it from config at
+    /// partition build.
+    evicted_ring_capacity: Cell<usize>,
+    /// Byte ceiling for `evicted_ring`. Defaults to
+    /// [`EVICTED_RING_BYTES_MAX`]; server-ng overrides it from config at
+    /// partition build.
+    evicted_ring_bytes_max: Cell<u64>,
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
@@ -207,6 +215,8 @@ where
             }),
             evicted_ring: UnsafeCell::new(VecDeque::new()),
             evicted_ring_bytes: Cell::new(0),
+            evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
+            evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
         }
     }
@@ -284,6 +294,15 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             ring.clear();
             self.evicted_ring_bytes.set(0);
         }
+    }
+
+    /// Override the evicted-ring ceilings from configuration. Called once at
+    /// partition build, before any eviction, so the caps govern the first
+    /// flush onward. Leaves `repair_retention` untouched: the single-replica
+    /// disable path stands on its own.
+    pub fn set_ring_caps(&self, capacity: usize, bytes_max: u64) {
+        self.evicted_ring_capacity.set(capacity);
+        self.evicted_ring_bytes_max.set(bytes_max);
     }
 
     /// Resident (un-evicted) entry count; diagnostics only.
@@ -466,8 +485,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 };
                 ring_bytes += entry.len() as u64;
                 ring.push_back((op, entry));
-                while ring.len() > EVICTED_RING_CAPACITY
-                    || (ring_bytes > EVICTED_RING_BYTES_MAX && ring.len() > 1)
+                while ring.len() > self.evicted_ring_capacity.get()
+                    || (ring_bytes > self.evicted_ring_bytes_max.get() && ring.len() > 1)
                 {
                     if let Some((_, dropped)) = ring.pop_front() {
                         ring_bytes -= dropped.len() as u64;
@@ -597,6 +616,8 @@ where
             inner: UnsafeCell::new(JournalInner { storage }),
             evicted_ring: UnsafeCell::new(VecDeque::new()),
             evicted_ring_bytes: Cell::new(0),
+            evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
+            evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
         }
     }
