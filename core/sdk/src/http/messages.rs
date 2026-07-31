@@ -19,14 +19,13 @@ use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PollMessages, PolledMessages,
-    PollingStrategy, SendMessages, SendMessagesConfirmationResponse, SendMessagesResponse,
+    PollingStrategy, SendMessages, SendMessagesResponse,
 };
 use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
-use iggy_common::decode_send_confirmations;
+use iggy_common::SendMessagesConfirmations;
 use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
-use serde::Deserialize;
 
 #[async_trait]
 impl MessageClient for HttpClient {
@@ -85,12 +84,16 @@ impl MessageClient for HttpClient {
             .bytes()
             .await
             .map_err(|_| IggyError::InvalidBytesResponse)?;
-        // The legacy server answers a successful send with no content; the
-        // shared fallback turns that into a zeroed confirmation.
+        // The legacy server answers a successful send with 201 and no content
+        // at all. That is not JSON, and it must not read as a decode failure on
+        // a write that already committed: no body means the batch landed with
+        // no offsets reported, which is an empty list.
         if body.is_empty() {
-            return decode_send_confirmations(&[]);
+            return Ok(SendMessagesResponse {
+                confirmations: Vec::new(),
+            });
         }
-        let confirmations: SendMessagesConfirmationsDto =
+        let confirmations: SendMessagesConfirmations =
             serde_json::from_slice(&body).map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(SendMessagesResponse::from(confirmations))
     }
@@ -120,38 +123,6 @@ impl MessageClient for HttpClient {
     }
 }
 
-/// JSON shape of a successful `SendMessages` reply. Mirrors the binary
-/// `SendMessagesResponse`, which carries no `serde` derives because wire types
-/// stay codec-only.
-#[derive(Deserialize)]
-struct SendMessagesConfirmationsDto {
-    confirmations: Vec<SendMessagesConfirmationDto>,
-}
-
-#[derive(Deserialize)]
-struct SendMessagesConfirmationDto {
-    stream_id: u32,
-    topic_id: u32,
-    partition_id: u32,
-    base_offset: u64,
-}
-
-impl From<SendMessagesConfirmationsDto> for SendMessagesResponse {
-    fn from(dto: SendMessagesConfirmationsDto) -> Self {
-        let confirmations = dto
-            .confirmations
-            .into_iter()
-            .map(|confirmation| SendMessagesConfirmationResponse {
-                stream_id: confirmation.stream_id,
-                topic_id: confirmation.topic_id,
-                partition_id: confirmation.partition_id,
-                base_offset: confirmation.base_offset,
-            })
-            .collect();
-        Self { confirmations }
-    }
-}
-
 fn get_path(stream_id: &str, topic_id: &str) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/messages")
 }
@@ -167,13 +138,13 @@ fn get_path_flush_unsaved_buffer(
 
 #[cfg(test)]
 mod tests {
-    use super::{SendMessagesConfirmationsDto, SendMessagesResponse};
+    use super::{SendMessagesConfirmations, SendMessagesResponse};
     use crate::prelude::SendMessagesConfirmationResponse;
 
     fn parse(json: &str) -> SendMessagesResponse {
-        let dto: SendMessagesConfirmationsDto =
+        let confirmations: SendMessagesConfirmations =
             serde_json::from_str(json).expect("contract sample must parse");
-        SendMessagesResponse::from(dto)
+        SendMessagesResponse::from(confirmations)
     }
 
     #[test]

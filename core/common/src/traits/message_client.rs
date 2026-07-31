@@ -45,9 +45,17 @@ pub trait MessageClient {
     ///
     /// Authentication is required, and the permission to send the messages.
     ///
-    /// Returns the per-partition commit confirmations. The legacy server
-    /// reports none (empty reply body); the confirmation then carries zeroed
-    /// ids and offset rather than failing the send.
+    /// Returns the per-partition commit confirmations, which may be empty: the
+    /// legacy server reports none, and a server that does report them can still
+    /// commit a batch it has no offsets to describe. Callers must handle an
+    /// empty list rather than assume a confirmation per send.
+    ///
+    /// A reported `base_offset` is where the batch's first message landed, with
+    /// two limits. Delivery is at-least-once, so an earlier retry may already
+    /// have committed the same batch at a lower offset and the value never
+    /// implies uniqueness. A batch is confirmed once it is committed in memory,
+    /// not once it is fsynced, so a crash-restart can stamp a later batch with
+    /// an offset a client has already recorded.
     async fn send_messages(
         &self,
         stream_id: &Identifier,

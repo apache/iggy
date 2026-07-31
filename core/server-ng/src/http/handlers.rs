@@ -63,7 +63,6 @@ use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
-use iggy_binary_protocol::responses::messages::SendMessagesResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::GetPersonalAccessTokensResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
@@ -99,14 +98,14 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, Stats, Stream, StreamDetails, TokenInfo,
-    Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
+    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
@@ -1118,41 +1117,6 @@ pub(in crate::http) async fn get_consumer_offset(
     }
 }
 
-/// `POST .../messages` response body: one entry per partition the batch landed
-/// in. A list, not a single confirmation, so a future multi-partition produce
-/// needs no shape change. Local DTOs because the wire types carry no serde by
-/// design.
-#[derive(Debug, Serialize)]
-struct SendMessagesConfirmations {
-    confirmations: Vec<PartitionConfirmation>,
-}
-
-/// One partition's commit confirmation.
-#[derive(Debug, Serialize)]
-struct PartitionConfirmation {
-    stream_id: u32,
-    topic_id: u32,
-    partition_id: u32,
-    base_offset: u64,
-}
-
-impl From<SendMessagesResponse> for SendMessagesConfirmations {
-    fn from(response: SendMessagesResponse) -> Self {
-        Self {
-            confirmations: response
-                .confirmations
-                .into_iter()
-                .map(|confirmation| PartitionConfirmation {
-                    stream_id: confirmation.stream_id,
-                    topic_id: confirmation.topic_id,
-                    partition_id: confirmation.partition_id,
-                    base_offset: confirmation.base_offset,
-                })
-                .collect(),
-        }
-    }
-}
-
 /// `POST /streams/{stream_id}/topics/{topic_id}/messages`: produce a batch of
 /// messages to a topic. The JSON body is the same `SendMessages` shape the
 /// legacy server accepts (partitioning + base64 messages); stream and topic
@@ -1166,6 +1130,10 @@ impl From<SendMessagesResponse> for SendMessagesConfirmations {
 /// after the quorum commit, with the commit's per-partition confirmations as
 /// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
 /// after dispatch and can carry no confirmation, having awaited none.
+///
+/// Every 201 carries a `confirmations` list, empty when the commit reported no
+/// offsets. One shape for one meaning: a caller that had to tell "no body"
+/// apart from "empty list" would be reading the same outcome two ways.
 pub(in crate::http) async fn send_messages(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1192,7 +1160,7 @@ pub(in crate::http) async fn send_messages(
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
-            let reply = SendWrapper::new(partition_write_replicated(
+            let (reply, header) = SendWrapper::new(partition_write_replicated(
                 &state,
                 &identity.session,
                 Operation::SendMessages,
@@ -1205,15 +1173,10 @@ pub(in crate::http) async fn send_messages(
             )];
             // An unreadable confirmation still answers 201: the batch committed,
             // only its offsets did not survive the reply.
-            match send_confirmations(&reply) {
-                Some(response) => Ok((
-                    StatusCode::CREATED,
-                    durability,
-                    Json(SendMessagesConfirmations::from(response)),
-                )
-                    .into_response()),
-                None => Ok((StatusCode::CREATED, durability).into_response()),
-            }
+            let confirmations = send_confirmations(&reply, &header)
+                .map(SendMessagesConfirmations::from)
+                .unwrap_or_default();
+            Ok((StatusCode::CREATED, durability, Json(confirmations)).into_response())
         }
         ProduceAck::None => {
             SendWrapper::new(produce_unacked(&state, &identity.session, &body)).await?;
@@ -1629,7 +1592,9 @@ fn issue_identity(inner: &HttpInner, user_id: u32) -> Result<Json<IdentityInfo>,
 mod tests {
     use super::*;
 
-    use iggy_binary_protocol::responses::messages::SendMessagesConfirmationResponse;
+    use iggy_binary_protocol::responses::messages::{
+        SendMessagesConfirmationResponse, SendMessagesResponse,
+    };
 
     /// Pins the produce response contract the SDKs decode: `snake_case` field
     /// names and a numeric `base_offset`.
@@ -1651,8 +1616,10 @@ mod tests {
         );
     }
 
-    /// A commit that reports no offsets still renders the envelope, so the
-    /// field is always present for a caller that indexes into it.
+    /// A commit that reports no offsets renders the envelope with an empty
+    /// list. Together with [`send_messages`] answering `Json` on every acked
+    /// produce - the unreadable-confirmation path included - that is what makes
+    /// `confirmations` present on every 201 body.
     #[test]
     fn empty_confirmations_render_an_empty_list() {
         let response = SendMessagesResponse {

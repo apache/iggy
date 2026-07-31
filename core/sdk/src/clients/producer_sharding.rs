@@ -249,6 +249,7 @@ impl Shard {
             if let Err(error) = result {
                 if let IggyError::ProducerSendFailed {
                     failed,
+                    committed,
                     cause,
                     stream_name,
                     topic_name,
@@ -262,6 +263,7 @@ impl Shard {
                         topic_name: topic_name.clone(),
                         partitioning: msg.inner.partitioning,
                         messages: failed.clone(),
+                        committed: committed.clone(),
                     };
                     let _ = err_sender.send_async(ctx).await;
                 } else {
@@ -293,7 +295,7 @@ impl Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::producer::MockProducerCoreBackend;
+    use crate::clients::producer::{MockProducerCoreBackend, no_confirmations};
     use bytes::Bytes;
     use iggy_common::IggyDuration;
     use std::time::Duration;
@@ -315,7 +317,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(10)
-            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(no_confirmations()) }));
 
         let bb = BackgroundConfig::builder()
             .batch_length(10)
@@ -357,7 +359,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(no_confirmations()) }));
 
         let bb = BackgroundConfig::builder()
             .batch_length(1000)
@@ -401,7 +403,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(no_confirmations()) }));
 
         let bb = BackgroundConfig::builder()
             .batch_length(10)
@@ -441,6 +443,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         let error = IggyError::ProducerSendFailed {
             failed: Arc::new(vec![dummy_message(1)]),
+            committed: Arc::new(Vec::new()),
             cause: Box::new(IggyError::Error),
             stream_name: "1".to_string(),
             topic_name: "1".to_string(),

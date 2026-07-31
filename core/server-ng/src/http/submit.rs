@@ -26,7 +26,7 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command2;
-use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader};
+use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RequestHeader};
 use iggy_common::IggyError;
 use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
@@ -362,14 +362,15 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
 /// guard borrows the registry, which is why this whole future runs inside
 /// the caller's `SendWrapper` on shard 0.
 ///
-/// Hands back the graded reply frame so a caller that renders a committed
-/// payload can read it; the offset writes answer 204 and drop it.
+/// Hands back the graded reply frame and the header grading read, so a caller
+/// that renders a committed payload can bound the body without parsing the
+/// header again; the offset writes answer 204 and drop both.
 pub(in crate::http) async fn partition_write_replicated(
     state: &HttpInner,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
-) -> Result<BusMessage, PartitionWriteError> {
+) -> Result<(BusMessage, ReplyHeader), PartitionWriteError> {
     // Admission sits here rather than before body decode: axum's extractors
     // already buffered and deserialized the body (bounded by the router-wide
     // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
@@ -413,7 +414,7 @@ pub(in crate::http) async fn partition_write_replicated(
     // reply after a timeout sheds at the bus instead of leaking a waiter.
     drop(guard);
     match outcome {
-        Ok(Ok(reply)) => classify_partition_reply(&reply).map(|()| reply),
+        Ok(Ok(reply)) => classify_partition_reply(&reply).map(|header| (reply, header)),
         // Cancelled (reply target torn down by session eviction mid-wait) or
         // elapsed: same caller contract either way - outcome unknown, 504.
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),

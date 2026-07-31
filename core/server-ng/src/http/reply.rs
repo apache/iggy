@@ -43,21 +43,25 @@ use crate::login_register::LoginRegisterError;
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
 /// is the bare typed payload - so the discriminators live in the header.
-/// `status` is read first: a nonzero value is the typed pre-commit denial (the
-/// partition primary's delete-of-missing-offset rejection, or a dispatch-time
-/// authorization denial) and renders through the legacy `IggyError -> status`
-/// map. With status 0, the reply's `op` splits the rest: a committed reply is
+/// `status` is read first, and that order is load-bearing: every pre-commit
+/// denial names itself there (a namespace that does not resolve or is not
+/// routable, a dispatch-time authorization denial, the partition primary's
+/// delete-of-missing-offset rejection), and each renders through the legacy
+/// `IggyError -> status` map, which is what keeps an unresolvable namespace a
+/// 404. Only with status 0 does `op` split the rest: a committed reply is
 /// built from its prepare header, whose op (the partition group's commit
-/// number) is always >= 1, while the pre-dispatch gate failures reply through
-/// `build_empty_reply` with 0 in that field. The gate reply cannot name which
-/// entity was missing, hence the generic legacy 404 body.
+/// number) is always >= 1, so a 0 there is an ack with nothing committed
+/// behind it and must not grade as success.
 ///
-/// Grading only. The committed body is read separately (see
-/// [`send_confirmations`]) because it is operation-specific: consumer-offset
-/// writes commit empty, a produce commits its confirmations.
+/// Grading only, and it hands the graded header back: the committed body is
+/// read separately (see [`send_confirmations`]) because it is
+/// operation-specific - consumer-offset writes commit empty, a produce commits
+/// its confirmations - and reading it needs the header's `size`. Returning it
+/// keeps that a single parse whose failure mode is already decided here, rather
+/// than a second one whose fallback would have to invent a body.
 pub(in crate::http) fn classify_partition_reply(
     reply: &BusMessage,
-) -> Result<(), PartitionWriteError> {
+) -> Result<ReplyHeader, PartitionWriteError> {
     let header = reply
         .as_slice()
         .get(..HEADER_SIZE)
@@ -74,7 +78,7 @@ pub(in crate::http) fn classify_partition_reply(
     if header.op == 0 {
         return Err(PartitionWriteError::NotFound);
     }
-    Ok(())
+    Ok(*header)
 }
 
 /// The per-partition commit confirmations carried by a graded `SendMessages`
@@ -83,10 +87,16 @@ pub(in crate::http) fn classify_partition_reply(
 /// `None` is a normal outcome, never a failure: a peer whose partition plane
 /// does not stamp the payload commits with an empty body, and a body this build
 /// cannot decode is a shape mismatch. Neither unmakes the commit, so both fall
-/// back to the payload-less success response rather than failing a write that
-/// already landed.
-pub(in crate::http) fn send_confirmations(reply: &BusMessage) -> Option<SendMessagesResponse> {
-    let body = partition_reply_body(reply);
+/// back to an empty confirmation list rather than failing a write that already
+/// landed.
+///
+/// `header` is the one [`classify_partition_reply`] graded, so this reads the
+/// body without re-deriving its extent.
+pub(in crate::http) fn send_confirmations(
+    reply: &BusMessage,
+    header: &ReplyHeader,
+) -> Option<SendMessagesResponse> {
+    let body = partition_reply_body(reply, header);
     if body.is_empty() {
         return None;
     }
@@ -105,13 +115,11 @@ pub(in crate::http) fn send_confirmations(reply: &BusMessage) -> Option<SendMess
 /// A partition reply's body past the header, bounded by the header's `size`
 /// rather than by the buffer length: `size` is the frame's authoritative
 /// extent, and the typed decoders reject trailing bytes.
-fn partition_reply_body(reply: &BusMessage) -> &[u8] {
-    let size = reply
+fn partition_reply_body<'a>(reply: &'a BusMessage, header: &ReplyHeader) -> &'a [u8] {
+    reply
         .as_slice()
-        .get(..HEADER_SIZE)
-        .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
-        .map_or(0, |header| header.size as usize);
-    reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default()
+        .get(HEADER_SIZE..header.size as usize)
+        .unwrap_or_default()
 }
 
 /// Classify a committed reply's leading result section and return the typed
@@ -388,8 +396,12 @@ mod tests {
         assert!(classify_partition_reply(&reply).is_ok());
     }
 
+    /// An ack with no commit number behind it: status 0 and `op` 0. A routing
+    /// failure names itself in `status`, so whatever emits this shape never
+    /// reached the partition plane, and grading it as success would report a
+    /// write that never happened.
     #[test]
-    fn gate_failure_empty_reply_classifies_as_not_found() {
+    fn status_zero_op_zero_ack_classifies_as_not_found() {
         let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
         let reply = frozen(build_empty_reply(request.header(), 42, 0, 9));
         assert!(matches!(
@@ -486,6 +498,14 @@ mod tests {
         frozen(consensus::build_reply_message(&prepare, body))
     }
 
+    /// Walks the same order the write path does: grade first, then read the
+    /// body with the header that grading returned.
+    fn graded_send_confirmations(body: &Bytes) -> Option<SendMessagesResponse> {
+        let reply = send_reply(body);
+        let header = classify_partition_reply(&reply).expect("committed send reply grades ok");
+        send_confirmations(&reply, &header)
+    }
+
     #[test]
     fn committed_send_reply_yields_its_confirmations() {
         let response = SendMessagesResponse {
@@ -497,7 +517,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            send_confirmations(&send_reply(&response.to_bytes())),
+            graded_send_confirmations(&response.to_bytes()),
             Some(response)
         );
     }
@@ -510,18 +530,15 @@ mod tests {
         let empty = SendMessagesResponse {
             confirmations: Vec::new(),
         };
-        assert_eq!(
-            send_confirmations(&send_reply(&empty.to_bytes())),
-            Some(empty)
-        );
+        assert_eq!(graded_send_confirmations(&empty.to_bytes()), Some(empty));
     }
 
     /// A peer whose partition plane does not stamp the payload commits with an
     /// empty body. The write still landed, so this is `None`, not an error, and
-    /// the handler answers its payload-less 201.
+    /// the handler answers 201 with an empty confirmation list.
     #[test]
     fn empty_commit_body_yields_no_confirmations() {
-        assert_eq!(send_confirmations(&send_reply(&Bytes::new())), None);
+        assert_eq!(graded_send_confirmations(&Bytes::new()), None);
     }
 
     /// Same fallback for a body this build cannot read: a shape mismatch must
@@ -529,7 +546,7 @@ mod tests {
     #[test]
     fn undecodable_commit_body_yields_no_confirmations() {
         let truncated = Bytes::from_static(&[1, 0, 0, 0, 9]);
-        assert_eq!(send_confirmations(&send_reply(&truncated)), None);
+        assert_eq!(graded_send_confirmations(&truncated), None);
     }
 
     /// The partition primary's typed pre-commit deny (delete of a missing

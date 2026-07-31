@@ -22,7 +22,7 @@ use crate::wire_conversions::{
 };
 use crate::{
     Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
-    PollingStrategy, SendMessagesConfirmationResponse, SendMessagesResponse,
+    PollingStrategy, SendMessagesResponse,
 };
 #[cfg(feature = "vsr")]
 use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
@@ -256,20 +256,33 @@ async fn poll_group_messages<B: BinaryClient>(
 /// Map a raw `SendMessages` reply body to its confirmation payload. An empty
 /// body means the batch was accepted but no offsets were reported: the legacy
 /// server answers that way, so absence must never surface as a decode failure.
-// TODO(hubcio): remove the zeroed-confirmation fallback once core/server is
-// retired in favor of core/server-ng, which always reports confirmations.
+///
+/// Absence is reported as an empty list, never as a zeroed entry. Every field
+/// of a confirmation has 0 as a legitimate value (ids are 0-based slab keys,
+/// the first batch of a partition commits at offset 0), so a synthetic entry
+/// would be indistinguishable from a real one and a caller checkpointing
+/// `base_offset` would record a commit that never happened.
 pub fn decode_send_confirmations(response: &[u8]) -> Result<SendMessagesResponse, IggyError> {
     if response.is_empty() {
         return Ok(SendMessagesResponse {
-            confirmations: vec![SendMessagesConfirmationResponse {
-                stream_id: 0,
-                topic_id: 0,
-                partition_id: 0,
-                base_offset: 0,
-            }],
+            confirmations: Vec::new(),
         });
     }
     super::decode_response::<SendMessagesResponse>(response)
+}
+
+/// Confirmations for a batch the server has already committed.
+///
+/// An unreadable body degrades to no confirmations instead of an error. The
+/// producer retry loop filters nothing and resends on any `Err`, so failing
+/// here would turn one committed write into as many copies as the retry budget
+/// allows, on a plane that keeps no reply cache to deduplicate them. Reporting
+/// a zeroed entry instead would be no better: the caller cannot tell it from a
+/// genuine commit at offset 0 and would checkpoint the shape mismatch.
+fn committed_send_confirmations(response: &[u8]) -> SendMessagesResponse {
+    decode_send_confirmations(response).unwrap_or_else(|_| SendMessagesResponse {
+        confirmations: Vec::new(),
+    })
 }
 
 #[async_trait::async_trait]
@@ -366,7 +379,7 @@ impl<B: BinaryClient> MessageClient for B {
         let response = self
             .send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
             .await?;
-        decode_send_confirmations(&response)
+        Ok(committed_send_confirmations(&response))
     }
 
     async fn flush_unsaved_buffer(
@@ -391,7 +404,7 @@ impl<B: BinaryClient> MessageClient for B {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_send_confirmations;
+    use super::{committed_send_confirmations, decode_send_confirmations};
     use crate::{IggyError, SendMessagesConfirmationResponse, SendMessagesResponse};
     use iggy_binary_protocol::codec::WireEncode;
 
@@ -406,20 +419,13 @@ mod tests {
         }
     }
 
-    /// Legacy-server fallback: an empty body yields a zeroed confirmation, not
-    /// an error, until core/server is retired and the fallback with it.
+    /// The legacy server reports nothing at all, and nothing is what the caller
+    /// must see: no error to retry on, and no entry that reads as a commit at
+    /// offset 0.
     #[test]
-    fn empty_body_is_a_zeroed_confirmation() {
+    fn empty_body_is_no_confirmations() {
         let decoded = decode_send_confirmations(&[]).expect("empty body must not fail");
-        assert_eq!(
-            decoded.confirmations,
-            vec![SendMessagesConfirmationResponse {
-                stream_id: 0,
-                topic_id: 0,
-                partition_id: 0,
-                base_offset: 0,
-            }]
-        );
+        assert!(decoded.confirmations.is_empty());
     }
 
     #[test]
@@ -430,10 +436,8 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
-    /// A zero-count payload is a present-but-empty confirmation list, which is
-    /// not the same thing as the zeroed legacy fallback above.
     #[test]
-    fn zero_count_body_decodes_to_present_empty_list() {
+    fn zero_count_body_decodes_to_empty_list() {
         let bytes = SendMessagesResponse {
             confirmations: vec![],
         }
@@ -462,6 +466,33 @@ mod tests {
                     Err(IggyError::InvalidFormat)
                 ),
                 "expected error for truncation at byte {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_body_keeps_reported_confirmations() {
+        let expected = response();
+        assert_eq!(committed_send_confirmations(&expected.to_bytes()), expected);
+    }
+
+    /// The write is already durable once the reply arrives, so an unreadable
+    /// body degrades to no confirmations. Anything else either resends a
+    /// committed batch or hands the caller a fabricated offset.
+    #[test]
+    fn committed_malformed_body_is_no_confirmations() {
+        let valid = response().to_bytes();
+
+        let mut with_tail = valid.to_vec();
+        with_tail.push(0xFF);
+        let degraded = committed_send_confirmations(&with_tail);
+        assert!(degraded.confirmations.is_empty());
+
+        for length in 1..valid.len() {
+            let degraded = committed_send_confirmations(&valid[..length]);
+            assert!(
+                degraded.confirmations.is_empty(),
+                "expected no confirmations for truncation at byte {length}"
             );
         }
     }

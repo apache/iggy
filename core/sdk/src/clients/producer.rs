@@ -28,7 +28,7 @@ use iggy_common::{Client, MessageClient, StreamClient, TopicClient};
 use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
-    SendMessagesResponse,
+    SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -42,14 +42,42 @@ use mockall::automock;
 
 #[cfg_attr(test, automock)]
 pub trait ProducerCoreBackend: Send + Sync + 'static {
-    /// Sends `msgs`, returning one confirmation per chunk, in chunk order.
+    /// Sends `msgs`, returning the confirmations of every chunk the send was
+    /// split into, concatenated in chunk order.
     fn send_internal(
         &self,
         stream: &Identifier,
         topic: &Identifier,
         msgs: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> impl Future<Output = Result<Vec<SendMessagesResponse>, IggyError>> + Send;
+    ) -> impl Future<Output = Result<SendMessagesResponse, IggyError>> + Send;
+}
+
+/// Reply for a send that produced no confirmation: nothing was sent, or the
+/// send is still queued on a background dispatcher.
+pub(crate) fn no_confirmations() -> SendMessagesResponse {
+    SendMessagesResponse {
+        confirmations: Vec::new(),
+    }
+}
+
+/// True when `error` can only have been raised after the server committed the
+/// batch. Resending then turns one durable write into as many copies as the
+/// retry budget allows, on a plane that keeps no reply cache to collapse them.
+///
+/// Both kinds are raised while decoding the HTTP reply body, which is reached
+/// only once the status check has accepted a 2xx, so the batch landed and just
+/// its confirmation is unreadable. The binary path degrades an unreadable body
+/// to an empty confirmation list and never raises either kind.
+///
+/// Membership is scoped to the send path and must stay conservative. An error
+/// meaning the request never arrived, or that the server rejected it before
+/// committing, has to keep retrying.
+fn implies_committed_send(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::InvalidBytesResponse | IggyError::InvalidJsonResponse
+    )
 }
 
 pub struct ProducerCore {
@@ -264,6 +292,14 @@ impl ProducerCore {
                 // failed attempts have none to report.
                 Ok(confirmation) => return Ok(confirmation),
                 Err(error) => {
+                    if implies_committed_send(&error) {
+                        error!(
+                            "Not retrying a send to topic: {topic}, stream: {stream}: the batch \
+                             committed and only its confirmation could not be read. {error}."
+                        );
+                        return Err(error);
+                    }
+
                     retries += 1;
                     if retries > max_retries {
                         error!(
@@ -348,10 +384,16 @@ impl ProducerCore {
         sleep(Duration::from_micros(remaining)).await;
     }
 
-    fn make_failed_error(&self, cause: IggyError, failed: Vec<IggyMessage>) -> IggyError {
+    fn make_failed_error(
+        &self,
+        cause: IggyError,
+        failed: Vec<IggyMessage>,
+        committed: Vec<SendMessagesConfirmationResponse>,
+    ) -> IggyError {
         IggyError::ProducerSendFailed {
             cause: Box::new(cause),
             failed: Arc::new(failed),
+            committed: Arc::new(committed),
             stream_name: self.stream_name.clone(),
             topic_name: self.topic_name.clone(),
         }
@@ -365,19 +407,19 @@ impl ProducerCoreBackend for ProducerCore {
         topic: &Identifier,
         mut msgs: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         if msgs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(no_confirmations());
         }
 
         if let Err(err) = self.encrypt_messages(&mut msgs) {
-            return Err(self.make_failed_error(err, msgs));
+            return Err(self.make_failed_error(err, msgs, Vec::new()));
         }
 
         let part = match self.get_partitioning(stream, topic, &msgs, partitioning.clone()) {
             Ok(p) => p,
             Err(err) => {
-                return Err(self.make_failed_error(err, msgs));
+                return Err(self.make_failed_error(err, msgs, Vec::new()));
             }
         };
 
@@ -400,29 +442,28 @@ impl ProducerCoreBackend for ProducerCore {
                     let end = (index + max).min(msgs.len());
                     let chunk = &mut msgs[index..end];
 
-                    let sent = self.try_send_messages(stream, topic, &part, chunk).await;
-                    match sent {
-                        Ok(confirmation) => confirmations.push(confirmation),
+                    match self.try_send_messages(stream, topic, &part, chunk).await {
+                        Ok(response) => confirmations.extend(response.confirmations),
                         Err(err) => {
                             let failed_tail = msgs.split_off(index);
-                            return Err(self.make_failed_error(err, failed_tail));
+                            return Err(self.make_failed_error(err, failed_tail, confirmations));
                         }
                     }
                     self.last_sent_at
                         .store(IggyTimestamp::now().into(), ORDERING);
                     index = end;
                 }
-                Ok(confirmations)
+                Ok(SendMessagesResponse { confirmations })
             }
             // background send on
             _ => {
-                let confirmation = self
+                let response = self
                     .try_send_messages(stream, topic, &part, &mut msgs)
                     .await
-                    .map_err(|err| self.make_failed_error(err, msgs))?;
+                    .map_err(|err| self.make_failed_error(err, msgs, Vec::new()))?;
                 self.last_sent_at
                     .store(IggyTimestamp::now().into(), ORDERING);
-                Ok(vec![confirmation])
+                Ok(response)
             }
         }
     }
@@ -506,22 +547,29 @@ impl IggyProducer {
         self.core.init().await
     }
 
-    /// Sends `messages`, returning one commit confirmation per chunk the send
-    /// was split into, in chunk order. A retried chunk contributes only the
-    /// confirmation of the attempt that finally succeeded; against the legacy
-    /// server (no confirmation payload) the entries carry zeroed ids and
-    /// offset.
+    /// Sends `messages` and returns the commit confirmations of every chunk the
+    /// send was split into, concatenated in chunk order. A retried chunk
+    /// contributes only the confirmation of the attempt that finally succeeded.
     ///
-    /// A `background` producer always returns an empty vector: it hands the
-    /// messages to a dispatcher and returns before the send happens, so no
-    /// confirmation can reach this caller.
+    /// Delivery is at-least-once. An earlier retry may already have committed
+    /// the same messages at a lower offset, so `base_offset` never implies
+    /// uniqueness.
+    ///
+    /// A batch is confirmed once it is committed in memory, not once it is
+    /// fsynced. A crash-restart can stamp a later batch with an offset a client
+    /// has already recorded.
+    ///
+    /// The confirmation list is empty whenever the server sends no confirmation
+    /// payload, which the legacy server never does, and for a `background`
+    /// producer, which hands the messages to a dispatcher and returns before the
+    /// send happens. Branch on `confirmations.is_empty()` instead of indexing.
     pub async fn send(
         &self,
         messages: Vec<IggyMessage>,
-    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         if messages.is_empty() {
             trace!("No messages to send.");
-            return Ok(Vec::new());
+            return Ok(no_confirmations());
         }
 
         let stream_id = self.core.stream_id.clone();
@@ -531,7 +579,7 @@ impl IggyProducer {
             Some(disp) => disp
                 .dispatch(messages, stream_id, topic_id, None)
                 .await
-                .map(|()| Vec::new()),
+                .map(|()| no_confirmations()),
             None => {
                 self.core
                     .send_internal(&stream_id, &topic_id, messages, None)
@@ -541,10 +589,7 @@ impl IggyProducer {
     }
 
     /// See [`IggyProducer::send`] for the confirmation semantics.
-    pub async fn send_one(
-        &self,
-        message: IggyMessage,
-    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
+    pub async fn send_one(&self, message: IggyMessage) -> Result<SendMessagesResponse, IggyError> {
         self.send(vec![message]).await
     }
 
@@ -553,10 +598,10 @@ impl IggyProducer {
         &self,
         messages: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         if messages.is_empty() {
             trace!("No messages to send.");
-            return Ok(Vec::new());
+            return Ok(no_confirmations());
         }
 
         let stream_id = self.core.stream_id.clone();
@@ -566,7 +611,7 @@ impl IggyProducer {
             Some(disp) => disp
                 .dispatch(messages, stream_id, topic_id, partitioning)
                 .await
-                .map(|()| Vec::new()),
+                .map(|()| no_confirmations()),
             None => {
                 self.core
                     .send_internal(&stream_id, &topic_id, messages, partitioning)
@@ -582,17 +627,17 @@ impl IggyProducer {
         topic: Arc<Identifier>,
         messages: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<Vec<SendMessagesResponse>, IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         if messages.is_empty() {
             trace!("No messages to send.");
-            return Ok(Vec::new());
+            return Ok(no_confirmations());
         }
 
         match &self.dispatcher {
             Some(disp) => disp
                 .dispatch(messages, stream, topic, partitioning)
                 .await
-                .map(|()| Vec::new()),
+                .map(|()| no_confirmations()),
             None => {
                 self.core
                     .send_internal(&stream, &topic, messages, partitioning)
@@ -608,6 +653,36 @@ impl IggyProducer {
     pub async fn shutdown(self) {
         if let Some(dispatcher) = self.dispatcher {
             dispatcher.shutdown().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::implies_committed_send;
+    use iggy_common::IggyError;
+
+    #[test]
+    fn test_unreadable_confirmation_of_a_committed_batch_stops_retrying() {
+        assert!(implies_committed_send(&IggyError::InvalidBytesResponse));
+        assert!(implies_committed_send(&IggyError::InvalidJsonResponse));
+    }
+
+    #[test]
+    fn test_errors_reachable_before_a_commit_keep_retrying() {
+        for error in [
+            IggyError::Disconnected,
+            IggyError::EmptyResponse,
+            IggyError::Unauthenticated,
+            IggyError::Unauthorized,
+            IggyError::CannotSendMessagesDueToClientDisconnection,
+            IggyError::HttpResponseError(500, String::new()),
+            IggyError::ResourceNotFound(String::new()),
+        ] {
+            assert!(
+                !implies_committed_send(&error),
+                "{error} does not prove a commit, so it must stay retryable"
+            );
         }
     }
 }

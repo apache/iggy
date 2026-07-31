@@ -22,6 +22,12 @@ use std::borrow::Cow;
 
 /// Size of one confirmation entry:
 /// `stream_id(4) + topic_id(4) + partition_id(4) + base_offset(8)`.
+///
+/// Frozen. Entries are read at this stride out of an array whose length the
+/// peer chooses, so widening one is not a compatible change: a reader built
+/// against the old stride would take its second entry from the middle of the
+/// first and return the garbage as a successful decode. Extra data needs a new
+/// response type or a protocol-version gate. The entry count may grow freely.
 const CONFIRMATION_SIZE: usize = 20;
 
 /// Commit confirmation for one partition written by a `SendMessages` request.
@@ -32,7 +38,13 @@ const CONFIRMATION_SIZE: usize = 20;
 /// ```
 ///
 /// `base_offset` is the offset assigned to the first message of the batch in
-/// that partition.
+/// that partition, bounded by three properties of the send path:
+/// - Delivery is at-least-once. An earlier retry of the same batch may already
+///   have committed at a lower offset, so the value never implies uniqueness.
+/// - A batch is confirmed once it is committed in memory, not once it is
+///   fsynced. A crash-restart can stamp a later batch with an offset a client
+///   has already recorded.
+/// - The legacy server confirms nothing, so its confirmation list is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessagesConfirmationResponse {
     pub stream_id: u32,
@@ -79,10 +91,14 @@ impl WireDecode for SendMessagesConfirmationResponse {
 /// [confirmations_count:4][SendMessagesConfirmationResponse]*
 /// ```
 ///
-/// `confirmations_count == 0` means the batch committed but no offsets are
-/// available. The server currently reports a single partition per request;
-/// the list decodes any count so a later multi-partition send needs no wire
-/// change.
+/// `confirmations_count == 0` means the batch committed with no offsets to
+/// report. The legacy server goes further and answers a successful send with no
+/// body at all, so a caller sees an empty list either way and must handle it.
+///
+/// The server currently reports a single partition per request; the list
+/// decodes any count, so a later multi-partition send needs no wire change.
+/// Growing the count is the only compatible way to extend this response, the
+/// entry itself being frozen at 20 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessagesResponse {
     pub confirmations: Vec<SendMessagesConfirmationResponse>,
@@ -120,6 +136,10 @@ impl WireDecode for SendMessagesResponse {
         }
         // The payload is the whole frame body, never a prefix of a larger
         // value, so leftover bytes mean a shape this build cannot read.
+        // Tolerating a tail would be sound only where the extra bytes cannot
+        // precede a field the reader still indexes, which a fixed-stride array
+        // breaks at any count above one: entries past the first would be read
+        // from inside their predecessor and returned as a successful decode.
         if offset != buf.len() {
             return Err(WireError::Validation(Cow::Owned(format!(
                 "send_messages response has {} trailing bytes",

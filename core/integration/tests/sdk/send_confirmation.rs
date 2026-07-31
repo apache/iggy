@@ -219,18 +219,17 @@ async fn given_direct_producer_when_send_splits_into_chunks_should_confirm_every
         .direct(DirectConfig::builder().batch_length(CHUNK_LENGTH).build())
         .build();
 
-    let confirmations = producer
+    let response = producer
         .send(batch(CHUNKS * CHUNK_LENGTH))
         .await
         .expect("producer send");
 
     assert_eq!(
-        confirmations.len(),
+        response.confirmations.len(),
         CHUNKS as usize,
-        "a direct producer confirms every chunk it split the send into"
+        "a direct producer concatenates the confirmation of every chunk it split the send into"
     );
-    for (chunk, response) in confirmations.iter().enumerate() {
-        let confirmation = sole_confirmation(response);
+    for (chunk, confirmation) in response.confirmations.iter().enumerate() {
         assert_eq!(confirmation.stream_id, stream_id, "confirmed stream id");
         assert_eq!(confirmation.topic_id, topic_id, "confirmed topic id");
         assert_eq!(confirmation.partition_id, PARTITION_ID, "pinned partition");

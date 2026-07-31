@@ -55,9 +55,9 @@ async fn background_send_receive_ok(harness: &TestHarness) {
         .background(BackgroundConfig::builder().build())
         .build();
 
-    let confirmations = producer.send(messages).await.unwrap();
+    let response = producer.send(messages).await.unwrap();
     assert!(
-        confirmations.is_empty(),
+        response.confirmations.is_empty(),
         "a background producer returns before the send happens, so no confirmation can reach it"
     );
     sleep(Duration::from_millis(500)).await;

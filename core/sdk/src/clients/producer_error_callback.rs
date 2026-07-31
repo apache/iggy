@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning};
+use iggy_common::{
+    Identifier, IggyError, IggyMessage, Partitioning, SendMessagesConfirmationResponse,
+};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,6 +32,9 @@ pub struct ErrorCtx {
     pub topic_name: String,
     pub partitioning: Option<Arc<Partitioning>>,
     pub messages: Arc<Vec<IggyMessage>>,
+    /// Confirmations of the chunks that committed before the failure; `messages`
+    /// is the tail that did not.
+    pub committed: Arc<Vec<SendMessagesConfirmationResponse>>,
 }
 
 /// A trait for handling background sending errors.
@@ -42,7 +47,8 @@ pub trait ErrorCallback: Send + Sync + Debug + 'static {
 
 /// Default implementation of [`ErrorCallback`] that logs the error using `tracing::error!`.
 ///
-/// Logs include stream, topic, optional partitioning, number of messages, and the cause.
+/// Logs include stream, topic, optional partitioning, number of messages, how
+/// many chunks committed before the failure, and the cause.
 #[derive(Debug, Default)]
 pub struct LogErrorCallback;
 
@@ -63,6 +69,7 @@ impl ErrorCallback for LogErrorCallback {
                 topic_name = ctx.topic_name,
                 partitioning = %partitioning,
                 num_messages = ctx.messages.len(),
+                committed_confirmations = ctx.committed.len(),
                 "Failed to send messages in background task",
             );
         })

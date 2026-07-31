@@ -207,7 +207,7 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::sleep;
 
-    use crate::clients::producer::MockProducerCoreBackend;
+    use crate::clients::producer::{MockProducerCoreBackend, no_confirmations};
     use crate::clients::producer_error_callback::ErrorCallback;
     use crate::clients::producer_sharding::Sharding;
 
@@ -229,7 +229,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(no_confirmations()) }));
 
         let msg = dummy_message(5);
         let config = BackgroundConfig::builder()
@@ -305,7 +305,7 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         mock.expect_send_internal()
             .times(1)
-            .returning(|_, _, _, _| Box::pin(async { Ok(Vec::new()) }));
+            .returning(|_, _, _, _| Box::pin(async { Ok(no_confirmations()) }));
 
         let msg = ShardMessage {
             stream: dummy_identifier(),
@@ -395,6 +395,7 @@ mod tests {
                     Err(IggyError::ProducerSendFailed {
                         cause: Box::new(IggyError::Error),
                         failed: Arc::new(vec![dummy_message(10)]),
+                        committed: Arc::new(Vec::new()),
                         stream_name: "1".to_string(),
                         topic_name: "1".to_string(),
                     })
