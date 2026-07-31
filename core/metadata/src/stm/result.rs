@@ -230,7 +230,30 @@ result_enum!(CreateConsumerGroupResult {
     TopicNotFound = 2010,
     NameAlreadyExists = 5004,
 });
-result_enum!(DeleteConsumerGroupResult { NotFound = 5000 });
+// Delete/Join/Leave resolve stream -> topic -> group inside the apply (the
+// authz gate passes a resolution miss through), so their codes mirror the
+// legacy `resolve_consumer_group` ladder -- StreamIdNotFound / TopicIdNotFound
+// / ConsumerGroupIdNotFound. One divergence: when the caller is unauthorized
+// AND the group is missing, legacy resolves first and leaks the miss (5000)
+// while ng commits Unauthorized (41) without confirming existence. Leave also
+// mirrors legacy's post-resolution member check: leaving a group the client
+// never joined returns ConsumerGroupMemberNotFound.
+result_enum!(DeleteConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    ConsumerGroupNotFound = 5000,
+});
+result_enum!(JoinConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    ConsumerGroupNotFound = 5000,
+});
+result_enum!(LeaveConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    ConsumerGroupNotFound = 5000,
+    ConsumerGroupMemberNotFound = 5006,
+});
 
 /// `IggyError::Unauthorized`. Any control-plane op can commit as an in-apply
 /// authorization no-op, so this code is valid for every op regardless of its
@@ -282,6 +305,8 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
         }
         Operation::CreateConsumerGroup => CreateConsumerGroupResult::from_u32(code).is_some(),
         Operation::DeleteConsumerGroup => DeleteConsumerGroupResult::from_u32(code).is_some(),
+        Operation::JoinConsumerGroup => JoinConsumerGroupResult::from_u32(code).is_some(),
+        Operation::LeaveConsumerGroup => LeaveConsumerGroupResult::from_u32(code).is_some(),
         _ => true,
     }
 }
@@ -561,9 +586,49 @@ mod tests {
             u32::from(CreateConsumerGroupResult::NameAlreadyExists),
             IggyError::ConsumerGroupNameAlreadyExists(String::new(), id()).as_code(),
         );
+        let consumer_group_not_found = IggyError::ConsumerGroupIdNotFound(id(), id()).as_code();
+
+        // Delete/Join/Leave mirror the legacy `resolve_consumer_group` error
+        // ladder.
         assert_eq!(
-            u32::from(DeleteConsumerGroupResult::NotFound),
-            IggyError::ConsumerGroupIdNotFound(id(), id()).as_code(),
+            u32::from(DeleteConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(DeleteConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(DeleteConsumerGroupResult::ConsumerGroupNotFound),
+            consumer_group_not_found,
+        );
+        assert_eq!(
+            u32::from(JoinConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(JoinConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(JoinConsumerGroupResult::ConsumerGroupNotFound),
+            consumer_group_not_found,
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::ConsumerGroupNotFound),
+            consumer_group_not_found,
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound),
+            IggyError::ConsumerGroupMemberNotFound(0, id(), id()).as_code(),
         );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.

@@ -29,7 +29,7 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 use consensus::LocalPipeline;
 use consensus::{
     CommitOutcome, Consensus, ConsensusClock, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline,
-    Plane, PlaneKind, Sequencer, VsrAction, VsrConsensus,
+    Plane, PlaneKind, Sequencer, VsrAction, VsrConsensus, build_deny_reply_from_request_header,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -42,7 +42,7 @@ use iggy_binary_protocol::{
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{IggyExpiry, IggyTimestamp};
+use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -52,11 +52,12 @@ use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
+use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
@@ -161,14 +162,19 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// connection homes on a peer shard, that shard verifies credentials and
 /// owns the session locally, but the consensus proposal (`Register` /
 /// `Logout`) must execute on shard 0. The peer hands just that step here
-/// and awaits the committed op number over `reply` (`None` = transient
-/// submit failure; all `MetadataSubmitError` variants are transient by
-/// contract, so the caller retries rather than distinguishing them).
+/// and awaits the outcome over `reply`. `Register` carries the submit error
+/// verbatim because one variant
+/// (`MetadataSubmitError::ClientIdOwnedByAnotherUser`) is terminal and must
+/// not be retried; the remaining variants are transient by contract.
 pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
         user_id: u32,
-        reply: Sender<Option<u64>>,
+        /// The committed bind, or the submit error verbatim. The error must
+        /// survive the hop: the ownership refusal is TERMINAL, and flattening it
+        /// into "no reply" makes the login look transient, which costs the
+        /// client a retry storm of full password verifications.
+        reply: Sender<Result<BoundSession, MetadataSubmitError>>,
     },
     Logout {
         vsr_client_id: u128,
@@ -708,12 +714,16 @@ impl ShardFrame {
     }
 }
 
-/// Prepares served per `RequestPrepares` round. The per-peer bus queues
-/// are bounded (`peer_queue_capacity`, 256 by default) and overrun frames
-/// drop silently, so an unbounded burst loses its own tail; the receiver
-/// pulls the window chunk by chunk instead (each walked `RepairDone`
-/// immediately requests the next chunk while progress holds).
-const REPAIR_CHUNK_MAX: u64 = 128;
+/// Prepares served per `RequestPrepares` round.
+///
+/// The per-peer bus queues are bounded (`peer_queue_capacity`, 256 by default)
+/// and overrun frames drop silently, so an unbounded burst loses its own tail;
+/// the receiver pulls the window chunk by chunk instead (each walked
+/// `RepairDone` immediately requests the next chunk while progress holds).
+///
+/// Runtime default; server-ng overrides the live ceiling per shard from
+/// `[cluster] repair_chunk_max` at bootstrap.
+pub const REPAIR_CHUNK_MAX: u64 = 128;
 
 /// One in-flight metadata journal-repair stream (shard 0 only).
 #[derive(Debug, Clone, Copy)]
@@ -824,6 +834,16 @@ where
     /// `ReconcileOp::InsertOwned` lands. Bounded per namespace; overflow
     /// drops the frame (at-least-once: client/primary retries recover).
     pending_partition_frames: RefCell<HashMap<IggyNamespace, Vec<Message<GenericHeader>>>>,
+
+    /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
+    /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
+    /// `[cluster] repair_chunk_max` at bootstrap.
+    repair_chunk_max: Cell<u64>,
+
+    /// Live stalled-repair retry threshold in consensus ticks. Defaults to
+    /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
+    /// `[cluster] repair_retry_interval` at bootstrap.
+    repair_retry_ticks: Cell<u32>,
 }
 
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -916,7 +936,23 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(HashMap::new()),
             metadata_repair: RefCell::new(None),
+            repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
+            repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
         })
+    }
+
+    /// Override the stalled-repair retry threshold (consensus ticks) from
+    /// configuration. Called once per shard at bootstrap; the simulator and
+    /// tests keep the compile-time [`partitions::REPAIR_RETRY_TICKS`] default.
+    pub fn set_repair_retry_ticks(&self, ticks: u32) {
+        self.repair_retry_ticks.set(ticks);
+    }
+
+    /// Override the per-round repair-serving chunk ceiling from configuration.
+    /// Called once per shard at bootstrap; the simulator and tests keep the
+    /// compile-time [`REPAIR_CHUNK_MAX`] default.
+    pub fn set_repair_chunk_max(&self, chunk: u64) {
+        self.repair_chunk_max.set(chunk);
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1123,6 +1159,8 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(HashMap::new()),
             metadata_repair: RefCell::new(None),
+            repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
+            repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
         }
     }
 
@@ -1162,7 +1200,8 @@ where
     /// Stage a partition mutation for the pump.
     ///
     /// Marker `try_send` is best-effort; the pump's tail drain on every
-    /// frame catches dropped markers, so the queue never strands ops.
+    /// frame and its consensus-tick drain catch dropped markers, so the
+    /// queue never strands ops for longer than one tick.
     pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B>) {
         self.reconcile_queue.borrow_mut().push_back(op);
         let Some(sender) = self.senders.get(self.id as usize) else {
@@ -1349,6 +1388,20 @@ where
     }
 }
 
+/// Routing verdict of [`IggyShard::park_if_unmaterialised`].
+enum ParkOutcome<H> {
+    /// Namespace is materialised (or the frame is not a partition op):
+    /// process normally.
+    Deliver(Message<H>),
+    /// Frame was parked until the namespace materialises (or dropped on
+    /// park overflow).
+    Parked,
+    /// Namespace is mid-teardown. Client requests must be denied with a
+    /// transient status; replicated traffic still flows to the plane, whose
+    /// own tombstone guards drop it.
+    Tombstoned(Message<H>),
+}
+
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -1383,35 +1436,61 @@ where
                 Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
+        T: ShardsTable,
     {
         match MessageBag::try_from(message) {
             Ok(MessageBag::Request(request)) => {
                 let routing = (request.header().operation, request.header().namespace);
-                if let Some(request) = self.park_if_unmaterialised(request, routing.0, routing.1) {
-                    self.on_request(request).await;
+                match self.park_if_unmaterialised(request, routing.0, routing.1) {
+                    // The incarnation fence runs only here, on client traffic.
+                    // A backup denying what the primary admitted would diverge
+                    // the replicas, so replicated frames are never fenced.
+                    ParkOutcome::Deliver(request)
+                        if !self.serves_committed_incarnation(routing.0, routing.1) =>
+                    {
+                        self.deny_partition_request_transient(request.header())
+                            .await;
+                    }
+                    ParkOutcome::Deliver(request) => self.on_request(request).await,
+                    // Deny instead of forwarding into the partition plane's
+                    // tombstone guard: that guard drops the frame without a
+                    // reply, and the transports decode replies in lockstep,
+                    // so silence wedges the connection until the SDK's
+                    // response read-timeout.
+                    ParkOutcome::Tombstoned(request) => {
+                        self.deny_partition_request_transient(request.header())
+                            .await;
+                    }
+                    ParkOutcome::Parked => {}
                 }
             }
             Ok(MessageBag::Prepare(prepare)) => {
                 let routing = (prepare.header().operation, prepare.header().namespace);
-                if let Some(prepare) = self.park_if_unmaterialised(prepare, routing.0, routing.1) {
-                    self.on_replicate(prepare).await;
-                    // A follower learns the cluster commit point from the
-                    // commit_max piggybacked on each prepare; the Commit
-                    // heartbeat carries commit_min and stops advancing
-                    // commit_max once the piggyback has raced ahead, so
-                    // on_commit alone never drains a follower's journal. Drive
-                    // it here off the prepare, as the metadata plane does inside
-                    // its own on_replicate.
-                    if routing.0.is_partition() {
-                        let planes = self.plane.inner();
-                        let config = planes.1.0.config();
-                        let namespace = IggyNamespace::from_raw(routing.1);
-                        if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
-                            && partition.consensus().is_follower()
-                        {
-                            partition.commit_journal(config).await;
+                // A tombstoned prepare still flows to the plane: replicated
+                // traffic has no client awaiting a reply on this node, and
+                // the plane's own tombstone guard drops it.
+                match self.park_if_unmaterialised(prepare, routing.0, routing.1) {
+                    ParkOutcome::Deliver(prepare) | ParkOutcome::Tombstoned(prepare) => {
+                        self.on_replicate(prepare).await;
+                        // A follower learns the cluster commit point from the
+                        // commit_max piggybacked on each prepare; the Commit
+                        // heartbeat carries commit_min and stops advancing
+                        // commit_max once the piggyback has raced ahead, so
+                        // on_commit alone never drains a follower's journal. Drive
+                        // it here off the prepare, as the metadata plane does inside
+                        // its own on_replicate.
+                        if routing.0.is_partition() {
+                            let planes = self.plane.inner();
+                            let config = planes.1.0.config();
+                            let namespace = IggyNamespace::from_raw(routing.1);
+                            if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
+                                && partition.consensus().is_follower()
+                            {
+                                partition.commit_journal(config).await;
+                            }
                         }
                     }
+                    ParkOutcome::Parked => {}
                 }
             }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
@@ -1429,9 +1508,58 @@ where
         }
     }
 
+    /// Does the partition materialised under `namespace_raw` belong to the
+    /// incarnation the committed metadata denotes?
+    ///
+    /// A delete + recreate of the same stream / topic / partition tuple recycles
+    /// the freed slab keys, so the namespace is byte-identical across
+    /// incarnations and presence proves nothing: a request admitted against the
+    /// prior incarnation is journaled and acked, then erased when the reconciler
+    /// tears that incarnation down. `created_revision` is the sole
+    /// discriminator - the committed value must equal the epoch this shard
+    /// stored on the routing row when it materialised the partition.
+    ///
+    /// Either side missing is a failed proof, not a pass: the row may lag the
+    /// plane or vanish entirely, but it never runs ahead, so an unverifiable
+    /// pairing means the reconciler has yet to converge. Non-partition
+    /// operations address no incarnation and always pass.
+    #[must_use]
+    pub fn serves_committed_incarnation(&self, operation: Operation, namespace_raw: u64) -> bool
+    where
+        M: StreamsFrontend,
+        T: ShardsTable,
+    {
+        if !operation.is_partition() {
+            return true;
+        }
+        let namespace = IggyNamespace::from_raw(namespace_raw);
+        let committed = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace);
+        let row = self.shards_table.epoch_for(namespace);
+        if committed.is_some() && committed == row {
+            return true;
+        }
+        tracing::debug!(
+            shard = self.id,
+            namespace_raw,
+            operation = ?operation,
+            committed_revision = ?committed,
+            row_epoch = ?row,
+            "denying partition request against an unverified incarnation"
+        );
+        false
+    }
+
     /// Drop parked frames for a namespace that will never materialise (it was
     /// removed before its `ReconcileOp::InsertOwned`), so the pending entry is
-    /// reclaimed instead of leaking until process exit.
+    /// reclaimed instead of leaking until process exit. Parked client requests
+    /// are denied with a transient status rather than dropped: the transports
+    /// decode replies in lockstep, so silence wedges the connection until the
+    /// SDK's response read-timeout.
     fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
         if let Some(frames) = self
             .pending_partition_frames
@@ -1445,6 +1573,16 @@ where
                 count = frames.len(),
                 "discarding parked partition frames for removed namespace"
             );
+            for frame in frames {
+                if frame.header().command == Command2::Request
+                    && let Ok(request) = frame.try_into_typed::<RequestHeader>()
+                {
+                    // Callers are synchronous (`apply_reconcile_ops`), so the
+                    // deny rides the pump's outbound lifecycle path instead of
+                    // an inline bus send.
+                    self.stage_transient_deny(request.header());
+                }
+            }
         }
     }
 
@@ -1452,29 +1590,36 @@ where
     /// materialised (post-`CreateTopic` convergence window: the metadata
     /// commit precedes the reconciler pass that builds the local replica).
     ///
-    /// Returns `Some(message)` when the frame should be processed normally:
-    /// non-partition operation, namespace materialised, or namespace
-    /// tombstoned (the plane's own tombstone guard handles the drop).
-    /// Returns `None` when the frame was parked (or dropped on overflow);
-    /// [`Self::apply_reconcile_ops`] re-dispatches parked frames once the
-    /// matching `ReconcileOp::InsertOwned` lands.
+    /// Tombstoned namespaces (teardown fence set by the reconciler before the
+    /// disk delete) report [`ParkOutcome::Tombstoned`] so the caller can deny
+    /// client requests instead of feeding them to the plane's silent-drop
+    /// guard, while replicated traffic still flows there. Parked frames are
+    /// re-dispatched by [`Self::apply_reconcile_ops`] once the matching
+    /// `ReconcileOp::InsertOwned` lands; overflow drops the frame
+    /// (at-least-once: client/primary retries recover).
     fn park_if_unmaterialised<H>(
         &self,
         message: Message<H>,
         operation: Operation,
         namespace_raw: u64,
-    ) -> Option<Message<H>>
+    ) -> ParkOutcome<H>
     where
         H: iggy_binary_protocol::ConsensusHeader,
     {
         const MAX_PARKED_PER_NAMESPACE: usize = 128;
         if !operation.is_partition() {
-            return Some(message);
+            return ParkOutcome::Deliver(message);
         }
         let namespace = IggyNamespace::from_raw(namespace_raw);
         let partitions = self.plane.partitions();
-        if partitions.contains(&namespace) || partitions.is_tombstoned(&namespace) {
-            return Some(message);
+        // Tombstone outranks presence: the partition value stays in the vec
+        // until `ConfirmRemove` drains, but the fence already forbids serving
+        // it.
+        if partitions.is_tombstoned(&namespace) {
+            return ParkOutcome::Tombstoned(message);
+        }
+        if partitions.contains(&namespace) {
+            return ParkOutcome::Deliver(message);
         }
         let mut pending = self.pending_partition_frames.borrow_mut();
         let parked = pending.entry(namespace).or_default();
@@ -1484,7 +1629,7 @@ where
                 namespace_raw = namespace.inner(),
                 "parked-frame buffer full; dropping partition frame"
             );
-            return None;
+            return ParkOutcome::Parked;
         }
         tracing::debug!(
             shard = self.id,
@@ -1493,7 +1638,58 @@ where
             "parking partition frame until namespace materialises"
         );
         parked.push(message.into_generic());
-        None
+        ParkOutcome::Parked
+    }
+
+    /// Deny a client partition request with `TransientNotAccepted`: the frame
+    /// never reached journal admission, so the SDK can safely replay it
+    /// anywhere, and partition rebuild completes well inside the replay
+    /// budget. Sent directly over the bus; delivery failure is terminal for
+    /// this reply (the client recovers via its own read-timeout).
+    #[allow(clippy::future_not_send)]
+    async fn deny_partition_request_transient(&self, request_header: &RequestHeader) {
+        let reply = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        if let Err(error) = self
+            .bus
+            .send_to_client(request_header.client, reply.into_generic().into_frozen())
+            .await
+        {
+            tracing::warn!(
+                shard = self.id,
+                client = request_header.client,
+                operation = ?request_header.operation,
+                error = %error,
+                "failed to send transient deny for partition request"
+            );
+        }
+    }
+
+    /// [`Self::deny_partition_request_transient`] for synchronous callers:
+    /// hand the deny to this shard's own pump as a
+    /// [`LifecycleFrame::ForwardClientSend`], whose handler performs the bus
+    /// send (same funnel the parked-frame re-dispatch uses).
+    fn stage_transient_deny(&self, request_header: &RequestHeader) {
+        let reply = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+            client_id: request_header.client,
+            msg: reply.into_generic().into_frozen(),
+        });
+        if let Some(sender) = self.senders.get(self.id as usize)
+            && let Err(error) = sender.try_send(frame)
+        {
+            tracing::warn!(
+                shard = self.id,
+                client = request_header.client,
+                operation = ?request_header.operation,
+                "dropping transient deny for discarded partition frame: inbox rejected: {error:?}"
+            );
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -2036,6 +2232,9 @@ where
     {
         let header = *msg.header();
         let target = header.replica;
+        // Snapshot the config-overridable chunk ceiling once; both plane
+        // branches below serve the same per-round window.
+        let repair_chunk_max = self.repair_chunk_max.get();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
             && consensus.namespace() == header.namespace
@@ -2097,7 +2296,7 @@ where
                 )
                 .await;
             }
-            let chunk_end = to_op.min(from_op.saturating_add(REPAIR_CHUNK_MAX - 1));
+            let chunk_end = to_op.min(from_op.saturating_add(repair_chunk_max - 1));
             let mut served_through = from_op.saturating_sub(1);
             for op in from_op..=chunk_end {
                 #[allow(clippy::cast_possible_truncation)]
@@ -2157,7 +2356,7 @@ where
             .await;
             from_op = retained_from;
         }
-        let chunk_end = to_op.min(from_op.saturating_add(REPAIR_CHUNK_MAX - 1));
+        let chunk_end = to_op.min(from_op.saturating_add(repair_chunk_max - 1));
         let mut served_through = from_op.saturating_sub(1);
         for op in from_op..=chunk_end {
             let Some(entry) = partition.log.journal().inner.repair_entry(op) else {
@@ -2541,6 +2740,7 @@ where
             >,
     {
         let partitions = self.plane.partitions();
+        let repair_retry_ticks = self.repair_retry_ticks.get();
         // Fan out over every group (each partition's heartbeat/retransmit timer
         // must advance), so the keyed single-namespace lookup the control-frame
         // handlers use does not apply here. The namespaces are snapshotted into
@@ -2579,7 +2779,7 @@ where
                         return None;
                     }
                     session.idle_ticks += 1;
-                    if session.idle_ticks < partitions::REPAIR_RETRY_TICKS {
+                    if session.idle_ticks < repair_retry_ticks {
                         return None;
                     }
                     session.idle_ticks = 0;
@@ -2693,6 +2893,7 @@ where
 
         // Stall retry, mirroring `tick_partitions`: a lost repair frame must
         // not wedge the session forever.
+        let repair_retry_ticks = self.repair_retry_ticks.get();
         let stalled = {
             let mut session = self.metadata_repair.borrow_mut();
             session.as_mut().and_then(|session| {
@@ -2700,7 +2901,7 @@ where
                     return None;
                 }
                 session.idle_ticks += 1;
-                if session.idle_ticks < partitions::REPAIR_RETRY_TICKS {
+                if session.idle_ticks < repair_retry_ticks {
                     return None;
                 }
                 session.idle_ticks = 0;

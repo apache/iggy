@@ -20,6 +20,8 @@
 # Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
 rebalancing_timeout = "30s"
 # How often the periodic checker scans for timed-out pending revocations.
+# TODO(hubcio): inert in server-ng, which paces the scan from
+# system.sharding.reconcile_periodic_interval instead. Boot warns when set.
 rebalancing_check_interval = "5s"
 
 [data_maintenance.messages]
@@ -34,10 +36,18 @@ interval = "1 m"
 # Determines if the HTTP server is active.
 # `true` enables the server, allowing it to handle HTTP requests.
 # `false` disables the server, preventing it from handling HTTP requests.
+# In cluster mode, followers forward control-plane requests (streams, topics,
+# users, ...) to the current primary when a cluster-wide JWT key exists (see
+# http.jwt / cluster.auth below).
+# TODO: forwarding does not cover the partition-plane APIs yet - message
+# produce and consumer-offset writes are never forwarded and must reach the
+# partition's primary node directly (message polls read locally on any node).
 enabled = true
 
 # Specifies the network address and port for the HTTP server.
 # The format is "HOST:PORT". For example, "127.0.0.1:3000" listens on localhost only on port 3000.
+# In cluster mode the HOST still picks the bind interface, while the port
+# comes from this node's cluster.nodes ports.http entry.
 address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
@@ -75,9 +85,9 @@ allowed_origins = ["*"]
 allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
-# `x-iggy-view` carries the current VSR view number; exposing it lets browser
+# `iggy-view` carries the current VSR view number; exposing it lets browser
 # clients read it on cross-origin responses.
-exposed_headers = ["x-iggy-view"]
+exposed_headers = ["iggy-view"]
 
 # Determines if credentials like cookies or HTTP auth can be included in CORS requests.
 # `true` allows credentials to be included, useful for authenticated sessions;
@@ -120,6 +130,10 @@ not_before = "0 s"
 
 # Secret key for encoding JWTs.
 # If left empty, a secure random secret will be generated on each server start.
+# In cluster mode a configured secret (identical on every node) makes bearers
+# valid cluster-wide and activates follower-to-primary HTTP forwarding; with
+# cluster.auth enabled the key is instead derived from the shared PSK. Without
+# either, tokens are node-local and forwarding stays disabled.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
@@ -185,9 +199,12 @@ enabled = true
 address = "127.0.0.1:8090"
 
 # Enable TCP socket migration across shards.
+# TODO(hubcio): inert in server-ng, not implemented. Boot warns when set.
 socket_migration = true
 
 # Whether to use ipv4 or ipv6
+# TODO(hubcio): inert in server-ng, which takes the family from the
+# tcp.address string. Boot warns when set.
 ipv6 = false
 
 # TLS configuration for the TCP server.
@@ -209,6 +226,8 @@ cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 
 # Configuration for the TCP socket
+# TODO(hubcio): the whole section is inert in server-ng, which leaves the OS
+# defaults in place. Boot warns when override_defaults is set.
 [tcp.socket]
 # Whether to overwrite the OS-default socket parameters
 override_defaults = false
@@ -286,6 +305,8 @@ cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 
 # Configuration for the QUIC socket
+# TODO(hubcio): the whole section is inert in server-ng, which leaves the OS
+# defaults in place. Boot warns when override_defaults is set.
 [quic.socket]
 # Whether to override the OS-default socket parameters
 override_defaults = false
@@ -309,9 +330,12 @@ enabled = true
 # Controls whether data saving is synchronous (enforce fsync) or asynchronous.
 # `true` for synchronous saving, ensuring data integrity at the cost of performance.
 # `false` for asynchronous saving, improving performance but with delayed data writing.
+# TODO(hubcio): inert in server-ng, which only flushes on shutdown and has no
+# periodic saver to configure. Boot warns when set.
 enforce_fsync = true
 
 # Interval for running the message saver.
+# TODO(hubcio): inert in server-ng, see enforce_fsync above. Boot warns when set.
 interval = "30 s"
 
 # Personal access token configuration.
@@ -363,6 +387,8 @@ endpoint = "http://localhost:7281/v1/traces"
 path = "local_data"
 
 # Backup configuration
+# TODO(hubcio): backup is not supported in server-ng; both paths below are
+# inert. Boot warns when either is set.
 [system.backup]
 # Path for storing backup.
 path = "backup"
@@ -372,6 +398,9 @@ path = "backup"
 # Subpath of the backup directory where converted segment data is stored after compatibility conversion.
 path = "compatibility"
 
+# TODO(hubcio): the three tunables below are inert in server-ng, whose state
+# writes do not go through the legacy retrying file layer. Boot warns when any
+# is set.
 [system.state]
 # Determines whether to enforce file synchronization on state updates (boolean).
 # `true` ensures immediate writing of data to disk for durability.
@@ -428,6 +457,8 @@ rotation_check_interval = "1 h"
 retention = "7 days"
 
 # Interval for printing system information to the log.
+# TODO(hubcio): inert in server-ng, which has no sysinfo printer. Boot warns
+# when set.
 sysinfo_print_interval = "10 s"
 
 # Encryption configuration
@@ -447,6 +478,8 @@ key = ""
 # Allows overriding the default compression algorithm per data segment (boolean).
 # `true` permits different compression algorithms for individual segments.
 # `false` means all data segments use the default compression algorithm.
+# TODO(hubcio): inert in server-ng, where live compression is already per-topic
+# from the request. Boot warns when set.
 allow_override = false
 
 # The default compression algorithm used for data storage (string).
@@ -494,8 +527,9 @@ path = "partitions"
 enforce_fsync = false
 
 # Enables checksum validation for data integrity (boolean).
-# `true` activates CRC checks when loading data, guarding against corruption.
-# `false` skips these checks for faster loading at the risk of undetected corruption.
+# TODO(hubcio): inert in server-ng, which never verifies checksums on load
+# whatever this says - `true` buys no corruption guard here. Boot warns when
+# set.
 validate_checksum = false
 
 # The count threshold of buffered messages before triggering a save to disk.
@@ -526,6 +560,8 @@ archive_expired = false
 # - "true" or "all": keeps indexes in memory, speeding up data retrieval at the cost of memory
 # - "open_segment": keeps indexes in memory only for the currently open segment
 # - "false" or "none": reads indexes from disk, which can conserve memory at the cost of access speed
+# TODO(hubcio): inert in server-ng, which picks its own index residency. Boot
+# warns when set.
 cache_indexes = "open_segment"
 
 # Message deduplication configuration
@@ -580,15 +616,67 @@ name = "iggy-cluster"
 # Backup-side liveness window for a consensus plane's primary (duration).
 # A replica that sees no primary traffic for this long starts a view change.
 # Raise it on oversubscribed hosts where scheduling stalls fake primary
-# death. Must be at least "2s": the primary heartbeats every second, and a
-# window at or below one ping interval would elect on every hiccup.
+# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
+# primary signals liveness through its commit broadcast, and the window must
+# span several broadcasts so one delayed broadcast never trips an election.
 heartbeat_timeout = "5s"
+
+# How often the primary broadcasts its commit point to every backup (duration).
+# This is the cluster's liveness signal: each broadcast resets every backup's
+# heartbeat_timeout window and carries the latest commit point forward. Must be
+# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
+# value. Drives the consensus CommitMessage timer.
+commit_broadcast_interval = "500ms"
+
+# How often the primary retransmits prepares that backups have not yet acked
+# (duration). Lower values recover faster from a dropped prepare at the cost of
+# more replica traffic; must be nonzero. Drives the consensus Prepare timer.
+prepare_retransmit_interval = "250ms"
+
+# How often a replica retransmits its StartViewChange / DoViewChange while a
+# view change is in progress (duration). Lower values converge a healthy
+# election faster at the cost of more replica traffic; must be nonzero. Drives
+# both consensus view-change retransmit timers.
+view_change_retransmit_interval = "500ms"
+
+# Backstop for a stalled view change (duration): one that does not conclude
+# within this window escalates to a fresh cluster-wide election. Must be nonzero
+# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# messages retransmit rather than prematurely escalate.
+view_change_status_timeout = "5s"
+
+# How often a recovering or view-change backup re-requests the current view's
+# StartView from its primary (duration); must be nonzero. Drives the consensus
+# RequestStartView timer.
+request_start_view_retransmit_interval = "1s"
+
+# How many consecutive unanswered RequestStartView probes a recovering replica
+# tolerates before falling back to an election (integer). A full-cluster restart
+# leaves nobody settled to answer, so the replica elects on its recovered log.
+# Must be between 1 and 100.
+view_probe_attempts_max = 5
+
+# How long a stalled journal-repair stream waits before re-requesting its
+# remaining window from the serving peer (duration). Repair frames are
+# fire-and-forget over the lossy bus, so a session with no retry wedges forever
+# on a single dropped frame. Paces both the metadata and partition repair loops;
+# must be nonzero.
+repair_retry_interval = "1s"
+
+# Prepares a peer serves per repair round before the requester walks to the next
+# chunk (integer). Each frame rides the per-peer message-bus queue, so this must
+# stay strictly below message_bus.peer_queue_capacity or a full round overruns
+# the queue and drops frames. Must be > 0 and <= 1024.
+repair_chunk_max = 128
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be
 # rejected, and shared_secret becomes mandatory. Off by default = legacy
 # unauthenticated replica traffic. Enabling it is a coordinated-restart change.
+# With http enabled and no http.jwt secrets configured, the PSK also becomes
+# the JWT key source, making bearers valid cluster-wide and activating
+# follower-to-primary HTTP forwarding.
 enabled = false
 
 # Cluster-wide pre-shared key, >= 32 bytes of CSPRNG output, byte-identical on
@@ -626,11 +714,30 @@ ca_file = ""
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
+#
+# 'ip' is the node's roster address. Replica-to-replica traffic and
+# follower-to-primary HTTP forwarding use it. It is not the bind interface for
+# tcp/quic/http/websocket, which comes from each transport's own 'address'
+# setting above; the roster supplies those transports their port only. A
+# cluster spread across hosts therefore needs each transport's 'address' set to
+# '0.0.0.0' or the routable NIC; the defaults below listen on loopback only,
+# and a bind that cannot serve the advertised 'ip' is warned about at startup.
+#
+# Each node may also set 'advertised_address': the client-facing address
+# handed out in cluster metadata and leader redirects. Set it when 'ip' is
+# a private replica-network address unreachable by clients (Docker,
+# Kubernetes, NAT). Accepts a literal IPv4/IPv6 address or a DNS hostname
+# (RFC 1123: ASCII letters, digits, '-' and '.'; no port, no trailing dot).
+# When unset, clients receive 'ip'.
+#
+# In cluster mode, 'ports' is the single source of listener ports: every
+# enabled transport needs an explicit per-node port, otherwise the server
+# refuses to start.
 [[cluster.nodes]]
 name = "iggy-node-1"
 ip = "127.0.0.1"
 replica_id = 0
-ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8070, tcp_replica = 9090 }
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8092, tcp_replica = 9090 }
 
 [[cluster.nodes]]
 name = "iggy-node-2"
@@ -638,12 +745,14 @@ ip = "127.0.0.1"
 replica_id = 1
 ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 9091 }
 
-# Example additional node (commented out):
+# Example additional node (commented out). tcp skips 8092-8094: those are the
+# websocket ports of the three nodes, which collide once nodes share a host.
 # [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
+# advertised_address = "iggy-node-3.example.com"
 # replica_id = 2
-# ports = { tcp = 8092, http = 3002, tcp_replica = 9092 }
+# ports = { tcp = 8095, quic = 8082, http = 3002, websocket = 8094, tcp_replica = 9092 }
 
 # Sharding configuration
 [system.sharding]
@@ -670,8 +779,10 @@ pin_cores = true
 # Per-shard inter-shard inbox capacity. Bounded by design: consensus-frame
 # drops recover via VSR retransmit, but cross-shard client-reply drops are
 # terminal. Size for the worst-case sum of both: the consensus working set
-# (~ PIPELINE_PREPARE_QUEUE_MAX (32) * replica_count * directions) plus peak
-# client-reply fan-out per shard.
+# (~ the prepare queue depth of the planes the shard hosts - [metadata] on
+# shard 0, [partition] elsewhere - times replica_count times directions) plus
+# peak client-reply fan-out per shard. Both depths are tunable, so raising
+# either raises the capacity needed here.
 inbox_capacity = 1024
 
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
@@ -693,9 +804,40 @@ shutdown_poll_interval = "50 ms"
 # dropped wake-ups and the initial post-bootstrap convergence window.
 reconcile_periodic_interval = "1 s"
 
+# WebSocket listener configuration. The frame-tuning knobs below are the
+# live source for server-ng's WS / WSS plane; they are folded into a
+# compio-ws WebSocketConfig once at bus construction. Each size knob is
+# optional: commenting it out keeps the compio-ws (tungstenite) default
+# noted next to it. A malformed size string fails config load.
 [websocket]
 enabled = true
 address = "127.0.0.1:8092"
+
+# Target minimum size of the frame read buffer. compio-ws default: "128 KiB".
+# read_buffer_size = "128 KiB"
+
+# Target buffer size for batched writes before flush. compio-ws
+# default: "128 KiB".
+# write_buffer_size = "128 KiB"
+
+# Hard ceiling on the write buffer; writes past it error instead of
+# buffering, so it must exceed write_buffer_size by at least one message.
+# compio-ws default: unlimited.
+# max_write_buffer_size = "128 MiB"
+
+# Hard upper bound on a single inbound WebSocket message
+# (post-fragment-reassembly). Must not exceed message_bus.max_message_size.
+# compio-ws default: "64 MiB".
+# max_message_size = "64 MiB"
+
+# Hard upper bound on a single inbound WebSocket frame
+# (pre-fragment-reassembly). Must not exceed max_message_size.
+# compio-ws default: "16 MiB".
+# max_frame_size = "16 MiB"
+
+# Whether to accept unmasked frames from clients in violation of
+# RFC 6455 client-to-server framing rules. Strict (false) by default.
+accept_unmasked_frames = false
 
 [websocket.tls]
 enabled = false
@@ -721,6 +863,36 @@ prepare_queue_depth = 32
 # between forced checkpoints at the cost of memory and bigger WAL
 # rewrites per checkpoint.
 journal_slots = 1024
+
+# Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
+# virtual clients and HTTP sessions together) hold live session state at once.
+# When full, the client whose last commit is oldest is evicted and its next
+# request re-registers. The HTTP session cap tracks this at half, so raising
+# it lifts both. Must be between 2 and 65536.
+clients_table_max = 8192
+
+# Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
+# plane), a pipeline exists per partition, so raising this multiplies pinned
+# request-buffer memory by the partition count. Keep it modest.
+[partition]
+# Depth of a partition's prepare queue: how many uncommitted produce /
+# consumer-offset ops may be in flight at once for that partition. Submits past
+# it spill into a request queue of twice this depth; once both are full the
+# server drops the request without a reply and the client retries on its own
+# request timeout. Must be > 0 and <= 256.
+prepare_queue_depth = 32
+
+# Entries the evicted ring retains per multi-replica partition for journal
+# repair after a peer rejoins. Larger widens the window a restarting peer can be
+# served from the ring before falling back to bulk sync, at the cost of pinned
+# memory per partition. Must be > 0 and <= 65536. Single-replica partitions
+# retain nothing regardless.
+evicted_ring_capacity = 4096
+
+# Byte ceiling for the evicted ring per partition; whichever ring cap (this or
+# evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
+# large batches can pin. Must be > 0 and <= "256 MiB".
+evicted_ring_bytes_max = "16 MiB"
 
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
@@ -757,29 +929,6 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
-
-# WebSocket frame-layer tunables for the bus's WS / WSS install path.
-# Distinct from the legacy [websocket] listener tuning: the bus owns
-# its own ceilings because the bus plane carries SDK-client traffic
-# with cardinality and burst characteristics distinct from the legacy
-# listener. Each `ws_*_size` knob is optional; commenting it out keeps
-# the tungstenite default. Folded once into a tungstenite::WebSocketConfig
-# at bus construction.
-#
-# Hard upper bound on a single inbound WebSocket message
-# (post-fragment-reassembly).
-# ws_max_message_size = "64 MiB"
-#
-# Hard upper bound on a single inbound WebSocket frame
-# (pre-fragment-reassembly).
-# ws_max_frame_size = "16 MiB"
-#
-# Target buffer size for batched WebSocket writes before flush.
-# ws_write_buffer_size = "128 KiB"
-#
-# Whether to accept unmasked frames from clients in violation of
-# RFC 6455 client-to-server framing rules. Strict (false) by default.
-ws_accept_unmasked_frames = false
 
 [extra.namespace]
 max_streams = 4096

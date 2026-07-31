@@ -49,6 +49,13 @@ x-vsr-cluster-env: &vsr-cluster-env
   IGGY_CLUSTER_NODES_1_IP: 172.28.0.102
   IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA: "8191"
   IGGY_CLUSTER_NODES_1_PORTS_TCP_REPLICA: "8192"
+  # http.enabled with cluster.enabled requires a JWT key every node can
+  # verify; cluster auth provides it (derived from the shared secret).
+  # Enabling auth activates follower-to-primary forwarding, so the config
+  # validator requires ports.http on every roster node - those ports are set
+  # in docker-compose.cluster.yml (merged for the leader_redirection flow).
+  IGGY_CLUSTER_AUTH_ENABLED: "true"
+  IGGY_CLUSTER_AUTH_SHARED_SECRET: "bdd-vsr-cluster-shared-secret-0123456789"
 
 services:
   iggy-server:

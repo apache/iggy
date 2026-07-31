@@ -48,7 +48,11 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create io_uring runtime for shard {shard_id}")]
+    // `{source}` is deliberately part of the Display text: the shard-join
+    // failure report and `%error` log fields print Display only, and the
+    // source carries the io_uring remediation folded in by
+    // `server_common::diagnostics::enrich_runtime_create_error`.
+    #[error("failed to create io_uring runtime for shard {shard_id}: {source}")]
     ShardRuntimeCreateFailed {
         shard_id: u16,
         #[source]
@@ -127,8 +131,14 @@ pub enum ServerNgError {
          cluster.enabled=true with a matching nodes[] entry, or drop --replica-id"
     )]
     ReplicaIdRequiresCluster { supplied: u8, default: u8 },
-    #[error("cluster node for replica {replica_id} is missing tcp_replica port")]
-    ClusterReplicaPortMissing { replica_id: u8 },
+    #[error(
+        "cluster node for replica {replica_id} is missing ports.{transport}; cluster mode \
+         requires an explicit roster port for every enabled transport"
+    )]
+    ClusterPortMissing {
+        transport: &'static str,
+        replica_id: u8,
+    },
     #[error(
         "cluster bootstrap with empty metadata requires both {username_env} and {password_env} to be set before server-ng can create the root user deterministically"
     )]
@@ -177,6 +187,8 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to build the HTTP forward client: {reason}")]
+    HttpForwardClient { reason: String },
     #[error("failed to construct IggyShard from bootstrap inputs")]
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
