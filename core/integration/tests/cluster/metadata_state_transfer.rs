@@ -104,3 +104,72 @@ async fn given_checkpointed_cluster_when_node_restarts_should_state_transfer_met
         sleep(MARKER_POLL).await;
     }
 }
+
+/// A node that joins a live, already-checkpointed cluster with NO local
+/// history must state-transfer, exactly like the restart-with-WAL case above.
+///
+/// This is the shape the user cares about beyond a plain restart: a fresh
+/// operator-provisioned replacement, or the third node of a cluster whose
+/// first two formed quorum and committed past a checkpoint before it arrived.
+/// It has no WAL to probe from, so the restart-arms-transfer boot path does
+/// not apply -- it joins as a plain view-0 backup, learns the frontier from
+/// the primary's heartbeats, discovers via journal repair that the gap sits
+/// below the retained floor, and converts THAT into a state transfer. The
+/// same `RangeEvicted`-to-transfer path serves the restart, the late join,
+/// and a partition heal; only the way each reaches repair differs.
+///
+/// Node 2 (a follower) is wiped rather than node 0 so the client keeps its
+/// primary and the cluster never loses quorum -- a genuine late join, not a
+/// restart of the whole cluster.
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_checkpointed_cluster_when_fresh_node_joins_late_should_state_transfer_metadata(
+    harness: &mut TestHarness,
+) {
+    let addr = tcp_addr(harness);
+    let (mut stream, session) = register(addr).await;
+    for request in 1..=OPS_BEFORE_RESTART {
+        commit_request(
+            &mut stream,
+            session,
+            request,
+            &create_stream_payload(&format!("iggy-latejoin-{request}")),
+        )
+        .await;
+    }
+
+    // Wipe a follower and bring it back with an empty data directory while the
+    // other two keep quorum. Its missing prefix (register at op 1 included) was
+    // checkpointed away on every survivor, so nothing but a transfer can seed
+    // its metadata state and client table.
+    harness.restart_node_from_clean_slate(2).unwrap();
+
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    loop {
+        if harness
+            .node(2)
+            .stdout_contains("metadata state transfer installed")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh late-joining node never completed the metadata state transfer \
+             within {TRANSFER_BUDGET:?}; it must convert a repair-floor eviction \
+             into a transfer, not wedge below the floor"
+        );
+        sleep(MARKER_POLL).await;
+    }
+
+    // Functional: the cluster still commits with the rejoined node present, and
+    // the original session (registered below every floor) continues.
+    drop(stream);
+    let addrs = tcp_addrs(harness);
+    resume_request(
+        &addrs,
+        session,
+        OPS_BEFORE_RESTART + 1,
+        &create_stream_payload("iggy-latejoin-continuation"),
+        None,
+    )
+    .await;
+}

@@ -999,6 +999,35 @@ impl Restartable for ServerHandle {
     }
 }
 
+impl ServerHandle {
+    /// Stop this node, delete its data directory, then start it again -- a
+    /// node that rejoins the cluster with no on-disk history, as a fresh
+    /// operator-provisioned replacement or a wiped disk does.
+    ///
+    /// Distinct from [`Restartable::restart`], which preserves the WAL and so
+    /// exercises the recovery-with-history path. The empty data directory is
+    /// what forces the state-transfer join: local recovery has nothing, and
+    /// the committed prefix the node missed no longer exists as WAL entries on
+    /// the peers that checkpointed it.
+    pub fn restart_from_clean_slate(&mut self) -> Result<(), TestBinaryError> {
+        let cleanup = self.config.cleanup;
+        self.config.cleanup = false;
+        self.stop_dependents()?;
+        self.stop()?;
+
+        let data_path = self.data_path();
+        if data_path.exists() {
+            fs::remove_dir_all(&data_path).map_err(|source| TestBinaryError::FileSystemError {
+                path: data_path,
+                source,
+            })?;
+        }
+
+        self.config.cleanup = cleanup;
+        self.start()
+    }
+}
+
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         // Reap the child before `port_reserver` drops: `Child::drop` detaches

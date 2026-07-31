@@ -2108,6 +2108,25 @@ where
                     // the post-install repair targets the right frontier.
                     if !consensus.is_transferring() {
                         planes.0.commit_journal().await;
+                        // A heartbeat is the only signal a behind-but-same-view
+                        // replica gets that the frontier moved: it advances
+                        // `commit_max`, but the walk above cannot cross a gap in
+                        // its own WAL (a late joiner missed the ops below the
+                        // primary's active window; the primary only retransmits
+                        // uncommitted ops, never the committed prefix). Without
+                        // this, such a replica learns it is behind and does
+                        // nothing about it -- metadata repair is otherwise only
+                        // rooted at StartView adoption, which a same-view
+                        // late joiner never sees. Request repair from the
+                        // primary; if it has checkpointed past the gap the
+                        // repair floor evicts and the handler above converts to
+                        // state transfer. Idempotent: `maybe_request_metadata_repair`
+                        // no-ops when caught up, already transferring, or a
+                        // session is live, so a caught-up replica and a
+                        // cold-start node (commit_max == commit_min == 0) both
+                        // skip it.
+                        self.maybe_request_metadata_repair(consensus, header.replica)
+                            .await;
                     }
                 }
                 CommitOutcome::RespondStartView => {
@@ -2500,17 +2519,54 @@ where
                     }
                 }
                 Command2::RangeEvicted => {
-                    // The metadata WAL retains everything above the snapshot
-                    // floor; an evicted range means the peer compacted past
-                    // this replica's gap -- bulk snapshot transfer (phase 3)
-                    // territory. Surface loudly; the divergence backstop
-                    // still guards the walk.
-                    tracing::warn!(
-                        shard = self.id,
-                        retained_from = header.op,
-                        "metadata repair range evicted on the serving peer; \
-                         snapshot transfer required"
-                    );
+                    // Journal repair cannot close this gap: the serving peer
+                    // compacted past it, so the ops this replica is missing no
+                    // longer exist as WAL entries anywhere. This is the one
+                    // authoritative "repair is impossible" signal, and it is
+                    // shape-identical for every way a replica falls behind a
+                    // checkpoint -- a fresh node joining an already-checkpointed
+                    // cluster, a node whose partition healed after the quorum
+                    // moved on, or a restart whose gap sits below the floor. All
+                    // three convert here to state transfer against the peer that
+                    // just announced the eviction (it has the checkpoint by
+                    // definition), which replaces the snapshot-shaped state
+                    // wholesale rather than replaying ops that are gone.
+                    //
+                    // Drop the repair session and arm the transfer only from
+                    // `Idle`: a transfer already in flight owns the stage, and
+                    // its own post-install tail repair can legitimately hit
+                    // `RangeEvicted` again if the primary checkpointed mid
+                    // transfer -- that reraises through the same path, and each
+                    // round lifts the local floor, so it converges.
+                    if consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
+                        *self.metadata_repair.borrow_mut() = None;
+                        consensus.begin_state_transfer_await();
+                        let nonce = iggy_common::random_id::get_uuid();
+                        *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
+                            nonce,
+                            peer: header.replica,
+                            commit_op: 0,
+                            artifacts: Vec::new(),
+                            target_accepted: false,
+                            idle_ticks: 0,
+                        });
+                        tracing::info!(
+                            shard = self.id,
+                            peer = header.replica,
+                            retained_from = header.op,
+                            local_commit = consensus.commit_min(),
+                            "metadata repair floor evicted; converting to state transfer"
+                        );
+                        self.send_request_state_transfer(consensus, header.replica, nonce)
+                            .await;
+                    } else {
+                        tracing::debug!(
+                            shard = self.id,
+                            retained_from = header.op,
+                            stage = ?consensus.state_transfer_stage(),
+                            "metadata repair range evicted while a transfer is already in flight"
+                        );
+                    }
                 }
                 _ => {}
             }
