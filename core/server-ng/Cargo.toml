@@ -185,6 +185,13 @@ vergen-git2 = { workspace = true }
 assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
 iggy = { workspace = true }
+# The reconciler's unit tests assert on `ShardMetrics` snapshots and
+# `IggyShard::parked_frame_count`, which are gated to test/simulator builds so
+# they cannot grow production callers. `shard`'s own `cfg(test)` is false when it
+# is compiled as our dependency, so the feature is how those accessors become
+# visible here. Dev-only: a production `cargo build -p iggy-server-ng` does not
+# resolve dev-dependencies, so nothing extra is compiled in.
+shard = { path = "../shard", features = ["simulator"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints.clippy]

@@ -1099,13 +1099,14 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
         send_partition_deny_reply(shard, transport_client_id, &header, status).await;
         return;
     }
-    // Convergence wait: a CreateTopic commit returns to the client
-    // before the per-shard reconcilers seed routing rows and
-    // materialise the partition (next wake/periodic tick). The SDK
-    // does not replay sends, so an immediately-following partition op
-    // would be dropped as unroutable. Absorb that window here with a
-    // bounded wait; steady-state sends (row present, partition probed
-    // once) skip it entirely.
+    // Convergence wait: a CreateTopic commit returns to the client before the
+    // per-shard reconcilers seed routing rows and materialise the partition
+    // (next wake/periodic tick). An op arriving inside that window is not lost
+    // if it skips this wait -- `router::route_typed` falls back to the hash
+    // assignment, and the owning shard parks it -- so this is an admission
+    // courtesy that keeps the steady state off that park buffer, not a
+    // correctness gate. See `wait_for_partition_routable`, which spells out why
+    // there is no owner-readiness probe here any more.
     if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
         // The op never reached the partition plane, so it is safe to re-issue
         // anywhere -- the same contract the plane itself answers for a
@@ -1886,13 +1887,26 @@ async fn send_empty_partition_reply<B, MJ, S>(
     }
 }
 
-/// Wait (bounded) until `namespace` is routable: this shard's routing row
-/// exists and the owning shard answers a probe read (partition
-/// materialised). Fast path: row already present -> no probe, no wait.
+/// Wait (bounded) until this shard holds a routing row for `namespace`. Fast
+/// path: row already present -> no wait.
 ///
-/// Covers the post-`CreateTopic` convergence window where the metadata
-/// commit has returned to the client but the per-shard reconcilers have
-/// not yet seeded routing rows / materialised partitions.
+/// Covers the post-`CreateTopic` convergence window where the metadata commit
+/// has returned to the client but the per-shard reconcilers have not yet seeded
+/// routing rows. This is an admission courtesy, not a correctness gate: the row
+/// is a cache of the deterministic hash assignment and may exist before the
+/// owner has materialised anything, so its presence proves only where the
+/// partition belongs. What makes an early arrival safe is the owning shard
+/// itself - `park_if_unmaterialised` holds the frame until its partition lands,
+/// and `serves_committed_incarnation` refuses to serve a mismatched
+/// incarnation. Waiting here simply keeps the steady state off that park
+/// buffer, whose overflow is the one path that still sheds a request without
+/// replying (`frame_drops_total{variant=partition,reason=park_overflow}`).
+///
+/// Deliberately no owner-readiness probe. One used to run here, on the theory
+/// that the table could not be trusted; it could not close the window either,
+/// because the fast path above skipped it in exactly the case it was meant to
+/// cover - a row seeded from the hash by a shard that owns nothing. Readiness
+/// belongs to the owner, which is where it is now enforced.
 #[allow(clippy::future_not_send)]
 async fn wait_for_partition_routable<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
@@ -1910,9 +1924,6 @@ where
     // bus sleep advances virtual time, whereas `Instant::now` would not.
     const MAX_ATTEMPTS: u32 = 60;
 
-    if shard.shards_table().shard_for(namespace).is_some() {
-        return true;
-    }
     let mut attempts = 0u32;
     while shard.shards_table().shard_for(namespace).is_none() {
         if attempts >= MAX_ATTEMPTS {
@@ -1921,30 +1932,7 @@ where
         attempts += 1;
         shard.bus.sleep(ATTEMPT_DELAY).await;
     }
-    // The local row is seeded by THIS shard's reconciler; the owner
-    // materialises the partition on its own pass. Probe with a cheap read
-    // until the owner answers, so the write below normally clears the
-    // owner's "partition not initialized" guard. Not a hard guarantee: the
-    // partition can de-materialise between this probe and the dispatch, but
-    // the park/tombstone path re-checks and the client retries.
-    while attempts < MAX_ATTEMPTS {
-        match shard
-            .partition_read(
-                namespace,
-                PartitionRead::ConsumerOffset {
-                    consumer: PollingConsumer::Consumer(0, 0),
-                },
-            )
-            .await
-        {
-            Some(PartitionReadReply::NotFound) | None => {
-                attempts += 1;
-                shard.bus.sleep(ATTEMPT_DELAY).await;
-            }
-            Some(_) => return true,
-        }
-    }
-    false
+    true
 }
 
 /// The 16-byte `PolledMessages` body with zero messages

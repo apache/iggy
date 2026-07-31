@@ -17,13 +17,18 @@
 
 //! Per-shard frame-drop accounting.
 //!
-//! [`ShardMetrics`] holds `frame_drops_total{variant, reason}`,
-//! bumped whenever an inter-shard `try_send` is rejected (`Full` /
-//! `Disconnected`) or its target shard id is out of range
-//! (`Unroutable`):
+//! [`ShardMetrics`] holds `frame_drops_total{variant, reason}`, bumped wherever
+//! a frame is shed instead of delivered -- an inter-shard `try_send` rejected
+//! (`Full` / `Disconnected`), a target shard id out of range (`Unroutable`), or
+//! a buffer at capacity (`ParkOverflow`):
 //! - [`crate::coordinator::ShardZeroCoordinator`] - fd-transfer delegation.
 //! - the cross-shard forward closures built in [`crate::builder`].
-//! - `IggyShard::try_send_to_target` - consensus frames.
+//! - `IggyShard::try_send_to_target` - consensus and partition frames, labelled
+//!   by plane.
+//! - `IggyShard::park_if_unmaterialised` - partition frames shed because the
+//!   park buffer is at its frame or byte cap.
+//! - `IggyShard::apply_reconcile_ops` - parked frames whose re-dispatch onto
+//!   this shard's own inbox was refused.
 //!
 //! The counter uses atomic interior mutability, safe to bump from `!Send`
 //! compio reactor contexts. Each shard owns its own instance. It is not
@@ -44,8 +49,9 @@ use prometheus_client::metrics::family::Family;
 /// `variant` describes the dropped frame class; `reason` is `"full"` or
 /// `"disconnected"` per crossfire `TrySendError`, `"unroutable"` when the
 /// target shard id has no sender slot, `"delivery_failed"` when the
-/// receiver path could not place the frame, or `"misrouted"` when a frame
-/// reached a shard that does not own its namespace.
+/// receiver path could not place the frame, `"misrouted"` when a frame
+/// reached a shard that does not own its namespace, or `"park_overflow"` when
+/// an un-materialised namespace's park buffer was already at capacity.
 ///
 /// `shard_id` is intentionally NOT a label here: each shard owns its own
 /// `Family<FrameDropLabel, Counter>`, so the per-shard scope is implicit
@@ -69,9 +75,22 @@ pub struct FrameDropLabel {
 /// counter is not scrape-able yet, see the module doc) and size
 /// `inbox_capacity` for the worst-case cross-shard reply burst.
 /// `FORWARD_REPLICA_SEND` is the symmetric variant for replica forwards;
-/// VSR retransmit covers its loss so it stays informational. `PARTITION`
-/// ticks when a partition-targeted frame cannot be dispatched because the
-/// namespace is absent from the local `ShardsTable`.
+/// VSR retransmit covers its loss so it stays informational.
+///
+/// `PARTITION` covers the partition plane: a frame shed because the namespace
+/// had not materialised and its park buffer was at capacity
+/// (`reason=park_overflow`), a re-dispatch the shard's own inbox refused, or a
+/// routing send the target inbox refused. A shed client request is answered with
+/// a retriable status, so the client recovers -- but a shed *prepare* is not
+/// covered by retransmit once its op has reached quorum
+/// (`consensus::retransmit_targets` skips `ok_quorum_received`, and the
+/// partition plane creates a repair session only in `on_start_view`), so it
+/// leaves that backup behind until an unrelated view change.
+//
+// TODO(krishna): give the partition plane a normal-status repair driver so a
+// shed or refused prepare is repaired without waiting for a view change. Until
+// then `variant=partition` is the only signal that a backup may be stranded
+// behind `commit_max`.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -94,16 +113,20 @@ pub mod frame_drop_variant {
 /// is the receiver-side equivalent: the frame arrived at the owning shard
 /// but the local registry refused it. `MISROUTED` ticks when the pump
 /// receives a Consensus frame whose target shard is not `self.id`.
+/// `PARK_OVERFLOW` ticks when a partition frame arrives for a namespace this
+/// shard has not materialised and the per-namespace park buffer is already at
+/// its cap, so the frame is shed with no reply.
 pub mod frame_drop_reason {
     pub const FULL: &str = "full";
     pub const DISCONNECTED: &str = "disconnected";
     pub const UNROUTABLE: &str = "unroutable";
     pub const DELIVERY_FAILED: &str = "delivery_failed";
     pub const MISROUTED: &str = "misrouted";
+    pub const PARK_OVERFLOW: &str = "park_overflow";
 }
 
 const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 5;
+const REASON_COUNT: usize = 6;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -121,6 +144,7 @@ const REASONS: [&str; REASON_COUNT] = [
     frame_drop_reason::UNROUTABLE,
     frame_drop_reason::DELIVERY_FAILED,
     frame_drop_reason::MISROUTED,
+    frame_drop_reason::PARK_OVERFLOW,
 ];
 
 fn variant_index(s: &str) -> Option<usize> {
@@ -151,6 +175,8 @@ pub struct ShardMetrics {
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
+    partition_frames_rejected_stale_total: Counter,
+    partition_requests_denied_transient_total: Counter,
 }
 
 impl ShardMetrics {
@@ -180,6 +206,8 @@ impl ShardMetrics {
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
+            partition_frames_rejected_stale_total: Counter::default(),
+            partition_requests_denied_transient_total: Counter::default(),
         }
     }
 
@@ -222,6 +250,19 @@ impl ShardMetrics {
         self.partitions_reconcile_failures_total.inc();
     }
 
+    /// Bumped when a parked partition frame is answered instead of served
+    /// because it was addressed to an incarnation this shard no longer holds
+    /// (delete + recreate recycled the namespace's slab keys). Serving it would
+    /// have written a dead topic's op into the topic that replaced it, so a
+    /// non-zero value is a caught correctness anomaly, not routine churn.
+    ///
+    /// Like every counter in this module it is not scrape-able yet (see the
+    /// module-level `TODO(hubcio)`); the `warn!` at the reject site is what an
+    /// operator can actually alert on today.
+    pub fn record_partition_frame_rejected_stale(&self) {
+        self.partition_frames_rejected_stale_total.inc();
+    }
+
     /// Total frame drops across every `{variant, reason}` pair.
     ///
     /// Simulator assertion hook: a run without injected loss must keep
@@ -258,6 +299,51 @@ impl ShardMetrics {
     #[must_use]
     pub fn partitions_reconcile_failures_value(&self) -> u64 {
         self.partitions_reconcile_failures_total.get()
+    }
+
+    /// Bumped for every partition request answered with
+    /// `TransientNotAccepted` rather than served - a namespace mid-teardown, an
+    /// unverified incarnation, a shed park buffer, or a build this shard gave up
+    /// on. Counted only once the answer has been handed to a transport or the
+    /// pump, so it measures answers delivered rather than attempted. The client
+    /// re-issues, so this is retry pressure rather than error rate, and it is
+    /// what distinguishes "answered and retried" from the silent sheds it
+    /// replaced.
+    pub fn record_partition_request_denied_transient(&self) {
+        self.partition_requests_denied_transient_total.inc();
+    }
+
+    /// Snapshot of `partition_requests_denied_transient_total`. Test/simulator
+    /// accessor; production scrape goes through the prometheus registry.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_requests_denied_transient_value(&self) -> u64 {
+        self.partition_requests_denied_transient_total.get()
+    }
+
+    /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
+    /// accessor, readable from any crate under those cfgs so the crates that
+    /// drive the reconciler can assert a reject did not happen.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_frames_rejected_stale_value(&self) -> u64 {
+        self.partition_frames_rejected_stale_total.get()
+    }
+
+    /// Snapshot of one `frame_drops_total{variant, reason}` pair, or 0 when the
+    /// pair is not a known label combination.
+    ///
+    /// An unknown pair reports 0 rather than falling through to
+    /// `Family::get_or_create`, which would materialise a permanent zero-valued
+    /// series in the registry as a side effect of a read: a typo'd label in a
+    /// test or assertion would then leak a metric series into production scrapes.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn frame_drop_count(&self, variant: &'static str, reason: &'static str) -> u64 {
+        match (variant_index(variant), reason_index(reason)) {
+            (Some(v_idx), Some(r_idx)) => self.cached_counters[v_idx][r_idx].get(),
+            _ => 0,
+        }
     }
 }
 
