@@ -373,7 +373,7 @@ pub struct ClusterNodeConfig {
 /// the roster is the single source of ports: every enabled transport needs
 /// an explicit per-node port (validated at startup, no fallback to the
 /// transport's top-level `address` port). The roster entry's `ip` is the
-/// advertised address only: ws/quic/http bind the interface from their own
+/// advertised address only: tcp/ws/quic/http bind the interface from their own
 /// `address` config, and followers forward HTTP requests to the primary at
 /// `ip:http`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, ConfigEnv)]

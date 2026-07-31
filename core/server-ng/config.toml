@@ -724,10 +724,13 @@ ca_file = ""
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
 #
-# 'ip' is the node's roster address. Replica-to-replica traffic,
-# follower-to-primary HTTP forwarding, and the TCP listener use it. It is not
-# the bind interface for quic/http/websocket, which comes from each transport's
-# own 'address' setting above.
+# 'ip' is the node's roster address. Replica-to-replica traffic and
+# follower-to-primary HTTP forwarding use it. It is not the bind interface for
+# tcp/quic/http/websocket, which comes from each transport's own 'address'
+# setting above; the roster supplies those transports their port only. A
+# cluster spread across hosts therefore needs each transport's 'address' set to
+# '0.0.0.0' or the routable NIC; the defaults below listen on loopback only,
+# and a bind that cannot serve the advertised 'ip' is warned about at startup.
 #
 # Each node may also set 'advertised_address': the client-facing address
 # handed out in cluster metadata and leader redirects. Set it when 'ip' is
