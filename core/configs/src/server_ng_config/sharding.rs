@@ -54,6 +54,11 @@ pub const SHUTDOWN_DRAIN_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 /// at 5s so Ctrl-C latency stays bounded regardless of config.
 pub const SHUTDOWN_POLL_INTERVAL_MAX: Duration = Duration::from_secs(5);
 
+/// Hard upper bound on `shutdown_join_timeout`. Comfortably above the
+/// drain cap so a full drain always fits inside the join budget, while
+/// still guaranteeing process exit against a pathological config typo.
+pub const SHUTDOWN_JOIN_TIMEOUT_MAX: Duration = Duration::from_secs(900);
+
 /// Hard upper bound on `reconcile_periodic_interval`. A tick longer
 /// than ~30s makes post-failure recovery latency operator-visible; the
 /// cap reins in pathological typos without disturbing reasonable
@@ -117,6 +122,15 @@ pub struct ShardingConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub shutdown_poll_interval: IggyDuration,
+    /// Hard wall-clock deadline for joining shard threads at process
+    /// exit. A shard whose pump or listener wedges past this budget is
+    /// abandoned with an error log instead of blocking exit forever.
+    /// Must be at least `shutdown_drain_timeout` (abandoning a shard
+    /// mid-drain would interrupt its WAL fsync / replica drain) and at
+    /// most [`SHUTDOWN_JOIN_TIMEOUT_MAX`].
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub shutdown_join_timeout: IggyDuration,
     /// Safety-tick cadence for the partition reconciliation loop; the
     /// reconciler also wakes immediately on every
     /// `LifecycleFrame::MetadataCommitTick` from shard 0. This periodic
@@ -144,6 +158,12 @@ impl Default for ShardingConfig {
                 .system
                 .sharding
                 .shutdown_poll_interval
+                .parse()
+                .unwrap(),
+            shutdown_join_timeout: SERVER_NG_CONFIG
+                .system
+                .sharding
+                .shutdown_join_timeout
                 .parse()
                 .unwrap(),
             reconcile_periodic_interval: SERVER_NG_CONFIG
@@ -214,6 +234,25 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  shutdown_drain_timeout {:?} (a poll cadence coarser than the drain budget makes \
                  the shutdown flag effectively unobservable)",
                 poll, drain
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let join = self.shutdown_join_timeout.get_duration();
+        if join < drain {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_join_timeout {:?} must be >= \
+                 shutdown_drain_timeout {:?} (a join budget shorter than the drain abandons \
+                 shards mid-drain, interrupting the WAL fsync / replica drain)",
+                join, drain
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if join > SHUTDOWN_JOIN_TIMEOUT_MAX {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_join_timeout {:?} exceeds the {:?} \
+                 cap (an unbounded join budget wedges process exit on a stuck shard)",
+                join, SHUTDOWN_JOIN_TIMEOUT_MAX
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -303,6 +342,38 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    #[test]
+    fn join_shorter_than_drain_is_rejected() {
+        // A join budget under the drain would abandon shards mid-drain.
+        let cfg = ShardingConfig {
+            shutdown_drain_timeout: IggyDuration::new(Duration::from_secs(10)),
+            shutdown_join_timeout: IggyDuration::new(Duration::from_secs(5)),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_cap_join_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_join_timeout: IggyDuration::new(
+                SHUTDOWN_JOIN_TIMEOUT_MAX + Duration::from_secs(1),
+            ),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn join_equal_to_drain_is_accepted() {
+        let cfg = ShardingConfig {
+            shutdown_drain_timeout: IggyDuration::new(Duration::from_secs(10)),
+            shutdown_join_timeout: IggyDuration::new(Duration::from_secs(10)),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
     // Guards the single source of truth: the server-ng sharding defaults
     // resolve from the embedded server-ng TOML, not hard-coded Rust values.
     #[test]
@@ -321,6 +392,7 @@ mod tests {
         assert_eq!(sharding.inbox_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
 
@@ -338,6 +410,7 @@ mod tests {
         assert_eq!(sharding.inbox_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
 
@@ -352,6 +425,7 @@ mod tests {
         assert_eq!(sharding.inbox_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
 }

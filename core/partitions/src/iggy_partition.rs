@@ -22,8 +22,8 @@ use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{delete_persisted_offset, persist_offset, persist_offset_max};
 use crate::poll_plan::{
-    AutoCommitCtx, AutoCommitTarget, DiskReadPlan, DiskSegment, LastPolledCtx, PollPlan, PollTier,
-    ResidentTailSnapshot,
+    AutoCommitCtx, AutoCommitTarget, DiskReadPlan, DiskSegment, LastPolledCtx,
+    PartitionDirResolution, PollPlan, PollTier, ResidentTailSnapshot,
 };
 use crate::segment::Segment;
 use crate::types::RepairSession;
@@ -825,7 +825,7 @@ where
             })
             .collect();
         let disk = DiskReadPlan {
-            partition_dir: self.partition_dir(),
+            partition_dir: self.partition_dir_resolution(),
             segments,
             start_position,
             namespace_raw: self.namespace().inner(),
@@ -1039,6 +1039,26 @@ where
                     .parent()
                     .map(|dir| dir.to_string_lossy().into_owned())
             })
+    }
+
+    /// [`Self::partition_dir`] upgraded with the reason a dir is absent, so a
+    /// disk poll can tell file-less (simulated) storage from a live partition
+    /// whose dir is transiently unresolvable mid-rotation. Storage readers,
+    /// unlike writers, survive segment sealing, so any present reader or
+    /// writer proves file-backed data exists behind the missing dir.
+    fn partition_dir_resolution(&self) -> PartitionDirResolution {
+        if let Some(dir) = self.partition_dir() {
+            return PartitionDirResolution::Resolved(dir);
+        }
+        let file_backed =
+            self.log.storages().iter().any(|storage| {
+                storage.messages_reader.is_some() || storage.messages_writer.is_some()
+            });
+        if file_backed {
+            PartitionDirResolution::Unresolvable
+        } else {
+            PartitionDirResolution::NoFiles
+        }
     }
 
     fn has_persisted_segment_bytes(&self) -> bool {
@@ -3884,7 +3904,7 @@ mod tests {
         // First segment claims persisted bytes but its file is absent, so the
         // open exhausts retries -> the walk must fault-close before segment two.
         let plan = DiskReadPlan {
-            partition_dir: Some(partition_dir),
+            partition_dir: PartitionDirResolution::Resolved(partition_dir),
             segments: vec![
                 DiskSegment {
                     start_offset: 0,
@@ -3967,7 +3987,7 @@ mod tests {
         }
 
         let plan = DiskReadPlan {
-            partition_dir: Some(partition_dir),
+            partition_dir: PartitionDirResolution::Resolved(partition_dir),
             segments: vec![
                 DiskSegment {
                     start_offset: 0,
@@ -3996,6 +4016,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A simulated (file-less) partition has no segment files by design, so a
+    /// disk poll with no dir must stay `Empty`: the caller then serves the
+    /// resident journal tier, the sim's only tier.
+    #[compio::test]
+    async fn read_disk_serves_journal_when_partition_has_no_files() {
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::NoFiles,
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: 512,
+            }],
+            start_position: 0,
+            namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
+        };
+
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 10,
+                ceiling: u64::MAX,
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, DiskReadOutcome::Empty),
+            "file-less (simulated) storage must serve the journal tier, not fault",
+        );
+    }
+
+    /// A live partition whose dir is transiently unresolvable (mid-rotation)
+    /// may hold disk-resident data the walk cannot reach; the poll must
+    /// fault-close instead of letting the journal-forward skip those offsets.
+    #[compio::test]
+    async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Unresolvable,
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: 512,
+            }],
+            start_position: 0,
+            namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
+        };
+
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 10,
+                ceiling: u64::MAX,
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, DiskReadOutcome::Faulted),
+            "unresolvable dir over file-backed data must fault-close, not serve the journal",
+        );
     }
 
     fn repair_config() -> PartitionsConfig {

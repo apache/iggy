@@ -97,6 +97,7 @@ use shard::{
 };
 use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -104,7 +105,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
@@ -217,10 +218,12 @@ pub type ServerNgShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnap
 ///
 /// Carries the cross-thread shutdown flag and one OS-thread `JoinHandle`
 /// per shard. The caller flips the flag via [`Self::install_ctrlc_handler`]
-/// and then drains every shard via [`Self::join_all`].
+/// and then drains every shard via [`Self::join_all`], bounded by
+/// `join_timeout` (`system.sharding.shutdown_join_timeout`).
 pub struct ShardHandles {
     shutdown_flag: Arc<AtomicBool>,
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)>,
+    join_timeout: Duration,
 }
 
 impl ShardHandles {
@@ -248,27 +251,60 @@ impl ShardHandles {
         })
     }
 
-    /// Drain every shard thread. Each shard's outcome is logged
-    /// (`info` on clean exit, `error` on Err or panic). If any shard
-    /// failed, returns every failure together as
+    /// Drain every shard thread. This is the main thread's park for the
+    /// server's whole lifetime, so shards are awaited WITHOUT any time
+    /// bound while the server runs; the `shutdown_join_timeout` clock
+    /// only starts once the cross-thread shutdown flag flips (Ctrl-C or
+    /// a shard failure). Each shard's outcome is logged (`info` on clean
+    /// exit, `error` on Err, panic, or wedge). If any shard failed,
+    /// returns every failure together as
     /// [`ServerNgError::ShardJoinFailures`] so the operator sees the
     /// full set rather than just the first.
+    ///
+    /// A shard whose thread is still running when the post-shutdown
+    /// deadline passes is abandoned (its `JoinHandle` dropped, the OS
+    /// thread left to die with the process) and reported as
+    /// [`ShardJoinFailureKind::Wedged`]: a wedged pump or listener must
+    /// not block process exit forever.
     ///
     /// # Errors
     ///
     /// Returns [`ServerNgError::ShardJoinFailures`] if any shard
-    /// returned a `Result::Err` or panicked. The variant carries every
-    /// per-shard failure (`ShardJoinFailureKind::Error` or
-    /// `ShardJoinFailureKind::Panic`) in shard-id order so the caller
-    /// does not need to read the trace log to discover late-failing shards.
+    /// returned a `Result::Err`, panicked, or wedged past the deadline.
+    /// The variant carries every per-shard failure in shard-id order so
+    /// the caller does not need to read the trace log to discover
+    /// late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
+        // Armed on the first poll that observes the shutdown flag, shared
+        // across all shards: one budget covers the whole drain, not one
+        // budget per shard.
+        let mut deadline: Option<Instant> = None;
         // Shards run thread-per-core with compio's blocking fallback pool
         // disabled, so an io_uring opcode the kernel lacks aborts every shard
         // with the same panic. Surface the actionable diagnostic once.
         let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
-            match handle.join() {
+            let Some(joined) = join_until_shutdown_deadline(
+                handle,
+                &self.shutdown_flag,
+                self.join_timeout,
+                &mut deadline,
+            ) else {
+                error!(
+                    shard_id,
+                    waited = ?self.join_timeout,
+                    "shard thread still running at the shutdown join deadline; abandoning it"
+                );
+                failures.push(ShardJoinFailure {
+                    shard_id,
+                    kind: ShardJoinFailureKind::Wedged {
+                        waited: self.join_timeout,
+                    },
+                });
+                continue;
+            };
+            match joined {
                 Ok(Ok(())) => {
                     info!(shard_id, "shard thread exited cleanly");
                 }
@@ -304,6 +340,41 @@ impl ShardHandles {
     }
 }
 
+/// Poll cadence for the bounded shard joins. Coarse enough to cost
+/// nothing during a normal drain, fine enough that exit latency past
+/// the last shard's return stays imperceptible.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Join `handle`, waiting indefinitely while the server runs. The
+/// `join_timeout` clock starts only when `shutdown_flag` is observed set
+/// (arming the caller-shared `deadline` once, so all shards drain under
+/// ONE budget); a running server parked here for hours must never be
+/// mistaken for a wedged shard. `None` means the thread was still
+/// running at the post-shutdown deadline and the handle was dropped
+/// (the OS thread keeps running detached; process exit reaps it).
+/// `JoinHandle` has no timed join, so this polls `is_finished` at
+/// [`JOIN_POLL_INTERVAL`]; the closing `join()` on a finished thread
+/// returns immediately.
+fn join_until_shutdown_deadline(
+    handle: thread::JoinHandle<Result<(), ServerNgError>>,
+    shutdown_flag: &AtomicBool,
+    join_timeout: Duration,
+    deadline: &mut Option<Instant>,
+) -> Option<thread::Result<Result<(), ServerNgError>>> {
+    while !handle.is_finished() {
+        if deadline.is_none() && shutdown_flag.load(Ordering::Relaxed) {
+            *deadline = Some(Instant::now() + join_timeout);
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= *deadline
+        {
+            return None;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL);
+    }
+    Some(handle.join())
+}
+
 /// Best-effort extraction of the panic message from a
 /// `Box<dyn Any + Send>` returned by `JoinHandle::join`. Tries the two
 /// payload shapes the standard library guarantees (`&'static str` and
@@ -319,73 +390,44 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     "<panic payload not String/&str>".to_string()
 }
 
-/// Joins survivor shard threads after a partial-spawn failure without
-/// panicking the bootstrap thread on `pthread_create` EAGAIN.
+/// Joins survivor shard threads after a partial-spawn failure, bounded
+/// by the same `shutdown_join_timeout` budget as the normal exit path.
 ///
-/// Bare `thread::spawn` panics on EAGAIN, which is the most likely OS
-/// state on this path since the parent `Builder::spawn` already failed
-/// for the same reason. A panic would unwind `bootstrap()` while
-/// survivor shard threads keep driving their compio runtimes and
-/// `io_uring` rings, orphaning them across process exit.
-///
-/// Uses `thread::Builder::spawn` and hands each survivor over via a
-/// one-shot `sync_channel(1)` so an `Err` drops the rx (not the
-/// survivor `JoinHandle`), letting us fall back to a sequential
-/// `survivor.join()` instead. Once one cleanup spawn fails, treats the
-/// OS as exhausted and routes every remaining survivor straight to the
-/// sequential pool to avoid re-trying spawn.
-///
-/// This routine bounds CPU/IO via the survivor's own
-/// `shutdown_drain_timeout` (driven by each shard's watchdog after
-/// `shutdown_flag` is set by the caller), not via a wall-clock
-/// deadline here. If a survivor's `shard_main` blocks past the drain
-/// window without observing the flag, this join hangs - that scenario
-/// is the same surface as the deferred watchdog-detach gap and is not
-/// addressed by this helper.
-///
-/// TODO(hubcio): no hard time limit on shard shutdown here. If a
-/// survivor's `shard_main` never returns, `survivor.join()` blocks
-/// forever.
+/// Polls every survivor's `is_finished` in one loop instead of spawning
+/// per-survivor joiner threads: the likely OS state on this path is
+/// `pthread_create` EAGAIN (the parent spawn just failed with it), so
+/// nothing here may create threads, and polling drains all survivors in
+/// parallel anyway. A survivor still running at the deadline is
+/// abandoned with an error log so the failed bootstrap can surface its
+/// spawn error instead of hanging on a wedged shard.
 fn join_partial_shard_survivors(
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)>,
+    join_timeout: Duration,
 ) {
-    let mut joiners = Vec::with_capacity(shard_threads.len());
-    let mut sequential_join: Vec<thread::JoinHandle<Result<(), ServerNgError>>> = Vec::new();
-    let mut spawn_exhausted = false;
-    for (sid, survivor) in shard_threads {
-        if spawn_exhausted {
-            sequential_join.push(survivor);
-            continue;
-        }
-        let (handover_tx, handover_rx) =
-            std::sync::mpsc::sync_channel::<thread::JoinHandle<Result<(), ServerNgError>>>(1);
-        match thread::Builder::new()
-            .name(format!("shard-{sid}-cleanup"))
-            .spawn(move || {
-                if let Ok(survivor) = handover_rx.recv() {
-                    let _ = survivor.join();
-                }
-            }) {
-            Ok(joiner) => {
-                let _ = handover_tx.send(survivor);
-                joiners.push(joiner);
-            }
-            Err(spawn_err) => {
-                warn!(
-                    error = %spawn_err,
-                    shard_id = sid,
-                    "cleanup helper thread spawn failed; falling back to sequential survivor join"
-                );
-                spawn_exhausted = true;
-                sequential_join.push(survivor);
+    let deadline = Instant::now() + join_timeout;
+    let mut remaining = shard_threads;
+    loop {
+        let mut still_running = Vec::with_capacity(remaining.len());
+        for (shard_id, survivor) in remaining {
+            if survivor.is_finished() {
+                let _ = survivor.join();
+                info!(shard_id, "survivor shard thread drained");
+            } else {
+                still_running.push((shard_id, survivor));
             }
         }
+        remaining = still_running;
+        if remaining.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL);
     }
-    for joiner in joiners {
-        let _ = joiner.join();
-    }
-    for survivor in sequential_join {
-        let _ = survivor.join();
+    for (shard_id, _survivor) in remaining {
+        error!(
+            shard_id,
+            waited = ?join_timeout,
+            "survivor shard thread still running at the shutdown join deadline; abandoning it"
+        );
     }
 }
 
@@ -744,7 +786,10 @@ pub fn bootstrap(
                 drop(metadata_bundle_rx);
                 drop(ready_tx);
                 drop(ready_rx);
-                join_partial_shard_survivors(shard_threads);
+                join_partial_shard_survivors(
+                    shard_threads,
+                    config.system.sharding.shutdown_join_timeout.get_duration(),
+                );
                 return Err(ServerNgError::ShardSpawnFailed { shard_id, source });
             }
         };
@@ -768,6 +813,7 @@ pub fn bootstrap(
     Ok(ShardHandles {
         shutdown_flag,
         shard_threads,
+        join_timeout: config.system.sharding.shutdown_join_timeout.get_duration(),
     })
 }
 
@@ -2327,6 +2373,7 @@ fn resolve_tcp_topology(
         http: http_listen_addr,
     } = resolve_cluster_client_addrs(
         self_node,
+        default_client_addr,
         default_ws_addr,
         default_quic_addr,
         default_http_addr,
@@ -2373,8 +2420,8 @@ fn resolve_optional_listener_addr(
 /// Client-facing listener addresses resolved for this cluster node. Each port
 /// comes from the node's roster entry; there is no fallback to the top-level
 /// listener port, an enabled transport without a roster port refuses to boot.
-/// ws/quic/http keep the bind interface from their own `address` config (the
-/// roster ip is advertised, not bound); tcp binds the roster ip directly.
+/// Every transport keeps the bind interface from its own `address` config: the
+/// roster ip is advertised, not bound.
 struct ClusterClientAddrs {
     client: SocketAddr,
     ws: Option<SocketAddr>,
@@ -2384,6 +2431,7 @@ struct ClusterClientAddrs {
 
 fn resolve_cluster_client_addrs(
     self_node: &configs::ng_cluster::ClusterNodeConfig,
+    default_tcp_addr: SocketAddr,
     default_ws_addr: Option<SocketAddr>,
     default_quic_addr: Option<SocketAddr>,
     default_http_addr: Option<SocketAddr>,
@@ -2395,7 +2443,8 @@ fn resolve_cluster_client_addrs(
             transport: "tcp",
             replica_id: self_node.replica_id,
         })?;
-    let client = socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
+    let client =
+        merge_roster_port_with_bind_ip("tcp", &self_node.ip, default_tcp_addr, client_port);
     let ws = resolve_cluster_optional_addr(self_node, "websocket", default_ws_addr, |ports| {
         ports.websocket
     })?;
@@ -2427,25 +2476,48 @@ fn resolve_cluster_optional_addr(
         transport,
         replica_id: self_node.replica_id,
     })?;
-    // The roster ip is what the cluster advertises (metadata, follower-to-
-    // primary HTTP forwarding targets); the transport's own `address` decides
-    // the bind interface. Merging keeps a loopback-only `127.0.0.1` private
-    // and a `0.0.0.0` wide in cluster mode instead of silently rebinding to
-    // the roster interface.
-    let listen_addr = SocketAddr::new(default_addr.ip(), port);
-    if !listen_addr.ip().is_unspecified()
-        && self_node
-            .ip
-            .parse::<IpAddr>()
-            .is_ok_and(|roster_ip| roster_ip != listen_addr.ip())
-    {
+    Ok(Some(merge_roster_port_with_bind_ip(
+        transport,
+        &self_node.ip,
+        default_addr,
+        port,
+    )))
+}
+
+/// Combine the roster-supplied `port` with the bind interface the transport's
+/// own `address` config asked for.
+///
+/// The roster ip is what the cluster advertises (metadata, follower-to-primary
+/// HTTP forwarding targets); the transport's own `address` decides the bind
+/// interface. Merging keeps a loopback-only `127.0.0.1` private and a
+/// `0.0.0.0` wide in cluster mode instead of silently rebinding to the roster
+/// interface, which would strand every co-located dialer (sidecars, health
+/// probes, on-host consumers) on `ECONNREFUSED`.
+fn merge_roster_port_with_bind_ip(
+    transport: &'static str,
+    roster_ip: &str,
+    bind_addr: SocketAddr,
+    port: u16,
+) -> SocketAddr {
+    let listen_addr = SocketAddr::new(bind_addr.ip(), port);
+    if roster_ip_unreachable_from_bind_addr(roster_ip, listen_addr) {
         warn!(
-            "{transport} listener binds {listen_addr} but the roster advertises {}:{port}; \
-             peers and clients dialing the advertised endpoint will not reach this node",
-            self_node.ip
+            "{transport} listener binds {listen_addr} but the roster advertises {roster_ip}:{port}; \
+             peers and clients dialing the advertised endpoint may not reach this node"
         );
     }
-    Ok(Some(listen_addr))
+    listen_addr
+}
+
+/// Whether a dialer aiming at the advertised roster ip misses `listen_addr`. An
+/// unspecified bind covers every interface, and a roster ip that parses as
+/// neither IPv4 nor IPv6 (a DNS name, say) can resolve to the bound interface,
+/// so both cases stay quiet.
+fn roster_ip_unreachable_from_bind_addr(roster_ip: &str, listen_addr: SocketAddr) -> bool {
+    !listen_addr.ip().is_unspecified()
+        && roster_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|parsed| parsed != listen_addr.ip())
 }
 
 fn resolve_cluster_replica_peers(
@@ -3053,18 +3125,23 @@ async fn start_client_listeners(
 
 /// Build the replica auth context from cluster config. Returns `None` when the
 /// cluster or replica auth is disabled, keeping the handshake in legacy mode.
-/// Only the derived MAC key is carried onward in [`ReplicaAuth`]; the raw secret
-/// (masked in config logs via `config_env(secret)`) is read here only to derive
-/// that key. `ClusterConfig::validate` guarantees a non-empty secret whenever
-/// both `cluster.enabled` and `cluster.auth.enabled` are set (validate
-/// early-returns `Ok` while `cluster.enabled` is false).
+/// Only the derived MAC keys are carried onward in [`ReplicaAuth`]; the raw
+/// secrets (masked in config logs via `config_env(secret)`) are read here only
+/// to derive them. A non-empty `previous_shared_secret` opens the verify-only
+/// rotation acceptance window (see the [`ReplicaAuth`] rustdoc for the rolling
+/// rotation procedure). `ClusterConfig::validate` guarantees a non-empty
+/// secret whenever both `cluster.enabled` and `cluster.auth.enabled` are set
+/// (validate early-returns `Ok` while `cluster.enabled` is false).
 fn load_replica_auth(config: &ServerNgConfig) -> Option<ReplicaAuth> {
     if !config.cluster.enabled || !config.cluster.auth.enabled {
         return None;
     }
-    Some(ReplicaAuth::new(
-        config.cluster.auth.shared_secret.as_bytes(),
-    ))
+    let auth = ReplicaAuth::new(config.cluster.auth.shared_secret.as_bytes());
+    let previous_shared_secret = &config.cluster.auth.previous_shared_secret;
+    if previous_shared_secret.is_empty() {
+        return Some(auth);
+    }
+    Some(auth.with_previous_secret(previous_shared_secret.as_bytes()))
 }
 
 /// Build the replica TLS context from cluster config. Returns `None` when
@@ -3142,17 +3219,15 @@ fn load_replica_tls_ctx(
     };
     client.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
 
-    // Replica ids form a bijection onto 0..nodes.len() (validated at
-    // boot), so sorting by id yields a Vec indexable by replica id.
-    // TODO(hubcio): dynamic replica join will break this positional
-    // indexing (sparse ids silently map to the wrong SNI/verify name);
-    // key peer names by replica id explicitly before supporting it.
-    let mut roster: Vec<_> = config.cluster.nodes.iter().collect();
-    roster.sort_unstable_by_key(|node| node.replica_id);
-    let peer_names = roster
+    // Keyed by replica id, never by roster position: sparse ids (dynamic
+    // replica join) would make a positional lookup verify against another
+    // peer's SNI name.
+    let peer_names = config
+        .cluster
+        .nodes
         .iter()
         .map(|node| {
-            ServerName::try_from(node.ip.clone()).map_err(|error| {
+            let name = ServerName::try_from(node.ip.clone()).map_err(|error| {
                 credential_error(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -3160,9 +3235,10 @@ fn load_replica_tls_ctx(
                         node.name, node.ip
                     ),
                 ))
-            })
+            })?;
+            Ok((node.replica_id, name))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<HashMap<_, _>, ServerNgError>>()?;
 
     Ok(Some(ReplicaTlsCtx {
         server: Arc::new(server),
@@ -3860,13 +3936,21 @@ mod tests {
     }
 
     fn cluster_node(ip: &str, http: Option<u16>) -> configs::ng_cluster::ClusterNodeConfig {
+        cluster_node_with_ports(ip, Some(18070), http)
+    }
+
+    fn cluster_node_with_ports(
+        ip: &str,
+        tcp: Option<u16>,
+        http: Option<u16>,
+    ) -> configs::ng_cluster::ClusterNodeConfig {
         configs::ng_cluster::ClusterNodeConfig {
             name: "node".to_owned(),
             ip: ip.to_owned(),
             advertised_address: None,
             replica_id: 0,
             ports: configs::ng_cluster::TransportPorts {
-                tcp: Some(18070),
+                tcp,
                 http,
                 ..Default::default()
             },
@@ -3883,8 +3967,14 @@ mod tests {
         // one host; the per-node roster port is the only port source so each
         // node binds a distinct HTTP socket.
         let node = cluster_node("127.0.0.1", Some(18090));
-        let addrs = resolve_cluster_client_addrs(&node, None, None, Some(addr("127.0.0.1:3000")))
-            .expect("cluster address resolution must succeed");
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:8090"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        )
+        .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, Some(addr("127.0.0.1:18090")));
     }
 
@@ -3894,8 +3984,14 @@ mod tests {
         // only the advertised address. Cluster mode must keep the configured
         // interface and take just the port from the roster.
         let node = cluster_node("10.0.0.5", Some(18090));
-        let addrs = resolve_cluster_client_addrs(&node, None, None, Some(addr("0.0.0.0:3000")))
-            .expect("cluster address resolution must succeed");
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("0.0.0.0:8090"),
+            None,
+            None,
+            Some(addr("0.0.0.0:3000")),
+        )
+        .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, Some(addr("0.0.0.0:18090")));
     }
 
@@ -3905,7 +4001,13 @@ mod tests {
         // with another same-host node, so a missing roster port for an
         // enabled transport must refuse to boot.
         let node = cluster_node("10.0.0.5", None);
-        let result = resolve_cluster_client_addrs(&node, None, None, Some(addr("127.0.0.1:3000")));
+        let result = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:8090"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        );
         assert!(matches!(
             result,
             Err(ServerNgError::ClusterPortMissing {
@@ -3920,8 +4022,130 @@ mod tests {
         // http.enabled = false collapses default_http_addr to None; no roster
         // port can revive a listener the operator turned off.
         let node = cluster_node("127.0.0.1", Some(18090));
-        let addrs = resolve_cluster_client_addrs(&node, None, None, None)
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
             .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, None);
+    }
+
+    /// Regression: the shutdown-join deadline must arm at SHUTDOWN, not
+    /// at boot. The original bound measured from `join_all` entry, so any
+    /// healthy server outliving `shutdown_join_timeout` (30s default) was
+    /// abandoned as "wedged" and the process exited - every BDD run died
+    /// at t+30s while the test container was still compiling.
+    #[test]
+    fn join_waits_unbounded_while_the_server_runs() {
+        let shutdown_flag = AtomicBool::new(false);
+        // Thread outlives a deliberately tiny join budget; with the flag
+        // clear the budget must never even arm.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(20),
+            &mut deadline,
+        );
+        assert!(
+            matches!(joined, Some(Ok(Ok(())))),
+            "a running server must be awaited indefinitely, not abandoned as wedged"
+        );
+        assert!(
+            deadline.is_none(),
+            "the join deadline must not arm before the shutdown flag flips"
+        );
+    }
+
+    #[test]
+    fn join_abandons_a_wedged_shard_after_the_shutdown_deadline() {
+        let shutdown_flag = AtomicBool::new(true);
+        // Never finishes: stands in for a wedged pump. The thread leaks
+        // into the test process, which exits right after.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(100),
+            &mut deadline,
+        );
+        assert!(
+            joined.is_none(),
+            "a shard still running past the post-shutdown budget must be abandoned"
+        );
+        assert!(deadline.is_some(), "the deadline arms once the flag is set");
+    }
+
+    #[test]
+    fn cluster_tcp_addr_takes_port_from_roster() {
+        // Same rule as the other transports: the roster owns the port so
+        // same-host nodes sharing one [tcp].address still bind distinct
+        // sockets.
+        let node = cluster_node("127.0.0.1", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("127.0.0.1:18070"));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_merges_config_ip_with_roster_port() {
+        // The roster ip is advertised, not bound. Binding it directly would
+        // strand every co-located dialer (sidecars, health probes, on-host
+        // consumers) that reaches this node over loopback.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("0.0.0.0:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("0.0.0.0:18070"));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_requires_roster_port() {
+        // tcp is always enabled in cluster mode, so a roster entry without a
+        // tcp port refuses to boot rather than falling back to [tcp].address.
+        let node = cluster_node_with_ports("10.0.0.5", None, None);
+        let result = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None);
+        assert!(matches!(
+            result,
+            Err(ServerNgError::ClusterPortMissing {
+                transport: "tcp",
+                replica_id: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_keeps_loopback_bind_and_warns_on_roster_mismatch() {
+        // A loopback [tcp].address under a routable roster ip is honoured
+        // as configured; remote peers cannot reach it, so the mismatch is
+        // warned about instead of silently rebinding.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("127.0.0.1:18070"));
+        assert!(roster_ip_unreachable_from_bind_addr(&node.ip, addrs.client));
+    }
+
+    #[test]
+    fn roster_mismatch_warning_is_silent_for_wildcard_and_hostname_rosters() {
+        // A wildcard bind covers the roster interface, and a DNS roster entry
+        // can resolve to the bound one; neither is a misconfiguration.
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("0.0.0.0:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "node-1.example.com",
+            addr("127.0.0.1:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("10.0.0.5:18070")
+        ));
     }
 }
