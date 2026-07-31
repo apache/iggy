@@ -248,15 +248,19 @@ impl ShardHandles {
         })
     }
 
-    /// Drain every shard thread under one shared `shutdown_join_timeout`
-    /// deadline. Each shard's outcome is logged (`info` on clean exit,
-    /// `error` on Err, panic, or wedge). If any shard failed, returns
-    /// every failure together as [`ServerNgError::ShardJoinFailures`] so
-    /// the operator sees the full set rather than just the first.
+    /// Drain every shard thread. This is the main thread's park for the
+    /// server's whole lifetime, so shards are awaited WITHOUT any time
+    /// bound while the server runs; the `shutdown_join_timeout` clock
+    /// only starts once the cross-thread shutdown flag flips (Ctrl-C or
+    /// a shard failure). Each shard's outcome is logged (`info` on clean
+    /// exit, `error` on Err, panic, or wedge). If any shard failed,
+    /// returns every failure together as
+    /// [`ServerNgError::ShardJoinFailures`] so the operator sees the
+    /// full set rather than just the first.
     ///
-    /// A shard whose thread is still running at the deadline is
-    /// abandoned (its `JoinHandle` dropped, the OS thread left to die
-    /// with the process) and reported as
+    /// A shard whose thread is still running when the post-shutdown
+    /// deadline passes is abandoned (its `JoinHandle` dropped, the OS
+    /// thread left to die with the process) and reported as
     /// [`ShardJoinFailureKind::Wedged`]: a wedged pump or listener must
     /// not block process exit forever.
     ///
@@ -269,13 +273,21 @@ impl ShardHandles {
     /// late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
-        let deadline = Instant::now() + self.join_timeout;
+        // Armed on the first poll that observes the shutdown flag, shared
+        // across all shards: one budget covers the whole drain, not one
+        // budget per shard.
+        let mut deadline: Option<Instant> = None;
         // Shards run thread-per-core with compio's blocking fallback pool
         // disabled, so an io_uring opcode the kernel lacks aborts every shard
         // with the same panic. Surface the actionable diagnostic once.
         let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
-            let Some(joined) = join_with_deadline(handle, deadline) else {
+            let Some(joined) = join_until_shutdown_deadline(
+                handle,
+                &self.shutdown_flag,
+                self.join_timeout,
+                &mut deadline,
+            ) else {
                 error!(
                     shard_id,
                     waited = ?self.join_timeout,
@@ -330,18 +342,29 @@ impl ShardHandles {
 /// the last shard's return stays imperceptible.
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Join `handle` unless `deadline` passes first. `None` means the
-/// thread was still running at the deadline and the handle was dropped
+/// Join `handle`, waiting indefinitely while the server runs. The
+/// `join_timeout` clock starts only when `shutdown_flag` is observed set
+/// (arming the caller-shared `deadline` once, so all shards drain under
+/// ONE budget); a running server parked here for hours must never be
+/// mistaken for a wedged shard. `None` means the thread was still
+/// running at the post-shutdown deadline and the handle was dropped
 /// (the OS thread keeps running detached; process exit reaps it).
 /// `JoinHandle` has no timed join, so this polls `is_finished` at
 /// [`JOIN_POLL_INTERVAL`]; the closing `join()` on a finished thread
 /// returns immediately.
-fn join_with_deadline(
+fn join_until_shutdown_deadline(
     handle: thread::JoinHandle<Result<(), ServerNgError>>,
-    deadline: Instant,
+    shutdown_flag: &AtomicBool,
+    join_timeout: Duration,
+    deadline: &mut Option<Instant>,
 ) -> Option<thread::Result<Result<(), ServerNgError>>> {
     while !handle.is_finished() {
-        if Instant::now() >= deadline {
+        if deadline.is_none() && shutdown_flag.load(Ordering::Relaxed) {
+            *deadline = Some(Instant::now() + join_timeout);
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= *deadline
+        {
             return None;
         }
         thread::sleep(JOIN_POLL_INTERVAL);
@@ -3894,5 +3917,60 @@ mod tests {
         let addrs = resolve_cluster_client_addrs(&node, None, None, None)
             .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, None);
+    }
+
+    /// Regression: the shutdown-join deadline must arm at SHUTDOWN, not
+    /// at boot. The original bound measured from `join_all` entry, so any
+    /// healthy server outliving `shutdown_join_timeout` (30s default) was
+    /// abandoned as "wedged" and the process exited - every BDD run died
+    /// at t+30s while the test container was still compiling.
+    #[test]
+    fn join_waits_unbounded_while_the_server_runs() {
+        let shutdown_flag = AtomicBool::new(false);
+        // Thread outlives a deliberately tiny join budget; with the flag
+        // clear the budget must never even arm.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(20),
+            &mut deadline,
+        );
+        assert!(
+            matches!(joined, Some(Ok(Ok(())))),
+            "a running server must be awaited indefinitely, not abandoned as wedged"
+        );
+        assert!(
+            deadline.is_none(),
+            "the join deadline must not arm before the shutdown flag flips"
+        );
+    }
+
+    #[test]
+    fn join_abandons_a_wedged_shard_after_the_shutdown_deadline() {
+        let shutdown_flag = AtomicBool::new(true);
+        // Never finishes: stands in for a wedged pump. The thread leaks
+        // into the test process, which exits right after.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(100),
+            &mut deadline,
+        );
+        assert!(
+            joined.is_none(),
+            "a shard still running past the post-shutdown budget must be abandoned"
+        );
+        assert!(deadline.is_some(), "the deadline arms once the flag is set");
     }
 }
