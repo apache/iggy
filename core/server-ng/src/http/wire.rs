@@ -105,6 +105,7 @@ pub(in crate::http) fn poll_wire_request(
         },
         count: query.count,
         auto_commit: query.auto_commit,
+        wait_timeout_us: 0,
     })
 }
 

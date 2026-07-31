@@ -42,7 +42,9 @@ pub trait MessageClient {
     ) -> Result<PolledMessages, IggyError>;
 
     /// Polls messages and waits up to the timeout when no messages are immediately available.
-    /// A zero timeout preserves immediate polling behavior.
+    /// A zero timeout preserves immediate polling behavior. Non-zero timeouts require transport support.
+    /// When auto commit is enabled, the offset can be committed before the response is delivered.
+    /// Implementors should override at least one polling method with a real implementation.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages_with_timeout(
         &self,

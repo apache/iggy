@@ -183,6 +183,7 @@ impl IggyShardBuilder {
             poll_waiters: self
                 .poll_waiters
                 .unwrap_or_else(|| Arc::new(Mutex::new(PollWaiterRegistry::default()))),
+            poll_waiters_live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             encryptor,
             config,
             _version: version,

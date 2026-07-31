@@ -81,6 +81,7 @@ pub struct IggyShard {
     pub(crate) local_partitions: RefCell<LocalPartitions>,
     pub(crate) pending_partition_inits: RefCell<AHashSet<IggyNamespace>>,
     pub(crate) poll_waiters: Arc<Mutex<PollWaiterRegistry>>,
+    pub(crate) poll_waiters_live: Arc<std::sync::atomic::AtomicUsize>,
 
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,

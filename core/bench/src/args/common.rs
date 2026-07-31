@@ -72,7 +72,7 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'w', default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
     pub warmup_time: IggyDuration,
 
-    /// Poll wait timeout in human readable format, e.g. "10ms", "1s"
+    /// Poll wait timeout, e.g. "10ms", "1s". Use "0s" to disable deferred polling.
     #[arg(long, default_value_t = IggyDuration::from_str(DEFAULT_POLL_WAIT_TIMEOUT).unwrap(), value_parser = IggyDuration::from_str)]
     pub poll_wait_timeout: IggyDuration,
 

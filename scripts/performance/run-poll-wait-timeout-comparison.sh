@@ -30,6 +30,7 @@ DRY_RUN=false
 QUICK=false
 RESOURCE_SAMPLING=true
 SAMPLE_INTERVAL_SECONDS=1
+RESOURCE_SAMPLER_PID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -98,13 +99,19 @@ source "$(dirname "$0")/../utils.sh"
 source "$(dirname "$0")/utils.sh"
 
 function on_interrupt() {
+    stop_resource_sampler "$RESOURCE_SAMPLER_PID"
     on_exit_bench
     exit 130
 }
 
+function on_exit() {
+    stop_resource_sampler "$RESOURCE_SAMPLER_PID"
+    on_exit_bench
+}
+
 if [[ "$DRY_RUN" == false ]]; then
     trap on_interrupt SIGINT SIGTERM
-    trap on_exit_bench EXIT
+    trap on_exit EXIT
 fi
 
 if [[ "$SKIP_BUILD" == false && "$DRY_RUN" == false ]]; then
@@ -207,15 +214,6 @@ function sample_process_resources() {
     done
 }
 
-function stop_resource_sampler() {
-    local sampler_pid="$1"
-
-    if [[ -n "$sampler_pid" ]]; then
-        kill "$sampler_pid" 2>/dev/null || true
-        wait "$sampler_pid" 2>/dev/null || true
-    fi
-}
-
 function summarize_resource_role() {
     local resource_log="$1"
     local role="$2"
@@ -281,7 +279,6 @@ function run_suite() {
     local command="$3"
     local log_file
     local resource_log
-    local sampler_pid=""
     local net_before_rx=0
     local net_before_tx=0
     local net_after_rx=0
@@ -303,7 +300,7 @@ function run_suite() {
         echo "timestamp,role,pid,cpu_percent,rss_kb" >"$resource_log"
         read -r net_before_rx net_before_tx < <(snapshot_network_bytes)
         sample_process_resources "$resource_log" &
-        sampler_pid=$!
+        RESOURCE_SAMPLER_PID=$!
     fi
 
     set +e
@@ -312,7 +309,8 @@ function run_suite() {
     set -e
 
     if [[ "$RESOURCE_SAMPLING" == true ]]; then
-        stop_resource_sampler "$sampler_pid"
+        stop_resource_sampler "$RESOURCE_SAMPLER_PID"
+        RESOURCE_SAMPLER_PID=""
         read -r net_after_rx net_after_tx < <(snapshot_network_bytes)
         append_resource_summary "$log_file" "$resource_log" "$net_before_rx" "$net_before_tx" "$net_after_rx" "$net_after_tx"
     fi

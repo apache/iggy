@@ -141,7 +141,7 @@ impl HttpSafeShard {
         user_id: u32,
         stream_id: Identifier,
         topic_id: Identifier,
-        consumer: Consumer,
+        consumer: &Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
@@ -151,7 +151,7 @@ impl HttpSafeShard {
         let future = SendWrapper::new(self.shard().poll_messages(
             client_id,
             topic,
-            consumer.clone(),
+            consumer,
             maybe_partition_id,
             args,
         ));

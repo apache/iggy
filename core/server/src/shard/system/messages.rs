@@ -31,7 +31,7 @@ use iggy_common::{
 };
 use server_common::PooledBuffer;
 use server_common::sharding::IggyNamespace;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::sync::atomic::Ordering;
 use tracing::error;
 
 impl IggyShard {
@@ -68,13 +68,13 @@ impl IggyShard {
         &self,
         client_id: u32,
         topic: ResolvedTopic,
-        consumer: Consumer,
+        consumer: &Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
         let Some((consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             topic,
-            &consumer,
+            consumer,
             client_id,
             maybe_partition_id,
             true,
@@ -410,6 +410,8 @@ impl IggyShard {
                 .size_of_messages_required_to_save
                 .as_bytes_u64() as u32;
 
+        self.wake_poll_waiters(namespace);
+
         if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
             let frozen_batches = {
                 let mut partitions = self.local_partitions.borrow_mut();
@@ -682,25 +684,14 @@ pub struct PollingArgs {
     pub strategy: PollingStrategy,
     pub count: u32,
     pub auto_commit: bool,
-    pub wait_timeout: Duration,
 }
 
 impl PollingArgs {
     pub fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
-        Self::with_wait_timeout(strategy, count, auto_commit, Duration::ZERO)
-    }
-
-    pub fn with_wait_timeout(
-        strategy: PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-        wait_timeout: Duration,
-    ) -> Self {
         Self {
             strategy,
             count,
             auto_commit,
-            wait_timeout,
         }
     }
 }

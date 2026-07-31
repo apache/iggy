@@ -17,13 +17,17 @@
 
 use iggy::prelude::*;
 use integration::harness::TestHarness;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(feature = "vsr"))]
+use std::time::Instant;
+#[cfg(not(feature = "vsr"))]
 use tokio::time::sleep;
 #[cfg(not(feature = "vsr"))]
 use tokio::time::timeout;
 
 const STREAM_NAME: &str = "poll-wait-timeout-stream";
 const TOPIC_NAME: &str = "poll-wait-timeout-topic";
+#[cfg(not(feature = "vsr"))]
 const CONSUMER_GROUP_NAME: &str = "poll-wait-timeout-group";
 #[cfg(not(feature = "vsr"))]
 const PARTITION_ID: u32 = 0;
@@ -111,6 +115,44 @@ pub async fn run_wake_after_append_checks(harness: &TestHarness) {
     );
 
     producer
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "vsr")]
+pub async fn run_server_ng_rejects_wait_timeout(harness: &TestHarness) {
+    let client = harness.root_client().await.expect("root client");
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            1,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+
+    let result = client
+        .poll_messages_with_timeout(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+            Duration::from_millis(10),
+        )
+        .await;
+
+    assert!(matches!(result, Err(IggyError::FeatureUnavailable)));
+
+    client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
@@ -308,6 +350,7 @@ async fn send_one(client: &IggyClient, id: u128, payload: &str) {
         .unwrap();
 }
 
+#[cfg(not(feature = "vsr"))]
 pub async fn run_consumer_group_checks(harness: &TestHarness) {
     let client = harness.root_client().await.expect("root client");
 
@@ -401,6 +444,7 @@ pub async fn run_consumer_group_checks(harness: &TestHarness) {
         .unwrap();
 }
 
+#[cfg(not(feature = "vsr"))]
 async fn wait_until_partition_readable(client: &IggyClient) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

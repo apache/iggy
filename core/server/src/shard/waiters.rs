@@ -19,7 +19,11 @@ use crate::shard::IggyShard;
 use ahash::AHashMap;
 use async_channel::{Receiver, Sender};
 use server_common::sharding::IggyNamespace;
-use std::{sync::Arc, sync::Mutex, time::Duration, time::Instant};
+use std::{
+    sync::Arc,
+    sync::Mutex,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const MAX_WAITERS_PER_NAMESPACE: usize = 1024;
 
@@ -27,7 +31,6 @@ const MAX_WAITERS_PER_NAMESPACE: usize = 1024;
 struct PollWaiter {
     id: u64,
     wake_sender: Sender<()>,
-    deadline: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -37,12 +40,7 @@ pub struct PollWaiterRegistry {
 }
 
 impl PollWaiterRegistry {
-    fn register(
-        &mut self,
-        namespace: IggyNamespace,
-        timeout: Duration,
-    ) -> Option<(u64, Receiver<()>)> {
-        self.prune_namespace(&namespace);
+    fn register(&mut self, namespace: IggyNamespace) -> Option<(u64, Receiver<()>)> {
         let waiters = self.waiters.entry(namespace).or_default();
         if waiters.len() >= MAX_WAITERS_PER_NAMESPACE {
             return None;
@@ -51,11 +49,7 @@ impl PollWaiterRegistry {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
         let (wake_sender, wake_receiver) = async_channel::bounded(1);
-        waiters.push(PollWaiter {
-            id,
-            wake_sender,
-            deadline: Instant::now().checked_add(timeout),
-        });
+        waiters.push(PollWaiter { id, wake_sender });
 
         Some((id, wake_receiver))
     }
@@ -107,23 +101,6 @@ impl PollWaiterRegistry {
             self.wake_namespace(&namespace);
         }
     }
-
-    fn prune_namespace(&mut self, namespace: &IggyNamespace) {
-        let now = Instant::now();
-        let should_remove = if let Some(waiters) = self.waiters.get_mut(namespace) {
-            waiters.retain(|waiter| {
-                !waiter.wake_sender.is_closed()
-                    && waiter.deadline.is_none_or(|deadline| deadline > now)
-            });
-            waiters.is_empty()
-        } else {
-            false
-        };
-
-        if should_remove {
-            self.waiters.remove(namespace);
-        }
-    }
 }
 
 pub(crate) struct PollWaiterRegistration {
@@ -131,6 +108,7 @@ pub(crate) struct PollWaiterRegistration {
     id: u64,
     receiver: Receiver<()>,
     registry: Arc<Mutex<PollWaiterRegistry>>,
+    live_counter: Arc<AtomicUsize>,
 }
 
 impl PollWaiterRegistration {
@@ -143,8 +121,9 @@ impl Drop for PollWaiterRegistration {
     fn drop(&mut self) {
         self.registry
             .lock()
-            .expect("poll waiter registry poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .remove(&self.namespace, self.id);
+        self.live_counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -152,39 +131,49 @@ impl IggyShard {
     pub(crate) fn register_poll_waiter(
         &self,
         namespace: IggyNamespace,
-        timeout: Duration,
     ) -> Option<PollWaiterRegistration> {
         let (id, receiver) = self
             .poll_waiters
             .lock()
-            .expect("poll waiter registry poisoned")
-            .register(namespace, timeout)?;
+            .unwrap_or_else(|error| error.into_inner())
+            .register(namespace)?;
+        self.poll_waiters_live.fetch_add(1, Ordering::Relaxed);
         Some(PollWaiterRegistration {
             namespace,
             id,
             receiver,
             registry: self.poll_waiters.clone(),
+            live_counter: self.poll_waiters_live.clone(),
         })
     }
 
     pub(crate) fn wake_poll_waiters(&self, namespace: &IggyNamespace) {
+        if self.poll_waiters_live.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         self.poll_waiters
             .lock()
-            .expect("poll waiter registry poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .wake_namespace(namespace);
     }
 
     pub(crate) fn wake_topic_poll_waiters(&self, stream_id: usize, topic_id: usize) {
+        if self.poll_waiters_live.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         self.poll_waiters
             .lock()
-            .expect("poll waiter registry poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .wake_topic(stream_id, topic_id);
     }
 
     pub(crate) fn wake_stream_poll_waiters(&self, stream_id: usize) {
+        if self.poll_waiters_live.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         self.poll_waiters
             .lock()
-            .expect("poll waiter registry poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .wake_stream(stream_id);
     }
 }
@@ -200,7 +189,7 @@ mod tests {
         let (id, receiver) = registry
             .lock()
             .unwrap()
-            .register(namespace, Duration::from_secs(1))
+            .register(namespace)
             .expect("waiter should register");
 
         assert_eq!(registry.lock().unwrap().waiters[&namespace].len(), 1);
@@ -210,6 +199,7 @@ mod tests {
             id,
             receiver,
             registry: registry.clone(),
+            live_counter: Arc::new(AtomicUsize::new(1)),
         };
         drop(registration);
 

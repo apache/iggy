@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(not(feature = "vsr"))]
+use crate::server::scenarios::poll_messages_wait_timeout_scenario;
 use crate::server::scenarios::{
     consumer_group_auto_commit_reconnection_scenario,
     consumer_group_duplicate_name_create_scenario, consumer_group_join_scenario,
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
-    poll_messages_wait_timeout_scenario,
 };
 use integration::iggy_harness;
 

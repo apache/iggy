@@ -70,7 +70,7 @@ async fn poll_messages(
         session.get_user_id(),
         query.0.stream_id,
         query.0.topic_id,
-        consumer,
+        &consumer,
         query.0.partition_id,
         PollingArgs::new(query.0.strategy, query.0.count, query.0.auto_commit),
     ));

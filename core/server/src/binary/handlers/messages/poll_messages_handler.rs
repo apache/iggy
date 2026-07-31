@@ -31,7 +31,9 @@ use iggy_common::{Consumer, IggyError, IggyPollMetadata, PollingStrategy};
 use server_common::PooledBuffer;
 use server_common::sharding::IggyNamespace;
 use std::{rc::Rc, time::Duration};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+
+const MAX_POLL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn handle_poll_messages(
     req: PollMessagesRequest,
@@ -46,7 +48,7 @@ pub async fn handle_poll_messages(
     let partition_id = req.partition_id;
     let count = req.count;
     let auto_commit = req.auto_commit;
-    let wait_timeout = Duration::from_micros(req.wait_timeout_us);
+    let wait_timeout = Duration::from_micros(req.wait_timeout_us).min(MAX_POLL_WAIT_TIMEOUT);
 
     debug!(
         "session: {session}, command: poll_messages, stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id:?}"
@@ -60,9 +62,9 @@ pub async fn handle_poll_messages(
         .poll_messages(
             client_id,
             topic,
-            consumer.clone(),
+            &consumer,
             partition_id,
-            PollingArgs::with_wait_timeout(strategy, count, auto_commit, wait_timeout),
+            PollingArgs::new(strategy, count, auto_commit),
         )
         .await?;
 
@@ -71,7 +73,16 @@ pub async fn handle_poll_messages(
             shard.resolve_poll_wait_namespaces(topic, &consumer, client_id, partition_id)?;
         let waiters = namespaces
             .iter()
-            .filter_map(|namespace| shard.register_poll_waiter(*namespace, wait_timeout))
+            .filter_map(|namespace| {
+                let waiter = shard.register_poll_waiter(*namespace);
+                if waiter.is_none() {
+                    warn!(
+                        namespace = namespace.inner(),
+                        "poll waiter cap reached; falling back to immediate poll"
+                    );
+                }
+                waiter
+            })
             .collect::<Vec<_>>();
 
         if let Some((next_metadata, next_batch)) = poll_wait_namespaces(
@@ -91,14 +102,15 @@ pub async fn handle_poll_messages(
         }
 
         if batch.is_empty() && !waiters.is_empty() {
-            let woke = matches!(
-                compio::time::timeout(wait_timeout, wait_for_any_poll_waiter(&waiters)).await,
-                Ok(true)
-            );
-            drop(waiters);
+            let deadline = std::time::Instant::now() + wait_timeout;
+            while batch.is_empty() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let _ = compio::time::timeout(remaining, wait_for_any_poll_waiter(&waiters)).await;
 
-            if woke
-                && let Some((next_metadata, next_batch)) = poll_wait_namespaces(
+                if let Some((next_metadata, next_batch)) = poll_wait_namespaces(
                     shard,
                     client_id,
                     topic,
@@ -109,10 +121,12 @@ pub async fn handle_poll_messages(
                     auto_commit,
                 )
                 .await?
-            {
-                metadata = next_metadata;
-                batch = next_batch;
+                {
+                    metadata = next_metadata;
+                    batch = next_batch;
+                }
             }
+            drop(waiters);
         }
     }
 
@@ -162,7 +176,7 @@ async fn poll_wait_namespaces(
             .poll_messages(
                 client_id,
                 topic,
-                consumer.clone(),
+                consumer,
                 Some(namespace.partition_id() as u32),
                 PollingArgs::new(*strategy, count, auto_commit),
             )
