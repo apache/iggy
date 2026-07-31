@@ -560,7 +560,7 @@ impl IggyProducer {
     /// has already recorded.
     ///
     /// The confirmation list is empty whenever the server sends no confirmation
-    /// payload, which the legacy server never does, and for a `background`
+    /// payload, as the legacy server never sends one, and for a `background`
     /// producer, which hands the messages to a dispatcher and returns before the
     /// send happens. Branch on `confirmations.is_empty()` instead of indexing.
     pub async fn send(
