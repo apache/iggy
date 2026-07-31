@@ -19,10 +19,24 @@
 import { translateCommandCode } from './command.code.js';
 import { translateErrorCode } from './error.code.js';
 
-export const responseError = (cmdCode: number, errCode: number) => new Error(
-  `command: { code: ${cmdCode}, name: ${translateCommandCode(cmdCode)} } ` +
-  `error: {code: ${errCode}, message: ${translateErrorCode(errCode)} }`
-);
+export class ResponseError extends Error {
+  readonly commandCode: number;
+  readonly errorCode: number;
+
+  constructor(commandCode: number, errorCode: number) {
+    super(
+      `command: { code: ${commandCode}, name: ${translateCommandCode(commandCode)} } ` +
+      `error: {code: ${errorCode}, message: ${translateErrorCode(errorCode)} }`
+    );
+    this.name = 'ResponseError';
+    this.commandCode = commandCode;
+    this.errorCode = errorCode;
+    Object.setPrototypeOf(this, ResponseError.prototype);
+  }
+}
+
+export const responseError = (cmdCode: number, errCode: number) =>
+  new ResponseError(cmdCode, errCode);
 
 export class DeserializeError extends Error {
   constructor(message: string, cause?: Record<string , unknown>) {

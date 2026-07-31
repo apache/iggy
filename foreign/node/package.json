@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.8.1-edge.2",
+  "version": "0.8.1-edge.3",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
@@ -37,12 +37,14 @@
   "scripts": {
     "test:unit": "node --import @swc-node/register/esm-register --test --experimental-test-coverage './src/**/*.test.ts'",
     "test:e2e": "node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/*.e2e.ts'",
+    "test:e2e:vsr": "IGGY_TEST_PROTOCOL=vsr node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/tcp.*.e2e.ts'",
     "test:bdd": "cucumber-js --exit",
     "test": "npm run test:unit && npm run test:bdd && npm run test:e2e",
     "clean": "rm -Rf dist/",
-    "lint": "eslint src/**/*.ts",
+    "lint": "eslint 'src/**/*.ts'",
     "commitlint": "commitlint --edit",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && npm run check:vsr-protocol",
+    "check:vsr-protocol": "node scripts/check-vsr-protocol.mjs",
     "start": "node dist/index.js",
     "prepare": "husky || true"
   },
