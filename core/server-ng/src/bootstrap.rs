@@ -2271,6 +2271,7 @@ fn resolve_tcp_topology(
         http: http_listen_addr,
     } = resolve_cluster_client_addrs(
         self_node,
+        default_client_addr,
         default_ws_addr,
         default_quic_addr,
         default_http_addr,
@@ -2317,8 +2318,8 @@ fn resolve_optional_listener_addr(
 /// Client-facing listener addresses resolved for this cluster node. Each port
 /// comes from the node's roster entry; there is no fallback to the top-level
 /// listener port, an enabled transport without a roster port refuses to boot.
-/// ws/quic/http keep the bind interface from their own `address` config (the
-/// roster ip is advertised, not bound); tcp binds the roster ip directly.
+/// Every transport keeps the bind interface from its own `address` config: the
+/// roster ip is advertised, not bound.
 struct ClusterClientAddrs {
     client: SocketAddr,
     ws: Option<SocketAddr>,
@@ -2328,6 +2329,7 @@ struct ClusterClientAddrs {
 
 fn resolve_cluster_client_addrs(
     self_node: &configs::ng_cluster::ClusterNodeConfig,
+    default_tcp_addr: SocketAddr,
     default_ws_addr: Option<SocketAddr>,
     default_quic_addr: Option<SocketAddr>,
     default_http_addr: Option<SocketAddr>,
@@ -2339,7 +2341,8 @@ fn resolve_cluster_client_addrs(
             transport: "tcp",
             replica_id: self_node.replica_id,
         })?;
-    let client = socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
+    let client =
+        merge_roster_port_with_bind_ip("tcp", &self_node.ip, default_tcp_addr, client_port);
     let ws = resolve_cluster_optional_addr(self_node, "websocket", default_ws_addr, |ports| {
         ports.websocket
     })?;
@@ -2371,25 +2374,48 @@ fn resolve_cluster_optional_addr(
         transport,
         replica_id: self_node.replica_id,
     })?;
-    // The roster ip is what the cluster advertises (metadata, follower-to-
-    // primary HTTP forwarding targets); the transport's own `address` decides
-    // the bind interface. Merging keeps a loopback-only `127.0.0.1` private
-    // and a `0.0.0.0` wide in cluster mode instead of silently rebinding to
-    // the roster interface.
-    let listen_addr = SocketAddr::new(default_addr.ip(), port);
-    if !listen_addr.ip().is_unspecified()
-        && self_node
-            .ip
-            .parse::<IpAddr>()
-            .is_ok_and(|roster_ip| roster_ip != listen_addr.ip())
-    {
+    Ok(Some(merge_roster_port_with_bind_ip(
+        transport,
+        &self_node.ip,
+        default_addr,
+        port,
+    )))
+}
+
+/// Combine the roster-supplied `port` with the bind interface the transport's
+/// own `address` config asked for.
+///
+/// The roster ip is what the cluster advertises (metadata, follower-to-primary
+/// HTTP forwarding targets); the transport's own `address` decides the bind
+/// interface. Merging keeps a loopback-only `127.0.0.1` private and a
+/// `0.0.0.0` wide in cluster mode instead of silently rebinding to the roster
+/// interface, which would strand every co-located dialer (sidecars, health
+/// probes, on-host consumers) on `ECONNREFUSED`.
+fn merge_roster_port_with_bind_ip(
+    transport: &'static str,
+    roster_ip: &str,
+    bind_addr: SocketAddr,
+    port: u16,
+) -> SocketAddr {
+    let listen_addr = SocketAddr::new(bind_addr.ip(), port);
+    if roster_ip_unreachable_from_bind_addr(roster_ip, listen_addr) {
         warn!(
-            "{transport} listener binds {listen_addr} but the roster advertises {}:{port}; \
-             peers and clients dialing the advertised endpoint will not reach this node",
-            self_node.ip
+            "{transport} listener binds {listen_addr} but the roster advertises {roster_ip}:{port}; \
+             peers and clients dialing the advertised endpoint may not reach this node"
         );
     }
-    Ok(Some(listen_addr))
+    listen_addr
+}
+
+/// Whether a dialer aiming at the advertised roster ip misses `listen_addr`. An
+/// unspecified bind covers every interface, and a roster ip that parses as
+/// neither IPv4 nor IPv6 (a DNS name, say) can resolve to the bound interface,
+/// so both cases stay quiet.
+fn roster_ip_unreachable_from_bind_addr(roster_ip: &str, listen_addr: SocketAddr) -> bool {
+    !listen_addr.ip().is_unspecified()
+        && roster_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|parsed| parsed != listen_addr.ip())
 }
 
 fn resolve_cluster_replica_peers(
@@ -3804,13 +3830,21 @@ mod tests {
     }
 
     fn cluster_node(ip: &str, http: Option<u16>) -> configs::ng_cluster::ClusterNodeConfig {
+        cluster_node_with_ports(ip, Some(18070), http)
+    }
+
+    fn cluster_node_with_ports(
+        ip: &str,
+        tcp: Option<u16>,
+        http: Option<u16>,
+    ) -> configs::ng_cluster::ClusterNodeConfig {
         configs::ng_cluster::ClusterNodeConfig {
             name: "node".to_owned(),
             ip: ip.to_owned(),
             advertised_address: None,
             replica_id: 0,
             ports: configs::ng_cluster::TransportPorts {
-                tcp: Some(18070),
+                tcp,
                 http,
                 ..Default::default()
             },
@@ -3827,8 +3861,14 @@ mod tests {
         // one host; the per-node roster port is the only port source so each
         // node binds a distinct HTTP socket.
         let node = cluster_node("127.0.0.1", Some(18090));
-        let addrs = resolve_cluster_client_addrs(&node, None, None, Some(addr("127.0.0.1:3000")))
-            .expect("cluster address resolution must succeed");
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:8090"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        )
+        .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, Some(addr("127.0.0.1:18090")));
     }
 
@@ -3838,8 +3878,14 @@ mod tests {
         // only the advertised address. Cluster mode must keep the configured
         // interface and take just the port from the roster.
         let node = cluster_node("10.0.0.5", Some(18090));
-        let addrs = resolve_cluster_client_addrs(&node, None, None, Some(addr("0.0.0.0:3000")))
-            .expect("cluster address resolution must succeed");
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("0.0.0.0:8090"),
+            None,
+            None,
+            Some(addr("0.0.0.0:3000")),
+        )
+        .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, Some(addr("0.0.0.0:18090")));
     }
 
@@ -3849,7 +3895,13 @@ mod tests {
         // with another same-host node, so a missing roster port for an
         // enabled transport must refuse to boot.
         let node = cluster_node("10.0.0.5", None);
-        let result = resolve_cluster_client_addrs(&node, None, None, Some(addr("127.0.0.1:3000")));
+        let result = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:8090"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        );
         assert!(matches!(
             result,
             Err(ServerNgError::ClusterPortMissing {
@@ -3864,8 +3916,75 @@ mod tests {
         // http.enabled = false collapses default_http_addr to None; no roster
         // port can revive a listener the operator turned off.
         let node = cluster_node("127.0.0.1", Some(18090));
-        let addrs = resolve_cluster_client_addrs(&node, None, None, None)
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
             .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, None);
+    }
+
+    #[test]
+    fn cluster_tcp_addr_takes_port_from_roster() {
+        // Same rule as the other transports: the roster owns the port so
+        // same-host nodes sharing one [tcp].address still bind distinct
+        // sockets.
+        let node = cluster_node("127.0.0.1", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("127.0.0.1:18070"));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_merges_config_ip_with_roster_port() {
+        // The roster ip is advertised, not bound. Binding it directly would
+        // strand every co-located dialer (sidecars, health probes, on-host
+        // consumers) that reaches this node over loopback.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("0.0.0.0:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("0.0.0.0:18070"));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_requires_roster_port() {
+        // tcp is always enabled in cluster mode, so a roster entry without a
+        // tcp port refuses to boot rather than falling back to [tcp].address.
+        let node = cluster_node_with_ports("10.0.0.5", None, None);
+        let result = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None);
+        assert!(matches!(
+            result,
+            Err(ServerNgError::ClusterPortMissing {
+                transport: "tcp",
+                replica_id: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_keeps_loopback_bind_and_warns_on_roster_mismatch() {
+        // A loopback [tcp].address under a routable roster ip is honoured
+        // as configured; remote peers cannot reach it, so the mismatch is
+        // warned about instead of silently rebinding.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("127.0.0.1:18070"));
+        assert!(roster_ip_unreachable_from_bind_addr(&node.ip, addrs.client));
+    }
+
+    #[test]
+    fn roster_mismatch_warning_is_silent_for_wildcard_and_hostname_rosters() {
+        // A wildcard bind covers the roster interface, and a DNS roster entry
+        // can resolve to the bound one; neither is a misconfiguration.
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("0.0.0.0:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "node-1.example.com",
+            addr("127.0.0.1:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("10.0.0.5:18070")
+        ));
     }
 }
