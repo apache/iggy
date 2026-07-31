@@ -18,7 +18,7 @@
 //! Commit confirmations for `SendMessages`: which partition a batch landed in
 //! and at which offset. server-ng answers a committed send with a confirmation
 //! payload; the legacy server answers with an empty body, which the SDK reports
-//! as a zeroed confirmation rather than as a decode failure.
+//! as no confirmations rather than as a decode failure.
 
 use iggy::prelude::*;
 use integration::iggy_harness;
@@ -245,9 +245,7 @@ async fn given_direct_producer_when_send_splits_into_chunks_should_confirm_every
 
 #[cfg(not(feature = "vsr"))]
 #[iggy_harness]
-async fn given_legacy_server_when_sending_should_report_a_zeroed_confirmation(
-    harness: &TestHarness,
-) {
+async fn given_legacy_server_when_sending_should_report_no_confirmations(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
 
     create_stream_and_topic(&client, PARTITIONS_COUNT).await;
@@ -262,14 +260,9 @@ async fn given_legacy_server_when_sending_should_report_a_zeroed_confirmation(
         .await
         .expect("send_messages");
 
-    assert_eq!(
-        response.confirmations,
-        vec![SendMessagesConfirmationResponse {
-            stream_id: 0,
-            topic_id: 0,
-            partition_id: 0,
-            base_offset: 0,
-        }],
-        "an empty legacy reply body degrades to a zeroed confirmation"
+    assert!(
+        response.confirmations.is_empty(),
+        "the legacy server reports no offsets; a synthetic entry would be \
+         indistinguishable from a genuine commit at offset 0"
     );
 }
