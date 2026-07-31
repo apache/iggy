@@ -152,12 +152,30 @@ pub struct RequestHeader {
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
+    /// Integrity stamp over the request payload, used by the client table to
+    /// catch a `request` number reused for a different operation: a retry that
+    /// disagrees with the stamp of the cached reply is refused rather than
+    /// answered with the wrong reply. Zero means unstamped, which disables the
+    /// comparison; the wire currently sends zero.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
+    /// Session fence epoch: the commit op of the latest committed `Register`
+    /// for this `client`. Handed to the client by that register's reply and
+    /// echoed on every subsequent request.
+    ///
+    /// Every bind commits a `Register`, so each rebind of the same `client`
+    /// carries a strictly higher value, and a request stamped with an older one
+    /// is a zombie from before that rebind and gets fenced. Being a log
+    /// position rather than a counter is what makes it non-regressing: it
+    /// cannot restart low after the server drops an entry and the client
+    /// registers again.
+    ///
+    /// Zero on `Register` itself (the client has no epoch to echo yet) and on
+    /// sessionless ops; header validation enforces both.
     pub session: u64,
     /// Acting user id, stamped by the metadata primary at admission for every
     /// gated client op so the in-apply RBAC gate resolves the same identity on
@@ -229,6 +247,17 @@ impl ConsensusHeader for RequestHeader {
                 "request: client must be != 0".to_string(),
             ));
         }
+        // Reserved is the zero value, never a real client op
+        // (`is_client_allowed` rejects it). Refusing it here rather than after
+        // the dedup preflight matters: a bound client sending
+        // `Reserved, request = 0` used to pass validation, reach
+        // `request_preflight`, hit its own watermark and get its register
+        // reply replayed before the operation gate ever ran.
+        if self.operation == Operation::Reserved {
+            return Err(ConsensusError::InvalidField(
+                "operation must not be Reserved".to_string(),
+            ));
+        }
         // Register: session must be 0, request must be 0.
         // NonReplicated: sessionless by design (the `ClientTable` ignores
         // these ops and the server routes/auth-gates them by transport id),
@@ -246,9 +275,7 @@ impl ConsensusHeader for RequestHeader {
                     "register: request must be 0".to_string(),
                 ));
             }
-        } else if self.operation != Operation::Reserved
-            && self.operation != Operation::NonReplicated
-        {
+        } else if self.operation != Operation::NonReplicated {
             if self.session == 0 {
                 return Err(ConsensusError::InvalidField(
                     "non-register: session must be > 0".to_string(),
@@ -280,6 +307,8 @@ pub struct ReplyHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
+    /// Echoed from the request this reply answers; the client table stores it
+    /// alongside the cached reply. See `RequestHeader::request_checksum`.
     pub request_checksum: u128,
     pub context: u128,
     pub client: u128,
@@ -618,6 +647,7 @@ pub struct PrepareHeader {
 
     pub client: u128,
     pub parent: u128,
+    /// Copied verbatim from the admitted `RequestHeader`; see that field.
     pub request_checksum: u128,
     pub op: u64,
     pub commit: u64,
@@ -1297,6 +1327,9 @@ mod tests {
         // client offset = 60 + 1 (replica) + 66 (reserved_frame) = 128.
         // validate rejects client == 0.
         buf[128] = 1;
+        // Register (session 0, request 0 are its required values); a zeroed
+        // operation is `Reserved`, which validate rejects.
+        buf[std::mem::offset_of!(RequestHeader, operation)] = Operation::Register as u8;
         let header: &RequestHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
         assert_eq!(header.command, Command2::Request);
         assert!(header.validate().is_ok());
@@ -1306,6 +1339,22 @@ mod tests {
     fn request_header_wrong_command_fails_validation() {
         let buf = aligned_zeroed(256);
         let header: &RequestHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
+        assert!(header.validate().is_err());
+    }
+
+    // `Reserved` is the zero discriminant and never a real client op. Ingress
+    // must reject it, since the operation gate that would otherwise catch it
+    // runs after the dedup preflight.
+    #[test]
+    fn request_reserved_operation_rejected() {
+        let header = RequestHeader {
+            command: Command2::Request,
+            client: 1,
+            operation: Operation::Reserved,
+            session: 1,
+            request: 1,
+            ..RequestHeader::default()
+        };
         assert!(header.validate().is_err());
     }
 

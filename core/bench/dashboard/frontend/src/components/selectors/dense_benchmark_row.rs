@@ -86,6 +86,11 @@ pub fn dense_benchmark_row(props: &DenseBenchmarkRowProps) -> Html {
                 <div class="dense-row-body">
                     <div class="dense-row-title">{display_name}</div>
                     <div class="dense-row-meta">
+                        if let Some(cluster) = &benchmark.cluster {
+                            <span class="dense-row-cluster" title={cluster.label()}>
+                                { format!("{}N", cluster.nodes.len()) }
+                            </span>
+                        }
                         { render_metrics(benchmark) }
                         if props.show_timestamp {
                             <span class="dense-row-meta-sep">{"·"}</span>

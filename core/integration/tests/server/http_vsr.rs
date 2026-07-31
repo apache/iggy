@@ -18,7 +18,7 @@
 //! HTTP data-plane gate for server-ng: produce, poll, and consumer-offset
 //! routes exercised over raw `reqwest` (not the SDK HTTP client) so the wire
 //! contract itself is under test - exact status codes, the
-//! `x-iggy-durability` header, the body-size cap, and cross-request isolation
+//! `iggy-durability` header, the body-size cap, and cross-request isolation
 //! of concurrent produces on one login session.
 
 use crate::server::http_client::HttpClient;
@@ -44,7 +44,7 @@ const PARTITION_ID: u32 = 0;
 /// (`Consumer::default()` would carry numeric id 0, not 1).
 const CONSUMER_ID: u32 = 1;
 
-const DURABILITY_HEADER: &str = "x-iggy-durability";
+const DURABILITY_HEADER: &str = "iggy-durability";
 const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
 const DURABILITY_NONE: &str = "none";
 
@@ -614,6 +614,17 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
         response.status(),
         StatusCode::PAYLOAD_TOO_LARGE,
         "oversized body must be rejected"
+    );
+    // The cap rejects the body unread, so the connection cannot be reused: the
+    // reply must say so, or the client pools a socket the server stopped
+    // reading and the next request on it fails on a clean EOF.
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close"),
+        "a 413 must close the connection rather than let the client pool it"
     );
 
     // The rejection must not poison the listener: a normal produce still commits.

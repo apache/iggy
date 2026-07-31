@@ -20,7 +20,7 @@ use crate::components::selectors::benchmarks_list::BenchmarksList;
 use crate::components::selectors::param_filters_panel::ParamFiltersPanel;
 use crate::router::AppRoute;
 use crate::state::benchmark::{BenchmarkAction, recency_cmp, use_benchmark};
-use crate::state::ui::{KindGroup, SidebarSort, UiAction, use_ui};
+use crate::state::ui::{KindGroup, SidebarSort, TopologyFilter, UiAction, use_ui};
 use bench_dashboard_shared::BenchmarkReportLight;
 use gloo::console::log;
 use std::cell::Cell;
@@ -110,6 +110,13 @@ pub fn sidebar(_props: &SidebarProps) -> Html {
         Callback::from(move |group: KindGroup| ui.dispatch(UiAction::ToggleKindFilter(group)))
     };
 
+    let on_topology_select = {
+        let ui = ui.clone();
+        Callback::from(move |filter: TopologyFilter| {
+            ui.dispatch(UiAction::SetTopologyFilter(filter))
+        })
+    };
+
     let on_sort_change = {
         let ui = ui.clone();
         Callback::from(move |event: Event| {
@@ -149,6 +156,7 @@ pub fn sidebar(_props: &SidebarProps) -> Html {
     let hardware_options = collect_hardware(&benchmarks);
     let gitref_options = collect_gitrefs(&benchmarks, ui.hardware_filter.as_deref());
     let active_kind_filter = ui.sidebar_kind_filter.clone();
+    let active_topology = ui.topology_filter;
     let current_sort = ui.sidebar_sort;
     let current_hardware = ui.hardware_filter.clone().unwrap_or_default();
     let current_gitref = ui.gitref_filter.clone().unwrap_or_default();
@@ -234,6 +242,27 @@ pub fn sidebar(_props: &SidebarProps) -> Html {
                                 aria-pressed={is_active.to_string()}
                             >
                                 {group.label()}
+                            </button>
+                        }
+                    })}
+                </div>
+
+                <div class="sidebar-kind-chips">
+                    { for TopologyFilter::all().iter().map(|filter| {
+                        let is_active = active_topology == *filter;
+                        let filter_copy = *filter;
+                        let on_click = {
+                            let on_topology_select = on_topology_select.clone();
+                            Callback::from(move |_: MouseEvent| on_topology_select.emit(filter_copy))
+                        };
+                        html! {
+                            <button
+                                type="button"
+                                class={classes!("sidebar-chip", is_active.then_some("active"))}
+                                onclick={on_click}
+                                aria-pressed={is_active.to_string()}
+                            >
+                                {filter.label()}
                             </button>
                         }
                     })}

@@ -315,7 +315,7 @@ function run_readme_commands() {
     local commands
     commands=$(grep -E "${grep_pattern}" "${readme_file}" || true)
     if [ -n "${grep_exclude}" ]; then
-        commands=$(echo "${commands}" | grep -v "${grep_exclude}" || true)
+        commands=$(echo "${commands}" | grep -v -e "${grep_exclude}" || true)
     fi
     if [ -z "${commands}" ]; then
         return

@@ -96,18 +96,25 @@ pub(in crate::http) fn committed_payload(
     }
 }
 
-/// True when a reply-shaped frame is the primary's pre-consensus
-/// `TransientNotCommitted` rejection (`[count=1][index=0][57]`, see
-/// `build_result_rejection_reply`): the op did not commit, so the write path
-/// must replay the same request id rather than grade it as a committed
-/// result or advance the session gate.
-pub(in crate::http) fn is_transient_not_committed(reply: &Message<GenericHeader>) -> bool {
-    matches!(
-        result_code(reply_body(reply)),
-        Some(code)
-            if code == IggyError::TransientNotCommitted.as_code()
-                || code == IggyError::TransientNotAccepted.as_code()
-    )
+/// The transient variant of a reply-shaped pre-consensus rejection frame
+/// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
+/// for a committed outcome. Either transient means the op did not commit, so
+/// the write path must replay the same request id rather than grade it as a
+/// committed result or advance the session gate. The two codes are kept
+/// distinct because they exhaust differently: `TransientNotAccepted` never
+/// entered the pipeline and is safe to re-issue anywhere, while
+/// `TransientNotCommitted` may still commit and only a same-session same-id
+/// replay is safe.
+pub(in crate::http) fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
+    match result_code(reply_body(reply)) {
+        Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
+            Some(IggyError::TransientNotCommitted)
+        }
+        Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
+            Some(IggyError::TransientNotAccepted)
+        }
+        _ => None,
+    }
 }
 
 /// The reply body past the generic header, bounded by the header's `size`.
@@ -368,11 +375,25 @@ mod tests {
             IggyError::TransientNotCommitted.as_code(),
         )
         .into_generic();
-        assert!(is_transient_not_committed(&reply));
+        assert_eq!(
+            transient_code(&reply),
+            Some(IggyError::TransientNotCommitted)
+        );
         assert!(matches!(
             committed_payload(&reply),
             Err(WriteError::Rejected(IggyError::TransientNotCommitted))
         ));
+
+        let not_accepted = consensus::build_result_rejection_reply(
+            request.header(),
+            9,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .into_generic();
+        assert_eq!(
+            transient_code(&not_accepted),
+            Some(IggyError::TransientNotAccepted)
+        );
     }
 
     /// Genuine committed outcomes must advance the gate, so neither a success
@@ -389,7 +410,7 @@ mod tests {
         body.extend_from_slice(b"payload");
         let success =
             build_reply_from_bytes(request.header(), 42, 7, 9, &Bytes::from(body)).into_generic();
-        assert!(!is_transient_not_committed(&success));
+        assert_eq!(transient_code(&success), None);
         let Ok(payload) = committed_payload(&success) else {
             panic!("success section must grade ok");
         };
@@ -401,7 +422,7 @@ mod tests {
             IggyError::UserAlreadyExists.as_code(),
         )
         .into_generic();
-        assert!(!is_transient_not_committed(&rejected));
+        assert_eq!(transient_code(&rejected), None);
         assert!(matches!(
             committed_payload(&rejected),
             Err(WriteError::Rejected(IggyError::UserAlreadyExists))
