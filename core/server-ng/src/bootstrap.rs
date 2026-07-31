@@ -2329,7 +2329,7 @@ struct ClusterClientAddrs {
 
 fn resolve_cluster_client_addrs(
     self_node: &configs::ng_cluster::ClusterNodeConfig,
-    default_client_addr: SocketAddr,
+    default_tcp_addr: SocketAddr,
     default_ws_addr: Option<SocketAddr>,
     default_quic_addr: Option<SocketAddr>,
     default_http_addr: Option<SocketAddr>,
@@ -2342,7 +2342,7 @@ fn resolve_cluster_client_addrs(
             replica_id: self_node.replica_id,
         })?;
     let client =
-        merge_roster_port_with_bind_ip("tcp", &self_node.ip, default_client_addr, client_port);
+        merge_roster_port_with_bind_ip("tcp", &self_node.ip, default_tcp_addr, client_port);
     let ws = resolve_cluster_optional_addr(self_node, "websocket", default_ws_addr, |ports| {
         ports.websocket
     })?;
@@ -2401,7 +2401,7 @@ fn merge_roster_port_with_bind_ip(
     if roster_ip_unreachable_from_bind_addr(roster_ip, listen_addr) {
         warn!(
             "{transport} listener binds {listen_addr} but the roster advertises {roster_ip}:{port}; \
-             peers and clients dialing the advertised endpoint will not reach this node"
+             peers and clients dialing the advertised endpoint may not reach this node"
         );
     }
     listen_addr
