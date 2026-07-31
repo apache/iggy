@@ -54,9 +54,12 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
-use server_common::sharding::{
-    IggyNamespace, METADATA_CONSENSUS_NAMESPACE, PartitionLocation, ShardId,
-};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+// Read only by the durable-before-send tripwire, which is `debug_assertions`-only, so
+// an unconditional import warns in release builds. CI's `-D warnings` rides clippy,
+// which builds debug, so that warning goes unobserved there.
+#[cfg(debug_assertions)]
+use server_common::sharding::METADATA_CONSENSUS_NAMESPACE;
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
@@ -2976,12 +2979,15 @@ where
         "answering stale-view heartbeat with StartView"
     );
     // Unsolicited, answering a stale-view heartbeat rather than a probe, so there is
-    // no incarnation to echo; freshness comes from the receiver's view checks.
+    // no incarnation to echo; freshness comes from the receiver's view checks. Sent to
+    // every backup, since a replica heartbeating an older view has peers that missed
+    // the view change with it.
     let action = VsrAction::SendStartView {
         view: consensus.view(),
         op: consensus.sequencer().current_sequence(),
         commit: consensus.commit_max(),
         incarnation: 0,
+        target: None,
         namespace: consensus.namespace(),
     };
     dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
@@ -3054,9 +3060,11 @@ async fn dispatch_vsr_actions<B, P, J>(
     // losing a commit. Every metadata caller persists first (the view-change dispatch
     // sites and the on_replicate / on_commit send gates), so this asserts they did
     // rather than letting a future bypass through silently. Metadata plane only:
-    // partition consensus has no superblock, so its `needs_superblock_persist` is
-    // always dirty and it is exempt. `RequestStartView` is exempt too, being a probe
-    // that asks to LEARN the view rather than advertise it.
+    // partition consensus has no superblock to record a view in, so it is exempt and
+    // the namespace test below is what does the work (its `needs_superblock_persist`
+    // is not a stand-in: that predicate reads clean at view 0, which is where a
+    // partition group spends most of its life). `RequestStartView` is exempt too,
+    // being a probe that asks to LEARN the view rather than advertise it.
     #[cfg(debug_assertions)]
     if consensus.namespace() == METADATA_CONSENSUS_NAMESPACE {
         for action in actions {
@@ -3066,6 +3074,11 @@ async fn dispatch_vsr_actions<B, P, J>(
                     | VsrAction::SendDoViewChange { .. }
                     | VsrAction::SendStartView { .. }
                     | VsrAction::SendPrepareOk { .. }
+                    // A backup drops a Commit whose view differs from its own, and a
+                    // primary answers an older-view one with a StartView, so the
+                    // heartbeat advertises a view like the rest. Gated today only
+                    // because its sole emitter rides the tick, which persists first.
+                    | VsrAction::SendCommit { .. }
             );
             debug_assert!(
                 !advertises_view || !consensus.needs_superblock_persist(),
@@ -3134,6 +3147,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 op,
                 commit,
                 incarnation,
+                target,
                 namespace,
             } => {
                 let msg = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
@@ -3148,7 +3162,15 @@ async fn dispatch_vsr_actions<B, P, J>(
                         h.namespace = *namespace;
                         h.size = size_of::<StartViewHeader>() as u32;
                     });
-                broadcast(msg.into_generic().into_frozen()).await;
+                let frozen = msg.into_generic().into_frozen();
+                // A probe echo is addressed to its requester: the incarnation it
+                // carries is that replica's freshness proof, and a peer recovering
+                // at the same time would read it as foreign and reject a current
+                // StartView.
+                match target {
+                    Some(replica) => send(*replica, frozen).await,
+                    None => broadcast(frozen).await,
+                }
             }
             VsrAction::SendPrepareOk {
                 view,

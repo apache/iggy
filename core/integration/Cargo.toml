@@ -62,7 +62,7 @@ iggy_common = { workspace = true }
 iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 # vsr-only: locate and decode the on-disk superblock slot files in the recovery
-# test (`SLOT_FILE_NAMES`, `decode_latest_payload`).
+# test (`SLOT_FILE_NAMES`, `decode_slots`).
 journal = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }

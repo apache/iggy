@@ -192,29 +192,41 @@ pub fn new_shard(
         // View/log_view come from the durable superblock; op, commit, and the
         // last-prepare markers come from the retained WAL. Independent inputs,
         // mirroring server-ng's restore_metadata_consensus.
+        let last_header = metadata_journal
+            .as_ref()
+            .and_then(|journal| journal.last_header());
         if let Some(state) = recovered_state {
             consensus.set_view(state.view);
             consensus.set_log_view(state.log_view);
             consensus.mark_superblock_durable(state.view, state.log_view);
+        } else if let Some(header) = last_header {
+            // No superblock: a fresh node, one that never changed view, or the
+            // first boot after an upgrade. Production infers the view from the
+            // last WAL prepare here, so mirror it -- otherwise the branch every
+            // existing deployment takes has no sim coverage.
+            consensus.set_view(header.view);
+        }
+        // Prior life is EITHER a non-empty WAL or a recovered superblock: a view
+        // change persists without touching the WAL, so an empty journal no longer
+        // proves a fresh boot. A clustered replica with a prior life rejoins as a
+        // quorum-invisible probing backup, since the live primary re-forms its view
+        // and re-commits any uncommitted suffix; a solo replica has no peer to ask,
+        // so it inits and resumes as its own primary. Matches
+        // restore_metadata_consensus exactly. Production's primary-only re-pipeline
+        // of an uncommitted suffix is skipped, since a rejoining replica is always a
+        // backup.
+        let restored_head = restored_op.unwrap_or(0);
+        if !solo && (restored_head > 0 || recovered_state.is_some()) {
+            consensus.init_as_backup();
+            consensus.begin_view_probe();
+        } else {
+            consensus.init();
         }
         if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
-            // A non-empty WAL proves a prior life. A clustered replica rejoins as a
-            // quorum-invisible probing backup, since the live primary re-forms its
-            // view and re-commits any uncommitted suffix; a solo replica has no peer
-            // to ask, so it inits and resumes as its own primary. Gated on
-            // `head > 0` to match restore_metadata_consensus exactly. Production's
-            // primary-only re-pipeline of an uncommitted suffix is skipped, since a
-            // rejoining replica is always a backup.
-            if !solo && head > 0 {
-                consensus.init_as_backup();
-                consensus.begin_view_probe();
-            } else {
-                consensus.init();
-            }
             let commit_watermark = journal.recovery_commit_watermark(solo);
             consensus.sequencer().set_sequence(head);
             consensus.restore_commit_state(commit_watermark, commit_watermark);
-            if let Some(header) = journal.last_header() {
+            if let Some(header) = last_header {
                 consensus.set_last_prepare_checksum(header.checksum);
                 consensus.observe_prepare_timestamp(header.timestamp);
             }
@@ -224,8 +236,6 @@ pub fn new_shard(
             if commit_watermark < head {
                 consensus.set_recovery_barrier(head);
             }
-        } else {
-            consensus.init();
         }
         consensus
     });

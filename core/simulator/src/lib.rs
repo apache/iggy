@@ -1106,6 +1106,44 @@ mod tests {
             view_after, view_before,
             "restarted replica must recover its persisted view from the superblock, not reset to 0"
         );
+
+        // This run takes zero traffic, so every WAL is empty: the recovered view came
+        // from the superblock alone. Pin that, since it is what makes the restart gate
+        // below load-bearing.
+        assert!(
+            sim.replicas[primary as usize]
+                .metadata_journal
+                .last_op()
+                .is_none(),
+            "no metadata traffic in this test, so the restarted replica's WAL must be empty"
+        );
+
+        // A recovered view is a prior life even with an empty WAL, so the replica must
+        // rejoin as a probing backup. It is still primary-by-index for the recovered
+        // view, so resuming primaryship here would have it act as primary in a view the
+        // survivors may already have left, with no probe to correct it.
+        let restarted = sim.replicas[primary as usize].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("restarted primary owns metadata consensus");
+        assert!(
+            restarted.is_primary(),
+            "the restarted replica is still primary-by-index for the recovered view, \
+             which is what makes ceding it necessary"
+        );
+        assert_eq!(
+            restarted.status(),
+            Status::Recovering,
+            "a replica with a recovered view must probe for the current view, not \
+             resume primaryship"
+        );
+        assert!(
+            restarted.has_ceded_primaryship(),
+            "a probing replica must be quorum-invisible until a StartView brings it \
+             forward"
+        );
     }
 
     #[test]
@@ -1325,10 +1363,36 @@ mod tests {
 
         // The faulted replica never durably recorded a new view, so a restart recovers
         // its old view, never one it might have voted in.
+        let faulted = sim.replicas[1].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("replica 1 owns metadata consensus");
+        assert!(
+            faulted.view() > 0,
+            "the gate must withhold the SEND, not the view advance: with the view still \
+             at 0 there was nothing to persist and this test would pass vacuously"
+        );
         assert_eq!(
             sim.replicas[1].superblock.read_latest_sync(),
             None,
             "a failing superblock persists nothing, so no new view is durable"
+        );
+
+        // The retry is bounded. Without a backoff the 10 ms consensus tick would run a
+        // full `atomic_replace` (create, write, fsync, rename, dir fsync) on every tick
+        // for as long as the disk stays broken, on the executor that also serves
+        // partition traffic.
+        let attempts = sim.replicas[1].shards[0]
+            .plane
+            .metadata()
+            .superblock_write_failures();
+        assert!(attempts > 0, "the gate must have attempted a persist");
+        assert!(
+            attempts < 40,
+            "superblock writes must back off, not retry every tick (attempted \
+             {attempts} times)"
         );
     }
 

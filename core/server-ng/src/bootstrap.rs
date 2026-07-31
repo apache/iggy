@@ -35,7 +35,8 @@ use configs::ng_sharding::{
 };
 use configs::server_ng::{NgSystemConfig, ServerNgConfig};
 use consensus::{
-    LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
+    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer,
+    VsrConsensus,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
@@ -49,7 +50,7 @@ use iggy_common::defaults::{
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
-use journal::superblock::DynSuperblockStore;
+use journal::superblock::{DynSuperblockStore, PingPongSuperblock};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
@@ -71,7 +72,7 @@ use message_bus::{
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
-use metadata::impls::recovery::recover;
+use metadata::impls::recovery::{ReplicaIdentity, recover};
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -893,7 +894,11 @@ async fn shard_main(
             // shifts one slab id and root is lost after the first restart.
             let recovered = recover::<ServerNgMuxStateMachine>(
                 data_dir,
-                topology.replica_count == 1,
+                ReplicaIdentity {
+                    cluster: topology.cluster_id,
+                    replica_id: topology.self_replica_id,
+                    replica_count: topology.replica_count,
+                },
                 config.metadata.journal_slots,
                 config.metadata.clients_table_max,
                 |mux_stm| {
@@ -931,16 +936,16 @@ async fn shard_main(
             .await?;
             (
                 recovered.mux_stm,
-                Some((
-                    recovered.journal,
-                    recovered.snapshot,
-                    recovered.last_applied_op,
-                    recovered.last_journaled_op,
-                    recovered.client_table,
-                    recovered.superblock,
-                    recovered.recovered_state,
-                    recovered.snapshot_checkpoint,
-                )),
+                Some(RecoveredOwnerState {
+                    journal: recovered.journal,
+                    snapshot: recovered.snapshot,
+                    last_applied_op: recovered.last_applied_op,
+                    last_journaled_op: recovered.last_journaled_op,
+                    client_table: recovered.client_table,
+                    superblock: recovered.superblock,
+                    recovered_state: recovered.recovered_state,
+                    snapshot_checkpoint: recovered.snapshot_checkpoint,
+                }),
             )
         }
         MetadataHandoff::Waiter { bundle_rx } => {
@@ -965,55 +970,21 @@ async fn shard_main(
         superblock_for_metadata,
         checkpoint_seed,
         recovered_client_table,
-    ) = if let Some((
-        journal,
-        snapshot,
-        last_applied_op,
-        last_journaled_op,
-        client_table,
-        superblock,
-        recovered_state,
-        snapshot_checkpoint,
-    )) = owner_state
-    {
-        let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-        let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
-        let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
+    ) = if let Some(owner) = owner_state {
         // `recover()` already opened the superblock, read `recovered_state`, and
         // verified the on-disk snapshot against its checkpoint pairing BEFORE decoding
         // it. Reuse that superblock rather than re-opening it, which would fork the
         // ping-pong sequence counter. Consensus recovers its true (view, log_view)
         // from `recovered_state` instead of inferring a stale view from the WAL.
-        let consensus = restore_metadata_consensus(
-            &journal,
-            restored_op,
-            commit_watermark,
-            topology.cluster_id,
-            topology.self_replica_id,
-            topology.replica_count,
-            Rc::clone(&bus),
-            config.metadata.prepare_queue_depth,
-            cluster_heartbeat_ticks(config),
-            commit_broadcast_ticks(config),
-            prepare_retransmit_ticks(config),
-            view_change_retransmit_ticks(config),
-            view_change_status_ticks(config),
-            request_start_view_ticks(config),
-            config.cluster.view_probe_attempts_max,
-            recovery_barrier_deadline(
-                config.cluster.heartbeat_timeout.get_duration(),
-                config.cluster.view_change_status_timeout.get_duration(),
-            ),
-            recovered_state,
-        );
-        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(superblock);
+        let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
+        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(owner.superblock);
         (
             Some(consensus),
-            Some(journal),
-            snapshot,
+            Some(owner.journal),
+            owner.snapshot,
             Some(superblock),
-            snapshot_checkpoint,
-            Some(client_table),
+            owner.snapshot_checkpoint,
+            Some(owner.client_table),
         )
     } else {
         (None, None, None, None, (0, 0), None)
@@ -1901,29 +1872,52 @@ pub(crate) fn repair_retry_ticks(config: &ServerNgConfig) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn restore_metadata_consensus(
-    journal: &PrepareJournal,
-    restored_op: u64,
-    commit_watermark: u64,
-    cluster_id: u128,
-    self_replica_id: u8,
-    replica_count: u8,
-    bus: Rc<IggyMessageBus>,
-    prepare_queue_depth: usize,
-    normal_heartbeat_ticks: u64,
-    commit_message_ticks: u64,
-    prepare_ticks: u64,
-    view_change_retransmit_ticks: u64,
-    view_change_status_ticks: u64,
-    request_start_view_ticks: u64,
-    probe_attempts_max: u32,
-    recovery_deadline: Duration,
+/// Shard 0's half of a metadata recovery: everything [`recover`] produced except the
+/// state machine, which every shard receives through the factory bundle.
+///
+/// Named rather than a positional tuple: the fields are same-typed `Option<u64>`s and
+/// `(u64, u128)` pairs that a reorder would silently rebind, and one of them decides
+/// what view the replica boots into.
+struct RecoveredOwnerState {
+    journal: PrepareJournal,
+    snapshot: Option<IggySnapshot>,
+    last_applied_op: Option<u64>,
+    last_journaled_op: Option<u64>,
+    client_table: ClientTable,
+    superblock: PingPongSuperblock,
     recovered_state: Option<VsrState>,
+    snapshot_checkpoint: (u64, u128),
+}
+
+/// Rebuild metadata consensus from what recovery read off this replica's own disk.
+///
+/// Takes the recovery result, topology and config whole rather than the dozen-plus
+/// scalars it needs from them: most were `u64` tick counts, where a misordered
+/// argument type-checks and mistunes a timeout silently.
+fn restore_metadata_consensus(
+    owner: &RecoveredOwnerState,
+    topology: &TcpTopology,
+    config: &ServerNgConfig,
+    bus: Rc<IggyMessageBus>,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
+    let journal = &owner.journal;
+    let replica_count = topology.replica_count;
+    let recovered_state = owner.recovered_state;
+    let snapshot_floor = owner
+        .snapshot
+        .as_ref()
+        .map_or(0, IggySnapshot::sequence_number);
+    let commit_watermark = owner.last_applied_op.unwrap_or(snapshot_floor);
+    let restored_op = owner.last_journaled_op.unwrap_or(snapshot_floor);
+    let recovery_deadline = recovery_barrier_deadline(
+        config.cluster.heartbeat_timeout.get_duration(),
+        config.cluster.view_change_status_timeout.get_duration(),
+    );
+    let prepare_queue_depth = config.metadata.prepare_queue_depth;
+
     let mut consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
+        topology.cluster_id,
+        topology.self_replica_id,
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
@@ -1932,13 +1926,13 @@ fn restore_metadata_consensus(
         // in-flight prepares and drain as prepares commit.
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
-    consensus.set_normal_heartbeat_ticks(normal_heartbeat_ticks);
-    consensus.set_commit_message_ticks(commit_message_ticks);
-    consensus.set_prepare_ticks(prepare_ticks);
-    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks);
-    consensus.set_view_change_status_ticks(view_change_status_ticks);
-    consensus.set_request_start_view_ticks(request_start_view_ticks);
-    consensus.set_probe_attempts_max(probe_attempts_max);
+    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
+    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
     // Fresh random incarnation each boot, so a StartView addressed to a previous
     // incarnation still in flight is ignored (`handle_start_view` guard). `| 1`
     // guarantees the non-zero the guard treats as set. The deterministic simulator
@@ -1965,18 +1959,23 @@ fn restore_metadata_consensus(
         consensus.set_view(header.view);
     }
 
-    // On a RESTART in a cluster (a non-empty WAL proves a prior life),
-    // rejoin as a quorum-invisible backup and probe for the current view
-    // (`RequestStartView`): the view's primary answers with a `StartView`,
-    // the replica adopts it as a backup, and journal repair fills any WAL
-    // gap. A probing replica never resumes primaryship -- if this replica
-    // IS the current primary-by-index, its probe makes the backups elect
-    // past it.
+    // On a RESTART in a cluster, rejoin as a quorum-invisible backup and
+    // probe for the current view (`RequestStartView`): the view's primary
+    // answers with a `StartView`, the replica adopts it as a backup, and
+    // journal repair fills any WAL gap. A probing replica never resumes
+    // primaryship -- if this replica IS the current primary-by-index, its
+    // probe makes the backups elect past it.
     // The probe re-broadcasts on its timeout, so it needs no live mesh at
-    // boot. A FRESH boot (empty WAL) keeps the plain init: the cluster
-    // needs its view-0 primary to exist, and a single-replica cluster has
-    // no peer to ask.
-    if replica_count > 1 && restored_op > 0 {
+    // boot. A FRESH boot keeps the plain init: the cluster needs its view-0
+    // primary to exist, and a single-replica cluster has no peer to ask.
+    //
+    // Prior life is EITHER a non-empty WAL or a recovered superblock. A view
+    // change persists without touching the WAL, so a replica that changed
+    // view before its first metadata write comes back with a non-zero view
+    // and an empty journal; gating on the WAL alone would `init()` it into
+    // `Status::Normal` as primary for a view the cluster may have moved past,
+    // with `ceded_primaryship` false and no probe to correct it.
+    if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
         consensus.init_as_backup();
         consensus.begin_view_probe();
     } else {
@@ -2050,7 +2049,7 @@ fn restore_metadata_consensus(
                 break;
             };
             let mut entry = PipelineEntry::new(*header);
-            entry.add_ack(self_replica_id);
+            entry.add_ack(topology.self_replica_id);
             pipeline.push(entry);
         }
     }

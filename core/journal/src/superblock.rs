@@ -51,6 +51,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+
+use crate::prepare_journal::TmpFileGuard;
 use twox_hash::XxHash3_64;
 
 /// Identifies a superblock file and rejects a foreign or zeroed one. "SBLK".
@@ -66,6 +68,16 @@ const HEADER_LEN: usize = 28;
 const CHECKSUM_LEN: usize = 8;
 /// Smallest well-formed record (empty payload).
 const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
+
+/// Ceiling on a record's payload, bounding every allocation this module makes from
+/// a length it read off disk (`PrepareJournal::MAX_ENTRY_SIZE` bounds the WAL for the
+/// same reason). The only payload today is a 58-byte [`VsrState`]; the headroom is
+/// for a payload that grows fields, not for bulk data. `read_slot` treats a longer
+/// file as corrupt WITHOUT reading it, and `build_record` refuses to write one, so a
+/// length this store could have produced is always in bounds.
+const MAX_PAYLOAD_LEN: usize = 4096;
+/// Largest record `read_slot` will read into memory.
+const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN;
 
 const FILE_A: &str = "superblock.a";
 const FILE_B: &str = "superblock.b";
@@ -245,7 +257,7 @@ impl SuperblockStore for PingPongSuperblock {
             ));
         }
         // Single-writer contract: callers MUST serialize `write` (the metadata
-        // durability lock does). `sequence`/`slot` are read before the
+        // superblock lock does). `sequence`/`slot` are read before the
         // `atomic_replace` await and committed after it, so two overlapping
         // writers would target the same slot and could tear it while both return
         // `Ok`. The ping-pong guarantee, that the non-written slot is always an
@@ -254,15 +266,12 @@ impl SuperblockStore for PingPongSuperblock {
         let slot = self.next_slot.get();
         // Built before the first await so the `payload` borrow does not span it.
         let record = build_record(sequence, payload)?;
+        // RAII, not a manual clear: a dropped write future would otherwise leave the
+        // flag latched for the store's lifetime and make every later write panic on a
+        // contract nobody violated, sending whoever debugs it to audit the lock.
         #[cfg(debug_assertions)]
-        assert!(
-            !self.writing.replace(true),
-            "PingPongSuperblock::write called concurrently; writes must be externally serialized"
-        );
-        let result = atomic_replace(&self.dir, slot.file_name(), record).await;
-        #[cfg(debug_assertions)]
-        self.writing.set(false);
-        result?;
+        let _writing = WritingGuard::acquire(&self.writing);
+        atomic_replace(&self.dir, slot.file_name(), record).await?;
         self.next_sequence.set(sequence + 1);
         self.next_slot.set(slot.other());
         Ok(())
@@ -275,6 +284,29 @@ impl SuperblockStore for PingPongSuperblock {
     }
 }
 
+/// Holds the single-writer tripwire for one `write`, clearing it on drop so a
+/// cancelled write future cannot latch it. Debug builds only.
+#[cfg(debug_assertions)]
+struct WritingGuard<'a>(&'a Cell<bool>);
+
+#[cfg(debug_assertions)]
+impl<'a> WritingGuard<'a> {
+    fn acquire(writing: &'a Cell<bool>) -> Self {
+        assert!(
+            !writing.replace(true),
+            "PingPongSuperblock::write called concurrently; writes must be externally serialized"
+        );
+        Self(writing)
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for WritingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 fn checksum(bytes: &[u8]) -> u64 {
     let mut hasher = XxHash3_64::new();
     hasher.write(bytes);
@@ -282,6 +314,18 @@ fn checksum(bytes: &[u8]) -> u64 {
 }
 
 fn build_record(sequence: u64, payload: &[u8]) -> io::Result<Vec<u8>> {
+    // Refuse here rather than at the next boot: a record over the read ceiling would
+    // be written durably and then classified corrupt, which blocks writes and refuses
+    // boot over a payload the caller could have been told about synchronously.
+    if payload.len() > MAX_PAYLOAD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "superblock payload is {} bytes, over the {MAX_PAYLOAD_LEN}-byte ceiling",
+                payload.len()
+            ),
+        ));
+    }
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "superblock payload too large"))?;
 
@@ -296,36 +340,6 @@ fn build_record(sequence: u64, payload: &[u8]) -> io::Result<Vec<u8>> {
     let ck = checksum(&record);
     record.extend_from_slice(&ck.to_le_bytes());
     Ok(record)
-}
-
-/// Parse and verify a record. Returns `(sequence, payload)` or `None` if the
-/// bytes are not a valid, checksum-clean record of a known version.
-fn parse_record(bytes: &[u8]) -> Option<(u64, Vec<u8>)> {
-    if bytes.len() < MIN_RECORD_LEN {
-        return None;
-    }
-    if u32::from_le_bytes(bytes[0..4].try_into().ok()?) != SUPERBLOCK_MAGIC {
-        return None;
-    }
-    if u16::from_le_bytes(bytes[4..6].try_into().ok()?) != SUPERBLOCK_VERSION {
-        return None;
-    }
-    let sequence = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let payload_len = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
-
-    let checksum_start = HEADER_LEN.checked_add(payload_len)?;
-    if bytes.len() != checksum_start.checked_add(CHECKSUM_LEN)? {
-        return None;
-    }
-    let stored = u64::from_le_bytes(
-        bytes[checksum_start..checksum_start + CHECKSUM_LEN]
-            .try_into()
-            .ok()?,
-    );
-    if checksum(&bytes[..checksum_start]) != stored {
-        return None;
-    }
-    Some((sequence, bytes[HEADER_LEN..checksum_start].to_vec()))
 }
 
 /// Reach the same verdict as [`PingPongSuperblock::read_latest`] from the two
@@ -345,12 +359,12 @@ pub fn decode_slots(slot_a: Option<&[u8]>, slot_b: Option<&[u8]>) -> SuperblockC
 enum SlotClass {
     /// File missing or zero-length.
     Absent,
-    /// Bytes present but unusable: bad magic, too short, or a length/checksum
-    /// failure on a record of the current version.
-    Corrupt,
-    /// Magic matched but the format `version` is unknown to this build, so
-    /// nothing past it can be trusted or checksum-verified.
-    UnsupportedVersion(u16),
+    /// Bytes present but unusable: too short, foreign magic, or a length/checksum
+    /// failure. `version` is `Some` when the magic matched but the format version is
+    /// unknown to this build, so nothing past that field can be trusted or
+    /// checksum-verified; [`combine_slots`] reports that case over generic corruption,
+    /// since it names a downgrade.
+    Corrupt { version: Option<u16> },
     /// A checksum-clean record of the current version.
     Valid { sequence: u64, payload: Vec<u8> },
 }
@@ -364,28 +378,49 @@ fn classify_bytes(bytes: Option<&[u8]>) -> SlotClass {
     }
 }
 
-/// Classify one slot's raw, non-empty bytes.
+/// Classify one slot's raw, non-empty bytes: framing, version, payload length and
+/// checksum in one pass, so no slot is parsed twice.
 fn classify(bytes: &[u8]) -> SlotClass {
+    let corrupt = SlotClass::Corrupt { version: None };
     // Too short to hold even the framing, or a foreign file: unusable bytes.
     if bytes.len() < MIN_RECORD_LEN {
-        return SlotClass::Corrupt;
+        return corrupt;
     }
     if u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != SUPERBLOCK_MAGIC {
-        return SlotClass::Corrupt;
+        return corrupt;
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     if version != SUPERBLOCK_VERSION {
-        // Magic matched, so a superblock writer produced this, but the framing
-        // past the version field may differ, so neither the payload length nor
-        // the checksum can validate it. Surface the version so recovery can name
-        // it (a downgrade).
-        return SlotClass::UnsupportedVersion(version);
+        // Magic matched, so a superblock writer produced this, but the framing past
+        // the version field may differ, so neither the payload length nor the checksum
+        // can validate it.
+        return SlotClass::Corrupt {
+            version: Some(version),
+        };
     }
-    // `parse_record` re-checks magic/version (cheap) and applies this build's
-    // length + checksum validation.
-    match parse_record(bytes) {
-        Some((sequence, payload)) => SlotClass::Valid { sequence, payload },
-        None => SlotClass::Corrupt,
+
+    let payload_len = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as usize;
+    // `decode_slots` is public and takes bytes straight from a caller, so bound the
+    // length field here too, not only via `read_slot`'s file-size ceiling.
+    if payload_len > MAX_PAYLOAD_LEN {
+        return corrupt;
+    }
+    let checksum_start = HEADER_LEN + payload_len;
+    if bytes.len() != checksum_start + CHECKSUM_LEN {
+        return corrupt;
+    }
+    let Ok(stored) = bytes[checksum_start..checksum_start + CHECKSUM_LEN].try_into() else {
+        return corrupt;
+    };
+    if checksum(&bytes[..checksum_start]) != u64::from_le_bytes(stored) {
+        return corrupt;
+    }
+
+    SlotClass::Valid {
+        sequence: u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]),
+        payload: bytes[HEADER_LEN..checksum_start].to_vec(),
     }
 }
 
@@ -422,8 +457,18 @@ fn combine_slots(a: SlotClass, b: SlotClass) -> SuperblockContents {
             SuperblockContents::Present(payload)
         }
         (SlotClass::Absent, SlotClass::Absent) => SuperblockContents::Empty,
-        (SlotClass::UnsupportedVersion(version), _)
-        | (_, SlotClass::UnsupportedVersion(version)) => SuperblockContents::Unreadable {
+        (
+            SlotClass::Corrupt {
+                version: Some(version),
+            },
+            _,
+        )
+        | (
+            _,
+            SlotClass::Corrupt {
+                version: Some(version),
+            },
+        ) => SuperblockContents::Unreadable {
             version: Some(version),
         },
         _ => SuperblockContents::Unreadable { version: None },
@@ -434,7 +479,7 @@ fn combine_slots(a: SlotClass, b: SlotClass) -> SuperblockContents {
 const fn sequence_of(slot: &SlotClass) -> Option<u64> {
     match slot {
         SlotClass::Valid { sequence, .. } => Some(*sequence),
-        SlotClass::Absent | SlotClass::Corrupt | SlotClass::UnsupportedVersion(_) => None,
+        SlotClass::Absent | SlotClass::Corrupt { .. } => None,
     }
 }
 
@@ -442,7 +487,7 @@ const fn sequence_of(slot: &SlotClass) -> Option<u64> {
 /// ruled out as the newer. An absent slot never held a record to lose, so it is
 /// not one of these.
 const fn has_unreadable_sequence(slot: &SlotClass) -> bool {
-    matches!(slot, SlotClass::Corrupt | SlotClass::UnsupportedVersion(_))
+    matches!(slot, SlotClass::Corrupt { .. })
 }
 
 async fn read_slot(path: &Path) -> io::Result<SlotClass> {
@@ -455,8 +500,15 @@ async fn read_slot(path: &Path) -> io::Result<SlotClass> {
     if len == 0 {
         return Ok(SlotClass::Absent);
     }
-    let len = usize::try_from(len)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "superblock file too large"))?;
+    // Bound the allocation on `st_size` before making it. A file longer than a
+    // well-formed record cannot be one: `classify` demands an exact length, so
+    // reading it would spend the allocation only to conclude "corrupt". The realistic
+    // producer is a foreign or leftover file, not bit-rot, since the value is the
+    // file's size rather than a field inside it.
+    let len = match usize::try_from(len) {
+        Ok(len) if len <= MAX_RECORD_LEN => len,
+        _ => return Ok(SlotClass::Corrupt { version: None }),
+    };
     let buf = vec![0u8; len];
     let (result, buf) = file.read_exact_at(buf, 0).await.into();
     result?;
@@ -471,12 +523,18 @@ async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Resu
     let tmp_path = dir.join(format!("{file_name}.tmp"));
     let final_path = dir.join(file_name);
 
+    // Unlink the temp on any failure before the rename. Not a correctness matter,
+    // since `File::create` truncates and `next_sequence` / `next_slot` stay
+    // un-advanced so a retry re-targets the same slot; it keeps a failing disk from
+    // littering `superblock.{a,b}.tmp` next to the slots an operator is inspecting.
+    let guard = TmpFileGuard::new(tmp_path.clone());
     let mut tmp = compio::fs::File::create(&tmp_path).await?;
     let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
     result?;
     tmp.sync_all().await?;
 
     compio::fs::rename(&tmp_path, &final_path).await?;
+    guard.defuse();
 
     let dir_file = compio::fs::File::open(dir).await?;
     dir_file.sync_all().await?;
@@ -681,7 +739,7 @@ mod tests {
 
     // Two `write`s interleaving across the `atomic_replace` await read the same
     // `(sequence, slot)` and would tear that slot while both report success.
-    // Production serializes writes behind the metadata durability lock; this
+    // Production serializes writes behind the metadata superblock lock; this
     // proves the debug tripwire catches a bypass instead of corrupting a slot.
     // Compiled out of release builds.
     #[cfg(debug_assertions)]
@@ -694,5 +752,73 @@ mod tests {
         // holding the writer flag, so the second trips the assert on the same poll.
         let (first, second) = futures::future::join(sb.write(b"first"), sb.write(b"second")).await;
         let _ = (first, second);
+    }
+
+    // A dropped write future must not latch the tripwire: the flag is a
+    // single-writer contract check, and leaving it set would make every later write
+    // panic on a violation that never happened.
+    #[cfg(debug_assertions)]
+    #[compio::test]
+    async fn given_dropped_write_future_when_writing_again_should_not_trip_guard() {
+        let dir = tempdir().unwrap();
+        let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
+        {
+            let mut write = Box::pin(sb.write(b"cancelled"));
+            // One poll parks it inside `atomic_replace` with the flag held, then the
+            // future is dropped without ever completing.
+            assert!(
+                futures::poll!(&mut write).is_pending(),
+                "the write must park on file I/O for this to model a cancellation"
+            );
+        }
+
+        sb.write(b"after").await.unwrap();
+        assert_eq!(
+            sb.read_latest().await.unwrap(),
+            SuperblockContents::Present(b"after".to_vec())
+        );
+    }
+
+    #[compio::test]
+    async fn given_oversized_payload_when_write_should_refuse() {
+        // Refused synchronously rather than written and then classified corrupt on the
+        // next boot, which would block writes and refuse boot over a payload the
+        // caller could have been told about here.
+        let dir = tempdir().unwrap();
+        let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
+        let error = sb
+            .write(&vec![0u8; MAX_PAYLOAD_LEN + 1])
+            .await
+            .expect_err("a payload over the ceiling must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            sb.read_latest().await.unwrap(),
+            SuperblockContents::Empty,
+            "a refused write must leave the store untouched"
+        );
+    }
+
+    #[compio::test]
+    async fn given_oversized_slot_file_when_read_latest_should_refuse_without_reading_it() {
+        // A file longer than a well-formed record cannot be one (`classify` demands
+        // an exact length), so it is classified from its size alone. The verdict must
+        // still be the fail-closed one: a foreign file in a slot is not a fresh
+        // deployment.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(SLOT_FILE_NAMES[0]);
+        let mut bytes = Vec::with_capacity(MAX_RECORD_LEN + 1);
+        bytes.extend_from_slice(&SUPERBLOCK_MAGIC.to_le_bytes());
+        bytes.resize(MAX_RECORD_LEN + 1, 0);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let sb = PingPongSuperblock::open(dir.path()).await.unwrap();
+        assert_eq!(
+            sb.read_latest().await.unwrap(),
+            SuperblockContents::Unreadable { version: None }
+        );
+        assert!(
+            sb.write(b"payload").await.is_err(),
+            "a slot whose generation is unknowable must block writes"
+        );
     }
 }

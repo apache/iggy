@@ -1056,9 +1056,10 @@ pub struct StartViewHeader {
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
     /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
-    /// A peer that predates it sends zeros, decoding as `incarnation == 0`, inert
-    /// per the `handle_start_view` guard, so a mixed-version rolling upgrade is
-    /// wire-compatible.
+    /// A peer that predates it sends zeros, decoding as `incarnation == 0`, which
+    /// the `handle_start_view` guard treats as no claim rather than as a foreign
+    /// one, so a mixed-version rolling upgrade is wire-compatible: the pre-upgrade
+    /// peer's `StartView` is judged by the view checks alone, as before the field.
     pub incarnation: u128,
 }
 const _: () = {

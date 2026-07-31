@@ -697,16 +697,22 @@ pub enum VsrAction {
     /// Stamped with the prober's view so peers can fence stale duplicates
     /// out of the probed-primary election path.
     SendRequestStartView { view: u32, namespace: u64 },
-    /// Send `StartView` to all backups (as new primary).
+    /// Send `StartView`, as the view's primary.
     ///
     /// `incarnation` echoes the requester's nonce when this answers a
     /// `RequestStartView` probe (freshness proof), and is `0` on an unsolicited
     /// send at view-change completion (carries no freshness claim).
+    ///
+    /// `target` is the probing replica for an echo and `None` for an unsolicited
+    /// broadcast. An echo must not be broadcast: the nonce it carries is one
+    /// replica's freshness proof, and every other peer that is itself recovering
+    /// reads a foreign nonce and rejects an otherwise current `StartView`.
     SendStartView {
         view: u32,
         op: u64,
         commit: u64,
         incarnation: u128,
+        target: Option<u8>,
         namespace: u64,
     },
     /// Send `PrepareOK` for each op in `[from_op, to_op]` that is present in the WAL.
@@ -1056,9 +1062,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// primary for different planes and clients route to the wrong one. Join
     /// as a backup instead; either the peers' heartbeat timeout elects a
     /// primary and its `StartView` brings this replica forward, or this
-    /// replica's own silence provokes that election. Unlike
-    /// [`Self::init_recovering`] the local journal is intact, so the normal
-    /// commit walk applies it -- no commit-floor fast-forward.
+    /// replica's own silence provokes that election.
+    ///
+    /// The local journal is intact here, so the normal commit walk applies it and no
+    /// commit-floor fast-forward is needed. Callers pair this with
+    /// [`Self::begin_view_probe`], which moves the replica to `Status::Recovering` so
+    /// it stays quorum-invisible until a `StartView` answers.
     pub fn init_as_backup(&self) {
         self.status.set(Status::Normal);
         self.ceded_primaryship.set(true);
@@ -1479,7 +1488,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// The caller passes what it wrote because the in-memory view can advance
     /// across the write's `.await`, when a concurrent checkpoint holds the
-    /// durability lock while the pump adopts a newer view via `handle_start_view`.
+    /// superblock lock while the pump adopts a newer view via `handle_start_view`.
     /// Re-reading `self.view` here would mark that newer, unwritten view durable,
     /// and [`Self::needs_superblock_persist`] would wrongly report it safe to
     /// send: the split-brain footgun this signature removes.
@@ -2309,11 +2318,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
         // Echo the requester's incarnation so it can prove this StartView
         // post-dates its restart (a probe reply, not a stale in-flight message).
+        // Addressed to the requester alone: the nonce proves freshness for that
+        // replica only, and a peer recovering at the same time would read it as
+        // foreign and reject a StartView that is in fact current.
         vec![VsrAction::SendStartView {
             view: self.view.get(),
             op: self.sequencer.current_sequence(),
             commit: self.commit_max.get(),
             incarnation: header.incarnation,
+            target: Some(header.replica),
             namespace: self.namespace,
         }]
     }
@@ -2385,9 +2398,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // in flight, and adopting it could install a stale head and let this replica
         // act in a view it will not remember after another crash. Inert when no
         // incarnation is set (partition plane, tests).
+        //
+        // A zero `header.incarnation` makes no claim either way: it is what an
+        // unsolicited StartView carries, and what a peer predating the field sends.
+        // Classifying it stale would have this replica reject a current StartView
+        // from a healthy primary purely because that primary is older, so it falls
+        // through to the view checks that governed before the field existed.
         let self_incarnation = self.incarnation.get();
         if self.status.get() == Status::Recovering
             && self_incarnation != 0
+            && header.incarnation != 0
             && msg_view <= self.view.get()
             && msg_op < self.sequencer.current_sequence()
             && header.incarnation != self_incarnation
@@ -2403,11 +2423,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        // Skip equal-view SV with old op.
-        // Already in this view; re-running reset_view_change_state would
-        // cancel subscribers (waking register awaiters Canceled) and clear
-        // pipeline for nothing. log_view (not self.view) tracks last-normal view.
-        if msg_view == self.log_view.get() && msg_op < self.sequencer.current_sequence() {
+        // Skip an equal-view StartView whose op is below our COMMITTED floor. Such a
+        // message can only be stale: a live primary's head covers every op it ever
+        // told us was committed. Already in this view, so re-running
+        // reset_view_change_state for one would cancel subscribers (waking register
+        // awaiters Canceled) and clear the pipeline for nothing. log_view (not
+        // self.view) tracks the last-normal view.
+        //
+        // The bound is deliberately the commit floor and NOT the sequencer head.
+        // Adopting a StartView drops the head (below) without truncating the WAL, so
+        // a replica that adopted at head H and then restarted re-derives a LONGER
+        // head from its own journal while log_view stays at that same view. Skipping
+        // on the head would drop the primary's StartView there -- including the reply
+        // echoing this replica's own probe -- leaving it to time the probe out and
+        // elect instead, with a DoViewChange of (log_view, discarded_head) that
+        // outranks the real primary's and pushes ops that view already discarded back
+        // over committed bodies.
+        //
+        // TODO(suffix-truncation): re-adoption drops the head again, but the WAL
+        // still holds the discarded suffix, so the primary's next prepare lands on an
+        // op that suffix already occupies and fails `append`'s slot-collision check,
+        // poisoning the journal. Loud beats the silent divergence above; a durable
+        // truncate-from-op primitive is what actually closes it.
+        if msg_view == self.log_view.get() && msg_op < self.commit_min() {
             return Vec::new();
         }
 
@@ -2624,12 +2662,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         emit_replica_event(SimEventKind::ReplicaStateChanged, &state);
 
         // Unsolicited StartView at view-change completion: no probe to answer,
-        // so it carries no incarnation (freshness comes from the newer view).
+        // so it carries no incarnation (freshness comes from the newer view) and
+        // goes to every backup.
         let action = VsrAction::SendStartView {
             view: self.view.get(),
             op: new_op,
             commit: max_commit,
             incarnation: 0,
+            target: None,
             namespace: self.namespace,
         };
         emit_sim_event(
@@ -2834,9 +2874,21 @@ where
         // survives view-change retransmits. The header `checksum` and its `parent`
         // chain stay `0`: activating them needs the retransmit path to re-seal a
         // re-stamped header, a separate change.
-        let checksum_body = u128::from(calculate_checksum(
-            &self.as_slice()[size_of::<PrepareHeader>()..],
-        ));
+        //
+        // Metadata plane only. A partition produce prepare already carries a verified
+        // `batch_checksum` over the same bytes, so a second full-payload pass is pure
+        // cost on the produce path, and it would describe the WRONG bytes:
+        // `stamp_prepare_for_persistence` rewrites the command header INSIDE this
+        // sealed region before the entry is journaled. Leaving those prepares at `0`
+        // is the designed "nothing to verify" sentinel, so a future durable partition
+        // journal skips verification instead of failing every entry as corrupt.
+        let checksum_body = if consensus.namespace == METADATA_CONSENSUS_NAMESPACE {
+            u128::from(calculate_checksum(
+                &self.as_slice()[size_of::<PrepareHeader>()..],
+            ))
+        } else {
+            0
+        };
 
         self.transmute_header(|old, new| {
             *new = PrepareHeader {
@@ -3309,37 +3361,37 @@ mod timestamp_clamp_tests {
         );
     }
 
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_start_view(
+        view: u32,
+        op: u64,
+        replica: u8,
+        incarnation: u128,
+    ) -> Message<StartViewHeader> {
+        let size = std::mem::size_of::<StartViewHeader>();
+        let mut msg = Message::<StartViewHeader>::new(size);
+        let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
+            &mut msg.as_mut_slice()[..size],
+        )
+        .expect("zeroed bytes are a valid StartViewHeader");
+        header.command = Command2::StartView;
+        header.cluster = 1;
+        header.view = view;
+        header.op = op;
+        header.commit = op;
+        header.replica = replica;
+        header.incarnation = incarnation;
+        header.namespace = METADATA_CONSENSUS_NAMESPACE;
+        header.size = size as u32;
+        msg
+    }
+
     #[test]
     fn given_recovering_replica_when_start_view_incarnation_foreign_should_ignore() {
         // A StartView addressed to a PREVIOUS incarnation, still in flight when the
         // replica crashed, must be ignored after restart, while the reply echoing
         // the CURRENT incarnation is adopted. Otherwise the replica could act in a
         // view it will not remember after another crash.
-        #[allow(clippy::cast_possible_truncation)]
-        fn make_start_view(
-            view: u32,
-            op: u64,
-            replica: u8,
-            incarnation: u128,
-        ) -> Message<StartViewHeader> {
-            let size = std::mem::size_of::<StartViewHeader>();
-            let mut msg = Message::<StartViewHeader>::new(size);
-            let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
-                &mut msg.as_mut_slice()[..size],
-            )
-            .expect("zeroed bytes are a valid StartViewHeader");
-            header.command = Command2::StartView;
-            header.cluster = 1;
-            header.view = view;
-            header.op = op;
-            header.commit = op;
-            header.replica = replica;
-            header.incarnation = incarnation;
-            header.namespace = METADATA_CONSENSUS_NAMESPACE;
-            header.size = size as u32;
-            msg
-        }
-
         const CURRENT: u128 = 0xB;
         const STALE: u128 = 0xA;
 
@@ -3393,6 +3445,115 @@ mod timestamp_clamp_tests {
             Status::Normal,
             "adopting a StartView transitions to Normal"
         );
+    }
+
+    #[test]
+    fn given_partition_namespace_when_projecting_should_leave_the_body_unsealed() {
+        // The body seal is metadata-only. A partition produce prepare already carries a
+        // verified `batch_checksum` over the same bytes, so a second full-payload hash
+        // is pure cost on the produce path, and it would describe bytes that never reach
+        // the journal: `stamp_prepare_for_persistence` rewrites the command header
+        // inside the sealed region. `0` is the designed "nothing to verify" sentinel, so
+        // a durable partition journal skips verification rather than reading every entry
+        // as corrupt.
+        let seal = |namespace: u64| -> u128 {
+            // Fixed clock: `project` stamps the prepare timestamp, and Miri covers this
+            // crate, where a real clock read is an unsupported syscall.
+            let consensus = VsrConsensus::with_clock(
+                1,
+                0,
+                1,
+                namespace,
+                NoopBus,
+                LocalPipeline::new(),
+                ConsensusClock::new(Rc::new(FixedClock(100_000))),
+            );
+            let header_size = size_of::<RequestHeader>();
+            let body = b"produce payload";
+            let mut msg = Message::<RequestHeader>::new(header_size + body.len());
+            msg.as_mut_slice()[header_size..].copy_from_slice(body);
+            let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+                &mut msg.as_mut_slice()[..header_size],
+            )
+            .expect("zeroed bytes are a valid RequestHeader");
+            header.command = Command2::Request;
+            header.client = 1;
+            header.request = 1;
+            header.operation = iggy_binary_protocol::Operation::SendMessages;
+            header.size = u32::try_from(header_size + body.len()).expect("fits u32");
+            msg.project(&consensus).header().checksum_body
+        };
+
+        assert_ne!(
+            seal(METADATA_CONSENSUS_NAMESPACE),
+            0,
+            "a metadata prepare must be sealed: the WAL scan verifies it after a crash"
+        );
+        assert_eq!(
+            seal(1),
+            0,
+            "a partition prepare must be left unsealed, since its sealed region is \
+             rewritten before it is journaled"
+        );
+    }
+
+    #[test]
+    fn given_restored_log_view_when_start_view_head_behind_wal_should_adopt() {
+        // A replica that adopted a StartView at head 105 in view 7, then crashed,
+        // recovers log_view = 7 from the superblock but re-derives head 120 from its
+        // own WAL: adoption drops the head without truncating the journal. The
+        // primary's StartView for view 7 then carries an op BEHIND that head, and
+        // skipping it on the head comparison would leave this replica probing until it
+        // elected instead, carrying a DoViewChange of (7, 120) that outranks the real
+        // primary's (7, 105) and resurrects ops view 7 already discarded.
+        //
+        // Replica 0 of 3 at view 7, whose primary is replica 1 (7 % 3). Incarnation
+        // left at 0 so the recovering-replica guard stays inert and this exercises the
+        // equal-view path alone.
+        let mut consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.set_view(7);
+        consensus.set_log_view(7);
+        consensus.restore_commit_state(105, 105);
+        consensus.sequencer().set_sequence(120);
+
+        // Below the committed floor: stale by construction, since a live primary's
+        // head covers every op it told us was committed.
+        assert!(
+            consensus
+                .handle_start_view(PlaneKind::Metadata, make_start_view(7, 104, 1, 0).header())
+                .is_empty(),
+            "an equal-view StartView below the commit floor must be skipped"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            120,
+            "a skipped StartView must not move the head"
+        );
+
+        // At the committed floor but behind our WAL head: the primary's real head.
+        // Adopt it and drop the discarded suffix.
+        assert!(
+            !consensus
+                .handle_start_view(PlaneKind::Metadata, make_start_view(7, 105, 1, 0).header())
+                .is_empty(),
+            "an equal-view StartView at or above the commit floor must be adopted, \
+             even when its head is behind a WAL suffix the view already discarded"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            105,
+            "adoption must drop the head to the primary's, so a later DoViewChange \
+             cannot outrank it with a discarded suffix"
+        );
+        assert_eq!(consensus.status(), Status::Normal);
     }
 
     /// The split-brain gate's predicate: `view` and `log_view` each independently

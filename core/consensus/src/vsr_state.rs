@@ -40,12 +40,17 @@ pub const ENCODED_LEN: usize = 58;
 /// an old view and split the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsrState {
-    /// Cluster this superblock belongs to. Recovery rejects a mismatch (a copied
-    /// or misplaced data directory).
+    /// Cluster this superblock belongs to. Recovery rejects a mismatch: a copied or
+    /// misplaced data directory. Catches misplacement only, never staleness -- an
+    /// older backup of this replica's own directory carries the right identity and
+    /// passes.
     pub cluster: u128,
-    /// Replica index this superblock belongs to. Recovery rejects a mismatch.
+    /// Replica index this superblock belongs to. Recovery rejects a mismatch, with
+    /// the same misplacement-only scope as `cluster`.
     pub replica_id: u8,
-    /// Cluster size at write time.
+    /// Cluster size at write time. Recovery rejects a mismatch: quorum size and the
+    /// `view % replica_count` primary mapping both derive from it, so booting a
+    /// resized cluster without reconfiguration splits the log.
     pub replica_count: u8,
     /// Current view.
     pub view: u32,
@@ -53,6 +58,11 @@ pub struct VsrState {
     /// as a backup, or completed a DVC quorum as primary). `log_view <= view`.
     pub log_view: u32,
     /// Highest op known committed by the cluster at write time.
+    ///
+    /// A recovery lower bound and nothing more: recovery reports a gap against what the
+    /// WAL can prove, but cannot act on one, since closing it needs state transfer.
+    /// Kept in the durable record because that is what state transfer will read, and
+    /// adding it later would mean a version bump that invalidates every record.
     pub commit_max: u64,
     /// Op of the paired checkpoint (the metadata snapshot's sequence number).
     pub checkpoint_op: u64,
@@ -89,7 +99,7 @@ impl TryFrom<&[u8]> for VsrState {
                 expected: ENCODED_LEN,
                 actual: bytes.len(),
             })?;
-        Ok(Self {
+        let state = Self {
             cluster: u128::from_le_bytes(field(bytes, 0)),
             replica_id: bytes[16],
             replica_count: bytes[17],
@@ -98,7 +108,19 @@ impl TryFrom<&[u8]> for VsrState {
             commit_max: u64::from_le_bytes(field(bytes, 26)),
             checkpoint_op: u64::from_le_bytes(field(bytes, 34)),
             checkpoint_checksum: u128::from_le_bytes(field(bytes, 42)),
-        })
+        };
+        // A record violating `log_view <= view` decodes into a replica that looks
+        // healthy locally while `DoViewChangeHeader::validate` makes every peer drop
+        // its DVCs, so it can never conclude a view change. Length validation alone
+        // would let corruption inside the checksummed region through as a live
+        // consensus state.
+        if state.log_view > state.view {
+            return Err(VsrStateError::LogViewAheadOfView {
+                view: state.view,
+                log_view: state.log_view,
+            });
+        }
+        Ok(state)
     }
 }
 
@@ -115,6 +137,9 @@ fn field<const N: usize>(bytes: &[u8; ENCODED_LEN], start: usize) -> [u8; N] {
 pub enum VsrStateError {
     /// The byte slice was not exactly [`ENCODED_LEN`] long.
     WrongLength { expected: usize, actual: usize },
+    /// The record violates `log_view <= view`, so it cannot be a state any replica
+    /// reached.
+    LogViewAheadOfView { view: u32, log_view: u32 },
 }
 
 impl fmt::Display for VsrStateError {
@@ -123,6 +148,10 @@ impl fmt::Display for VsrStateError {
             Self::WrongLength { expected, actual } => {
                 write!(f, "VsrState needs {expected} bytes, got {actual}")
             }
+            Self::LogViewAheadOfView { view, log_view } => write!(
+                f,
+                "VsrState log_view {log_view} exceeds view {view}, which no replica can reach"
+            ),
         }
     }
 }
@@ -142,8 +171,10 @@ mod tests {
             cluster: 1,
             replica_id: 2,
             replica_count: 5,
-            view: 3,
-            log_view: 4,
+            // Distinct per-field values make a swap between two same-width fields
+            // observable, and `view > log_view` keeps the record decodable.
+            view: 4,
+            log_view: 3,
             commit_max: 6,
             checkpoint_op: 7,
             checkpoint_checksum: 8,
@@ -153,13 +184,41 @@ mod tests {
         assert_eq!(bytes[0], 1, "cluster low byte");
         assert_eq!(bytes[16], 2, "replica_id");
         assert_eq!(bytes[17], 5, "replica_count");
-        assert_eq!(bytes[18], 3, "view low byte");
-        assert_eq!(bytes[22], 4, "log_view low byte");
+        assert_eq!(bytes[18], 4, "view low byte");
+        assert_eq!(bytes[22], 3, "log_view low byte");
         assert_eq!(bytes[26], 6, "commit_max low byte");
         assert_eq!(bytes[34], 7, "checkpoint_op low byte");
         assert_eq!(bytes[42], 8, "checkpoint_checksum low byte");
 
         assert_eq!(VsrState::try_from(&bytes[..]).unwrap(), state);
         assert!(VsrState::try_from(&bytes[..ENCODED_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn given_log_view_past_view_when_decoded_should_reject() {
+        // Corruption inside the checksummed region can produce a length-valid record
+        // that violates `log_view <= view`. Decoding it yields a replica that looks
+        // healthy locally while every peer drops its DoViewChange messages
+        // (`DoViewChangeHeader::validate`), so it can never conclude a view change.
+        let mut bytes = VsrState {
+            cluster: 1,
+            replica_id: 0,
+            replica_count: 3,
+            view: 4,
+            log_view: 4,
+            commit_max: 0,
+            checkpoint_op: 0,
+            checkpoint_checksum: 0,
+        }
+        .to_bytes();
+        bytes[22] = 5; // log_view = 5, view stays 4
+
+        assert_eq!(
+            VsrState::try_from(&bytes[..]),
+            Err(VsrStateError::LogViewAheadOfView {
+                view: 4,
+                log_view: 5
+            })
+        );
     }
 }

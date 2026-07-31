@@ -26,10 +26,12 @@ use consensus::{
 use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
-use journal::superblock::{PingPongSuperblock, SuperblockContents, SuperblockStore};
+use journal::superblock::{
+    PingPongSuperblock, SLOT_FILE_NAMES, SuperblockContents, SuperblockStore,
+};
 use server_common::Message;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Error type for metadata recovery.
 #[derive(Debug)]
@@ -38,8 +40,14 @@ pub enum RecoveryError {
     Journal(JournalError),
     StateMachine(IggyError),
     Io(std::io::Error),
-    /// Opening or reading the durable superblock failed.
-    Superblock(std::io::Error),
+    /// Opening or reading the durable superblock failed. `dir` is the metadata
+    /// directory holding [`journal::superblock::SLOT_FILE_NAMES`]: `compio` attaches no
+    /// path to its I/O errors, so without this the operator's chain ends in a bare
+    /// `ENOENT`.
+    Superblock {
+        dir: PathBuf,
+        source: std::io::Error,
+    },
     /// A checkpoint client-table slot held bytes that are not a valid reply
     /// message (a corrupt or torn snapshot).
     ClientTableDecode(ClientTableDecodeError),
@@ -47,12 +55,14 @@ pub enum RecoveryError {
     /// lost or reverted snapshot write: recovering from the older snapshot while
     /// trusting the superblock's commit point could skip committed state.
     CheckpointAheadOfSnapshot {
+        dir: PathBuf,
         checkpoint_op: u64,
         snapshot_op: u64,
     },
     /// The paired snapshot's checksum does not match the superblock's record (a
     /// corrupt or torn snapshot).
     CheckpointChecksumMismatch {
+        dir: PathBuf,
         op: u64,
         expected: u128,
         actual: u128,
@@ -62,7 +72,10 @@ pub enum RecoveryError {
     /// corruption inside the checksummed region. The durable consensus state is
     /// unrecoverable, so refuse boot rather than infer a stale view from the WAL and
     /// risk re-entering a superseded view.
-    SuperblockUndecodable(VsrStateError),
+    SuperblockUndecodable {
+        dir: PathBuf,
+        source: VsrStateError,
+    },
     /// The slots yield no record this build can trust: bytes that fail verification
     /// on every copy, or one clean record beside a copy that does not verify, whose
     /// lost `sequence` may have been the newer (`version` names an unrecognized
@@ -72,8 +85,58 @@ pub enum RecoveryError {
     /// different case, a genuinely fresh or not-yet-checkpointed node, and is NOT an
     /// error.
     SuperblockUnreadable {
+        dir: PathBuf,
         version: Option<u16>,
     },
+    /// The superblock was written by a different cluster or a different replica
+    /// index: a copied, restored-to-the-wrong-host, or otherwise misplaced data
+    /// directory. Recovering `(view, log_view)` from another replica's record would
+    /// have this node act on consensus numbers it never reached.
+    SuperblockIdentityMismatch {
+        dir: PathBuf,
+        field: IdentityField,
+        expected: u128,
+        found: u128,
+    },
+}
+
+/// Which identity field of a durable [`VsrState`] failed to match this replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityField {
+    Cluster,
+    ReplicaId,
+    ReplicaCount,
+}
+
+impl fmt::Display for IdentityField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cluster => write!(f, "cluster"),
+            Self::ReplicaId => write!(f, "replica_id"),
+            Self::ReplicaCount => write!(f, "replica_count"),
+        }
+    }
+}
+
+/// The identity a replica expects its own durable superblock to carry.
+///
+/// Bundled rather than passed as three positional scalars, since `cluster`,
+/// `replica_id` and `replica_count` are exactly the values a silent misbinding would
+/// make unrecoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaIdentity {
+    pub cluster: u128,
+    pub replica_id: u8,
+    pub replica_count: u8,
+}
+
+impl ReplicaIdentity {
+    /// A single-replica cluster: quorum is 1/1, so every journaled op committed the
+    /// moment it was written.
+    #[must_use]
+    pub const fn is_solo(&self) -> bool {
+        self.replica_count == 1
+    }
 }
 
 impl fmt::Display for RecoveryError {
@@ -83,42 +146,73 @@ impl fmt::Display for RecoveryError {
             Self::Journal(e) => write!(f, "recovery journal error: {e}"),
             Self::StateMachine(e) => write!(f, "recovery state machine error: {e}"),
             Self::Io(e) => write!(f, "recovery I/O error: {e}"),
-            Self::Superblock(e) => write!(f, "recovery superblock error: {e}"),
+            Self::Superblock { dir, source } => write!(
+                f,
+                "recovery superblock error in {} ({} / {}): {source}",
+                dir.display(),
+                SLOT_FILE_NAMES[0],
+                SLOT_FILE_NAMES[1]
+            ),
             Self::ClientTableDecode(e) => write!(f, "recovery client-table decode error: {e}"),
             Self::CheckpointAheadOfSnapshot {
+                dir,
                 checkpoint_op,
                 snapshot_op,
             } => write!(
                 f,
-                "superblock references checkpoint op {checkpoint_op} but the on-disk snapshot is \
-                 only at op {snapshot_op}: a lost or reverted snapshot write, refusing boot"
+                "superblock in {} references checkpoint op {checkpoint_op} but the on-disk \
+                 snapshot is only at op {snapshot_op}: a lost or reverted snapshot write, \
+                 refusing boot",
+                dir.display()
             ),
             Self::CheckpointChecksumMismatch {
+                dir,
                 op,
                 expected,
                 actual,
             } => write!(
                 f,
-                "snapshot at op {op} does not match the superblock's checkpoint checksum \
+                "snapshot at op {op} in {} does not match the superblock's checkpoint checksum \
                  (superblock {expected:#034x}, snapshot {actual:#034x}): corrupt or torn snapshot, \
-                 refusing boot"
+                 refusing boot",
+                dir.display()
             ),
-            Self::SuperblockUndecodable(e) => write!(
+            Self::SuperblockUndecodable { dir, source } => write!(
                 f,
-                "superblock record is present and checksum-clean but its payload did not decode \
-                 into VSR state ({e}): unrecoverable durable consensus state, refusing boot"
+                "superblock record in {} is present and checksum-clean but its payload did not \
+                 decode into VSR state ({source}): unrecoverable durable consensus state, \
+                 refusing boot",
+                dir.display()
             ),
             Self::SuperblockUnreadable {
+                dir,
                 version: Some(version),
             } => write!(
                 f,
-                "superblock present but its format version {version} is unrecognized by this build \
-                 (a downgrade, or a corrupt version field): refusing boot"
+                "superblock in {} present but its format version {version} is unrecognized by \
+                 this build (a downgrade, or a corrupt version field): refusing boot",
+                dir.display()
             ),
-            Self::SuperblockUnreadable { version: None } => write!(
+            Self::SuperblockUnreadable { dir, version: None } => write!(
                 f,
                 "superblock present but a copy holds bytes that do not verify (bit-rot or a \
-                 checksum failure), so its latest generation cannot be established: refusing boot"
+                 checksum failure), so its latest generation cannot be established: refusing \
+                 boot; inspect {} and {} in {}",
+                SLOT_FILE_NAMES[0],
+                SLOT_FILE_NAMES[1],
+                dir.display()
+            ),
+            Self::SuperblockIdentityMismatch {
+                dir,
+                field,
+                expected,
+                found,
+            } => write!(
+                f,
+                "superblock {field} in {} is {found} but this replica is configured with \
+                 {expected}: the metadata directory belongs to another cluster or replica, or the \
+                 cluster was resized without reconfiguration, refusing boot",
+                dir.display()
             ),
         }
     }
@@ -130,12 +224,13 @@ impl std::error::Error for RecoveryError {
             Self::Snapshot(e) => Some(e),
             Self::Journal(e) => Some(e),
             Self::StateMachine(e) => Some(e),
-            Self::Io(e) | Self::Superblock(e) => Some(e),
+            Self::Io(e) | Self::Superblock { source: e, .. } => Some(e),
             Self::ClientTableDecode(e) => Some(e),
-            Self::SuperblockUndecodable(e) => Some(e),
+            Self::SuperblockUndecodable { source, .. } => Some(source),
             Self::CheckpointAheadOfSnapshot { .. }
             | Self::CheckpointChecksumMismatch { .. }
-            | Self::SuperblockUnreadable { .. } => None,
+            | Self::SuperblockUnreadable { .. }
+            | Self::SuperblockIdentityMismatch { .. } => None,
         }
     }
 }
@@ -174,10 +269,10 @@ impl From<std::io::Error> for RecoveryError {
 pub struct RecoveredMetadata<M> {
     pub journal: PrepareJournal,
     pub snapshot: Option<IggySnapshot>,
-    /// The durable superblock, opened by recovery so it could verify the snapshot's
-    /// integrity against the checkpoint pairing before decoding it. Handed to the
-    /// consensus/metadata layer to reuse; re-opening would fork the ping-pong
-    /// sequence counter.
+    /// The durable superblock, opened by recovery so it could cross-check the
+    /// snapshot's op and checksum against the checkpoint pairing before restoring the
+    /// state machine from it. Handed to the consensus/metadata layer to reuse;
+    /// re-opening would fork the ping-pong sequence counter.
     pub superblock: PingPongSuperblock,
     /// The durable VSR state read from the superblock, or `None` when none has been
     /// written yet (a fresh deployment, or a node that took writes but never
@@ -240,8 +335,10 @@ pub struct RecoveredMetadata<M> {
 /// caller built, so reading the compile-time default here would make the knob
 /// inert on every restart.
 ///
-/// `solo` marks a single-replica cluster: the quorum is 1/1, so every
-/// journaled op was committed the moment it was written and replay runs to
+/// `identity` is what this replica expects its own durable superblock to carry, and
+/// a mismatch refuses boot ([`RecoveryError::SuperblockIdentityMismatch`]). Its
+/// `replica_count == 1` also marks a single-replica cluster: the quorum is 1/1, so
+/// every journaled op was committed the moment it was written and replay runs to
 /// the journal head. The embedded `commit` stamps cannot be used there: each
 /// stamp is the primary's commit point when the prepare was SENT, so a
 /// pipelined burst (e.g. create-stream + create-topic on one connection) is
@@ -249,7 +346,7 @@ pub struct RecoveredMetadata<M> {
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub async fn recover<M>(
     data_dir: &Path,
-    solo: bool,
+    identity: ReplicaIdentity,
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
@@ -264,10 +361,13 @@ where
     std::fs::create_dir_all(&metadata_dir)?;
 
     let snapshot_path = metadata_dir.join("snapshot.bin");
-    let snapshot = if snapshot_path.exists() {
-        Some(IggySnapshot::load(&snapshot_path)?)
+    // The checksum is over the bytes on disk, so the pairing cross-check below holds
+    // across a schema change: see `IggySnapshot::load`.
+    let (snapshot, snapshot_checksum) = if snapshot_path.exists() {
+        let (snapshot, checksum) = IggySnapshot::load(&snapshot_path)?;
+        (Some(snapshot), checksum)
     } else {
-        None
+        (None, 0)
     };
 
     // Open the durable superblock and read the last VSR state. Recovery owns this so
@@ -277,7 +377,10 @@ where
     // sequence counter, and restores `(view, log_view)` from `recovered_state`.
     let superblock = PingPongSuperblock::open(&metadata_dir)
         .await
-        .map_err(RecoveryError::Superblock)?;
+        .map_err(|source| RecoveryError::Superblock {
+            dir: metadata_dir.clone(),
+            source,
+        })?;
     // Distinguish the three read outcomes so a lost or corrupt superblock cannot
     // masquerade as a fresh deployment: a present but unreadable or
     // unrecognized-version record refuses boot with a typed error. An EMPTY
@@ -286,40 +389,61 @@ where
     // persist-before-send gate guarantees this replica never externalized a view it
     // cannot re-derive by re-probing, so it recovers `(view, log_view)` from the
     // WAL/init path with no split-brain risk.
-    let recovered_state = match superblock
-        .read_latest()
-        .await
-        .map_err(RecoveryError::Superblock)?
-    {
-        SuperblockContents::Present(bytes) => {
-            // A checksum-clean record that does not decode is a durability violation,
-            // not absent state: refuse boot rather than infer a stale view.
-            Some(
-                VsrState::try_from(bytes.as_slice())
-                    .map_err(RecoveryError::SuperblockUndecodable)?,
-            )
-        }
-        SuperblockContents::Unreadable { version } => {
-            return Err(RecoveryError::SuperblockUnreadable { version });
-        }
-        SuperblockContents::Empty => None,
-    };
+    let recovered_state =
+        match superblock
+            .read_latest()
+            .await
+            .map_err(|source| RecoveryError::Superblock {
+                dir: metadata_dir.clone(),
+                source,
+            })? {
+            SuperblockContents::Present(bytes) => {
+                // A checksum-clean record that does not decode is a durability violation,
+                // not absent state: refuse boot rather than infer a stale view.
+                Some(VsrState::try_from(bytes.as_slice()).map_err(|source| {
+                    RecoveryError::SuperblockUndecodable {
+                        dir: metadata_dir.clone(),
+                        source,
+                    }
+                })?)
+            }
+            SuperblockContents::Unreadable { version } => {
+                return Err(RecoveryError::SuperblockUnreadable {
+                    dir: metadata_dir.clone(),
+                    version,
+                });
+            }
+            SuperblockContents::Empty => None,
+        };
 
-    // Verify before decode: a superblock pointing past the snapshot (a lost snapshot
-    // write) or disagreeing on its checksum (corrupt or torn) is a durability
-    // violation, not a recoverable state. One that merely lags a newer,
-    // atomically-complete snapshot is accepted, since `commit_max` is a recovery lower
-    // bound and the WAL suffix re-commits.
+    // The superblock is the only on-disk identity in the metadata directory, and the
+    // wire handshake cannot stand in for it: both peers derive `cluster` from the
+    // configured cluster name, so it never sees a foreign disk.
+    if let Some(state) = recovered_state.as_ref() {
+        verify_identity(state, identity, &metadata_dir)?;
+    }
+
+    // Second of the snapshot's two integrity checks, and the one the superblock owns.
+    // Ordering, precisely: `IggySnapshot::load` verified the snapshot's own trailer
+    // against its payload before decoding it, and this cross-checks the decoded
+    // snapshot's op against the superblock's pairing. The pairing check cannot run
+    // first, since it needs `sequence_number` out of the decoded snapshot.
+    //
+    // A superblock pointing past the snapshot (a lost snapshot write) or disagreeing on
+    // its checksum (corrupt or torn) is a durability violation, not a recoverable
+    // state. One that merely lags a newer, atomically-complete snapshot is accepted,
+    // since `commit_max` is a recovery lower bound and the WAL suffix re-commits.
     //
     // TODO(state-transfer): there is no metadata state transfer yet, so refusing boot
     // is the only sound response. Once it lands, fetch the checkpoint from a healthy
     // replica here instead of erroring.
     let snapshot_op = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let snapshot_checksum = match snapshot.as_ref() {
-        Some(snapshot) => snapshot.checksum()?,
-        None => 0,
-    };
-    verify_checkpoint_pairing(recovered_state.as_ref(), snapshot_op, snapshot_checksum)?;
+    verify_checkpoint_pairing(
+        recovered_state.as_ref(),
+        snapshot_op,
+        snapshot_checksum,
+        &metadata_dir,
+    )?;
 
     let replay_from = snapshot
         .as_ref()
@@ -363,7 +487,7 @@ where
     // future non-monotone stamping change cannot silently under-apply the
     // committed prefix.
     let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let commit_watermark = if solo {
+    let commit_watermark = if identity.is_solo() {
         headers_to_replay
             .iter()
             .map(|header| header.op)
@@ -374,6 +498,27 @@ where
             .map(|header| header.commit)
             .fold(snapshot_floor, u64::max)
     };
+
+    // The superblock's `commit_max` is the highest op this replica knew the cluster had
+    // committed when it last wrote. Report a gap against what the WAL can prove, since
+    // nothing else surfaces "committed ops this node cannot see".
+    //
+    // A warning and not a refusal, deliberately: each journaled prepare stamps the
+    // primary's commit point as of its SEND, so the derived watermark is a lower bound
+    // and trails `commit_max` on a perfectly healthy node. Only state transfer can turn
+    // this into a decision, which is why the field has no other reader (see the
+    // TODO(state-transfer) above).
+    if let Some(state) = recovered_state.as_ref()
+        && state.commit_max > commit_watermark
+    {
+        tracing::warn!(
+            durable_commit_max = state.commit_max,
+            wal_commit_watermark = commit_watermark,
+            snapshot_op,
+            "superblock records a commit point above what this replica's WAL can prove; \
+             the gap re-commits from the cluster, or needs state transfer if it does not"
+        );
+    }
 
     // Restore the client table from the checkpoint's folded copy, then replay the
     // committed suffix on top, mirroring how the state machine is restored from the
@@ -485,6 +630,58 @@ where
     })
 }
 
+/// Refuse a durable record this replica did not write.
+///
+/// Scope it honestly: identity catches MISPLACEMENT, not staleness. An older backup
+/// of this replica's own directory carries the right `cluster`, `replica_id` and
+/// `replica_count` and passes here; only the checkpoint pairing and the WAL constrain
+/// how old it may be.
+///
+/// `replica_count` is checked alongside the identity pair because quorum size and the
+/// `view % replica_count` primary mapping both derive from it. There is no VSR
+/// reconfiguration yet, so a count that disagrees with the config means the cluster
+/// was resized underneath a node, and booting it would have replicas disagree on both
+/// quorum and who leads a view.
+///
+/// # Errors
+/// [`RecoveryError::SuperblockIdentityMismatch`] naming the first field that differs
+/// and the directory it was read from, since which directory a node was pointed at is
+/// the whole diagnosis here.
+fn verify_identity(
+    state: &VsrState,
+    expected: ReplicaIdentity,
+    dir: &Path,
+) -> Result<(), RecoveryError> {
+    let mismatch = |field, expected: u128, found: u128| RecoveryError::SuperblockIdentityMismatch {
+        dir: dir.to_path_buf(),
+        field,
+        expected,
+        found,
+    };
+    if state.cluster != expected.cluster {
+        return Err(mismatch(
+            IdentityField::Cluster,
+            expected.cluster,
+            state.cluster,
+        ));
+    }
+    if state.replica_id != expected.replica_id {
+        return Err(mismatch(
+            IdentityField::ReplicaId,
+            expected.replica_id.into(),
+            state.replica_id.into(),
+        ));
+    }
+    if state.replica_count != expected.replica_count {
+        return Err(mismatch(
+            IdentityField::ReplicaCount,
+            expected.replica_count.into(),
+            state.replica_count.into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Cross-check the superblock's checkpoint pairing against the on-disk snapshot
 /// BEFORE the snapshot's decoded contents are trusted. The superblock's
 /// `(checkpoint_op, checkpoint_checksum)` identify the snapshot its `commit_max` was
@@ -506,22 +703,25 @@ where
 /// # Errors
 /// [`RecoveryError::CheckpointAheadOfSnapshot`] or
 /// [`RecoveryError::CheckpointChecksumMismatch`] on a durability violation.
-const fn verify_checkpoint_pairing(
+fn verify_checkpoint_pairing(
     recovered: Option<&VsrState>,
     snapshot_op: u64,
     snapshot_checksum: u128,
+    dir: &Path,
 ) -> Result<(), RecoveryError> {
     let Some(state) = recovered else {
         return Ok(());
     };
     if state.checkpoint_op > snapshot_op {
         return Err(RecoveryError::CheckpointAheadOfSnapshot {
+            dir: dir.to_path_buf(),
             checkpoint_op: state.checkpoint_op,
             snapshot_op,
         });
     }
     if state.checkpoint_op == snapshot_op && state.checkpoint_checksum != snapshot_checksum {
         return Err(RecoveryError::CheckpointChecksumMismatch {
+            dir: dir.to_path_buf(),
             op: state.checkpoint_op,
             expected: state.checkpoint_checksum,
             actual: snapshot_checksum,
@@ -534,6 +734,7 @@ const fn verify_checkpoint_pairing(
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use crate::impls::metadata::checkpoint_checksum;
     use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
@@ -545,6 +746,21 @@ mod tests {
     type TestStm = MuxStateMachine<()>;
 
     const HEADER_SIZE: usize = size_of::<PrepareHeader>();
+
+    /// Replica 0 of a 3-node cluster 1: quorum 2, so the WAL's embedded commit
+    /// stamps bound replay.
+    const CLUSTERED: ReplicaIdentity = ReplicaIdentity {
+        cluster: 1,
+        replica_id: 0,
+        replica_count: 3,
+    };
+
+    /// The same replica running solo: quorum 1/1, so replay runs to the journal head.
+    const SOLO: ReplicaIdentity = ReplicaIdentity {
+        cluster: 1,
+        replica_id: 0,
+        replica_count: 1,
+    };
 
     fn vsr_state_with_checkpoint(checkpoint_op: u64, checkpoint_checksum: u128) -> VsrState {
         VsrState {
@@ -564,47 +780,53 @@ mod tests {
     /// on a pure function and the boundaries only mean something together.
     #[test]
     fn checkpoint_pairing_accepts_consistent_pairings_and_rejects_violations() {
+        // The directory only reaches the error message, so one stand-in serves every case.
+        let dir = Path::new("/metadata");
+
         // No superblock yet (fresh or not-yet-checkpointed): nothing to cross-check.
-        assert!(verify_checkpoint_pairing(None, 42, 0xabc).is_ok());
+        assert!(verify_checkpoint_pairing(None, 42, 0xabc, dir).is_ok());
 
         // Exact pairing.
         let matching = vsr_state_with_checkpoint(42, 0xabc);
-        assert!(verify_checkpoint_pairing(Some(&matching), 42, 0xabc).is_ok());
+        assert!(verify_checkpoint_pairing(Some(&matching), 42, 0xabc, dir).is_ok());
 
         // A checkpoint whose superblock update had not yet landed leaves the
         // superblock behind an atomically-complete newer snapshot: safe, and it must
         // NOT refuse boot on an otherwise healthy node.
         let lagging = vsr_state_with_checkpoint(40, 0xdead);
-        assert!(verify_checkpoint_pairing(Some(&lagging), 42, 0xbeef).is_ok());
+        assert!(verify_checkpoint_pairing(Some(&lagging), 42, 0xbeef, dir).is_ok());
 
         // Superblock points past the snapshot on disk: a lost snapshot write.
         let ahead = vsr_state_with_checkpoint(50, 0xabc);
         assert!(matches!(
-            verify_checkpoint_pairing(Some(&ahead), 42, 0xabc),
+            verify_checkpoint_pairing(Some(&ahead), 42, 0xabc, dir),
             Err(RecoveryError::CheckpointAheadOfSnapshot {
                 checkpoint_op: 50,
                 snapshot_op: 42,
+                ..
             })
         ));
 
         // A checkpoint claim with no snapshot on disk is the same violation at op 0.
         let claim_without_snapshot = vsr_state_with_checkpoint(5, 0xabc);
         assert!(matches!(
-            verify_checkpoint_pairing(Some(&claim_without_snapshot), 0, 0),
+            verify_checkpoint_pairing(Some(&claim_without_snapshot), 0, 0, dir),
             Err(RecoveryError::CheckpointAheadOfSnapshot {
                 checkpoint_op: 5,
                 snapshot_op: 0,
+                ..
             })
         ));
 
         // Same op, different content: corrupt or torn snapshot.
         let mismatched = vsr_state_with_checkpoint(42, 0xaaaa);
         assert!(matches!(
-            verify_checkpoint_pairing(Some(&mismatched), 42, 0xbbbb),
+            verify_checkpoint_pairing(Some(&mismatched), 42, 0xbbbb, dir),
             Err(RecoveryError::CheckpointChecksumMismatch {
                 op: 42,
                 expected: 0xaaaa,
                 actual: 0xbbbb,
+                ..
             })
         ));
     }
@@ -669,7 +891,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let recovered = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -694,7 +916,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -729,7 +951,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -771,7 +993,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -808,7 +1030,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -877,7 +1099,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            true,
+            SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -952,7 +1174,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            true,
+            SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -1017,7 +1239,7 @@ mod tests {
         // Solo: every journaled op is committed.
         let recovered = recover::<TestStm>(
             dir.path(),
-            true,
+            SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -1072,7 +1294,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            true,
+            SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -1095,8 +1317,25 @@ mod tests {
         let snapshot = IggySnapshot::new(99);
         snapshot.persist(&path).unwrap();
 
-        let loaded = IggySnapshot::load(&path).unwrap();
+        let (loaded, checksum) = IggySnapshot::load(&path).unwrap();
         assert_eq!(loaded.sequence_number(), 99);
+        assert_eq!(
+            checksum,
+            checkpoint_checksum(&snapshot.encode().unwrap()),
+            "load must report the checksum of the payload bytes on disk, which is what \
+             the superblock pairing recorded"
+        );
+
+        // The trailer makes the file self-verifying, so a torn or bit-rotted snapshot is
+        // caught even when the superblock's pairing cannot judge it (a crash inside a
+        // checkpoint leaves the pairing behind the snapshot on disk).
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            IggySnapshot::load(&path),
+            Err(SnapshotError::ChecksumMismatch { .. })
+        ));
     }
 
     #[compio::test]
@@ -1117,7 +1356,7 @@ mod tests {
         // non-Debug handles.
         let result = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -1125,7 +1364,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(RecoveryError::SuperblockUndecodable(_))
+            Err(RecoveryError::SuperblockUndecodable { .. })
         ));
     }
 
@@ -1149,7 +1388,7 @@ mod tests {
 
         let result = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -1157,7 +1396,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(RecoveryError::SuperblockUnreadable { version: None })
+            Err(RecoveryError::SuperblockUnreadable { version: None, .. })
         ));
     }
 
@@ -1180,7 +1419,7 @@ mod tests {
 
         let recovered = recover::<TestStm>(
             dir.path(),
-            false,
+            CLUSTERED,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
@@ -1188,5 +1427,153 @@ mod tests {
         .await
         .unwrap();
         assert!(recovered.recovered_state.is_none());
+    }
+
+    #[compio::test]
+    async fn recover_refuses_boot_on_foreign_superblock_identity() {
+        // The superblock is the only on-disk identity in the metadata directory, and
+        // the wire handshake cannot substitute: both peers derive `cluster` from the
+        // configured cluster name, so it never sees a foreign DISK. Each field is
+        // checked on its own, since a copied directory, a replica index swap, and a
+        // cluster resized without reconfiguration are distinct operator mistakes.
+        let cases = [
+            (
+                VsrState {
+                    cluster: 99,
+                    ..vsr_state_with_checkpoint(0, 0)
+                },
+                IdentityField::Cluster,
+            ),
+            (
+                VsrState {
+                    replica_id: 2,
+                    ..vsr_state_with_checkpoint(0, 0)
+                },
+                IdentityField::ReplicaId,
+            ),
+            (
+                VsrState {
+                    replica_count: 5,
+                    ..vsr_state_with_checkpoint(0, 0)
+                },
+                IdentityField::ReplicaCount,
+            ),
+        ];
+
+        for (state, expected_field) in cases {
+            let dir = tempdir().unwrap();
+            let metadata_dir = dir.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            {
+                let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+                superblock.write(&state.to_bytes()).await.unwrap();
+            }
+
+            let result = recover::<TestStm>(
+                dir.path(),
+                CLUSTERED,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+            )
+            .await;
+            match result {
+                Err(RecoveryError::SuperblockIdentityMismatch { field, .. }) => {
+                    assert_eq!(field, expected_field);
+                }
+                Err(other) => panic!("expected an identity mismatch, got {other}"),
+                Ok(_) => panic!("expected {expected_field} mismatch to refuse boot"),
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn recover_accepts_snapshot_written_before_a_trailing_default_field() {
+        // Appending a `#[serde(default)]` field is this repo's forward-compatible
+        // snapshot migration, and msgpack encodes structs positionally: a file the
+        // previous build wrote decodes fine (the default fills the missing element)
+        // but re-encodes with one MORE element. A pairing checksum recomputed by
+        // re-encoding the decoded snapshot would therefore diverge on the FIRST boot
+        // of the new build and refuse every checkpointed node, with the WAL prefix
+        // already drained. Hashing the bytes on disk is what makes that upgrade boot.
+        //
+        // Emulated in the direction the migration runs: strip the trailing element off
+        // a current-shape file, which is what the pre-`client_table` build wrote.
+        const CHECKPOINT_OP: u64 = 42;
+        let encoded = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
+        assert_eq!(
+            encoded[0] & 0xf0,
+            0x90,
+            "snapshot must encode as a msgpack fixarray for this emulation"
+        );
+        assert_eq!(
+            *encoded.last().unwrap(),
+            0xC0,
+            "the trailing snapshot field must encode as nil here; adjust the emulation \
+             if the last field stops being an Option"
+        );
+        let mut legacy = vec![0x90 | ((encoded[0] & 0x0f) - 1)];
+        legacy.extend_from_slice(&encoded[1..encoded.len() - 1]);
+
+        let decoded = IggySnapshot::decode(&legacy).unwrap();
+        assert_eq!(decoded.sequence_number(), CHECKPOINT_OP);
+        assert_ne!(
+            decoded.encode().unwrap(),
+            legacy,
+            "the emulated legacy file must NOT round-trip byte-identically, else this \
+             test cannot distinguish the two checksum sources"
+        );
+
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        std::fs::write(metadata_dir.join("snapshot.bin"), &legacy).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&legacy));
+        {
+            let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+            superblock.write(&state.to_bytes()).await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.snapshot_checkpoint.0, CHECKPOINT_OP);
+        assert_eq!(
+            recovered.snapshot_checkpoint.1,
+            checkpoint_checksum(&legacy),
+            "the verified pairing must be the checksum of the bytes on disk"
+        );
+    }
+
+    #[compio::test]
+    async fn recover_accepts_matching_superblock_identity() {
+        // The fence must not brick the healthy case it guards: the replica's own
+        // record boots, so the mismatch arm above is proving identity and not just
+        // that any record refuses.
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let state = vsr_state_with_checkpoint(0, 0);
+        {
+            let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+            superblock.write(&state.to_bytes()).await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.recovered_state, Some(state));
     }
 }

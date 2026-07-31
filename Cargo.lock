@@ -7681,6 +7681,7 @@ dependencies = [
  "iggy_binary_protocol",
  "server_common",
  "tempfile",
+ "tracing",
  "twox-hash",
 ]
 

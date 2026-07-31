@@ -40,9 +40,11 @@ const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 /// body sealing, or replicated from a primary predating it (backups journal the
 /// header verbatim, so the zero travels along). Indistinguishable from
 /// sealed-then-corrupted, so the scan skips verification and counts these rather
-/// than reject a WAL it cannot prove is damaged. Safe as a sentinel: `XxHash3_64`
-/// never returns `0`, not even for an empty body, which a sealed zero-length entry
-/// does carry.
+/// than reject a WAL it cannot prove is damaged. Sound as a sentinel because a sealed
+/// body hashing to `0` is a 1-in-2^64 event, not an impossible one: some input maps
+/// there, we just do not know which. The consequence of that collision is a single
+/// entry replayed unverified, the same treatment a genuinely unsealed one gets, which
+/// is why the sentinel is worth the odds.
 ///
 /// Never re-sealed on receipt: the producer seals once and every replica stores that
 /// verbatim, so re-sealing locally would diverge the header bytes and break the
@@ -192,31 +194,55 @@ const fn slot_for_op(op: u64, slot_count: usize) -> usize {
 /// Repair a damaged WAL tail by truncating to `pos`, or surface a loud
 /// error when truncation would be unsafe.
 ///
-/// Truncation is only sound for a torn final append, which writes at most
-/// one entry's worth of bytes. If more than `MAX_ENTRY_SIZE` bytes follow
-/// `pos`, the damage is mid-file: truncating would silently discard every
-/// committed entry after it, so this hard-errors instead of repairing.
+/// Truncation is sound only for a torn final append. The question that decides it
+/// is the one the interior-corruption branch in `scan` asks: does a complete entry
+/// follow? An entry only exists past `pos` if an `append` completed after the damaged
+/// region, and each `append` fsyncs before its `PrepareOk`, so discarding it would
+/// drop an entry that was durable, acked, and possibly quorum-committed. `pos` alone
+/// cannot answer this: a bit-flip in a header's `size` field loses the entry boundary
+/// while leaving intact entries behind it, and those bytes are what the probe finds.
+///
+/// The `> MAX_ENTRY_SIZE` test is kept as a second refusal, not as the classifier:
+/// one entry per `append` + fsync means a torn tail is at most one entry wide, so a
+/// larger unparsable region is damage of some other kind and not this function's to
+/// repair.
+///
+/// Both outcomes are traced. A silent truncation is the failure mode that hides
+/// durable data loss from an operator who has no other signal.
 #[allow(clippy::future_not_send)]
 async fn truncate_or_fail(
     storage: &FileStorage,
     pos: u64,
     reason: &'static str,
 ) -> Result<(), JournalError> {
-    let trailing = storage.file_len().saturating_sub(pos);
-    // Sound only because this WAL appends exactly one entry per `append`
-    // + fsync, so a torn tail is at most one entry wide. A batched-append
-    // WAL could leave a torn tail many entries wide, and this
-    // `> MAX_ENTRY_SIZE` check would misclassify it as mid-file damage.
+    let file_len = storage.file_len();
+    let trailing = file_len.saturating_sub(pos);
+    if let Some(entry_pos) = find_complete_entry(storage, pos, file_len).await? {
+        return Err(JournalError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "mid-file WAL corruption at pos {pos}: {reason}; a complete entry \
+                 starts at pos {entry_pos} ({trailing} trailing bytes), so this is not \
+                 a torn tail; refusing to truncate and discard committed entries"
+            ),
+        )));
+    }
     if trailing > MAX_ENTRY_SIZE {
         return Err(JournalError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "mid-file WAL corruption at pos {pos}: {reason}; {trailing} bytes \
-                 follow (> MAX_ENTRY_SIZE {MAX_ENTRY_SIZE}), refusing to truncate \
-                 and discard committed entries"
+                 follow (> MAX_ENTRY_SIZE {MAX_ENTRY_SIZE}), wider than one append can \
+                 tear; refusing to truncate and discard committed entries"
             ),
         )));
     }
+    tracing::warn!(
+        pos,
+        trailing,
+        reason,
+        "truncating torn WAL tail; no complete entry follows the damage"
+    );
     storage.truncate(pos).await?;
     // The repair must be crash-durable. `FileStorage::truncate` is a
     // bare `set_len`; without this fsync a power loss right after the
@@ -226,12 +252,80 @@ async fn truncate_or_fail(
     Ok(())
 }
 
-/// Best-effort unlink of the drain temp file on any error path between
-/// `File::create(wal.tmp)` and the atomic `rename`. Without this, every
-/// failed drain leaks a `wal.tmp` next to the WAL; the next drain
-/// truncates it on re-create so safety holds, but operators see the tmp
-/// files accumulate across crashed/aborted drains. `defuse` is called
-/// after a successful rename so the now-renamed file is not removed.
+/// Position of the first structurally complete entry starting after `from`, or
+/// `None` when the region holds no entry a scan could read.
+///
+/// Entry starts are byte-aligned in the file (`append` writes exact-sized buffers
+/// with no padding) and the damaged entry's own `size` cannot be trusted, so every
+/// offset is a candidate. `command` is a `#[repr(u8)]` discriminant at a fixed offset,
+/// so it pre-filters ~255 of every 256 offsets down to a byte compare, and the full
+/// structural validation runs only on the rest. Cost is bounded by the trailing
+/// region, which the caller refuses above `MAX_ENTRY_SIZE`, and this runs once on a
+/// boot that is already repairing.
+#[allow(clippy::future_not_send)]
+async fn find_complete_entry(
+    storage: &FileStorage,
+    from: u64,
+    file_len: u64,
+) -> Result<Option<u64>, JournalError> {
+    const COMMAND_OFFSET: usize = std::mem::offset_of!(PrepareHeader, command);
+    /// Fresh bytes read per pass, over the `HEADER_SIZE` overlap that lets a
+    /// candidate straddle two passes.
+    const PROBE_STRIDE: usize = 64 * 1024;
+
+    // The entry AT `from` already failed to parse, so it is not a candidate.
+    let mut base = from.saturating_add(1);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut scratch = Owned::<16>::zeroed(HEADER_SIZE);
+    while base + HEADER_SIZE as u64 <= file_len {
+        let want = usize::try_from((file_len - base).min((PROBE_STRIDE + HEADER_SIZE) as u64))
+            .unwrap_or(PROBE_STRIDE + HEADER_SIZE);
+        if buf.len() != want {
+            buf = vec![0u8; want];
+        }
+        buf = storage.read_at(base, buf).await?;
+
+        let last_start = want - HEADER_SIZE;
+        for offset in 0..=last_start {
+            if buf[offset + COMMAND_OFFSET] != Command2::Prepare as u8 {
+                continue;
+            }
+            let candidate = &buf[offset..offset + HEADER_SIZE];
+            let Some(header) = valid_entry_header(&mut scratch, candidate) else {
+                continue;
+            };
+            let start = base + offset as u64;
+            if start + u64::from(header.size) <= file_len {
+                return Ok(Some(start));
+            }
+        }
+        base += last_start as u64 + 1;
+    }
+    Ok(None)
+}
+
+/// The structural checks `scan` applies before it trusts a header's `size`: a valid
+/// bit pattern, the `Prepare` command, and a size that spans at least the header and
+/// at most one entry.
+fn valid_entry_header(scratch: &mut Owned<16>, bytes: &[u8]) -> Option<PrepareHeader> {
+    scratch.as_mut_slice().copy_from_slice(bytes);
+    let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(scratch.as_slice()).ok()?;
+    if header.command != Command2::Prepare
+        || (header.size as usize) < HEADER_SIZE
+        || u64::from(header.size) > MAX_ENTRY_SIZE
+    {
+        return None;
+    }
+    Some(header)
+}
+
+/// Best-effort unlink of a temp file on any error path between its
+/// `File::create` and the atomic `rename`. Without this, every failed
+/// write leaks a tmp file next to its target; the next attempt truncates
+/// it on re-create so safety holds, but operators see the tmp files
+/// accumulate across crashed/aborted writes. `defuse` is called after a
+/// successful rename so the now-renamed file is not removed. Shared with
+/// `superblock::atomic_replace`, which has the same window.
 ///
 /// `Drop` cannot be async, so the unlink is a blocking `std::fs::remove_file`.
 /// This only runs on the drain failure path (already returning an error),
@@ -239,17 +333,17 @@ async fn truncate_or_fail(
 /// may already be gone (e.g. rename succeeded but a later step failed
 /// and we defused too late) and there is no useful recovery from a
 /// failed cleanup unlink.
-struct TmpFileGuard {
+pub(crate) struct TmpFileGuard {
     path: PathBuf,
     armed: bool,
 }
 
 impl TmpFileGuard {
-    const fn new(path: PathBuf) -> Self {
+    pub(crate) const fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
     }
 
-    fn defuse(mut self) {
+    pub(crate) fn defuse(mut self) {
         self.armed = false;
     }
 }
@@ -787,6 +881,25 @@ impl Journal<FileStorage> for PrepareJournal {
         let header = *entry.header();
         let slot = slot_for_op(header.op, self.slot_count);
 
+        // Reject a buffer with slack for the same reason as the slot-collision check
+        // below: before it reaches disk. `Message::try_from` permits `len >= size`, and
+        // `write_append` writes the WHOLE buffer, so slack would land on disk while the
+        // scan's checksum verification and its `pos += entry_size` walk both use
+        // `header.size`. The producer seals the whole buffer today, which makes an
+        // over-length entry a loud checksum failure rather than a silent one, but the
+        // seal is an integrity field and not the place to enforce framing.
+        if entry.as_slice().len() != header.size as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal entry buffer is {} bytes but its header claims {}: \
+                     the slack would be written to disk and mis-frame the scan",
+                    entry.as_slice().len(),
+                    header.size,
+                ),
+            ));
+        }
+
         // Slot collision must be detected BEFORE `write_append + fsync`:
         // a post-fsync panic would leave bytes durably on disk, and the
         // recovery scan on the next boot would re-hit the same collision,
@@ -1285,6 +1398,82 @@ mod tests {
         assert_eq!(
             size_before, size_after,
             "a rejected mid-file scan must not truncate the WAL"
+        );
+    }
+
+    #[compio::test]
+    async fn open_refuses_when_a_complete_entry_follows_the_damage() {
+        // Bit-rot in an interior header loses that entry's boundary but leaves the
+        // entries behind it intact. Each was fsynced before its PrepareOk, so they may
+        // be quorum-committed: classifying this as a torn tail would silently discard
+        // durable data. The trailing region is a few hundred bytes here, well under
+        // MAX_ENTRY_SIZE, so only the forward probe can tell the two apart.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal.append(make_prepare(1, 64)).await.unwrap();
+            journal.append(make_prepare(2, 64)).await.unwrap();
+            journal.append(make_prepare(3, 64)).await.unwrap();
+            journal.storage.fsync().await.unwrap();
+        }
+
+        let entry_2_offset = (HEADER_SIZE + 64) as u64;
+        let command_byte_offset =
+            entry_2_offset + std::mem::offset_of!(PrepareHeader, command) as u64;
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
+            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.sync_all().unwrap();
+        }
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let error = PrepareJournal::open(&path, 0)
+            .await
+            .expect_err("damage with a complete entry behind it must refuse boot");
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("a complete entry starts at pos"),
+            "the refusal must come from the forward probe, not the size heuristic: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size_before,
+            "a refused scan must leave the WAL intact for repair from a peer"
+        );
+    }
+
+    #[compio::test]
+    async fn append_rejects_entry_buffer_with_slack() {
+        // `Message::try_from` permits `len >= size` and `write_append` writes the whole
+        // buffer, so slack would reach disk while the scan frames on `header.size`.
+        // Refuse before the write rather than leave a mis-framed entry durable.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+
+        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE + 64);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.command = Command2::Prepare;
+        header.op = 1;
+        header.operation = Operation::CreateStream;
+        header.size = (HEADER_SIZE + 48) as u32; // 16 bytes of slack
+        let entry = Message::try_from(buffer).unwrap();
+
+        let error = journal
+            .append(entry)
+            .await
+            .expect_err("an over-length entry buffer must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            journal.storage.file_len(),
+            0,
+            "a refused append must write nothing"
         );
     }
 

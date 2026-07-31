@@ -118,7 +118,7 @@ impl IggySnapshot {
     }
 
     /// Write already-encoded snapshot bytes to `path` durably: temp, fsync,
-    /// rename, parent-dir fsync.
+    /// rename, parent-dir fsync, with the integrity trailer appended.
     ///
     /// Split from [`Self::persist`] so the checkpoint path can hash and write one
     /// buffer instead of encoding the whole snapshot twice under the durability
@@ -139,6 +139,16 @@ impl IggySnapshot {
             source: e,
         })?;
         file.write_all(encoded)
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
+        // Self-verifying trailer. The superblock's checkpoint pairing cannot stand in:
+        // phase 1 of a checkpoint renames the new snapshot over `snapshot.bin`, so a
+        // crash before the pairing write is the NORMAL crash-inside-a-checkpoint
+        // outcome, and it recovers through the `checkpoint_op < snapshot_op` arm, which
+        // accepts the snapshot with nothing to check it against.
+        file.write_all(&snapshot_trailer(encoded))
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Write,
                 source: e,
@@ -169,31 +179,101 @@ impl IggySnapshot {
         Ok(())
     }
 
-    /// Load a snapshot from disk.
+    /// Load a snapshot from disk, with the [`checkpoint_checksum`] of the exact bytes
+    /// read.
+    ///
+    /// The checksum comes from the file's bytes, never from re-encoding what was
+    /// decoded: the pairing must survive a schema change. Adding a trailing
+    /// `#[serde(default)]` field is the repo's forward-compatible migration, and an
+    /// older file re-encodes with one MORE msgpack array element after it, so a
+    /// re-encode checksum would diverge on the first boot of the new build and refuse
+    /// every checkpointed node with its WAL prefix already drained.
     ///
     /// # Errors
-    /// Returns `SnapshotError` if the file cannot be read or deserialization fails.
-    pub fn load(path: &Path) -> Result<Self, SnapshotError> {
+    /// `SnapshotError::ChecksumMismatch` if the file carries an integrity trailer that
+    /// does not match its payload, or `SnapshotError` if the file cannot be read or
+    /// deserialized.
+    pub fn load(path: &Path) -> Result<(Self, u128), SnapshotError> {
         let data = std::fs::read(path)?;
+        let (payload, checksum) = split_trailer(&data, path)?;
+        Ok((Self::decode(payload)?, checksum))
+    }
+}
 
-        // TODO: when checksum is added we need to check
-        // if data.len() is atleast the size of checksum
+/// First retry delay after a failed superblock write, doubling per consecutive
+/// failure. Starts near the 10 ms consensus tick, so a one-off failure costs no
+/// latency, and a persistent one stops re-running `atomic_replace` per tick.
+const SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS: u64 = 10_000;
+/// Ceiling on the retry delay. A replica fenced this long is not coming back without
+/// operator action, but the retry must stay frequent enough to recover on its own the
+/// moment the disk does.
+const SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS: u64 = 1_000_000;
+/// Caps the doubling so the shift cannot overflow before the ceiling clamps it.
+const SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT: u64 = 8;
 
-        Self::decode(data.as_slice())
+/// Framing marker for the snapshot integrity trailer, "ISNP". Distinguishes a sealed
+/// snapshot from one written before the trailer existed, so a MISSING trailer can be
+/// accepted (unverified, loudly) while a PRESENT but mismatching one refuses boot. A
+/// bare checksum could not tell those apart, and guessing wrong in either direction is
+/// unacceptable: silently accepting corruption, or bricking a healthy node.
+const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
+
+/// `magic` + the payload's [`checkpoint_checksum`].
+const SNAPSHOT_TRAILER_LEN: usize = size_of::<u32>() + size_of::<u128>();
+
+/// The integrity trailer for an encoded snapshot.
+fn snapshot_trailer(encoded: &[u8]) -> [u8; SNAPSHOT_TRAILER_LEN] {
+    let mut trailer = [0u8; SNAPSHOT_TRAILER_LEN];
+    trailer[..4].copy_from_slice(&SNAPSHOT_TRAILER_MAGIC.to_le_bytes());
+    trailer[4..].copy_from_slice(&checkpoint_checksum(encoded).to_le_bytes());
+    trailer
+}
+
+/// Split a snapshot file into `(payload, checkpoint_checksum)`, verifying the trailer
+/// when one is present.
+///
+/// A file without the trailer is a snapshot written before sealing: its whole contents
+/// are the payload and the checksum is computed over them, exactly as the pairing
+/// recorded it, so an upgrade boots. It replays unverified, which is the same trade the
+/// WAL makes for entries no producer sealed, so it is warned about rather than
+/// silently accepted.
+fn split_trailer<'a>(data: &'a [u8], path: &Path) -> Result<(&'a [u8], u128), SnapshotError> {
+    let sealed = data.len() >= SNAPSHOT_TRAILER_LEN
+        && data[data.len() - SNAPSHOT_TRAILER_LEN..][..4] == SNAPSHOT_TRAILER_MAGIC.to_le_bytes();
+    if !sealed {
+        tracing::warn!(
+            path = %path.display(),
+            "metadata snapshot carries no integrity trailer; restored unverified \
+             (written before snapshot sealing)"
+        );
+        return Ok((data, checkpoint_checksum(data)));
     }
 
-    /// Deterministic content checksum, paired into the superblock's
-    /// `checkpoint_checksum` so a torn or mismatched snapshot/superblock pairing is
-    /// detectable on boot. Computed over the encoded msgpack bytes with the same
-    /// `XxHash3_64` the WAL and superblock use, widened to the `u128` the durable
-    /// record reserves. `encode` is deterministic for a fixed schema, so
-    /// persist-time and boot-time (encode-of-decoded) checksums agree in a build.
-    ///
-    /// # Errors
-    /// `SnapshotError::Serialize` if msgpack encoding fails.
-    pub fn checksum(&self) -> Result<u128, SnapshotError> {
-        Ok(u128::from(calculate_checksum(&self.encode()?)))
+    let (payload, trailer) = data.split_at(data.len() - SNAPSHOT_TRAILER_LEN);
+    let expected = u128::from_le_bytes(
+        trailer[4..]
+            .try_into()
+            .expect("a sealed trailer holds 16 checksum bytes"),
+    );
+    let actual = checkpoint_checksum(payload);
+    if actual != expected {
+        return Err(SnapshotError::ChecksumMismatch { expected, actual });
     }
+    Ok((payload, expected))
+}
+
+/// The superblock's `checkpoint_checksum` over a snapshot's on-disk bytes: the same
+/// `XxHash3_64` the WAL and superblock use, widened to the `u128` the durable record
+/// reserves.
+///
+/// Both sides of the pairing hash BYTES rather than a state: the checkpoint hashes
+/// what it wrote (`SnapshotCoordinator::persist_snapshot`), recovery hashes what it
+/// read ([`IggySnapshot::load`]). Nothing re-serializes a decoded snapshot, so the
+/// cross-check does not depend on decode-then-encode being byte-identical across
+/// builds.
+#[must_use]
+pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
+    u128::from(calculate_checksum(encoded))
 }
 
 impl Snapshot for IggySnapshot {
@@ -323,10 +403,10 @@ impl<M> SnapshotCoordinator<M> {
         // the drained WAL prefix.
         snapshot.snapshot.client_table = client_table;
         // Encode once: the checksum and the on-disk record share one buffer, so the
-        // snapshot is not serialized twice while the durability lock freezes this
-        // core.
+        // snapshot is not serialized twice while the checkpoint lock freezes this
+        // core, and the pairing is provably over the bytes that reach the file.
         let encoded = snapshot.encode()?;
-        let checksum = u128::from(calculate_checksum(&encoded));
+        let checksum = checkpoint_checksum(&encoded);
         let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
         IggySnapshot::write_durably(&path, &encoded)?;
         self.last_checkpoint.set((commit_op, checksum));
@@ -636,18 +716,41 @@ pub struct IggyMetadata<C, J, S, M> {
     /// partition plane, which is not yet durable. Behind `Rc<dyn ...>` so the
     /// simulator harness can keep a clone outliving a replica across a restart.
     pub superblock: Option<Rc<dyn DynSuperblockStore>>,
-    /// Serializes durability writes on shard 0 so at most one is in flight.
+    /// Serializes superblock writes on shard 0 so at most one is in flight.
     /// View-change persists ([`Self::persist_superblock_if_needed`]) and checkpoints
     /// ([`Self::checkpoint_if_needed`]) share the one ping-pong superblock, and
     /// in-process metadata submits each run on their own spawned task, so both can
     /// reach a write concurrently. `PingPongSuperblock::write` picks its slot before
     /// it awaits, so two overlapping writers would target the same slot and could
-    /// tear it, and the checkpoint's WAL drain likewise must not run twice at once.
+    /// tear it.
+    ///
+    /// Scoped to the write itself, NOT to a whole checkpoint. A pending view persist
+    /// blocks every gated send behind it, including the ack path's
+    /// `send_prepare_ok`, so it must not also wait out a checkpoint's snapshot
+    /// encode, two `std::fs` fsyncs and an async WAL drain. Whoever writes builds
+    /// its `VsrState` inside this section with no await in between, so the last
+    /// writer carries the freshest view and the durable view cannot regress.
+    ///
     /// Held across the write `.await`, so it uses the same single-threaded,
     /// cancel-safe [`LocalGate`] as `journal_gate`, a `Cell` flag with no atomics:
     /// this shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
     /// atomic RMW per gated send for exclusion the `Cell` already provides.
-    durability_lock: LocalGate,
+    superblock_lock: LocalGate,
+    /// Serializes whole checkpoints against each other: `persist_snapshot` renames
+    /// over the single `snapshot.bin` and `drain` rewrites the WAL through a shared
+    /// `wal.tmp`, so two concurrent checkpoints would race both. Distinct from
+    /// [`Self::superblock_lock`], which a checkpoint takes only for its own pairing
+    /// write. A checkpoint holds this one and then acquires that one; nothing takes
+    /// them in the other order.
+    checkpoint_lock: LocalGate,
+    /// Consecutive failed superblock writes, and the clock reading after which the
+    /// next attempt may run. A persistent `ENOSPC` / `EIO` would otherwise re-run a
+    /// full `atomic_replace` (create, write, fsync, rename, dir fsync) on every 10 ms
+    /// consensus tick, on the executor that also serves partition traffic. Reset on
+    /// the first success. See [`Self::persist_superblock_if_needed`] for the terminal
+    /// policy.
+    superblock_write_failures: Cell<u64>,
+    superblock_retry_after_micros: Cell<u64>,
     /// State machine - lives on all shards
     pub mux_stm: M,
     pub allocator: ConsensusGroupAllocator,
@@ -704,7 +807,10 @@ where
             journal,
             snapshot,
             superblock,
-            durability_lock: LocalGate::new(),
+            superblock_lock: LocalGate::new(),
+            checkpoint_lock: LocalGate::new(),
+            superblock_write_failures: Cell::new(0),
+            superblock_retry_after_micros: Cell::new(0),
             mux_stm,
             allocator,
             coordinator,
@@ -2360,6 +2466,13 @@ where
     /// dispatching any view-scoped VSR message, so a replica that acted in a view can
     /// never recover an older one after a crash.
     ///
+    /// It fences the SEND, not the ACT. By the time a caller reaches here the handler
+    /// has already moved `view`, `log_view`, `status`, the sequencer and the pipeline,
+    /// and `commit_journal` runs outside the gate, so a failed persist still applies
+    /// committed ops locally. That is the VSR fence and it is sufficient: local state a
+    /// crash forgets is state no peer ever saw, whereas an externalized view must be
+    /// recoverable. Do not read this as "nothing changed until the write lands".
+    ///
     /// `true` when the send may proceed, either because the state is now durable or
     /// because there was nothing to persist (peer shard, partition plane, or an
     /// unchanged view). `false` only when a write was attempted and failed, and the
@@ -2382,18 +2495,52 @@ where
         if !consensus.needs_superblock_persist() {
             return true;
         }
-        // Serialize every durability write on this shard: view-change persists here
-        // and checkpoints share the one ping-pong superblock, whose `write` picks its
-        // slot before it awaits, so two overlapping writers would target the same slot
-        // and could tear it while both report success. Re-check needs-persist AFTER
+        // A write that keeps failing must not re-run a full `atomic_replace` on every
+        // 10 ms tick. Back off first, while still reporting `false` so the send stays
+        // withheld: fail-closed is the point of this gate, and the backoff only bounds
+        // what the retry costs.
+        if consensus.clock_realtime_micros() < self.superblock_retry_after_micros.get() {
+            return false;
+        }
+        // Serialize superblock writes on this shard: view-change persists here and
+        // checkpoints share the one ping-pong superblock, whose `write` picks its slot
+        // before it awaits, so two overlapping writers would target the same slot and
+        // could tear it while both report success. Re-check needs-persist AFTER
         // acquiring the lock so check and write are atomic and a redundant caller
         // coalesces, finding the state already made durable by the writer it queued
-        // behind. See `mark_superblock_durable` for why the state is captured before
-        // the await rather than re-read after it.
-        let _durable = self.durability_lock.acquire().await;
+        // behind.
+        let _superblock = self.superblock_lock.acquire().await;
         if !consensus.needs_superblock_persist() {
             return true;
         }
+        self.write_superblock(consensus, superblock.as_ref()).await
+    }
+
+    /// Write the current VSR state, paired with the last durable checkpoint, under
+    /// [`Self::superblock_lock`].
+    ///
+    /// The caller must hold that lock. The state is captured HERE rather than passed
+    /// in: with writes serialized and no await between the capture and the write, the
+    /// last writer carries the freshest view, so the durable view cannot regress even
+    /// when a checkpoint and a view change interleave. See `mark_superblock_durable`
+    /// for why the written values, not a re-read, mark durability.
+    ///
+    /// # Terminal policy
+    /// There is none beyond staying fenced: a replica that cannot record the view it
+    /// is in must not act in it, so it withholds every view-scoped send, goes quiet,
+    /// and its peers elect around it. Failures are counted and the retry interval backs
+    /// off to [`SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`], with the error logged on the
+    /// first failure and then at each backoff step rather than per tick.
+    ///
+    /// TODO(fail-stop): a replica wedged here is dead weight an operator has to notice
+    /// from logs. Fail-stopping the process is the TigerBeetle-style answer, but this
+    /// layer holds no process-lifecycle handle; wire it where the shard owns shutdown.
+    #[allow(clippy::future_not_send)]
+    async fn write_superblock(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        superblock: &dyn DynSuperblockStore,
+    ) -> bool {
         // Carry the last durable pairing forward so a view-change write never
         // regresses the `(checkpoint_op, checksum)` a checkpoint recorded. `(0, 0)`
         // with no checkpoint taken, or no coordinator (peer shards, the simulator).
@@ -2405,17 +2552,44 @@ where
         match superblock.dyn_write(&state.to_bytes()).await {
             Ok(()) => {
                 consensus.mark_superblock_durable(state.view, state.log_view);
+                self.superblock_write_failures.set(0);
+                self.superblock_retry_after_micros.set(0);
                 true
             }
             Err(error) => {
-                tracing::error!(
-                    replica_id = consensus.replica(),
-                    %error,
-                    "superblock persist failed; withholding view-scoped send"
-                );
+                let failures = self.superblock_write_failures.get() + 1;
+                self.superblock_write_failures.set(failures);
+                let backoff = SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS
+                    .saturating_mul(1 << failures.min(SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT))
+                    .min(SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
+                self.superblock_retry_after_micros
+                    .set(consensus.clock_realtime_micros() + backoff);
+                // Rate-limited to the backoff steps: the tick would otherwise emit this
+                // every 10 ms for as long as the disk stays broken.
+                if failures.is_power_of_two() {
+                    tracing::error!(
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        view = state.view,
+                        log_view = state.log_view,
+                        superblock_write_failures = failures,
+                        retry_in_micros = backoff,
+                        %error,
+                        "superblock persist failed; withholding every view-scoped send \
+                         until it succeeds, so this replica stays quorum-invisible"
+                    );
+                }
                 false
             }
         }
+    }
+
+    /// Consecutive failed superblock writes, `0` when the last one succeeded. Read by
+    /// diagnostics: a non-zero value means this replica is fenced out of view changes.
+    #[must_use]
+    pub const fn superblock_write_failures(&self) -> u64 {
+        self.superblock_write_failures.get()
     }
 }
 
@@ -2444,17 +2618,19 @@ where
         let Some(coordinator) = &self.coordinator else {
             return;
         };
-        // Serialize the whole checkpoint (snapshot persist, superblock write, WAL
-        // drain) against sibling durability ops on this shard. In-process metadata
-        // submits each run on their own spawned task (`bus.spawn` in server-ng's
-        // metadata submit handler), so at the checkpoint margin two can enter here
-        // concurrently; without this lock they would run concurrent
-        // `persist_snapshot`s, race the superblock write, and concurrently `drain` the
-        // WAL, which rewrites through a shared `wal.tmp`. Acquire BEFORE
-        // `should_checkpoint` so check and sequence are atomic: the second caller
-        // re-checks under the lock, finds the margin restored by the first's drain,
-        // and coalesces away the redundant work.
-        let _durable = self.durability_lock.acquire().await;
+        // Serialize whole checkpoints against each other. In-process metadata submits
+        // each run on their own spawned task (`bus.spawn` in server-ng's metadata submit
+        // handler), so at the checkpoint margin two can enter here concurrently; without
+        // this lock they would run concurrent `persist_snapshot`s over the single
+        // `snapshot.bin` and concurrently `drain` the WAL, which rewrites through a
+        // shared `wal.tmp`. Acquire BEFORE `should_checkpoint` so check and sequence are
+        // atomic: the second caller re-checks under the lock, finds the margin restored
+        // by the first's drain, and coalesces away the redundant work.
+        //
+        // The superblock write below takes `superblock_lock` for itself, so a
+        // concurrent view persist (and with it every gated send, including the ack
+        // path) waits only for that write and not for this whole sequence.
+        let _checkpoint = self.checkpoint_lock.acquire().await;
         if !coordinator.should_checkpoint(journal) {
             return;
         }
@@ -2500,19 +2676,28 @@ where
         };
 
         if let Some(superblock) = self.superblock.as_ref() {
-            let state = consensus.vsr_state(snap_op, checksum);
-            if let Err(error) = superblock.dyn_write(&state.to_bytes()).await {
+            // `persist_snapshot` already recorded the new pairing on the coordinator, so
+            // `write_superblock` picks it up from there. A view persist that interleaves
+            // between those two steps writes the same new pairing, which only makes it
+            // durable sooner.
+            debug_assert_eq!(
+                self.coordinator
+                    .as_ref()
+                    .map(SnapshotCoordinator::last_checkpoint),
+                Some((snap_op, checksum)),
+                "the checkpoint's pairing must be what the superblock write records"
+            );
+            let _superblock = self.superblock_lock.acquire().await;
+            if !self.write_superblock(consensus, superblock.as_ref()).await {
                 error!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     checkpoint_op = snap_op,
-                    %error,
                     "checkpoint superblock write failed; withholding WAL drain"
                 );
                 return;
             }
-            consensus.mark_superblock_durable(state.view, state.log_view);
         }
 
         if let Err(e) = coordinator.drain(journal, snap_op).await {
@@ -3258,34 +3443,37 @@ mod tests {
 
     #[test]
     fn populated_snapshot_reencode_and_checksum_are_stable() {
-        // Recovery recomputes the checkpoint checksum as hash(encode(decode(disk)))
-        // and compares it to the stored hash(encode(state)). They agree only if a
-        // decode then re-encode is byte-identical, which holds only while every
-        // serialized collection keeps a deterministic order. Fold a multi-slot client
-        // table (the envelope's own Vec) and assert both the raw re-encode and the
-        // checksum survive the round-trip. The streams sub-tree's map-derived Vecs are
+        // Two replicas holding identical state must serialize it identically, which
+        // holds only while every serialized collection keeps a deterministic order.
+        // Fold a multi-slot client table (the envelope's own Vec) and assert the raw
+        // re-encode survives the round-trip. The streams sub-tree's map-derived Vecs are
         // covered by
         // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
         let mut snapshot = IggySnapshot::new(7);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
             slots: vec![
-                Some(consensus::ClientEntrySnapshot {
-                    client_id: 1,
-                    epoch: 10,
-                    user_id: 1,
-                    watermark: 3,
-                    watermark_checksum: 0xabc,
-                    reply: vec![1, 2, 3],
-                }),
-                None,
-                Some(consensus::ClientEntrySnapshot {
-                    client_id: 2,
-                    epoch: 20,
-                    user_id: 2,
-                    watermark: 0,
-                    watermark_checksum: 0,
-                    reply: vec![4, 5],
-                }),
+                (
+                    0,
+                    consensus::ClientEntrySnapshot {
+                        client_id: 1,
+                        epoch: 10,
+                        user_id: 1,
+                        watermark: 3,
+                        watermark_checksum: 0xabc,
+                        reply: vec![1, 2, 3],
+                    },
+                ),
+                (
+                    2,
+                    consensus::ClientEntrySnapshot {
+                        client_id: 2,
+                        epoch: 20,
+                        user_id: 2,
+                        watermark: 0,
+                        watermark_checksum: 0,
+                        reply: vec![4, 5],
+                    },
+                ),
             ],
         });
 
@@ -3295,19 +3483,51 @@ mod tests {
             encoded,
             decoded.encode().unwrap(),
             "a populated snapshot must re-encode byte-identically after a decode; an \
-             unordered collection in the serialized form would break the checkpoint \
-             checksum cross-check and refuse boot on a healthy node"
-        );
-        assert_eq!(
-            snapshot.checksum().unwrap(),
-            decoded.checksum().unwrap(),
-            "persist-time and boot-time checkpoint checksums must agree"
+             unordered collection in the serialized form would make two replicas with \
+             identical state serialize differently"
         );
         assert_ne!(
-            snapshot.checksum().unwrap(),
-            IggySnapshot::new(7).checksum().unwrap(),
+            checkpoint_checksum(&encoded),
+            checkpoint_checksum(&IggySnapshot::new(7).encode().unwrap()),
             "the checksum must track content, else it could not detect a torn snapshot"
         );
+    }
+
+    #[test]
+    fn client_table_reply_bytes_encode_as_a_msgpack_blob() {
+        // A `Vec<u8>` serialized through serde's sequence path spends 2 bytes on every
+        // byte >= 0x80, so a checkpoint's reply payload runs up to roughly double.
+        // Reply bytes are wire messages, mostly high bytes, so pin the `bin` encoding:
+        // the format freezes at release and this is much cheaper to fix now.
+        const REPLY_LEN: usize = 512;
+        let mut snapshot = IggySnapshot::new(1);
+        snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            slots: vec![(
+                0,
+                consensus::ClientEntrySnapshot {
+                    client_id: 1,
+                    epoch: 1,
+                    user_id: 1,
+                    watermark: 0,
+                    watermark_checksum: 0,
+                    reply: vec![0xFF; REPLY_LEN],
+                },
+            )],
+        });
+
+        let encoded = snapshot.encode().unwrap();
+        let baseline = IggySnapshot::new(1).encode().unwrap().len();
+        let reply_cost = encoded.len() - baseline;
+        assert!(
+            reply_cost < REPLY_LEN * 2,
+            "a {REPLY_LEN}-byte reply of high bytes cost {reply_cost} bytes, so it is \
+             still encoding as an integer array rather than a msgpack blob"
+        );
+
+        // And it must decode back to the same bytes.
+        let decoded = IggySnapshot::decode(&encoded).unwrap();
+        let table = decoded.snapshot().client_table.as_ref().unwrap();
+        assert_eq!(table.slots[0].1.reply, vec![0xFF; REPLY_LEN]);
     }
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
