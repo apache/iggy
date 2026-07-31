@@ -145,6 +145,10 @@ where
     }
 
     if header.view > consensus.view() {
+        // Dropped, but recorded: a newer-view prepare is proof the cluster
+        // moved past this replica, so the heartbeat-timeout handler probes to
+        // catch up rather than starting a futile election.
+        consensus.observe_newer_view(header.view);
         return Err(IgnoreReason::NewerView);
     }
 

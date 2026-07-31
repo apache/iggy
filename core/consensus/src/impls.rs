@@ -850,6 +850,16 @@ where
     /// the probe-exhausted election fallback (full-cluster bootstrap).
     state_transfer_stage: Cell<StateTransferStage>,
 
+    /// Highest view seen on inbound traffic that this replica could not
+    /// process because the view was ahead of its own (a dropped newer-view
+    /// prepare or heartbeat). Proof the cluster elected past this replica
+    /// rather than that the primary died, which is why the heartbeat-timeout
+    /// handler probes to catch up instead of starting a futile election (see
+    /// [`Self::handle_normal_heartbeat_timeout`]). Monotone `max`; a value at
+    /// or below `view` is stale and inert because the catch-up guard is a
+    /// strict `>`.
+    observed_newer_view: Cell<u32>,
+
     /// Highest op number that has been locally executed (state machine applied,
     /// client table updated). Advances one-by-one in `commit_journal` (backup)
     /// and `on_ack` (primary). On a normal primary, `commit_min == commit_max`.
@@ -976,6 +986,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
             state_transfer_stage: Cell::new(StateTransferStage::Idle),
+            observed_newer_view: Cell::new(0),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
             commit_max: Cell::new(0),
@@ -1656,6 +1667,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        // Distinguish "primary died" from "primary moved to a view I missed".
+        // If newer-view traffic has been arriving (a partition that healed
+        // across an election, or a fresh/rejoined node that never saw the
+        // election), the primary is alive and the timer only fired because a
+        // matching-view heartbeat never reset it. Electing would be futile --
+        // a lagging replica cannot win -- and would drag a healthy cluster
+        // through a needless view change. Probe instead: the current primary
+        // answers a `RequestStartView` with its live `StartView` regardless of
+        // the probe's view stamp, and adopting it routes into journal repair
+        // (and state transfer, if the gap fell below the peer's floor). The
+        // probe re-broadcasts on its own timer, so no action is emitted here;
+        // `Recovering` also makes this timeout inert until the probe resolves.
+        if self.observed_newer_view.get() > self.view.get() {
+            tracing::info!(
+                replica = self.replica,
+                namespace_raw = self.namespace,
+                view = self.view.get(),
+                observed_newer_view = self.observed_newer_view.get(),
+                "heartbeat timed out behind a newer view; probing to catch up"
+            );
+            self.begin_view_probe();
+            return Vec::new();
+        }
+
         self.start_election(plane, ViewChangeReason::NormalHeartbeatTimeout)
     }
 
@@ -1895,6 +1930,26 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// the primary is alive and can advance their own `commit_max`.
     fn handle_commit_message_timeout(&self) -> Vec<VsrAction> {
         if !self.is_primary() || self.status.get() != Status::Normal {
+            return Vec::new();
+        }
+
+        // A primary-by-index that has seen a newer view is stale: the cluster
+        // elected past it while it was gone, and it booted primary-by-index at
+        // an old view (a fresh or rejoined node that missed the election). It
+        // has no `NormalHeartbeat` timeout to catch this -- it IS the heartbeat
+        // sender -- so convert here instead of advertising a commit point no
+        // peer will accept. The probe solicits the current `StartView`, which
+        // demotes this replica to a backup and routes into repair / state
+        // transfer. `begin_view_probe` stops this timer.
+        if self.observed_newer_view.get() > self.view.get() {
+            tracing::info!(
+                replica = self.replica,
+                namespace_raw = self.namespace,
+                view = self.view.get(),
+                observed_newer_view = self.observed_newer_view.get(),
+                "stale primary-by-index behind a newer view; probing to catch up"
+            );
+            self.begin_view_probe();
             return Vec::new();
         }
 
@@ -2237,6 +2292,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
     }
 
+    /// Record that a message stamped with `view` arrived that this replica
+    /// could not process because the view is ahead of its own. Monotone: only
+    /// a value strictly above the current record moves it. Called from the two
+    /// ingress paths that drop newer-view traffic (`handle_commit` and
+    /// `replicate_preflight`); read by the heartbeat-timeout handler to choose
+    /// catch-up over election.
+    pub fn observe_newer_view(&self, view: u32) {
+        if view > self.observed_newer_view.get() {
+            self.observed_newer_view.set(view);
+        }
+    }
+
     #[must_use]
     pub const fn state_transfer_stage(&self) -> StateTransferStage {
         self.state_transfer_stage.get()
@@ -2497,6 +2564,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             {
                 return CommitOutcome::RespondStartView;
             }
+            // A "primary" hearing a NEWER view is stale-by-index: the cluster
+            // elected past it. Record so its heartbeat-send timer converts to
+            // a probe (see `handle_commit_message_timeout`).
+            if header.view > self.view.get() {
+                self.observe_newer_view(header.view);
+            }
             return CommitOutcome::Accepted;
         }
 
@@ -2505,6 +2578,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         if header.view != self.view.get() {
+            // A heartbeat from a newer view is proof the cluster elected past
+            // this replica. Record it so the heartbeat-timeout handler probes
+            // to catch up instead of electing (this same heartbeat cannot
+            // reset the timer -- the reset below is gated on a matching view).
+            if header.view > self.view.get() {
+                self.observe_newer_view(header.view);
+            }
             return CommitOutcome::Accepted;
         }
 
@@ -3343,5 +3423,139 @@ mod state_transfer_stage_tests {
         assert!(consensus.is_transferring());
         consensus.set_state_transfer_stage(StateTransferStage::Idle);
         assert!(!consensus.is_transferring());
+    }
+
+    // A backup left behind on VIEW (partition healed across an election, or a
+    // fresh node that never saw it) keeps getting newer-view heartbeats it
+    // cannot process -- they never reset its heartbeat timer, so the timer
+    // fires. The primary is alive, so it must PROBE to adopt the current view
+    // (which routes into repair / state transfer), not elect: a lagging
+    // replica cannot win, and electing would drag a healthy cluster through a
+    // needless view change.
+    #[test]
+    fn heartbeat_timeout_behind_a_newer_view_probes_not_elects() {
+        // Replica 1 is a backup at view 0 (primary_index(0) == 0).
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.view(), 0);
+
+        // A newer-view frame arrived and was dropped by the ingress path.
+        consensus.observe_newer_view(3);
+
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "must enter the probe (Recovering), not an election"
+        );
+        assert_eq!(consensus.view(), 0, "probing must not bump the view");
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartViewChange { .. })),
+            "must not broadcast an election SVC"
+        );
+    }
+
+    // No newer view seen means the primary is presumed dead, so the timeout
+    // must still elect -- the split must not swallow the ordinary case.
+    #[test]
+    fn heartbeat_timeout_with_no_newer_view_still_elects() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+
+        assert_eq!(
+            consensus.status(),
+            Status::ViewChange,
+            "a silent primary must still trigger an election"
+        );
+        assert_eq!(consensus.view(), 1, "election advances the view");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartViewChange { .. })),
+            "election must broadcast its SVC"
+        );
+    }
+
+    // A recorded view at or below the current one is stale (already caught up)
+    // and must not divert a genuine election, since the guard is a strict `>`.
+    #[test]
+    fn stale_observed_view_does_not_divert_election() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.observe_newer_view(0);
+
+        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+
+        assert_eq!(
+            consensus.status(),
+            Status::ViewChange,
+            "a stale observed view must not suppress the election"
+        );
+    }
+
+    // A fresh or rejoined node that missed an election boots primary-by-index
+    // at a stale view (replica 0 is primary_index(0)). It has no heartbeat
+    // timeout -- it IS the heartbeat sender -- so its heartbeat-SEND timer must
+    // convert to a probe once it observes the newer view, or it wedges forever
+    // advertising a commit point no peer accepts.
+    #[test]
+    fn stale_primary_by_index_probes_on_its_heartbeat_send_timer() {
+        // Replica 0 is primary-by-index at view 0.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(consensus.is_primary());
+        assert_eq!(consensus.status(), Status::Normal);
+
+        // A prepare/heartbeat from the real primary at a newer view was seen.
+        consensus.observe_newer_view(2);
+
+        let actions = consensus.handle_commit_message_timeout();
+
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "a stale primary-by-index must probe, not keep heartbeating"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendCommit { .. })),
+            "a stale primary must not advertise a commit point"
+        );
+    }
+
+    // A genuine current primary (no newer view seen) keeps heartbeating.
+    #[test]
+    fn current_primary_keeps_heartbeating() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let actions = consensus.handle_commit_message_timeout();
+
+        assert_eq!(consensus.status(), Status::Normal, "must stay primary");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendCommit { .. })),
+            "a healthy primary must heartbeat"
+        );
+    }
+
+    // `observe_newer_view` is monotone: an older stamp cannot lower it.
+    #[test]
+    fn observe_newer_view_keeps_the_max() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.observe_newer_view(5);
+        consensus.observe_newer_view(2);
+        // Timeout at view 0 with the record still 5 must probe.
+        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+        assert_eq!(consensus.status(), Status::Recovering);
     }
 }

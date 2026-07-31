@@ -173,3 +173,93 @@ async fn given_checkpointed_cluster_when_fresh_node_joins_late_should_state_tran
     )
     .await;
 }
+
+/// A node that rejoins at a STALE VIEW must probe to catch up, not wedge.
+///
+/// The late-join test above rejoins a follower while the cluster is still at
+/// view 0, so it adopts the frontier from same-view heartbeats. This one forces
+/// the harder case: kill the view-0 primary so the survivors elect past it,
+/// then rejoin that same node (replica 0) with an empty disk. It boots
+/// primary-by-index at view 0 -- so it has NO heartbeat timeout to notice it is
+/// behind, and thinks it is the primary of a view the cluster has abandoned.
+///
+/// It must observe the newer-view traffic it keeps dropping, convert its own
+/// heartbeat-SEND timer into a view probe, adopt the current view from the
+/// live primary's `StartView`, and from there follow the same repair ->
+/// `RangeEvicted` -> transfer path. Without that it advertises a commit point
+/// no peer accepts, forever.
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_election_past_a_node_when_it_rejoins_stale_should_probe_then_state_transfer(
+    harness: &mut TestHarness,
+) {
+    let addr = tcp_addr(harness);
+    let (mut stream, session) = register(addr).await;
+    for request in 1..=OPS_BEFORE_RESTART {
+        commit_request(
+            &mut stream,
+            session,
+            request,
+            &create_stream_payload(&format!("iggy-stale-{request}")),
+        )
+        .await;
+    }
+    drop(stream);
+
+    // Kill the view-0 primary (replica 0). The survivors (1, 2) hold quorum and
+    // elect a new primary at a higher view, leaving replica 0 behind on view.
+    harness.stop_node(0).unwrap();
+
+    // Confirm the cluster recovered to a live primary at the new view before
+    // rejoining: one continuation must commit against a survivor. The stopped
+    // node's address is skipped by the round-robin.
+    let addrs = tcp_addrs(harness);
+    resume_request(
+        &addrs,
+        session,
+        OPS_BEFORE_RESTART + 1,
+        &create_stream_payload("iggy-stale-failover"),
+        None,
+    )
+    .await;
+
+    // Rejoin replica 0 with an empty disk. It boots primary-by-index at view 0
+    // while the cluster sits at a higher view -- the stale-primary case.
+    harness.restart_node_from_clean_slate(0).unwrap();
+
+    // It must first PROBE (its heartbeat-send timer converting, since it has no
+    // heartbeat-receive timer as a "primary"), then complete the transfer. The
+    // probe marker distinguishes this path from the same-view backstop.
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    let mut probed = false;
+    loop {
+        probed = probed || harness.node(0).stdout_contains("probing to catch up");
+        if harness
+            .node(0)
+            .stdout_contains("metadata state transfer installed")
+        {
+            assert!(
+                probed,
+                "the rejoined node transferred without first probing; the \
+                 stale-view path must reach the transfer through a view probe"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node that rejoined at a stale view never state-transferred within \
+             {TRANSFER_BUDGET:?}; a stale primary-by-index must convert its \
+             heartbeat-send timer into a probe rather than wedge"
+        );
+        sleep(MARKER_POLL).await;
+    }
+
+    // Functional: the session continues cluster-wide with the node rejoined.
+    resume_request(
+        &addrs,
+        session,
+        OPS_BEFORE_RESTART + 2,
+        &create_stream_payload("iggy-stale-continuation"),
+        None,
+    )
+    .await;
+}
