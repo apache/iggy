@@ -76,6 +76,9 @@ impl MessageIterator {
         self.key
     }
 
+    // PHP's \Iterator contract fixes this method name, and PhpResult cannot
+    // satisfy Iterator::next, so the standard trait is not implementable here.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> PhpResult {
         if self.current.is_some() {
             self.key += 1;
