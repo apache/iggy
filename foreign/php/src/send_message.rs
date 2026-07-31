@@ -99,38 +99,38 @@ impl From<RustSendMessagesResponse> for SendMessagesResponse {
 impl SendMessagesResponse {
     /// One confirmation per partition the batch landed in.
     ///
-    /// An empty list means the batch committed but the server reported no offsets.
+    /// The list is empty when the server reports no offsets. The legacy server never
+    /// reports any, and a server that does can still commit a batch it has no offsets
+    /// to describe, so check for an empty array instead of indexing.
+    ///
     /// The confirmations are rebuilt on each getter call; cache the result in PHP if
     /// they will be read repeatedly.
-    // TODO(hubcio): a single all-zero confirmation is the SDK's stand-in for the empty
-    // body legacy core/server sends; remove that shape once core/server is retired in
-    // favor of core/server-ng, which always reports confirmations. Empty stays valid.
     #[php(getter)]
-    pub fn confirmations(&self) -> Vec<SendMessagesConfirmationResponse> {
+    pub fn confirmations(&self) -> Vec<SendMessagesConfirmation> {
         self.inner
             .confirmations
             .iter()
             .cloned()
-            .map(SendMessagesConfirmationResponse::from)
+            .map(SendMessagesConfirmation::from)
             .collect()
     }
 }
 
 /// A PHP class representing where one partition's batch was committed.
 #[php_class]
-#[php(name = "Iggy\\SendMessagesConfirmationResponse")]
-pub struct SendMessagesConfirmationResponse {
+#[php(name = "Iggy\\SendMessagesConfirmation")]
+pub struct SendMessagesConfirmation {
     pub(crate) inner: RustSendMessagesConfirmationResponse,
 }
 
-impl From<RustSendMessagesConfirmationResponse> for SendMessagesConfirmationResponse {
+impl From<RustSendMessagesConfirmationResponse> for SendMessagesConfirmation {
     fn from(inner: RustSendMessagesConfirmationResponse) -> Self {
         Self { inner }
     }
 }
 
 #[php_impl]
-impl SendMessagesConfirmationResponse {
+impl SendMessagesConfirmation {
     #[php(getter)]
     pub fn stream_id(&self) -> u32 {
         self.inner.stream_id
@@ -147,6 +147,16 @@ impl SendMessagesConfirmationResponse {
     }
 
     /// The offset assigned to the first message of the batch in this partition.
+    ///
+    /// Delivery is at-least-once, so an earlier retry may already have committed the
+    /// same batch at a lower offset. The value never implies uniqueness.
+    ///
+    /// A batch is confirmed once it is committed in memory, not once it is fsynced. A
+    /// crash-restart can stamp a later batch with an offset a client has already
+    /// recorded.
+    ///
+    /// The legacy server returns an empty confirmation list, so it reports no offset
+    /// at all.
     #[php(getter)]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset

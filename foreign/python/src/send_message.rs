@@ -109,11 +109,11 @@ impl_stub_type!(PyMessagePayload = String | PyBytes);
 /// written by a send.
 #[pyclass]
 #[gen_stub_pyclass]
-pub struct SendMessagesConfirmationResponse {
+pub struct SendMessagesConfirmation {
     pub(crate) inner: RustSendMessagesConfirmationResponse,
 }
 
-impl From<&RustSendMessagesConfirmationResponse> for SendMessagesConfirmationResponse {
+impl From<&RustSendMessagesConfirmationResponse> for SendMessagesConfirmation {
     fn from(confirmation: &RustSendMessagesConfirmationResponse) -> Self {
         Self {
             inner: confirmation.clone(),
@@ -123,7 +123,7 @@ impl From<&RustSendMessagesConfirmationResponse> for SendMessagesConfirmationRes
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl SendMessagesConfirmationResponse {
+impl SendMessagesConfirmation {
     /// Gets the unique identifier (numeric) of the stream the batch was written to.
     #[getter]
     pub fn stream_id(&self) -> u32 {
@@ -143,6 +143,17 @@ impl SendMessagesConfirmationResponse {
     }
 
     /// Gets the offset assigned to the first message of the batch in this partition.
+    ///
+    /// The offset locates the batch, it does not identify it. Delivery is
+    /// at-least-once, so an earlier retry may already have committed these
+    /// messages at a lower offset.
+    ///
+    /// A batch is confirmed once it is committed in memory, not once it is
+    /// fsynced. A crash-restart can stamp a later batch with an offset a client
+    /// has already recorded.
+    ///
+    /// The legacy server confirms nothing, so its confirmation list is empty
+    /// and this value is never reached.
     #[getter]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset
@@ -166,18 +177,22 @@ impl From<RustSendMessagesResponse> for SendMessagesResponse {
 #[pymethods]
 impl SendMessagesResponse {
     /// Gets the commit confirmations, one per partition the batch was written to.
-    /// A server that commits without reporting offsets yields either an empty
-    /// list or a single all-zero entry, so neither the length nor a zero
-    /// `base_offset` can be read as a real offset.
-    // TODO(hubcio): the all-zero entry is the SDK's stand-in for the empty body legacy
-    // core/server sends; remove that shape once core/server is retired in favor of
-    // core/server-ng, which always reports confirmations. An empty list stays valid.
+    ///
+    /// The list is empty when the server reports no offsets, and the legacy
+    /// server never reports any, so branch on it being empty rather than
+    /// indexing into it.
+    ///
+    /// A reported `base_offset` never implies uniqueness, because delivery is
+    /// at-least-once and an earlier retry may already have committed the same
+    /// messages at a lower offset. A batch is confirmed once it is committed in
+    /// memory, not once it is fsynced. A crash-restart can stamp a later batch
+    /// with an offset a client has already recorded.
     #[getter]
-    pub fn confirmations(&self) -> Vec<SendMessagesConfirmationResponse> {
+    pub fn confirmations(&self) -> Vec<SendMessagesConfirmation> {
         self.inner
             .confirmations
             .iter()
-            .map(SendMessagesConfirmationResponse::from)
+            .map(SendMessagesConfirmation::from)
             .collect()
     }
 }

@@ -55,15 +55,21 @@ export type SendMessagesConfirmation = {
   topicId: number,
   /** Partition the batch was written to */
   partitionId: number,
-  /** Offset assigned to the first message of the batch in that partition */
+  /**
+   * Offset assigned to the first message of the batch in that partition.
+   *
+   * Delivery is at-least-once, so an earlier retry of the same batch may
+   * already have committed at a lower offset: this never identifies a batch
+   * uniquely. A batch is confirmed once it is committed in memory, not once it
+   * is fsynced, so a crash-restart can stamp a later batch with an offset a
+   * client has already recorded.
+   */
   baseOffset: bigint,
 };
 
 /**
- * Outcome of a successful send, one confirmation per written partition. A
- * server that commits without reporting offsets yields either an empty list or
- * a single all-zero entry, so neither the length nor a zero `baseOffset` can be
- * read as a real offset.
+ * Outcome of a successful send, one confirmation per written partition. The
+ * legacy server returns an empty list: it commits without reporting offsets.
  */
 export type SendMessagesResponse = {
   /** Commit confirmations, one per partition the batch was written to */
@@ -74,20 +80,11 @@ export type SendMessagesResponse = {
  * Decodes the reply body of a send: `[confirmations_count:4]` then that many
  * `[stream_id:4 topic_id:4 partition_id:4 base_offset:8]` entries.
  *
- * An empty body means the batch was accepted but no offsets were reported: the
- * legacy server answers that way, so absence must never surface as a decode
- * failure.
+ * The legacy server reports a commit by sending no body at all, so absence
+ * decodes to no confirmations instead of surfacing as a decode failure.
  */
-// TODO(hubcio): remove the zeroed-confirmation fallback once core/server is
-// retired in favor of core/server-ng, which always reports confirmations. A
-// count of zero stays valid.
 const deserializeSendMessages = (data: Buffer): SendMessagesResponse => {
-  if (data.length === 0)
-    return {
-      confirmations: [
-        { streamId: 0, topicId: 0, partitionId: 0, baseOffset: 0n }
-      ]
-    };
+  if (data.length === 0) return { confirmations: [] };
   if (data.length < CONFIRMATIONS_COUNT_SIZE)
     throw new DeserializeError('send messages confirmation count is truncated');
 
@@ -126,7 +123,8 @@ export const SEND_MESSAGES = {
 };
 
 /**
- * Executable send messages command function.
+ * Executable send messages command function. Resolves to the commit
+ * confirmations of the written partitions, empty against the legacy server.
  */
 export const sendMessages =
   wrapCommand<SendMessages, SendMessagesResponse>(SEND_MESSAGES);

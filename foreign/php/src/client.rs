@@ -185,6 +185,8 @@ impl IggyClient {
     }
 
     /// Sends messages to a topic and returns the commit confirmations.
+    ///
+    /// The list is empty against the legacy server, which reports no offsets.
     pub fn send_messages(
         &self,
         stream: PhpIdentifier,

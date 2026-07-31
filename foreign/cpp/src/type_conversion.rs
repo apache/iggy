@@ -660,9 +660,6 @@ impl From<RustSendMessagesConfirmationResponse> for ffi::SendMessagesConfirmatio
 
 impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
     fn from(response: RustSendMessagesResponse) -> Self {
-        // TODO(hubcio): a single all-zero confirmation is the SDK's stand-in for the empty
-        // body legacy core/server sends; remove that shape once core/server is retired in
-        // favor of core/server-ng, which always reports confirmations. Empty stays valid.
         ffi::SendMessagesResponse {
             confirmations: response
                 .confirmations

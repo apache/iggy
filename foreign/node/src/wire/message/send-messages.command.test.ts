@@ -230,13 +230,9 @@ describe("SendMessages", () => {
       assert.deepEqual(SEND_MESSAGES.deserialize(r), { confirmations: [] });
     });
 
-    it('substitutes a zeroed confirmation for an empty legacy server body', () => {
+    it('reads the bodiless legacy server reply as an empty list', () => {
       const r = response(Buffer.alloc(0));
-      assert.deepEqual(SEND_MESSAGES.deserialize(r), {
-        confirmations: [
-          { streamId: 0, topicId: 0, partitionId: 0, baseOffset: 0n }
-        ]
-      });
+      assert.deepEqual(SEND_MESSAGES.deserialize(r), { confirmations: [] });
     });
 
     it('throws on a truncated body', () => {

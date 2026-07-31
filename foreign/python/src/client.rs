@@ -899,7 +899,9 @@ impl IggyClient {
 
     /// Sends a list of messages to the specified topic.
     /// Returns a SendMessagesResponse carrying the per-partition commit
-    /// confirmations, or a PyRuntimeError on failure.
+    /// confirmations, or a PyRuntimeError on failure. The confirmation list is
+    /// empty when the server reports no offsets, and the legacy server never
+    /// reports any.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,

@@ -145,16 +145,28 @@ mod ffi {
         messages: Vec<IggyMessagePolled>,
     }
 
+    /// Commit confirmation for one partition written by `send_messages`.
     struct SendMessagesConfirmation {
         stream_id: u32,
         topic_id: u32,
         partition_id: u32,
-        // Offset assigned to the first message of the batch in this partition.
+        /// Offset assigned to the first message of the batch in this partition.
+        ///
+        /// Sends are at-least-once: an earlier retry may already have committed
+        /// the same batch at a lower offset, so this never identifies a batch
+        /// uniquely.
+        ///
+        /// A batch is confirmed once it is committed in memory, not once it is
+        /// fsynced. A crash-restart can stamp a later batch with an offset a
+        /// client has already recorded.
         base_offset: u64,
     }
 
+    /// Reply to `send_messages`.
     struct SendMessagesResponse {
-        // Empty means the batch committed but the server reported no offsets.
+        /// One entry per partition the batch was written to. Empty whenever the
+        /// server reports no offsets, which is every send against the legacy
+        /// server, so call `empty()` before indexing.
         confirmations: Vec<SendMessagesConfirmation>,
     }
 

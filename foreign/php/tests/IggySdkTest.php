@@ -23,7 +23,6 @@ use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
 use Iggy\SendMessage;
-use Iggy\SendMessagesConfirmationResponse;
 use Iggy\SendMessagesResponse;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
@@ -223,8 +222,8 @@ final class IggySdkTest extends TestCase
         }
     }
 
-    #[TestDox('sendMessages confirms the partition and base offset the batch committed at')]
-    public function testSendMessagesReportsCommitConfirmation(): void
+    #[TestDox('sendMessages against the legacy server reports no commit confirmations')]
+    public function testSendMessagesReportsNoConfirmationFromLegacyServer(): void
     {
         $client = new_client();
         $streamName = unique_name('confirm-stream');
@@ -234,23 +233,9 @@ final class IggySdkTest extends TestCase
         try {
             create_stream_and_topic($client, $streamName, $topicName);
 
-            $first = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-first')]);
-            assert_instance_of(SendMessagesResponse::class, $first);
-            assert_count(1, $first->confirmations);
-
-            $confirmation = $first->confirmations[0];
-            assert_instance_of(SendMessagesConfirmationResponse::class, $confirmation);
-            assert_same($partitionId, $confirmation->partition_id);
-            assert_same(0, $confirmation->base_offset, 'the first batch of an empty partition starts at offset 0');
-
-            // core/server answers a send with an empty body, which the SDK reports as a
-            // zeroed confirmation, so only a non-decreasing offset holds on every server.
-            $second = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-second')]);
-            assert_count(1, $second->confirmations);
-            assert_true(
-                $second->confirmations[0]->base_offset >= $confirmation->base_offset,
-                'expected the second send not to report a lower base offset',
-            );
+            $response = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-first')]);
+            assert_instance_of(SendMessagesResponse::class, $response);
+            assert_count(0, $response->confirmations, 'the legacy server answers a send with no offsets');
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }
