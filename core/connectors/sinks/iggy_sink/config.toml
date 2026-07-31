@@ -1,0 +1,20 @@
+type = "sink"
+key = "iggy"
+enabled = true
+version = 0
+name = "Iggy sink"
+path = "../../target/debug/libiggy_connector_iggy_sink"
+verbose = false
+
+[[streams]]
+stream = "source_stream"
+topics = ["source_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "iggy_sink"
+
+[plugin_config]
+server_address = "iggy://iggy:iggy@127.0.0.1:8090"
+stream_id = "target_stream"
+topic_id = "target_topic"

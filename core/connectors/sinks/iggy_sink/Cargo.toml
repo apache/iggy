@@ -1,0 +1,18 @@
+[package]
+name = "iggy_connector_iggy_sink"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+iggy = { workspace = true }
+iggy_connector_sdk = { workspace = true }
+iggy_common = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
