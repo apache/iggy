@@ -2196,6 +2196,28 @@ async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
         .expect("Failed to get consumer group")
 }
 
+/// Wait for the consumer group to settle at `expected` members, pinging
+/// `keep_alive` each round.
+///
+/// The tests that configure a short `heartbeat.interval` also give the server a
+/// stale-client threshold of `interval * 1.2`. A client that holds a group
+/// membership and stays idle past that is evicted with a session-terminal
+/// `StaleClient`, so any wait longer than the threshold has to keep the clients
+/// it still needs alive rather than sleeping through it.
+async fn wait_for_members(root_client: &IggyClient, keep_alive: &IggyClient, expected: u32) {
+    for _ in 0..50 {
+        if get_consumer_group(root_client).await.members_count == expected {
+            return;
+        }
+        keep_alive.ping().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "Consumer group did not settle at {expected} members, last seen: {:?}",
+        get_consumer_group(root_client).await.members
+    );
+}
+
 fn assert_unique_partition_assignments(cg: &ConsumerGroupDetails) {
     let mut all_partitions = HashSet::new();
 
@@ -3144,7 +3166,11 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
 
     // 3. Consumer2 (revocation target) disconnects — its slab is freed
     drop(client2);
-    sleep(Duration::from_secs(3)).await;
+    // The slab is released by the socket-close reap, not the heartbeat
+    // verifier, so wait on the observable membership drop instead of a fixed
+    // sleep that would outlast the server's stale threshold and take client1
+    // down with it.
+    wait_for_members(&root_client, &client1, 1).await;
 
     // 4. Consumer3 joins — may reuse consumer2's old slab
     let client3 = harness.new_client().await.unwrap();
