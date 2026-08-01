@@ -36,8 +36,10 @@ pub enum SnapshotError {
         stage: PersistStage,
         source: std::io::Error,
     },
-    /// Checksum mismatch on snapshot load.
-    ChecksumMismatch { expected: u32, actual: u32 },
+    /// The snapshot's integrity trailer does not match its payload: a torn or
+    /// bit-rotted checkpoint. Refuse to restore from it rather than feed corrupt state
+    /// into the state machine.
+    ChecksumMismatch { expected: u128, actual: u128 },
     /// Snapshot file is too short to contain a valid checksum.
     Truncated { size: u64 },
 }
@@ -71,7 +73,7 @@ impl fmt::Display for SnapshotError {
             Self::ChecksumMismatch { expected, actual } => {
                 write!(
                     f,
-                    "snapshot checksum mismatch: expected {expected:#010x}, actual {actual:#010x}"
+                    "snapshot checksum mismatch: expected {expected:#034x}, actual {actual:#034x}"
                 )
             }
             Self::Truncated { size } => {
@@ -103,6 +105,15 @@ impl From<std::io::Error> for SnapshotError {
 
 /// The snapshot container for all metadata state machines.
 /// Each field corresponds to one state machine's serialized state.
+///
+/// Serialized-form invariant: every collection here and in the nested `*Snapshot`
+/// types must keep a deterministic order (`Vec` or `BTreeMap`, never an unordered
+/// `HashMap`/`HashSet`/`AHashMap`). The checkpoint pairing hashes bytes on both sides
+/// (`impls::metadata::checkpoint_checksum`), so it no longer depends on this, but
+/// cross-replica state comparison and any future content-addressed transfer do: two
+/// replicas with identical state must serialize identically. Regression guards:
+/// `stream::tests::populated_streams_snapshot_reencode_is_byte_stable` and
+/// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
     /// Snapshot format version for forward/backward compatibility.
@@ -117,6 +128,12 @@ pub struct MetadataSnapshot {
     /// Streams state machine snapshot data (consumer groups are nested inside
     /// each topic).
     pub streams: Option<StreamsSnapshot>,
+    /// Client-table state (sessions + at-most-once dedup replies) at the checkpoint
+    /// op. Not a state machine, but folded in so a restart that drained the WAL
+    /// prefix still recovers pre-checkpoint sessions. `#[serde(default)]` so a
+    /// snapshot predating this field decodes as `None`.
+    #[serde(default)]
+    pub client_table: Option<consensus::ClientTableSnapshot>,
 }
 
 impl Default for MetadataSnapshot {
@@ -140,6 +157,7 @@ impl MetadataSnapshot {
             sequence_number,
             users: None,
             streams: None,
+            client_table: None,
         }
     }
 
@@ -317,6 +335,7 @@ mod tests {
         assert_eq!(decoded.sequence_number, 42);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
+        assert!(decoded.client_table.is_none());
     }
 
     #[test]

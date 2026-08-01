@@ -1048,15 +1048,30 @@ pub struct StartViewHeader {
     /// max(commit) from all DVCs.
     pub commit: u64,
     pub namespace: u64,
-    pub reserved: [u8; 104],
+    pub reserved: [u8; 88],
+    /// Sender's incarnation, echoed from the `RequestStartView` this answers so a
+    /// recovering replica can prove the reply post-dates its restart (see
+    /// `RequestStartViewHeader::incarnation`). `0` on an unsolicited `StartView`
+    /// (a normal view-change completion), which carries no freshness claim.
+    ///
+    /// Carved from the tail of the former `reserved` region and placed LAST so it
+    /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
+    /// A peer that predates it sends zeros, decoding as `incarnation == 0`, which
+    /// the `handle_start_view` guard treats as no claim rather than as a foreign
+    /// one, so a mixed-version rolling upgrade is wire-compatible: the pre-upgrade
+    /// peer's `StartView` is judged by the view checks alone, as before the field.
+    pub incarnation: u128,
 }
 const _: () = {
     assert!(size_of::<StartViewHeader>() == HEADER_SIZE);
+    // op/commit/namespace keep their pre-incarnation offsets.
     assert!(
         offset_of!(StartViewHeader, op)
             == offset_of!(StartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StartViewHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE);
+    // `incarnation` is last and 16-aligned, so the struct has no padding.
+    assert!(offset_of!(StartViewHeader, incarnation) + size_of::<u128>() == HEADER_SIZE);
+    assert!(offset_of!(StartViewHeader, incarnation) % 16 == 0);
 };
 
 impl ConsensusHeader for StartViewHeader {
@@ -1097,8 +1112,11 @@ impl ConsensusHeader for StartViewHeader {
 /// Recovering replica -> all replicas: resend me the current `StartView`.
 ///
 /// Header-only; only the current view's primary answers, with a targeted
-/// `StartView` (adoption is fenced by the receiver's view monotonicity and
-/// the sender-is-primary check, so no nonce is needed).
+/// `StartView`. Adoption is fenced by the receiver's view monotonicity and the
+/// sender-is-primary check; `incarnation` additionally proves the reply
+/// post-dates this replica's restart, so a `StartView` from a previous
+/// incarnation still in flight cannot be adopted (see the `handle_start_view`
+/// recovering-status guard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct RequestStartViewHeader {
@@ -1113,15 +1131,26 @@ pub struct RequestStartViewHeader {
     pub reserved_frame: [u8; 66],
 
     pub namespace: u64,
-    pub reserved: [u8; 120],
+    pub reserved: [u8; 104],
+    /// The requester's per-boot incarnation, echoed back in the answering
+    /// `StartView` so a reply from a previous incarnation is detectable.
+    ///
+    /// Carved from the tail of the former `reserved` region and placed LAST so it
+    /// lands 16-aligned with no padding WITHOUT moving `namespace`. A peer that
+    /// predates it sends zeros, decoding as `incarnation == 0`, so a mixed-version
+    /// rolling upgrade is wire-compatible.
+    pub incarnation: u128,
 }
 const _: () = {
     assert!(size_of::<RequestStartViewHeader>() == HEADER_SIZE);
+    // namespace keeps its pre-incarnation offset.
     assert!(
         offset_of!(RequestStartViewHeader, namespace)
             == offset_of!(RequestStartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestStartViewHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
+    // `incarnation` is last and 16-aligned, so the struct has no padding.
+    assert!(offset_of!(RequestStartViewHeader, incarnation) + size_of::<u128>() == HEADER_SIZE);
+    assert!(offset_of!(RequestStartViewHeader, incarnation) % 16 == 0);
 };
 
 impl ConsensusHeader for RequestStartViewHeader {

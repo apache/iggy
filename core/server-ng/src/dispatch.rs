@@ -3036,6 +3036,7 @@ mod tests {
             Some(consensus),
             Some(journal),
             None,
+            None,
             TestMux::default(),
             None,
         );
@@ -3156,7 +3157,7 @@ mod tests {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
 
         let bus = SpyBus::default();
-        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -3279,7 +3280,7 @@ mod tests {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
 
         let bus = SpyBus::default();
-        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -3341,7 +3342,7 @@ mod tests {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
 
         let bus = SpyBus::default();
-        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
