@@ -106,6 +106,13 @@ run_language_examples() {
             report_result "${EXAMPLES_EXIT_CODE}"
             return "${EXAMPLES_EXIT_CODE}"
         fi
+        # The pre-flight leaves streams behind, and examples with
+        # hardcoded IDs assume a fresh server; restart with clean state.
+        stop_server
+        cleanup_server_state
+        # shellcheck disable=SC2086
+        start_plain_server ${server_extra_args}
+        wait_for_server_ready "${lang}"
     fi
 
     if [ "${workdir}" != "." ]; then
