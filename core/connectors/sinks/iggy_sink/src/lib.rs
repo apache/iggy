@@ -179,4 +179,54 @@ mod tests {
         assert_eq!(sink.config.stream_id.as_deref(), Some("target_stream"));
         assert_eq!(sink.config.topic_id.as_deref(), Some("target_topic"));
     }
+
+    #[tokio::test]
+    async fn given_uninitialized_client_consume_should_return_init_error() {
+        let sink = IggySink::new(1, test_config());
+        let topic_meta = TopicMetadata {
+            stream: "stream1".to_string(),
+            topic: "topic1".to_string(),
+        };
+        let msg_meta = MessagesMetadata {
+            partition_id: 1,
+            current_offset: 0,
+            schema: iggy_connector_sdk::Schema::Raw,
+        };
+
+        let result = sink.consume(&topic_meta, msg_meta, vec![]).await;
+        assert!(result.is_err());
+        if let Err(Error::InitError(msg)) = result {
+            assert!(msg.contains("Client not initialized"));
+        } else {
+            panic!("Expected InitError for uninitialized client");
+        }
+    }
+
+    #[test]
+    fn given_consumed_message_conversion_should_preserve_id_and_payload() {
+        let mut consumed = ConsumedMessage {
+            id: 42,
+            offset: 10,
+            timestamp: 1000,
+            origin_timestamp: 999,
+            checksum: 12345,
+            headers: None,
+            payload: Payload::Raw(b"hello iggy".to_vec()),
+        };
+
+        let payload_bytes = match mem::replace(&mut consumed.payload, Payload::Raw(vec![])) {
+            Payload::Raw(bytes) => bytes,
+            other => other.try_to_bytes().unwrap(),
+        };
+
+        let iggy_msg = IggyMessage::builder()
+            .id(consumed.id)
+            .payload(Bytes::from(payload_bytes))
+            .maybe_user_headers(consumed.headers)
+            .build()
+            .unwrap();
+
+        assert_eq!(iggy_msg.header.id, 42);
+        assert_eq!(iggy_msg.payload.as_ref(), b"hello iggy");
+    }
 }
