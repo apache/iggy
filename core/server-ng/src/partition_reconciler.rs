@@ -1110,7 +1110,7 @@ mod tests {
             journal::prepare_journal::PrepareJournal,
             IggySnapshot,
             _,
-        > = IggyMetadata::new(None, None, None, mux, None);
+        > = IggyMetadata::new(None, None, None, None, mux, None);
         let partitions = IggyPartitions::new(
             ShardId::new(shard_id),
             PartitionsConfig {

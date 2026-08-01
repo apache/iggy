@@ -44,6 +44,14 @@ mod http_tls;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 #[cfg(feature = "vsr")]
 mod cluster_metadata_vsr;
+// A metadata view change must persist the advanced view and recover it from disk
+// across a replica restart.
+#[cfg(feature = "vsr")]
+mod cluster_view_durability_vsr;
+// A metadata checkpoint must drain the WAL and recover from the snapshot fold plus
+// the WAL suffix across a restart.
+#[cfg(feature = "vsr")]
+mod metadata_checkpoint_recovery_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;
