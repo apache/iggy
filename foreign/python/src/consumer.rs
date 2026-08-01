@@ -93,8 +93,7 @@ impl IggyConsumer {
 
     /// Stores the provided offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
-    /// if the operation fails.
+    /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
         &self,
@@ -115,8 +114,7 @@ impl IggyConsumer {
 
     /// Deletes the offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
-    /// if the operation fails.
+    /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
         &self,

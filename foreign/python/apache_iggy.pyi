@@ -375,15 +375,14 @@ class IggyClient:
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
-        Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
-        if the connection fails.
+        Raises `RuntimeError` if the connection fails.
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
     ) -> collections.abc.Awaitable[None]:
         r"""
         Logs in the user with the given credentials.
-        Returns `Ok(())` on success, or a RuntimeError on failure.
+        Raises `RuntimeError` on failure.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -474,12 +473,12 @@ class IggyClient:
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.
-        Returns Ok(()) on successful connection or a RuntimeError on failure.
+        Raises `RuntimeError` if the connection fails.
         """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
-        Returns Ok(()) on successful stream creation or a RuntimeError on failure.
+        Raises `RuntimeError` if the stream cannot be created.
         """
     def get_stream(
         self, stream_id: builtins.str | builtins.int
@@ -500,7 +499,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a RuntimeError on failure.
+        Raises `RuntimeError` if the topic cannot be created.
         """
     def get_topic(
         self,
@@ -735,7 +734,7 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a RuntimeError on failure.
+        Raises `RuntimeError` if sending fails.
         """
     def poll_messages(
         self,
@@ -829,8 +828,7 @@ class IggyConsumer:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
-        if the operation fails.
+        Raises `RuntimeError` if the operation fails.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -838,8 +836,7 @@ class IggyConsumer:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
-        if the operation fails.
+        Raises `RuntimeError` if the operation fails.
         """
     def iter_messages(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
         r"""

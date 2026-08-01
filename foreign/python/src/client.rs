@@ -116,8 +116,7 @@ impl IggyClient {
     }
 
     /// Sends a ping request to the server to check connectivity.
-    /// Returns `Ok(())` if the server responds successfully, or a `RuntimeError`
-    /// if the connection fails.
+    /// Raises `RuntimeError` if the connection fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -130,7 +129,7 @@ impl IggyClient {
     }
 
     /// Logs in the user with the given credentials.
-    /// Returns `Ok(())` on success, or a RuntimeError on failure.
+    /// Raises `RuntimeError` on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn login_user<'a>(
         &self,
@@ -290,7 +289,7 @@ impl IggyClient {
     }
 
     /// Connects the IggyClient to its service.
-    /// Returns Ok(()) on successful connection or a RuntimeError on failure.
+    /// Raises `RuntimeError` if the connection fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -304,7 +303,7 @@ impl IggyClient {
     }
 
     /// Creates a new stream with the provided ID and name.
-    /// Returns Ok(()) on successful stream creation or a RuntimeError on failure.
+    /// Raises `RuntimeError` if the stream cannot be created.
     #[pyo3(signature = (name))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_stream<'a>(&self, py: Python<'a>, name: String) -> PyResult<Bound<'a, PyAny>> {
@@ -339,7 +338,7 @@ impl IggyClient {
     }
 
     /// Creates a new topic with the given parameters.
-    /// Returns Ok(()) on successful topic creation or a RuntimeError on failure.
+    /// Raises `RuntimeError` if the topic cannot be created.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -799,7 +798,7 @@ impl IggyClient {
     }
 
     /// Sends a list of messages to the specified topic.
-    /// Returns Ok(()) on successful sending or a RuntimeError on failure.
+    /// Raises `RuntimeError` if sending fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
