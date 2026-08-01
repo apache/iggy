@@ -20,11 +20,12 @@ use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use integration::harness::{TestBinary, TestHarness};
 use std::str::FromStr;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, sleep};
 
 const STREAM_NAME: &str = "test-reconnect-stream";
 const TOPIC_NAME: &str = "test-reconnect-topic";
 
+#[cfg(not(feature = "vsr"))]
 pub async fn run_producer(harness: &mut TestHarness) {
     let client = create_client(harness);
     Client::connect(&client).await.expect("Failed to connect");
@@ -69,7 +70,7 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .start()
         .expect("Failed to start server");
 
-    let send_result = timeout(Duration::from_secs(60), send_handle)
+    let send_result = tokio::time::timeout(Duration::from_secs(60), send_handle)
         .await
         .expect("Timed out waiting for send after server restart")
         .expect("Send task panicked");
