@@ -40,7 +40,10 @@ pub fn iggy_duration_to_py_delta(
     py: Python<'_>,
     duration: IggyDuration,
 ) -> PyResult<Bound<'_, PyDelta>> {
-    let micros = duration.as_micros();
+    // IggyDuration::as_micros() truncates to u64; read the std Duration to keep
+    // the full u128 so oversized values fail the i32 conversion below instead of
+    // wrapping.
+    let micros = duration.get_duration().as_micros();
     let total_seconds = micros / 1_000_000;
     let days = i32::try_from(total_seconds / 86_400).map_err(|_| {
         PyErr::new::<pyo3::exceptions::PyOverflowError, _>(

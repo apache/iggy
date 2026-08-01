@@ -129,6 +129,12 @@ class TestTcpReconnectionConfig:
 
         assert reconnection.interval == timedelta(days=30_000)
 
+    def test_maximum_interval_round_trips(self):
+        """Test that the largest timedelta survives the u64-microsecond boundary."""
+        reconnection = TcpReconnectionConfig(interval=timedelta(days=999_999_999))
+
+        assert reconnection.interval == timedelta(days=999_999_999)
+
 
 @pytest.mark.unit
 class TestTcpConfig:
