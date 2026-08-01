@@ -1850,6 +1850,12 @@ impl StateHandler for DeletePartitionsRequest {
 }
 
 /// Snapshot representation for the Streams state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items` and the nested `topics` / `consumer_groups` / `partitions` stay ordered
+/// `Vec`s even though the runtime holds them in `AHashMap`s and a `Slab`. Swapping
+/// any back to an unordered map reorders on a decode and re-encode, breaking the
+/// checkpoint checksum cross-check recovery relies on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsSnapshot {
     pub items: Vec<(usize, StreamSnapshot)>,
@@ -2048,6 +2054,7 @@ impl_fill_restore!(Streams, streams);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::snapshot::MetadataSnapshot;
     use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::codec::WireDecode;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -2098,6 +2105,85 @@ mod tests {
             replication_factor: 1,
             name: WireName::new(name).unwrap(),
         }
+    }
+
+    /// Regression guard for the [`StreamsSnapshot`] serialized-form invariant: a
+    /// populated snapshot must re-encode byte-identically after a decode, or the
+    /// checkpoint checksum cross-check (`recovery::verify_checkpoint_pairing`) would
+    /// diverge and refuse boot on a healthy node. Populates the three map-derived
+    /// `Vec`s (`items`, `topics`, `consumer_groups`) with two entries each, since one
+    /// entry cannot reorder and only >= 2 makes a regression observable.
+    #[test]
+    fn populated_streams_snapshot_reencode_is_byte_stable() {
+        let mut inner = StreamsInner::new();
+        for name in ["alpha", "beta"] {
+            create_stream(&mut inner, name);
+        }
+        // Streams are assigned ids 0, 1 in creation order; two topics per stream,
+        // two consumer groups per topic.
+        for stream_id in 0..2u32 {
+            for topic_name in ["logs", "events"] {
+                let create_topic = CreateTopicWithAssignmentsRequest {
+                    request: make_topic_request(stream_id, 2, topic_name),
+                    partitions: vec![
+                        CreatedPartitionAssignment {
+                            partition_id: 0,
+                            consensus_group_id: 1,
+                        },
+                        CreatedPartitionAssignment {
+                            partition_id: 1,
+                            consensus_group_id: 2,
+                        },
+                    ],
+                };
+                let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+            }
+        }
+        for stream_id in 0..2u32 {
+            for topic_id in 0..2u32 {
+                for group_name in ["cg-a", "cg-b"] {
+                    let request = CreateConsumerGroupRequest {
+                        stream_id: WireIdentifier::numeric(stream_id),
+                        topic_id: WireIdentifier::numeric(topic_id),
+                        name: WireName::new(group_name).unwrap(),
+                    };
+                    let _ = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+                }
+            }
+        }
+        let streams: Streams = inner.into();
+
+        let mut snapshot = MetadataSnapshot::new(7);
+        snapshot.streams = Some(streams.to_snapshot());
+
+        // The tree really is populated, else a byte-stable empty snapshot would pass
+        // vacuously.
+        let streams_snapshot = snapshot.streams.as_ref().unwrap();
+        assert_eq!(streams_snapshot.items.len(), 2, "two streams");
+        let (_, first_stream) = &streams_snapshot.items[0];
+        assert_eq!(
+            first_stream.topics.len(),
+            2,
+            "two topics in the first stream"
+        );
+        let (_, first_topic) = &first_stream.topics[0];
+        assert_eq!(
+            first_topic.consumer_groups.len(),
+            2,
+            "two consumer groups in the first topic"
+        );
+
+        let encoded = snapshot.encode().unwrap();
+        let reencoded = MetadataSnapshot::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(
+            encoded, reencoded,
+            "a populated snapshot must re-encode byte-identically after a decode; an \
+             unordered collection would reorder and break the checkpoint checksum \
+             cross-check, refusing boot on a healthy node"
+        );
     }
 
     #[test]

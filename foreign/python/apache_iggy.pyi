@@ -34,14 +34,18 @@ __all__ = [
     "ConsumerGroupMember",
     "HeaderKey",
     "HeaderValue",
+    "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
+    "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
     "StreamDetails",
+    "StreamPermissions",
     "Topic",
     "TopicDetails",
+    "TopicPermissions",
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
@@ -661,6 +665,105 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
+class GlobalPermissions:
+    r"""
+    Global permissions, applied to all streams without specifying them one by one.
+    """
+    @property
+    def manage_servers(self) -> builtins.bool:
+        r"""
+        Whether managing servers is allowed; includes `read_servers`.
+        """
+    @property
+    def read_servers(self) -> builtins.bool:
+        r"""
+        Whether reading server info (stats, clients) is allowed.
+        """
+    @property
+    def manage_users(self) -> builtins.bool:
+        r"""
+        Whether managing users is allowed; includes `read_users`.
+        """
+    @property
+    def read_users(self) -> builtins.bool:
+        r"""
+        Whether reading user info is allowed.
+        """
+    @property
+    def manage_streams(self) -> builtins.bool:
+        r"""
+        Whether managing all streams is allowed; includes `read_streams` and
+        `manage_topics`.
+        """
+    @property
+    def read_streams(self) -> builtins.bool:
+        r"""
+        Whether reading all streams is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing all topics is allowed; includes `read_topics` and
+        `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading all topics and managing consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from all streams and managing consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to all streams is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_servers: builtins.bool = False,
+        read_servers: builtins.bool = False,
+        manage_users: builtins.bool = False,
+        read_users: builtins.bool = False,
+        manage_streams: builtins.bool = False,
+        read_streams: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> GlobalPermissions:
+        r"""
+        Create global permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_streams` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_servers: Allow managing servers; includes `read_servers`.
+            read_servers: Allow reading server info (stats, clients).
+            manage_users: Allow managing users; includes `read_users`.
+            read_users: Allow reading user info.
+            manage_streams: Allow managing all streams; includes `read_streams`
+                and `manage_topics`.
+            read_streams: Allow reading all streams; includes `read_topics`.
+            manage_topics: Allow managing all topics; includes `read_topics`
+                and `send_messages`.
+            read_topics: Allow reading all topics and managing consumer groups
+                (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from all streams and managing
+                consumer offsets.
+            send_messages: Allow sending messages to all streams.
+        """
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -724,16 +827,16 @@ class IggyClient:
         username: builtins.str,
         password: builtins.str,
         status: UserStatus | None = None,
+        permissions: Permissions | None = None,
     ) -> collections.abc.Awaitable[UserInfoDetails]:
         r"""
         Create a new user.
-
-        The user is created without permissions.
 
         Args:
             username: Username as `str`.
             password: Password as `str`.
             status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+            permissions: Permissions as `Permissions | None`; the user has none when `None`.
 
         Returns:
             An awaitable that resolves to the created `UserInfoDetails`.
@@ -776,6 +879,57 @@ class IggyClient:
 
         Raises:
             PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def update_permissions(
+        self, user_id: builtins.str | builtins.int, permissions: Permissions | None
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Update the permissions of a user by unique ID or username.
+
+        This is a full replacement: the given permissions overwrite the previous
+        ones, and `None` removes them entirely.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            permissions: New permissions as `Permissions | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the permissions are updated.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def change_password(
+        self,
+        user_id: builtins.str | builtins.int,
+        current_password: builtins.str,
+        new_password: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Change the password of a user by unique ID or username.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            current_password: Current password as `str`.
+            new_password: New password as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the password is changed.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the current password is wrong or the request fails.
+        """
+    def logout_user(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Log out the currently authenticated user.
+
+        Returns:
+            An awaitable that resolves to `None` when the user is logged out.
+
+        Raises:
             PyRuntimeError: If the request fails.
         """
     def connect(self) -> collections.abc.Awaitable[None]:
@@ -1171,6 +1325,39 @@ class IggyConsumer:
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
+@typing.final
+class Permissions:
+    r"""
+    The permissions of a user: global permissions applied to all streams,
+    optionally extended by per-stream permissions.
+    """
+    @property
+    def global_permissions(self) -> GlobalPermissions:
+        r"""
+        The global permissions, applied to all streams.
+        """
+    @property
+    def streams(self) -> dict[int, StreamPermissions] | None:
+        r"""
+        The per-stream permissions keyed by stream ID, or `None` when not set.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        global_permissions: GlobalPermissions | None = None,
+        streams: dict[int, StreamPermissions] | None = None,
+    ) -> Permissions:
+        r"""
+        Create permissions from global permissions and optional per-stream permissions.
+
+        Args:
+            global_permissions: Global permissions as `GlobalPermissions | None`;
+                defaults to all denied.
+            streams: Per-stream permissions keyed by stream ID as
+                `dict[int, StreamPermissions] | None`; an empty dict is
+                treated as `None`.
+        """
+
 class PollingStrategy:
     @typing.final
     class Offset(PollingStrategy):
@@ -1284,6 +1471,88 @@ class StreamDetails:
     def topics_count(self) -> builtins.int: ...
 
 @typing.final
+class StreamPermissions:
+    r"""
+    Permissions for a specific stream and all its topics, optionally refined per topic.
+    They extend the global permissions, they do not override them.
+    """
+    @property
+    def manage_stream(self) -> builtins.bool:
+        r"""
+        Whether managing the stream is allowed; includes `read_stream` and
+        `manage_topics`.
+        """
+    @property
+    def read_stream(self) -> builtins.bool:
+        r"""
+        Whether reading the stream is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing the stream topics is allowed; includes `read_topics`
+        and `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading the stream topics and managing their consumer groups
+        is allowed; includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from the stream and managing its consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to the stream is allowed.
+        """
+    @property
+    def topics(self) -> dict[int, TopicPermissions] | None:
+        r"""
+        The per-topic permissions keyed by topic ID, or `None` when not set.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_stream: builtins.bool = False,
+        read_stream: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+        topics: dict[int, TopicPermissions] | None = None,
+    ) -> StreamPermissions:
+        r"""
+        Create stream permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_stream` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_stream: Allow managing the stream; includes `read_stream`
+                and `manage_topics`.
+            read_stream: Allow reading the stream; includes `read_topics`.
+            manage_topics: Allow managing the stream topics; includes
+                `read_topics` and `send_messages`.
+            read_topics: Allow reading the stream topics and managing their
+                consumer groups (including create and delete); includes
+                `poll_messages`.
+            poll_messages: Allow polling messages from the stream and managing
+                its consumer offsets.
+            send_messages: Allow sending messages to the stream.
+            topics: Per-topic permissions keyed by topic ID as
+                `dict[int, TopicPermissions] | None`; an empty dict is
+                treated as `None`.
+        """
+
+@typing.final
 class Topic:
     @property
     def id(self) -> builtins.int:
@@ -1340,6 +1609,62 @@ class TopicDetails:
         """
 
 @typing.final
+class TopicPermissions:
+    r"""
+    Permissions for a specific topic of a stream. The lowest level of permissions.
+    They extend the stream and global permissions, they do not override them.
+    """
+    @property
+    def manage_topic(self) -> builtins.bool:
+        r"""
+        Whether managing the topic is allowed; includes `read_topic` and
+        `send_messages`.
+        """
+    @property
+    def read_topic(self) -> builtins.bool:
+        r"""
+        Whether reading the topic and managing its consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from the topic and managing its consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to the topic is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_topic: builtins.bool = False,
+        read_topic: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> TopicPermissions:
+        r"""
+        Create topic permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_topic` includes
+        `read_topic` and `send_messages`, and through `read_topic` also
+        `poll_messages`.
+
+        Args:
+            manage_topic: Allow managing the topic; includes `read_topic` and
+                `send_messages`.
+            read_topic: Allow reading the topic and managing its consumer
+                groups (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from the topic and managing
+                its consumer offsets.
+            send_messages: Allow sending messages to the topic.
+        """
+
+@typing.final
 class UserInfo:
     @property
     def id(self) -> builtins.int:
@@ -1383,6 +1708,11 @@ class UserInfoDetails:
     def username(self) -> builtins.str:
         r"""
         The username of the user.
+        """
+    @property
+    def permissions(self) -> Permissions | None:
+        r"""
+        The permissions of the user, or `None` when the user has none assigned.
         """
 
 @typing.final
