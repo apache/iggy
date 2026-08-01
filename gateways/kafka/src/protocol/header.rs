@@ -18,7 +18,7 @@
 #![allow(
     clippy::doc_markdown,
     clippy::missing_const_for_fn,
-        clippy::missing_errors_doc,
+    clippy::missing_errors_doc,
     clippy::match_same_arms
 )]
 

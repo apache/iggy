@@ -17,8 +17,7 @@
 
 //! Kafka request decoders for critical API keys
 
-#![allow(clippy::too_many_lines,
-    clippy::doc_markdown)]
+#![allow(clippy::too_many_lines, clippy::doc_markdown)]
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::Decoder;
 use bytes::Bytes;
