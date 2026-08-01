@@ -44,7 +44,7 @@ lifecycle, ferries messages between Apache Iggy and plugins, exposes
 runtime/src/
 ├── main.rs                  Entry, plugin path resolution, SourceApi/SinkApi FFI structs
 ├── sink.rs                  Sink lifecycle, Iggy consumer wiring, FFI consume calls
-├── source.rs                Source lifecycle, flume forwarding, state save loop
+├── source.rs                Source lifecycle, bounded crossfire forwarding, state save loop
 ├── stream.rs                Stream + consumer/producer setup
 ├── transform.rs             Loads transforms from config, applies them in chain
 ├── state.rs                 FileStateProvider, atomic ConnectorState file I/O
@@ -57,7 +57,7 @@ runtime/src/
 ├── manager/{mod,sink,source}.rs   SinkManager / SourceManager, status, restart_guard
 ├── configs/
 │   ├── runtime.rs           RuntimeConfig + LoggingConfig + LogFormat
-│   ├── connectors.rs        ConnectorConfig, SinkConfig, SourceConfig (verbose + benchmark)
+│   ├── connectors.rs        ConnectorConfig, SinkConfig, SourceConfig (verbose + benchmark + channel_capacity)
 │   └── connectors/{local,http}_provider.rs
 └── api/                     HTTP control + observability endpoints
 ```
@@ -109,19 +109,24 @@ Don't mix.
 
 1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
 2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
-3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside). The FFI callback bumps errors on deserialize or channel-closed failure with one relaxed atomic - no `Family` lookup, no `Arc<Metrics>` handle.
+3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a **bounded crossfire channel** (`crossfire::mpsc::bounded_blocking_async`, capacity = `SourceConfig::channel_capacity` in batches, default 1024, clamped to [1, 65536]) keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`).
+   - `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside) + two `Arc<AtomicBool>`s (`shutdown`, `backpressure_active` - the latter latches the channel-full `warn!` to one per backpressure episode).
+   - The callback clones the fields out and drops the DashMap guard before sending. Holding the shard guard through a stall would block `cleanup_sender`.
+   - A full channel makes `send_with_backpressure` retry via `send_timeout(SEND_RETRY_INTERVAL)` - the stall IS the backpressure into the plugin's polling loop. The batch is dropped (+1 `errors`) only on disconnect or when the shutdown flag is observed while full.
 4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer.
 5. On success, save returned `ConnectorState` via `FileStateProvider`.
 
 **Shutdown ordering (`manager/source.rs::stop_connector`):**
 
-1. Call `iggy_source_close` FIRST. It blocks until the plugin's polling task stops, so no new send callbacks fire after it returns.
-2. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender makes the forwarding task's `recv_async()` resolve with `Disconnected` and exit cleanly, instead of blocking until the abort timeout.
-3. Finally await spawned handlers with `tokio::time::timeout`. On timeout, `handle.abort()` + drain - prevents leaked tasks colliding with the next `start_connector` (a late `file.save()` could otherwise race the new instance). The silent-drop branch in `handle_produced_messages` only covers the window between close and cleanup.
+1. `signal_shutdown(plugin_id)` FIRST - sets the entry's shutdown flag so a send callback parked in the full-channel retry loop unblocks; `iggy_source_close` waits on the polling task that loop runs in, so skipping this can deadlock the close when Iggy is hung. (Process shutdown in `main.rs` calls `signal_shutdown_all()` before the sequential per-connector stops, because same-`.so` instances share one plugin runtime.)
+2. Call `iggy_source_close` NEXT. It blocks until the plugin's polling task stops, so no new send callbacks fire after it returns.
+3. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender makes the forwarding task's `recv()` resolve with `Disconnected` and exit cleanly, instead of blocking until the abort timeout.
+4. Finally await spawned handlers with `tokio::time::timeout`. On timeout, `handle.abort()` + drain - prevents leaked tasks colliding with the next `start_connector` (a late `file.save()` could otherwise race the new instance). The silent-drop branch in `handle_produced_messages` only covers the window between close and cleanup.
 
 Gotchas:
 
 - `SOURCE_SENDERS` must be cleaned up on connector close or memory leaks (channel + task).
+- `send_with_backpressure` parks a worker of the plugin library's shared tokio runtime while the channel is full (bounded per park by `SEND_RETRY_INTERVAL`). All instances of one `.so` share that runtime, so saturated siblings can delay another instance's close; the SDK-side worker handoff (`block_in_place`) is the known follow-up.
 - `spawn_source_handler` wraps the outer `iggy_source_handle(id, callback)` FFI call in `tokio::task::spawn_blocking()`. That call returns quickly - the SDK macro internally `runtime.spawn`s an async `handle_messages` task and returns. **`send_callback` invocations come from that async task, not from `spawn_blocking`.** A long-running synchronous poll inside the plugin would block one Tokio worker. async polls don't.
 - No timeout on the registration call - a plugin whose `iggy_source_handle` never returns stalls one blocking worker for the process lifetime.
 
@@ -183,7 +188,9 @@ New per-batch logging follows the same pattern. Default to `debug!`, upgrade to 
 
 ### Env-var overrides via `ConfigEnv` derive
 
-`SinkConfig`, `SourceConfig`, and inner structs derive `ConfigEnv` (`configs_derive::ConfigEnv`). Generates env-var addressability as `IGGY_CONNECTORS_<TYPE>_<KEY>_<FIELD>` for primitive fields. Used heavily by integration tests to inject testcontainer ports - see `core/integration/tests/connectors/fixtures/postgres/container.rs` for env-var constants. Mark new compound fields `#[config_env(skip)]`, leaf primitives `#[config_env(leaf)]`.
+`SinkConfig`, `SourceConfig`, and inner structs derive `ConfigEnv` (`configs_derive::ConfigEnv`). Generates env-var addressability as `IGGY_CONNECTORS_<TYPE>_<KEY>_<FIELD>` for primitive fields. Used heavily by integration tests to inject testcontainer ports - see `core/integration/tests/connectors/fixtures/postgres/container.rs` for env-var constants.
+
+Mark new compound fields `#[config_env(skip)]`; non-primitive leaves (enums, `PathBuf`) need `#[config_env(leaf)]`, while plain primitives and `Option`-of-primitive (e.g. `channel_capacity: Option<usize>`) are auto-detected.
 
 ### Versioning
 
@@ -235,17 +242,17 @@ Per-message drops in the batch loops are counted into a local `u64` and flushed 
 - `sink.rs::spawn_consume_tasks` task wrapper - bumps once on `consume_messages` Err
 - `source.rs::source_forwarding_loop` - payload decode, prepare (transform/encode) failure, Iggy send Err, state save Err
 - `source.rs::process_messages` - transform Err (logs + bumps `errors` + continue. does NOT propagate, so one bad payload doesn't flip the connector to permanent ERROR), transform encode failure, `build_iggy_message` failure
-- `source.rs::handle_produced_messages` - postcard deserialize failure, `sender.send` channel-closed
+- `source.rs::handle_produced_messages` / `send_with_backpressure` - postcard deserialize failure, channel disconnected, channel-still-full-at-shutdown drop (all one `inc()` per batch)
 
 Filter case bumps `messages_filtered` via `inc_messages_filtered_with_labels`. Adding a new drop path: mirror this pattern.
 
 ## Hard rules
 
-1. **Never block the executor.** All I/O async. `spawn_blocking` only for FFI registration (already in place).
+1. **Never block the executor.** All I/O async. `spawn_blocking` only for FFI registration (already in place). One documented exception: `send_with_backpressure` parks a plugin-runtime worker in bounded `send_timeout` waits - that stall is the source backpressure mechanism.
 2. **Plugin ID counter is monotonic.** No reset, no reuse.
 3. **FFI return codes:** `0` success, non-zero failure.
 4. **Don't add static mutable state** beyond `LOG_CALLBACK`, `PLUGIN_ID`, `SOURCE_SENDERS`.
-5. **Pair `cleanup_sender(id)` with shutdown** for sources (avoid flume leak). Order: close FFI -> cleanup sender -> drain/abort tasks.
+5. **Pair `cleanup_sender(id)` with shutdown** for sources (avoid channel leak). Order: signal shutdown -> close FFI -> cleanup sender -> drain/abort tasks.
 6. **Restart uses `restart_guard.try_lock()`** - no thundering-herd regression.
 7. **No timeouts on plugin FFI calls without a kill-task strategy.** A timeout that returns from the runtime but leaves the plugin running has the worst of both worlds.
 

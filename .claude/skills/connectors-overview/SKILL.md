@@ -206,7 +206,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 | Duplicate-ID FFI guard                                                  | `sdk/src/sink.rs::sink_connector!`, `sdk/src/source.rs::source_connector!`         | Prevents silent data loss on reopen-without-close |
 | `restart_guard.try_lock()`                                              | `runtime/src/manager/{sink,source}.rs::restart_connector`                          | No thundering-herd restarts                       |
 | `tokio::time::timeout(..., handle).await` + `handle.abort()` on timeout | `runtime/src/manager/source.rs::stop_connector`                                    | Bounded shutdown + leak prevention                |
-| `flume::unbounded()` channel                                            | `runtime/src/source.rs::spawn_source_handler` / `source_forwarding_loop`           | MPSC handoff from SDK async task to runtime loop  |
+| `crossfire::mpsc::bounded_blocking_async` channel                       | `runtime/src/source.rs::spawn_source_handler` / `source_forwarding_loop`           | Bounded MPSC handoff with backpressure to plugin  |
 | `tokio::sync::watch::channel(())`                                       | `sdk/src/{sink,source}.rs`, `runtime/src/sink.rs`, `runtime/src/manager/*`         | One-shot shutdown broadcast                       |
 | `dashmap::DashMap`                                                      | `runtime/src/manager/sink.rs`, `source.rs::SOURCE_SENDERS`, SDK `INSTANCES`        | Lock-free concurrent keyed access                 |
 | `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | `Debug` redacts; `serialize_secret` EXPOSES       |

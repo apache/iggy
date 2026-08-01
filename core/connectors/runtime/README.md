@@ -219,6 +219,21 @@ Emitted fields:
 
 Filter the stream via `RUST_LOG=iggy_connectors::benchmark=info`. The corresponding stage durations are also recorded in the `iggy_connector_stage_duration_seconds` histogram regardless of this flag, so Prometheus dashboards remain available without enabling text events.
 
+## Source Channel Capacity
+
+Each source configuration accepts an optional `channel_capacity` setting that bounds the channel between the plugin's send callback and the runtime's forwarding loop. Capacity is counted in batches (one `poll()` result each, potentially megabytes), not messages or bytes. The default is 1024 batches.
+
+When the channel is full (Iggy accepts messages more slowly than the plugin produces them), the send callback backs off and retries instead of buffering without bound, so backpressure propagates into the plugin's polling loop. During shutdown, a batch that still cannot be enqueued after the stop signal is dropped and counted in `iggy_connector_errors_total`, so a saturated source may report errors at SIGTERM. Values outside `[1, 65536]` are clamped with a warning.
+
+```toml
+type = "source"
+key = "postgres"
+# ... other fields ...
+channel_capacity = 1024
+```
+
+Environment override: `IGGY_CONNECTORS_SOURCE_<KEY>_CHANNEL_CAPACITY`.
+
 ## Metrics
 
 The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint when enabled. The following metrics are available:

@@ -137,6 +137,8 @@ pub struct CreateSourceConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    /// Forwarding channel capacity in batches; defaults to 1024.
+    pub channel_capacity: Option<usize>,
 }
 
 impl CreateSourceConfig {
@@ -153,6 +155,7 @@ impl CreateSourceConfig {
             plugin_config: self.plugin_config.clone(),
             verbose: self.verbose,
             benchmark: self.benchmark,
+            channel_capacity: self.channel_capacity,
         }
     }
 }
@@ -175,6 +178,10 @@ pub struct SourceConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    /// Capacity of the plugin -> runtime forwarding channel, counted in
+    /// batches (a single batch can be megabytes), not messages or bytes.
+    /// Defaults to 1024; values are clamped to [1, 65536].
+    pub channel_capacity: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -333,7 +340,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {}, channel_capacity: {:?} }}",
             self.enabled,
             self.name,
             self.path,
@@ -346,6 +353,7 @@ impl std::fmt::Display for SourceConfig {
             self.plugin_config_format,
             self.verbose,
             self.benchmark,
+            self.channel_capacity,
         )
     }
 }

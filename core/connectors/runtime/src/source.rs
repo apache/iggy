@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crossfire::{AsyncRx, MTx, SendTimeoutError, TrySendError, mpsc::Array};
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
-use flume::{Receiver, Sender};
 use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
     IggyProducer,
@@ -30,8 +30,11 @@ use iggy_connector_sdk::{
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
-    sync::{Arc, LazyLock, atomic::Ordering},
-    time::Instant,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -50,11 +53,28 @@ use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
 use tokio::task::JoinHandle;
 
+pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
+
+// crossfire eagerly allocates the whole ring and asserts capacity < 2^31;
+// the cap keeps a config typo from panicking the process or committing
+// gigabytes up front.
+const MAX_CHANNEL_CAPACITY: usize = 65_536;
+
+const SEND_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+pub(crate) type BatchSender = MTx<Array<ProducedMessages>>;
+pub(crate) type BatchReceiver = AsyncRx<Array<ProducedMessages>>;
+
 pub(crate) struct SourceSenderEntry {
-    pub(crate) sender: Sender<ProducedMessages>,
+    pub(crate) sender: BatchSender,
     // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
     // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
     pub(crate) error_counter: Counter,
+    pub(crate) shutdown: Arc<AtomicBool>,
+    // Latched across callback invocations so sustained overload logs one
+    // warn per backpressure episode, not one per batch; cleared only by an
+    // uncontended fast-path send (i.e. genuine recovery).
+    pub(crate) backpressure_active: Arc<AtomicBool>,
 }
 
 pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
@@ -62,6 +82,26 @@ pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
 
 pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
+}
+
+/// Unwedges a send callback stuck in its full-channel backoff so
+/// `iggy_source_close` (which blocks until the plugin's polling task exits)
+/// cannot deadlock while the forwarding loop is itself blocked on a slow Iggy.
+pub(crate) fn signal_shutdown(plugin_id: u32) {
+    if let Some(entry) = SOURCE_SENDERS.get(&plugin_id) {
+        entry.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// Sets every live instance's shutdown flag. Process shutdown stops
+/// connectors sequentially, and instances loaded from the same plugin
+/// library share one tokio runtime - without this, an instance wedged in
+/// backpressure later in the list keeps holding a runtime worker that an
+/// earlier instance's close needs to observe its own shutdown.
+pub(crate) fn signal_shutdown_all() {
+    for entry in SOURCE_SENDERS.iter() {
+        entry.shutdown.store(true, Ordering::Release);
+    }
 }
 
 /// Initializes all enabled source connectors.
@@ -191,6 +231,7 @@ pub async fn init(
             error: init_error.clone(),
             verbose: config.verbose,
             benchmark: config.benchmark,
+            channel_capacity: config.channel_capacity,
         });
 
         if let Some(error) = init_error {
@@ -364,7 +405,7 @@ pub(crate) async fn source_forwarding_loop(
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
-    receiver: Receiver<ProducedMessages>,
+    receiver: BatchReceiver,
     context: Arc<RuntimeContext>,
     labels: Arc<SourceLabels>,
 ) {
@@ -390,7 +431,7 @@ pub(crate) async fn source_forwarding_loop(
         topic: producer.topic().to_string(),
     };
 
-    while let Ok(produced_messages) = receiver.recv_async().await {
+    while let Ok(produced_messages) = receiver.recv().await {
         let total_start = Instant::now();
         let count = produced_messages.messages.len();
         context
@@ -554,6 +595,7 @@ pub(crate) fn spawn_source_handler(
     plugin_key: &str,
     verbose: bool,
     benchmark: bool,
+    channel_capacity: Option<usize>,
     producer: IggyProducer,
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
@@ -561,7 +603,15 @@ pub(crate) fn spawn_source_handler(
     callback: HandleCallback,
     context: Arc<RuntimeContext>,
 ) -> Vec<JoinHandle<()>> {
-    let (sender, receiver) = flume::unbounded();
+    let configured = channel_capacity.unwrap_or(DEFAULT_CHANNEL_CAPACITY);
+    let capacity = configured.clamp(1, MAX_CHANNEL_CAPACITY);
+    if capacity != configured {
+        warn!(
+            "Source connector with ID: {plugin_id} channel_capacity: {configured} clamped to {capacity}"
+        );
+    }
+    let (sender, receiver) = crossfire::mpsc::bounded_blocking_async(capacity);
+    info!("Source connector with ID: {plugin_id} forwarding channel capacity: {capacity} batches");
     let plugin_key = plugin_key.to_string();
     let labels = Arc::new(SourceLabels::new(&plugin_key));
     SOURCE_SENDERS.insert(
@@ -569,6 +619,8 @@ pub(crate) fn spawn_source_handler(
         SourceSenderEntry {
             sender,
             error_counter: context.metrics.error_counter(&labels.counter),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            backpressure_active: Arc::new(AtomicBool::new(false)),
         },
     );
 
@@ -623,6 +675,7 @@ pub fn handle(
                 &plugin_key,
                 plugin.verbose,
                 plugin.benchmark,
+                plugin.channel_capacity,
                 producer_wrapper.producer,
                 producer_wrapper.encoder,
                 plugin.transforms,
@@ -719,7 +772,18 @@ pub(crate) extern "C" fn handle_produced_messages(
     unsafe {
         // Entry missing = SOURCE_SENDERS cleaned up at shutdown; benign race
         // expected on stop/restart. No metric (would conflate with real failures).
-        let Some(entry) = SOURCE_SENDERS.get(&plugin_id) else {
+        // Clone out and drop the guard: the backoff loop below may run for a
+        // while, and holding the shard guard would block cleanup_sender.
+        let Some((sender, error_counter, shutdown, backpressure_active)) =
+            SOURCE_SENDERS.get(&plugin_id).map(|entry| {
+                (
+                    entry.sender.clone(),
+                    entry.error_counter.clone(),
+                    entry.shutdown.clone(),
+                    entry.backpressure_active.clone(),
+                )
+            })
+        else {
             tracing::trace!(
                 plugin_id,
                 "dropping produced batch: sender already cleaned up"
@@ -729,21 +793,100 @@ pub(crate) extern "C" fn handle_produced_messages(
         let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
         match postcard::from_bytes::<ProducedMessages>(messages) {
             Ok(messages) => {
-                if let Err(send_error) = entry.sender.send(messages) {
-                    error!(
-                        "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
-                    );
-                    entry.error_counter.inc();
-                }
+                send_with_backpressure(
+                    plugin_id,
+                    &sender,
+                    &shutdown,
+                    &backpressure_active,
+                    &error_counter,
+                    messages,
+                );
             }
             Err(err) => {
                 error!(
                     "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
                 );
-                entry.error_counter.inc();
+                error_counter.inc();
             }
         }
     }
+}
+
+// Parks a worker thread of the plugin library's shared tokio runtime - a
+// deliberate exception to the never-block-the-executor rule: the park IS
+// the backpressure, propagating a full channel into the plugin's polling
+// loop instead of buffering without bound. Every park is bounded by
+// SEND_RETRY_INTERVAL with the shutdown flag re-read in between, so
+// iggy_source_close (which waits on the polling task this runs in) cannot
+// deadlock on a hung Iggy. Instances loaded from the same .so share that
+// runtime, so a saturated sibling can still delay another instance's
+// close; signal_shutdown_all covers the process-shutdown path, and the
+// complete fix (handing the worker off via block_in_place) belongs in the
+// SDK.
+fn send_with_backpressure(
+    plugin_id: u32,
+    sender: &BatchSender,
+    shutdown: &AtomicBool,
+    backpressure_active: &AtomicBool,
+    error_counter: &Counter,
+    messages: ProducedMessages,
+) {
+    let mut messages = match sender.try_send(messages) {
+        Ok(()) => {
+            // An uncontended send is the recovery signal; a send that only
+            // succeeded after stalling below is not.
+            if backpressure_active.swap(false, Ordering::Relaxed) {
+                info!(
+                    "Forwarding channel for source connector with ID: {plugin_id} recovered from backpressure"
+                );
+            }
+            return;
+        }
+        Err(TrySendError::Full(returned)) => returned,
+        Err(TrySendError::Disconnected(returned)) => {
+            log_channel_closed(plugin_id, returned.messages.len(), error_counter);
+            return;
+        }
+    };
+    if shutdown.load(Ordering::Acquire) {
+        drop_during_shutdown(plugin_id, messages.messages.len(), error_counter);
+        return;
+    }
+    if !backpressure_active.swap(true, Ordering::Relaxed) {
+        warn!(
+            "Forwarding channel for source connector with ID: {plugin_id} is full. Backpressuring the plugin's polling task."
+        );
+    }
+    loop {
+        match sender.send_timeout(messages, SEND_RETRY_INTERVAL) {
+            Ok(()) => return,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                if shutdown.load(Ordering::Acquire) {
+                    drop_during_shutdown(plugin_id, returned.messages.len(), error_counter);
+                    return;
+                }
+                messages = returned;
+            }
+            Err(SendTimeoutError::Disconnected(returned)) => {
+                log_channel_closed(plugin_id, returned.messages.len(), error_counter);
+                return;
+            }
+        }
+    }
+}
+
+fn drop_during_shutdown(plugin_id: u32, message_count: usize, error_counter: &Counter) {
+    error!(
+        "Dropping {message_count} produced messages for source connector with ID: {plugin_id}. Channel still full during shutdown."
+    );
+    error_counter.inc();
+}
+
+fn log_channel_closed(plugin_id: u32, message_count: usize, error_counter: &Counter) {
+    error!(
+        "Failed to send {message_count} produced messages for source connector with ID: {plugin_id}. Channel closed."
+    );
+    error_counter.inc();
 }
 
 fn build_iggy_message(
@@ -766,5 +909,316 @@ fn build_iggy_message(
             .user_headers(h)
             .build(),
         (None, None) => IggyMessage::builder().payload(payload.into()).build(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_connector_sdk::ProducedMessage;
+
+    fn batch() -> ProducedMessages {
+        ProducedMessages {
+            schema: Schema::Raw,
+            messages: vec![ProducedMessage {
+                id: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                headers: None,
+                payload: vec![0u8],
+            }],
+            state: None,
+        }
+    }
+
+    fn bounded_channel(capacity: usize) -> (BatchSender, BatchReceiver) {
+        crossfire::mpsc::bounded_blocking_async(capacity)
+    }
+
+    // Shutdown relies on buffered batches surviving sender drop; crossfire's
+    // docs don't promise it, so this pins the behavior against upgrades.
+    #[tokio::test]
+    async fn given_buffered_batches_when_senders_drop_should_drain_before_disconnect() {
+        let (sender, receiver) = bounded_channel(4);
+        for _ in 0..3 {
+            sender.try_send(batch()).expect("channel has capacity");
+        }
+        drop(sender);
+        for _ in 0..3 {
+            assert!(
+                receiver.recv().await.is_ok(),
+                "buffered batch must drain after sender drop"
+            );
+        }
+        assert!(
+            receiver.recv().await.is_err(),
+            "drained channel with no senders must disconnect"
+        );
+    }
+
+    #[test]
+    fn given_full_channel_when_shutdown_signaled_should_drop_batch_and_count_error() {
+        let (sender, receiver) = bounded_channel(1);
+        sender.try_send(batch()).expect("fills the channel");
+        let shutdown = AtomicBool::new(true);
+        let backpressure_active = AtomicBool::new(false);
+        let error_counter = Counter::default();
+        send_with_backpressure(
+            0,
+            &sender,
+            &shutdown,
+            &backpressure_active,
+            &error_counter,
+            batch(),
+        );
+        assert_eq!(
+            error_counter.get(),
+            1,
+            "batch dropped during shutdown must count as an error"
+        );
+        assert!(
+            receiver.try_recv().is_ok(),
+            "pre-existing batch must still be queued"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "shutdown-dropped batch must not have been enqueued"
+        );
+    }
+
+    #[test]
+    fn given_backoff_in_progress_when_shutdown_signaled_should_unblock_and_drop() {
+        let (sender, _receiver) = bounded_channel(1);
+        sender.try_send(batch()).expect("fills the channel");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let error_counter = Counter::default();
+        let sender_in_loop = sender.clone();
+        let shutdown_in_loop = shutdown.clone();
+        let counter_in_loop = error_counter.clone();
+        let blocked = std::thread::spawn(move || {
+            let backpressure_active = AtomicBool::new(false);
+            send_with_backpressure(
+                0,
+                &sender_in_loop,
+                &shutdown_in_loop,
+                &backpressure_active,
+                &counter_in_loop,
+                batch(),
+            );
+        });
+        // Let the loop enter backoff before flipping the flag, so a refactor
+        // that reads the flag once up front cannot pass this test.
+        std::thread::sleep(Duration::from_millis(30));
+        shutdown.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !blocked.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "send_with_backpressure must unblock after the shutdown signal"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        blocked.join().expect("blocked thread panicked");
+        assert_eq!(
+            error_counter.get(),
+            1,
+            "batch dropped after mid-backoff shutdown must count as an error"
+        );
+    }
+
+    #[test]
+    fn given_registered_entry_when_signal_shutdown_called_should_set_flag() {
+        // SOURCE_SENDERS is process-global; an id far above anything the
+        // runtime allocates keeps this isolated from sibling tests.
+        let plugin_id = u32::MAX;
+        let (sender, _receiver) = bounded_channel(1);
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                error_counter: Counter::default(),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                backpressure_active: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        signal_shutdown(plugin_id);
+        let flag = SOURCE_SENDERS
+            .get(&plugin_id)
+            .expect("entry inserted above")
+            .shutdown
+            .load(Ordering::Acquire);
+        cleanup_sender(plugin_id);
+        assert!(flag, "signal_shutdown must set the registered entry's flag");
+    }
+
+    #[test]
+    fn given_multiple_registered_entries_when_signal_shutdown_all_called_should_set_every_flag() {
+        let plugin_ids = [u32::MAX - 1, u32::MAX - 2];
+        for plugin_id in plugin_ids {
+            let (sender, _receiver) = bounded_channel(1);
+            SOURCE_SENDERS.insert(
+                plugin_id,
+                SourceSenderEntry {
+                    sender,
+                    error_counter: Counter::default(),
+                    shutdown: Arc::new(AtomicBool::new(false)),
+                    backpressure_active: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        signal_shutdown_all();
+        let flags: Vec<bool> = plugin_ids
+            .iter()
+            .map(|plugin_id| {
+                SOURCE_SENDERS
+                    .get(plugin_id)
+                    .expect("entry inserted above")
+                    .shutdown
+                    .load(Ordering::Acquire)
+            })
+            .collect();
+        for plugin_id in plugin_ids {
+            cleanup_sender(plugin_id);
+        }
+        assert!(
+            flags.iter().all(|flag_set| *flag_set),
+            "signal_shutdown_all must set every registered entry's flag"
+        );
+    }
+
+    #[test]
+    fn given_registered_entry_when_callback_invoked_should_deliver_batch_to_channel() {
+        let plugin_id = u32::MAX - 3;
+        let (sender, receiver) = bounded_channel(2);
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                error_counter: Counter::default(),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                backpressure_active: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let bytes = postcard::to_allocvec(&batch()).expect("batch serializes");
+        handle_produced_messages(plugin_id, bytes.as_ptr(), bytes.len());
+        cleanup_sender(plugin_id);
+        let delivered = receiver
+            .try_recv()
+            .expect("callback must enqueue the deserialized batch");
+        assert_eq!(delivered.messages.len(), 1);
+    }
+
+    #[test]
+    fn given_invalid_payload_when_callback_invoked_should_count_error() {
+        let plugin_id = u32::MAX - 4;
+        let (sender, _receiver) = bounded_channel(1);
+        let error_counter = Counter::default();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                error_counter: error_counter.clone(),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                backpressure_active: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let garbage = [0xFFu8; 3];
+        handle_produced_messages(plugin_id, garbage.as_ptr(), garbage.len());
+        cleanup_sender(plugin_id);
+        assert_eq!(
+            error_counter.get(),
+            1,
+            "deserialize failure must count as an error"
+        );
+    }
+
+    #[test]
+    fn given_unregistered_plugin_when_callback_invoked_should_drop_silently() {
+        let bytes = postcard::to_allocvec(&batch()).expect("batch serializes");
+        handle_produced_messages(u32::MAX - 5, bytes.as_ptr(), bytes.len());
+    }
+
+    #[test]
+    fn given_backpressure_latched_when_uncontended_send_succeeds_should_clear_latch() {
+        let (sender, receiver) = bounded_channel(2);
+        let shutdown = AtomicBool::new(false);
+        let backpressure_active = AtomicBool::new(true);
+        let error_counter = Counter::default();
+        send_with_backpressure(
+            0,
+            &sender,
+            &shutdown,
+            &backpressure_active,
+            &error_counter,
+            batch(),
+        );
+        assert!(
+            !backpressure_active.load(Ordering::Relaxed),
+            "uncontended send must clear the backpressure latch"
+        );
+        assert!(receiver.try_recv().is_ok(), "batch must be delivered");
+        assert_eq!(error_counter.get(), 0);
+    }
+
+    #[test]
+    fn given_disconnected_channel_when_sending_should_count_error() {
+        let (sender, receiver) = bounded_channel(1);
+        drop(receiver);
+        let shutdown = AtomicBool::new(false);
+        let backpressure_active = AtomicBool::new(false);
+        let error_counter = Counter::default();
+        send_with_backpressure(
+            0,
+            &sender,
+            &shutdown,
+            &backpressure_active,
+            &error_counter,
+            batch(),
+        );
+        assert_eq!(
+            error_counter.get(),
+            1,
+            "batch lost to a closed channel must count as an error"
+        );
+    }
+
+    #[test]
+    fn given_full_channel_when_receiver_frees_capacity_should_deliver_batch() {
+        let (sender, receiver) = bounded_channel(1);
+        sender.try_send(batch()).expect("fills the channel");
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_signal = delivered.clone();
+        // Keeps the receiver alive until the send lands, so the backoff loop
+        // can only exit through the success path.
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let drained = receiver.try_recv();
+            while !delivered_signal.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drained
+        });
+        let shutdown = AtomicBool::new(false);
+        let backpressure_active = AtomicBool::new(false);
+        let error_counter = Counter::default();
+        send_with_backpressure(
+            0,
+            &sender,
+            &shutdown,
+            &backpressure_active,
+            &error_counter,
+            batch(),
+        );
+        delivered.store(true, Ordering::Release);
+        assert!(
+            drainer.join().expect("drainer thread panicked").is_ok(),
+            "drainer must have freed a slot from the full channel"
+        );
+        assert_eq!(
+            error_counter.get(),
+            0,
+            "backpressured send must succeed once capacity frees up"
+        );
     }
 }
