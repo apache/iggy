@@ -37,6 +37,7 @@
 use super::client_table_restart::{
     commit_request, create_stream_payload, register, resume_request, tcp_addr, tcp_addrs,
 };
+use integration::harness::TestHarness;
 use integration::iggy_harness;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
@@ -172,6 +173,93 @@ async fn given_checkpointed_cluster_when_fresh_node_joins_late_should_state_tran
         None,
     )
     .await;
+
+    // The install replaced `snapshot.bin` with the primary's copy, so the
+    // superblock's `(checkpoint_op, checksum)` pairing has to name THAT snapshot.
+    // A stale pairing does not refuse boot -- `verify_checkpoint_pairing` reads
+    // `checkpoint_op < snapshot_op` as a lagging local checkpoint and accepts --
+    // which is exactly why this reads the durable record instead of inferring
+    // health from a successful restart: a pairing that names a snapshot no longer
+    // on disk silently disarms the integrity check it exists to power.
+    //
+    // A wiped node has `local_applied == 0`, so the transferred snapshot is always
+    // ahead and the pairing is always recorded; the marker carries the op it
+    // recorded, so the assertion compares against what install actually wrote.
+    assert_pairing_matches_install(harness, 2).await;
+}
+
+/// Assert `node`'s durable superblock pairs with the checkpoint its state-transfer
+/// install recorded.
+async fn assert_pairing_matches_install(harness: &TestHarness, node: usize) {
+    const PAIRING_MARKER: &str = "state transfer recorded its checkpoint pairing";
+
+    // The server colors its tracing fields, so `checkpoint_op=193` reaches the log
+    // as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`. Strip escapes before matching,
+    // the same reason `ServerHandle::stdout_occurrences` does.
+    let (stdout, _stderr) = harness.node(node).collect_logs();
+    let mut plain = String::with_capacity(stdout.len());
+    let mut chars = stdout.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for escaped in chars.by_ref() {
+                if escaped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let recorded_op: u64 = plain
+        .lines()
+        .filter(|line| line.contains(PAIRING_MARKER))
+        .filter_map(|line| {
+            let rest = line.split("checkpoint_op=").nth(1)?;
+            rest.split(|c: char| !c.is_ascii_digit())
+                .find(|token| !token.is_empty())?
+                .parse::<u64>()
+                .ok()
+        })
+        .next_back()
+        .expect("a wiped node's transfer must record a checkpoint pairing");
+
+    // The superblock reads through `compio` file I/O and this test runs on tokio,
+    // so give it a runtime of its own on a scratch thread.
+    let metadata_dir = harness.node(node).data_path().join("metadata");
+    let record = std::thread::spawn(move || {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(async move {
+                let superblock = journal::superblock::PingPongSuperblock::open(&metadata_dir)
+                    .await
+                    .expect("superblock must open");
+                journal::superblock::SuperblockStore::read_latest(&superblock)
+                    .await
+                    .expect("superblock must be readable")
+            })
+    })
+    .join()
+    .expect("superblock reader thread");
+
+    let journal::superblock::SuperblockContents::Present(record) = record else {
+        panic!("a node that installed a transfer must have a durable superblock record");
+    };
+    let state =
+        consensus::VsrState::try_from(record.as_slice()).expect("the durable record must decode");
+
+    assert_eq!(
+        state.checkpoint_op, recorded_op,
+        "the superblock must pair with the snapshot the transfer installed \
+         (durable pairing at op {}, install recorded {recorded_op}); a lagging \
+         pairing names a snapshot that no longer exists",
+        state.checkpoint_op
+    );
+    assert!(
+        state.commit_max >= recorded_op,
+        "the durable commit point ({}) must not sit below the transferred \
+         checkpoint ({recorded_op})",
+        state.commit_max
+    );
 }
 
 /// A node that rejoins at a STALE VIEW must probe to catch up, not wedge.
@@ -262,4 +350,70 @@ async fn given_election_past_a_node_when_it_rejoins_stale_should_probe_then_stat
         None,
     )
     .await;
+}
+
+/// A transfer whose serving peer dies must not wedge the rejoining node.
+///
+/// The stall retry re-requests from the SAME peer and has no peer re-selection,
+/// so without a retry budget a node whose server died mid-transfer would retry
+/// into a corpse forever -- and, being mid-transfer, it withholds `PrepareOk`
+/// the whole time. The budget makes it abandon and fall back to journal repair,
+/// which re-picks a target and (its gap still being below the retained floor)
+/// arms a fresh transfer against whoever is primary now.
+///
+/// Node 1 is stopped rather than the primary: with 3 nodes the survivors (0, 2)
+/// still hold quorum, so the cluster keeps committing and the rejoining node has
+/// somewhere to converge to.
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover(
+    harness: &mut TestHarness,
+) {
+    let addr = tcp_addr(harness);
+    let (mut stream, session) = register(addr).await;
+    for request in 1..=OPS_BEFORE_RESTART {
+        commit_request(
+            &mut stream,
+            session,
+            request,
+            &create_stream_payload(&format!("iggy-deadpeer-{request}")),
+        )
+        .await;
+    }
+    drop(stream);
+
+    // Wipe node 2 so it must transfer, then take node 1 down. Whichever peer
+    // node 2 targets, the cluster is now degraded mid-rejoin -- the shape the
+    // retry budget exists for.
+    harness.restart_node_from_clean_slate(2).unwrap();
+    harness.stop_node(1).unwrap();
+
+    // It must still converge: either the surviving peer served it directly, or
+    // it burned its budget against the dead one, abandoned, and came back
+    // through repair. Both are correct; wedging is not.
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    loop {
+        if harness
+            .node(2)
+            .stdout_contains("metadata state transfer installed")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rejoining node never converged within {TRANSFER_BUDGET:?}; a transfer \
+             whose peer died must abandon after its retry budget and fall back to \
+             journal repair, not retry the dead peer forever"
+        );
+        sleep(MARKER_POLL).await;
+    }
+
+    // Convergence IS the assertion here, deliberately with no follow-up commit.
+    // With one node stopped and another mid-rejoin the cluster is momentarily
+    // quorum-marginal (a transferring replica withholds `PrepareOk`), so a
+    // client write can legitimately go unanswered for a while -- and
+    // `resume_request`'s login helper treats an unanswered read as a verdict
+    // rather than something to wait out, by design, since that is how the
+    // sibling specs catch a silently dropped frame. Asserting commit throughput
+    // through a degraded window would be testing something this case is not
+    // about; the sibling tests already cover committing after a transfer.
 }

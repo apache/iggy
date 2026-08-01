@@ -29,7 +29,7 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 use consensus::LocalPipeline;
 use consensus::{
     CommitOutcome, Consensus, ConsensusClock, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline,
-    Plane, PlaneKind, Sequencer, VsrAction, VsrConsensus,
+    Plane, PlaneKind, Sequencer, VsrAction, VsrConsensus, build_deny_reply_from_request_header,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -44,7 +44,7 @@ use iggy_binary_protocol::{
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{IggyExpiry, IggyTimestamp};
+use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -57,6 +57,11 @@ use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+// Read only by the durable-before-send tripwire, which is `debug_assertions`-only, so
+// an unconditional import warns in release builds. CI's `-D warnings` rides clippy,
+// which builds debug, so that warning goes unobserved there.
+#[cfg(debug_assertions)]
+use server_common::sharding::METADATA_CONSENSUS_NAMESPACE;
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
@@ -745,6 +750,19 @@ struct MetadataRepairSession {
 /// message cap is far above this.
 const STATE_CHUNK_LEN: u32 = 256 * 1024;
 
+/// Stall rounds a receiver spends on ONE peer before abandoning the transfer
+/// and falling back to journal repair. The retry has no peer re-selection, so
+/// this is what keeps a peer that died mid-transfer from wedging the rejoining
+/// node; repair then re-picks a target and re-arms a transfer if the gap is
+/// still below the new peer's retained floor.
+const STATE_TRANSFER_MAX_STALL_RETRIES: u32 = 5;
+
+/// Serving-side offer lifetime, as a multiple of the repair-retry interval. An
+/// offer resets its counter on every chunk it serves, so this only expires one
+/// that stopped being pulled -- a receiver that finished installing (the
+/// protocol has no completion frame) or gave up.
+const STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE: u32 = 10;
+
 /// One artifact of an accepted transfer target: its manifest entry plus the
 /// bytes received so far (chunks are sequential, so `buf.len()` doubles as
 /// the next request offset).
@@ -776,6 +794,11 @@ struct MetadataTransferSession {
     /// Whether a descriptor has been accepted (an accepted EMPTY manifest is
     /// distinguishable from "still waiting").
     target_accepted: bool,
+    /// Stall rounds this session has burned. Bounded by
+    /// [`STATE_TRANSFER_MAX_STALL_RETRIES`]: the retry always targets the same
+    /// `peer`, so a peer that dies mid-transfer would otherwise wedge the
+    /// rejoining node forever.
+    attempts: u32,
     /// Ticks with no frame progress; at the configured repair-retry
     /// threshold the missing piece is re-requested.
     idle_ticks: u32,
@@ -788,6 +811,19 @@ struct MetadataTransferSession {
 struct ServedStateTransfer {
     nonce: u128,
     offer: metadata::StateTransferOffer,
+    /// Ticks since this offer last served a chunk. An offer owns a full copy of
+    /// the snapshot and the encoded client table, so a completed or abandoned
+    /// transfer must not pin them for the process lifetime. There is no
+    /// completion frame in the protocol (the receiver installs and goes quiet),
+    /// so the serving side ages the offer out instead.
+    idle_ticks: u32,
+    /// Set once the final chunk of the final artifact has been served, which is
+    /// the closest thing to a completion signal this side gets. Such an offer
+    /// expires after a single retry interval instead of the full idle window:
+    /// the short grace still covers the receiver re-requesting a dropped last
+    /// chunk, while releasing the snapshot copy an order of magnitude sooner
+    /// than waiting out the abandoned-transfer timeout.
+    fully_served: bool,
 }
 
 /// What `on_request_state_chunk` decided inside its offers borrow; the wire
@@ -1290,7 +1326,8 @@ where
     /// Stage a partition mutation for the pump.
     ///
     /// Marker `try_send` is best-effort; the pump's tail drain on every
-    /// frame catches dropped markers, so the queue never strands ops.
+    /// frame and its consensus-tick drain catch dropped markers, so the
+    /// queue never strands ops for longer than one tick.
     pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B>) {
         self.reconcile_queue.borrow_mut().push_back(op);
         let Some(sender) = self.senders.get(self.id as usize) else {
@@ -1477,6 +1514,20 @@ where
     }
 }
 
+/// Routing verdict of [`IggyShard::park_if_unmaterialised`].
+enum ParkOutcome<H> {
+    /// Namespace is materialised (or the frame is not a partition op):
+    /// process normally.
+    Deliver(Message<H>),
+    /// Frame was parked until the namespace materialises (or dropped on
+    /// park overflow).
+    Parked,
+    /// Namespace is mid-teardown. Client requests must be denied with a
+    /// transient status; replicated traffic still flows to the plane, whose
+    /// own tombstone guards drop it.
+    Tombstoned(Message<H>),
+}
+
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -1514,35 +1565,61 @@ where
             + metadata::stm::snapshot::RestoreSnapshotInPlace<
                 metadata::stm::snapshot::MetadataSnapshot,
             >,
+        T: ShardsTable,
     {
         match MessageBag::try_from(message) {
             Ok(MessageBag::Request(request)) => {
                 let routing = (request.header().operation, request.header().namespace);
-                if let Some(request) = self.park_if_unmaterialised(request, routing.0, routing.1) {
-                    self.on_request(request).await;
+                match self.park_if_unmaterialised(request, routing.0, routing.1) {
+                    // The incarnation fence runs only here, on client traffic.
+                    // A backup denying what the primary admitted would diverge
+                    // the replicas, so replicated frames are never fenced.
+                    ParkOutcome::Deliver(request)
+                        if !self.serves_committed_incarnation(routing.0, routing.1) =>
+                    {
+                        self.deny_partition_request_transient(request.header())
+                            .await;
+                    }
+                    ParkOutcome::Deliver(request) => self.on_request(request).await,
+                    // Deny instead of forwarding into the partition plane's
+                    // tombstone guard: that guard drops the frame without a
+                    // reply, and the transports decode replies in lockstep,
+                    // so silence wedges the connection until the SDK's
+                    // response read-timeout.
+                    ParkOutcome::Tombstoned(request) => {
+                        self.deny_partition_request_transient(request.header())
+                            .await;
+                    }
+                    ParkOutcome::Parked => {}
                 }
             }
             Ok(MessageBag::Prepare(prepare)) => {
                 let routing = (prepare.header().operation, prepare.header().namespace);
-                if let Some(prepare) = self.park_if_unmaterialised(prepare, routing.0, routing.1) {
-                    self.on_replicate(prepare).await;
-                    // A follower learns the cluster commit point from the
-                    // commit_max piggybacked on each prepare; the Commit
-                    // heartbeat carries commit_min and stops advancing
-                    // commit_max once the piggyback has raced ahead, so
-                    // on_commit alone never drains a follower's journal. Drive
-                    // it here off the prepare, as the metadata plane does inside
-                    // its own on_replicate.
-                    if routing.0.is_partition() {
-                        let planes = self.plane.inner();
-                        let config = planes.1.0.config();
-                        let namespace = IggyNamespace::from_raw(routing.1);
-                        if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
-                            && partition.consensus().is_follower()
-                        {
-                            partition.commit_journal(config).await;
+                // A tombstoned prepare still flows to the plane: replicated
+                // traffic has no client awaiting a reply on this node, and
+                // the plane's own tombstone guard drops it.
+                match self.park_if_unmaterialised(prepare, routing.0, routing.1) {
+                    ParkOutcome::Deliver(prepare) | ParkOutcome::Tombstoned(prepare) => {
+                        self.on_replicate(prepare).await;
+                        // A follower learns the cluster commit point from the
+                        // commit_max piggybacked on each prepare; the Commit
+                        // heartbeat carries commit_min and stops advancing
+                        // commit_max once the piggyback has raced ahead, so
+                        // on_commit alone never drains a follower's journal. Drive
+                        // it here off the prepare, as the metadata plane does inside
+                        // its own on_replicate.
+                        if routing.0.is_partition() {
+                            let planes = self.plane.inner();
+                            let config = planes.1.0.config();
+                            let namespace = IggyNamespace::from_raw(routing.1);
+                            if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
+                                && partition.consensus().is_follower()
+                            {
+                                partition.commit_journal(config).await;
+                            }
                         }
                     }
+                    ParkOutcome::Parked => {}
                 }
             }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
@@ -1568,9 +1645,58 @@ where
         }
     }
 
+    /// Does the partition materialised under `namespace_raw` belong to the
+    /// incarnation the committed metadata denotes?
+    ///
+    /// A delete + recreate of the same stream / topic / partition tuple recycles
+    /// the freed slab keys, so the namespace is byte-identical across
+    /// incarnations and presence proves nothing: a request admitted against the
+    /// prior incarnation is journaled and acked, then erased when the reconciler
+    /// tears that incarnation down. `created_revision` is the sole
+    /// discriminator - the committed value must equal the epoch this shard
+    /// stored on the routing row when it materialised the partition.
+    ///
+    /// Either side missing is a failed proof, not a pass: the row may lag the
+    /// plane or vanish entirely, but it never runs ahead, so an unverifiable
+    /// pairing means the reconciler has yet to converge. Non-partition
+    /// operations address no incarnation and always pass.
+    #[must_use]
+    pub fn serves_committed_incarnation(&self, operation: Operation, namespace_raw: u64) -> bool
+    where
+        M: StreamsFrontend,
+        T: ShardsTable,
+    {
+        if !operation.is_partition() {
+            return true;
+        }
+        let namespace = IggyNamespace::from_raw(namespace_raw);
+        let committed = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace);
+        let row = self.shards_table.epoch_for(namespace);
+        if committed.is_some() && committed == row {
+            return true;
+        }
+        tracing::debug!(
+            shard = self.id,
+            namespace_raw,
+            operation = ?operation,
+            committed_revision = ?committed,
+            row_epoch = ?row,
+            "denying partition request against an unverified incarnation"
+        );
+        false
+    }
+
     /// Drop parked frames for a namespace that will never materialise (it was
     /// removed before its `ReconcileOp::InsertOwned`), so the pending entry is
-    /// reclaimed instead of leaking until process exit.
+    /// reclaimed instead of leaking until process exit. Parked client requests
+    /// are denied with a transient status rather than dropped: the transports
+    /// decode replies in lockstep, so silence wedges the connection until the
+    /// SDK's response read-timeout.
     fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
         if let Some(frames) = self
             .pending_partition_frames
@@ -1584,6 +1710,16 @@ where
                 count = frames.len(),
                 "discarding parked partition frames for removed namespace"
             );
+            for frame in frames {
+                if frame.header().command == Command2::Request
+                    && let Ok(request) = frame.try_into_typed::<RequestHeader>()
+                {
+                    // Callers are synchronous (`apply_reconcile_ops`), so the
+                    // deny rides the pump's outbound lifecycle path instead of
+                    // an inline bus send.
+                    self.stage_transient_deny(request.header());
+                }
+            }
         }
     }
 
@@ -1591,29 +1727,36 @@ where
     /// materialised (post-`CreateTopic` convergence window: the metadata
     /// commit precedes the reconciler pass that builds the local replica).
     ///
-    /// Returns `Some(message)` when the frame should be processed normally:
-    /// non-partition operation, namespace materialised, or namespace
-    /// tombstoned (the plane's own tombstone guard handles the drop).
-    /// Returns `None` when the frame was parked (or dropped on overflow);
-    /// [`Self::apply_reconcile_ops`] re-dispatches parked frames once the
-    /// matching `ReconcileOp::InsertOwned` lands.
+    /// Tombstoned namespaces (teardown fence set by the reconciler before the
+    /// disk delete) report [`ParkOutcome::Tombstoned`] so the caller can deny
+    /// client requests instead of feeding them to the plane's silent-drop
+    /// guard, while replicated traffic still flows there. Parked frames are
+    /// re-dispatched by [`Self::apply_reconcile_ops`] once the matching
+    /// `ReconcileOp::InsertOwned` lands; overflow drops the frame
+    /// (at-least-once: client/primary retries recover).
     fn park_if_unmaterialised<H>(
         &self,
         message: Message<H>,
         operation: Operation,
         namespace_raw: u64,
-    ) -> Option<Message<H>>
+    ) -> ParkOutcome<H>
     where
         H: iggy_binary_protocol::ConsensusHeader,
     {
         const MAX_PARKED_PER_NAMESPACE: usize = 128;
         if !operation.is_partition() {
-            return Some(message);
+            return ParkOutcome::Deliver(message);
         }
         let namespace = IggyNamespace::from_raw(namespace_raw);
         let partitions = self.plane.partitions();
-        if partitions.contains(&namespace) || partitions.is_tombstoned(&namespace) {
-            return Some(message);
+        // Tombstone outranks presence: the partition value stays in the vec
+        // until `ConfirmRemove` drains, but the fence already forbids serving
+        // it.
+        if partitions.is_tombstoned(&namespace) {
+            return ParkOutcome::Tombstoned(message);
+        }
+        if partitions.contains(&namespace) {
+            return ParkOutcome::Deliver(message);
         }
         let mut pending = self.pending_partition_frames.borrow_mut();
         let parked = pending.entry(namespace).or_default();
@@ -1623,7 +1766,7 @@ where
                 namespace_raw = namespace.inner(),
                 "parked-frame buffer full; dropping partition frame"
             );
-            return None;
+            return ParkOutcome::Parked;
         }
         tracing::debug!(
             shard = self.id,
@@ -1632,7 +1775,58 @@ where
             "parking partition frame until namespace materialises"
         );
         parked.push(message.into_generic());
-        None
+        ParkOutcome::Parked
+    }
+
+    /// Deny a client partition request with `TransientNotAccepted`: the frame
+    /// never reached journal admission, so the SDK can safely replay it
+    /// anywhere, and partition rebuild completes well inside the replay
+    /// budget. Sent directly over the bus; delivery failure is terminal for
+    /// this reply (the client recovers via its own read-timeout).
+    #[allow(clippy::future_not_send)]
+    async fn deny_partition_request_transient(&self, request_header: &RequestHeader) {
+        let reply = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        if let Err(error) = self
+            .bus
+            .send_to_client(request_header.client, reply.into_generic().into_frozen())
+            .await
+        {
+            tracing::warn!(
+                shard = self.id,
+                client = request_header.client,
+                operation = ?request_header.operation,
+                error = %error,
+                "failed to send transient deny for partition request"
+            );
+        }
+    }
+
+    /// [`Self::deny_partition_request_transient`] for synchronous callers:
+    /// hand the deny to this shard's own pump as a
+    /// [`LifecycleFrame::ForwardClientSend`], whose handler performs the bus
+    /// send (same funnel the parked-frame re-dispatch uses).
+    fn stage_transient_deny(&self, request_header: &RequestHeader) {
+        let reply = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+            client_id: request_header.client,
+            msg: reply.into_generic().into_frozen(),
+        });
+        if let Some(sender) = self.senders.get(self.id as usize)
+            && let Err(error) = sender.try_send(frame)
+        {
+            tracing::warn!(
+                shard = self.id,
+                client = request_header.client,
+                operation = ?request_header.operation,
+                "dropping transient deny for discarded partition frame: inbox rejected: {error:?}"
+            );
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -1879,7 +2073,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             return;
         }
 
@@ -1922,7 +2118,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             if actions
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
@@ -1978,12 +2176,23 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
-            // State transfer (cluster-restart rejoin): the adopted view names
-            // a live primary to fetch snapshot-shaped state from. The commit
-            // walk and journal repair are deferred until the install lands --
-            // walking the pre-transfer STM would apply ops the snapshot
-            // already contains, and the transfer replaces the table anyway.
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
+            // State transfer (rejoin behind the peers' retained floor): the
+            // adopted view names a live primary to fetch snapshot-shaped state
+            // from. The commit walk and journal repair are deferred until the
+            // install lands -- walking the pre-transfer STM would apply ops the
+            // snapshot already contains, and the transfer replaces the table
+            // anyway.
+            //
+            // Outside the superblock gate above: that gate fail-closes the VSR
+            // actions this replica would VOUCH with (notably `PrepareOk`) until
+            // the adopted view is durable. Requesting a transfer vouches for
+            // nothing -- it only pulls state -- and a transferring replica
+            // withholds `PrepareOk` on its own (`is_transferring`). Gating it
+            // would also wedge the one path that repairs a replica whose gap
+            // sits below every peer's floor.
             if consensus.state_transfer_stage() == consensus::StateTransferStage::AwaitingTarget {
                 let nonce = iggy_common::random_id::get_uuid();
                 *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
@@ -1992,12 +2201,13 @@ where
                     commit_op: 0,
                     artifacts: Vec::new(),
                     target_accepted: false,
+                    attempts: 0,
                     idle_ticks: 0,
                 });
                 tracing::info!(
                     shard = self.id,
                     peer = header.replica,
-                    "restart adopted a live view; requesting metadata state transfer"
+                    "adopted a live view while awaiting transfer; requesting metadata state transfer"
                 );
                 self.send_request_state_transfer(consensus, header.replica, nonce)
                     .await;
@@ -2130,7 +2340,13 @@ where
                     }
                 }
                 CommitOutcome::RespondStartView => {
-                    respond_start_view::<B, _, MJ>(consensus).await;
+                    // Durable-before-send: the StartView advertises this replica's
+                    // current view, so persist before answering, as the view-change
+                    // dispatch gate does. Withhold on failure; the stale peer keeps
+                    // heartbeating, so it re-triggers once the tick persists.
+                    if planes.0.persist_superblock_if_needed(consensus).await {
+                        respond_start_view::<B, _, MJ>(consensus).await;
+                    }
                 }
                 CommitOutcome::Accepted => {}
             }
@@ -2151,6 +2367,9 @@ where
         match consensus.handle_commit(&header) {
             CommitOutcome::Advanced => partition.commit_journal(config).await,
             CommitOutcome::RespondStartView => {
+                // Partition consensus is not superblock-durable yet, so there is no
+                // view to persist before answering here; the metadata arm above
+                // gates its StartView on the durable view.
                 respond_start_view::<B, _, MJ>(consensus).await;
             }
             CommitOutcome::Accepted => {}
@@ -2178,7 +2397,9 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if planes.0.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            }
             return;
         }
         let Some(partition) = planes
@@ -2548,6 +2769,7 @@ where
                             commit_op: 0,
                             artifacts: Vec::new(),
                             target_accepted: false,
+                            attempts: 0,
                             idle_ticks: 0,
                         });
                         tracing::info!(
@@ -2944,6 +3166,8 @@ where
                 ServedStateTransfer {
                     nonce: header.nonce,
                     offer,
+                    idle_ticks: 0,
+                    fully_served: false,
                 },
             );
         } else {
@@ -2989,6 +3213,14 @@ where
         /// Alloc cap per artifact: a corrupt length field must not OOM the
         /// shard. Far above any real metadata snapshot or client table.
         const ARTIFACT_LEN_MAX: u64 = 1 << 30;
+
+        /// Alloc cap across the WHOLE manifest. The per-artifact cap alone does
+        /// not bound the total: `STATE_MANIFEST_ENTRIES_MAX` allows 65k entries,
+        /// and the buffers below are reserved eagerly, so per-artifact limits
+        /// would still admit a 64 TiB reservation and abort the process. The
+        /// manifest checksum only proves it arrived intact, not that the peer
+        /// computed it sanely, so bound what this side is willing to reserve.
+        const MANIFEST_TOTAL_LEN_MAX: u64 = 4 << 30;
 
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -3049,6 +3281,19 @@ where
                 kind = oversized.kind,
                 len = oversized.len,
                 "state transfer descriptor exceeds artifact cap; ignoring"
+            );
+            return;
+        }
+        let declared_total = manifest
+            .iter()
+            .fold(0u64, |total, entry| total.saturating_add(entry.len));
+        if declared_total > MANIFEST_TOTAL_LEN_MAX {
+            tracing::error!(
+                shard = self.id,
+                peer = header.replica,
+                artifacts = manifest.len(),
+                declared_total,
+                "state transfer descriptor exceeds the total manifest cap; ignoring"
             );
             return;
         }
@@ -3160,16 +3405,26 @@ where
         // RefCell borrow must not cross an await on the shard).
         // Out-of-bounds requests are dropped silently inside the block.
         let reply = {
-            let offers = self.metadata_transfer_offers.borrow();
+            let mut offers = self.metadata_transfer_offers.borrow_mut();
             let served = offers
-                .get(&header.replica)
+                .get_mut(&header.replica)
                 .filter(|served| served.nonce == header.nonce);
             served.map_or(Some(ChunkReply::UnknownOffer), |served| {
+                // Serving a chunk is the only liveness signal the offer gets;
+                // the expiry sweep drops it once these stop arriving.
+                served.idle_ticks = 0;
                 // Manifest-index addressing: an index past the offer is a
                 // requester bug (or a stale frame) and is dropped below.
+                let last_artifact = served.offer.payloads.len().saturating_sub(1);
                 let artifact_bytes = served.offer.payloads.get(header.artifact as usize)?;
                 let start = header.offset as usize;
                 let end = start.saturating_add(header.len as usize);
+                // Tail of the final artifact: the receiver now holds everything
+                // the manifest promised, so the offer only has to outlive a
+                // possible re-request of this very chunk.
+                if header.artifact as usize == last_artifact && end >= artifact_bytes.len() {
+                    served.fully_served = true;
+                }
                 artifact_bytes
                     .get(start..end.min(artifact_bytes.len()))
                     .map(|payload| {
@@ -3337,6 +3592,7 @@ where
             .expect("session checked above");
         let peer = session.peer;
         let commit_op = session.commit_op;
+        let attempts = session.attempts;
 
         // Per-artifact integrity, then pick the pieces this plane installs.
         // Unknown kinds are refused rather than skipped: an artifact the
@@ -3393,8 +3649,32 @@ where
         };
 
         let Some((snapshot, table, table_frontier)) = decoded else {
-            // Damaged in transit: restart the session from scratch against
-            // the same peer (fresh nonce; the peer re-offers).
+            // Damage is usually transit corruption, which a re-fetch fixes. But
+            // it can also be permanent -- a peer whose artifacts this build
+            // cannot decode, or an unknown artifact kind -- and that re-offers
+            // identically every round. Carry the attempt count across the
+            // restart and share the stall budget, so a re-fetch that keeps
+            // failing gives up instead of pulling the whole snapshot forever.
+            // Distinct from the stall path: frames ARE flowing here, so
+            // `idle_ticks` never accumulates and that sweep can never fire.
+            let attempts = attempts + 1;
+            if attempts > STATE_TRANSFER_MAX_STALL_RETRIES {
+                tracing::warn!(
+                    shard = self.id,
+                    peer,
+                    attempts,
+                    "state transfer artifacts kept failing to decode; abandoning \
+                     and falling back to journal repair"
+                );
+                if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
+                    consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+                }
+                planes.0.commit_journal().await;
+                self.maybe_request_metadata_repair(consensus, peer).await;
+                return;
+            }
+            // Restart the session from scratch against the same peer (fresh
+            // nonce; the peer re-offers).
             if consensus.state_transfer_stage() == consensus::StateTransferStage::Fetching {
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::AwaitingTarget);
             }
@@ -3405,6 +3685,7 @@ where
                 commit_op: 0,
                 artifacts: Vec::new(),
                 target_accepted: false,
+                attempts,
                 idle_ticks: 0,
             });
             self.send_request_state_transfer(consensus, peer, nonce)
@@ -3416,18 +3697,41 @@ where
         match planes
             .0
             .install_state_transfer(&snapshot, table, table_frontier, commit_op)
+            .await
         {
-            Ok(snapshot_seq) => {
+            Ok(applied_frontier) => {
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+                // `applied_frontier`, not the transferred snapshot's op: the install
+                // returns `max(snapshot_seq, local_applied)`, which differs whenever a
+                // serving peer offers a snapshot BEHIND this replica (checkpoints are
+                // node-local) and the local state machine is kept instead.
                 tracing::info!(
                     shard = self.id,
-                    snapshot_seq,
+                    applied_frontier,
                     commit_op,
                     table_frontier,
                     "metadata state transfer installed; handing tail to journal repair"
                 );
                 // Walk whatever is already walkable, then let repair fetch
                 // the (snapshot_seq, commit_max] tail.
+                planes.0.commit_journal().await;
+                self.maybe_request_metadata_repair(consensus, peer).await;
+            }
+            // Installed, but its `(checkpoint_op, checksum)` pairing is not durable
+            // yet. Not a failed install: the snapshot, table and frontiers are all in
+            // place, and the coordinator already holds the new pairing, so the next
+            // superblock write (view change or checkpoint) records it. Until then a
+            // crash recovers the PREVIOUS checkpoint and this replica transfers again,
+            // which is correct, just wasted work. Continue as a success.
+            Err(metadata::stm::snapshot::SnapshotError::SuperblockNotDurable { op }) => {
+                consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+                tracing::warn!(
+                    shard = self.id,
+                    snapshot_seq = op,
+                    commit_op,
+                    "metadata state transfer installed but its checkpoint pairing is \
+                     not durable yet; the next superblock write records it"
+                );
                 planes.0.commit_journal().await;
                 self.maybe_request_metadata_repair(consensus, peer).await;
             }
@@ -3568,6 +3872,44 @@ where
         }
     }
 
+    /// Drop serving-side state-transfer offers that stopped being pulled.
+    ///
+    /// Each offer owns a whole snapshot plus the encoded client table, and the
+    /// protocol has no completion frame (a receiver installs and goes quiet), so
+    /// without this a primary that ever served a transfer pins that memory for
+    /// the rest of the process. Generous relative to the chunk cadence: a live
+    /// puller resets the counter on every chunk it fetches, so only an abandoned
+    /// or finished transfer ages out.
+    fn expire_idle_state_transfer_offers(&self) {
+        // `max(1)`: the retry interval is operator-configurable, and a zero would
+        // make the expiry zero, dropping every offer on the tick after it was
+        // built and breaking transfers outright.
+        let retry_ticks = self.repair_retry_ticks.get().max(1);
+        let idle_expiry_ticks = retry_ticks.saturating_mul(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE);
+        let mut offers = self.metadata_transfer_offers.borrow_mut();
+        offers.retain(|requester, served| {
+            served.idle_ticks += 1;
+            // A fully-served offer only has to outlive a re-request of its last
+            // chunk, so it goes after one retry interval; anything else is an
+            // abandoned transfer and waits out the full idle window.
+            let expiry_ticks = if served.fully_served {
+                retry_ticks
+            } else {
+                idle_expiry_ticks
+            };
+            let live = served.idle_ticks < expiry_ticks;
+            if !live {
+                tracing::debug!(
+                    shard = self.id,
+                    requester,
+                    fully_served = served.fully_served,
+                    "dropping a state-transfer offer"
+                );
+            }
+            live
+        });
+    }
+
     #[allow(clippy::future_not_send)]
     pub async fn tick_metadata(&self)
     where
@@ -3594,7 +3936,9 @@ where
 
         let actions = consensus.tick(PlaneKind::Metadata);
 
-        dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+        if metadata.persist_superblock_if_needed(consensus).await {
+            dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+        }
 
         // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
         // no-op, so the timer-driven retransmit above cannot recover the
@@ -3611,6 +3955,8 @@ where
         // nothing is stranded.
         metadata.resume_stranded_commits().await;
 
+        self.expire_idle_state_transfer_offers();
+
         // Stall retry for an in-flight state transfer: descriptor or chunk
         // frames are fire-and-forget, so a lost one must not wedge the
         // session (and the boot flow behind it) forever.
@@ -3622,14 +3968,45 @@ where
                     return None;
                 }
                 session.idle_ticks = 0;
-                Some((session.peer, session.nonce, session.target_accepted))
+                session.attempts += 1;
+                Some((
+                    session.peer,
+                    session.nonce,
+                    session.target_accepted,
+                    session.attempts,
+                ))
             })
         };
-        if let Some((peer, nonce, target_accepted)) = transfer_stalled {
+        if let Some((peer, nonce, target_accepted, attempts)) = transfer_stalled {
+            // Retrying the same peer forever is a wedge when that peer is the
+            // thing that died: nothing in this loop re-selects a target. Give up
+            // after a bounded number of rounds and fall back to journal repair,
+            // which re-picks a peer and, if the gap is still below its retained
+            // floor, answers `RangeEvicted` and arms a fresh transfer against
+            // whoever is primary now.
+            if attempts > STATE_TRANSFER_MAX_STALL_RETRIES {
+                tracing::warn!(
+                    shard = self.id,
+                    peer,
+                    attempts,
+                    "metadata state transfer stalled past its retry budget; \
+                     abandoning and falling back to journal repair"
+                );
+                *self.metadata_transfer.borrow_mut() = None;
+                if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
+                    consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+                }
+                metadata.commit_journal().await;
+                let current_primary = consensus.primary_index(consensus.view());
+                self.maybe_request_metadata_repair(consensus, current_primary)
+                    .await;
+                return;
+            }
             tracing::info!(
                 shard = self.id,
                 peer,
                 target_accepted,
+                attempts,
                 "metadata state transfer stalled; re-requesting"
             );
             if target_accepted {
@@ -3703,10 +4080,16 @@ where
         namespace = consensus.namespace(),
         "answering stale-view heartbeat with StartView"
     );
+    // Unsolicited, answering a stale-view heartbeat rather than a probe, so there is
+    // no incarnation to echo; freshness comes from the receiver's view checks. Sent to
+    // every backup, since a replica heartbeating an older view has peers that missed
+    // the view change with it.
     let action = VsrAction::SendStartView {
         view: consensus.view(),
         op: consensus.sequencer().current_sequence(),
         commit: consensus.commit_max(),
+        incarnation: 0,
+        target: None,
         namespace: consensus.namespace(),
     };
     dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
@@ -3773,6 +4156,41 @@ async fn dispatch_vsr_actions<B, P, J>(
         }
     };
 
+    // Centralized durable-before-send tripwire: a view-scoped message must never
+    // advertise a (view, log_view) the superblock has not recorded, or a crash could
+    // recover an older view than one a peer already saw, splitting the brain or
+    // losing a commit. Every metadata caller persists first (the view-change dispatch
+    // sites and the on_replicate / on_commit send gates), so this asserts they did
+    // rather than letting a future bypass through silently. Metadata plane only:
+    // partition consensus has no superblock to record a view in, so it is exempt and
+    // the namespace test below is what does the work (its `needs_superblock_persist`
+    // is not a stand-in: that predicate reads clean at view 0, which is where a
+    // partition group spends most of its life). `RequestStartView` is exempt too,
+    // being a probe that asks to LEARN the view rather than advertise it.
+    #[cfg(debug_assertions)]
+    if consensus.namespace() == METADATA_CONSENSUS_NAMESPACE {
+        for action in actions {
+            let advertises_view = matches!(
+                action,
+                VsrAction::SendStartViewChange { .. }
+                    | VsrAction::SendDoViewChange { .. }
+                    | VsrAction::SendStartView { .. }
+                    | VsrAction::SendPrepareOk { .. }
+                    // A backup drops a Commit whose view differs from its own, and a
+                    // primary answers an older-view one with a StartView, so the
+                    // heartbeat advertises a view like the rest. Gated today only
+                    // because its sole emitter rides the tick, which persists first.
+                    | VsrAction::SendCommit { .. }
+            );
+            debug_assert!(
+                !advertises_view || !consensus.needs_superblock_persist(),
+                "durable-before-send violated: dispatching a view-scoped metadata action \
+                 while the superblock is behind the in-memory view {}",
+                consensus.view(),
+            );
+        }
+    }
+
     for action in actions {
         match action {
             VsrAction::SendStartViewChange { view, namespace } => {
@@ -3810,6 +4228,9 @@ async fn dispatch_vsr_actions<B, P, J>(
                 send(*target, msg.into_generic().into_frozen()).await;
             }
             VsrAction::SendRequestStartView { view, namespace } => {
+                // Stamp this replica's incarnation so the answering StartView can
+                // echo it, proving to us the reply post-dates our restart.
+                let incarnation = consensus.incarnation();
                 let msg =
                     Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
                         .transmute_header(|_, h: &mut RequestStartViewHeader| {
@@ -3817,6 +4238,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.view = *view;
+                            h.incarnation = incarnation;
                             h.namespace = *namespace;
                             h.size = size_of::<RequestStartViewHeader>() as u32;
                         });
@@ -3826,6 +4248,8 @@ async fn dispatch_vsr_actions<B, P, J>(
                 view,
                 op,
                 commit,
+                incarnation,
+                target,
                 namespace,
             } => {
                 let msg = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
@@ -3836,10 +4260,19 @@ async fn dispatch_vsr_actions<B, P, J>(
                         h.view = *view;
                         h.op = *op;
                         h.commit = *commit;
+                        h.incarnation = *incarnation;
                         h.namespace = *namespace;
                         h.size = size_of::<StartViewHeader>() as u32;
                     });
-                broadcast(msg.into_generic().into_frozen()).await;
+                let frozen = msg.into_generic().into_frozen();
+                // A probe echo is addressed to its requester: the incarnation it
+                // carries is that replica's freshness proof, and a peer recovering
+                // at the same time would read it as foreign and reject a current
+                // StartView.
+                match target {
+                    Some(replica) => send(*replica, frozen).await,
+                    None => broadcast(frozen).await,
+                }
             }
             VsrAction::SendPrepareOk {
                 view,

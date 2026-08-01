@@ -510,6 +510,48 @@ where
     reply
 }
 
+/// [`build_deny_reply_from_request`] for layers that hold no consensus group
+/// for the request's namespace (a shard fencing a frame aimed at a torn-down
+/// or never-materialised partition).
+///
+/// Replica-stamped fields (`cluster`, `view`, `replica`) echo the request
+/// instead, the same convention as [`build_result_rejection_reply`];
+/// `commit` stays 0 because no commit position exists here and deny frames
+/// are never cached in the `ClientTable`.
+///
+/// # Panics
+/// If the constructed message buffer is not a valid reply message.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_deny_reply_from_request_header(
+    request_header: &RequestHeader,
+    status: u32,
+) -> Message<ReplyHeader> {
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let mut buffer = bytes::BytesMut::zeroed(header_size);
+
+    let header = ReplyHeader {
+        cluster: request_header.cluster,
+        size: header_size as u32,
+        view: request_header.view,
+        release: request_header.release,
+        command: Command2::Reply,
+        replica: request_header.replica,
+        request_checksum: request_header.request_checksum,
+        client: request_header.client,
+        status,
+        timestamp: request_header.timestamp,
+        request: request_header.request,
+        operation: request_header.operation,
+        namespace: request_header.namespace,
+        ..Default::default()
+    };
+    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
+        .expect("deny reply buffer must contain a valid reply message")
+}
+
 /// Verify hash chain would not break if we add this header.
 ///
 /// # Panics

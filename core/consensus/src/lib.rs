@@ -148,7 +148,10 @@ where
 }
 
 pub mod client_table;
-pub use client_table::{CachedReply, ClientTable, CommitReply};
+pub use client_table::{
+    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableCodecError, ClientTableDecodeError,
+    ClientTableSnapshot, CommitReply,
+};
 pub mod state_manifest;
 pub use state_manifest::{
     StateArtifact, StateManifestError, artifact_kind, decode_state_manifest, encode_state_manifest,
@@ -171,5 +174,7 @@ pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;
+mod vsr_state;
+pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;
 pub use vsr_timeout::TimeoutManager;

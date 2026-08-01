@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::ConsensusError;
 use iggy_binary_protocol::{GenericHeader, ReplyHeader};
+use serde::{Deserialize, Serialize};
 use server_common::{
     MESSAGE_ALIGN, Message,
     iobuf::{Frozen, Owned},
 };
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::hash::Hasher;
 use std::mem::size_of;
 use tracing::trace;
@@ -70,11 +73,24 @@ impl CachedReply {
             bytes: msg.into_generic().into_frozen(),
         }
     }
+
+    /// Raw reply bytes for checkpoint serialization, round-tripped through
+    /// [`Self::from_message`] on decode.
+    fn as_bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
 }
 
 /// Reserved request number for [`Operation::Register`](iggy_binary_protocol::Operation::Register).
 /// Real requests start at 1 (header validation enforces `request > 0`).
 pub const REGISTER_REQUEST_ID: u64 = 0;
+
+/// Exclusive ceiling on a checkpointed slot index.
+///
+/// Bounds the table [`ClientTable::from_snapshot`] allocates from an index it read off
+/// disk. Mirrors the config's `MAX_METADATA_CLIENTS_TABLE_MAX`, the largest capacity an
+/// operator can configure, so no valid checkpoint can carry an index at or above it.
+pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 
 /// Committed replies retained per entry, newest at the back.
 ///
@@ -127,6 +143,175 @@ struct ClientEntry {
     /// commit loop. Maintained wherever `ring` is pushed.
     client_id: u128,
     latest_commit: u64,
+}
+
+/// Serializable form of one occupied slot.
+///
+/// Folded into the metadata checkpoint (`MetadataSnapshot`) so fence epochs and
+/// dedup watermarks survive a restart that drained the WAL prefix they committed
+/// in. Carries `client_id` explicitly because the index is rebuilt from it on
+/// decode.
+///
+/// Only the entry's latest reply is carried, not the whole ring: `latest_commit`
+/// is re-derived from its header, which is what keeps `evict_oldest` picking the
+/// same victim on a checkpoint-restored replica as on a WAL-replayed one. The
+/// older ring entries are volatile by design (see [`REPLY_RING_CAPACITY`]), so a
+/// retransmit that would have hit them answers
+/// [`RequestStatus::AlreadyApplied`] instead of replaying bytes: a worse answer,
+/// never a re-execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientEntrySnapshot {
+    pub client_id: u128,
+    pub epoch: u64,
+    pub user_id: u32,
+    pub watermark: u64,
+    pub watermark_checksum: u128,
+    /// Wire bytes of the entry's latest committed reply, round-tripped through
+    /// [`CachedReply::from_message`]. Never empty: registration seeds the ring.
+    ///
+    /// Serialized as a msgpack `bin` blob, not the integer array a plain `Vec<u8>`
+    /// produces, which spends 2 bytes on every byte >= 0x80 and runs a checkpoint's
+    /// reply payload up to roughly double on disk.
+    #[serde(with = "reply_bytes")]
+    pub reply: Vec<u8>,
+}
+
+/// Serializable [`ClientTable`]: the occupied slots, each with its index.
+///
+/// Slot positions are carried explicitly rather than by array position, so the
+/// encoded form is proportional to live clients instead of to configured capacity.
+/// The alternative (a full `Vec<Option<_>>`) makes the slot count self-perpetuating:
+/// [`ClientTable::from_snapshot`] would have to honour the array's length, so
+/// lowering `clients_table_max` could never take effect, and every checkpoint would
+/// serde-walk `clients_table_max` entries while shard 0 is blocked on fsyncs.
+///
+/// Deterministic eviction order is unaffected: the index is what places each entry,
+/// and it survives here verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientTableSnapshot {
+    pub slots: Vec<(u32, ClientEntrySnapshot)>,
+}
+
+/// Serializes reply bytes as a msgpack `bin` blob. See [`ClientEntrySnapshot::reply`].
+mod reply_bytes {
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("reply bytes")
+        }
+
+        fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(bytes)
+        }
+
+        /// A checkpoint written before the `bin` encoding holds an integer array.
+        /// Accepting it keeps this a read-compatible change rather than one that
+        /// refuses a checkpoint it could decode.
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+/// A [`ClientTableSnapshot`] could not be decoded into a [`ClientTable`], so a
+/// corrupt or torn checkpoint refuses boot with a typed error rather than
+/// panicking mid-decode.
+#[derive(Debug)]
+pub enum ClientTableDecodeError {
+    /// A slot's serialized reply bytes are not a valid reply message.
+    InvalidReply {
+        /// Slot whose reply bytes failed to decode.
+        slot: usize,
+        /// The underlying wire-decode failure.
+        source: ConsensusError,
+    },
+    /// Two occupied slots carry the same `client_id`. Rebuilding the index would
+    /// collapse them onto one slot and leave the other occupied but unindexed, so
+    /// the decode is rejected.
+    DuplicateClientId {
+        /// Slot repeating an already-seen `client_id`.
+        slot: usize,
+        /// Slot that first declared it.
+        first_slot: usize,
+        /// The duplicated client id.
+        client_id: u128,
+    },
+    /// Two entries claim the same slot index. The second would overwrite the first,
+    /// leaving that client indexed onto another's state, so the decode is rejected.
+    DuplicateSlot {
+        /// The repeated slot index.
+        slot: usize,
+    },
+    /// A slot index is past what any configured capacity can produce, so honouring
+    /// it would size the table from a corrupt length.
+    SlotOutOfRange {
+        /// The out-of-range slot index.
+        slot: usize,
+        /// Exclusive ceiling on a slot index.
+        max: usize,
+    },
+}
+
+impl fmt::Display for ClientTableDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidReply { slot, source } => write!(
+                f,
+                "client-table checkpoint slot {slot} holds invalid reply bytes: {source}"
+            ),
+            Self::DuplicateClientId {
+                slot,
+                first_slot,
+                client_id,
+            } => write!(
+                f,
+                "client-table checkpoint slot {slot} repeats client_id {client_id} already in \
+                 slot {first_slot}"
+            ),
+            Self::DuplicateSlot { slot } => write!(
+                f,
+                "client-table checkpoint holds two entries for slot {slot}"
+            ),
+            Self::SlotOutOfRange { slot, max } => write!(
+                f,
+                "client-table checkpoint slot index {slot} is past the {max}-slot ceiling"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClientTableDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidReply { source, .. } => Some(source),
+            Self::DuplicateClientId { .. }
+            | Self::DuplicateSlot { .. }
+            | Self::SlotOutOfRange { .. } => None,
+        }
+    }
 }
 
 /// Result of checking a request against the client table.
@@ -209,12 +394,20 @@ pub enum CommitReply {
 /// `commit_register` in the apply path, so every replica of the group
 /// derives an identical table from the committed log.
 ///
-/// ## Serialization
+/// ## Durability
+///
+/// [`Self::to_snapshot`] / [`Self::from_snapshot`] fold the table into the
+/// metadata checkpoint, so sessions registered below the snapshot floor survive
+/// a restart that drained the WAL prefix they committed in.
+///
+/// ## Serialization (wire)
 ///
 /// [`Self::encode`] / [`Self::decode`] carry the table across state transfer
-/// (a cluster-restart rejoin replaces its table with the primary's copy).
-/// Deterministic: slot-order walk over apply-derived state, so every
-/// caught-up replica encodes identical bytes.
+/// (a rejoin behind the peers' retained floor replaces its table with the
+/// primary's copy). Deterministic: slot-order walk over apply-derived state,
+/// so every caught-up replica encodes identical bytes. Distinct from the
+/// checkpoint form above: that one is local-recovery durability, this one is
+/// the transfer wire format.
 #[derive(Debug)]
 pub struct ClientTable {
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
@@ -256,6 +449,123 @@ impl ClientTable {
             "set_capacity must run before any client registers"
         );
         *self = Self::new(max_clients);
+    }
+
+    /// Snapshot the table for the metadata checkpoint: every occupied slot with its
+    /// index, so positions (and with them deterministic eviction order) survive, plus
+    /// each entry's `client_id` so the index rebuilds on decode.
+    ///
+    /// Walks only occupied slots. This runs on shard 0's checkpoint task, inside the
+    /// section where that core is already blocked on the snapshot's fsyncs, so it must
+    /// not also allocate and serde-walk one element per configured slot.
+    #[must_use]
+    pub fn to_snapshot(&self) -> ClientTableSnapshot {
+        let slots = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot_idx, slot)| {
+                let entry = slot.as_ref()?;
+                let slot_idx = u32::try_from(slot_idx).ok()?;
+                Some((
+                    slot_idx,
+                    ClientEntrySnapshot {
+                        client_id: entry.client_id,
+                        epoch: entry.epoch,
+                        user_id: entry.user_id,
+                        watermark: entry.watermark,
+                        watermark_checksum: entry.watermark_checksum,
+                        reply: entry.latest().as_bytes().to_vec(),
+                    },
+                ))
+            })
+            .collect();
+        ClientTableSnapshot { slots }
+    }
+
+    /// Rebuild a table from a checkpoint snapshot: restore each slot in place and
+    /// rebuild the client-to-slot index.
+    ///
+    /// The restored ring holds only the entry's latest reply, so `latest_commit`
+    /// (and with it `evict_oldest`'s victim order) is reproduced exactly while
+    /// older retransmits degrade from [`RequestStatus::Duplicate`] to
+    /// [`RequestStatus::AlreadyApplied`].
+    ///
+    /// `min_slots` is the configured capacity. The rebuilt table is that, or enough
+    /// to hold the highest occupied index when the checkpoint was taken under a
+    /// larger capacity: a capacity *lowered* below a live entry's slot cannot be
+    /// honoured without dropping a recovered session, so the larger count stands
+    /// until those entries drain, and a later checkpoint then rebuilds at the
+    /// configured size. Slot positions are preserved either way, so eviction order is
+    /// unchanged.
+    ///
+    /// # Errors
+    /// [`ClientTableDecodeError`] if a slot's reply bytes are not a valid reply
+    /// message, if two slots share a `client_id`, if two entries claim the same slot,
+    /// or if a slot index is past [`CLIENTS_TABLE_SLOT_MAX`] (a corrupt, torn, or
+    /// foreign checkpoint). Surfaced rather than panicked so a bad checkpoint refuses
+    /// boot instead of unwinding the shard. Callers verify the checkpoint's checksum
+    /// against the superblock first, so a correct boot never hits this.
+    pub fn from_snapshot(
+        snapshot: ClientTableSnapshot,
+        min_slots: usize,
+    ) -> Result<Self, ClientTableDecodeError> {
+        // Bound the capacity on a slot index read off disk before allocating from it,
+        // as the superblock and WAL do with their length fields.
+        let mut capacity = min_slots;
+        for (slot_idx, _) in &snapshot.slots {
+            let slot = *slot_idx as usize;
+            if slot >= CLIENTS_TABLE_SLOT_MAX {
+                return Err(ClientTableDecodeError::SlotOutOfRange {
+                    slot,
+                    max: CLIENTS_TABLE_SLOT_MAX,
+                });
+            }
+            capacity = capacity.max(slot + 1);
+        }
+
+        let mut index = HashMap::with_capacity(snapshot.slots.len());
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || None);
+        for (slot_idx, entry) in snapshot.slots {
+            let slot_idx = slot_idx as usize;
+            let reply = Message::<ReplyHeader>::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(
+                &entry.reply,
+            ))
+            .map_err(|source| ClientTableDecodeError::InvalidReply {
+                slot: slot_idx,
+                source,
+            })?;
+            // Reject rather than collapse the index onto one slot, leaving the
+            // other occupied but unindexed. Slot `client_id`s are unique in a
+            // table this crate produced, so a duplicate means a corrupt or
+            // foreign checkpoint.
+            if let Some(first_slot) = index.insert(entry.client_id, slot_idx) {
+                return Err(ClientTableDecodeError::DuplicateClientId {
+                    slot: slot_idx,
+                    first_slot,
+                    client_id: entry.client_id,
+                });
+            }
+            let latest_commit = reply.header().commit;
+            let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
+            ring.push_back(CachedReply::from_message(reply));
+            // Two entries claiming one slot would silently drop the first, leaving it
+            // indexed but pointing at another client's state.
+            if slots[slot_idx].is_some() {
+                return Err(ClientTableDecodeError::DuplicateSlot { slot: slot_idx });
+            }
+            slots[slot_idx] = Some(ClientEntry {
+                epoch: entry.epoch,
+                user_id: entry.user_id,
+                watermark: entry.watermark,
+                watermark_checksum: entry.watermark_checksum,
+                ring,
+                client_id: entry.client_id,
+                latest_commit,
+            });
+        }
+        Ok(Self { slots, index })
     }
 
     /// Check a request against the table. Epoch fence first, then the
@@ -868,6 +1178,7 @@ impl ClientEntry {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use iggy_binary_protocol::{Command2, Operation};
@@ -926,6 +1237,204 @@ mod tests {
             ..ReplyHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn to_from_snapshot_round_trips_epochs_and_watermarks() {
+        let mut table = ClientTable::new(8);
+        table.commit_register(1, 11, make_register_reply(1, 10));
+        table.commit_register(2, 22, make_register_reply(2, 20));
+        // Client 1 committed request 5; its reply is the entry's latest.
+        table.commit_reply(1, make_reply_with_checksum(1, 5, 30, 0xbeef));
+
+        let restored = ClientTable::from_snapshot(table.to_snapshot(), 0).unwrap();
+
+        // Fences and dedup history survive, and the index is rebuilt (every
+        // accessor reads through it).
+        assert_eq!(restored.get_epoch(1), Some(10));
+        assert_eq!(restored.get_epoch(2), Some(20));
+        assert_eq!(restored.get_watermark(1), Some(5));
+        assert_eq!(restored.get_watermark(2), Some(0));
+        assert_eq!(restored.get_user_id(1), Some(11));
+        // Replaying request 5 is a dedup hit, not a re-execution: at-most-once
+        // holds across a restart, and the original bytes still answer it.
+        match restored.check_request(1, 10, 5, 0xbeef) {
+            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 5),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        // The persisted watermark checksum still catches request-id reuse.
+        assert!(matches!(
+            restored.check_request(1, 10, 5, 0xfeed),
+            RequestStatus::ChecksumMismatch { request: 5 }
+        ));
+        // A zombie holding the pre-restart epoch of a since-rebound client is
+        // still fenced, so the fence is not weakened by the round trip.
+        assert!(matches!(
+            restored.check_request(1, 9, 6, 0),
+            RequestStatus::Fenced {
+                current: 10,
+                received: 9
+            }
+        ));
+        // A client that never registered is still unknown.
+        assert!(matches!(
+            restored.check_request(3, 1, 1, 0),
+            RequestStatus::NoSession
+        ));
+    }
+
+    // Only the entry's latest reply is persisted, so a retransmit of an older
+    // ring entry is refused execution rather than answered from cache.
+    #[test]
+    fn snapshot_drops_stale_ring_replies_but_keeps_at_most_once() {
+        let mut table = ClientTable::new(4);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_reply(1, make_reply_for(1, 5, 20));
+        table.commit_reply(1, make_reply_for(1, 6, 21));
+
+        let restored = ClientTable::from_snapshot(table.to_snapshot(), 0).unwrap();
+
+        assert!(matches!(
+            restored.check_request(1, 10, 5, 0),
+            RequestStatus::AlreadyApplied {
+                request: 5,
+                watermark: 6
+            }
+        ));
+    }
+
+    // Slot positions are preserved, so a checkpoint-restored replica picks the
+    // same eviction victim as one that replayed the whole WAL.
+    #[test]
+    fn snapshot_preserves_slot_order_for_eviction() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+
+        let mut restored = ClientTable::from_snapshot(table.to_snapshot(), 0).unwrap();
+        assert_eq!(restored.client_ids().collect::<Vec<_>>(), vec![1, 2]);
+
+        // Full table: the oldest latest_commit (client 1, op 10) is evicted, and
+        // latest_commit came back from the persisted reply header.
+        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30));
+        assert_eq!(restored.get_epoch(1), None);
+        assert_eq!(restored.get_epoch(2), Some(20));
+        assert_eq!(restored.get_epoch(3), Some(30));
+    }
+
+    // A LOWERED `clients_table_max` must take effect too. It cannot while the encoded
+    // form is one element per configured slot, since the rebuilt table has to be at
+    // least as long as that array.
+    #[test]
+    fn from_snapshot_shrinks_to_the_configured_capacity() {
+        let mut table = ClientTable::new(8);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+
+        let mut restored = ClientTable::from_snapshot(table.to_snapshot(), 2).unwrap();
+
+        // Capacity 2: the recovered session plus one, and the third register evicts.
+        restored.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30));
+        assert_eq!(restored.count(), 2);
+        assert_eq!(
+            restored.get_epoch(1),
+            None,
+            "the oldest committed entry is the eviction victim at the lowered capacity"
+        );
+    }
+
+    // A capacity lowered below a live entry's slot cannot be honoured without dropping
+    // a recovered session, so the table keeps room for it.
+    #[test]
+    fn from_snapshot_keeps_a_slot_above_the_configured_capacity() {
+        let mut table = ClientTable::new(8);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        let mut snapshot = table.to_snapshot();
+        snapshot.slots[0].0 = 5;
+
+        let restored = ClientTable::from_snapshot(snapshot, 2).unwrap();
+        assert_eq!(
+            restored.get_epoch(1),
+            Some(10),
+            "an entry above the configured capacity must survive, not be dropped"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_two_entries_in_one_slot() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        let mut snapshot = table.to_snapshot();
+        snapshot.slots[1].0 = snapshot.slots[0].0;
+
+        assert!(matches!(
+            ClientTable::from_snapshot(snapshot, 0),
+            Err(ClientTableDecodeError::DuplicateSlot { slot: 0 })
+        ));
+    }
+
+    #[test]
+    fn from_snapshot_rejects_a_slot_index_past_the_ceiling() {
+        // The capacity is allocated from this index, so an out-of-range one must be
+        // refused before the allocation rather than sized from.
+        let mut table = ClientTable::new(2);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        let mut snapshot = table.to_snapshot();
+        snapshot.slots[0].0 = u32::MAX;
+
+        assert!(matches!(
+            ClientTable::from_snapshot(snapshot, 0),
+            Err(ClientTableDecodeError::SlotOutOfRange { .. })
+        ));
+    }
+
+    // A raised `clients_table_max` must take effect on the next boot rather than
+    // staying inert behind the checkpoint's slot count.
+    #[test]
+    fn from_snapshot_grows_to_the_configured_capacity() {
+        let mut table = ClientTable::new(1);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+
+        let mut restored = ClientTable::from_snapshot(table.to_snapshot(), 3).unwrap();
+
+        // Two free slots were padded on, so the next registers land without
+        // evicting the recovered session.
+        restored.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30));
+        assert_eq!(restored.count(), 3);
+        assert_eq!(restored.get_epoch(1), Some(10));
+    }
+
+    #[test]
+    fn from_snapshot_rejects_duplicate_client_ids() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        let mut snapshot = table.to_snapshot();
+        snapshot.slots[1].1 = snapshot.slots[0].1.clone();
+
+        assert!(matches!(
+            ClientTable::from_snapshot(snapshot, 0),
+            Err(ClientTableDecodeError::DuplicateClientId {
+                slot: 1,
+                first_slot: 0,
+                client_id: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn from_snapshot_rejects_invalid_reply_bytes() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        let mut snapshot = table.to_snapshot();
+        snapshot.slots[0].1.reply = vec![0xff; 8];
+
+        assert!(matches!(
+            ClientTable::from_snapshot(snapshot, 0),
+            Err(ClientTableDecodeError::InvalidReply { slot: 0, .. })
+        ));
     }
 
     /// Register client 1 (register commit stamped at op 10). Returns

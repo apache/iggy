@@ -731,6 +731,11 @@ pub struct PermissionerSnapshot {
 }
 
 /// Snapshot representation for the Users state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items`, `personal_access_tokens`, and the permissioner's maps stay ordered
+/// (`Vec` / `BTreeMap`) even though the runtime holds them in `AHashMap`s. Swapping
+/// any to an unordered map breaks the checkpoint checksum cross-check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsersSnapshot {
     pub items: Vec<(usize, UserSnapshot)>,

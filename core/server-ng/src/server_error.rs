@@ -48,7 +48,11 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create io_uring runtime for shard {shard_id}")]
+    // `{source}` is deliberately part of the Display text: the shard-join
+    // failure report and `%error` log fields print Display only, and the
+    // source carries the io_uring remediation folded in by
+    // `server_common::diagnostics::enrich_runtime_create_error`.
+    #[error("failed to create io_uring runtime for shard {shard_id}: {source}")]
     ShardRuntimeCreateFailed {
         shard_id: u16,
         #[source]
@@ -206,7 +210,14 @@ pub struct ShardJoinFailure {
 #[derive(Debug)]
 pub enum ShardJoinFailureKind {
     Error(Box<ServerNgError>),
-    Panic { message: String },
+    Panic {
+        message: String,
+    },
+    /// The shard thread never finished inside `shutdown_join_timeout`
+    /// and was abandoned so process exit is not blocked forever.
+    Wedged {
+        waited: std::time::Duration,
+    },
 }
 
 fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
@@ -222,6 +233,13 @@ fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
             }
             ShardJoinFailureKind::Panic { message } => {
                 let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
+            }
+            ShardJoinFailureKind::Wedged { waited } => {
+                let _ = write!(
+                    out,
+                    "shard {} wedged: thread still running after {waited:?}, abandoned",
+                    failure.shard_id
+                );
             }
         }
     }
