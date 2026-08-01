@@ -31,7 +31,7 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public class IggyConsumerBuilder
 {
-    private IMessageEncryptor? _encryptor;
+    private protected IMessageEncryptor? _encryptor;
 
     internal Func<ConsumerErrorEventArgs, Task>? OnPollingError { get; set; }
     internal IggyConsumerConfig Config { get; set; } = new();
@@ -39,7 +39,7 @@ public class IggyConsumerBuilder
 
     /// <summary>
     ///     Creates a new consumer builder that will create its own Iggy client.
-    ///     You must configure connection settings using <see cref="WithConnection" />.
+    ///     You must configure connection settings using <c>WithConnection</c>.
     /// </summary>
     /// <param name="streamId">The stream identifier to consume from</param>
     /// <param name="topicId">The topic identifier to consume from</param>
@@ -104,6 +104,18 @@ public class IggyConsumerBuilder
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
         Config.ReconnectionSettings = reconnectionSettings;
+
+        return this;
+    }
+
+    /// <summary>
+    ///     Selects the wire framing the consumer's client speaks. Defaults to <see cref="WireProtocol.Classic" />.
+    /// </summary>
+    /// <param name="wireProtocol">The wire framing to use. VSR requires <see cref="Protocol.Tcp" />.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
+    public IggyConsumerBuilder WithWireProtocol(WireProtocol wireProtocol)
+    {
+        Config.WireProtocol = wireProtocol;
 
         return this;
     }
@@ -241,10 +253,12 @@ public class IggyConsumerBuilder
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
+                WireProtocol = Config.WireProtocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });

@@ -195,6 +195,7 @@ jobs:
         working-directory: foreign/csharp
         env:
           IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
+          IGGY_TEST_SERVER: classic
         run: |
           dotnet test \
             --project Iggy_SDK.Tests.Integration \
@@ -204,6 +205,43 @@ jobs:
             --coverage-output-format cobertura \
             --coverage-output coverage.cobertura.xml \
             --results-directory ./reports/integration
+
+      - name: Build iggy-server-ng Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="iggy-server-ng:test"
+          SERVER_BINARY="target/debug/iggy-server-ng"
+          CLI_BINARY="target/debug/iggy"
+
+          # server-ng only speaks the VSR wire protocol when built with the vsr feature.
+          cargo build --locked --features vsr --bin iggy-server-ng --bin iggy
+
+          docker build \
+            -f core/server-ng/Dockerfile \
+            --target runtime-prebuilt \
+            -t "$IMAGE_TAG" \
+            --build-arg PREBUILT_IGGY_SERVER_NG="$SERVER_BINARY" \
+            --build-arg PREBUILT_IGGY_CLI="$CLI_BINARY" \
+            .
+
+          echo "IGGY_SERVER_NG_DOCKER_IMAGE=$IMAGE_TAG" >> "$GITHUB_ENV"
+
+      # The PR side uploads its e2e-vsr run under the same csharp flag, so a baseline without this leg
+      # compares every VSR line against nothing and reports the whole transport as uncovered.
+      - name: Run VSR integration tests with coverage
+        working-directory: foreign/csharp
+        env:
+          IGGY_TEST_SERVER: ng
+        run: |
+          dotnet test \
+            --project Iggy_SDK.Tests.Integration \
+            --no-build \
+            --verbosity normal \
+            --coverage \
+            --coverage-output-format cobertura \
+            --coverage-output coverage.cobertura.xml \
+            --results-directory ./reports/vsr
 
       - name: Merge coverage reports
         working-directory: foreign/csharp

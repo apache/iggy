@@ -35,15 +35,17 @@ using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
 /// <summary>
-///     A TCP client for interacting with the Iggy server.
+///     A TCP client for interacting with the Iggy server. The consensus (VSR) framing, leader redirection and
+///     register handshake live in <c>TcpMessageStream.Vsr.cs</c>.
 /// </summary>
-public sealed class TcpMessageStream : IIggyClient
+public sealed partial class TcpMessageStream : IIggyClient
 {
     private const int InvalidCommandStatus = 3;
 
@@ -58,20 +60,32 @@ public sealed class TcpMessageStream : IIggyClient
 
     private readonly IggyClientConfigurator _configuration;
     private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
+    private readonly SemaphoreSlim _connectGate = new(1, 1);
     private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly byte[] _responseHeaderBuffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
     private readonly SemaphoreSlim _sendingSemaphore;
     private string _currentAddress = string.Empty;
     private X509Certificate2Collection _customCaStore = [];
-    private bool _isConnecting;
+    private volatile bool _disposed;
+    private int _isConnecting;
     private DateTimeOffset _lastConnectionTime;
-    private ConnectionState _state = ConnectionState.Disconnected;
+    private int _leaderRedirectCount;
+
+    // Both are written by the connect and redirect paths, which do not hold the sending semaphore the request
+    // paths read them under, so they are accessed through Interlocked rather than as plain fields. Losing an
+    // update to the skip flag leaves a connection reporting Connected that never authenticated; losing one to
+    // the redirect counter over- or under-spends the redirect budget.
+    private int _skipAutoLoginOnce;
+    private volatile ConnectionState _state = ConnectionState.Disconnected;
     private TcpConnectionStream _stream = null!;
+
+    private bool IsConnecting => Volatile.Read(ref _isConnecting) != 0;
 
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
         _configuration = configuration;
+        _isVsr = configuration.WireProtocol == WireProtocol.Vsr;
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
         _sendingSemaphore = new SemaphoreSlim(1, 1);
         _connectionSemaphore = new SemaphoreSlim(1, 1);
@@ -84,10 +98,14 @@ public sealed class TcpMessageStream : IIggyClient
     /// </summary>
     public void Dispose()
     {
+        _disposed = true;
         _stream?.Close();
         _stream?.Dispose();
+
+        SetConnectionStateAsync(ConnectionState.Disconnected);
         _sendingSemaphore.Dispose();
         _connectionSemaphore.Dispose();
+        _connectGate.Dispose();
         _connectionEvents.Clear();
     }
 
@@ -273,6 +291,7 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_TOPIC_CODE);
 
         await SendAckAsync(payload, token);
+        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
 
     /// <inheritdoc />
@@ -290,6 +309,11 @@ public sealed class TcpMessageStream : IIggyClient
     public Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
         IList<Message> messages, CancellationToken token = default)
     {
+        if (NeedsClientSidePartitioning(partitioning))
+        {
+            return SendMessagesResolvedAsync(streamId, topicId, partitioning, messages, token);
+        }
+
         return SendMessagesCoreAsync(streamId, topicId, partitioning, AsSpan(messages), token);
     }
 
@@ -297,6 +321,11 @@ public sealed class TcpMessageStream : IIggyClient
     public Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
         Message message, CancellationToken token = default)
     {
+        if (NeedsClientSidePartitioning(partitioning))
+        {
+            return SendMessagesResolvedAsync(streamId, topicId, partitioning, [message], token);
+        }
+
         ReadOnlySpan<Message> span = [message];
         return SendMessagesCoreAsync(streamId, topicId, partitioning, span, token);
     }
@@ -324,38 +353,23 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
         uint? partitionId,
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
         ThrowIfAutoCommitWithEncryptor(autoCommit);
 
-        var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
-        var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
-        var payload = ArrayPool<byte>.Shared.Rent(payloadBufferSize);
-        IMemoryOwner<byte>? responseBuffer = null;
+        // Under VSR the broker routes explicit partitions only, so a group poll picks one of the member's
+        // assigned partitions client-side.
+        if (_isVsr && consumer.Type == ConsumerType.ConsumerGroup && partitionId is null)
+        {
+            return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategy, count, autoCommit,
+                token);
+        }
 
-        try
-        {
-            TcpContracts.GetMessages(payload.AsSpan().Slice(8, messageBufferSize), consumer, streamId,
-                topicId, pollingStrategy, count, autoCommit, partitionId);
-            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[..4], messageBufferSize + 4);
-            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[4..8], CommandCodes.POLL_MESSAGES_CODE);
-
-            responseBuffer = await SendWithResponseAsync(payload.AsMemory(0, payloadBufferSize), token);
-            return BinaryMapper.MapRentedMessages(responseBuffer.Memory, responseBuffer,
-                _configuration.MessageEncryptor);
-        }
-        catch
-        {
-            responseBuffer?.Dispose();
-            throw;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
+            autoCommit, token);
     }
 
     /// <inheritdoc />
@@ -462,6 +476,7 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_CONSUMER_GROUP_CODE);
 
         await SendAckAsync(payload, token);
+        _groupState.DeregisterGroup(new GroupKey(streamId, topicId, groupId));
     }
 
     /// <inheritdoc />
@@ -473,6 +488,10 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.JOIN_CONSUMER_GROUP_CODE);
 
         await SendAckAsync(payload, token);
+
+        // A join rebalances the group, so whatever this client holds for it is a generation behind and every
+        // poll under it would be fenced until the first re-sync.
+        _groupState.InvalidateAssignment(new GroupKey(streamId, topicId, groupId));
     }
 
     /// <inheritdoc />
@@ -484,6 +503,7 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LEAVE_CONSUMER_GROUP_CODE);
 
         await SendAckAsync(payload, token);
+        _groupState.DeregisterGroup(new GroupKey(streamId, topicId, groupId));
     }
 
     /// <inheritdoc />
@@ -495,6 +515,7 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_PARTITIONS_CODE);
 
         await SendAckAsync(payload, token);
+        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
 
     /// <inheritdoc />
@@ -506,6 +527,7 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_PARTITIONS_CODE);
 
         await SendAckAsync(payload, token);
+        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
 
     /// <inheritdoc />
@@ -578,6 +600,11 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PING_CODE);
 
         await SendAckAsync(payload, token);
+
+        if (_isVsr)
+        {
+            await RefreshGroupAssignmentsAsync(token);
+        }
     }
 
     /// <inheritdoc />
@@ -611,7 +638,17 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task ConnectAsync(CancellationToken token = default)
+    public Task ConnectAsync(CancellationToken token = default)
+    {
+        return ConnectAsync(true, token);
+    }
+
+    /// <summary>
+    ///     Connects, optionally without the configured auto login. A caller that authenticates itself right
+    ///     after the connect passes <c>false</c>, so the connect does not spend a round trip on credentials the
+    ///     caller is about to replace.
+    /// </summary>
+    private async Task ConnectAsync(bool autoLogin, CancellationToken token)
     {
         if (_state is ConnectionState.Connected
             or ConnectionState.Authenticating
@@ -621,20 +658,29 @@ public sealed class TcpMessageStream : IIggyClient
             return;
         }
 
-        if (_lastConnectionTime != DateTimeOffset.MinValue)
-        {
-            await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
-        }
-
-        SetConnectionStateAsync(ConnectionState.Connecting);
-        _isConnecting = true;
+        await _connectGate.WaitAsync(token);
+        Interlocked.Exchange(ref _isConnecting, 1);
         try
         {
-            await TryEstablishConnectionAsync(token);
+            if (_state is ConnectionState.Connected
+                or ConnectionState.Authenticating
+                or ConnectionState.Authenticated)
+            {
+                return;
+            }
+
+            if (_lastConnectionTime != DateTimeOffset.MinValue)
+            {
+                await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
+            }
+
+            SetConnectionStateAsync(ConnectionState.Connecting);
+            await TryEstablishConnectionAsync(autoLogin, token);
         }
         finally
         {
-            _isConnecting = false;
+            Interlocked.Exchange(ref _isConnecting, 0);
+            _connectGate.Release();
         }
     }
 
@@ -775,8 +821,14 @@ public sealed class TcpMessageStream : IIggyClient
             throw new NotConnectedException();
         }
 
+        if (_isVsr)
+        {
+            return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_CODE,
+                LoginRegister.Serialize(userName, password), token);
+        }
+
         // TODO: Add binary protocol version
-        var message = TcpContracts.LoginUser(userName, password, SdkVersion.Value, "csharp-sdk");
+        var message = TcpContracts.LoginUser(userName, password, SdkVersion.Value, LoginRegister.SDK_NAME);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 
@@ -791,7 +843,7 @@ public sealed class TcpMessageStream : IIggyClient
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.Memory.Span[..responseBuffer.Memory.Length]);
         SetConnectionStateAsync(ConnectionState.Authenticated);
 
-        if (await RedirectAsync(token))
+        if (!IsConnecting && await RedirectAsync(token))
         {
             await ConnectAsync(token);
             return await LoginUserAsync(userName, password, token);
@@ -808,7 +860,22 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGOUT_USER_CODE);
 
-        await SendAckAsync(payload, token);
+        try
+        {
+            await SendAckAsync(payload, token);
+        }
+        finally
+        {
+            if (_isVsr)
+            {
+                await ResetConsensusSessionAsync();
+
+                if (_state == ConnectionState.Authenticated)
+                {
+                    SetConnectionStateAsync(ConnectionState.Connected);
+                }
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -860,6 +927,12 @@ public sealed class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default)
     {
+        if (_isVsr)
+        {
+            return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
+                LoginRegister.SerializeWithPersonalAccessToken(token), ct);
+        }
+
         var message = TcpContracts.LoginWithPersonalAccessToken(token);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE);
@@ -876,13 +949,50 @@ public sealed class TcpMessageStream : IIggyClient
 
         SetConnectionStateAsync(ConnectionState.Authenticated);
 
-        if (await RedirectAsync(ct))
+        if (!IsConnecting && await RedirectAsync(ct))
         {
             await ConnectAsync(ct);
             return await LoginWithPersonalAccessTokenAsync(token, ct);
         }
 
         return new AuthResponse(userId, null);
+    }
+
+    private async Task<PolledMessagesRental> PollPartitionMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        CancellationToken token)
+    {
+        var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
+        var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
+        var payload = ArrayPool<byte>.Shared.Rent(payloadBufferSize);
+        IMemoryOwner<byte>? responseBuffer = null;
+
+        try
+        {
+            TcpContracts.GetMessages(payload.AsSpan().Slice(8, messageBufferSize), consumer, streamId,
+                topicId, pollingStrategy, count, autoCommit, partitionId);
+            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[..4], messageBufferSize + 4);
+            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[4..8], CommandCodes.POLL_MESSAGES_CODE);
+
+            responseBuffer = await SendWithResponseAsync(payload.AsMemory(0, payloadBufferSize), token);
+            if (responseBuffer.Memory.Length == 0)
+            {
+                responseBuffer.Dispose();
+                return EmptyPolledMessages;
+            }
+
+            return BinaryMapper.MapRentedMessages(responseBuffer.Memory, responseBuffer,
+                _configuration.MessageEncryptor);
+        }
+        catch
+        {
+            responseBuffer?.Dispose();
+            throw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(payload);
+        }
     }
 
     // Server-side autoCommit commits the batch offset before the client decrypts, so a decryption failure
@@ -962,59 +1072,101 @@ public sealed class TcpMessageStream : IIggyClient
         return messageBufferSize;
     }
 
-    private async Task TryEstablishConnectionAsync(CancellationToken token)
+    private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token)
     {
         var retryCount = 0;
+        var redirects = 0;
         var delay = _configuration.ReconnectionSettings.InitialDelay;
         do
         {
-            // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
-            _stream?.Close();
-            _stream?.Dispose();
+            // The sending semaphore owns every write to _stream, so an in-flight request never observes the
+            // field changing between its write and its reply.
+            await _sendingSemaphore.WaitAsync(token);
+            try
+            {
+                _stream?.Dispose();
+
+                ResetConsensusSession();
+            }
+            finally
+            {
+                _sendingSemaphore.Release();
+            }
 
             if (string.IsNullOrEmpty(_currentAddress))
             {
                 _currentAddress = _configuration.BaseAddress;
             }
 
-            var urlPortSplitter = _currentAddress.Split(":");
-            if (urlPortSplitter.Length > 2)
+            if (!ServerAddress.TryParse(_currentAddress, out var host, out var port))
             {
                 throw new InvalidBaseAddressException();
             }
 
+            Socket? socket = null;
             try
             {
-                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket = new Socket(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
                 socket.SendBufferSize = _configuration.SendBufferSize;
                 socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
 
-                await socket.ConnectAsync(urlPortSplitter[0], int.Parse(urlPortSplitter[1]), token);
+                // The protocol is request/reply on both wire protocols, so a write is always the last one before
+                // the client blocks on the answer and Nagle has nothing to coalesce it with - it only delays the
+                // trailing segment of a large request until the previous one is acked.
+                socket.NoDelay = true;
+
+                await socket.ConnectAsync(host, port, token);
 
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
 
-                SetConnectionStateAsync(ConnectionState.Connected);
-                _lastConnectionTime = DateTimeOffset.UtcNow;
-
-                _stream = _configuration.TlsSettings.Enabled switch
+                TcpConnectionStream connectionStream = _configuration.TlsSettings.Enabled switch
                 {
                     true => await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
                     false => new TcpConnectionStream(new NetworkStream(socket, true))
                 };
 
-                if (_configuration.AutoLoginSettings.Enabled)
+                await _sendingSemaphore.WaitAsync(token);
+                try
+                {
+                    _stream = connectionStream;
+                }
+                finally
+                {
+                    _sendingSemaphore.Release();
+                }
+
+                SetConnectionStateAsync(ConnectionState.Connected);
+                _lastConnectionTime = DateTimeOffset.UtcNow;
+
+                socket = null;
+
+                if (_isVsr && await RedirectAsync(token))
+                {
+                    await BackoffOrThrowAsync();
+                    continue;
+                }
+
+                if (autoLogin && _configuration.AutoLoginSettings.Enabled && !ConsumeSkipAutoLogin())
                 {
                     _logger.LogInformation("Auto login enabled. Trying to login with credentials: {Username}",
                         _configuration.AutoLoginSettings.Username);
                     await LoginUserAsync(_configuration.AutoLoginSettings.Username,
                         _configuration.AutoLoginSettings.Password, token);
+
+                    if (await RedirectAsync(token))
+                    {
+                        await BackoffOrThrowAsync();
+                        continue;
+                    }
                 }
 
                 break;
             }
             catch (Exception e)
             {
+                socket?.Dispose();
+
                 _logger.LogError(e, "Failed to connect");
 
                 if (!_configuration.ReconnectionSettings.Enabled ||
@@ -1045,37 +1197,38 @@ public sealed class TcpMessageStream : IIggyClient
                 await Task.Delay(delay, token);
             }
         } while (true);
-    }
 
-    private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
-    {
-        try
+        // A redirect restarts the loop without passing through the catch, so it spends no retry and waits for
+        // nothing. Its own budget rather than the reconnection one: following the roster to the leader is how a
+        // VSR connect succeeds, and it has to work with reconnection turned off.
+        async Task BackoffOrThrowAsync()
         {
-            var clusterMetadata = await GetClusterMetadataAsync(token);
-            if (clusterMetadata == null)
+            if (++redirects > VsrMaxLeaderRedirects)
             {
-                return null;
-            }
-
-            // Single-node cluster (clustering disabled) - no redirection needed
-            if (clusterMetadata.Nodes.Count() == 1)
-            {
-                return null;
-            }
-
-            var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x => x.Role == ClusterNodeRole.Leader);
-            if (leaderNode == null)
-            {
+                SetConnectionStateAsync(ConnectionState.Disconnected);
                 throw new MissingLeaderException();
             }
 
-            return leaderNode;
+            _logger.LogInformation("Following leader redirect {Redirect} to {Address}", redirects, _currentAddress);
+
+            await Task.Delay(delay, token);
         }
-        // todo: change after error refactoring, error code 5 is for feature not supported
-        catch (IggyInvalidStatusCodeException e) when (e.StatusCode == 5)
+    }
+
+    /// <summary>
+    ///     Whether this connect was triggered by a login or register request that will re-authenticate itself,
+    ///     so the auto-login must sit this one out. Consumes the flag.
+    /// </summary>
+    private bool ConsumeSkipAutoLogin()
+    {
+        if (Interlocked.Exchange(ref _skipAutoLoginOnce, 0) == 0)
         {
-            return null;
+            return false;
         }
+
+        _logger.LogInformation("Skipping auto login for a replayed register request");
+
+        return true;
     }
 
     private async Task<TcpConnectionStream> CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
@@ -1104,7 +1257,7 @@ public sealed class TcpMessageStream : IIggyClient
         {
             return await SendRawAsync(payload, token);
         }
-        catch (Exception e) when (IsConnectionException(e) && !_isConnecting)
+        catch (Exception e) when (IsConnectionException(e) && !IsConnecting && !_disposed)
         {
             _logger.LogWarning("Connection lost");
             if (!_configuration.ReconnectionSettings.Enabled)
@@ -1149,13 +1302,24 @@ public sealed class TcpMessageStream : IIggyClient
         }
     }
 
-    private async Task<IMemoryOwner<byte>> SendRawAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
+    private Task<IMemoryOwner<byte>> SendRawAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
         {
             throw new NotConnectedException();
         }
 
+        return _isVsr ? SendRawVsrAsync(payload, token) : SendRawClassicAsync(payload, token);
+    }
+
+    /// <summary>
+    ///     Sends a classic-framed payload (<c>[size u32][code u32][body]</c>) and reads the
+    ///     <c>[status u32][length u32]</c> reply header plus its body.
+    /// </summary>
+    private async Task<IMemoryOwner<byte>> SendRawClassicAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
         await _sendingSemaphore.WaitAsync(token);
 
         try
@@ -1186,7 +1350,7 @@ public sealed class TcpMessageStream : IIggyClient
                 if (response.Length == 0)
                 {
                     throw new IggyInvalidStatusCodeException(response.Status,
-                        $"Invalid response status code: {response.Status}");
+                        $"Invalid response status code: {response.Status}", true);
                 }
 
 
@@ -1355,30 +1519,6 @@ public sealed class TcpMessageStream : IIggyClient
         }
 
         return false;
-    }
-
-    private async Task<bool> RedirectAsync(CancellationToken token)
-    {
-        var currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
-        if (currentLeaderNode == null)
-        {
-            return false;
-        }
-
-        var leaderAddress = $"{currentLeaderNode.Ip}:{currentLeaderNode.Endpoints.Tcp}";
-        if (leaderAddress == _currentAddress)
-        {
-            return false;
-        }
-
-        _currentAddress = leaderAddress;
-
-        _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}",
-            leaderAddress);
-
-        _stream.Close();
-        SetConnectionStateAsync(ConnectionState.Disconnected);
-        return true;
     }
 
     internal sealed class EmptyMemoryOwner : IMemoryOwner<byte>

@@ -38,6 +38,18 @@ public sealed class IggyClientConfigurator
     public required Protocol Protocol { get; set; }
 
     /// <summary>
+    ///     The wire framing to use. Default is <see cref="Enums.WireProtocol.Classic" />.
+    ///     <see cref="Enums.WireProtocol.Vsr" /> requires <see cref="Enums.Protocol.Tcp" />.
+    /// </summary>
+    public WireProtocol WireProtocol { get; set; } = WireProtocol.Classic;
+
+    /// <summary>
+    ///     The largest response frame accepted under <see cref="Enums.WireProtocol.Vsr" />, in bytes.
+    ///     Default is 64 MiB, minimum is the 256-byte header.
+    /// </summary>
+    public int MaxResponseFrameSize { get; set; } = 64 * 1024 * 1024;
+
+    /// <summary>
     ///     The size of the receive buffer in bytes. Default is 4096.
     /// </summary>
     public int ReceiveBufferSize { get; set; } = 4096;

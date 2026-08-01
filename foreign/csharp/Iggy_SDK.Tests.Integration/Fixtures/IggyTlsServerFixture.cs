@@ -42,9 +42,4 @@ public class IggyTlsServerFixture : IggyServerFixture
     [
         new("Certs", "/app/certs/")
     ];
-
-    public override async Task InitializeAsync()
-    {
-        await IggyContainer!.StartAsync();
-    }
 }

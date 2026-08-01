@@ -173,7 +173,7 @@ public partial class IggyPublisher : IAsyncDisposable
         await Client.ConnectAsync(ct);
 
         LogInitializingPublisher(Config.StreamId, Config.TopicId);
-        if (Config.CreateIggyClient)
+        if (!string.IsNullOrEmpty(Config.Login) && !Config.CreateIggyClient)
         {
             await Client.LoginUserAsync(Config.Login, Config.Password, ct);
             LogUserLoggedIn(Config.Login);

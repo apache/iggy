@@ -988,7 +988,7 @@ public class HttpMessageStream : IIggyClient
         {
             var err = await response.Content.ReadAsStringAsync();
             var errorModel = JsonSerializer.Deserialize<ErrorResponse>(err);
-            throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err);
+            throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
         }
 
         if (response.StatusCode == HttpStatusCode.InternalServerError)

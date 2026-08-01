@@ -23,6 +23,7 @@ using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -90,6 +91,8 @@ public class FetchMessagesTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    [SkipServerNg(
+        "server-ng replies the empty-poll shape for an unresolved topic; a zero-byte error body would break the poll decoder")]
     public async Task PollMessages_InvalidTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
         var (client, streamName) = await CreateStreamWithMessages(protocol);

@@ -21,7 +21,7 @@ description: .NET pre-merge testing github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, test, build, e2e)"
+    description: "Task to run (lint, test, build, e2e, e2e-vsr)"
     required: true
 
 runs:
@@ -33,7 +33,7 @@ runs:
         dotnet-version: "10.0.x"
 
     - name: Setup Rust with cache
-      if: inputs.task == 'test' || inputs.task == 'e2e'
+      if: inputs.task == 'test' || inputs.task == 'e2e' || inputs.task == 'e2e-vsr'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Restore dependencies
@@ -90,6 +90,51 @@ runs:
       env:
         IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
         IGGY_TEST_LOGS_DIR: ./reports/container-logs
+        # The suite runs once per server; this job only built the classic image.
+        IGGY_TEST_SERVER: classic
+      run: |
+        dotnet test --project Iggy_SDK.Tests.Integration \
+          --no-build \
+          --verbosity normal \
+          --coverage \
+          --coverage-output-format cobertura \
+          --coverage-output coverage.cobertura.xml \
+          --results-directory ./reports \
+          -- --report-trx --retry-failed-tests 3
+      shell: bash
+
+    - name: Build iggy-server-ng Docker image
+      if: inputs.task == 'e2e-vsr'
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMAGE_TAG="iggy-server-ng:test"
+        SERVER_BINARY="target/debug/iggy-server-ng"
+        CLI_BINARY="target/debug/iggy"
+
+        # server-ng only speaks the VSR wire protocol when built with the vsr feature.
+        cargo build --locked --features vsr --bin iggy-server-ng --bin iggy
+        ls -lh "$SERVER_BINARY" "$CLI_BINARY"
+
+        docker build \
+          -f core/server-ng/Dockerfile \
+          --target runtime-prebuilt \
+          -t "$IMAGE_TAG" \
+          --build-arg PREBUILT_IGGY_SERVER_NG="$SERVER_BINARY" \
+          --build-arg PREBUILT_IGGY_CLI="$CLI_BINARY" \
+          .
+
+        echo "IGGY_SERVER_NG_DOCKER_IMAGE=$IMAGE_TAG" >> "$GITHUB_ENV"
+
+    - name: Run VSR integration tests
+      if: inputs.task == 'e2e-vsr'
+      working-directory: foreign/csharp
+      env:
+        IGGY_TEST_LOGS_DIR: ./reports/container-logs
+        # Runs the whole suite plus the server-ng-only tests against a two-node iggy-server-ng cluster the
+        # fixture starts, so every case commits through consensus. TCP only on this leg, framed with the VSR
+        # wire protocol.
+        IGGY_TEST_SERVER: ng
       run: |
         dotnet test --project Iggy_SDK.Tests.Integration \
           --no-build \
@@ -102,7 +147,7 @@ runs:
       shell: bash
 
     - name: Collect container logs
-      if: inputs.task == 'e2e' && always()
+      if: (inputs.task == 'e2e' || inputs.task == 'e2e-vsr') && always()
       shell: bash
       run: |
         mkdir -p foreign/csharp/reports/container-logs
@@ -110,9 +155,9 @@ runs:
 
     - name: Upload Test Results
       uses: actions/upload-artifact@v7
-      if: inputs.task == 'e2e' && always()
+      if: (inputs.task == 'e2e' || inputs.task == 'e2e-vsr') && always()
       with:
-        name: dotnet-test-results
+        name: dotnet-test-results-${{ inputs.task }}
         path: foreign/csharp/reports
         retention-days: 7
 

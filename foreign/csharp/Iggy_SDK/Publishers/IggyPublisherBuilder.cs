@@ -33,7 +33,7 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
-    private IMessageEncryptor? _encryptor;
+    private protected IMessageEncryptor? _encryptor;
 
     internal Func<PublisherErrorEventArgs, Task>? OnBackgroundError { get; set; }
     internal Func<MessageBatchFailedEventArgs, Task>? OnMessageBatchFailed { get; set; }
@@ -123,6 +123,18 @@ public class IggyPublisherBuilder
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
         Config.ReconnectionSettings = reconnectionSettings;
+
+        return this;
+    }
+
+    /// <summary>
+    ///     Selects the wire framing the publisher's client speaks. Defaults to <see cref="WireProtocol.Classic" />.
+    /// </summary>
+    /// <param name="wireProtocol">The wire framing to use. VSR requires <see cref="Protocol.Tcp" />.</param>
+    /// <returns>The builder instance for method chaining.</returns>
+    public IggyPublisherBuilder WithWireProtocol(WireProtocol wireProtocol)
+    {
+        Config.WireProtocol = wireProtocol;
 
         return this;
     }
@@ -301,10 +313,12 @@ public class IggyPublisherBuilder
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
+                WireProtocol = Config.WireProtocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });

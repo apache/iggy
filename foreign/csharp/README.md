@@ -37,6 +37,13 @@ The SDK supports two transport protocols:
 - **TCP** - Binary protocol for optimal performance and lower latency (recommended)
 - **HTTP** - RESTful JSON API for stateless operations
 
+Over TCP the SDK speaks one of two wire protocols, selected with `WireProtocol`:
+
+- **`WireProtocol.Classic`** (default) - the `[size][code][body]` framing every released Iggy server speaks
+- **`WireProtocol.Vsr`** - the consensus framing of the clustered next-generation server
+
+See [Viewstamped Replication (VSR)](#viewstamped-replication-vsr) for what changes when it is enabled.
+
 ### Creating a Client
 
 The SDK is built around the `IIggyClient` interface. To create a client instance:
@@ -119,6 +126,93 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 
 await client.ConnectAsync();
 ```
+
+## Viewstamped Replication (VSR)
+
+`WireProtocol.Vsr` targets the clustered next-generation server. Every request is wrapped in a 256-byte
+consensus header, the client registers a consensus session at login, and writes are replicated before they are
+acknowledged. The same `IIggyClient` calls work under both wire protocols, with the few exceptions listed
+under [Limitations](#limitations).
+
+```c#
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+{
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp,
+    WireProtocol = WireProtocol.Vsr,
+
+    // Upper bound on a reply frame the server announces, 64 MiB by default.
+    // Applies to the VSR reader only; classic TCP framing is unbounded as before.
+    MaxResponseFrameSize = 64 * 1024 * 1024,
+
+    AutoLoginSettings = new AutoLoginSettings
+    {
+        Enabled = true,
+        Username = "iggy",
+        Password = "iggy"
+    }
+});
+
+await client.ConnectAsync();
+```
+
+### What changes under VSR
+
+- **Login binds a session.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync` run the register handshake
+  instead of the classic login, and the session lives for as long as the connection. Logging out, being evicted
+  or losing the connection ends it, and the next login registers a fresh one.
+- **Leader redirection is automatic.** The client reads the cluster roster, follows the current leader and
+  re-checks it when a request is refused because the node stopped being primary.
+- **The client picks partitions.** The broker never routes: balanced and message-key partitioning are resolved
+  client-side (the message-key hash matches the Rust SDK byte for byte), and consumer-group polls round-robin
+  over the partitions the coordinator assigned to this client.
+- **Consumer groups are assignment-based.** `JoinConsumerGroupAsync` makes this client a member; the assignment
+  is synced on demand and refreshed on every `PingAsync`. Partition counts are cached for 30 seconds, so a topic
+  another client widens is picked up without waiting for a ping.
+- **Credentials are bounds-checked locally.** A username outside 3-50 bytes, a password outside 3-100 bytes or a
+  personal access token outside 1-255 bytes is rejected before the register body is framed.
+- **`PingAsync` costs more than a ping.** Besides the ping it re-syncs the assignment of every consumer group
+  this client has joined, so it makes one extra round trip per joined group. The SDK runs no background
+  heartbeat: an application that wants assignments refreshed calls `PingAsync` on its own cadence.
+
+### Retries and failed requests
+
+The SDK replays a request whenever the server says it never admitted it. Two cases surface to the caller:
+
+- `IggyInvalidStatusCodeException` carries the server status code, with `FromServer` telling apart a verdict the
+  cluster reported from a failure the client raised itself.
+- `VsrRequestOutcomeUnknownException` means no server verdict arrived after the request was written - the
+  connection was lost, the call was cancelled, or the server evicted the session while the request was in
+  flight - so the cluster may or may not have committed it. The SDK will not replay it on a new session,
+  because that would bypass server-side deduplication - re-issuing it is the caller's decision.
+  `IggyPublisher` will not retry it either: it reports the batch through the message-batch-failed event, and
+  `IggyConsumer` rethrows it rather than swallowing it, because an auto-committing poll may have advanced the
+  offset already. Rethrowing ends the consumer's polling loop: catch it around the enumeration, decide whether
+  the operation is safe to re-issue, and start consuming again.
+
+### Limitations
+
+- VSR requires `Protocol.Tcp`; configuring it with `Protocol.Http` throws at client creation.
+- VSR combined with `TlsSettings.Enabled` is not covered by the test suite yet.
+- `StoreOffsetAsync` / `DeleteOffsetAsync` need an explicit partition id under VSR: the broker does not
+  resolve a `null` partition for a consumer-offset request, so passing one throws client-side.
+- `FlushUnsavedBufferAsync` is not available under VSR; the server refuses it.
+- Polling a topic that does not exist returns an empty poll under VSR, where classic TCP throws. The server
+  answers an unresolved topic with the empty-poll reply shape, so the client cannot tell it apart from a topic
+  with no messages. Check the topic exists first if the distinction matters.
+
+### Behaviour changes for existing clients
+
+- `MaxResponseFrameSize` bounds the reply frames the **VSR** reader accepts. A reply larger than the 64 MiB
+  default is refused and the connection is dropped, so raise it if a single response legitimately exceeds that
+  - a large `GetSnapshotAsync` is the usual case. Classic TCP framing is unbounded, as it was before.
+- Clients built with `IggyConsumerBuilder` / `IggyPublisherBuilder` now auto-login with the credentials passed
+  to `WithConnection`, under **both** wire protocols. Before, a builder-created client came back from a
+  reconnect unauthenticated; now the credentials are held for the lifetime of the connection and replayed.
+- The SDK now ships a dependency on `System.IO.Hashing`, used for the client-side message-key partitioner.
+- TCP sockets are opened with `NoDelay`, under **both** wire protocols. Both are request/reply, so a write is
+  always the last one before the client waits for the answer and Nagle has nothing to coalesce it with - it
+  only held back the trailing segment of a large request until the previous one was acked.
 
 ## Authentication
 
@@ -694,10 +788,18 @@ Integration tests are located in `Iggy_SDK.Tests.Integration/`. Tests can run ag
 
 #### 1. Dockerization
 
+The whole suite runs once per server: `iggy-server`, then `iggy-server-ng` built with the `vsr` feature. On
+`iggy-server` every test runs over both `http` and `tcp`; the `iggy-server-ng` leg is TCP-only. Local runs
+therefore need both images.
+
 ```bash
 cargo build
 
-docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t local-iggy-server .
+docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
+
+cargo build --features vsr --bin iggy-server-ng --bin iggy
+
+docker build --no-cache -f core/server-ng/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server-ng:test .
 ```
 
 #### 2. Build the Test Project
@@ -710,9 +812,23 @@ dotnet build foreign/csharp/Iggy_SDK.Tests.Integration
 
 ```bash
 cd foreign/csharp
-export IGGY_SERVER_DOCKER_IMAGE=local-iggy-server
+export IGGY_SERVER_DOCKER_IMAGE=iggy-server:test
+export IGGY_SERVER_NG_DOCKER_IMAGE=iggy-server-ng:test
 dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
 ```
+
+`IGGY_TEST_SERVER` picks the server. It defaults to `classic`, so the command above needs no environment at
+all when only `iggy-server:test` is built. Run it a second time to cover `iggy-server-ng`, where TCP is framed
+with the VSR wire protocol. That leg runs TCP only: the cluster serves reads from the primary, and the HTTP
+surface has no equivalent path to route them through.
+
+```bash
+export IGGY_TEST_SERVER=ng
+dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build
+```
+
+Rider and Visual Studio need nothing configured for the classic run; set `IGGY_TEST_SERVER=ng` in the run
+configuration's environment for the other one.
 
 ## Useful Resources
 

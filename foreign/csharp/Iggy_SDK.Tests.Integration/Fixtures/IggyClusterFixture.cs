@@ -39,12 +39,6 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     private const ushort PortRangeSize = 100;
     private static readonly ushort BasePort = (ushort)(30000 + Environment.Version.Major * 100);
     private static readonly ushort EndPort = (ushort)(BasePort + PortRangeSize);
-
-    // Listeners only need to outlive the eight ReservePort() calls in the
-    // constructor so we don't pick the same port twice within one fixture.
-    // Partitioned ranges already guarantee sibling processes can't race us, so
-    // we can release them as soon as picking is done.
-    private readonly List<TcpListener> _portReservations = [];
     private readonly IContainer _followerContainer;
     private readonly ushort _followerHttpPort;
     private readonly ushort _followerQuicPort;
@@ -59,6 +53,12 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     private readonly ushort _leaderWsPort;
 
     private readonly INetwork _network;
+
+    // Listeners only need to outlive the eight ReservePort() calls in the
+    // constructor so we don't pick the same port twice within one fixture.
+    // Partitioned ranges already guarantee sibling processes can't race us, so
+    // we can release them as soon as picking is done.
+    private readonly List<TcpListener> _portReservations = [];
 
     private string DockerImage =>
         Environment.GetEnvironmentVariable("IGGY_SERVER_DOCKER_IMAGE") ?? "apache/iggy:edge";
@@ -108,7 +108,7 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
             ["IGGY_CLUSTER_NODES_1_PORTS_TCP"] = _followerTcpPort.ToString(),
             ["IGGY_CLUSTER_NODES_1_PORTS_QUIC"] = _followerQuicPort.ToString(),
             ["IGGY_CLUSTER_NODES_1_PORTS_HTTP"] = _followerHttpPort.ToString(),
-            ["IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET"] = _followerWsPort.ToString(),
+            ["IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET"] = _followerWsPort.ToString()
         };
 
         _leaderContainer = new ContainerBuilder(DockerImage)
@@ -183,7 +183,7 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
     private ushort ReservePort()
     {
-        for (ushort candidate = BasePort; candidate < EndPort; candidate++)
+        for (var candidate = BasePort; candidate < EndPort; candidate++)
         {
             try
             {

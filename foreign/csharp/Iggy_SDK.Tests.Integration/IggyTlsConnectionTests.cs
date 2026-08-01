@@ -19,11 +19,13 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
+[RequiresClassicServer]
 public class IggyTlsConnectionTests
 {
     [ClassDataSource<IggyTlsServerFixture>(Shared = SharedType.PerAssembly)]
@@ -34,7 +36,7 @@ public class IggyTlsConnectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetIggyAddress(Protocol.Tcp),
+            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false },
             AutoLoginSettings = new AutoLoginSettings
@@ -62,7 +64,7 @@ public class IggyTlsConnectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetIggyAddress(Protocol.Tcp),
+            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false }
         });
@@ -76,7 +78,7 @@ public class IggyTlsConnectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetIggyAddress(Protocol.Tcp),
+            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false },
             AutoLoginSettings = new AutoLoginSettings

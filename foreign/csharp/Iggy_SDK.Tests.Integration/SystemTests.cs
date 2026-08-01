@@ -55,8 +55,7 @@ public class SystemTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var tcpClient = await Fixture.CreateClient(Protocol.Tcp);
-        await tcpClient.LoginUserAsync("iggy", "iggy");
+        var tcpClient = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
         var clientInfo = await tcpClient.GetMeAsync();
         clientInfo.ShouldNotBeNull();
 
@@ -76,7 +75,7 @@ public class SystemTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetMe_Tcp_Should_Return_MyClient(Protocol protocol)
     {
-        var client = await Fixture.CreateTcpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
@@ -91,7 +90,7 @@ public class SystemTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetMe_HTTP_Should_Throw_FeatureUnavailableException(Protocol protocol)
     {
-        var client = await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         await Should.ThrowAsync<FeatureUnavailableException>(() => client.GetMeAsync());
     }
@@ -103,8 +102,7 @@ public class SystemTests
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var streamName = $"sys-cg-{Guid.NewGuid():N}";
-        var tcpClient = await Fixture.CreateClient(Protocol.Tcp);
-        await tcpClient.LoginUserAsync("iggy", "iggy");
+        var tcpClient = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
 
         var stream = await tcpClient.CreateStreamAsync(streamName);
         await tcpClient.CreateTopicAsync(Identifier.String(streamName), "first_topic", 2);
@@ -159,7 +157,12 @@ public class SystemTests
         response.PartitionsCount.ShouldBeGreaterThanOrEqualTo(1);
         response.SegmentsCount.ShouldBeGreaterThanOrEqualTo(1);
         response.MessagesCount.ShouldBeGreaterThanOrEqualTo(1u);
-        response.ClientsCount.ShouldBeGreaterThanOrEqualTo(1);
+        if (!IggyServerFixture.IsServerNg)
+        {
+            // iggy-server-ng leaves the connected-client tally out of its stats reply.
+            response.ClientsCount.ShouldBeGreaterThanOrEqualTo(1);
+        }
+
         response.Hostname.ShouldNotBeNullOrEmpty();
         response.OsName.ShouldNotBeNullOrEmpty();
         response.OsVersion.ShouldNotBeNullOrEmpty();

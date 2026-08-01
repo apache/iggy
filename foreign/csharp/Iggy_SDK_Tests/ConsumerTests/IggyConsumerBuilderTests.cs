@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
@@ -68,5 +69,58 @@ public class IggyConsumerBuilderTests
             .Build();
 
         Assert.NotNull(consumer);
+    }
+
+    /// <summary>VSR is a framing choice, not a transport one, so the builder has to carry it to the client.</summary>
+    [Fact]
+    public void WithWireProtocol_CarriesTheFramingToTheConfig()
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass")
+                .WithWireProtocol(WireProtocol.Vsr);
+
+        Assert.Equal(WireProtocol.Vsr, builder.Config.WireProtocol);
+    }
+
+    [Fact]
+    public void WithConnection_DefaultsToClassicFraming()
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
+
+        Assert.Equal(WireProtocol.Classic, builder.Config.WireProtocol);
+    }
+
+    [Fact]
+    public void TypedBuild_WithVsr_CreatesTheClient()
+    {
+        IggyConsumerBuilder<string> builder = IggyConsumerBuilder<string>
+            .Create(StreamId, TopicId, Consumer.New(1), new StringDeserializer());
+        builder.WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass")
+            .WithWireProtocol(WireProtocol.Vsr);
+
+        Assert.NotNull(builder.Build());
+    }
+
+    [Fact]
+    public void TypedBuild_WithVsrOverHttp_Throws()
+    {
+        IggyConsumerBuilder<string> builder = IggyConsumerBuilder<string>
+            .Create(StreamId, TopicId, Consumer.New(1), new StringDeserializer());
+        builder.WithConnection(Protocol.Http, "http://127.0.0.1:3000", "user", "pass")
+            .WithWireProtocol(WireProtocol.Vsr);
+
+        var ex = Assert.Throws<ArgumentException>(() => builder.Build());
+        Assert.Contains("WireProtocol.Vsr requires Protocol.Tcp", ex.Message);
+    }
+
+    private sealed class StringDeserializer : IDeserializer<string>
+    {
+        public string Deserialize(ReadOnlyMemory<byte> data)
+        {
+            return Encoding.UTF8.GetString(data.Span);
+        }
     }
 }

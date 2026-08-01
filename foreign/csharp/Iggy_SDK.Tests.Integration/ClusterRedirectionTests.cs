@@ -19,11 +19,13 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
+[RequiresClassicServer]
 public class ClusterRedirectionTests
 {
     [ClassDataSource<IggyClusterFixture>(Shared = SharedType.PerAssembly)]

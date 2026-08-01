@@ -19,6 +19,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -55,25 +56,25 @@ public class FlushMessagesTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    [SkipServerNg("server-ng has no on-demand flush primitive and denies FLUSH_UNSAVED_BUFFER outright")]
     public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully(Protocol protocol)
     {
         var (client, streamName, topicName) = await CreateStreamWithMessages(protocol);
 
         await Should.NotThrowAsync(() =>
-            client.FlushUnsavedBufferAsync(
-                Identifier.String(streamName),
+            client.FlushUnsavedBufferAsync(Identifier.String(streamName),
                 Identifier.String(topicName), 0, true));
     }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    [SkipServerNg("server-ng has no on-demand flush primitive and denies FLUSH_UNSAVED_BUFFER outright")]
     public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully(Protocol protocol)
     {
         var (client, streamName, topicName) = await CreateStreamWithMessages(protocol);
 
         await Should.NotThrowAsync(() =>
-            client.FlushUnsavedBufferAsync(
-                Identifier.String(streamName),
+            client.FlushUnsavedBufferAsync(Identifier.String(streamName),
                 Identifier.String(topicName), 0, false));
     }
 
@@ -84,8 +85,7 @@ public class FlushMessagesTests
         var (client, streamName, topicName) = await CreateStreamWithMessages(protocol);
 
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            client.FlushUnsavedBufferAsync(
-                Identifier.String(streamName),
+            client.FlushUnsavedBufferAsync(Identifier.String(streamName),
                 Identifier.String(topicName), 55, false));
     }
 }
