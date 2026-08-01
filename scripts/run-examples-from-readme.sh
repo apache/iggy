@@ -175,17 +175,21 @@ run_rust_examples() {
     resolve_server_binary "${TARGET}"
     resolve_cli_binary "${TARGET}"
 
+    # The README documents credentials as <iggy_username>/<iggy_password>
+    # placeholders; the test server starts with iggy/iggy.
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|cargo r |cargo r --target ${TARGET} |g" | sed "s|cargo run |cargo run --target ${TARGET} |g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
         }
     else
-        unset -f TRANSFORM_COMMAND 2>/dev/null || true
+        TRANSFORM_COMMAND() {
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
+        }
     fi
 
     # Pre-flight: run CLI commands from root README
     _rust_preflight() {
-        run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
+        run_readme_commands "README.md" '^[`]cargo run --bin iggy -- '
     }
 
     run_language_examples \
@@ -345,21 +349,15 @@ run_csharp_examples() {
     resolve_server_binary "${TARGET}"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
-    # Pre-flight: run CLI commands from root README
-    _csharp_preflight() {
-        run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
-    }
-
     run_language_examples \
         "C#" \
         "." \
-        "README.md examples/csharp/README.md" \
+        "examples/csharp/README.md" \
         "^dotnet run --project" \
         "TcpTls" \
         "^dotnet run --project.*TcpTls" \
         0 \
-        "" \
-        "_csharp_preflight"
+        ""
 }
 
 # ---------------------------------------------------------------------------
