@@ -226,6 +226,22 @@ class TestClientConstruction:
         with pytest.raises(RuntimeError):
             IggyClient("nonsense")
 
+    def test_negative_message_expiry_is_rejected(self):
+        """Test that the negative-duration rule reaches the pre-existing surface.
+
+        create_topic accepted a negative message_expiry before durations were
+        validated; it now fails at the call, before any I/O.
+        """
+        client = IggyClient()
+
+        with pytest.raises(ValueError, match="negative"):
+            client.create_topic(
+                stream="stream",
+                name="topic",
+                partitions_count=1,
+                message_expiry=timedelta(seconds=-1),
+            )
+
 
 @pytest.mark.integration
 class TestAutoLoginAgainstServer:
