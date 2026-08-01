@@ -17,9 +17,9 @@
 
 //! Tests for message retention policies (time-based and size-based).
 //!
-//! Configuration: 100KB segment size, 100ms cleaner interval, instant flush.
-//! Message size: 64B header + 936B payload = 1KB per message.
-//! Therefore: 100 messages = 1 segment, 101+ messages = 2+ segments.
+//! Configuration: 10KiB segment size, 100ms cleaner interval, fsync per
+//! message. Message size: 64B header + 936B payload = 1KB per message.
+//! Therefore: ~9 messages fill a segment, and a 110-message send spans a dozen.
 
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -39,8 +39,53 @@ const PAYLOAD_SIZE: usize = 936;
 /// Buffer time for cleaner to run after expiry conditions are met.
 const CLEANER_BUFFER: Duration = Duration::from_millis(300);
 
+/// Messages per `send_messages` call.
+///
+/// These scenarios run with `enforce_fsync = true` and
+/// `messages_required_to_save = 1`, so a message-per-call loop pays a full
+/// fsync round trip each time: 300 of them measured ~6.9s, which outran the
+/// topic's own 4s expiry and let the cleaner delete the oldest segments before
+/// the scenario had polled anything. Batching keeps the send phase inside every
+/// expiry under test while still rotating segments every ~10 messages.
+const SEND_BATCH_SIZE: usize = 10;
+
 fn make_payload(fill: char) -> Bytes {
     Bytes::from(fill.to_string().repeat(PAYLOAD_SIZE))
+}
+
+/// Send `count` messages with ids `first_id..first_id + count`, batched so the
+/// send phase does not race the retention policy under test (see
+/// [`SEND_BATCH_SIZE`]).
+async fn send_batched(
+    client: &IggyClient,
+    stream: &str,
+    topic: &str,
+    partition_id: u32,
+    payload: &Bytes,
+    first_id: u128,
+    count: usize,
+) {
+    for sent in (0..count).step_by(SEND_BATCH_SIZE) {
+        let batch = SEND_BATCH_SIZE.min(count - sent);
+        let mut messages = (0..batch)
+            .map(|index| {
+                IggyMessage::builder()
+                    .id(first_id + (sent + index) as u128)
+                    .payload(payload.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        client
+            .send_messages(
+                &Identifier::named(stream).unwrap(),
+                &Identifier::named(topic).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
 }
 
 /// Tests time-based retention: segments are cleaned up after expiry.
@@ -48,7 +93,9 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    // Nothing may expire before the "poll everything" assertion below, so the
+    // expiry has to cover the send phase plus the poll on a loaded runner.
+    let expiry = Duration::from_secs(5);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -70,28 +117,20 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 110 messages (1KB each) to create 2 segments (100KB segment size)
+    // Send 110 messages (1KB each) to fill several 10KiB segments
     let payload = make_payload('A');
     let total_messages = 110;
 
-    for i in 0..total_messages {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
-
-        let mut messages = vec![message];
-        client
-            .send_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut messages,
-            )
-            .await
-            .unwrap();
-    }
+    send_batched(
+        client,
+        STREAM_NAME,
+        TOPIC_NAME,
+        PARTITION_ID,
+        &payload,
+        0,
+        total_messages,
+    )
+    .await;
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);
     let initial_count = initial_segments.len();
@@ -255,24 +294,16 @@ pub async fn run_size_based_retention(client: &IggyClient, data_path: &Path) {
     let payload = make_payload('B');
     let total_messages = 160;
 
-    for i in 0..total_messages {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
-
-        let mut messages = vec![message];
-        client
-            .send_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut messages,
-            )
-            .await
-            .unwrap();
-    }
+    send_batched(
+        client,
+        STREAM_NAME,
+        TOPIC_NAME,
+        PARTITION_ID,
+        &payload,
+        0,
+        total_messages,
+    )
+    .await;
 
     // Wait for cleaner
     tokio::time::sleep(CLEANER_BUFFER).await;
@@ -345,26 +376,18 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 110 messages to create 2 segments (under size threshold, but will expire)
+    // Send 110 messages to rotate segments (under size threshold, but will expire)
     let payload = make_payload('C');
-    for i in 0..110 {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
-
-        let mut messages = vec![message];
-        client
-            .send_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut messages,
-            )
-            .await
-            .unwrap();
-    }
+    send_batched(
+        client,
+        STREAM_NAME,
+        TOPIC_NAME,
+        PARTITION_ID,
+        &payload,
+        0,
+        110,
+    )
+    .await;
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);
     let initial_count = initial_segments.len();
@@ -416,25 +439,16 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
 
     // Send messages to all partitions
     for partition_id in 0..PARTITIONS_COUNT {
-        for i in 0..messages_per_partition {
-            let msg_id = partition_id as u128 * 1000 + i as u128;
-            let message = IggyMessage::builder()
-                .id(msg_id)
-                .payload(payload.clone())
-                .build()
-                .unwrap();
-
-            let mut messages = vec![message];
-            client
-                .send_messages(
-                    &Identifier::named(STREAM_NAME).unwrap(),
-                    &Identifier::named(TOPIC_NAME).unwrap(),
-                    &Partitioning::partition_id(partition_id),
-                    &mut messages,
-                )
-                .await
-                .unwrap();
-        }
+        send_batched(
+            client,
+            STREAM_NAME,
+            TOPIC_NAME,
+            partition_id,
+            &payload,
+            u128::from(partition_id) * 1000,
+            messages_per_partition,
+        )
+        .await;
     }
 
     // Collect initial segment counts
@@ -528,25 +542,16 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 
     // Send 70 messages per partition = 210KB total, exceeds 180KB threshold
     for partition_id in 0..PARTITIONS_COUNT {
-        for i in 0..70 {
-            let msg_id = partition_id as u128 * 1000 + i as u128;
-            let message = IggyMessage::builder()
-                .id(msg_id)
-                .payload(payload.clone())
-                .build()
-                .unwrap();
-
-            let mut messages = vec![message];
-            client
-                .send_messages(
-                    &Identifier::named(STREAM_NAME).unwrap(),
-                    &Identifier::named(TOPIC_NAME).unwrap(),
-                    &Partitioning::partition_id(partition_id),
-                    &mut messages,
-                )
-                .await
-                .unwrap();
-        }
+        send_batched(
+            client,
+            STREAM_NAME,
+            TOPIC_NAME,
+            partition_id,
+            &payload,
+            u128::from(partition_id) * 1000,
+            70,
+        )
+        .await;
     }
 
     // Wait for cleaner
@@ -594,11 +599,12 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     let stream = client.create_stream(TEST_STREAM).await.unwrap();
     let stream_id = stream.id;
 
-    // Expiry must outlast the send + first-poll phase: 300 serial sends with
-    // per-message fsync (and VSR quorum in cluster mode) take ~3s under load.
-    // If segments expire before the consumer commits its first offset, there is
-    // no barrier yet and the cleaner legally deletes them, breaking the premise.
-    let expiry = Duration::from_secs(4);
+    // Expiry must outlast the send + first-poll phase. Until the consumer
+    // commits its first offset there is no barrier, so anything that expires
+    // during the send is deleted legally and the premise is gone before the
+    // scenario starts. `send_batched` keeps that phase well under a second;
+    // the headroom here covers a loaded runner on top of it.
+    let expiry = Duration::from_secs(8);
     let topic = client
         .create_topic(
             &Identifier::named(TEST_STREAM).unwrap(),
@@ -620,25 +626,19 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .display()
         .to_string();
 
-    // Send 300 messages (1KB each) -> 3 sealed segments + active
+    // Send 300 messages (1KB each) -> many sealed segments + active
     let payload = make_payload('B');
-    let total_messages = 300u32;
-    for i in 0..total_messages {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
-        client
-            .send_messages(
-                &Identifier::named(TEST_STREAM).unwrap(),
-                &Identifier::named(TEST_TOPIC).unwrap(),
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut [message],
-            )
-            .await
-            .unwrap();
-    }
+    let total_messages = 300;
+    send_batched(
+        client,
+        TEST_STREAM,
+        TEST_TOPIC,
+        PARTITION_ID,
+        &payload,
+        0,
+        total_messages,
+    )
+    .await;
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);
     assert!(
