@@ -19,7 +19,6 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
-use iggy_gateway_kafka::protocol::header::request_header_version;
 use kafka_protocol::messages::*;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use std::path::PathBuf;
@@ -574,8 +573,13 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
 // Build a complete framed Kafka request message ready for TCP transmission.
 fn build_framed(api_key: i16, version: i16, corr: i32) -> Result<Bytes> {
     let payload = build_payload(api_key, version)?;
-    // Header v2 == flexible request encoding; threshold lives in iggy-gateway-kafka.
-    let flexible = request_header_version(api_key, version) >= 2;
+    // Header version comes from kafka-protocol's own per-request `HeaderVersion` impl (via
+    // `ApiKey::request_header_version`), not the gateway's table under test - otherwise a bug
+    // in the gateway's flexible-version threshold would mis-frame the fixture identically and
+    // the tests would still pass.
+    let api =
+        ApiKey::try_from(api_key).map_err(|()| anyhow::anyhow!("unknown api_key={api_key}"))?;
+    let flexible = api.request_header_version(version) >= 2;
     Ok(frame_request(
         api_key,
         version,

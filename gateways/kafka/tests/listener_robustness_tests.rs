@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! TCP listener robustness — framing, pipelining, concurrency, edge cases.
+//! TCP listener robustness - framing, pipelining, concurrency, edge cases.
 
 #[path = "common/server.rs"]
 mod server;
@@ -32,13 +32,15 @@ use tokio::net::TcpStream;
 use tokio::time;
 
 use iggy_gateway_kafka::ServerConfig;
-use iggy_gateway_kafka::protocol::api::{API_KEY_API_VERSIONS, API_KEY_METADATA, API_KEY_PRODUCE};
+use iggy_gateway_kafka::protocol::api::{
+    API_KEY_API_VERSIONS, API_KEY_FETCH, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
+};
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
 use server::{spawn_test_server, spawn_test_server_with_config};
 use tcp::{
     ByteRead, build_request_frame, concat_frames, parse_response_payload, read_byte_with_timeout,
-    read_response_frame, read_response_frame_with_timeout,
+    read_response_frame, read_response_frame_with_timeout, scan_for_error_code,
 };
 
 #[tokio::test]
@@ -416,4 +418,144 @@ async fn e2e_flexible_metadata_v9_empty_topics_round_trip() {
         .unwrap()
         .saturating_sub(1);
     assert_eq!(broker_count, 1);
+}
+
+// ── Idle connection handling (read_timeout must not act as idle cap) ───────
+
+#[tokio::test]
+async fn e2e_quiet_connection_accepts_request_after_short_idle() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    time::sleep(Duration::from_secs(2)).await;
+
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 501, Some("idle-test"), &[]);
+    stream
+        .write_all(&frame)
+        .await
+        .expect("connection should stay open after short idle");
+
+    let payload =
+        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_secs(2))
+            .await
+            .expect("request after short idle should succeed");
+
+    let (corr, _) = parse_response_payload(API_KEY_API_VERSIONS, 1, payload);
+    assert_eq!(corr, 501);
+}
+
+#[tokio::test]
+async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
+    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+        bind_addr: String::new(),
+        advertised_host: None,
+        advertised_port: None,
+        max_frame_size: 8 * 1024 * 1024,
+        read_timeout: Duration::from_secs(3),
+        write_timeout: Duration::from_secs(5),
+    })
+    .await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    // Idle longer than read_timeout: prefix wait has no timer; connection stays open.
+    time::sleep(Duration::from_secs(4)).await;
+
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 502, Some("idle-test"), &[]);
+    stream
+        .write_all(&frame)
+        .await
+        .expect("idle connection should remain writable after read_timeout elapses");
+
+    let payload =
+        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_secs(2))
+            .await
+            .expect(
+                "request after idle period longer than read_timeout should succeed \
+                 (read_timeout applies to in-flight frame body only)",
+            );
+
+    let (corr, _) = parse_response_payload(API_KEY_API_VERSIONS, 1, payload);
+    assert_eq!(corr, 502);
+}
+
+// ── Corrupt body survives on the connection (no disconnect) ────────────────
+
+#[tokio::test]
+async fn corrupt_produce_body_e2e_returns_error_without_disconnect() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let bad = build_request_frame(
+        API_KEY_PRODUCE,
+        3,
+        391,
+        Some("scope-test"),
+        &[0xFF, 0xFF, 0xFF],
+    );
+    stream.write_all(&bad).await.expect("corrupt produce");
+    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert!(
+        scan_for_error_code(
+            &parse_response_payload(API_KEY_PRODUCE, 3, payload).1,
+            ERROR_INVALID_REQUEST
+        ),
+        "corrupt Produce must surface INVALID_REQUEST"
+    );
+
+    let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 392, Some("scope-test"), &[]);
+    stream.write_all(&ok).await.expect("follow-up");
+    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert_eq!(
+        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
+        392
+    );
+}
+
+#[tokio::test]
+async fn corrupt_fetch_body_e2e_returns_error_without_disconnect() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let bad = build_request_frame(
+        API_KEY_FETCH,
+        4,
+        393,
+        Some("scope-test"),
+        &[0xFF, 0xFF, 0xFF],
+    );
+    stream.write_all(&bad).await.expect("corrupt fetch");
+    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert!(
+        scan_for_error_code(
+            &parse_response_payload(API_KEY_FETCH, 4, payload).1,
+            ERROR_INVALID_REQUEST
+        ),
+        "corrupt Fetch must surface INVALID_REQUEST"
+    );
+
+    let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 394, Some("scope-test"), &[]);
+    stream.write_all(&ok).await.expect("follow-up");
+    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert_eq!(
+        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
+        394
+    );
+}
+
+#[tokio::test]
+async fn e2e_client_eof_after_valid_frame_closes_connection_cleanly() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let frame = build_request_frame(18, 1, 901, Some("eof-test"), &[]);
+    stream.write_all(&frame).await.expect("api versions write");
+    let _payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+
+    stream.shutdown().await.expect("client shutdown");
+    time::sleep(Duration::from_millis(100)).await;
+
+    let mut buf = [0u8; 1];
+    let n = stream.read(&mut buf).await.expect("read after shutdown");
+    assert_eq!(n, 0, "server should close after client EOF");
 }

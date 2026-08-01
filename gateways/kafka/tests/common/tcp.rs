@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! TCP round-trip helpers — compiled into each integration test binary via `#[path]`.
+//! TCP round-trip helpers - compiled into each integration test binary via `#[path]`.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -119,7 +119,21 @@ pub fn build_produce_v3_body(acks: i16, topics_count: i32) -> Bytes {
     body.freeze()
 }
 
-/// Legacy Metadata request body listing topic names (non-flexible, v0–v8).
+/// `ListOffsets` v0 request body for topic "t", partition 0.
+pub fn build_list_offsets_v0_request_with_topic_t() -> Bytes {
+    let mut body = BytesMut::new();
+    body.put_i32(-1); // replica_id
+    body.put_i32(1); // topics array length
+    body.put_i16(1); // topic name length
+    body.put_u8(b't');
+    body.put_i32(1); // partitions array length
+    body.put_i32(0); // partition index
+    body.put_i64(-1); // timestamp
+    body.put_i32(1); // max_num_offsets
+    body.freeze()
+}
+
+/// Legacy Metadata request body listing topic names (non-flexible, v0-v8).
 pub fn build_metadata_legacy_request(topic_names: &[&str]) -> Bytes {
     let mut body = BytesMut::new();
     body.put_i32(i32::try_from(topic_names.len()).expect("topic name count fits i32"));
@@ -175,6 +189,14 @@ pub async fn read_byte_with_timeout(stream: &mut TcpStream, timeout: Duration) -
         Ok(Ok(_)) => ByteRead::Byte(buf[0]),
         Err(_) => ByteRead::Timeout,
     }
+}
+
+/// Scan a response body for a big-endian `i16` error code at any 2-byte-aligned
+/// offset. Used by corrupt-body / unsupported-version tests that assert an error
+/// code is present somewhere in the response without fully decoding its shape.
+pub fn scan_for_error_code(body: &Bytes, code: i16) -> bool {
+    body.windows(2)
+        .any(|w| i16::from_be_bytes([w[0], w[1]]) == code)
 }
 
 /// Send one request frame and return parsed `(correlation_id, response_body)`.

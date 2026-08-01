@@ -33,7 +33,7 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
     (client, server)
 }
 
-/// Raw length-prefixed write (no Kafka response header) — mirrors `server::write_frame`.
+/// Raw length-prefixed write (no Kafka response header) - mirrors `server::write_frame`.
 async fn write_length_prefixed(
     stream: &mut TcpStream,
     payload: &[u8],

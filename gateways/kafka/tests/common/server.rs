@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Test server spawn helper — compiled into each integration test binary via `#[path]`.
+//! Test server spawn helper - compiled into each integration test binary via `#[path]`.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;

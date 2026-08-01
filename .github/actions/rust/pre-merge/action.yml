@@ -290,6 +290,9 @@ runs:
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
           ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
           trap './gateways/kafka/scripts/ci-wire-fixtures.sh cleanup' EXIT
+          # Fixtures are expected to exist from here on; a missing one now means
+          # generation silently failed, not a legitimate local-dev skip.
+          export KAFKA_FIXTURES_REQUIRED=1
         fi
 
         # Start D-Bus and unlock keyring right before test execution to avoid

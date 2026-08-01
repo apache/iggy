@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Version negotiation firewall — boundary tests for every scoped API key.
+//! Version negotiation firewall - boundary tests for every scoped API key.
 
 #[path = "common/fixtures.rs"]
 mod fixtures;
@@ -30,22 +30,31 @@ mod wire;
 
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
-    advertised_min_version, handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
+    ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
+    supported_api_ranges,
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
-use fixtures::load_fixture_body_or_skip;
+use fixtures::{fixture_exists, load_fixture_body, load_fixture_body_or_skip};
 use scope::{SCOPED_API_KEYS, default_broker};
 use server::spawn_test_server;
-use tcp::{ByteRead, build_metadata_legacy_request, build_request_frame, read_byte_with_timeout};
+use tcp::{
+    ByteRead, build_list_offsets_v0_request_with_topic_t, build_metadata_legacy_request,
+    build_produce_v3_body, build_request_frame, parse_response_payload, read_byte_with_timeout,
+    round_trip, scan_for_error_code,
+};
 use wire::build_metadata_flexible_request_v10;
+use wire::{
+    OUT_OF_SCOPE_API_KEYS, build_create_topics_empty_request, build_fetch_empty_topics_request,
+    build_list_offsets_request,
+};
 
 #[test]
 fn supported_ranges_table_has_six_entries() {
@@ -346,4 +355,368 @@ fn corrupt_fetch_body_returns_invalid_request_error() {
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+// ── ListOffsets v0 wire shape (old_style_offsets array, not bare i64) ───────
+
+/// Parse one `ListOffsets` v0 partition entry the way a v0 Kafka client would.
+fn parse_list_offsets_v0_partition(d: &mut Decoder) {
+    let _partition_index = d.read_i32().expect("partition_index");
+    let _error_code = d.read_i16().expect("error_code");
+    let offset_count = d.read_i32().expect("old_style_offsets array length");
+    assert!(
+        offset_count >= 0,
+        "old_style_offsets count must be non-negative, got {offset_count}"
+    );
+    for _ in 0..offset_count {
+        d.read_i64().expect("old_style_offsets entry");
+    }
+}
+
+#[test]
+fn list_offsets_v0_unsupported_version_is_parseable_by_v0_clients() {
+    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+
+    assert_eq!(d.read_i32().unwrap(), 1, "topics array length");
+    assert_eq!(
+        d.read_nullable_string().unwrap(),
+        Some(String::new()),
+        "placeholder topic name"
+    );
+    assert_eq!(d.read_i32().unwrap(), 1, "partitions array length");
+
+    parse_list_offsets_v0_partition(&mut d);
+
+    assert_eq!(
+        d.remaining(),
+        0,
+        "v0 client must consume the full error response without trailing bytes"
+    );
+}
+
+#[test]
+fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
+    let request_body = build_list_offsets_v0_request_with_topic_t();
+    let body = handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+
+    assert_eq!(d.read_i32().unwrap(), 1);
+    d.read_nullable_string().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 1);
+    assert_eq!(d.read_i32().unwrap(), 0, "partition index");
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_UNSUPPORTED_VERSION,
+        "partition error code"
+    );
+
+    // partition_index and error_code were already asserted above; only the
+    // trailing old_style_offsets array remains for this single partition.
+    let offset_count = d.read_i32().expect("old_style_offsets array length");
+    assert!(
+        offset_count >= 0,
+        "old_style_offsets count must be non-negative, got {offset_count}"
+    );
+    for _ in 0..offset_count {
+        d.read_i64().expect("old_style_offsets entry");
+    }
+    assert_eq!(d.remaining(), 0);
+}
+
+// ── Comprehensive scoped-API coverage (correlation id, boundary versions) ──
+
+fn metadata_empty_legacy_body() -> Bytes {
+    let mut body = BytesMut::new();
+    body.put_i32(0);
+    body.freeze()
+}
+
+fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes {
+    match api_key {
+        API_KEY_METADATA => metadata_empty_legacy_body(),
+        API_KEY_PRODUCE => {
+            if fixture_exists(api_key, name, version) {
+                load_fixture_body(api_key, name, version)
+            } else {
+                build_produce_v3_body(1, 0)
+            }
+        }
+        API_KEY_FETCH => {
+            if fixture_exists(api_key, name, version) {
+                load_fixture_body(api_key, name, version)
+            } else {
+                build_fetch_empty_topics_request(version)
+            }
+        }
+        API_KEY_LIST_OFFSETS => {
+            if fixture_exists(api_key, name, version) {
+                load_fixture_body(api_key, name, version)
+            } else {
+                build_list_offsets_request(version, "scope-topic", 0)
+            }
+        }
+        API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
+        _ => Bytes::new(),
+    }
+}
+
+#[tokio::test]
+async fn each_scoped_api_min_version_preserves_correlation_id_e2e() {
+    let (addr, _shutdown) = spawn_test_server().await;
+
+    for &(api_key, name, min_ver, _max_ver) in SCOPED_API_KEYS {
+        let correlation_id = 10_000 + i32::from(api_key);
+        let body = request_body_for_scoped_api(api_key, name, min_ver);
+        let (corr, resp_body) = round_trip(addr, api_key, min_ver, correlation_id, &body).await;
+        assert_eq!(
+            corr, correlation_id,
+            "{name} v{min_ver} correlation id must round-trip"
+        );
+        assert!(
+            !resp_body.is_empty(),
+            "{name} v{min_ver} must return non-empty body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_scoped_api_max_version_preserves_correlation_id_e2e() {
+    let (addr, _shutdown) = spawn_test_server().await;
+
+    for &(api_key, name, _min_ver, max_ver) in SCOPED_API_KEYS {
+        let correlation_id = 20_000 + i32::from(api_key);
+        let body = request_body_for_scoped_api(api_key, name, max_ver);
+        let (corr, resp_body) = round_trip(addr, api_key, max_ver, correlation_id, &body).await;
+        assert_eq!(
+            corr, correlation_id,
+            "{name} v{max_ver} correlation id must round-trip"
+        );
+        assert!(
+            !resp_body.is_empty(),
+            "{name} v{max_ver} must return non-empty body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn apiversions_v0_and_v2_e2e_return_success() {
+    let (addr, _shutdown) = spawn_test_server().await;
+
+    for version in [0i16, 2] {
+        let correlation_id = 300 + i32::from(version);
+        let (corr, body) =
+            round_trip(addr, API_KEY_API_VERSIONS, version, correlation_id, &[]).await;
+        assert_eq!(corr, correlation_id);
+        let mut d = Decoder::new(body);
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NONE,
+            "ApiVersions v{version} must succeed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn apiversions_v4_out_of_range_e2e_returns_unsupported() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 4, 350, &[]).await;
+    assert_eq!(corr, 350);
+    let mut d = Decoder::new(body);
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_UNSUPPORTED_VERSION,
+        "ApiVersions v4 must return UNSUPPORTED_VERSION per KIP-511"
+    );
+}
+
+// ── Out-of-scope API keys (SCOPE.md unsupported list) ───────────────────────
+
+#[test]
+fn out_of_scope_api_keys_return_unsupported_version_without_panic() {
+    for &(api_key, name) in OUT_OF_SCOPE_API_KEYS {
+        let body = handle_request(api_key, 0, Bytes::new(), &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
+        let mut d = Decoder::new(body);
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_UNSUPPORTED_VERSION,
+            "{name} (key {api_key})"
+        );
+    }
+}
+
+// ── Boundary versions keep the TCP session (except Metadata) ───────────────
+
+#[tokio::test]
+async fn each_scoped_api_above_max_version_e2e_keeps_connection() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    for &(api_key, name, _min_ver, max_ver) in SCOPED_API_KEYS {
+        let above = max_ver + 1;
+        let frame = build_request_frame(
+            api_key,
+            above,
+            50_000 + i32::from(api_key),
+            Some("scope-test"),
+            &[],
+        );
+        stream
+            .write_all(&frame)
+            .await
+            .unwrap_or_else(|_| panic!("write {name} v{above}"));
+        if api_key == API_KEY_METADATA {
+            // Unsupported Metadata closes: clamped bodies are unparsable at the client version.
+            assert_eq!(
+                read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+                ByteRead::Closed,
+                "Metadata v{above} must close the connection"
+            );
+            stream = TcpStream::connect(addr)
+                .await
+                .expect("reconnect after Metadata close");
+            continue;
+        }
+        let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+        assert!(
+            !payload.is_empty(),
+            "{name} v{above} must still respond on wire"
+        );
+    }
+
+    let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 89_999, Some("scope-test"), &[]);
+    stream.write_all(&ok).await.expect("recovery request");
+    let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert_eq!(
+        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
+        89_999
+    );
+}
+
+#[tokio::test]
+async fn each_scoped_api_below_min_version_e2e_keeps_connection() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    for &(api_key, name, min_ver, _max_ver) in SCOPED_API_KEYS {
+        let below = min_ver - 1;
+        let frame = build_request_frame(
+            api_key,
+            below,
+            40_000 + i32::from(api_key),
+            Some("scope-test"),
+            &[],
+        );
+        stream
+            .write_all(&frame)
+            .await
+            .unwrap_or_else(|_| panic!("write {name} v{below}"));
+        if api_key == API_KEY_METADATA {
+            assert_eq!(
+                read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+                ByteRead::Closed,
+                "Metadata v{below} must close the connection"
+            );
+            stream = TcpStream::connect(addr)
+                .await
+                .expect("reconnect after Metadata close");
+            continue;
+        }
+        let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+        assert!(
+            !payload.is_empty(),
+            "{name} v{below} must still respond on wire"
+        );
+    }
+
+    let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 88_888, Some("scope-test"), &[]);
+    stream.write_all(&ok).await.expect("recovery request");
+    let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert_eq!(
+        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
+        88_888
+    );
+}
+
+#[test]
+fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
+    let range = SCOPED_API_KEYS
+        .iter()
+        .find(|(k, _, _, _)| *k == API_KEY_PRODUCE)
+        .expect("produce in scope");
+    let (_, _, firewall_min, _) = *range;
+    assert_eq!(firewall_min, 3);
+    assert_eq!(advertised_min_version(API_KEY_PRODUCE, firewall_min), 0);
+    assert!(!is_supported_version(API_KEY_PRODUCE, 0));
+    assert!(!is_supported_version(API_KEY_PRODUCE, 2));
+
+    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _topics = d.read_i32().unwrap();
+    let _name = d.read_nullable_string().unwrap();
+    let _parts = d.read_i32().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 0, "partition index");
+    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
+}
+
+// ── Unsupported-version e2e paths for remaining scoped APIs ─────────────────
+
+#[tokio::test]
+async fn list_offsets_v7_unsupported_e2e_returns_error() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let (corr, body) = round_trip(
+        addr,
+        API_KEY_LIST_OFFSETS,
+        7,
+        370,
+        &[0x00, 0x00, 0x00, 0x00],
+    )
+    .await;
+    assert_eq!(corr, 370);
+    assert!(
+        scan_for_error_code(&body, ERROR_UNSUPPORTED_VERSION),
+        "ListOffsets v7 must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn create_topics_v1_unsupported_e2e_returns_error() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let (corr, body) = round_trip(addr, API_KEY_CREATE_TOPICS, 1, 380, &[]).await;
+    assert_eq!(corr, 380);
+    assert!(
+        scan_for_error_code(&body, ERROR_UNSUPPORTED_VERSION),
+        "CreateTopics v1 must be rejected"
+    );
+}
+
+// ── Corrupt decode paths for remaining scoped APIs ──────────────────────────
+
+#[test]
+fn corrupt_list_offsets_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_LIST_OFFSETS, 1, body, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    assert!(!resp.is_empty());
+    assert!(
+        scan_for_error_code(&resp, ERROR_INVALID_REQUEST)
+            || scan_for_error_code(&resp, ERROR_UNSUPPORTED_VERSION),
+        "corrupt ListOffsets must surface protocol error"
+    );
+}
+
+#[test]
+fn corrupt_create_topics_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_CREATE_TOPICS, 2, body, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    assert!(!resp.is_empty());
+    assert!(
+        scan_for_error_code(&resp, ERROR_INVALID_REQUEST)
+            || scan_for_error_code(&resp, ERROR_UNSUPPORTED_VERSION)
+    );
 }

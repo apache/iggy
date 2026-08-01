@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared scope constants — compiled into each integration test binary via `#[path]`.
+//! Shared scope constants - compiled into each integration test binary via `#[path]`.
 #![allow(dead_code)]
 
 use iggy_gateway_kafka::protocol::api::BrokerAdvertise;

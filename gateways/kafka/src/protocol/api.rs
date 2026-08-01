@@ -72,7 +72,7 @@ impl HandleOutcome {
     ///
     /// # Panics
     ///
-    /// Panics on [`HandleOutcome::Close`] — match on `Close` explicitly, or use
+    /// Panics on [`HandleOutcome::Close`] - match on `Close` explicitly, or use
     /// [`Self::expect_response`] in tests that require a body.
     #[must_use]
     pub fn into_optional_response(self) -> Option<Bytes> {
@@ -432,7 +432,7 @@ fn encode_metadata_response(
     } else {
         e.write_i32(1); // brokers array length
         e.write_i32(1); // node_id
-        // broker.host is config-derived (KAFKA_ADVERTISED_HOST), not request-decoded — use
+        // broker.host is config-derived (KAFKA_ADVERTISED_HOST), not request-decoded - use
         // the checked variant so an overly long hostname returns an error instead of panicking.
         if e.write_nullable_string(Some(&broker.host)).is_err() {
             return encode_error_only_response(ERROR_INVALID_REQUEST);
@@ -446,7 +446,7 @@ fn encode_metadata_response(
             e.write_nullable_string_unchecked(None); // cluster_id
         }
         if response_version >= 1 {
-            e.write_i32(1); // controller_id — must come before topics array
+            e.write_i32(1); // controller_id - must come before topics array
         }
 
         e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));

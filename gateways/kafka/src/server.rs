@@ -156,7 +156,7 @@ impl KafkaServer {
                             tracker.wait().await;
                             break;
                         }
-                        // Capacity-1 channel: lagged means a signal was sent before we polled — treat as shutdown.
+                        // Capacity-1 channel: lagged means a signal was sent before we polled - treat as shutdown.
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             info!("kafka listener shutdown requested (lagged)");
                             tracker.close();

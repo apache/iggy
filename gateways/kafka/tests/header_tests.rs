@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_gateway_kafka::protocol::api::{
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_PRODUCE,
+};
 use iggy_gateway_kafka::protocol::codec::Encoder;
 use iggy_gateway_kafka::protocol::header::{
     RequestHeader, ResponseHeader, request_header_version, response_header_version,
@@ -51,7 +55,7 @@ fn request_header_v1_null_client_id() {
     assert_eq!(header.client_id, None);
 }
 
-// ── Request header v2 (flexible — compact client_id + tagged fields) ───────
+// ── Request header v2 (flexible - compact client_id + tagged fields) ───────
 
 #[test]
 fn request_header_v2_decodes() {
@@ -343,4 +347,22 @@ fn response_header_encoded_size_matches_versions() {
     assert_eq!(ResponseHeader::encoded_size(0), 4);
     assert_eq!(ResponseHeader::encoded_size(1), 5);
     assert_eq!(ResponseHeader::encoded_size(2), 5);
+}
+
+// ── Flexible-encoding boundaries (SCOPE.md) ─────────────────────────────────
+
+#[test]
+fn request_header_version_switches_at_scope_flexible_boundaries() {
+    assert_eq!(request_header_version(API_KEY_PRODUCE, 8), 1);
+    assert_eq!(request_header_version(API_KEY_PRODUCE, 9), 2);
+    assert_eq!(request_header_version(API_KEY_FETCH, 11), 1);
+    assert_eq!(request_header_version(API_KEY_FETCH, 12), 2);
+    assert_eq!(request_header_version(API_KEY_LIST_OFFSETS, 5), 1);
+    assert_eq!(request_header_version(API_KEY_LIST_OFFSETS, 6), 2);
+    assert_eq!(request_header_version(API_KEY_METADATA, 8), 1);
+    assert_eq!(request_header_version(API_KEY_METADATA, 9), 2);
+    assert_eq!(request_header_version(API_KEY_API_VERSIONS, 2), 1);
+    assert_eq!(request_header_version(API_KEY_API_VERSIONS, 3), 2);
+    assert_eq!(request_header_version(API_KEY_CREATE_TOPICS, 4), 1);
+    assert_eq!(request_header_version(API_KEY_CREATE_TOPICS, 5), 2);
 }

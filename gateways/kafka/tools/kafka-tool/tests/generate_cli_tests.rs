@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! CLI regression for PR #3519 review: `generate` must accept repeated `--api-key`.
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};

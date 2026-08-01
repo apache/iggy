@@ -17,8 +17,8 @@
 
 //! Kafka request decoders for critical API keys
 
-#![allow(clippy::pedantic)]
-
+#![allow(clippy::too_many_lines,
+    clippy::doc_markdown)]
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::Decoder;
 use bytes::Bytes;
@@ -59,6 +59,10 @@ pub enum ProduceDecodeResult {
 
 impl ProduceDecodeResult {
     /// Collapse to `Result` for tests and callers that only need a successful `ProduceRequest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte stream is malformed or if the API version is unsupported.
     pub fn into_request(self) -> Result<ProduceRequest> {
         match self {
             Self::Ok(req) => Ok(req),
@@ -189,7 +193,11 @@ pub struct FetchPartition {
     pub fetch_offset: i64,
     pub partition_max_bytes: i32,
 }
-
+/// Decodes a raw byte stream into a `FetchRequest`.
+///
+/// # Errors
+///
+/// Returns an error if the byte stream is malformed or if the API version is unsupported.
 pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
     let mut d = Decoder::new(body);
     let flexible = version >= 12;
@@ -206,7 +214,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
 
     let isolation_level = if version >= 4 { d.read_i8()? } else { 0 };
 
-    // session_id and session_epoch (v7+) — read and discard (stub path)
+    // session_id and session_epoch (v7+) - read and discard (stub path)
     if version >= 7 {
         d.read_i32()?; // session_id
         d.read_i32()?; // session_epoch
@@ -272,7 +280,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
         }
     }
 
-    // forgotten_topics_data (v7+) — skip
+    // forgotten_topics_data (v7+) - skip
     if version >= 7 {
         let forgotten_count = if flexible {
             d.read_compact_array_count()?
@@ -337,7 +345,10 @@ pub struct ListOffsetsPartition {
     pub partition: i32,
     pub timestamp: i64, // -2 = earliest, -1 = latest
 }
-
+/// Collapse to `Result` for tests and callers that only need a successful `decode_list_offsets_request`.
+/// # Errors
+///
+/// Returns an error if the byte stream is malformed or if the API version is unsupported.
 pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffsetsRequest> {
     let mut d = Decoder::new(body);
     let flexible = version >= 6;
@@ -408,7 +419,7 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
     })
 }
 
-/// CreateTopics Request (API Key 19)
+/// `CreateTopics` Request (API Key 19)
 #[derive(Debug, Clone)]
 pub struct CreateTopicsRequest {
     pub topics: Vec<CreatableTopic>,
@@ -423,6 +434,10 @@ pub struct CreatableTopic {
     pub replication_factor: i16,
 }
 
+/// Collapse to `Result` for tests and callers that only need a successful `decode_create_topics_request`.
+/// # Errors
+///
+/// Returns an error if the byte stream is malformed or if the API version is unsupported.
 pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateTopicsRequest> {
     let mut d = Decoder::new(body);
     let flexible = version >= 5;
@@ -446,7 +461,7 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
         let num_partitions = d.read_i32()?;
         let replication_factor = d.read_i16()?;
 
-        // assignments (COMPACT_ARRAY or ARRAY) — skip
+        // assignments (COMPACT_ARRAY or ARRAY) - skip
         let assignments_count = if flexible {
             d.read_compact_array_count()?
         } else {
@@ -467,7 +482,7 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
             }
         }
 
-        // configs (COMPACT_ARRAY or ARRAY) — skip
+        // configs (COMPACT_ARRAY or ARRAY) - skip
         let configs_count = if flexible {
             d.read_compact_array_count()?
         } else {

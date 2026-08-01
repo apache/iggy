@@ -62,7 +62,7 @@ fn golden_metadata_v0_single_topic_response_fixture() {
     let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default())
         .expect_response("test request has acks != 0 and expects a response");
 
-    // Metadata v0 layout: brokers[], topics[]  (no controller_id — added in v1)
+    // Metadata v0 layout: brokers[], topics[]  (no controller_id - added in v1)
     // brokers[1]: node_id=1, host=127.0.0.1, port=9093
     // topics[1]: topic_error=3, topic_name=orders (echoed from the request), partitions[0]
     let expected: [u8; 41] = [

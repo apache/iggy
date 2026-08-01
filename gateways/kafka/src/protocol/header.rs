@@ -16,8 +16,9 @@
 // under the License.
 
 #![allow(
-    clippy::pedantic,
+    clippy::doc_markdown,
     clippy::missing_const_for_fn,
+        clippy::missing_errors_doc,
     clippy::match_same_arms
 )]
 
@@ -73,7 +74,7 @@ fn first_flexible_version_threshold(api_key: i16) -> i16 {
         14 => 4,        // SyncGroup
         15 => 5,        // DescribeGroups
         16 => 3,        // ListGroups
-        17 => i16::MAX, // SaslHandshake — never flexible
+        17 => i16::MAX, // SaslHandshake - never flexible
         18 => 3,        // ApiVersions
         19 => 5,        // CreateTopics
         20 => 4,        // DeleteTopics
@@ -101,34 +102,34 @@ fn first_flexible_version_threshold(api_key: i16) -> i16 {
         42 => 2,        // DeleteGroups
         43 => 2,        // ElectLeaders
         44 => 1,        // IncrementalAlterConfigs
-        45 => 0,        // AlterPartitionReassignments — always flexible
-        46 => 0,        // ListPartitionReassignments — always flexible
-        47 => i16::MAX, // OffsetDelete — never flexible
+        45 => 0,        // AlterPartitionReassignments - always flexible
+        46 => 0,        // ListPartitionReassignments - always flexible
+        47 => i16::MAX, // OffsetDelete - never flexible
         48 => 1,        // DescribeClientQuotas
         49 => 1,        // AlterClientQuotas
-        50 => 0,        // DescribeUserScramCredentials — always flexible
-        51 => 0,        // AlterUserScramCredentials — always flexible
-        55 => 0,        // DescribeQuorum — always flexible
-        56 => 0,        // AlterPartition — always flexible
+        50 => 0,        // DescribeUserScramCredentials - always flexible
+        51 => 0,        // AlterUserScramCredentials - always flexible
+        55 => 0,        // DescribeQuorum - always flexible
+        56 => 0,        // AlterPartition - always flexible
         57 => 1,        // UpdateFeatures
-        60 => 0,        // DescribeCluster — always flexible
-        61 => 0,        // DescribeProducers — always flexible
-        64 => 0,        // UnregisterBroker — always flexible
-        65 => 0,        // DescribeTransactions — always flexible
-        66 => 0,        // ListTransactions — always flexible
-        67 => 0,        // AllocateProducerIds — always flexible
-        68 => 0,        // ConsumerGroupHeartbeat — always flexible
-        69 => 0,        // ConsumerGroupDescribe — always flexible
-        71 => 0,        // GetTelemetrySubscriptions — always flexible
-        72 => 0,        // PushTelemetry — always flexible
-        74 => 0,        // AssignReplicasToDirs — always flexible
-        75 => 0,        // DescribeTopicPartitions — always flexible
-        76 => 0,        // ListClientMetricsResources — always flexible
-        77 => 0,        // ShareGroupHeartbeat — always flexible (Kafka 4.0)
-        78 => 0,        // ShareGroupDescribe — always flexible
-        79 => 0,        // ShareFetch — always flexible
-        80 => 0,        // ShareAcknowledge — always flexible
-        _ => i16::MAX,  // Unknown API — assume non-flexible
+        60 => 0,        // DescribeCluster - always flexible
+        61 => 0,        // DescribeProducers - always flexible
+        64 => 0,        // UnregisterBroker - always flexible
+        65 => 0,        // DescribeTransactions - always flexible
+        66 => 0,        // ListTransactions - always flexible
+        67 => 0,        // AllocateProducerIds - always flexible
+        68 => 0,        // ConsumerGroupHeartbeat - always flexible
+        69 => 0,        // ConsumerGroupDescribe - always flexible
+        71 => 0,        // GetTelemetrySubscriptions - always flexible
+        72 => 0,        // PushTelemetry - always flexible
+        74 => 0,        // AssignReplicasToDirs - always flexible
+        75 => 0,        // DescribeTopicPartitions - always flexible
+        76 => 0,        // ListClientMetricsResources - always flexible
+        77 => 0,        // ShareGroupHeartbeat - always flexible (Kafka 4.0)
+        78 => 0,        // ShareGroupDescribe - always flexible
+        79 => 0,        // ShareFetch - always flexible
+        80 => 0,        // ShareAcknowledge - always flexible
+        _ => i16::MAX,  // Unknown API - assume non-flexible
     }
 }
 
@@ -150,15 +151,12 @@ pub fn request_header_version(api_key: i16, api_version: i16) -> i16 {
 /// ApiVersions (18) is a special case: the server ALWAYS returns response header v0 (no tagged
 /// fields) so that clients that don't yet know the server supports flexible encoding can still
 /// parse the discovery response.  All other flexible-version APIs use response header v1.
+#[must_use]
 pub fn response_header_version(api_key: i16, api_version: i16) -> i16 {
     if api_key == 18 {
         return 0;
     }
-    if request_header_version(api_key, api_version) >= 2 {
-        1
-    } else {
-        0
-    }
+    i16::from(request_header_version(api_key, api_version) >= 2)
 }
 
 impl RequestHeader {
@@ -212,6 +210,7 @@ impl ResponseHeader {
     ///
     /// v0: correlation_id i32  (non-flexible APIs and ApiVersions)
     /// v1: correlation_id i32 + empty tagged fields  (flexible APIs)
+    #[must_use]
     pub fn encode(&self, header_version: i16) -> Bytes {
         let mut e = Encoder::with_capacity(5);
         e.write_i32(self.correlation_id);

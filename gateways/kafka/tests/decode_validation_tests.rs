@@ -29,7 +29,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 
-use iggy_gateway_kafka::protocol::codec::Decoder;
+use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
 use iggy_gateway_kafka::protocol::header::{RequestHeader, request_header_version};
 use iggy_gateway_kafka::protocol::requests::{
     decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
@@ -57,7 +57,7 @@ fn load_body(api_key: i16, api_name: &str, version: i16) -> Option<Bytes> {
     let path = fixtures_dir().join(&filename);
     let Ok(data) = std::fs::read(&path) else {
         eprintln!(
-            "skipping {filename}: wire fixture missing — generate with \
+            "skipping {filename}: wire fixture missing - generate with \
              `gateways/kafka/scripts/ci-wire-fixtures.sh generate` (or the kafka-tool \
              `generate` subcommand)"
         );
@@ -149,12 +149,12 @@ fn produce_response_v3_roundtrip() {
     let partition = d.read_i32().unwrap();
     assert_eq!(partition, 0);
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 6); // NOT_LEADER_OR_FOLLOWER — stub until Iggy bridge
+    assert_eq!(error_code, 6); // NOT_LEADER_OR_FOLLOWER - stub until Iggy bridge
     let base_offset = d.read_i64().unwrap();
     assert_eq!(base_offset, 0);
     // log_append_time_ms (v2+)
     let _log_append = d.read_i64().unwrap();
-    // log_start_offset (v5+) — not present for v3
+    // log_start_offset (v5+) - not present for v3
     let throttle = d.read_i32().unwrap();
     assert_eq!(throttle, 0);
 }
@@ -176,7 +176,7 @@ fn produce_response_v8_includes_record_errors() {
     assert_eq!(partition_count, 1);
     let _partition = d.read_i32().unwrap();
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 6); // NOT_LEADER_OR_FOLLOWER — stub until Iggy bridge
+    assert_eq!(error_code, 6); // NOT_LEADER_OR_FOLLOWER - stub until Iggy bridge
     let _base_offset = d.read_i64().unwrap();
     let _log_append_time = d.read_i64().unwrap(); // v2+
     let _log_start_offset = d.read_i64().unwrap(); // v5+
@@ -196,6 +196,61 @@ fn produce_v9_flexible_empty_topics_decode() {
         .expect("flexible produce request should decode");
     assert_eq!(req.acks, 0);
     assert_eq!(req.topics.len(), 0);
+}
+
+#[test]
+fn produce_v2_skips_transactional_id_branch() {
+    let req = decode_produce_request(2, wire::build_produce_legacy_request(2, 1, None, None))
+        .into_request()
+        .expect("produce v2 should decode");
+    assert_eq!(req.acks, 1);
+    assert!(req.transactional_id.is_none());
+    assert!(req.topics.is_empty());
+}
+
+#[test]
+fn produce_v3_legacy_transactional_id_and_topic_decode() {
+    let req = decode_produce_request(
+        3,
+        wire::build_produce_legacy_request(3, -1, Some("txn-1"), Some("legacy-topic")),
+    )
+    .into_request()
+    .expect("produce v3 legacy should decode");
+    assert_eq!(req.transactional_id.as_deref(), Some("txn-1"));
+    assert_eq!(req.topics.len(), 1);
+    assert_eq!(req.topics[0].topic, "legacy-topic");
+    assert!(req.topics[0].partitions[0].records.is_some());
+}
+
+#[test]
+fn produce_v8_legacy_null_records_decode() {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_nullable_string(None::<&str>).unwrap();
+    enc.write_i16(1);
+    enc.write_i32(500);
+    enc.write_i32(1);
+    enc.write_nullable_string(Some("topic")).unwrap();
+    enc.write_i32(1);
+    enc.write_i32(0);
+    enc.write_nullable_bytes(None).unwrap();
+
+    let req = decode_produce_request(8, enc.freeze())
+        .into_request()
+        .expect("produce v8 with null records should decode");
+    assert!(req.topics[0].partitions[0].records.is_none());
+}
+
+#[test]
+fn produce_v9_flexible_transactional_id_and_tagged_fields_decode() {
+    let req = decode_produce_request(
+        9,
+        wire::build_produce_flexible_request_with_topic("flex-topic"),
+    )
+    .into_request()
+    .expect("produce v9 flexible should decode");
+    assert_eq!(req.transactional_id.as_deref(), Some("txn-1"));
+    assert_eq!(req.topics[0].topic, "flex-topic");
+    assert!(req.topics[0].partitions[0].records.is_some());
 }
 
 // ── Fetch (API key 1) ─────────────────────────────────────────────────────────
@@ -300,6 +355,54 @@ fn fetch_v12_decodes_forgotten_topics_and_rack_id_sections() {
     assert_eq!(req.topics[0].partitions[0].partition_max_bytes, 1024);
 }
 
+#[test]
+fn fetch_v2_uses_default_max_bytes_when_field_absent() {
+    let req = decode_fetch_request(2, wire::build_fetch_v2_default_max_bytes_request())
+        .expect("fetch v2 should decode");
+    assert_eq!(req.max_bytes, 52_428_800);
+    assert_eq!(req.isolation_level, 0);
+    assert!(req.topics.is_empty());
+}
+
+#[test]
+fn fetch_v7_legacy_forgotten_topics_and_rack_id_decode() {
+    let req = decode_fetch_request(
+        7,
+        wire::build_fetch_request_with_sections(7, "topic-a", 1, Some("forgotten"), Some("rack-1")),
+    )
+    .expect("fetch v7 legacy sections should decode");
+    assert_eq!(req.topics[0].topic, "topic-a");
+    assert_eq!(req.topics[0].partitions[0].partition, 1);
+}
+
+#[test]
+fn fetch_v9_leader_epoch_without_v12_fields_decode() {
+    let req = decode_fetch_request(
+        9,
+        wire::build_fetch_request_with_sections(9, "topic-b", 2, None, None),
+    )
+    .expect("fetch v9 should decode");
+    assert_eq!(req.topics[0].partitions[0].fetch_offset, 42);
+}
+
+#[test]
+fn fetch_v11_legacy_rack_id_decode() {
+    let req = decode_fetch_request(
+        11,
+        wire::build_fetch_request_with_sections(11, "topic-c", 3, None, Some("rack-z")),
+    )
+    .expect("fetch v11 legacy rack id should decode");
+    assert_eq!(req.max_wait_ms, 100);
+}
+
+#[test]
+fn fetch_v3_skips_isolation_level_field() {
+    let req = decode_fetch_request(3, wire::build_fetch_v3_no_isolation_request())
+        .expect("fetch v3 should decode");
+    assert_eq!(req.isolation_level, 0);
+    assert_eq!(req.max_bytes, 1024);
+}
+
 // ── ListOffsets (API key 2) ───────────────────────────────────────────────────
 
 #[test]
@@ -391,7 +494,7 @@ fn list_offsets_response_v1_no_leader_epoch() {
     assert_eq!(error_code, 0);
     let _timestamp = d.read_i64().unwrap(); // v1+
     let _offset = d.read_i64().unwrap();
-    // v1 must NOT have a leader_epoch field — assert all bytes consumed
+    // v1 must NOT have a leader_epoch field - assert all bytes consumed
     assert_eq!(
         d.remaining(),
         0,
@@ -423,6 +526,34 @@ fn list_offsets_response_v4_has_leader_epoch() {
     let leader_epoch = d.read_i32().unwrap(); // v4+
     assert_eq!(leader_epoch, -1, "v4 must have leader_epoch = -1");
     assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn list_offsets_v1_skips_isolation_level_field() {
+    let req = decode_list_offsets_request(1, wire::build_list_offsets_branch_request(1, "v1", 0))
+        .expect("list offsets v1 should decode");
+    assert_eq!(req.isolation_level, 0);
+}
+
+#[test]
+fn list_offsets_v2_reads_isolation_level() {
+    let req = decode_list_offsets_request(2, wire::build_list_offsets_branch_request(2, "v2", 1))
+        .expect("list offsets v2 should decode");
+    assert_eq!(req.isolation_level, 1);
+}
+
+#[test]
+fn list_offsets_v3_skips_leader_epoch_branch() {
+    let req = decode_list_offsets_request(3, wire::build_list_offsets_branch_request(3, "v3", 2))
+        .expect("list offsets v3 should decode");
+    assert_eq!(req.topics[0].partitions[0].partition, 2);
+}
+
+#[test]
+fn list_offsets_v5_leader_epoch_without_flexible_encoding() {
+    let req = decode_list_offsets_request(5, wire::build_list_offsets_branch_request(5, "v5", 3))
+        .expect("list offsets v5 should decode");
+    assert_eq!(req.topics[0].topic, "v5");
 }
 
 // ── CreateTopics (API key 19) ─────────────────────────────────────────────────
@@ -523,7 +654,7 @@ fn create_topics_response_v2_roundtrip() {
     let resp_topic = d.read_nullable_string().unwrap().unwrap();
     assert_eq!(resp_topic, topic_name);
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 41); // NOT_CONTROLLER — stub until Iggy bridge
+    assert_eq!(error_code, 41); // NOT_CONTROLLER - stub until Iggy bridge
     let error_msg = d.read_nullable_string().unwrap(); // v1+
     assert!(error_msg.is_none());
     assert_eq!(d.remaining(), 0);
@@ -545,7 +676,7 @@ fn create_topics_response_v5_roundtrip() {
 
     let _topic_name = d.read_compact_nullable_string().unwrap();
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 41); // NOT_CONTROLLER — stub until Iggy bridge
+    assert_eq!(error_code, 41); // NOT_CONTROLLER - stub until Iggy bridge
     let _error_msg = d.read_compact_nullable_string().unwrap(); // v1+
     let num_partitions = d.read_i32().unwrap();
     assert_eq!(num_partitions, 1);
@@ -556,4 +687,25 @@ fn create_topics_response_v5_roundtrip() {
     d.read_tagged_fields().unwrap(); // per-entry tagged_fields
     d.read_tagged_fields().unwrap(); // top-level tagged_fields
     assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn create_topics_v3_legacy_assignments_decode() {
+    let req = decode_create_topics_request(
+        3,
+        wire::build_create_topics_request_with_sections(3, "v3-topic"),
+    )
+    .expect("create topics v3 should decode");
+    assert_eq!(req.topics[0].name, "v3-topic");
+    assert!(req.validate_only);
+}
+
+#[test]
+fn create_topics_v4_legacy_configs_decode() {
+    let req = decode_create_topics_request(
+        4,
+        wire::build_create_topics_request_with_sections(4, "v4-topic"),
+    )
+    .expect("create topics v4 should decode");
+    assert_eq!(req.topics[0].replication_factor, 1);
 }

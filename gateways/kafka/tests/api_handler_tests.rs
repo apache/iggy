@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "common/fixtures.rs"]
+mod fixtures;
+#[path = "common/scope.rs"]
+mod scope;
+#[path = "common/tcp.rs"]
+mod tcp;
 #[path = "common/wire.rs"]
 mod wire;
 
@@ -22,21 +28,23 @@ use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, BrokerAdvertise, ERROR_INVALID_REQUEST,
-    ERROR_UNSUPPORTED_VERSION, handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
+    handle_request, is_supported_version, supported_api_ranges,
 };
+use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
+use iggy_gateway_kafka::protocol::requests::{ProduceDecodeResult, decode_produce_request};
 
-fn test_broker() -> BrokerAdvertise {
-    BrokerAdvertise::default()
-}
-use iggy_gateway_kafka::protocol::codec::Decoder;
-use wire::build_metadata_flexible_request_v10;
+use fixtures::load_fixture_body_or_skip;
+use scope::default_broker;
+use tcp::{build_metadata_legacy_request, build_produce_v3_body};
+use wire::{build_metadata_flexible_request, build_metadata_flexible_request_v10};
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
 
 #[test]
 fn api_versions_v1_response_non_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker())
+    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -61,7 +69,7 @@ fn api_versions_v1_response_non_flexible_format() {
 
 #[test]
 fn api_versions_v3_response_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker())
+    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -92,7 +100,7 @@ fn api_versions_v3_response_flexible_format() {
 
 #[test]
 fn metadata_response_has_broker_array_and_topic_array() {
-    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker())
+    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
@@ -117,7 +125,7 @@ fn unsupported_metadata_version_closes_connection() {
             API_KEY_METADATA,
             99,
             build_metadata_flexible_request_v10(&["orders"]),
-            &test_broker(),
+            &default_broker(),
         )
         .is_close(),
         "Metadata above supported max must close rather than return a clamped body"
@@ -128,7 +136,7 @@ fn unsupported_metadata_version_closes_connection() {
 
 #[test]
 fn unknown_api_key_returns_error_only_payload() {
-    let body = handle_request(999, 0, Bytes::new(), &test_broker())
+    let body = handle_request(999, 0, Bytes::new(), &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
@@ -144,9 +152,9 @@ fn version_support_table_is_applied() {
 
 #[test]
 fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
-    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker())
+    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
-    // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 — no throttle_time_ms.
+    // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 - no throttle_time_ms.
     assert_eq!(body.len(), 42);
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
@@ -162,7 +170,7 @@ fn produce_malformed_body_with_acks_one_returns_invalid_request() {
         0x00, 0x00, 0x03, 0xe8, // timeout_ms
         0x00, 0x00, 0x00, 0x01, // one topic
     ]);
-    let response = handle_request(API_KEY_PRODUCE, 3, body, &test_broker())
+    let response = handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
         .expect_response("acks=1 malformed produce should get error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 1);
@@ -182,7 +190,7 @@ fn fetch_malformed_body_returns_invalid_request() {
             0x00, 0x00, 0x00, 0x64, // max_wait_ms
             0x00, 0x00, 0x00, 0x01, // min_bytes
         ]),
-        &test_broker(),
+        &default_broker(),
     )
     .expect_response("fetch must return error response");
     let mut d = Decoder::new(response);
@@ -201,7 +209,7 @@ fn list_offsets_malformed_body_returns_invalid_request() {
             0x02, // compact topics count = one
             0x00, // null topic name
         ]),
-        &test_broker(),
+        &default_broker(),
     )
     .expect_response("list offsets must return error response");
     let mut d = Decoder::new(response);
@@ -225,7 +233,7 @@ fn create_topics_malformed_body_returns_invalid_request() {
             0x02, // compact topics count = one
             0x00, // null compact topic name
         ]),
-        &test_broker(),
+        &default_broker(),
     )
     .expect_response("create topics must return error response");
     let mut d = Decoder::new(response);
@@ -247,7 +255,7 @@ fn metadata_null_topic_name_yields_zero_topics() {
             0x00, 0x00, 0x00, 0x01, // one topic
             0xff, 0xff, // null topic name
         ]),
-        &test_broker(),
+        &default_broker(),
     )
     .expect_response("metadata request should still return response");
     let mut d = Decoder::new(body);
@@ -257,4 +265,658 @@ fn metadata_null_topic_name_yields_zero_topics() {
     d.read_i32().unwrap();
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.remaining(), 0);
+}
+
+// ── Full handler regression - every scoped API key x version through `handle_request` ──
+
+#[test]
+fn handle_request_succeeds_for_every_supported_version_with_fixture() {
+    for &(api_key, name, min_ver, max_ver) in scope::SCOPED_API_KEYS {
+        if api_key == 3 || api_key == 18 {
+            // Metadata / ApiVersions: empty body is valid
+            for version in min_ver..=max_ver {
+                let resp = handle_request(api_key, version, bytes::Bytes::new(), &default_broker())
+                    .expect_response("test request has acks != 0 and expects a response");
+                assert!(
+                    !resp.is_empty(),
+                    "{name} v{version} returned empty response"
+                );
+            }
+            continue;
+        }
+
+        for version in min_ver..=max_ver {
+            let Some(body) = load_fixture_body_or_skip(api_key, name, version) else {
+                continue;
+            };
+            let resp = handle_request(api_key, version, body, &default_broker())
+                .expect_response("test request has acks != 0 and expects a response");
+            assert!(
+                !resp.is_empty(),
+                "{name} v{version} returned empty response"
+            );
+        }
+    }
+}
+
+#[test]
+fn produce_stub_response_returns_retriable_not_leader() {
+    for version in 3i16..=9 {
+        let Some(body) = load_fixture_body_or_skip(0, "Produce", version) else {
+            continue;
+        };
+        let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
+        let flexible = version >= 9;
+        let mut d = Decoder::new(resp);
+        if flexible {
+            let _topics = d.read_varint().unwrap();
+            let _topic = d.read_compact_nullable_string().unwrap();
+            let _parts = d.read_varint().unwrap();
+        } else {
+            let _topics = d.read_i32().unwrap();
+            let _topic = d.read_nullable_string().unwrap();
+            let _parts = d.read_i32().unwrap();
+        }
+        let _partition = d.read_i32().unwrap();
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_LEADER_OR_FOLLOWER,
+            "Produce v{version}"
+        );
+    }
+}
+
+#[test]
+fn fetch_stub_response_has_zero_partition_error() {
+    for version in 4i16..=12 {
+        let Some(body) = load_fixture_body_or_skip(1, "Fetch", version) else {
+            continue;
+        };
+        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
+        let flexible = version >= 12;
+        let mut d = Decoder::new(resp);
+        if version >= 1 {
+            let _throttle = d.read_i32().unwrap();
+        }
+        if version >= 7 {
+            assert_eq!(d.read_i16().unwrap(), ERROR_NONE);
+            let _session = d.read_i32().unwrap();
+        }
+        if flexible {
+            let _topics = d.read_varint().unwrap();
+            let _topic = d.read_compact_nullable_string().unwrap();
+            let _parts = d.read_varint().unwrap();
+        } else {
+            let _topics = d.read_i32().unwrap();
+            let _topic = d.read_nullable_string().unwrap();
+            let _parts = d.read_i32().unwrap();
+        }
+        let _partition = d.read_i32().unwrap();
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NONE,
+            "Fetch v{version} partition error"
+        );
+    }
+}
+
+#[test]
+fn list_offsets_stub_response_has_zero_error() {
+    for version in 1i16..=6 {
+        let Some(body) = load_fixture_body_or_skip(2, "ListOffsets", version) else {
+            continue;
+        };
+        let resp = handle_request(API_KEY_LIST_OFFSETS, version, body, &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
+        let flexible = version >= 6;
+        let mut d = Decoder::new(resp);
+        if version >= 2 {
+            let _throttle = d.read_i32().unwrap();
+        }
+        if flexible {
+            let _topics = d.read_varint().unwrap();
+            let _topic = d.read_compact_nullable_string().unwrap();
+            let _parts = d.read_varint().unwrap();
+        } else {
+            let _topics = d.read_i32().unwrap();
+            let _topic = d.read_nullable_string().unwrap();
+            let _parts = d.read_i32().unwrap();
+        }
+        let _partition = d.read_i32().unwrap();
+        assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "ListOffsets v{version}");
+    }
+}
+
+// ── Metadata regression - all supported versions, broker advertise, topic counts ──
+
+/// Topic name assigned to slot `i` by [`metadata_request_legacy`] / [`metadata_request_flexible`].
+fn synthetic_topic_name(i: i32) -> String {
+    format!("topic-{i}")
+}
+
+fn metadata_request_legacy(topic_count: i32) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_i32(topic_count);
+    for i in 0..topic_count {
+        enc.write_nullable_string(Some(&synthetic_topic_name(i)))
+            .expect("topic name fits");
+    }
+    enc.freeze()
+}
+
+fn metadata_request_flexible(topic_count: usize) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_varint((topic_count + 1) as u64);
+    for i in 0..topic_count {
+        enc.write_compact_nullable_string(Some(&synthetic_topic_name(i32::try_from(i).unwrap())));
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+fn read_broker_legacy(d: &mut Decoder) -> (String, i32) {
+    let count = d.read_i32().unwrap();
+    assert_eq!(count, 1);
+    let _node = d.read_i32().unwrap();
+    let host = d.read_nullable_string().unwrap().unwrap();
+    let port = d.read_i32().unwrap();
+    (host, port)
+}
+
+fn read_broker_flexible(d: &mut Decoder) -> (String, i32) {
+    let count_plus_one = d.read_varint().unwrap();
+    assert_eq!(count_plus_one, 2); // one broker
+    let _node = d.read_i32().unwrap();
+    let host = d.read_compact_nullable_string().unwrap().unwrap();
+    let port = d.read_i32().unwrap();
+    let _rack = d.read_compact_nullable_string().unwrap();
+    d.read_tagged_fields().unwrap();
+    (host, port)
+}
+
+#[test]
+fn metadata_corrupt_partial_body_returns_zero_topics() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        Bytes::from_static(&[0x00, 0x00]),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _ = read_broker_legacy(&mut d);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn metadata_v0_empty_topics_stub_broker() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        metadata_request_legacy(0),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let (host, port) = read_broker_legacy(&mut d);
+    assert_eq!(host, "127.0.0.1");
+    assert_eq!(port, 9093);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(
+        d.remaining(),
+        0,
+        "empty request must produce no trailing bytes"
+    );
+}
+
+#[test]
+fn metadata_v0_three_topics_each_unknown() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        metadata_request_legacy(3),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _ = read_broker_legacy(&mut d);
+    assert_eq!(d.read_i32().unwrap(), 3);
+    for i in 0..3 {
+        assert_eq!(d.read_i16().unwrap(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert_eq!(
+            d.read_nullable_string().unwrap().unwrap(),
+            synthetic_topic_name(i)
+        );
+        assert_eq!(d.read_i32().unwrap(), 0);
+    }
+}
+
+#[test]
+fn metadata_v1_includes_controller_id() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        1,
+        metadata_request_legacy(0),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    // Metadata v1 has no throttle_time_ms (added in v3).
+    let _ = read_broker_legacy(&mut d);
+    let _rack = d.read_nullable_string().unwrap();
+    let controller = d.read_i32().unwrap();
+    assert_eq!(controller, 1);
+}
+
+#[test]
+fn metadata_v2_includes_cluster_id_field() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        2,
+        metadata_request_legacy(0),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _ = read_broker_legacy(&mut d);
+    let _rack = d.read_nullable_string().unwrap();
+    let _cluster_id = d.read_nullable_string().unwrap();
+    let _controller = d.read_i32().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 0);
+}
+
+#[test]
+fn metadata_all_legacy_versions_produce_valid_response() {
+    for version in 0i16..=8 {
+        let body = handle_request(
+            API_KEY_METADATA,
+            version,
+            metadata_request_legacy(1),
+            &default_broker(),
+        )
+        .expect_response("test request has acks != 0 and expects a response");
+        let mut d = Decoder::new(body);
+        if version >= 3 {
+            let _throttle = d.read_i32().unwrap();
+        }
+        let _ = read_broker_legacy(&mut d);
+        if version >= 1 {
+            let _rack = d.read_nullable_string().unwrap();
+        }
+        if version >= 2 {
+            let _cluster = d.read_nullable_string().unwrap();
+        }
+        if version >= 1 {
+            let _controller = d.read_i32().unwrap();
+        }
+        assert_eq!(d.read_i32().unwrap(), 1);
+        assert_eq!(d.read_i16().unwrap(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+}
+
+#[test]
+fn metadata_v9_flexible_encoding() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        9,
+        metadata_request_flexible(2),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _throttle = d.read_i32().unwrap();
+    let (host, port) = read_broker_flexible(&mut d);
+    assert_eq!(host, "127.0.0.1");
+    assert_eq!(port, 9093);
+    let _cluster = d.read_compact_nullable_string().unwrap();
+    let controller = d.read_i32().unwrap();
+    assert_eq!(controller, 1);
+
+    let topics_plus_one = d.read_varint().unwrap();
+    assert_eq!(topics_plus_one, 3); // 2 topics
+    for i in 0..2 {
+        assert_eq!(d.read_i16().unwrap(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert_eq!(
+            d.read_compact_nullable_string().unwrap().unwrap(),
+            synthetic_topic_name(i)
+        );
+        let _internal = d.read_bool().unwrap();
+        let parts_plus_one = d.read_varint().unwrap();
+        assert_eq!(parts_plus_one, 1); // empty partitions
+        assert_eq!(d.read_i32().unwrap(), i32::MIN); // topic_authorized_operations (v8+)
+        d.read_tagged_fields().unwrap();
+    }
+    assert_eq!(d.read_i32().unwrap(), i32::MIN); // cluster_authorized_operations (v8+)
+    d.read_tagged_fields().unwrap();
+    assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn metadata_v8_includes_authorized_operations_legacy() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        8,
+        metadata_request_legacy(1),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _throttle = d.read_i32().unwrap();
+    let _ = read_broker_legacy(&mut d);
+    let _rack = d.read_nullable_string().unwrap();
+    let _cluster = d.read_nullable_string().unwrap();
+    let _controller = d.read_i32().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 1);
+    let _topic_error = d.read_i16().unwrap();
+    let _topic = d.read_nullable_string().unwrap();
+    let _internal = d.read_bool().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 0); // empty partitions
+    assert_eq!(d.read_i32().unwrap(), i32::MIN); // topic_authorized_operations
+    assert_eq!(d.read_i32().unwrap(), i32::MIN); // cluster_authorized_operations
+    assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn create_topics_stub_response_returns_not_controller() {
+    for version in 2i16..=5 {
+        let Some(body) = load_fixture_body_or_skip(19, "CreateTopics", version) else {
+            continue;
+        };
+        let resp = handle_request(API_KEY_CREATE_TOPICS, version, body, &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
+        let flexible = version >= 5;
+        let mut d = Decoder::new(resp);
+        if version >= 2 {
+            let _throttle = d.read_i32().unwrap();
+        }
+        if flexible {
+            let _topics = d.read_varint().unwrap();
+            let _topic = d.read_compact_nullable_string().unwrap();
+        } else {
+            let _topics = d.read_i32().unwrap();
+            let _topic = d.read_nullable_string().unwrap();
+        }
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_CONTROLLER,
+            "CreateTopics v{version}"
+        );
+    }
+}
+
+// ── Produce acks=0 (broker must stay silent even on a malformed body) ──────
+
+#[test]
+fn produce_acks_zero_malformed_body_decode_carries_acks() {
+    let body = build_produce_v3_body(0, 1);
+    match decode_produce_request(3, body.clone()) {
+        ProduceDecodeResult::Err { acks: Some(0), .. } => {}
+        other => panic!("expected decode error with acks=0, got {other:?}"),
+    }
+    assert!(
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
+        "handler must not respond when acks=0 even if decode fails after acks"
+    );
+}
+
+// ── Metadata topic name echo (must not hardcode a placeholder topic name) ──
+
+fn read_metadata_v1_topics(d: &mut Decoder, expected_count: i32) -> Vec<String> {
+    let _brokers_count = d.read_i32().unwrap();
+    d.read_i32().unwrap(); // node_id
+    d.read_nullable_string().unwrap(); // host
+    d.read_i32().unwrap(); // port
+    d.read_nullable_string().unwrap(); // rack (v1+)
+    d.read_i32().unwrap(); // controller_id (v1+)
+
+    assert_eq!(d.read_i32().unwrap(), expected_count);
+    let mut names = Vec::with_capacity(usize::try_from(expected_count).unwrap_or(0));
+    for _ in 0..expected_count {
+        d.read_i16().unwrap(); // topic_error
+        names.push(d.read_nullable_string().unwrap().expect("topic name"));
+        d.read_bool().unwrap(); // is_internal (v1+)
+        assert_eq!(d.read_i32().unwrap(), 0, "empty partitions array");
+    }
+    names
+}
+
+#[test]
+fn metadata_v1_echoes_requested_topic_name_in_response() {
+    let topic = "orders";
+    let request = build_metadata_legacy_request(&[topic]);
+    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+
+    let names = read_metadata_v1_topics(&mut d, 1);
+    assert_eq!(names, vec![topic.to_string()]);
+    assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn metadata_v1_unknown_topic_returns_error_with_requested_name() {
+    let topic = "orders";
+    let request = build_metadata_legacy_request(&[topic]);
+    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+
+    let _brokers_count = d.read_i32().unwrap();
+    d.read_i32().unwrap();
+    d.read_nullable_string().unwrap();
+    d.read_i32().unwrap();
+    d.read_nullable_string().unwrap();
+    d.read_i32().unwrap();
+
+    assert_eq!(d.read_i32().unwrap(), 1);
+    assert_eq!(
+        d.read_i16().unwrap(),
+        ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        "unknown topic should surface error 3"
+    );
+    assert_eq!(
+        d.read_nullable_string().unwrap().as_deref(),
+        Some(topic),
+        "response must echo requested topic name, not a placeholder"
+    );
+}
+
+// ── Metadata (spec + SCOPE.md coverage) ─────────────────────────────────────
+
+#[test]
+fn metadata_v0_empty_topics_returns_zero_length_topic_array() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        build_metadata_legacy_request(&[]),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    let _brokers = d.read_i32().unwrap();
+    d.read_i32().unwrap();
+    d.read_nullable_string().unwrap();
+    d.read_i32().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 0, "empty request → zero topics");
+    assert_eq!(d.remaining(), 0);
+}
+
+#[test]
+fn metadata_v3_includes_throttle_time_ms_before_brokers() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        3,
+        build_metadata_legacy_request(&[]),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle_time_ms");
+}
+
+#[test]
+fn metadata_v9_flexible_empty_topics_returns_zero_topics() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        9,
+        build_metadata_flexible_request(&[]),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    d.read_i32().unwrap(); // throttle
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    for _ in 0..broker_count {
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_tagged_fields().unwrap();
+    }
+    d.read_compact_nullable_string().unwrap(); // cluster_id
+    d.read_i32().unwrap(); // controller_id
+    let topic_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    assert_eq!(topic_count, 0);
+}
+
+#[test]
+fn metadata_v9_flexible_echoes_each_requested_topic_name() {
+    let topics = ["orders", "payments", "inventory"];
+    let body = handle_request(
+        API_KEY_METADATA,
+        9,
+        build_metadata_flexible_request(&topics),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+
+    let mut d = Decoder::new(body);
+    d.read_i32().unwrap();
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    for _ in 0..broker_count {
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_tagged_fields().unwrap();
+    }
+    d.read_compact_nullable_string().unwrap();
+    d.read_i32().unwrap();
+
+    let topic_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    assert_eq!(topic_count, topics.len());
+
+    let mut names = Vec::new();
+    for _ in 0..topic_count {
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            "stub gateway returns unknown topic error per topic"
+        );
+        names.push(
+            d.read_compact_nullable_string()
+                .unwrap()
+                .expect("topic name"),
+        );
+        d.read_bool().unwrap();
+        assert_eq!(
+            usize::try_from(d.read_varint().unwrap())
+                .unwrap()
+                .saturating_sub(1),
+            0,
+            "empty partitions array"
+        );
+        d.read_i32().unwrap(); // topic_authorized_operations (v8+)
+        d.read_tagged_fields().unwrap();
+    }
+
+    assert_eq!(
+        names,
+        topics
+            .iter()
+            .map(|topic| (*topic).to_string())
+            .collect::<Vec<_>>(),
+        "metadata must echo requested topic names for client matching"
+    );
+}
+
+#[test]
+fn metadata_v1_legacy_multiple_topics_echo_names() {
+    let topics = ["alpha", "beta"];
+    let body = handle_request(
+        API_KEY_METADATA,
+        1,
+        build_metadata_legacy_request(&topics),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+
+    let mut d = Decoder::new(body);
+    d.read_i32().unwrap();
+    d.read_i32().unwrap();
+    d.read_nullable_string().unwrap();
+    d.read_i32().unwrap();
+    d.read_nullable_string().unwrap();
+    d.read_i32().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 2);
+
+    for expected in topics {
+        assert_eq!(d.read_i16().unwrap(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert_eq!(
+            d.read_nullable_string().unwrap().as_deref(),
+            Some(expected),
+            "metadata v1 must echo {expected}"
+        );
+        d.read_bool().unwrap();
+        assert_eq!(d.read_i32().unwrap(), 0);
+    }
+}
+
+fn skip_metadata_v9_prefix(d: &mut Decoder) {
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    for _ in 0..broker_count {
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_tagged_fields().unwrap();
+    }
+    d.read_compact_nullable_string().unwrap();
+    d.read_i32().unwrap();
+}
+
+#[test]
+fn metadata_v9_request_with_three_topics_yields_three_response_slots() {
+    let topics = ["a", "b", "c"];
+    let body = handle_request(
+        API_KEY_METADATA,
+        9,
+        build_metadata_flexible_request(&topics),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(body);
+    d.read_i32().unwrap();
+    skip_metadata_v9_prefix(&mut d);
+    let topic_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    assert_eq!(
+        topic_count,
+        topics.len(),
+        "response topic count must mirror request topic count"
+    );
 }

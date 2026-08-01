@@ -15,13 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Adversarial wire-input tests for #3421 — malformed lengths must return errors, never panic.
+//! Adversarial wire-input tests for #3421 - malformed lengths must return errors, never panic.
+
+#[path = "common/wire.rs"]
+mod wire;
 
 use bytes::Bytes;
 
 use iggy_gateway_kafka::error::KafkaProtocolError;
 use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder, MAX_COLLECTION_LEN};
-use iggy_gateway_kafka::protocol::requests::decode_produce_request;
+use iggy_gateway_kafka::protocol::requests::{
+    ProduceDecodeResult, decode_create_topics_request, decode_fetch_request,
+    decode_list_offsets_request, decode_produce_request,
+};
 
 #[test]
 fn compact_array_varint_zero_decodes_as_empty_without_panic() {
@@ -80,4 +86,221 @@ fn varint_terminal_byte_with_extra_bits_at_shift_63_is_rejected() {
     ]));
     let err = d.read_varint().unwrap_err();
     assert!(matches!(err, KafkaProtocolError::InvalidVarint));
+}
+
+// ── Produce: error preserves acks (so a retry decision can honor acks=0) ────
+
+#[test]
+fn produce_null_topic_name_preserves_acks_on_error() {
+    let mut enc = Encoder::with_capacity(32);
+    enc.write_nullable_string(None::<&str>).unwrap();
+    enc.write_i16(1);
+    enc.write_i32(500);
+    enc.write_i32(1);
+    enc.write_nullable_string(None::<&str>).unwrap();
+
+    match decode_produce_request(3, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, error } => {
+            assert_eq!(acks, Some(1));
+            assert!(matches!(error, KafkaProtocolError::NullTopicName));
+        }
+        ProduceDecodeResult::Ok(_) => panic!("expected NullTopicName"),
+    }
+}
+
+#[test]
+fn produce_v3_error_before_acks_has_none_acks() {
+    let mut enc = Encoder::with_capacity(8);
+    enc.write_i16(1);
+    match decode_produce_request(3, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, None),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error before acks"),
+    }
+}
+
+#[test]
+fn produce_v3_error_after_acks_preserves_acks() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_nullable_string(None::<&str>).unwrap();
+    enc.write_i16(7);
+    match decode_produce_request(3, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(7)),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error after acks"),
+    }
+}
+
+#[test]
+fn produce_v3_error_after_timeout_preserves_acks() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_nullable_string(None::<&str>).unwrap();
+    enc.write_i16(1);
+    enc.write_i32(500);
+    match decode_produce_request(3, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(1)),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error after timeout"),
+    }
+}
+
+#[test]
+fn produce_v9_error_on_null_topic_preserves_acks() {
+    let mut enc = Encoder::with_capacity(32);
+    enc.write_compact_nullable_string(None);
+    enc.write_i16(2);
+    enc.write_i32(500);
+    enc.write_varint(2);
+    enc.write_compact_nullable_string(None);
+    match decode_produce_request(9, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, error } => {
+            assert_eq!(acks, Some(2));
+            assert!(matches!(error, KafkaProtocolError::NullTopicName));
+        }
+        ProduceDecodeResult::Ok(_) => panic!("expected NullTopicName"),
+    }
+}
+
+#[test]
+fn produce_v9_error_on_partition_count_preserves_acks() {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_compact_nullable_string(None);
+    enc.write_i16(3);
+    enc.write_i32(500);
+    enc.write_varint(2);
+    enc.write_compact_nullable_string(Some("topic"));
+    match decode_produce_request(9, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(3)),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error in partition count"),
+    }
+}
+
+#[test]
+fn produce_v9_error_on_partition_records_preserves_acks() {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_compact_nullable_string(None);
+    enc.write_i16(4);
+    enc.write_i32(500);
+    enc.write_varint(2);
+    enc.write_compact_nullable_string(Some("topic"));
+    enc.write_varint(2);
+    enc.write_i32(0);
+    match decode_produce_request(9, enc.freeze()) {
+        ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(4)),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error in records"),
+    }
+}
+
+// ── Fetch: truncated / null-topic inputs return errors, never panic ────────
+
+#[test]
+fn fetch_v4_truncated_after_replica_id_returns_error() {
+    let mut enc = Encoder::with_capacity(4);
+    enc.write_i32(-1);
+    let err = decode_fetch_request(4, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+}
+
+#[test]
+fn fetch_v7_truncated_in_forgotten_topics_returns_error() {
+    let body = wire::build_fetch_request_with_sections(7, "topic", 0, Some("forgot"), None);
+    let truncated = body.slice(..body.len() - 2);
+    let err = decode_fetch_request(7, truncated).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+}
+
+#[test]
+fn fetch_v12_flexible_truncated_in_topic_tagged_fields_returns_error() {
+    let body = wire::build_fetch_request_with_sections(12, "topic", 0, None, None);
+    let truncated = body.slice(..body.len() - 1);
+    let err = decode_fetch_request(12, truncated).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+}
+
+#[test]
+fn fetch_v12_flexible_null_topic_name_returns_error() {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_i32(-1);
+    enc.write_i32(100);
+    enc.write_i32(1);
+    enc.write_i32(1024);
+    enc.write_i8(0);
+    enc.write_i32(0);
+    enc.write_i32(0);
+    enc.write_varint(2);
+    enc.write_compact_nullable_string(None);
+    let err = decode_fetch_request(12, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullTopicName));
+}
+
+#[test]
+fn fetch_null_topic_name_returns_error() {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_i32(-1);
+    enc.write_i32(100);
+    enc.write_i32(1);
+    enc.write_i32(i32::MAX);
+    enc.write_i8(0);
+    enc.write_i32(1);
+    enc.write_nullable_string(None::<&str>).unwrap();
+
+    let err = decode_fetch_request(4, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullTopicName));
+}
+
+// ── ListOffsets: truncated / null-topic inputs return errors, never panic ──
+
+#[test]
+fn list_offsets_v4_truncated_in_leader_epoch_returns_error() {
+    let body = wire::build_list_offsets_branch_request(4, "topic", 1);
+    let truncated = body.slice(..body.len() - 4);
+    let err = decode_list_offsets_request(4, truncated).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+}
+
+#[test]
+fn list_offsets_v6_flexible_null_topic_name_returns_error() {
+    let mut enc = Encoder::with_capacity(32);
+    enc.write_i32(-1);
+    enc.write_i8(0);
+    enc.write_varint(2);
+    enc.write_compact_nullable_string(None);
+    let err = decode_list_offsets_request(6, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullTopicName));
+}
+
+#[test]
+fn list_offsets_null_topic_name_returns_error() {
+    let mut enc = Encoder::with_capacity(32);
+    enc.write_i32(-1);
+    enc.write_i8(0);
+    enc.write_i32(1);
+    enc.write_nullable_string(None::<&str>).unwrap();
+    let err = decode_list_offsets_request(2, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullTopicName));
+}
+
+// ── CreateTopics: truncated / null-topic inputs return errors, never panic ─
+
+#[test]
+fn create_topics_v2_truncated_in_config_value_returns_error() {
+    let body = wire::build_create_topics_request_with_sections(2, "topic");
+    let truncated = body.slice(..body.len() - 3);
+    let err = decode_create_topics_request(2, truncated).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+}
+
+#[test]
+fn create_topics_v5_flexible_null_topic_name_returns_error() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_varint(2);
+    enc.write_compact_nullable_string(None);
+    let err = decode_create_topics_request(5, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullTopicName));
+}
+
+#[test]
+fn create_topics_null_topic_name_returns_error() {
+    let mut enc = Encoder::with_capacity(32);
+    enc.write_i32(1);
+    enc.write_nullable_string(None::<&str>).unwrap();
+    let err = decode_create_topics_request(2, enc.freeze()).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullTopicName));
 }

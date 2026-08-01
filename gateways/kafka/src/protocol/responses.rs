@@ -17,7 +17,7 @@
 
 //! Kafka response encoders (stub implementations).
 
-#![allow(clippy::pedantic)]
+#![allow(clippy::doc_markdown)]
 
 use crate::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE, ERROR_NOT_CONTROLLER,
@@ -25,12 +25,14 @@ use crate::protocol::api::{
 };
 use crate::protocol::codec::Encoder;
 use crate::protocol::requests::{
-    CreatableTopic, CreateTopicsRequest, FetchRequest, ListOffsetsRequest, ProducePartitionData,
+    CreatableTopic, CreateTopicsRequest, FetchPartition, FetchRequest, FetchTopic,
+    ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic, ProducePartitionData,
     ProduceRequest, ProduceTopicData,
 };
 use bytes::Bytes;
 
 /// Well-formed Produce response with a single placeholder topic/partition.
+#[must_use]
 pub fn encode_produce_error_response(version: i16, error_code: i16) -> Bytes {
     let topics = vec![ProduceTopicData {
         topic: String::new(), // TODO topic name will be populated in the end to end functional completion
@@ -41,7 +43,7 @@ pub fn encode_produce_error_response(version: i16, error_code: i16) -> Bytes {
     }];
     encode_produce_response_inner(version, &topics, error_code)
 }
-
+#[must_use]
 pub fn encode_produce_response(version: i16, req: &ProduceRequest) -> Bytes {
     // Stub: discard payload and return a retriable error so clients keep data locally
     // until the Iggy bridge lands (do not advertise silent success).
@@ -116,9 +118,8 @@ fn encode_produce_response_inner(
 
 /// Well-formed Fetch response. Uses top-level `error_code` at v7+, or a single
 /// placeholder topic/partition with per-partition `error_code` below v7.
+#[must_use]
 pub fn encode_fetch_error_response(version: i16, error_code: i16) -> Bytes {
-    use crate::protocol::requests::{FetchPartition, FetchTopic};
-
     if version >= 7 {
         return encode_fetch_response_inner(version, &[], Some(error_code), error_code);
     }
@@ -133,7 +134,7 @@ pub fn encode_fetch_error_response(version: i16, error_code: i16) -> Bytes {
     }];
     encode_fetch_response_inner(version, &topics, Some(ERROR_NONE), error_code)
 }
-
+#[must_use]
 pub fn encode_fetch_response(version: i16, req: &FetchRequest) -> Bytes {
     encode_fetch_response_inner(version, &req.topics, Some(ERROR_NONE), ERROR_NONE)
 }
@@ -217,9 +218,8 @@ fn encode_fetch_response_inner(
 }
 
 /// Well-formed ListOffsets response with a single placeholder topic/partition.
+#[must_use]
 pub fn encode_list_offsets_error_response(version: i16, error_code: i16) -> Bytes {
-    use crate::protocol::requests::{ListOffsetsPartition, ListOffsetsTopic};
-
     let topics = vec![ListOffsetsTopic {
         topic: String::new(),
         partitions: vec![ListOffsetsPartition {
@@ -229,7 +229,7 @@ pub fn encode_list_offsets_error_response(version: i16, error_code: i16) -> Byte
     }];
     encode_list_offsets_response_inner(version, &topics, error_code)
 }
-
+#[must_use]
 pub fn encode_list_offsets_response(version: i16, req: &ListOffsetsRequest) -> Bytes {
     encode_list_offsets_response_inner(version, &req.topics, ERROR_NONE)
 }
@@ -299,6 +299,7 @@ fn encode_list_offsets_response_inner(
 }
 
 /// Well-formed CreateTopics response with a single placeholder topic.
+#[must_use]
 pub fn encode_create_topics_error_response(version: i16, error_code: i16) -> Bytes {
     let topics = vec![CreatableTopic {
         name: String::new(),
@@ -307,7 +308,7 @@ pub fn encode_create_topics_error_response(version: i16, error_code: i16) -> Byt
     }];
     encode_create_topics_response_inner(version, &topics, error_code)
 }
-
+#[must_use]
 pub fn encode_create_topics_response(version: i16, req: &CreateTopicsRequest) -> Bytes {
     encode_create_topics_response_inner(version, &req.topics, ERROR_NONE)
 }
