@@ -83,7 +83,189 @@ impl IggyClient {
         _cls: &Bound<'_, PyType>,
         connection_string: String,
     ) -> PyResult<Self> {
+        // The QUIC transport builds its endpoint eagerly and needs a Tokio runtime context to do
+        // so (see `quic()` below for details); entering it here is a no-op for the other
+        // transports since the protocol isn't known until the connection string is parsed.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
         let client = RustIggyClient::from_connection_string(&connection_string)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the TCP transport.
+    ///
+    /// Args:
+    ///     server_address: TCP server address as `host:port`. Defaults to `127.0.0.1:8090`.
+    ///     tls_enabled: Whether to use TLS when connecting to the server. Defaults to `False`.
+    ///     tls_domain: Domain to use for TLS when connecting to the server.
+    ///     tls_ca_file: Path to the CA certificate file for TLS.
+    ///     tls_validate_certificate: Whether to validate the TLS certificate. Defaults to `True`.
+    ///     no_delay: Whether to disable Nagle's algorithm on the TCP socket. Defaults to `False`.
+    ///
+    /// Returns:
+    ///     A new `IggyClient` configured for TCP.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the client configuration is invalid.
+    #[classmethod]
+    #[pyo3(signature = (server_address=None, tls_enabled=false, tls_domain=None, tls_ca_file=None, tls_validate_certificate=true, no_delay=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn tcp(
+        _cls: &Bound<'_, PyType>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
+            String,
+        >,
+        tls_enabled: bool,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_domain: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_ca_file: Option<String>,
+        tls_validate_certificate: bool,
+        no_delay: bool,
+    ) -> PyResult<Self> {
+        let mut builder = IggyClientBuilder::new()
+            .with_tcp()
+            .with_tls_enabled(tls_enabled)
+            .with_tls_validate_certificate(tls_validate_certificate);
+        if let Some(server_address) = server_address {
+            builder = builder.with_server_address(server_address);
+        }
+        if let Some(tls_domain) = tls_domain {
+            builder = builder.with_tls_domain(tls_domain);
+        }
+        if let Some(tls_ca_file) = tls_ca_file {
+            builder = builder.with_tls_ca_file(tls_ca_file);
+        }
+        if no_delay {
+            builder = builder.with_no_delay();
+        }
+        let client = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the QUIC transport.
+    ///
+    /// Args:
+    ///     server_address: QUIC server address as `host:port`. Defaults to `127.0.0.1:8080`.
+    ///     server_name: Server name used for the QUIC/TLS handshake. Defaults to `localhost`.
+    ///
+    /// Returns:
+    ///     A new `IggyClient` configured for QUIC.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the client configuration is invalid.
+    #[classmethod]
+    #[pyo3(signature = (server_address=None, server_name=None))]
+    fn quic(
+        _cls: &Bound<'_, PyType>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_name: Option<String>,
+    ) -> PyResult<Self> {
+        let mut builder = IggyClientBuilder::new().with_quic();
+        if let Some(server_address) = server_address {
+            builder = builder.with_server_address(server_address);
+        }
+        if let Some(server_name) = server_name {
+            builder = builder.with_server_name(server_name);
+        }
+        // `quinn::Endpoint::client` (invoked eagerly by `.build()`) looks up the current Tokio
+        // runtime via `Handle::try_current()` and fails with `CannotCreateEndpoint` if none is
+        // active. This method runs synchronously from Python without one, so enter the runtime
+        // pyo3-async-runtimes uses for our own async methods before building the endpoint.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+        let client = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the HTTP transport.
+    ///
+    /// Args:
+    ///     api_url: Base URL of the Iggy HTTP API. Defaults to `http://127.0.0.1:3000`.
+    ///     retries: Number of retries to perform on transient errors. Defaults to `3`.
+    ///     jwt: JWT token for A2A (Agent-to-Agent) authentication.
+    ///
+    /// Returns:
+    ///     A new `IggyClient` configured for HTTP.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the client configuration is invalid.
+    #[classmethod]
+    #[pyo3(signature = (api_url=None, retries=None, jwt=None))]
+    fn http(
+        _cls: &Bound<'_, PyType>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] api_url: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] retries: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] jwt: Option<String>,
+    ) -> PyResult<Self> {
+        let mut builder = IggyClientBuilder::new().with_http();
+        if let Some(api_url) = api_url {
+            builder = builder.with_api_url(api_url);
+        }
+        if let Some(retries) = retries {
+            builder = builder.with_retries(retries);
+        }
+        if let Some(jwt) = jwt {
+            builder = builder.with_jwt(jwt);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the WebSocket transport.
+    ///
+    /// Args:
+    ///     server_address: WebSocket server address as `host:port`. Defaults to `127.0.0.1:8092`.
+    ///     tls_enabled: Whether to use TLS when connecting to the server. Defaults to `False`.
+    ///     tls_domain: Domain to use for TLS when connecting to the server.
+    ///     tls_ca_file: Path to the CA certificate file for TLS.
+    ///     tls_validate_certificate: Whether to validate the TLS certificate. Defaults to `False`.
+    ///
+    /// Returns:
+    ///     A new `IggyClient` configured for WebSocket.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the client configuration is invalid.
+    #[classmethod]
+    #[pyo3(signature = (server_address=None, tls_enabled=false, tls_domain=None, tls_ca_file=None, tls_validate_certificate=false))]
+    fn websocket(
+        _cls: &Bound<'_, PyType>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
+            String,
+        >,
+        tls_enabled: bool,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_domain: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_ca_file: Option<String>,
+        tls_validate_certificate: bool,
+    ) -> PyResult<Self> {
+        let mut builder = IggyClientBuilder::new()
+            .with_websocket()
+            .with_tls_enabled(tls_enabled)
+            .with_tls_validate_certificate(tls_validate_certificate);
+        if let Some(server_address) = server_address {
+            builder = builder.with_server_address(server_address);
+        }
+        if let Some(tls_domain) = tls_domain {
+            builder = builder.with_tls_domain(tls_domain);
+        }
+        if let Some(tls_ca_file) = tls_ca_file {
+            builder = builder.with_tls_ca_file(tls_ca_file);
+        }
+        let client = builder
+            .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(client),

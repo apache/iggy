@@ -71,6 +71,37 @@ python basic/consumer.py
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
 
+## Transport Protocol Examples
+
+Each of the non-TCP transports has its own example pair, using the explicit
+
+`IggyClient.quic()`/`IggyClient.http()`/`IggyClient.websocket()` constructors (`IggyClient(...)`
+
+already covers TCP). These assume a server started with defaults, which enables all four
+
+transports (`cargo run --bin iggy-server`, or the `docker run` command above).
+
+### QUIC
+
+```bash
+uv run quic/producer.py
+uv run quic/consumer.py
+```
+
+### HTTP
+
+```bash
+uv run http/producer.py
+uv run http/consumer.py
+```
+
+### WebSocket
+
+```bash
+uv run websocket/producer.py
+uv run websocket/consumer.py
+```
+
 ## TLS Examples
 
 To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:

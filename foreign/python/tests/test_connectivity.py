@@ -19,7 +19,14 @@ import pytest
 
 from apache_iggy import IggyClient
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
+from .utils import (
+    get_http_server_config,
+    get_quic_server_config,
+    get_server_config,
+    get_websocket_server_config,
+    wait_for_ping,
+    wait_for_server,
+)
 
 
 class TestConnectivity:
@@ -40,6 +47,7 @@ class TestConnectivity:
             "iggy+http://iggy:iggy@127.0.0.1:3000?heartbeat_interval=5s&retries=3",
             "iggy+ws://iggy:iggy@127.0.0.1:8092",
             "iggy+ws://iggy:iggy@127.0.0.1:8092?heartbeat_interval=5s&reconnection_retries=3&reconnection_interval=1s&reestablish_after=5s&read_buffer_size=4096&write_buffer_size=4096&max_write_buffer_size=8192&max_message_size=16384&max_frame_size=16384&accept_unmasked_frames=false&tls_domain=localhost&tls_ca_file=unused.pem&tls_validate_certificate=false&tls=false",
+            "iggy+quic://iggy:iggy@127.0.0.1:8080",
         ],
     )
     @pytest.mark.asyncio
@@ -47,6 +55,30 @@ class TestConnectivity:
         """Test that valid connection string formats can connect to the server."""
 
         client = IggyClient.from_connection_string(connection_string)
+        await client.connect()
+        await wait_for_ping(client, timeout=5, interval=1)
+
+    @pytest.mark.parametrize("transport", ["tcp", "quic", "http", "websocket"])
+    @pytest.mark.asyncio
+    async def test_explicit_transport_constructor_connects(self, transport: str):
+        """Test each per-transport constructor connects and responds to ping."""
+        if transport == "tcp":
+            host, port = get_server_config()
+            wait_for_server(host, port)
+            client = IggyClient.tcp(server_address=f"{host}:{port}")
+        elif transport == "quic":
+            # QUIC is UDP, so `wait_for_server`'s TCP connect check doesn't apply.
+            host, port = get_quic_server_config()
+            client = IggyClient.quic(server_address=f"{host}:{port}")
+        elif transport == "http":
+            host, port = get_http_server_config()
+            wait_for_server(host, port)
+            client = IggyClient.http(api_url=f"http://{host}:{port}")
+        else:
+            host, port = get_websocket_server_config()
+            wait_for_server(host, port)
+            client = IggyClient.websocket(server_address=f"{host}:{port}")
+
         await client.connect()
         await wait_for_ping(client, timeout=5, interval=1)
 
@@ -77,7 +109,6 @@ class TestConnectivity:
                 "iggy+tcp://iggy:iggy@{host}:{port}?invalid_option=value",
                 "Invalid connection string",
             ),
-            ("iggy+quic://iggy:iggy@127.0.0.1:8080", "Cannot create endpoint"),
         ],
     )
     def test_invalid_connection_string(self, invalid_value: str, expected_error: str):

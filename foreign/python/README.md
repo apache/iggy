@@ -58,6 +58,33 @@ maturin develop
 pytest tests/ -v # Run tests (requires iggy-server running)
 ```
 
+## Connecting
+
+`IggyClient` supports all four transport protocols. Use the matching constructor, or build a
+client from a connection string (`iggy+<protocol>://user:pass@host:port`, e.g. `iggy+quic://...`):
+
+```python
+from apache_iggy import IggyClient
+
+# TCP (also the `IggyClient(server_address)` shorthand). Default: 127.0.0.1:8090
+client = IggyClient.tcp(server_address="127.0.0.1:8090")
+
+# QUIC. Default: 127.0.0.1:8080
+client = IggyClient.quic(server_address="127.0.0.1:8080")
+
+# HTTP. Default: http://127.0.0.1:3000
+client = IggyClient.http(api_url="http://127.0.0.1:3000")
+
+# WebSocket. Default: 127.0.0.1:8092
+client = IggyClient.websocket(server_address="127.0.0.1:8092")
+
+# Or from a connection string, which also supports TLS and other options:
+client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+```
+
+`tcp()` and `websocket()` also accept `tls_enabled`, `tls_domain`, `tls_ca_file`, and
+`tls_validate_certificate` keyword arguments.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.

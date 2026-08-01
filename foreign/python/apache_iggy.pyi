@@ -326,6 +326,98 @@ class IggyClient:
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
         """
+    @classmethod
+    def tcp(
+        cls,
+        server_address: builtins.str | None = None,
+        tls_enabled: builtins.bool = False,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool = True,
+        no_delay: builtins.bool = False,
+    ) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the TCP transport.
+
+        Args:
+            server_address: TCP server address as `host:port`. Defaults to `127.0.0.1:8090`.
+            tls_enabled: Whether to use TLS when connecting to the server. Defaults to `False`.
+            tls_domain: Domain to use for TLS when connecting to the server.
+            tls_ca_file: Path to the CA certificate file for TLS.
+            tls_validate_certificate: Whether to validate the TLS certificate. Defaults to `True`.
+            no_delay: Whether to disable Nagle's algorithm on the TCP socket. Defaults to `False`.
+
+        Returns:
+            A new `IggyClient` configured for TCP.
+
+        Raises:
+            PyRuntimeError: If the client configuration is invalid.
+        """
+    @classmethod
+    def quic(
+        cls,
+        server_address: builtins.str | None = None,
+        server_name: builtins.str | None = None,
+    ) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the QUIC transport.
+
+        Args:
+            server_address: QUIC server address as `host:port`. Defaults to `127.0.0.1:8080`.
+            server_name: Server name used for the QUIC/TLS handshake. Defaults to `localhost`.
+
+        Returns:
+            A new `IggyClient` configured for QUIC.
+
+        Raises:
+            PyRuntimeError: If the client configuration is invalid.
+        """
+    @classmethod
+    def http(
+        cls,
+        api_url: builtins.str | None = None,
+        retries: builtins.int | None = None,
+        jwt: builtins.str | None = None,
+    ) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the HTTP transport.
+
+        Args:
+            api_url: Base URL of the Iggy HTTP API. Defaults to `http://127.0.0.1:3000`.
+            retries: Number of retries to perform on transient errors. Defaults to `3`.
+            jwt: JWT token for A2A (Agent-to-Agent) authentication.
+
+        Returns:
+            A new `IggyClient` configured for HTTP.
+
+        Raises:
+            PyRuntimeError: If the client configuration is invalid.
+        """
+    @classmethod
+    def websocket(
+        cls,
+        server_address: builtins.str | None = None,
+        tls_enabled: builtins.bool = False,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool = False,
+    ) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the WebSocket transport.
+
+        Args:
+            server_address: WebSocket server address as `host:port`. Defaults to `127.0.0.1:8092`.
+            tls_enabled: Whether to use TLS when connecting to the server. Defaults to `False`.
+            tls_domain: Domain to use for TLS when connecting to the server.
+            tls_ca_file: Path to the CA certificate file for TLS.
+            tls_validate_certificate: Whether to validate the TLS certificate. Defaults to `False`.
+
+        Returns:
+            A new `IggyClient` configured for WebSocket.
+
+        Raises:
+            PyRuntimeError: If the client configuration is invalid.
+        """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
