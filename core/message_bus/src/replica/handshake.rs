@@ -54,8 +54,12 @@
 //! trusted L2 boundary (cluster-local VPC, dedicated private subnet,
 //! encrypted overlay such as `WireGuard`, or an air-gapped management
 //! network).
-//
-// TODO(hubcio): follow-up - dual-key rotation acceptance window.
+//!
+//! Rotating the PSK is NOT a coordinated-restart change: a verify-only
+//! acceptance window for the retiring key
+//! (`cluster.auth.previous_shared_secret`) lets a rolling three-step
+//! rotation keep every mid-roll handshake verifiable; see the
+//! [`ReplicaAuth`] rustdoc for the procedure.
 
 use crate::framing;
 use crate::replica::auth::{self, ChannelBinding, HandshakeStatus, ReplicaAuth, Transcript};
@@ -64,6 +68,7 @@ use compio::io::{AsyncRead, AsyncWrite};
 use iggy_binary_protocol::{Command2, HEADER_SIZE};
 use iggy_common::IggyError;
 use rustls::pki_types::ServerName;
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,9 +95,11 @@ pub struct ReplicaHandshakeCtx {
 /// `server` drives the acceptor (TLS server) role on a delegated inbound
 /// connection; `client` drives the dialer role on a delegated outbound
 /// one. `peer_names` maps a replica id to the name the dialer presents
-/// in SNI and verifies the peer's certificate against; in self-signed
-/// mode the client config's verifier accepts any certificate and only
-/// the PSK handshake authenticates the peer, so the name only feeds SNI.
+/// in SNI and verifies the peer's certificate against; keyed explicitly
+/// by id (not roster position) so sparse ids from dynamic replica join
+/// cannot verify against another peer's name. In self-signed mode the
+/// client config's verifier accepts any certificate and only the PSK
+/// handshake authenticates the peer, so the name only feeds SNI.
 ///
 /// Both configs are TLS 1.3 only with the `iggy-replica` ALPN
 /// ([`crate::transports::tls::REPLICA_ALPN`]); a client-plane TLS
@@ -101,8 +108,8 @@ pub struct ReplicaHandshakeCtx {
 pub struct ReplicaTlsCtx {
     pub server: Arc<rustls::ServerConfig>,
     pub client: Arc<rustls::ClientConfig>,
-    /// Indexed by replica id; same length as the roster.
-    pub peer_names: Vec<ServerName<'static>>,
+    /// Keyed by replica id; one entry per roster node.
+    pub peer_names: HashMap<u8, ServerName<'static>>,
 }
 
 /// Run the acceptor half on a delegated inbound stream and return the
