@@ -1007,7 +1007,9 @@ class TcpConfig:
                 taken from `server_address`.
             tls_ca_file: Path to the CA file for TLS.
             tls_validate_certificate: Whether to validate the server certificate.
-                Defaults to validating.
+                Defaults to validating. Disabling this accepts any certificate the
+                server presents, including self-signed and mismatched ones; intended
+                for local development only.
             nodelay: Disable the Nagle algorithm for the TCP socket. Defaults to
                 leaving it on.
 
