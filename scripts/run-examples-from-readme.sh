@@ -197,6 +197,10 @@ run_rust_examples() {
     # Pre-flight: run CLI commands from root README
     _rust_preflight() {
         run_readme_commands "README.md" '^[`]cargo run --bin iggy -- '
+        if [ "${README_COMMANDS_EXECUTED}" -eq 0 ]; then
+            echo -e "\e[31mNo CLI commands extracted from README.md; the preflight pattern is stale.\e[0m"
+            EXAMPLES_EXIT_CODE=1
+        fi
     }
 
     run_language_examples \
