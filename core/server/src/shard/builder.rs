@@ -37,7 +37,10 @@ use server_common::sharding::{IggyNamespace, PartitionLocation};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize},
+    },
 };
 
 #[derive(Default)]
@@ -59,6 +62,7 @@ pub struct IggyShardBuilder {
     metadata: Option<Metadata>,
     metadata_writer: Option<MetadataWriter>,
     poll_waiters: Option<Arc<Mutex<PollWaiterRegistry>>>,
+    poll_waiters_live: Option<Arc<AtomicUsize>>,
 }
 
 impl IggyShardBuilder {
@@ -135,6 +139,11 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn poll_waiters_live(mut self, poll_waiters_live: Arc<AtomicUsize>) -> Self {
+        self.poll_waiters_live = Some(poll_waiters_live);
+        self
+    }
+
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
@@ -183,7 +192,9 @@ impl IggyShardBuilder {
             poll_waiters: self
                 .poll_waiters
                 .unwrap_or_else(|| Arc::new(Mutex::new(PollWaiterRegistry::default()))),
-            poll_waiters_live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            poll_waiters_live: self
+                .poll_waiters_live
+                .unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
             encryptor,
             config,
             _version: version,

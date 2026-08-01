@@ -341,6 +341,7 @@ fn main() -> Result<(), ServerError> {
         let client_manager: EternalPtr<DashMap<u32, Client>> = client_manager.into();
         let client_manager = ClientManager::new(client_manager);
         let poll_waiters = Arc::new(Mutex::new(PollWaiterRegistry::default()));
+        let poll_waiters_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Populate shards_table from SharedMetadata partitions (hierarchical traversal)
         metadata.with_metadata(|metadata| {
@@ -387,6 +388,7 @@ fn main() -> Result<(), ServerError> {
             );
             let client_manager = client_manager.clone();
             let poll_waiters = poll_waiters.clone();
+            let poll_waiters_live = poll_waiters_live.clone();
             let shard_metadata = metadata.clone();
 
             // Take metadata_writer for shard 0 only
@@ -435,7 +437,8 @@ fn main() -> Result<(), ServerError> {
                                 .is_follower(is_follower)
                                 .current_replica_id(replica_id)
                                 .metadata(shard_metadata)
-                                .poll_waiters(poll_waiters);
+                                .poll_waiters(poll_waiters)
+                                .poll_waiters_live(poll_waiters_live);
 
                             if let Some(writer) = shard_metadata_writer {
                                 builder = builder.metadata_writer(writer);
