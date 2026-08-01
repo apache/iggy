@@ -48,6 +48,25 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
+# A connector test is not one thread of work. It spawns an iggy-server-ng
+# pinned to a 4-CPU window (see `build_envs` in the harness), a connectors
+# runtime, and a Docker container. Left at one slot each, a 16-core runner
+# starts 16 of them at once - 64 pinned shard threads plus 16 containers - and
+# the fixtures fail on their own readiness budgets (`/ping did not respond`,
+# `container startup timeout`) long before the slow-timeout fires. Charging
+# four slots holds the runner at roughly four concurrent connector tests while
+# still letting light tests fill the remainder.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/^connectors::/)'
+threads-required = 4
+
+# Same accounting for the harness-backed server suites. These spawn one to
+# three iggy-server-ng processes each (no container), so they cost less than a
+# connector test but well more than one thread.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/^(server|data_integrity|cluster|state|storage)::/)'
+threads-required = 2
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
