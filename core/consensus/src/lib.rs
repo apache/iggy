@@ -148,9 +148,10 @@ where
 }
 
 pub mod client_table;
+pub mod le_cursor;
 pub use client_table::{
-    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableCodecError, ClientTableDecodeError,
-    ClientTableSnapshot, CommitReply,
+    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableSnapshot,
+    ClientTableWireError, CommitReply,
 };
 pub mod state_manifest;
 pub use state_manifest::{

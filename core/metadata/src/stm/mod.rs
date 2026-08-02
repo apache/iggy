@@ -441,7 +441,7 @@ macro_rules! collect_handlers {
                             },
                         )*
                         [<$state Command>]::RestoreSnapshot(snapshot) => {
-                            *self = Self::inner_from_snapshot(snapshot.clone());
+                            self.restore_in_place(snapshot.clone());
                             $crate::stm::result::ApplyReply::default()
                         },
                     });

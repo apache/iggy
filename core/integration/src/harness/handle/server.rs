@@ -211,6 +211,21 @@ impl ServerHandle {
             .map_or(0, |log| strip_ansi(&log).matches(marker).count())
     }
 
+    /// This node's stdout log with ANSI escapes stripped, the same text
+    /// [`Self::stdout_occurrences`] matches against. Empty when the log is
+    /// missing or unreadable.
+    ///
+    /// For callers that need to PARSE a marker's fields (`checkpoint_op=193`
+    /// reaches the file as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`) rather
+    /// than just count occurrences of it.
+    #[must_use]
+    pub fn stdout_plain(&self) -> String {
+        self.stdout_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map_or_else(String::new, |log| strip_ansi(&log))
+    }
+
     /// Returns a `ClientBuilder` using the test transport.
     ///
     /// Returns an error if no test transport is configured.
@@ -1010,8 +1025,6 @@ impl ServerHandle {
     /// the committed prefix the node missed no longer exists as WAL entries on
     /// the peers that checkpointed it.
     pub fn restart_from_clean_slate(&mut self) -> Result<(), TestBinaryError> {
-        let cleanup = self.config.cleanup;
-        self.config.cleanup = false;
         self.stop_dependents()?;
         self.stop()?;
 
@@ -1023,7 +1036,6 @@ impl ServerHandle {
             })?;
         }
 
-        self.config.cleanup = cleanup;
         self.start()
     }
 }

@@ -1779,7 +1779,12 @@ async fn build_shard_for_thread(
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
     shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
-    shard.set_clients_table_max(config.metadata.clients_table_max);
+    // Bounds a served state-transfer chunk. A frame above the bus ceiling is
+    // rejected by the RECEIVING transport, which tears the replica connection
+    // down rather than dropping one message.
+    shard.set_bus_max_message_size(
+        usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
+    );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1813,6 +1818,10 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(
+    configs::ng_cluster::STATE_CHUNK_HEADER_LEN
+        == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
+);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {

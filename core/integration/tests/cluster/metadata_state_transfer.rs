@@ -193,23 +193,10 @@ async fn given_checkpointed_cluster_when_fresh_node_joins_late_should_state_tran
 async fn assert_pairing_matches_install(harness: &TestHarness, node: usize) {
     const PAIRING_MARKER: &str = "state transfer recorded its checkpoint pairing";
 
-    // The server colors its tracing fields, so `checkpoint_op=193` reaches the log
-    // as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`. Strip escapes before matching,
-    // the same reason `ServerHandle::stdout_occurrences` does.
-    let (stdout, _stderr) = harness.node(node).collect_logs();
-    let mut plain = String::with_capacity(stdout.len());
-    let mut chars = stdout.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for escaped in chars.by_ref() {
-                if escaped.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            plain.push(c);
-        }
-    }
+    // Escapes stripped by the harness: the server colors its tracing fields, so
+    // `checkpoint_op=193` reaches the log as
+    // `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`.
+    let plain = harness.node(node).stdout_plain();
     let recorded_op: u64 = plain
         .lines()
         .filter(|line| line.contains(PAIRING_MARKER))

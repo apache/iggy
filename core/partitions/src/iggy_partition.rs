@@ -1371,7 +1371,7 @@ where
                 );
                 assert!(
                     !consensus.is_transferring(),
-                    "drain_request_queue_into_prepares: must not be syncing"
+                    "drain_request_queue_into_prepares: must not be transferring state"
                 );
                 let prepare = req.message.project(consensus);
                 consensus.verify_pipeline();

@@ -745,10 +745,56 @@ struct MetadataRepairSession {
     idle_ticks: u32,
 }
 
+/// The metadata state machine, as every handler that walks or restores it
+/// needs it.
+///
+/// A blanket-implemented alias for a three-part bound that was pasted verbatim
+/// at eleven sites across this file and `router.rs`. No API change: anything
+/// satisfying the parts satisfies this.
+pub trait MetadataStm:
+    StreamsFrontend
+    + StateMachine<
+        Input = Message<PrepareHeader>,
+        Output = metadata::stm::result::ApplyReply,
+        Error = iggy_common::IggyError,
+    >
+{
+}
+
+impl<M> MetadataStm for M where
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = metadata::stm::result::ApplyReply,
+            Error = iggy_common::IggyError,
+        >
+{
+}
+
+/// [`MetadataStm`] plus in-place snapshot restore: the additional capability a
+/// state-transfer install needs over a plain commit walk.
+pub trait RestorableMetadataStm:
+    MetadataStm
+    + metadata::stm::snapshot::RestoreSnapshotInPlace<metadata::stm::snapshot::MetadataSnapshot>
+{
+}
+
+impl<M> RestorableMetadataStm for M where
+    M: MetadataStm
+        + metadata::stm::snapshot::RestoreSnapshotInPlace<metadata::stm::snapshot::MetadataSnapshot>
+{
+}
+
 /// Chunk size for state-transfer artifact pulls. Lockstep (one in flight),
-/// so the bounded per-peer bus queue can never drop a burst tail; the bus
-/// message cap is far above this.
+/// so the bounded per-peer bus queue can never drop a burst tail. Clamped
+/// against the live bus ceiling by
+/// [`IggyShard::state_chunk_len_max`] rather than assumed to fit.
 const STATE_CHUNK_LEN: u32 = 256 * 1024;
+
+/// Bus frame ceiling assumed before bootstrap overrides it. Matches the
+/// shipped `[message_bus] max_message_size` so the simulator and unit tests
+/// clamp the same way a default deployment does.
+const DEFAULT_BUS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Stall rounds a receiver spends on ONE peer before abandoning the transfer
 /// and falling back to journal repair. The retry has no peer re-selection, so
@@ -762,6 +808,14 @@ const STATE_TRANSFER_MAX_STALL_RETRIES: u32 = 5;
 /// that stopped being pulled -- a receiver that finished installing (the
 /// protocol has no completion frame) or gave up.
 const STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE: u32 = 10;
+
+/// Lifetime of a FULLY SERVED offer, as a multiple of the repair-retry
+/// interval. It only has to outlive the receiver re-requesting a lost final
+/// chunk, but the receiver's stall re-request fires at exactly one such
+/// interval, so a one-interval grace is a coin flip against its own retry plus
+/// a network hop -- and losing the race costs a full re-pull (`UnknownOffer`
+/// drops the session with every byte already downloaded).
+const STATE_TRANSFER_SERVED_EXPIRY_MULTIPLE: u32 = 3;
 
 /// One artifact of an accepted transfer target: its manifest entry plus the
 /// bytes received so far (chunks are sequential, so `buf.len()` doubles as
@@ -794,11 +848,6 @@ struct MetadataTransferSession {
     /// Whether a descriptor has been accepted (an accepted EMPTY manifest is
     /// distinguishable from "still waiting").
     target_accepted: bool,
-    /// Stall rounds this session has burned. Bounded by
-    /// [`STATE_TRANSFER_MAX_STALL_RETRIES`]: the retry always targets the same
-    /// `peer`, so a peer that dies mid-transfer would otherwise wedge the
-    /// rejoining node forever.
-    attempts: u32,
     /// Ticks with no frame progress; at the configured repair-retry
     /// threshold the missing piece is re-requested.
     idle_ticks: u32,
@@ -808,9 +857,12 @@ struct MetadataTransferSession {
 /// primary). Keyed by requester replica id so a rebooted requester's fresh
 /// nonce replaces the stale offer; chunks must all come from ONE offer or
 /// the artifact checksums cannot hold.
+///
+/// The offer itself is refcounted, so simultaneous rejoiners on the same
+/// snapshot generation share one copy of the snapshot bytes.
 struct ServedStateTransfer {
     nonce: u128,
-    offer: metadata::StateTransferOffer,
+    offer: Rc<metadata::StateTransferOffer>,
     /// Ticks since this offer last served a chunk. An offer owns a full copy of
     /// the snapshot and the encoded client table, so a completed or abandoned
     /// transfer must not pin them for the process lifetime. There is no
@@ -945,17 +997,27 @@ where
     /// `[cluster] repair_chunk_max` at bootstrap.
     repair_chunk_max: Cell<u64>,
 
-    /// Capacity for a state-transferred client table
-    /// ([`consensus::ClientTable::decode`]). Defaults to
-    /// [`consensus::CLIENTS_TABLE_MAX`]; server-ng overrides it from
-    /// `[metadata] clients_table_max` at bootstrap so the installed table
-    /// matches the configured capacity instead of the compile-time default.
-    clients_table_max: Cell<usize>,
-
     /// Live stalled-repair retry threshold in consensus ticks. Defaults to
     /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
     /// `[cluster] repair_retry_interval` at bootstrap.
     repair_retry_ticks: Cell<u32>,
+
+    /// Live `[message_bus] max_message_size`. Bounds a served state chunk: a
+    /// frame above this is rejected by the RECEIVING transport, which tears
+    /// down the whole replica connection. Defaults to a value that leaves
+    /// [`STATE_CHUNK_LEN`] usable; server-ng overrides it at bootstrap.
+    bus_max_message_size: Cell<usize>,
+
+    /// Consecutive metadata state-transfer rounds that made no progress.
+    ///
+    /// Deliberately NOT on [`MetadataTransferSession`]: three of the four
+    /// arming sites mint a fresh session, so a per-session counter bounded
+    /// nothing -- a permanently undecodable peer cycled abandon -> repair ->
+    /// `RangeEvicted` -> re-arm at zero forever. Held here it survives the
+    /// cycle, and it is reset by actual progress (see
+    /// [`IggyShard::note_metadata_transfer_progress`]) so scattered transient
+    /// stalls cannot accumulate into abandoning a nearly-complete transfer.
+    metadata_transfer_attempts: Cell<u32>,
 }
 
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -1052,7 +1114,8 @@ where
             metadata_transfer_offers: RefCell::new(HashMap::new()),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
-            clients_table_max: Cell::new(consensus::CLIENTS_TABLE_MAX),
+            bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
+            metadata_transfer_attempts: Cell::new(0),
         })
     }
 
@@ -1070,12 +1133,11 @@ where
         self.repair_chunk_max.set(chunk);
     }
 
-    /// Override the state-transfer client-table capacity from configuration
-    /// (`[metadata] clients_table_max`). Called once per shard at bootstrap;
-    /// the simulator and tests keep the compile-time
-    /// [`consensus::CLIENTS_TABLE_MAX`] default.
-    pub fn set_clients_table_max(&self, max_clients: usize) {
-        self.clients_table_max.set(max_clients);
+    /// Override the message-bus frame ceiling from configuration
+    /// (`[message_bus] max_message_size`). Called once per shard at bootstrap;
+    /// the simulator and tests keep the compile-time default.
+    pub fn set_bus_max_message_size(&self, max_message_size: usize) {
+        self.bus_max_message_size.set(max_message_size);
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1286,7 +1348,8 @@ where
             metadata_transfer_offers: RefCell::new(HashMap::new()),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
-            clients_table_max: Cell::new(consensus::CLIENTS_TABLE_MAX),
+            bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
+            metadata_transfer_attempts: Cell::new(0),
         }
     }
 
@@ -2104,12 +2167,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            >,
+        M: MetadataStm,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -2121,9 +2179,12 @@ where
             if planes.0.persist_superblock_if_needed(consensus).await {
                 dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
             }
+            // Same transfer gate as `on_start_view` and `on_commit`: the
+            // pre-install STM must not walk while a transfer is in flight.
             if actions
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
+                && !consensus.is_transferring()
             {
                 planes.0.commit_journal().await;
             }
@@ -2162,12 +2223,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            >,
+        M: MetadataStm,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -2176,6 +2232,12 @@ where
             && consensus.namespace() == header.namespace
         {
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
+            // Every rejection path (wrong primary, old view, stale incarnation,
+            // below the commit floor, self-sent) returns no actions, and an
+            // adopted StartView always emits at least `CommitJournal`. That
+            // makes emptiness the adoption signal -- and the arms below must
+            // not fire on a StartView this replica did not adopt.
+            let adopted = !actions.is_empty();
             if planes.0.persist_superblock_if_needed(consensus).await {
                 dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
             }
@@ -2186,6 +2248,12 @@ where
             // snapshot already contains, and the transfer replaces the table
             // anyway.
             //
+            // Gated on `adopted`: a stale StartView leaves `header.replica`
+            // pointing at a replica that need not be primary, and re-arming on
+            // one would re-mint the nonce (dropping the descriptor already in
+            // flight through the nonce filter) and, before the budget moved off
+            // the session, reset the retry bound as well.
+            //
             // Outside the superblock gate above: that gate fail-closes the VSR
             // actions this replica would VOUCH with (notably `PrepareOk`) until
             // the adopted view is durable. Requesting a transfer vouches for
@@ -2193,24 +2261,26 @@ where
             // withholds `PrepareOk` on its own (`is_transferring`). Gating it
             // would also wedge the one path that repairs a replica whose gap
             // sits below every peer's floor.
-            if consensus.state_transfer_stage() == consensus::StateTransferStage::AwaitingTarget {
-                let nonce = iggy_common::random_id::get_uuid();
-                *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
-                    nonce,
-                    peer: header.replica,
-                    commit_op: 0,
-                    artifacts: Vec::new(),
-                    target_accepted: false,
-                    attempts: 0,
-                    idle_ticks: 0,
-                });
+            if adopted
+                && consensus.state_transfer_stage() == consensus::StateTransferStage::AwaitingTarget
+            {
                 tracing::info!(
                     shard = self.id,
                     peer = header.replica,
                     "adopted a live view while awaiting transfer; requesting metadata state transfer"
                 );
-                self.send_request_state_transfer(consensus, header.replica, nonce)
-                    .await;
+                self.arm_metadata_transfer(consensus, header.replica).await;
+                return;
+            }
+            // Mid-transfer the pre-install STM must not walk: the snapshot
+            // being installed already contains those ops, and a walk that
+            // advances `commit_min` past the incoming `snapshot_seq` flips the
+            // install to table-only (no STM restore, no persist, no pairing)
+            // while still reporting success. Landing inside the install's
+            // superblock await instead trips `set_commit_floor`'s anti-rewind
+            // assert. The `AwaitingTarget` return above covers only that one
+            // stage; `Fetching` and `Installing` fall through to here.
+            if consensus.is_transferring() {
                 return;
             }
             // `dispatch_vsr_actions` deliberately no-ops `CommitJournal` (it
@@ -2297,12 +2367,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            >,
+        M: MetadataStm,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -2684,12 +2749,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            >,
+        M: MetadataStm,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -2762,25 +2822,15 @@ where
                     if consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
                         *self.metadata_repair.borrow_mut() = None;
                         consensus.begin_state_transfer_await();
-                        let nonce = iggy_common::random_id::get_uuid();
-                        *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
-                            nonce,
-                            peer: header.replica,
-                            commit_op: 0,
-                            artifacts: Vec::new(),
-                            target_accepted: false,
-                            attempts: 0,
-                            idle_ticks: 0,
-                        });
                         tracing::info!(
                             shard = self.id,
                             peer = header.replica,
                             retained_from = header.op,
                             local_commit = consensus.commit_min(),
+                            attempts = self.metadata_transfer_attempts.get(),
                             "metadata repair floor evicted; converting to state transfer"
                         );
-                        self.send_request_state_transfer(consensus, header.replica, nonce)
-                            .await;
+                        self.arm_metadata_transfer(consensus, header.replica).await;
                     } else {
                         tracing::debug!(
                             shard = self.id,
@@ -3052,7 +3102,7 @@ where
     ) where
         B: MessageBus,
     {
-        let manifest = offer.map(|offer| consensus::encode_state_manifest(&offer.artifacts));
+        let manifest = offer.map(|offer| consensus::encode_state_manifest(&offer.manifest()));
         let total_size =
             size_of::<StateTransferTargetHeader>() + manifest.as_ref().map_or(0, Vec::len);
         let mut msg = Message::<StateTransferTargetHeader>::new(total_size);
@@ -3125,12 +3175,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            >,
+        M: MetadataStm,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -3140,17 +3185,34 @@ where
         if consensus.namespace() != header.namespace {
             return;
         }
-        let offer = planes.0.state_transfer_offer();
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
-        if let Some(offer) = offer {
-            tracing::info!(
+
+        // First-wins per (requester, nonce). A stall-retry `RequestStateTransfer`
+        // reuses the session nonce, and rebuilding under it would replace a
+        // manifest the receiver may already have accepted: the client table is
+        // encoded live, so a rebuild that is SHORTER (a client logged out between
+        // the two builds) lands the receiver's cursor exactly at the new length
+        // and it re-requests an empty tail forever. Re-answering with the SAME
+        // offer is also what makes the retry idempotent.
+        let cached = self
+            .metadata_transfer_offers
+            .borrow_mut()
+            .get_mut(&header.replica)
+            .filter(|served| served.nonce == header.nonce)
+            .map(|served| {
+                // A descriptor retry proves the requester is alive and still
+                // wants THIS offer, so it counts as liveness: without the reset
+                // the offer could age out mid-retry and the rebuild that
+                // replaced it is exactly what first-wins exists to prevent.
+                served.idle_ticks = 0;
+                Rc::clone(&served.offer)
+            });
+        if let Some(offer) = cached {
+            tracing::debug!(
                 shard = self.id,
                 requester = header.replica,
-                commit_op = offer.commit_op,
-                artifacts = offer.artifacts.len(),
-                total_len = offer.artifacts.iter().map(|a| a.len).sum::<u64>(),
-                "serving metadata state transfer"
+                "re-answering a state transfer request from the offer already served"
             );
             self.send_state_transfer_target(
                 cluster,
@@ -3161,31 +3223,60 @@ where
                 Some(&offer),
             )
             .await;
-            self.metadata_transfer_offers.borrow_mut().insert(
-                header.replica,
-                ServedStateTransfer {
-                    nonce: header.nonce,
-                    offer,
-                    idle_ticks: 0,
-                    fully_served: false,
-                },
-            );
-        } else {
-            tracing::info!(
-                shard = self.id,
-                requester = header.replica,
-                "cannot serve metadata state transfer (not a caught-up \
-                 primary, or no snapshot persisted); requester falls back"
-            );
-            self.send_state_transfer_target(
-                cluster,
-                self_id,
-                header.replica,
-                header.nonce,
-                header.namespace,
-                None,
-            )
-            .await;
+            return;
+        }
+
+        match planes.0.state_transfer_offer() {
+            Ok(offer) => {
+                tracing::info!(
+                    shard = self.id,
+                    requester = header.replica,
+                    commit_op = offer.commit_op,
+                    snapshot_seq = offer.snapshot_seq,
+                    artifacts = offer.len(),
+                    total_len = offer.total_len(),
+                    "serving metadata state transfer"
+                );
+                self.send_state_transfer_target(
+                    cluster,
+                    self_id,
+                    header.replica,
+                    header.nonce,
+                    header.namespace,
+                    Some(&offer),
+                )
+                .await;
+                self.metadata_transfer_offers.borrow_mut().insert(
+                    header.replica,
+                    ServedStateTransfer {
+                        nonce: header.nonce,
+                        offer,
+                        idle_ticks: 0,
+                        fully_served: false,
+                    },
+                );
+            }
+            Err(reason) => {
+                // Log the ACTUAL reason: "no snapshot yet" is routine and the
+                // requester recovers through journal repair, while an unreadable
+                // or corrupt `snapshot.bin` is an operator-visible fault on THIS
+                // node that the old catch-all message actively misattributed.
+                tracing::info!(
+                    shard = self.id,
+                    requester = header.replica,
+                    %reason,
+                    "cannot serve metadata state transfer; requester falls back"
+                );
+                self.send_state_transfer_target(
+                    cluster,
+                    self_id,
+                    header.replica,
+                    header.nonce,
+                    header.namespace,
+                    None,
+                )
+                .await;
+            }
         }
     }
 
@@ -3201,14 +3292,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + metadata::stm::snapshot::RestoreSnapshotInPlace<
-                metadata::stm::snapshot::MetadataSnapshot,
-            >,
+        M: RestorableMetadataStm,
     {
         /// Alloc cap per artifact: a corrupt length field must not OOM the
         /// shard. Far above any real metadata snapshot or client table.
@@ -3348,6 +3432,10 @@ where
         let Some(ref consensus) = planes.0.consensus else {
             return;
         };
+        // Same clamp the serving side applies, so a bus ceiling below
+        // `STATE_CHUNK_LEN` shrinks the ask instead of leaving the server to
+        // silently serve less than was requested.
+        let chunk_len_max = self.state_chunk_len_max() as u64;
         let request = {
             let session = self.metadata_transfer.borrow();
             session.as_ref().and_then(|session| {
@@ -3362,7 +3450,7 @@ where
                 let offset = artifact.buf.len() as u64;
                 let remaining = artifact.entry.len - offset;
                 #[allow(clippy::cast_possible_truncation)]
-                let len = remaining.min(u64::from(STATE_CHUNK_LEN)) as u32;
+                let len = remaining.min(chunk_len_max) as u32;
                 #[allow(clippy::cast_possible_truncation)]
                 Some((session.nonce, session.peer, index as u32, offset, len))
             })
@@ -3380,6 +3468,68 @@ where
             )
             .await;
         }
+    }
+
+    /// Arm a fresh metadata transfer session against `peer` and request its
+    /// descriptor.
+    ///
+    /// Every arming site goes through here. Three near-identical session
+    /// literals had already drifted on the retry budget, which is why that
+    /// budget now lives on the shard ([`Self::metadata_transfer_attempts`])
+    /// instead of being re-minted with each session.
+    #[allow(clippy::future_not_send)]
+    async fn arm_metadata_transfer<P>(&self, consensus: &VsrConsensus<B, P>, peer: u8)
+    where
+        B: MessageBus,
+        P: Pipeline<Entry = consensus::PipelineEntry>,
+    {
+        let nonce = iggy_common::random_id::get_uuid();
+        *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
+            nonce,
+            peer,
+            commit_op: 0,
+            artifacts: Vec::new(),
+            target_accepted: false,
+            idle_ticks: 0,
+        });
+        self.send_request_state_transfer(consensus, peer, nonce)
+            .await;
+    }
+
+    /// Largest state-chunk PAYLOAD this side will put on the wire.
+    ///
+    /// Clamped so header + payload stays inside the bus ceiling. Above it the
+    /// RECEIVING transport rejects the frame and tears down the entire replica
+    /// connection, which surfaces to an operator as an unexplained link flap.
+    /// Both ends derive their chunk size from this same function, so a bus cap
+    /// below [`STATE_CHUNK_LEN`] shrinks the chunk rather than making large
+    /// artifacts untransferable.
+    fn state_chunk_len_max(&self) -> usize {
+        let budget = self
+            .bus_max_message_size
+            .get()
+            .saturating_sub(size_of::<StateChunkHeader>());
+        // A bus cap at or below one header cannot carry a chunk at all. Serve
+        // one byte at a time rather than zero: a zero-length chunk is the
+        // livelock `on_request_state_chunk` refuses, and the boot validator
+        // rejects this configuration anyway.
+        budget.clamp(1, STATE_CHUNK_LEN as usize)
+    }
+
+    /// Burn one retry round; `true` once the budget is exhausted.
+    fn burn_metadata_transfer_attempt(&self) -> bool {
+        let attempts = self.metadata_transfer_attempts.get() + 1;
+        self.metadata_transfer_attempts.set(attempts);
+        attempts > STATE_TRANSFER_MAX_STALL_RETRIES
+    }
+
+    /// Real progress: reset the retry budget.
+    ///
+    /// The budget bounds CONSECUTIVE failures, not lifetime ones. Without this
+    /// five stalls scattered across a large transfer would abandon one that was
+    /// nearly done, throwing away every byte already pulled.
+    fn note_metadata_transfer_progress(&self) {
+        self.metadata_transfer_attempts.set(0);
     }
 
     /// Serve one chunk out of the cached offer. An unknown nonce (offer
@@ -3401,6 +3551,12 @@ where
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
 
+        // Never serve a frame the receiving transport will reject: anything past
+        // `max_message_size` tears down the whole replica connection, which reads
+        // as an unexplained link flap. Bounded by the requester's own ask, this
+        // side's chunk size, and what the bus will carry.
+        let chunk_len_max = self.state_chunk_len_max();
+
         // Frame built inside the borrow; every send runs after it drops (a
         // RefCell borrow must not cross an await on the shard).
         // Out-of-bounds requests are dropped silently inside the block.
@@ -3410,39 +3566,54 @@ where
                 .get_mut(&header.replica)
                 .filter(|served| served.nonce == header.nonce);
             served.map_or(Some(ChunkReply::UnknownOffer), |served| {
-                // Serving a chunk is the only liveness signal the offer gets;
-                // the expiry sweep drops it once these stop arriving.
-                served.idle_ticks = 0;
                 // Manifest-index addressing: an index past the offer is a
                 // requester bug (or a stale frame) and is dropped below.
-                let last_artifact = served.offer.payloads.len().saturating_sub(1);
-                let artifact_bytes = served.offer.payloads.get(header.artifact as usize)?;
+                let last_artifact = served.offer.len().saturating_sub(1);
+                let artifact_bytes = served.offer.payload(header.artifact as usize)?;
                 let start = header.offset as usize;
-                let end = start.saturating_add(header.len as usize);
-                // Tail of the final artifact: the receiver now holds everything
+                // A request AT the end of an artifact has nothing left to serve.
+                // Answering it with `Some(&[])` -- which `get(len..len)` happily
+                // returns -- would extend nothing on the receiver, reset both
+                // sides' idle counters, and be re-requested at the same offset
+                // forever: an unbounded empty-frame ping-pong with the rejoining
+                // replica withholding `PrepareOk` for the life of the process.
+                // Reachable when a rebuilt offer is SHORTER than the manifest the
+                // receiver accepted (a client logged out between the two builds).
+                if start >= artifact_bytes.len() {
+                    return None;
+                }
+                let end = start
+                    .saturating_add((header.len as usize).min(chunk_len_max))
+                    .min(artifact_bytes.len());
+                let payload = artifact_bytes.get(start..end)?;
+                // Only now that bytes are actually going out: an out-of-bounds or
+                // stale frame must not flip a live offer onto the short expiry.
+                // Tail of the final artifact means the receiver holds everything
                 // the manifest promised, so the offer only has to outlive a
                 // possible re-request of this very chunk.
                 if header.artifact as usize == last_artifact && end >= artifact_bytes.len() {
                     served.fully_served = true;
                 }
-                artifact_bytes
-                    .get(start..end.min(artifact_bytes.len()))
-                    .map(|payload| {
-                        let total_size = size_of::<StateChunkHeader>() + payload.len();
-                        let mut chunk = Message::<StateChunkHeader>::new(total_size);
-                        chunk.as_mut_slice()[size_of::<StateChunkHeader>()..]
-                            .copy_from_slice(payload);
-                        ChunkReply::Chunk(chunk.transmute_header(|_, h: &mut StateChunkHeader| {
-                            h.command = Command2::StateChunk;
-                            h.cluster = cluster;
-                            h.replica = self_id;
-                            h.nonce = header.nonce;
-                            h.namespace = header.namespace;
-                            h.artifact = header.artifact;
-                            h.offset = header.offset;
-                            h.size = total_size as u32;
-                        }))
-                    })
+                // Serving a chunk is the only liveness signal the offer gets;
+                // the expiry sweep drops it once these stop arriving. Set here
+                // rather than on entry so a request that serves NOTHING cannot
+                // keep an abandoned offer alive.
+                served.idle_ticks = 0;
+                let total_size = size_of::<StateChunkHeader>() + payload.len();
+                let mut chunk = Message::<StateChunkHeader>::new(total_size);
+                chunk.as_mut_slice()[size_of::<StateChunkHeader>()..].copy_from_slice(payload);
+                Some(ChunkReply::Chunk(chunk.transmute_header(
+                    |_, h: &mut StateChunkHeader| {
+                        h.command = Command2::StateChunk;
+                        h.cluster = cluster;
+                        h.replica = self_id;
+                        h.nonce = header.nonce;
+                        h.namespace = header.namespace;
+                        h.artifact = header.artifact;
+                        h.offset = header.offset;
+                        h.size = total_size as u32;
+                    },
+                )))
             })
         };
         match reply {
@@ -3492,14 +3663,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + metadata::stm::snapshot::RestoreSnapshotInPlace<
-                metadata::stm::snapshot::MetadataSnapshot,
-            >,
+        M: RestorableMetadataStm,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -3536,9 +3700,19 @@ where
                 );
                 return;
             }
+            // A zero-byte payload is not progress: it extends nothing and the
+            // same offset is re-requested immediately. Resetting the liveness
+            // counters on one is what turned a short rebuilt offer into an
+            // unbounded empty-frame ping-pong. The serving side refuses to
+            // produce these now; the guard stays because a peer running an
+            // older build still can.
+            if payload.is_empty() {
+                return;
+            }
             artifact.buf.extend_from_slice(payload);
             session.idle_ticks = 0;
         }
+        self.note_metadata_transfer_progress();
         self.on_transfer_progress().await;
     }
 
@@ -3557,19 +3731,35 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StreamsFrontend
-            + StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + metadata::stm::snapshot::RestoreSnapshotInPlace<
-                metadata::stm::snapshot::MetadataSnapshot,
-            >,
+        M: RestorableMetadataStm,
     {
         let planes = self.plane.inner();
         let Some(ref consensus) = planes.0.consensus else {
             return;
         };
+        // The stage is the authority on whether this transfer is still wanted,
+        // and it can be cleared from OUTSIDE this file: the probe-exhausted
+        // election fallback lives in the consensus crate, which cannot reach
+        // `metadata_transfer`, so it drops the stage to `Idle` (legal from
+        // `Fetching`, hence silent) and leaves the session armed with its nonce
+        // intact. Chunks then keep arriving, the pull completes, and the
+        // `Installing` transition below asserts on an `Idle -> Installing` edge
+        // that takes down shard 0. Drop the abandoned session here instead --
+        // this is the single funnel both descriptor acceptance and chunk
+        // arrival pass through.
+        let stage = consensus.state_transfer_stage();
+        if stage != consensus::StateTransferStage::Fetching {
+            if self.metadata_transfer.borrow().is_some() {
+                tracing::info!(
+                    shard = self.id,
+                    ?stage,
+                    "metadata state transfer was abandoned out from under its session; \
+                     dropping it"
+                );
+                *self.metadata_transfer.borrow_mut() = None;
+            }
+            return;
+        }
         let complete = {
             let session = self.metadata_transfer.borrow();
             match session.as_ref() {
@@ -3592,7 +3782,6 @@ where
             .expect("session checked above");
         let peer = session.peer;
         let commit_op = session.commit_op;
-        let attempts = session.attempts;
 
         // Per-artifact integrity, then pick the pieces this plane installs.
         // Unknown kinds are refused rather than skipped: an artifact the
@@ -3633,10 +3822,23 @@ where
         let decoded = if damaged {
             None
         } else if let (Some(snapshot), Some((table_bytes, table_frontier))) = (snapshot, table) {
-            match consensus::ClientTable::decode(&table_bytes, self.clients_table_max.get()) {
+            // Decode against the LIVE table's capacity, not a separately
+            // plumbed config cell. The serving primary's table can legitimately
+            // hold more entries than this node's configured cap -- heterogeneous
+            // config, or homogeneous config after a cap reduction, since
+            // `from_snapshot` sizes capacity to `max(min_slots, highest_slot +
+            // 1)`. Against the raw config value that is a deterministic
+            // `TooManyEntries` every round: a permanent, log-only join failure.
+            let capacity = planes.0.client_table_capacity();
+            match consensus::ClientTable::decode(&table_bytes, capacity) {
                 Ok(table) => Some((snapshot, table, table_frontier)),
                 Err(error) => {
-                    tracing::error!(shard = self.id, %error, "transferred client table undecodable");
+                    tracing::error!(
+                        shard = self.id,
+                        capacity,
+                        %error,
+                        "transferred client table undecodable"
+                    );
                     None
                 }
             }
@@ -3652,17 +3854,16 @@ where
             // Damage is usually transit corruption, which a re-fetch fixes. But
             // it can also be permanent -- a peer whose artifacts this build
             // cannot decode, or an unknown artifact kind -- and that re-offers
-            // identically every round. Carry the attempt count across the
-            // restart and share the stall budget, so a re-fetch that keeps
-            // failing gives up instead of pulling the whole snapshot forever.
-            // Distinct from the stall path: frames ARE flowing here, so
+            // identically every round. The budget lives on the shard, so it
+            // survives the abandon -> repair -> re-arm cycle and a re-fetch that
+            // keeps failing gives up instead of pulling the whole snapshot
+            // forever. Distinct from the stall path: frames ARE flowing here, so
             // `idle_ticks` never accumulates and that sweep can never fire.
-            let attempts = attempts + 1;
-            if attempts > STATE_TRANSFER_MAX_STALL_RETRIES {
+            if self.burn_metadata_transfer_attempt() {
                 tracing::warn!(
                     shard = self.id,
                     peer,
-                    attempts,
+                    attempts = self.metadata_transfer_attempts.get(),
                     "state transfer artifacts kept failing to decode; abandoning \
                      and falling back to journal repair"
                 );
@@ -3678,18 +3879,7 @@ where
             if consensus.state_transfer_stage() == consensus::StateTransferStage::Fetching {
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::AwaitingTarget);
             }
-            let nonce = iggy_common::random_id::get_uuid();
-            *self.metadata_transfer.borrow_mut() = Some(MetadataTransferSession {
-                nonce,
-                peer,
-                commit_op: 0,
-                artifacts: Vec::new(),
-                target_accepted: false,
-                attempts,
-                idle_ticks: 0,
-            });
-            self.send_request_state_transfer(consensus, peer, nonce)
-                .await;
+            self.arm_metadata_transfer(consensus, peer).await;
             return;
         };
 
@@ -3699,39 +3889,38 @@ where
             .install_state_transfer(&snapshot, table, table_frontier, commit_op)
             .await
         {
-            Ok(applied_frontier) => {
+            Ok(outcome) => {
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
-                // `applied_frontier`, not the transferred snapshot's op: the install
-                // returns `max(snapshot_seq, local_applied)`, which differs whenever a
-                // serving peer offers a snapshot BEHIND this replica (checkpoints are
-                // node-local) and the local state machine is kept instead.
-                tracing::info!(
-                    shard = self.id,
-                    applied_frontier,
-                    commit_op,
-                    table_frontier,
-                    "metadata state transfer installed; handing tail to journal repair"
-                );
+                // A completed install: the budget starts fresh for any later
+                // rejoin rather than carrying this one's stalls forward.
+                self.note_metadata_transfer_progress();
+                if outcome.pairing_durable {
+                    // `applied_frontier`, not the transferred snapshot's op: the install
+                    // returns `max(snapshot_seq, local_applied)`, which differs whenever a
+                    // serving peer offers a snapshot BEHIND this replica (checkpoints are
+                    // node-local) and the local state machine is kept instead.
+                    tracing::info!(
+                        shard = self.id,
+                        applied_frontier = outcome.applied_frontier,
+                        commit_op,
+                        table_frontier,
+                        "metadata state transfer installed; handing tail to journal repair"
+                    );
+                } else {
+                    // Deliberately NOT prefixed with the success line's text:
+                    // the specs match log substrings, so a shared prefix would
+                    // let every one of them pass on the degraded path.
+                    tracing::warn!(
+                        shard = self.id,
+                        applied_frontier = outcome.applied_frontier,
+                        commit_op,
+                        table_frontier,
+                        "metadata state transfer landed WITHOUT a durable checkpoint \
+                         pairing; the next superblock write records it"
+                    );
+                }
                 // Walk whatever is already walkable, then let repair fetch
                 // the (snapshot_seq, commit_max] tail.
-                planes.0.commit_journal().await;
-                self.maybe_request_metadata_repair(consensus, peer).await;
-            }
-            // Installed, but its `(checkpoint_op, checksum)` pairing is not durable
-            // yet. Not a failed install: the snapshot, table and frontiers are all in
-            // place, and the coordinator already holds the new pairing, so the next
-            // superblock write (view change or checkpoint) records it. Until then a
-            // crash recovers the PREVIOUS checkpoint and this replica transfers again,
-            // which is correct, just wasted work. Continue as a success.
-            Err(metadata::stm::snapshot::SnapshotError::SuperblockNotDurable { op }) => {
-                consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
-                tracing::warn!(
-                    shard = self.id,
-                    snapshot_seq = op,
-                    commit_op,
-                    "metadata state transfer installed but its checkpoint pairing is \
-                     not durable yet; the next superblock write records it"
-                );
                 planes.0.commit_journal().await;
                 self.maybe_request_metadata_repair(consensus, peer).await;
             }
@@ -3886,14 +4075,15 @@ where
         // built and breaking transfers outright.
         let retry_ticks = self.repair_retry_ticks.get().max(1);
         let idle_expiry_ticks = retry_ticks.saturating_mul(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE);
+        let served_expiry_ticks = retry_ticks.saturating_mul(STATE_TRANSFER_SERVED_EXPIRY_MULTIPLE);
         let mut offers = self.metadata_transfer_offers.borrow_mut();
         offers.retain(|requester, served| {
             served.idle_ticks += 1;
             // A fully-served offer only has to outlive a re-request of its last
-            // chunk, so it goes after one retry interval; anything else is an
+            // chunk, so it goes on the short clock; anything else is an
             // abandoned transfer and waits out the full idle window.
             let expiry_ticks = if served.fully_served {
-                retry_ticks
+                served_expiry_ticks
             } else {
                 idle_expiry_ticks
             };
@@ -3908,6 +4098,11 @@ where
             }
             live
         });
+        // Nobody is pulling: release the cached snapshot copy too, rather than
+        // pinning it for the life of the process.
+        if offers.is_empty() {
+            self.plane.metadata().clear_state_transfer_offer_cache();
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -3968,23 +4163,19 @@ where
                     return None;
                 }
                 session.idle_ticks = 0;
-                session.attempts += 1;
-                Some((
-                    session.peer,
-                    session.nonce,
-                    session.target_accepted,
-                    session.attempts,
-                ))
+                Some((session.peer, session.nonce, session.target_accepted))
             })
         };
-        if let Some((peer, nonce, target_accepted, attempts)) = transfer_stalled {
+        if let Some((peer, nonce, target_accepted)) = transfer_stalled {
+            let exhausted = self.burn_metadata_transfer_attempt();
+            let attempts = self.metadata_transfer_attempts.get();
             // Retrying the same peer forever is a wedge when that peer is the
             // thing that died: nothing in this loop re-selects a target. Give up
             // after a bounded number of rounds and fall back to journal repair,
             // which re-picks a peer and, if the gap is still below its retained
             // floor, answers `RangeEvicted` and arms a fresh transfer against
             // whoever is primary now.
-            if attempts > STATE_TRANSFER_MAX_STALL_RETRIES {
+            if exhausted {
                 tracing::warn!(
                     shard = self.id,
                     peer,

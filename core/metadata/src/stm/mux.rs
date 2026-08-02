@@ -194,8 +194,22 @@ where
     Tail: RestoreSnapshotInPlace<SnapshotData>,
 {
     fn restore_snapshot_in_place(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        // Two-phase, and the reason this is not a plain `?`-chain: the halves
+        // mutate independently with no rollback between them, and the caller
+        // has already persisted the transferred snapshot and seeded its
+        // pairing by the time it gets here. A half-restored mux would then be
+        // fed the local WAL's contiguous suffix by the follow-up
+        // `commit_journal`, replaying it into only the half that moved. The
+        // boot path fail-stops on the same input; this makes the running path
+        // agree.
+        self.check_restorable(snapshot)?;
         self.0.restore_snapshot_in_place(snapshot)?;
         self.1.restore_snapshot_in_place(snapshot)
+    }
+
+    fn check_restorable(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        self.0.check_restorable(snapshot)?;
+        self.1.check_restorable(snapshot)
     }
 }
 
@@ -205,6 +219,10 @@ where
 {
     fn restore_snapshot_in_place(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
         self.inner.restore_snapshot_in_place(snapshot)
+    }
+
+    fn check_restorable(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        self.inner.check_restorable(snapshot)
     }
 }
 

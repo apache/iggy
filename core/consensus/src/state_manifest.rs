@@ -35,6 +35,7 @@
 //!
 //! [`kind`]: StateArtifact::kind
 
+use crate::le_cursor::{LeCursor, Truncated, split_verified_trailer};
 use std::hash::Hasher;
 use twox_hash::XxHash3_64;
 
@@ -128,6 +129,12 @@ impl std::fmt::Display for StateManifestError {
 
 impl std::error::Error for StateManifestError {}
 
+impl From<Truncated> for StateManifestError {
+    fn from(_: Truncated) -> Self {
+        Self::Truncated
+    }
+}
+
 /// Format tag for [`encode_state_manifest`]; bump on incompatible change
 /// (appending entry fields is compatible, see `entry_len`).
 pub const STATE_MANIFEST_MAGIC: [u8; 4] = *b"ISM1";
@@ -167,9 +174,8 @@ pub fn encode_state_manifest(artifacts: &[StateArtifact]) -> Vec<u8> {
         out.extend_from_slice(&artifact.len.to_le_bytes());
         out.extend_from_slice(&artifact.checksum.to_le_bytes());
     }
-    let mut hasher = XxHash3_64::new();
-    hasher.write(&out);
-    out.extend_from_slice(&hasher.finish().to_le_bytes());
+    let trailer = state_artifact_checksum(&out);
+    out.extend_from_slice(&trailer.to_le_bytes());
     out
 }
 
@@ -186,21 +192,12 @@ pub fn encode_state_manifest(artifacts: &[StateArtifact]) -> Vec<u8> {
 /// # Panics
 /// Unreachable: slice-to-array conversions are length-checked first.
 pub fn decode_state_manifest(bytes: &[u8]) -> Result<Vec<StateArtifact>, StateManifestError> {
-    const TRAILER: usize = size_of::<u64>();
-    let content_len = bytes
-        .len()
-        .checked_sub(TRAILER)
-        .ok_or(StateManifestError::Truncated)?;
-    let (content, trailer) = bytes.split_at(content_len);
-    let expected = u64::from_le_bytes(trailer.try_into().expect("trailer is 8 bytes"));
-    let mut hasher = XxHash3_64::new();
-    hasher.write(content);
-    let actual = hasher.finish();
-    if expected != actual {
-        return Err(StateManifestError::ChecksumMismatch { expected, actual });
-    }
+    let content = split_verified_trailer(bytes).map_err(|mismatch| match mismatch {
+        Some((expected, actual)) => StateManifestError::ChecksumMismatch { expected, actual },
+        None => StateManifestError::Truncated,
+    })?;
 
-    let mut reader = ManifestReader { bytes: content };
+    let mut reader = LeCursor::new(content);
     if reader.take(STATE_MANIFEST_MAGIC.len())? != STATE_MANIFEST_MAGIC {
         return Err(StateManifestError::BadMagic);
     }
@@ -215,8 +212,7 @@ pub fn decode_state_manifest(bytes: &[u8]) -> Result<Vec<StateArtifact>, StateMa
 
     let mut artifacts = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let entry = reader.take(entry_len as usize)?;
-        let mut entry = ManifestReader { bytes: entry };
+        let mut entry = LeCursor::new(reader.take(entry_len as usize)?);
         artifacts.push(StateArtifact {
             kind: entry.u8()?,
             frontier: entry.u64()?,
@@ -224,38 +220,10 @@ pub fn decode_state_manifest(bytes: &[u8]) -> Result<Vec<StateArtifact>, StateMa
             checksum: entry.u64()?,
         });
     }
-    if !reader.bytes.is_empty() {
+    if !reader.remaining().is_empty() {
         return Err(StateManifestError::Truncated);
     }
     Ok(artifacts)
-}
-
-/// Little-endian cursor over the encoded manifest content.
-struct ManifestReader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> ManifestReader<'a> {
-    const fn take(&mut self, len: usize) -> Result<&'a [u8], StateManifestError> {
-        if self.bytes.len() < len {
-            return Err(StateManifestError::Truncated);
-        }
-        let (head, tail) = self.bytes.split_at(len);
-        self.bytes = tail;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8, StateManifestError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, StateManifestError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4B")))
-    }
-
-    fn u64(&mut self) -> Result<u64, StateManifestError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8B")))
-    }
 }
 
 #[cfg(test)]

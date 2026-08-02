@@ -819,6 +819,15 @@ impl Snapshotable for Users {
 }
 
 impl UsersInner {
+    /// Rebuild from a snapshot section IN PLACE (state transfer), absorbed on
+    /// both left-right buffers.
+    ///
+    /// Nothing here is shared across buffers the way `StreamsInner`'s stats
+    /// registry is, so a wholesale replace is correct.
+    pub(crate) fn restore_in_place(&mut self, snapshot: UsersSnapshot) {
+        *self = Self::inner_from_snapshot(snapshot);
+    }
+
     /// Build a complete `UsersInner` from a snapshot section. Shared by
     /// wrapper construction ([`Snapshotable::from_snapshot`]) and the
     /// in-place restore command (state transfer), which absorbs it on both

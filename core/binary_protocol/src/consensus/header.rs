@@ -1364,11 +1364,22 @@ impl ConsensusHeader for RequestStateTransferHeader {
         self.size
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::RequestStateTransfer {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::RequestStateTransfer,
                 found: self.command,
+            });
+        }
+        // Header-only frame, so the size is fully determined. `EvictionHeader`
+        // pins the same way; the generic `Message::try_from` bound makes this
+        // safe either way, but a validate that checks what it can keeps the
+        // surface uniform across frames.
+        if self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidSize {
+                expected: HEADER_SIZE as u32,
+                found: self.size,
             });
         }
         Ok(())
@@ -1440,7 +1451,12 @@ impl ConsensusHeader for StateTransferTargetHeader {
             ));
         }
         // Unavailable is a bare refusal; a manifest body on it would be
-        // ambiguous (which offer would the chunks belong to?).
+        // ambiguous (which offer would the chunks belong to?). An
+        // `available == 1` body is left unbounded here on purpose: it carries
+        // the state manifest, whose entry count and per-artifact/total lengths
+        // are bounded where it is decoded (`STATE_MANIFEST_ENTRIES_MAX`, plus
+        // the receiver's artifact caps), and the generic `Message::try_from`
+        // bound already keeps `size` inside the frame.
         if self.available == 0 && self.size as usize != HEADER_SIZE {
             return Err(ConsensusError::InvalidField(
                 "unavailable descriptor must be header-only".to_string(),
@@ -1499,6 +1515,7 @@ impl ConsensusHeader for RequestStateChunkHeader {
         self.size
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::RequestStateChunk {
             return Err(ConsensusError::InvalidCommand {
@@ -1510,6 +1527,14 @@ impl ConsensusHeader for RequestStateChunkHeader {
             return Err(ConsensusError::InvalidField(
                 "chunk len must be non-zero".to_string(),
             ));
+        }
+        // Header-only frame; the requested `len` describes the REPLY, which the
+        // serving side clamps against its own chunk size and the bus ceiling.
+        if self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidSize {
+                expected: HEADER_SIZE as u32,
+                found: self.size,
+            });
         }
         Ok(())
     }

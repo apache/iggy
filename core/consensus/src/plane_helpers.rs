@@ -42,7 +42,7 @@ pub async fn pipeline_prepare_common<C, F>(
     assert!(consensus.is_normal(), "on_request: status must be normal");
     assert!(
         !consensus.is_transferring(),
-        "on_request: must not be syncing"
+        "on_request: must not be transferring state"
     );
 
     consensus.verify_pipeline();

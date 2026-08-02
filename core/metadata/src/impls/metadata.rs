@@ -809,6 +809,11 @@ pub struct IggyMetadata<C, J, S, M> {
     /// them (re-running `commit_register` would double-bump epochs). `0`
     /// outside state transfer (no op is skipped). Monotone per install.
     client_table_frontier: Cell<u64>,
+    /// Last built [`StateTransferOffer`], shared by every requester of the same
+    /// snapshot generation. Rebuilding per request re-reads and re-decodes the
+    /// whole snapshot on shard 0's pump, and hands each requester its own
+    /// multi-MB copy.
+    transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -849,11 +854,34 @@ where
             default_max_topic_size: Cell::new(u64::MAX),
             default_message_expiry: Cell::new(u64::MAX),
             client_table_frontier: Cell::new(0),
+            transfer_offer_cache: RefCell::new(None),
         }
     }
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+    /// Slot capacity of the LIVE client table, i.e. the largest transferred
+    /// table this replica can absorb.
+    ///
+    /// Read at decode instead of a separately plumbed `clients_table_max`: the
+    /// live table sizes itself to `max(configured, highest recovered slot + 1)`,
+    /// so a serving primary can legitimately hold more entries than this node's
+    /// raw config value and decoding against that value would reject every
+    /// round.
+    #[must_use]
+    pub fn client_table_capacity(&self) -> usize {
+        self.client_table.borrow().capacity()
+    }
+
+    /// Drop the cached state-transfer offer, releasing its snapshot copy.
+    ///
+    /// Called by the shard's expiry sweep once no requester holds an offer:
+    /// the cache exists to collapse repeat builds within one rejoin, not to
+    /// pin a snapshot for the life of the process.
+    pub fn clear_state_transfer_offer_cache(&self) {
+        self.transfer_offer_cache.borrow_mut().take();
+    }
+
     /// Install (or replace) the post-commit notifier. Passing `None`
     /// removes any previous one. Server-ng bootstrap calls this on shard 0
     /// only; peer shards never commit metadata locally.
@@ -1338,20 +1366,125 @@ where
 
 /// One state-transfer serving payload.
 ///
-/// The on-disk snapshot bytes plus the live client table, both
+/// The on-disk snapshot payload plus the live client table, both
 /// frontier-stamped. Built by [`IggyMetadata::state_transfer_offer`] on the
-/// serving primary; the shard caches it per requester and serves chunks
-/// from it.
+/// serving primary; the shard serves chunks out of it and shares one instance
+/// across every requester of the same snapshot generation.
 pub struct StateTransferOffer {
     /// Serving primary's applied frontier when the offer was built; the
     /// receiver's tail repair targets past this.
     pub commit_op: u64,
-    /// Manifest entries, index-aligned with `payloads`. Metadata plane:
-    /// `[METADATA_SNAPSHOT (frontier = sequence_number),
-    ///   CLIENT_TABLE (frontier = commit_min at encode)]`.
-    pub artifacts: Vec<consensus::StateArtifact>,
-    /// Artifact bytes, chunk-served by `(manifest index, offset)`.
-    pub payloads: Vec<Vec<u8>>,
+    /// The offered snapshot's `sequence_number`, i.e. the generation this
+    /// offer describes. Reused as the cache key: a later checkpoint rewrites
+    /// `snapshot.bin` and invalidates every payload below.
+    pub snapshot_seq: u64,
+    /// Manifest entries paired with their bytes. One `Vec` of pairs rather
+    /// than two index-aligned `Vec`s: the manifest is encoded in one file and
+    /// the chunks served in another, so a desync would be invisible at both
+    /// ends. Metadata plane: `[METADATA_SNAPSHOT (frontier = sequence_number),
+    /// CLIENT_TABLE (frontier = commit_min at encode)]`.
+    ///
+    /// Payloads are refcounted so n simultaneous rejoiners share one copy
+    /// rather than pinning n multi-MB snapshots on shard 0.
+    pub artifacts: Vec<(consensus::StateArtifact, Rc<Vec<u8>>)>,
+}
+
+impl StateTransferOffer {
+    /// Manifest entries for the descriptor body.
+    #[must_use]
+    pub fn manifest(&self) -> Vec<consensus::StateArtifact> {
+        self.artifacts.iter().map(|(entry, _)| *entry).collect()
+    }
+
+    /// Bytes of the artifact at `index` in manifest order.
+    #[must_use]
+    pub fn payload(&self, index: usize) -> Option<&[u8]> {
+        self.artifacts.get(index).map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// Number of artifacts on offer.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.artifacts.len()
+    }
+
+    /// Whether the offer carries no artifacts at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.artifacts.is_empty()
+    }
+
+    /// Total advertised bytes across every artifact.
+    #[must_use]
+    pub fn total_len(&self) -> u64 {
+        self.artifacts.iter().map(|(entry, _)| entry.len).sum()
+    }
+}
+
+/// Why this replica cannot serve a state transfer right now.
+///
+/// Named rather than folded into `None` so the refusal the requester sees is
+/// logged with its actual cause: "no snapshot persisted" and "snapshot.bin is
+/// corrupt" call for opposite operator responses.
+#[derive(Debug)]
+pub enum StateTransferUnavailable {
+    /// Not a caught-up primary, so a client-table read would not be
+    /// authoritative.
+    NotCaughtUpPrimary,
+    /// This shard has no snapshot coordinator, so it never checkpoints.
+    NoCoordinator,
+    /// No snapshot has ever been persisted. The WAL still holds the full
+    /// history, so the requester's journal repair covers its whole gap.
+    NoSnapshot,
+    /// `snapshot.bin` exists but could not be read, or failed its integrity
+    /// trailer. Refusing is strictly better than shipping it: the receiver
+    /// would re-seal the corruption under a fresh valid trailer.
+    SnapshotUnreadable(SnapshotError),
+}
+
+impl std::fmt::Display for StateTransferUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCaughtUpPrimary => write!(f, "not a caught-up primary"),
+            Self::NoCoordinator => write!(f, "no snapshot coordinator on this shard"),
+            Self::NoSnapshot => write!(f, "no snapshot has been persisted yet"),
+            Self::SnapshotUnreadable(source) => {
+                write!(f, "persisted snapshot is unreadable: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateTransferUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SnapshotUnreadable(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// What a completed [`IggyMetadata::install_state_transfer`] landed.
+///
+/// A degraded install is reported HERE rather than as an `Err`, because it is
+/// a success: the snapshot, table, frontiers and commit point are all in
+/// place by the time the pairing write is attempted. Returning it as an error
+/// invites a caller to treat a completed install as a failure and redo it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallOutcome {
+    /// The receiver's new applied frontier, `max(snapshot_seq,
+    /// local_applied)`. These differ whenever a serving peer offered a
+    /// snapshot BEHIND this replica and the local state machine was kept.
+    pub applied_frontier: u64,
+    /// Whether the transferred checkpoint's `(checkpoint_op, checksum)`
+    /// pairing reached the durable superblock.
+    ///
+    /// `false` leaves the install fully usable: the coordinator already holds
+    /// the new pairing, so the next superblock write (view change or
+    /// checkpoint) records it. Until then a crash recovers the PREVIOUS
+    /// checkpoint and this replica transfers again -- correct, just wasted
+    /// work.
+    pub pairing_durable: bool,
 }
 
 impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
@@ -1366,45 +1499,96 @@ where
             Error = iggy_common::IggyError,
         >,
 {
-    /// Build a state-transfer offer for a restarted peer, or `None` when
-    /// this replica cannot serve one right now: not a caught-up primary
-    /// (table reads would not be authoritative), or no snapshot has ever
-    /// been persisted (the WAL then still holds the full history and the
-    /// requester's journal repair covers the whole gap).
+    /// Build a state-transfer offer for a restarted peer.
     ///
-    /// The snapshot is served as the on-disk bytes verbatim -- possibly
-    /// stale, which costs nothing: the receiver journal-repairs
-    /// `(snapshot_seq, commit_max]` afterwards through the existing repair
-    /// machinery. The table is encoded live at this instant; both frontier
-    /// stamps read `commit_min` inside one synchronous region, so they are
-    /// mutually consistent.
-    #[must_use]
-    pub fn state_transfer_offer(&self) -> Option<StateTransferOffer> {
-        let consensus = self.consensus.as_ref()?;
+    /// The snapshot is served as the on-disk PAYLOAD, with its integrity
+    /// trailer verified and stripped. Both halves matter. Verified, because a
+    /// flipped bit inside the payload that still msgpack-decodes would
+    /// otherwise be re-sealed on the receiver under a fresh valid trailer and
+    /// a matching pairing: a fault the source node refuses to boot over would
+    /// become undetectable on the second node. Stripped, because the receiver
+    /// re-persists what it is sent through `write_durably`, which appends a
+    /// trailer of its own -- shipping the sealed file grows `snapshot.bin` by
+    /// one trailer per transfer generation and leaves it byte-shape-different
+    /// from a locally checkpointed one.
+    ///
+    /// The snapshot may be stale, which costs nothing: the receiver
+    /// journal-repairs `(snapshot_seq, commit_max]` afterwards through the
+    /// existing repair machinery. The table is encoded live at this instant;
+    /// both frontier stamps read `commit_min` inside one synchronous region,
+    /// so they are mutually consistent.
+    ///
+    /// The result is cached and shared: a repeat request for the same snapshot
+    /// generation reuses it instead of re-reading and re-decoding the file on
+    /// shard 0's pump.
+    ///
+    /// # Errors
+    /// [`StateTransferUnavailable`] naming why this replica cannot serve.
+    pub fn state_transfer_offer(&self) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(StateTransferUnavailable::NoCoordinator)?;
         if !is_caught_up_primary(consensus) {
-            return None;
+            return Err(StateTransferUnavailable::NotCaughtUpPrimary);
         }
-        let coordinator = self.coordinator.as_ref()?;
-        let snapshot = std::fs::read(coordinator.snapshot_path()).ok()?;
-        let snapshot_seq = IggySnapshot::decode(&snapshot).ok()?.sequence_number();
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(StateTransferUnavailable::NoCoordinator)?;
+        let path = coordinator.snapshot_path();
+        if !path.exists() {
+            return Err(StateTransferUnavailable::NoSnapshot);
+        }
+        let sealed = std::fs::read(&path)
+            .map_err(|source| StateTransferUnavailable::SnapshotUnreadable(source.into()))?;
+        // Verifies the trailer and hands back the payload alone.
+        let (payload, _) =
+            split_trailer(&sealed, &path).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
+        // Still decoded rather than read off `last_checkpoint()`: `write_durably`
+        // renames before the parent-dir fsync, so a DirSync failure leaves the new
+        // file live with that cell stale, and the offer would then under-advertise
+        // the frontier it is actually shipping.
+        let snapshot_seq = IggySnapshot::decode(payload)
+            .map_err(StateTransferUnavailable::SnapshotUnreadable)?
+            .sequence_number();
+
+        // Reuse the cached offer for this generation. Only the SNAPSHOT half is
+        // expensive to rebuild, and the cached table is merely older, never
+        // incoherent: its frontier is stamped at its own encode, and the receiver
+        // replays everything above that frontier during tail repair.
+        if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
+            && cached.snapshot_seq == snapshot_seq
+        {
+            return Ok(Rc::clone(cached));
+        }
+
         let commit_op = consensus.commit_min();
         let table = self.client_table.borrow().encode();
-        Some(StateTransferOffer {
+        let offer = Rc::new(StateTransferOffer {
             commit_op,
+            snapshot_seq,
             artifacts: vec![
-                consensus::StateArtifact::for_bytes(
-                    consensus::artifact_kind::METADATA_SNAPSHOT,
-                    snapshot_seq,
-                    &snapshot,
+                (
+                    consensus::StateArtifact::for_bytes(
+                        consensus::artifact_kind::METADATA_SNAPSHOT,
+                        snapshot_seq,
+                        payload,
+                    ),
+                    Rc::new(payload.to_vec()),
                 ),
-                consensus::StateArtifact::for_bytes(
-                    consensus::artifact_kind::CLIENT_TABLE,
-                    commit_op,
-                    &table,
+                (
+                    consensus::StateArtifact::for_bytes(
+                        consensus::artifact_kind::CLIENT_TABLE,
+                        commit_op,
+                        &table,
+                    ),
+                    Rc::new(table),
                 ),
             ],
-            payloads: vec![snapshot, table],
-        })
+        });
+        *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
+        Ok(offer)
     }
 
     /// Install a fetched state transfer: persist + restore the snapshot,
@@ -1424,12 +1608,13 @@ where
     /// reconciler's periodic full diff against the committed STM, which
     /// reads the restored state on its next tick.
     ///
-    /// Returns the installed snapshot sequence (the receiver's new applied
-    /// frontier).
+    /// Returns an [`InstallOutcome`]: the new applied frontier, plus whether
+    /// the transferred checkpoint's pairing reached the durable superblock.
     ///
     /// # Errors
     /// [`SnapshotError`] when the snapshot bytes do not decode, the persist
-    /// fails, or the in-place restore is rejected.
+    /// fails, or the in-place restore is rejected. Every `Err` here means
+    /// NOTHING was installed.
     ///
     /// # Panics
     /// If called on a shard without consensus (state transfer is a shard-0
@@ -1441,7 +1626,7 @@ where
         client_table: ClientTable,
         table_frontier: u64,
         commit_op: u64,
-    ) -> Result<u64, SnapshotError>
+    ) -> Result<InstallOutcome, SnapshotError>
     where
         M: RestoreSnapshotInPlace<MetadataSnapshot>,
     {
@@ -1489,21 +1674,34 @@ where
         let local_applied = consensus.commit_min();
         let snapshot_ahead = snapshot_seq > local_applied;
 
-        // Hold the superblock gate across the ENTIRE install, not just its
-        // superblock write. A checkpoint does the same pair of steps -- rewrite
-        // `snapshot.bin`, record `(checkpoint_op, checksum)` -- so interleaving
-        // the two could leave the file from one and the durable pairing from the
-        // other, which is precisely the torn pairing the superblock exists to
-        // detect. Serializing against `checkpoint_if_needed` makes that
-        // impossible by construction rather than by argument (a transferring
-        // replica withholds acks, so it should not be committing, but "should"
-        // is not an invariant this path can rely on).
+        // Serialize the whole install against a concurrent checkpoint, in the
+        // checkpoint's own lock order (`checkpoint_lock` then
+        // `superblock_lock`), so the two cannot deadlock against each other.
         //
-        // Deadlock-free: nothing between here and the write awaits, and
-        // `write_superblock` takes no lock of its own -- the checkpoint path
-        // calls it under this same gate.
-        let _superblock_gate = if snapshot_ahead && self.superblock.is_some() {
-            Some(self.superblock_lock.acquire().await)
+        // Both do the same pair of steps -- rewrite `snapshot.bin`, record
+        // `(checkpoint_op, checksum)` -- and `checkpoint_if_needed` holds
+        // `checkpoint_lock` across BOTH while taking `superblock_lock` only
+        // around the pairing write. `superblock_lock` alone therefore
+        // serializes nothing against the checkpoint's file rewrite: interleave
+        // them and the file comes from one while the durable pairing describes
+        // the other, which is exactly the torn pairing the superblock exists to
+        // detect (a crash inside that window refuses boot with
+        // `CheckpointChecksumMismatch`). Checkpoints run on spawned tasks, so a
+        // prepare that passed preflight before the transfer armed can drive one
+        // during this install's superblock await -- a transferring replica
+        // withholds acks, but "should not be committing" is not an invariant
+        // this path can rest on.
+        //
+        // Deadlock-free: nothing between here and the superblock write awaits,
+        // and `write_superblock` takes no lock of its own.
+        let _install_gates = if snapshot_ahead {
+            let checkpoint = self.checkpoint_lock.acquire().await;
+            let superblock = if self.superblock.is_some() {
+                Some(self.superblock_lock.acquire().await)
+            } else {
+                None
+            };
+            Some((checkpoint, superblock))
         } else {
             None
         };
@@ -1589,23 +1787,27 @@ where
         // checkpoint with the WAL intact and the transfer simply retries; a crash
         // after it recovers the transferred state. Failing here withholds nothing
         // already written -- the snapshot on disk subsumes the recorded pairing, which
-        // `verify_checkpoint_pairing` accepts -- but it is still reported so the
-        // caller can retry rather than treat the install as fully durable.
+        // `verify_checkpoint_pairing` accepts -- so it is reported as a DEGRADED
+        // install rather than a failed one.
+        let mut pairing_durable = true;
         if snapshot_ahead && let Some(superblock) = self.superblock.as_ref() {
-            // Already under `_superblock_gate`, acquired above; re-acquiring here
+            // Already under `_install_gates`, acquired above; re-acquiring here
             // would deadlock on the same non-reentrant gate.
-            if !self.write_superblock(consensus, superblock.as_ref()).await {
+            pairing_durable = self.write_superblock(consensus, superblock.as_ref()).await;
+            if !pairing_durable {
                 tracing::error!(
                     snapshot_seq,
                     commit_op,
                     "state transfer installed but the superblock write failed; the \
                      transferred checkpoint is not durable yet"
                 );
-                return Err(SnapshotError::SuperblockNotDurable { op: snapshot_seq });
             }
         }
 
-        Ok(snapshot_seq.max(local_applied))
+        Ok(InstallOutcome {
+            applied_frontier: snapshot_seq.max(local_applied),
+            pairing_durable,
+        })
     }
 
     /// Submit `Register` from in-process, await commit. Wire reply still fires
@@ -2756,7 +2958,7 @@ where
             assert!(consensus.is_normal(), "promotion: status must be normal");
             assert!(
                 !consensus.is_transferring(),
-                "promotion: must not be syncing"
+                "promotion: must not be transferring state"
             );
             consensus.verify_pipeline();
             match reply_sender {

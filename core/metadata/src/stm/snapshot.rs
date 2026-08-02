@@ -53,11 +53,6 @@ pub enum SnapshotError {
         commit_op: u64,
         table_frontier: u64,
     },
-    /// A state-transfer install wrote its snapshot but could not durably record the
-    /// paired `(checkpoint_op, checksum)` in the superblock. The on-disk snapshot
-    /// subsumes the stale pairing, so recovery still accepts it; the caller retries
-    /// so the pairing (and the integrity check it powers) stops lagging.
-    SuperblockNotDurable { op: u64 },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -109,13 +104,6 @@ impl fmt::Display for SnapshotError {
                      commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
-            Self::SuperblockNotDurable { op } => {
-                write!(
-                    f,
-                    "state transfer installed a snapshot at op {op} but could not \
-                     durably pair it in the superblock"
-                )
-            }
         }
     }
 }
@@ -128,8 +116,7 @@ impl std::error::Error for SnapshotError {
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
             Self::ChecksumMismatch { .. }
             | Self::Truncated { .. }
-            | Self::IncoherentManifest { .. }
-            | Self::SuperblockNotDurable { .. } => None,
+            | Self::IncoherentManifest { .. } => None,
         }
     }
 }
@@ -310,11 +297,25 @@ pub trait RestoreSnapshot<S>: Sized {
 pub trait RestoreSnapshotInPlace<S> {
     /// Replace this state machine's contents from the snapshot.
     fn restore_snapshot_in_place(&self, snapshot: &S) -> Result<(), SnapshotError>;
+
+    /// Whether this state machine can restore from `snapshot`, WITHOUT
+    /// mutating anything.
+    ///
+    /// A mux restores its halves one at a time, so a snapshot missing the
+    /// second half would otherwise leave the first restored and the second on
+    /// pre-transfer state -- a split the caller cannot undo, because the
+    /// transferred snapshot was already persisted and its pairing seeded.
+    /// Every half agrees here before any half mutates.
+    fn check_restorable(&self, snapshot: &S) -> Result<(), SnapshotError>;
 }
 
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
 impl<S> RestoreSnapshotInPlace<S> for () {
     fn restore_snapshot_in_place(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    fn check_restorable(&self, _snapshot: &S) -> Result<(), SnapshotError> {
         Ok(())
     }
 }
@@ -398,6 +399,23 @@ macro_rules! impl_fill_restore {
                             )))
                         })
                 }
+            }
+
+            fn check_restorable(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                if snapshot.$field.is_none() {
+                    return Err(SnapshotError::Deserialize(
+                        rmp_serde::decode::Error::custom(format_args!(
+                            "Snapshot Restore Error: {}",
+                            stringify!($field)
+                        )),
+                    ));
+                }
+                Ok(())
             }
         }
     };
