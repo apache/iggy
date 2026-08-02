@@ -35,7 +35,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 hex = "0.4"
 iggy-gateway-kafka = { path = "../.." }
-indexmap = "2"
+indexmap = { workspace = true }
 kafka-protocol = "0.17"
 tokio = { workspace = true }
 tracing = { workspace = true }
