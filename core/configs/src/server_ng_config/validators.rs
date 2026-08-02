@@ -26,13 +26,18 @@
 //! net.
 
 use super::COMPONENT_NG;
-use super::cluster::http_forwarding_key_material;
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MaxTopicSize, Validatable};
 use server_common::sharding::IggyNamespace;
 use tracing::warn;
+
+/// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
+/// evaluate the `max_write_buffer_size > write_buffer_size` invariant
+/// when the operator leaves `write_buffer_size` unset; keep in sync
+/// with the defaults documented in the shipped config.toml.
+const WS_DEFAULT_WRITE_BUFFER_SIZE: u64 = 128 * 1024;
 
 impl Validatable<ConfigurationError> for ServerNgConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -83,6 +88,9 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
         })?;
         self.metadata.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate metadata config")
+        })?;
+        self.partition.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate partition config")
         })?;
         self.system
             .logging
@@ -138,21 +146,29 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // Without key material forwarding is disabled (followers answer a
-        // transient 503) and the server still boots, so it is not required
-        // here. When it IS present the operator opted into forwarding, and the
-        // roster must support it: a node listed without an http port would
-        // silently degrade every forward through it to a fail-closed 503.
-        let http_forwarding_active =
-            self.http.enabled && http_forwarding_key_material(&self.http.jwt, &self.cluster);
-        if http_forwarding_active {
+        // Cluster mode has no port fallbacks: the roster is the single source
+        // of listener ports, so every enabled transport needs an explicit
+        // per-node port. Falling back to the port of a transport's top-level
+        // `address` would hand two same-host nodes the same socket and fail
+        // only at bind time, and a portless node would silently degrade every
+        // follower-to-primary HTTP forward through it to a fail-closed 503.
+        if self.cluster.enabled {
             for node in &self.cluster.nodes {
-                if node.ports.http.is_none() {
-                    eprintln!(
-                        "cluster node '{}' has no ports.http; every node needs one when http.enabled so followers can forward to the primary",
-                        node.name
-                    );
-                    return Err(ConfigurationError::InvalidConfigurationValue);
+                let required_ports = [
+                    ("tcp", true, node.ports.tcp),
+                    ("quic", self.quic.enabled, node.ports.quic),
+                    ("http", self.http.enabled, node.ports.http),
+                    ("websocket", self.websocket.enabled, node.ports.websocket),
+                    ("tcp_replica", true, node.ports.tcp_replica),
+                ];
+                for (transport, enabled, port) in required_ports {
+                    if enabled && port.is_none() {
+                        eprintln!(
+                            "cluster node '{}' has no ports.{transport}; cluster mode requires an explicit roster port for every enabled transport",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
                 }
             }
         }
@@ -172,9 +188,129 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
                 format!("{COMPONENT_NG} (error: {e}) - failed to validate message_bus config")
             })?;
 
+        // Repair frames ride the bounded per-peer message-bus queue. A repair
+        // round of cluster.repair_chunk_max frames that meets or overruns
+        // message_bus.peer_queue_capacity drops its own tail silently, wedging
+        // the repair loop into slow retries. Keep the chunk strictly below the
+        // queue; this also floors peer_queue_capacity, which is otherwise only
+        // checked for > 0.
+        if self.cluster.repair_chunk_max >= self.message_bus.peer_queue_capacity {
+            eprintln!(
+                "{COMPONENT_NG} cluster.repair_chunk_max ({}) must be < message_bus.peer_queue_capacity ({}): repair frames ride the per-peer bus queue, so a chunk that fills or overruns it drops frames and wedges repair",
+                self.cluster.repair_chunk_max, self.message_bus.peer_queue_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // WS frame chain: websocket.max_frame_size <= websocket.max_message_size
+        // <= message_bus.max_message_size. The bus's WS / WSS install path takes
+        // its frame tuning from [websocket], so a WS ceiling above the bus's own
+        // frame cap would admit messages the bus read-side validator then tears
+        // the connection down over. An absent knob defers to the compio-ws
+        // default (16 MiB frame / 64 MiB message), which satisfies the chain
+        // against the shipped bus cap in practice.
+        let bus_max_message_size = self.message_bus.max_message_size.as_bytes_u64();
+        if let (Some(frame), Some(message)) = (
+            self.websocket.max_frame_size,
+            self.websocket.max_message_size,
+        ) && frame.as_bytes_u64() > message.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} websocket.max_frame_size ({}) exceeds websocket.max_message_size ({})",
+                frame.as_bytes_u64(),
+                message.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(message) = self.websocket.max_message_size
+            && message.as_bytes_u64() > bus_max_message_size
+        {
+            eprintln!(
+                "{COMPONENT_NG} websocket.max_message_size ({}) exceeds message_bus.max_message_size ({})",
+                message.as_bytes_u64(),
+                bus_max_message_size
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(frame) = self.websocket.max_frame_size
+            && frame.as_bytes_u64() > bus_max_message_size
+        {
+            eprintln!(
+                "{COMPONENT_NG} websocket.max_frame_size ({}) exceeds message_bus.max_message_size ({})",
+                frame.as_bytes_u64(),
+                bus_max_message_size
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // "0", "unlimited" and "none" all parse to a zero IggyByteSize. A
+        // zero WS tunable is never usable: zero message or frame ceilings
+        // reject every inbound frame, and zero buffers starve the
+        // compio-ws pipeline. Reject at boot instead of shipping a
+        // listener that cannot serve a single message.
+        for (key, size) in [
+            ("read_buffer_size", self.websocket.read_buffer_size),
+            ("write_buffer_size", self.websocket.write_buffer_size),
+            (
+                "max_write_buffer_size",
+                self.websocket.max_write_buffer_size,
+            ),
+            ("max_message_size", self.websocket.max_message_size),
+            ("max_frame_size", self.websocket.max_frame_size),
+        ] {
+            if let Some(size) = size
+                && size.as_bytes_u64() == 0
+            {
+                eprintln!(
+                    "{COMPONENT_NG} websocket.{key} must be non-zero (\"0\", \"unlimited\" and \"none\" all parse to zero)"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+        }
+
+        // tungstenite asserts `max_write_buffer_size > write_buffer_size`
+        // during connection setup, so a violating pair panics on every
+        // accepted socket. Enforce the invariant at boot; an unset
+        // write_buffer_size runs at the compio-ws default.
+        if let Some(max_write) = self.websocket.max_write_buffer_size {
+            let write_buffer_size = self
+                .websocket
+                .write_buffer_size
+                .map_or(WS_DEFAULT_WRITE_BUFFER_SIZE, |size| size.as_bytes_u64());
+            if max_write.as_bytes_u64() <= write_buffer_size {
+                eprintln!(
+                    "{COMPONENT_NG} websocket.max_write_buffer_size ({}) must exceed websocket.write_buffer_size ({write_buffer_size})",
+                    max_write.as_bytes_u64()
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+        }
+
         self.quic.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate quic config")
         })?;
+
+        // Both knobs below are live in server-ng but sit on structs the legacy
+        // server shares, so the rejects live here instead of in a `Validatable`
+        // impl that would tighten legacy boots too. `0` / `disabled` /
+        // `unlimited` all parse to the same zero duration.
+        if self
+            .consumer_group
+            .rebalancing_timeout
+            .get_duration()
+            .is_zero()
+        {
+            eprintln!(
+                "{COMPONENT_NG} consumer_group.rebalancing_timeout must be nonzero: it is the deadline after which a pending revocation completes without the source client committing what it was served, so zero force-transfers every partition on the next reconciler tick and reopens the duplicate-delivery window"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.heartbeat.enabled && self.heartbeat.interval.get_duration().is_zero() {
+            eprintln!(
+                "{COMPONENT_NG} heartbeat.interval must be nonzero when heartbeat.enabled: it sizes both the verifier's sleep and the staleness window, so zero spins the verifier and reaps every live session on its first pass"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         reject_unsupported_and_warn_inert(self)?;
 
@@ -222,6 +358,11 @@ fn reject_unsupported_and_warn_inert(config: &ServerNgConfig) -> Result<(), Conf
     }
     if config.tcp.socket_migration != defaults.tcp.socket_migration {
         warn!("tcp.socket_migration is not implemented in server-ng");
+    }
+    if config.system.partition.validate_checksum != defaults.system.partition.validate_checksum {
+        warn!(
+            "system.partition.validate_checksum is not applied in server-ng; nothing verifies checksums on load"
+        );
     }
     if config.system.segment.cache_indexes != defaults.system.segment.cache_indexes {
         warn!("system.segment.cache_indexes is not applied in server-ng");
@@ -352,6 +493,157 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn given_peer_queue_capacity_not_above_repair_chunk_max_when_validating_should_reject() {
+        // The default repair_chunk_max (128) must stay strictly below
+        // peer_queue_capacity; shrinking the queue to the chunk size is the
+        // silent wedged-repair footgun this cross-section guard closes.
+        let config = config_with_override("[message_bus]\npeer_queue_capacity = 128\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_repair_chunk_max_at_peer_queue_capacity_when_validating_should_reject() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 256\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_repair_chunk_max_below_peer_queue_capacity_when_validating_should_pass() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 255\n");
+        config
+            .validate()
+            .expect("a chunk below the peer queue capacity must validate");
+    }
+
+    #[test]
+    fn given_ws_frame_size_above_ws_message_size_when_validating_should_reject() {
+        let config = config_with_override(
+            "[websocket]\nmax_message_size = \"1 MiB\"\nmax_frame_size = \"2 MiB\"\n",
+        );
+        assert!(config.validate().is_err());
+    }
+
+    // The shipped bus cap is 64 MiB, so a 128 MiB WS ceiling breaks the chain.
+    #[test]
+    fn given_ws_message_size_above_bus_max_message_size_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_message_size = \"128 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_ws_frame_size_above_bus_max_message_size_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_frame_size = \"128 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_ws_frame_chain_in_ascending_order_when_validating_should_pass() {
+        let config = config_with_override(
+            "[websocket]\nmax_message_size = \"32 MiB\"\nmax_frame_size = \"16 MiB\"\n",
+        );
+        config
+            .validate()
+            .expect("frame <= message <= bus cap must validate");
+    }
+
+    // "unlimited" is not a supported sentinel for the WS size knobs: it
+    // parses to zero, which as a cap would reject every message.
+    #[test]
+    fn given_zero_ws_size_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_message_size = \"unlimited\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    // tungstenite panics on this pair at connection setup; boot must
+    // reject it first.
+    #[test]
+    fn given_max_write_buffer_at_write_buffer_when_validating_should_reject() {
+        let config = config_with_override(
+            "[websocket]\nwrite_buffer_size = \"256 KiB\"\nmax_write_buffer_size = \"256 KiB\"\n",
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_max_write_buffer_below_default_write_buffer_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_write_buffer_size = \"64 KiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_max_write_buffer_above_write_buffer_when_validating_should_pass() {
+        let config = config_with_override(
+            "[websocket]\nwrite_buffer_size = \"128 KiB\"\nmax_write_buffer_size = \"1 MiB\"\n",
+        );
+        config
+            .validate()
+            .expect("max write buffer above write buffer must validate");
+    }
+
+    // The size knobs are strictly typed; a malformed string must fail
+    // deserialization at load rather than degrade to the compio-ws default.
+    #[test]
+    fn given_malformed_ws_size_string_when_deserializing_should_reject() {
+        let result: Result<ServerNgConfig, _> = Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .merge(Toml::string(
+                "[websocket]\nmax_message_size = \"not-a-size\"\n",
+            ))
+            .extract();
+        assert!(
+            result.is_err(),
+            "malformed websocket.max_message_size must fail config load"
+        );
+    }
+
+    // The shipped config is single-node (cluster.enabled = false), where the
+    // cross-section rule above is the only repair_chunk_max check that used to
+    // run; its structural bounds have to hold there too.
+    #[test]
+    fn given_single_node_zero_repair_chunk_max_when_validating_should_reject() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 0\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_single_node_repair_chunk_max_above_ceiling_when_validating_should_reject() {
+        // Queue widened past the chunk so the cross-section rule passes and
+        // only the structural ceiling can reject.
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 2000\n\n[message_bus]\npeer_queue_capacity = 4096\n",
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_rebalancing_timeout_when_validating_should_reject() {
+        let config = config_with_override("[consumer_group]\nrebalancing_timeout = \"0\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_disabled_rebalancing_timeout_when_validating_should_reject() {
+        // "disabled" reads like an opt-out but parses to the same zero
+        // duration, which force-transfers every revocation instead.
+        let config = config_with_override("[consumer_group]\nrebalancing_timeout = \"disabled\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_heartbeat_interval_when_heartbeat_enabled_should_reject() {
+        let config = config_with_override("[heartbeat]\nenabled = true\ninterval = \"0\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_heartbeat_interval_when_heartbeat_disabled_should_pass() {
+        let config = config_with_override("[heartbeat]\nenabled = false\ninterval = \"0\"\n");
+        config
+            .validate()
+            .expect("a disabled heartbeat never reads its interval");
+    }
+
     /// The warn-helper baseline is [`ServerNgConfig::default`], but the reused
     /// legacy sections source that default from the legacy server config.toml,
     /// not this NG file. Pin the knobs the helper compares so any drift between
@@ -365,6 +657,10 @@ mod tests {
         let defaults = ServerNgConfig::default();
 
         assert_eq!(shipped.tcp.socket_migration, defaults.tcp.socket_migration);
+        assert_eq!(
+            shipped.system.partition.validate_checksum,
+            defaults.system.partition.validate_checksum
+        );
         assert_eq!(
             shipped.system.segment.cache_indexes,
             defaults.system.segment.cache_indexes
@@ -435,12 +731,13 @@ mod tests {
         ClusterNodeConfig {
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
+            advertised_address: None,
             replica_id,
             ports: TransportPorts {
                 tcp: Some(8090 + u16::from(replica_id)),
-                quic: None,
+                quic: Some(8080 + u16::from(replica_id)),
                 http,
-                websocket: None,
+                websocket: Some(8070 + u16::from(replica_id)),
                 tcp_replica: Some(9090 + u16::from(replica_id)),
             },
         }
@@ -466,11 +763,35 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    // Without key material forwarding is off, so the roster http-port
-    // requirement does not apply either.
+    // Cluster mode has no port fallbacks, so a portless roster node is
+    // invalid even when forwarding is off (keyless).
     #[test]
-    fn validate_accepts_keyless_cluster_http_with_portless_roster_node() {
+    fn validate_rejects_keyless_cluster_http_with_portless_roster_node() {
         let cfg = clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    // The explicit-port rule covers every enabled transport, not just http.
+    #[test]
+    fn validate_rejects_cluster_node_without_port_for_enabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = true;
+        cfg.cluster.nodes[1].ports.quic = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    // A disabled transport never binds, so its roster port may stay unset.
+    #[test]
+    fn validate_accepts_cluster_node_without_port_for_disabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = false;
+        cfg.cluster.nodes[1].ports.quic = None;
         assert!(cfg.validate().is_ok());
     }
 
@@ -494,14 +815,5 @@ mod tests {
         cfg.cluster.auth.enabled = true;
         cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_cluster_http_when_a_roster_node_has_no_http_port() {
-        let mut cfg =
-            clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
-        cfg.cluster.auth.enabled = true;
-        cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
-        assert!(cfg.validate().is_err());
     }
 }

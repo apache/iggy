@@ -85,6 +85,7 @@ use configs::server_ng::ServerNgConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::FutureExt;
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
+use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -240,7 +241,7 @@ pub async fn run_reconciler(
     reconcile_once(&ctx).await;
 
     loop {
-        let sleep = compio::time::sleep(periodic);
+        let sleep = ctx.shard.bus.sleep(periodic);
         // Biased for the same reason as the shard pump: unbiased `select!`
         // polls arms in process-random order, which a deterministic
         // simulator cannot seed. Listed order is the intended priority.
@@ -279,6 +280,11 @@ struct PassCounters {
     /// blocked by a consumer barrier or by a rejoin whose offsets land via
     /// journal repair, and neither unblocking bumps `Streams::revision`.
     trims_pending: usize,
+    /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
+    /// so the pass does not arm the fast-skip: the pump's drop clears the
+    /// tombstone and re-wakes us without bumping `Streams::revision`, so an
+    /// armed skip would swallow that wake and strand the rebuild forever.
+    deferred: usize,
 }
 
 impl PassCounters {
@@ -291,6 +297,7 @@ impl PassCounters {
             + self.stale
             + self.cg_offsets_purged
             + self.trims_pending
+            + self.deferred
     }
 }
 
@@ -311,8 +318,10 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // Fast-skip: committed partition set unchanged since the last
     // fully-converged pass and no backoff retry due, so the O(N) diff is
     // pure waste. Safe because reconcile is level-triggered: the next
-    // partition-shaping commit bumps `revision` and a pending retry keeps
-    // `failure_state` non-empty, either of which forces the next pass.
+    // partition-shaping commit bumps `revision`, a pending retry keeps
+    // `failure_state` non-empty, and a pass that found work it could not
+    // finish (a deferred rebuild, an incomplete trim) leaves
+    // `last_pass_noop` false; any of the three forces the next pass.
     if ctx.last_revision.get() == Some(revision)
         && ctx.last_pass_noop.get()
         && ctx.failure_state.borrow().is_empty()
@@ -356,6 +365,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             removed_routed = counters.removed_routed,
             backoff_skipped = counters.backoff_skipped,
             stale = counters.stale,
+            deferred = counters.deferred,
             "partition reconciler pass complete"
         );
     } else {
@@ -399,6 +409,7 @@ async fn reconcile_additions(
             // [`ReconcilerCtx::has_pending_delete_failure`]).
             if partitions.is_tombstoned(&ns) {
                 if !ctx.has_pending_delete_failure(ns) {
+                    counters.deferred += 1;
                     trace!(
                         shard = shard_id,
                         ns_raw = ns.inner(),
@@ -872,7 +883,9 @@ pub fn install_tick_handler(shard: &Rc<ServerNgShard>, wake_tx: WakeTx) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureCause, FailureRecord, ReconcilerCtx, reconcile_once};
+    use super::{
+        FailureCause, FailureRecord, ReconcilerCtx, delete_partitions_from_disk, reconcile_once,
+    };
     use configs::server_ng::{NgSystemConfig, ServerNgConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
     use iggy_binary_protocol::codec::WireEncode;
@@ -897,7 +910,7 @@ mod tests {
     use server_common::Message;
     use server_common::sharding::{IggyNamespace, ShardId};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
-    use shard::{IggyShard, PartitionConsensusConfig, ShardIdentity};
+    use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, ShardIdentity};
     use std::mem::size_of;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1097,7 +1110,7 @@ mod tests {
             journal::prepare_journal::PrepareJournal,
             IggySnapshot,
             _,
-        > = IggyMetadata::new(None, None, None, mux, None);
+        > = IggyMetadata::new(None, None, None, None, mux, None);
         let partitions = IggyPartitions::new(
             ShardId::new(shard_id),
             PartitionsConfig {
@@ -1563,6 +1576,108 @@ mod tests {
         );
     }
 
+    /// The window between the recreate committing and the reconciler
+    /// converging is a data-loss race: the namespace is byte-identical across
+    /// incarnations, so a `SendMessages` arriving inside it would otherwise be
+    /// journaled and acked against the PRIOR partition, which the reconciler
+    /// then deletes. The shard must refuse to serve until the epoch it stored
+    /// on the routing row matches the committed `created_revision` again.
+    #[compio::test]
+    async fn fence_denies_partition_request_until_recreated_incarnation_converges() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence");
+        seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_pass(&ctx).await;
+        assert!(
+            shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()),
+            "a converged partition must serve normal traffic; the fence must not \
+             deny the steady state"
+        );
+
+        // Delete + recreate the SAME tuple, reusing the freed slab key. No
+        // reconcile pass runs in between, so the prior incarnation is still
+        // materialised under the recycled identity.
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-fence",
+            vec![assignment(0, 1)],
+        );
+        assert!(
+            !shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()),
+            "a send landing before the reconciler tears the prior incarnation down \
+             must be denied; delivering it acks a batch that teardown then erases"
+        );
+
+        // Pass 1 tears the stale incarnation down, pass 2 rebuilds it at the
+        // committed epoch; only then may traffic resume.
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(
+            shard.plane.partitions().contains(&ns),
+            "fresh partition must materialise after the teardown"
+        );
+        assert!(
+            shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()),
+            "traffic must resume once the rebuilt row carries the committed epoch"
+        );
+    }
+
+    /// The fence proves an incarnation by pairing the committed
+    /// `created_revision` with the epoch on the routing row. Neither side alone
+    /// is a proof, so a missing row (not yet materialised) and a missing commit
+    /// (namespace deleted, teardown pending) both deny. Metadata operations
+    /// address no partition incarnation and must pass regardless.
+    #[compio::test]
+    async fn fence_denies_partition_request_when_incarnation_is_unverifiable() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-unverifiable");
+        seed_topic(&mux, 2, 0, "topic-unverifiable", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        // Committed, but no reconcile pass has run: no row to prove against.
+        assert!(
+            shard.shards_table().epoch_for(ns).is_none(),
+            "precondition: the routing row is written by the reconciler"
+        );
+        assert!(
+            !shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()),
+            "a committed namespace with no routing row cannot be proven current"
+        );
+
+        reconcile_pass(&ctx).await;
+
+        // Deleted, teardown not yet applied: the row outlives the commit.
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        assert!(
+            shard.shards_table().epoch_for(ns).is_some(),
+            "precondition: the row survives until the reconciler removes it"
+        );
+        assert!(
+            !shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()),
+            "a namespace no longer committed must be denied even while its row lingers"
+        );
+        assert!(
+            shard.serves_committed_incarnation(Operation::CreateStream, ns.inner()),
+            "the fence guards partition operations only; metadata traffic carries \
+             no partition incarnation"
+        );
+    }
+
     /// Once converged, a pass with an unchanged
     /// `Streams::revision` fast-skips the O(N) diff instead of re-scanning
     /// every committed namespace every periodic tick. A fresh
@@ -1739,6 +1854,73 @@ mod tests {
         );
     }
 
+    /// Deferral-arms-the-fast-skip regression: a deferred rebuild is pending
+    /// work, but a pass that found nothing else used to report `did_work =
+    /// false` and arm the fast-skip. The wake the pump fires after draining
+    /// `ConfirmRemove` carries no revision bump (dropping a partition is not a
+    /// metadata commit), so it landed on the armed guard and was swallowed:
+    /// the rebuild never ran, the namespace stayed unroutable, and every
+    /// parked data-plane frame hung until the client timed out.
+    #[compio::test]
+    async fn reconcile_rebuilds_after_deferred_confirm_remove_drains() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-defer-skip");
+        seed_topic(&mux, 2, 0, "topic-defer-skip", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        assert!(partitions.contains(&ns));
+
+        // Post-successful-teardown, pre-drain state: fenced, unlinked, and a
+        // `ConfirmRemove` queued but not yet applied. `ns` is still in the
+        // committed target, so the additions pass can only defer the rebuild.
+        partitions.tombstone(ns);
+        shard.shards_table().remove(&ns);
+        delete_partitions_from_disk(
+            ns.stream_id(),
+            ns.topic_id(),
+            ns.partition_id(),
+            ctx.config.as_ref(),
+        )
+        .await
+        .expect("teardown disk delete succeeds");
+        shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace: ns });
+
+        reconcile_once(&ctx).await;
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the pass under test must be the deferring one"
+        );
+
+        // Pump drains: partition dropped, tombstone cleared, reconciler woken.
+        // No commit happened, so `revision` is unchanged and `last_pass_noop`
+        // is the only thing that can keep the woken pass alive.
+        shard.apply_reconcile_ops();
+        assert!(!partitions.contains(&ns));
+
+        assert!(
+            reconcile_once(&ctx).await,
+            "the post-ConfirmRemove wake must run a full pass: a deferring \
+             pass has not converged and must not arm the fast-skip"
+        );
+        shard.apply_reconcile_ops();
+        assert!(
+            partitions.contains(&ns),
+            "the deferred rebuild must materialise once the drop drains"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            Some(0),
+            "rebuilt partition must be addressable again"
+        );
+    }
+
     /// A bare `DeleteConsumerGroup` (topic survives) leaves the group's offsets
     /// on the partition. The reconciler must reclaim a deleted group's offset
     /// while leaving a still-live group's offset untouched.
@@ -1759,15 +1941,15 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         assert!(shard.plane.partitions().contains(&ns));
 
-        // Two groups: "dead" gets id 1, "live" gets id 2 (per-topic monotonic).
+        // Two groups: "dead" gets id 0, "live" gets id 1 (per-topic monotonic).
         let stm = &shard.plane.metadata().mux_stm;
         seed_create_consumer_group(stm, 3, 0, 0, "dead");
         seed_create_consumer_group(stm, 4, 0, 0, "live");
 
         // Offsets are keyed by the monotonic group id (the id the store path is
         // rewritten to and the read path / live-set resolve), not the name hash.
-        let dead_key: u32 = 1;
-        let live_key: u32 = 2;
+        let dead_key: u32 = 0;
+        let live_key: u32 = 1;
         {
             let partitions = shard.plane.partitions();
             let partition = partitions.get_by_ns(&ns).expect("partition materialised");
@@ -1781,8 +1963,8 @@ mod tests {
             );
         }
 
-        // Delete the "dead" group (id 1); "live" (id 2) stays.
-        seed_delete_consumer_group(stm, 5, 0, 0, 1);
+        // Delete the "dead" group (id 0); "live" (id 1) stays.
+        seed_delete_consumer_group(stm, 5, 0, 0, 0);
         reconcile_pass(&ctx).await;
 
         let partitions = shard.plane.partitions();
@@ -1815,10 +1997,10 @@ mod tests {
             vec![assignment(0, 1), assignment(1, 2)],
         );
         seed_create_consumer_group(&mux, 3, 0, 0, "cg");
-        // Single member owns every partition (group id 1, the first in topic).
-        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
+        // Single member owns every partition (group id 0, the first in topic).
+        seed_join_consumer_group(&mux, 4, 0, 0, 0, 100);
 
-        let group = WireIdentifier::numeric(1);
+        let group = WireIdentifier::numeric(0);
         let stream = WireIdentifier::numeric(0);
         let topic = WireIdentifier::numeric(0);
         let assigned = |mux: &TestMux| -> Vec<u32> {
@@ -1888,13 +2070,13 @@ mod tests {
             "topic-dc",
             vec![assignment(0, 1), assignment(1, 2)],
         );
-        seed_create_consumer_group(&mux, 3, 0, 0, "cg"); // group id 1
-        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
-        seed_join_consumer_group(&mux, 5, 0, 0, 1, 200);
+        seed_create_consumer_group(&mux, 3, 0, 0, "cg"); // group id 0
+        seed_join_consumer_group(&mux, 4, 0, 0, 0, 100);
+        seed_join_consumer_group(&mux, 5, 0, 0, 0, 200);
 
         let stream = WireIdentifier::numeric(0);
         let topic = WireIdentifier::numeric(0);
-        let group = WireIdentifier::numeric(1);
+        let group = WireIdentifier::numeric(0);
         let assigned = |client: u128| -> Option<Vec<u32>> {
             mux.streams()
                 .consumer_group_member_assignment(&stream, &topic, &group, client)

@@ -52,6 +52,11 @@ pub trait Pipeline {
 
     fn len(&self) -> usize;
 
+    /// In-flight prepare-queue capacity. `VsrConsensus` snapshots it at
+    /// construction to size the loopback queue and to bound the uncommitted
+    /// range a new primary may rebuild after a view change.
+    fn prepare_queue_max(&self) -> usize;
+
     fn verify(&self);
 
     /// True iff either queue carries `client_id`. Used by metadata-plane
@@ -143,7 +148,10 @@ where
 }
 
 pub mod client_table;
-pub use client_table::{CachedReply, ClientTable};
+pub use client_table::{
+    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableSnapshot,
+    CommitReply,
+};
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
@@ -161,5 +169,7 @@ pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;
+mod vsr_state;
+pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;
 pub use vsr_timeout::TimeoutManager;

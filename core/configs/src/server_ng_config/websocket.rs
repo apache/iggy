@@ -17,36 +17,75 @@
 
 //! Server-ng WebSocket listener schema.
 //!
-//! Field shape mirrors the legacy [`crate::websocket::WebSocketConfig`]
-//! verbatim, including the `Option<String>` frame-tunable fields that
-//! the legacy server parses lazily into `IggyByteSize` inside
-//! [`WebSocketConfig::to_tungstenite_config`]. The fork lives in
-//! `server_ng_config` so server-ng can evolve its WS frame surface
-//! (e.g. tighten the type to `Option<IggyByteSize>`) independently of
-//! the legacy server.
+//! Unlike the legacy [`crate::websocket::WebSocketConfig`] it was
+//! forked from, this section is the live frame-tuning source for
+//! server-ng's WS / WSS plane: the message bus folds the
+//! `Option<IggyByteSize>` knobs below into a compio-ws
+//! `WebSocketConfig` once at bus construction. The sizes are strictly
+//! typed, so a malformed size string fails config load instead of
+//! being silently ignored at conversion time. The conversion itself
+//! lives in `core/message_bus` because the standalone `tungstenite`
+//! dependency and the compio-ws re-export are different major versions
+//! with incompatible config types.
 
 use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, serde_as};
 use std::fmt::{Display, Formatter};
-use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
+#[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct WebSocketConfig {
     pub enabled: bool,
     pub address: String,
+
+    /// Target minimum size of the frame read buffer. `None` keeps the
+    /// compio-ws default (currently 128 KiB).
+    #[config_env(leaf)]
     #[serde(default)]
-    pub read_buffer_size: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub read_buffer_size: Option<IggyByteSize>,
+
+    /// Target buffer size for batched writes before compio-ws flushes.
+    /// `None` keeps the compio-ws default (currently 128 KiB).
+    #[config_env(leaf)]
     #[serde(default)]
-    pub write_buffer_size: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub write_buffer_size: Option<IggyByteSize>,
+
+    /// Hard ceiling on the write buffer; writes past it error instead
+    /// of buffering. Must exceed [`Self::write_buffer_size`] by at
+    /// least one frame. `None` keeps the compio-ws default
+    /// (unlimited).
+    #[config_env(leaf)]
     #[serde(default)]
-    pub max_write_buffer_size: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub max_write_buffer_size: Option<IggyByteSize>,
+
+    /// Hard upper bound on a single inbound WebSocket message
+    /// (post-fragment-reassembly). `None` keeps the compio-ws default
+    /// (currently 64 MiB).
+    #[config_env(leaf)]
     #[serde(default)]
-    pub max_message_size: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub max_message_size: Option<IggyByteSize>,
+
+    /// Hard upper bound on a single inbound WebSocket frame
+    /// (pre-fragment-reassembly). `None` keeps the compio-ws default
+    /// (currently 16 MiB).
+    #[config_env(leaf)]
     #[serde(default)]
-    pub max_frame_size: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub max_frame_size: Option<IggyByteSize>,
+
+    /// Whether to accept unmasked frames from clients in violation of
+    /// RFC 6455 client-to-server framing rules. Strict (`false`) by
+    /// default; enable only for non-browser test clients that emit
+    /// unmasked frames.
     #[serde(default)]
     pub accept_unmasked_frames: bool,
+
     #[serde(default)]
     pub tls: WebSocketTlsConfig,
 }
@@ -57,46 +96,6 @@ pub struct WebSocketTlsConfig {
     pub self_signed: bool,
     pub cert_file: String,
     pub key_file: String,
-}
-
-impl WebSocketConfig {
-    pub fn to_tungstenite_config(&self) -> TungsteniteConfig {
-        let mut config = TungsteniteConfig::default();
-
-        if let Some(read_buf_size_str) = &self.read_buffer_size
-            && let Ok(byte_size) = read_buf_size_str.parse::<IggyByteSize>()
-        {
-            config = config.read_buffer_size(byte_size.as_bytes_u64() as usize);
-        }
-
-        if let Some(write_buf_size_str) = &self.write_buffer_size
-            && let Ok(byte_size) = write_buf_size_str.parse::<IggyByteSize>()
-        {
-            config = config.write_buffer_size(byte_size.as_bytes_u64() as usize);
-        }
-
-        if let Some(max_write_buf_size_str) = &self.max_write_buffer_size
-            && let Ok(byte_size) = max_write_buf_size_str.parse::<IggyByteSize>()
-        {
-            config = config.max_write_buffer_size(byte_size.as_bytes_u64() as usize);
-        }
-
-        if let Some(msg_size_str) = &self.max_message_size
-            && let Ok(byte_size) = msg_size_str.parse::<IggyByteSize>()
-        {
-            config = config.max_message_size(Some(byte_size.as_bytes_u64() as usize));
-        }
-
-        if let Some(frame_size_str) = &self.max_frame_size
-            && let Ok(byte_size) = frame_size_str.parse::<IggyByteSize>()
-        {
-            config = config.max_frame_size(Some(byte_size.as_bytes_u64() as usize));
-        }
-
-        config = config.accept_unmasked_frames(self.accept_unmasked_frames);
-
-        config
-    }
 }
 
 impl Display for WebSocketConfig {

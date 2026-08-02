@@ -25,6 +25,7 @@ use std::fmt;
 use std::io;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use twox_hash::XxHash3_64;
 
 const HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
@@ -34,6 +35,21 @@ const HEADER_SIZE: usize = size_of::<PrepareHeader>();
 /// prevents a bit-flipped size field (e.g. `0xFFFF_FFFF`) from causing a
 /// multi-GiB allocation during the WAL scan.
 const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
+
+/// `checksum_body` of an entry no producer sealed: written by a build predating
+/// body sealing, or replicated from a primary predating it (backups journal the
+/// header verbatim, so the zero travels along). Indistinguishable from
+/// sealed-then-corrupted, so the scan skips verification and counts these rather
+/// than reject a WAL it cannot prove is damaged. Sound as a sentinel because a sealed
+/// body hashing to `0` is a 1-in-2^64 event, not an impossible one: some input maps
+/// there, we just do not know which. The consequence of that collision is a single
+/// entry replayed unverified, the same treatment a genuinely unsealed one gets, which
+/// is why the sentinel is worth the odds.
+///
+/// Never re-sealed on receipt: the producer seals once and every replica stores that
+/// verbatim, so re-sealing locally would diverge the header bytes and break the
+/// parent chain in the TODO below.
+const CHECKSUM_BODY_UNSEALED: u128 = 0;
 
 /// Number of slots in the journal ring buffer.
 ///
@@ -147,6 +163,10 @@ pub struct PrepareJournal {
     /// let more committed-but-unsnapshotted entries accumulate between
     /// checkpoints (more WAL churn headroom, more memory).
     slot_count: usize,
+    /// How many entries the opening scan accepted unverified because no producer
+    /// sealed them ([`CHECKSUM_BODY_UNSEALED`]). Fixed at `open`, since every later
+    /// entry comes from a sealing producer.
+    unsealed_entries: u64,
 }
 
 /// Captured cause of journal poisoning. `stage` names the drain step
@@ -174,31 +194,55 @@ const fn slot_for_op(op: u64, slot_count: usize) -> usize {
 /// Repair a damaged WAL tail by truncating to `pos`, or surface a loud
 /// error when truncation would be unsafe.
 ///
-/// Truncation is only sound for a torn final append, which writes at most
-/// one entry's worth of bytes. If more than `MAX_ENTRY_SIZE` bytes follow
-/// `pos`, the damage is mid-file: truncating would silently discard every
-/// committed entry after it, so this hard-errors instead of repairing.
+/// Truncation is sound only for a torn final append. The question that decides it
+/// is the one the interior-corruption branch in `scan` asks: does a complete entry
+/// follow? An entry only exists past `pos` if an `append` completed after the damaged
+/// region, and each `append` fsyncs before its `PrepareOk`, so discarding it would
+/// drop an entry that was durable, acked, and possibly quorum-committed. `pos` alone
+/// cannot answer this: a bit-flip in a header's `size` field loses the entry boundary
+/// while leaving intact entries behind it, and those bytes are what the probe finds.
+///
+/// The `> MAX_ENTRY_SIZE` test is kept as a second refusal, not as the classifier:
+/// one entry per `append` + fsync means a torn tail is at most one entry wide, so a
+/// larger unparsable region is damage of some other kind and not this function's to
+/// repair.
+///
+/// Both outcomes are traced. A silent truncation is the failure mode that hides
+/// durable data loss from an operator who has no other signal.
 #[allow(clippy::future_not_send)]
 async fn truncate_or_fail(
     storage: &FileStorage,
     pos: u64,
     reason: &'static str,
 ) -> Result<(), JournalError> {
-    let trailing = storage.file_len().saturating_sub(pos);
-    // Sound only because this WAL appends exactly one entry per `append`
-    // + fsync, so a torn tail is at most one entry wide. A batched-append
-    // WAL could leave a torn tail many entries wide, and this
-    // `> MAX_ENTRY_SIZE` check would misclassify it as mid-file damage.
+    let file_len = storage.file_len();
+    let trailing = file_len.saturating_sub(pos);
+    if let Some(entry_pos) = find_complete_entry(storage, pos, file_len).await? {
+        return Err(JournalError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "mid-file WAL corruption at pos {pos}: {reason}; a complete entry \
+                 starts at pos {entry_pos} ({trailing} trailing bytes), so this is not \
+                 a torn tail; refusing to truncate and discard committed entries"
+            ),
+        )));
+    }
     if trailing > MAX_ENTRY_SIZE {
         return Err(JournalError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "mid-file WAL corruption at pos {pos}: {reason}; {trailing} bytes \
-                 follow (> MAX_ENTRY_SIZE {MAX_ENTRY_SIZE}), refusing to truncate \
-                 and discard committed entries"
+                 follow (> MAX_ENTRY_SIZE {MAX_ENTRY_SIZE}), wider than one append can \
+                 tear; refusing to truncate and discard committed entries"
             ),
         )));
     }
+    tracing::warn!(
+        pos,
+        trailing,
+        reason,
+        "truncating torn WAL tail; no complete entry follows the damage"
+    );
     storage.truncate(pos).await?;
     // The repair must be crash-durable. `FileStorage::truncate` is a
     // bare `set_len`; without this fsync a power loss right after the
@@ -208,12 +252,80 @@ async fn truncate_or_fail(
     Ok(())
 }
 
-/// Best-effort unlink of the drain temp file on any error path between
-/// `File::create(wal.tmp)` and the atomic `rename`. Without this, every
-/// failed drain leaks a `wal.tmp` next to the WAL; the next drain
-/// truncates it on re-create so safety holds, but operators see the tmp
-/// files accumulate across crashed/aborted drains. `defuse` is called
-/// after a successful rename so the now-renamed file is not removed.
+/// Position of the first structurally complete entry starting after `from`, or
+/// `None` when the region holds no entry a scan could read.
+///
+/// Entry starts are byte-aligned in the file (`append` writes exact-sized buffers
+/// with no padding) and the damaged entry's own `size` cannot be trusted, so every
+/// offset is a candidate. `command` is a `#[repr(u8)]` discriminant at a fixed offset,
+/// so it pre-filters ~255 of every 256 offsets down to a byte compare, and the full
+/// structural validation runs only on the rest. Cost is bounded by the trailing
+/// region, which the caller refuses above `MAX_ENTRY_SIZE`, and this runs once on a
+/// boot that is already repairing.
+#[allow(clippy::future_not_send)]
+async fn find_complete_entry(
+    storage: &FileStorage,
+    from: u64,
+    file_len: u64,
+) -> Result<Option<u64>, JournalError> {
+    const COMMAND_OFFSET: usize = std::mem::offset_of!(PrepareHeader, command);
+    /// Fresh bytes read per pass, over the `HEADER_SIZE` overlap that lets a
+    /// candidate straddle two passes.
+    const PROBE_STRIDE: usize = 64 * 1024;
+
+    // The entry AT `from` already failed to parse, so it is not a candidate.
+    let mut base = from.saturating_add(1);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut scratch = Owned::<16>::zeroed(HEADER_SIZE);
+    while base + HEADER_SIZE as u64 <= file_len {
+        let want = usize::try_from((file_len - base).min((PROBE_STRIDE + HEADER_SIZE) as u64))
+            .unwrap_or(PROBE_STRIDE + HEADER_SIZE);
+        if buf.len() != want {
+            buf = vec![0u8; want];
+        }
+        buf = storage.read_at(base, buf).await?;
+
+        let last_start = want - HEADER_SIZE;
+        for offset in 0..=last_start {
+            if buf[offset + COMMAND_OFFSET] != Command2::Prepare as u8 {
+                continue;
+            }
+            let candidate = &buf[offset..offset + HEADER_SIZE];
+            let Some(header) = valid_entry_header(&mut scratch, candidate) else {
+                continue;
+            };
+            let start = base + offset as u64;
+            if start + u64::from(header.size) <= file_len {
+                return Ok(Some(start));
+            }
+        }
+        base += last_start as u64 + 1;
+    }
+    Ok(None)
+}
+
+/// The structural checks `scan` applies before it trusts a header's `size`: a valid
+/// bit pattern, the `Prepare` command, and a size that spans at least the header and
+/// at most one entry.
+fn valid_entry_header(scratch: &mut Owned<16>, bytes: &[u8]) -> Option<PrepareHeader> {
+    scratch.as_mut_slice().copy_from_slice(bytes);
+    let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(scratch.as_slice()).ok()?;
+    if header.command != Command2::Prepare
+        || (header.size as usize) < HEADER_SIZE
+        || u64::from(header.size) > MAX_ENTRY_SIZE
+    {
+        return None;
+    }
+    Some(header)
+}
+
+/// Best-effort unlink of a temp file on any error path between its
+/// `File::create` and the atomic `rename`. Without this, every failed
+/// write leaks a tmp file next to its target; the next attempt truncates
+/// it on re-create so safety holds, but operators see the tmp files
+/// accumulate across crashed/aborted writes. `defuse` is called after a
+/// successful rename so the now-renamed file is not removed. Shared with
+/// `superblock::atomic_replace`, which has the same window.
 ///
 /// `Drop` cannot be async, so the unlink is a blocking `std::fs::remove_file`.
 /// This only runs on the drain failure path (already returning an error),
@@ -221,17 +333,17 @@ async fn truncate_or_fail(
 /// may already be gone (e.g. rename succeeded but a later step failed
 /// and we defused too late) and there is no useful recovery from a
 /// failed cleanup unlink.
-struct TmpFileGuard {
+pub(crate) struct TmpFileGuard {
     path: PathBuf,
     armed: bool,
 }
 
 impl TmpFileGuard {
-    const fn new(path: PathBuf) -> Self {
+    pub(crate) const fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
     }
 
-    fn defuse(mut self) {
+    pub(crate) fn defuse(mut self) {
         self.armed = false;
     }
 }
@@ -310,11 +422,17 @@ impl PrepareJournal {
         let mut headers: Vec<Option<PrepareHeader>> = vec![None; slot_count];
         let mut offsets: Vec<Option<u64>> = vec![None; slot_count];
         let mut last_op: Option<u64> = None;
+        let mut unsealed_entries: u64 = 0;
         let mut pos: u64 = 0;
         let mut header_buf = vec![0u8; HEADER_SIZE];
         // Reused 16-aligned scratch (PrepareHeader has u128 fields). Avoids
         // per-iteration 4 KiB-aligned alloc; bytes never become a `Message`.
         let mut aligned = Owned::<16>::zeroed(HEADER_SIZE);
+        // Reused across entries, skipping a fresh allocation when consecutive
+        // bodies match in size (the common case for metadata prepares). The read
+        // below fills the buffer to capacity, so it must be sized to exactly the
+        // entry body; a size change takes a new exact-sized buffer.
+        let mut body_buf: Vec<u8> = Vec::new();
 
         while pos + HEADER_SIZE as u64 <= file_len {
             // Read the 256-byte header
@@ -344,24 +462,70 @@ impl PrepareJournal {
 
             let entry_size = u64::from(header.size);
 
-            // TODO(hubcio): verify `header.checksum` / `header.checksum_body`
-            // against the entry body during scan and route a mismatch
-            // through `truncate_or_fail`. Blocked on the writer side: the
-            // `PrepareHeader` projection in consensus builds prepares with
-            // `..Default::default()` so the integrity fields are always 0.
-            // Until a producer computes them, verification here would be
-            // trivially-passing noise. Without it, a body bit-flip that
-            // leaves the header valid is replayed silently as corrupt
-            // state. Committed bytes are meant to be byte-identical across
-            // replicas (deterministic apply, timestamp replicated not
-            // re-projected), so once the producer computes the integrity fields
-            // they should agree on every node and this check can be turned on
-            // without per-replica false positives.
-
             // Check if the full entry fits
             if pos + entry_size > file_len {
                 truncate_or_fail(&storage, pos, "truncated entry at tail").await?;
                 break;
+            }
+
+            // Verify the body integrity field the primary sealed at prepare-build
+            // (`checksum_body`, XxHash3_64 over the payload past the header,
+            // replicated verbatim so it agrees on every replica), catching a body
+            // bit-flip that leaves the header structurally valid. A completed entry
+            // after the corrupt one means interior bit-rot and refuses boot below;
+            // only a genuine torn tail is truncated. An unsealed entry has nothing to
+            // verify against and is skipped, not rejected: see
+            // [`CHECKSUM_BODY_UNSEALED`].
+            //
+            // TODO(wal-integrity): the header `checksum` and its `parent` chain stay
+            // unverified, since the producer does not seal them yet (blocked on
+            // re-sealing re-stamped retransmits), so a bit-flip in a
+            // structurally-valid header field slips through. Recovery derives
+            // `commit_watermark = max(header.commit)`, so a flipped `commit` makes it
+            // apply prepared-but-uncommitted ops as committed, the very ops a view
+            // change may have truncated cluster-wide, diverging this replica. Seal
+            // and verify the header checksum + parent chain.
+            if header.checksum_body == CHECKSUM_BODY_UNSEALED {
+                // Skip the body read too, so a WAL written entirely by a pre-sealing
+                // build scans without touching its payload.
+                unsealed_entries += 1;
+            } else {
+                let body_len = (entry_size - HEADER_SIZE as u64) as usize;
+                // `read_at` (read_exact_at) fills the buffer to capacity, so it must
+                // hold exactly `body_len`. A prior buffer of the same length is
+                // reused as-is; any size change replaces it, since capacity cannot
+                // shrink in place and an oversized buffer would read past the entry.
+                if body_buf.len() != body_len {
+                    body_buf = vec![0u8; body_len];
+                }
+                body_buf = storage.read_at(pos + HEADER_SIZE as u64, body_buf).await?;
+                if u128::from(XxHash3_64::oneshot(&body_buf)) != header.checksum_body {
+                    // The header passed the structural checks above, so `entry_size`
+                    // is trustworthy. Bytes following this entry mean a later append
+                    // completed after it, so this is interior bit-rot of a durable
+                    // entry, NOT a torn tail: one append+fsync per entry means a torn
+                    // write can only be the final entry. Truncating forward would
+                    // discard the committed entries that follow, so refuse boot. A
+                    // cluster repairs the entry from a peer, and a solo node keeps
+                    // its WAL for manual recovery instead of silently losing
+                    // committed data.
+                    if pos + entry_size < file_len {
+                        return Err(JournalError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "interior WAL corruption at pos {pos} (op {}, operation {:?}): \
+                                 prepare body checksum mismatch with {} bytes of entries \
+                                 following; refusing to truncate and discard the committed suffix",
+                                header.op,
+                                header.operation,
+                                file_len - (pos + entry_size),
+                            ),
+                        )));
+                    }
+                    truncate_or_fail(&storage, pos, "prepare body checksum mismatch at tail")
+                        .await?;
+                    break;
+                }
             }
 
             let slot = slot_for_op(header.op, slot_count);
@@ -394,6 +558,7 @@ impl PrepareJournal {
             poisoned: OnceCell::new(),
             drain_in_flight: Cell::new(false),
             slot_count,
+            unsealed_entries,
         })
     }
 
@@ -411,6 +576,13 @@ impl PrepareJournal {
     /// Highest op number in the index, or `None` if empty.
     pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    /// How many entries the opening scan replayed unverified
+    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// warns while it is not, so the fail-open stretch is visible to an operator.
+    pub const fn unsealed_entry_count(&self) -> u64 {
+        self.unsealed_entries
     }
 
     /// Advance the snapshot watermark. The caller must ensure `op` is
@@ -709,6 +881,25 @@ impl Journal<FileStorage> for PrepareJournal {
         let header = *entry.header();
         let slot = slot_for_op(header.op, self.slot_count);
 
+        // Reject a buffer with slack for the same reason as the slot-collision check
+        // below: before it reaches disk. `Message::try_from` permits `len >= size`, and
+        // `write_append` writes the WHOLE buffer, so slack would land on disk while the
+        // scan's checksum verification and its `pos += entry_size` walk both use
+        // `header.size`. The producer seals the whole buffer today, which makes an
+        // over-length entry a loud checksum failure rather than a silent one, but the
+        // seal is an integrity field and not the place to enforce framing.
+        if entry.as_slice().len() != header.size as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal entry buffer is {} bytes but its header claims {}: \
+                     the slack would be written to disk and mis-frame the scan",
+                    entry.as_slice().len(),
+                    header.size,
+                ),
+            ));
+        }
+
         // Slot collision must be detected BEFORE `write_append + fsync`:
         // a post-fsync panic would leave bytes durably on disk, and the
         // recovery scan on the next boot would re-hit the same collision,
@@ -806,9 +997,30 @@ mod tests {
     use iggy_binary_protocol::consensus::Operation;
     use tempfile::tempdir;
 
+    /// An entry as the primary's `project` produces it: body checksum sealed.
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
+        make_entry(op, body_size, |body| u128::from(XxHash3_64::oneshot(body)))
+    }
+
+    /// An entry as a pre-sealing build wrote it, or as a pre-sealing primary
+    /// still replicates it: `checksum_body == 0`.
+    fn make_unsealed_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
+        make_entry(op, body_size, |_| CHECKSUM_BODY_UNSEALED)
+    }
+
+    fn make_entry(
+        op: u64,
+        body_size: usize,
+        seal: impl FnOnce(&[u8]) -> u128,
+    ) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total_size);
+
+        // Recognizable pattern, then seal over it so the scan accepts the entry.
+        for (i, byte) in buffer.as_mut_slice()[HEADER_SIZE..].iter_mut().enumerate() {
+            *byte = (op as u8).wrapping_add(i as u8);
+        }
+        let checksum_body = seal(&buffer.as_slice()[HEADER_SIZE..]);
 
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
@@ -817,13 +1029,144 @@ mod tests {
         header.command = Command2::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
-
-        // Fill body with recognizable pattern
-        for (i, byte) in buffer.as_mut_slice()[HEADER_SIZE..].iter_mut().enumerate() {
-            *byte = (op as u8).wrapping_add(i as u8);
-        }
+        header.checksum_body = checksum_body;
 
         Message::try_from(buffer).unwrap()
+    }
+
+    #[compio::test]
+    async fn scan_truncates_entry_with_body_checksum_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal
+                .append(make_prepare(1, 64).deep_copy())
+                .await
+                .unwrap();
+            journal
+                .append(make_prepare(2, 64).deep_copy())
+                .await
+                .unwrap();
+            assert_eq!(journal.last_op(), Some(2));
+        }
+
+        // Flip a byte in the last entry's body, leaving its header structurally
+        // valid (command/size/op intact) so only the body checksum can catch it.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Reopen: the scan recomputes the body checksum, finds the mismatch, and
+        // truncates the corrupt tail entry via the torn-tail repair.
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(1),
+            "a body-checksum mismatch on the tail entry must truncate it on scan"
+        );
+        assert!(journal.header(2).is_none());
+    }
+
+    #[compio::test]
+    async fn scan_refuses_boot_on_interior_body_checksum_mismatch() {
+        // Bit-rot in a committed entry that is NOT the tail must refuse boot:
+        // truncating forward would discard the committed entries that follow
+        // (here op 3). A torn tail, the final in-flight entry, stays truncatable.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            for op in 1..=3u64 {
+                journal
+                    .append(make_prepare(op, BODY).deep_copy())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(journal.last_op(), Some(3));
+        }
+
+        // Flip a byte inside op 2's body. Entries append in order at a fixed
+        // HEADER_SIZE + BODY stride, so op 2's body starts one full entry plus one
+        // header in.
+        let entry_size = HEADER_SIZE + BODY;
+        let op2_body_byte = entry_size + HEADER_SIZE + 5;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[op2_body_byte] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Reopen must refuse boot: op 3 (committed) follows the corrupt op 2, so
+        // this is interior bit-rot, not a torn tail.
+        let result = PrepareJournal::open(&path, 0).await;
+        assert!(
+            matches!(result, Err(JournalError::Io(_))),
+            "interior body-checksum mismatch must refuse boot, not truncate the committed suffix"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_replays_unsealed_entries_and_counts_them() {
+        // A WAL from a pre-sealing build, or one a pre-sealing primary replicated:
+        // every entry carries `checksum_body == 0`. Verifying against that would fail
+        // every entry and brick the upgrade, so the scan replays them and reports how
+        // many it could not verify.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            for op in 1..=3u64 {
+                journal
+                    .append(make_unsealed_prepare(op, 64).deep_copy())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(3),
+            "an unsealed WAL must boot, not be rejected as corrupt"
+        );
+        assert_eq!(journal.unsealed_entry_count(), 3);
+    }
+
+    #[compio::test]
+    async fn scan_verifies_sealed_entries_alongside_unsealed_ones() {
+        // The sentinel must exempt only the entries carrying it: a rolling upgrade
+        // leaves both kinds in one WAL, and bit-rot in a sealed one must still be
+        // caught.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            // Op 1 from the old primary, ops 2 and 3 after it upgraded.
+            journal
+                .append(make_unsealed_prepare(1, BODY).deep_copy())
+                .await
+                .unwrap();
+            for op in 2..=3u64 {
+                journal
+                    .append(make_prepare(op, BODY).deep_copy())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Flip a byte in sealed op 2's body, one full entry plus one header in.
+        let entry_size = HEADER_SIZE + BODY;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[entry_size + HEADER_SIZE + 5] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = PrepareJournal::open(&path, 0).await;
+        assert!(
+            matches!(result, Err(JournalError::Io(_))),
+            "a sealed entry must still be verified when unsealed entries precede it"
+        );
     }
 
     #[compio::test]
@@ -1055,6 +1398,82 @@ mod tests {
         assert_eq!(
             size_before, size_after,
             "a rejected mid-file scan must not truncate the WAL"
+        );
+    }
+
+    #[compio::test]
+    async fn open_refuses_when_a_complete_entry_follows_the_damage() {
+        // Bit-rot in an interior header loses that entry's boundary but leaves the
+        // entries behind it intact. Each was fsynced before its PrepareOk, so they may
+        // be quorum-committed: classifying this as a torn tail would silently discard
+        // durable data. The trailing region is a few hundred bytes here, well under
+        // MAX_ENTRY_SIZE, so only the forward probe can tell the two apart.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal.append(make_prepare(1, 64)).await.unwrap();
+            journal.append(make_prepare(2, 64)).await.unwrap();
+            journal.append(make_prepare(3, 64)).await.unwrap();
+            journal.storage.fsync().await.unwrap();
+        }
+
+        let entry_2_offset = (HEADER_SIZE + 64) as u64;
+        let command_byte_offset =
+            entry_2_offset + std::mem::offset_of!(PrepareHeader, command) as u64;
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
+            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.sync_all().unwrap();
+        }
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let error = PrepareJournal::open(&path, 0)
+            .await
+            .expect_err("damage with a complete entry behind it must refuse boot");
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("a complete entry starts at pos"),
+            "the refusal must come from the forward probe, not the size heuristic: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            size_before,
+            "a refused scan must leave the WAL intact for repair from a peer"
+        );
+    }
+
+    #[compio::test]
+    async fn append_rejects_entry_buffer_with_slack() {
+        // `Message::try_from` permits `len >= size` and `write_append` writes the whole
+        // buffer, so slack would reach disk while the scan frames on `header.size`.
+        // Refuse before the write rather than leave a mis-framed entry durable.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+
+        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE + 64);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.command = Command2::Prepare;
+        header.op = 1;
+        header.operation = Operation::CreateStream;
+        header.size = (HEADER_SIZE + 48) as u32; // 16 bytes of slack
+        let entry = Message::try_from(buffer).unwrap();
+
+        let error = journal
+            .append(entry)
+            .await
+            .expect_err("an over-length entry buffer must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            journal.storage.file_len(),
+            0,
+            "a refused append must write nothing"
         );
     }
 

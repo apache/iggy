@@ -3225,6 +3225,7 @@ dependencies = [
  "message_bus",
  "rand 0.10.2",
  "rand_xoshiro",
+ "serde",
  "server_common",
  "tracing",
 ]
@@ -6611,7 +6612,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.10.3-edge.2"
+version = "0.10.3-edge.3"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6821,7 +6822,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.10.3-edge.2"
+version = "0.10.3-edge.3"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6833,7 +6834,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.10.3-edge.2"
+version = "0.10.3-edge.3"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -7447,6 +7448,7 @@ dependencies = [
  "compio",
  "configs",
  "configs_derive",
+ "consensus",
  "ctor 1.0.9",
  "deltalake",
  "dtor 1.0.5",
@@ -7460,6 +7462,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_doris_sink",
  "iggy_connector_sdk",
+ "journal",
  "jsonwebtoken",
  "keyring-core",
  "lazy_static",
@@ -7701,6 +7704,8 @@ dependencies = [
  "iggy_binary_protocol",
  "server_common",
  "tempfile",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]

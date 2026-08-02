@@ -41,11 +41,28 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::warn;
 
+/// Where the disk tier's segment files live, resolved at plan-build time.
+/// The two dir-less cases must stay distinct: only a genuinely file-less
+/// partition may fall forward to the journal tier, while file-backed data
+/// behind an unresolvable dir must fail closed (see [`DiskReadOutcome`]).
+pub enum PartitionDirResolution {
+    /// The canonical partition directory to open segment files from.
+    Resolved(String),
+    /// No file-backed storage exists (simulated in-memory persistence):
+    /// there are no files to read and the journal tier is the only tier.
+    NoFiles,
+    /// File-backed storage exists but no directory was resolvable right now
+    /// (a live partition mid-rotation whose sealed segments dropped their
+    /// writer). Disk-resident data may be temporarily hidden, so the read
+    /// fails closed instead of letting the journal-forward skip it.
+    Unresolvable,
+}
+
 /// Owned, borrow-free inputs for the disk tier of a poll (see module docs).
 /// Segment files are re-opened by path because sealed segments drop their
 /// writer at rotation.
 pub struct DiskReadPlan {
-    pub(crate) partition_dir: Option<String>,
+    pub(crate) partition_dir: PartitionDirResolution,
     /// Segments to walk, snapshotted from the poll's starting segment onward
     /// (see `build_poll_plan`); `start_position` is the byte offset into the
     /// first one.
@@ -385,23 +402,27 @@ impl DiskReadPlan {
         if count == 0 || self.segments.is_empty() {
             return DiskReadOutcome::Empty;
         }
-        let Some(partition_dir) = self.partition_dir.as_deref() else {
-            // Simulated in-memory persistence, or no writer was resolvable
-            // (e.g. mid-rotation): no files to read. This is not an IO fault on
-            // present data, so it is `Empty`: the caller serves the resident
-            // journal tier (the sim's only tier) without skipping anything.
-            // TODO(hubcio): a live partition mid-rotation can also land here
-            // with disk-resident-but-unresolvable data; the journal-forward
-            // could then skip those offsets. Distinguish sim/no-files (Empty)
-            // from a transiently-unresolvable writer (Faulted, fail-closed).
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = self.namespace_raw,
-                segment_count = self.segments.len(),
-                "disk poll: no partition dir to resolve segment files; serving journal tier"
-            );
-            return DiskReadOutcome::Empty;
+        let partition_dir = match &self.partition_dir {
+            PartitionDirResolution::Resolved(dir) => dir.as_str(),
+            // Simulated in-memory persistence: no files exist, so this is not
+            // an IO fault on present data. `Empty` lets the caller serve the
+            // resident journal tier (the sim's only tier) without skipping
+            // anything.
+            PartitionDirResolution::NoFiles => return DiskReadOutcome::Empty,
+            // File-backed data exists but the dir was unresolvable at plan
+            // time (mid-rotation). Fail-closed like an IO fault: the
+            // journal-forward would splice resident ops over the hidden
+            // disk-resident offsets. A later poll resolves the dir again.
+            PartitionDirResolution::Unresolvable => {
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace_raw,
+                    segment_count = self.segments.len(),
+                    "disk poll: file-backed partition has no resolvable dir; failing closed"
+                );
+                return DiskReadOutcome::Faulted;
+            }
         };
 
         // `start_position` applies to the first snapshotted segment; each later

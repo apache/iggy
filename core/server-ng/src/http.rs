@@ -48,8 +48,9 @@ use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request};
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Version, header::CONNECTION};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 use configs::http::{HttpConfig, HttpCorsConfig};
 use configs::ng_cluster::{ClusterConfig, TransportPorts, http_forwarding_key_material};
@@ -94,6 +95,7 @@ pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
+    clients_table_max: usize,
     cluster: &ClusterConfig,
     system_config: Arc<NgSystemConfig>,
     self_ports: TransportPorts,
@@ -151,6 +153,7 @@ pub async fn start(
             // never consulted here.
             metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
+        max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
         in_flight_writes: Cell::new(0),
         forward,
     }));
@@ -158,8 +161,12 @@ pub async fn start(
 
     if http_config.tls.enabled {
         let server_config = tls::load_http_tls_server_config(&http_config.tls)?;
-        let (connections, pump) =
-            tls::spawn_accept_pump(listener, server_config, shard.bus.token());
+        let (connections, pump) = tls::spawn_accept_pump(
+            listener,
+            server_config,
+            shard.bus.config().handshake_grace,
+            shard.bus.token(),
+        );
         shard.bus.track_background(pump);
         info!(address = %bound_addr, "server-ng HTTPS listener started");
         let handle = compio::runtime::spawn(tls::serve(connections, router, shard.bus.token()));
@@ -200,7 +207,8 @@ const PING_PATH: &str = "/ping";
 /// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
 /// it), exactly like the legacy server: it bounds the per-request term of the
 /// admission math - what one body may cost in bytes and decode CPU - while
-/// the in-flight caps bound the multiplier.
+/// the in-flight caps bound the multiplier. Those 413s reject the body unread,
+/// so they are stamped `Connection: close` (see below).
 ///
 /// `cors`, present only when `[http.cors]` is enabled, is applied as the
 /// outermost layer. This node authenticates per route (the `Authenticated` /
@@ -322,13 +330,35 @@ fn router(
                     insert_view_header(&view_source, response)
                 }
             }
-        }));
+        }))
+        .layer(from_fn(close_on_payload_too_large));
     let router = match cors {
         Some(cors) => router.layer(cors),
         None => router,
     };
 
     merge_web_ui(router, web_ui)
+}
+
+/// Stamp `Connection: close` on a 413, which rejects its request body unread.
+///
+/// hyper decides to close only once it notices the dropped body, and that is
+/// after the response head is already encoded: the reply advertises keep-alive,
+/// the peer pools a connection the server has stopped reading, and the next
+/// request sent on it dies on a clean EOF. A caller-set `Connection` is written
+/// through untouched, so setting it here has the peer retire the connection.
+///
+/// HTTP/2 carries no connection-level headers, so h2 replies are left alone
+/// rather than handed a header hyper would strip and warn about.
+async fn close_on_payload_too_large(request: Request, next: Next) -> Response {
+    let http2 = request.version() == Version::HTTP_2;
+    let mut response = next.run(request).await;
+    if !http2 && response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
 }
 
 /// Merge the unauthenticated `/ui` static-asset surface when `web_ui` is set.
