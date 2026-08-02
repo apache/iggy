@@ -381,6 +381,12 @@ mod tests {
             401,
             Duration::from_micros(40),
         );
+        metrics.record_request(
+            "http_github",
+            PathKind::Named,
+            500,
+            Duration::from_micros(20),
+        );
         metrics.record_rejected_full("http_github");
 
         let encoded = metrics.encode(&[]);
@@ -391,10 +397,24 @@ mod tests {
             "http_source_requests_total{instance=\"http_github\",kind=\"named\",status=\"4xx\"} 1"
         ));
         assert!(
+            encoded.contains(
+                "http_source_requests_total{instance=\"http_github\",kind=\"named\",status=\"5xx\"} 1"
+            ),
+            "every status class needs its label pinned: a wrong one silently \
+             mislabels an alert rather than failing anything"
+        );
+        assert!(
             encoded.contains("http_source_rejected_full_total{instance=\"http_github\"} 1"),
             "a 429 needs its own series: it is backpressure, not a caller error"
         );
         assert!(encoded.contains("http_source_request_duration_seconds_bucket"));
+    }
+
+    /// `Default` exists to satisfy `clippy::new_without_default`, so the only
+    /// thing it owes is agreeing with the constructor it stands in for.
+    #[test]
+    fn given_default_registry_when_encoded_should_match_a_new_one() {
+        assert_eq!(Metrics::default().encode(&[]), Metrics::new().encode(&[]));
     }
 
     #[test]

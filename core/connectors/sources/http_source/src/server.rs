@@ -212,7 +212,7 @@ pub(crate) struct ServerState {
 }
 
 impl ServerState {
-    fn new(config: &HttpSourceConfig) -> Self {
+    pub(crate) fn new(config: &HttpSourceConfig) -> Self {
         ServerState {
             listen_addr: config.listen_addr.clone(),
             management_token: config.management_token.clone(),
@@ -1496,6 +1496,161 @@ mod tests {
             metrics.headers_clamped(instance),
             metrics.headers_dropped(instance),
         )
+    }
+
+    #[test]
+    fn given_populated_routes_when_serving_nothing_should_drop_every_one() {
+        let state = ServerState::new(&config(free_port(), free_port(), &[ENDPOINT_ONE]));
+        state
+            .publish(vec![crate::test_support::instance(
+                1,
+                Some("github"),
+                &[ENDPOINT_ONE],
+            )])
+            .expect("a single instance cannot collide with itself");
+        assert_eq!(state.routes.load().secret_path_count(), 1);
+        assert_eq!(state.routes.load().named_path_count(), 1);
+
+        state.serve_nothing();
+
+        assert_eq!(state.routes.load().secret_path_count(), 0);
+        assert_eq!(state.routes.load().named_path_count(), 0);
+        assert_eq!(
+            state.instances().len(),
+            1,
+            "the instances stay joined; only the routes projecting them stop being served"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_no_bound_listener_when_routes_refreshed_should_name_the_address() {
+        let unbound = format!("127.0.0.1:{}", free_port());
+
+        let error = refresh_routes(&unbound)
+            .await
+            .expect_err("an address nothing is bound to cannot be reprojected");
+
+        assert!(matches!(
+            error,
+            Error::InitError(message) if message.contains(&unbound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_duplicate_instance_name_when_joined_should_reject() {
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let mut first = open(1, first_config).await;
+
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.instance_name = Some("http_github".to_string());
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = HttpSource::new(2, second_config, None);
+        let error = second
+            .open()
+            .await
+            .expect_err("a duplicate name would address two instances at once");
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfigValue(message) if message.contains("instance_name")
+        ));
+        assert_eq!(
+            post_signed(&base_url(&first), ENDPOINT_TWO, "{}")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "a rejected join must leave no routes behind"
+        );
+        close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_unknown_named_path_when_posted_should_answer_not_found_as_unrouted() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/unclaimed", base_url(&source)))
+            .body("{}")
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let scraped = client()
+            .get(format!("{admin}/admin/metrics"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .text()
+            .await
+            .expect("the scrape must have a body");
+        assert!(
+            scraped.contains(
+                "http_source_requests_total{instance=\"unrouted\",kind=\"named\",status=\"4xx\"} 1"
+            ),
+            "a misconfigured sender posting to the wrong path is the thing an \
+             operator needs to see, so it cannot go uncounted: {scraped}"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_body_when_posted_to_a_named_path_should_answer_payload_too_large() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.max_body_size_bytes = 16;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .body("x".repeat(1024))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(source.shared.sender.len(), 0);
+        close(&mut source).await;
+    }
+
+    #[test]
+    fn given_unrepresentable_forwarded_values_when_headers_built_should_drop_and_count_them() {
+        let mut config = config(free_port(), free_port(), &[]);
+        config.include_http_metadata = false;
+        config.forward_headers = vec!["x-binary".to_string(), "x-blank".to_string()];
+        let source = HttpSource::new(1, config, None);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            axum::http::HeaderName::from_static("x-binary"),
+            axum::http::HeaderValue::from_bytes(&[0xff])
+                .expect("an opaque byte is a legal HTTP header value"),
+        );
+        request_headers.insert(
+            axum::http::HeaderName::from_static("x-blank"),
+            axum::http::HeaderValue::from_static(""),
+        );
+
+        let (headers, clamped, dropped) = message_headers(
+            &source.shared,
+            &request_headers,
+            "127.0.0.1:4444".parse().expect("a literal address parses"),
+        );
+
+        // Both are present but unrepresentable: one is not visible ASCII, the
+        // other clamps away to nothing. An absent header is not a loss, so a
+        // count above two would be silent over-reporting.
+        assert_eq!(dropped, 2);
+        assert_eq!(clamped, 0);
+        assert!(
+            headers.is_none(),
+            "with metadata off and both forwarded values dropped there is nothing to attach"
+        );
     }
 
     async fn close(source: &mut HttpSource) {

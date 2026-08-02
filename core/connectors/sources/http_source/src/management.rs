@@ -597,6 +597,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_wrong_token_when_each_route_called_should_answer_unauthorized() {
+        // Every route, not just the one route a single test happens to reach.
+        // Each handler carries its own guard, so a check dropped from any of
+        // the four mutating ones would still leave the suite green.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let endpoints = format!("{}/admin/endpoints", fixture.admin);
+        let one = format!("{endpoints}/{ENDPOINT_ONE}");
+        let http = client();
+        let cases = vec![
+            (
+                "POST /admin/endpoints",
+                http.post(&endpoints)
+                    .json(&json!({"instance": "http_github"})),
+            ),
+            ("GET /admin/endpoints", http.get(&endpoints)),
+            ("GET /admin/endpoints/{endpoint_id}", http.get(&one)),
+            (
+                "PATCH /admin/endpoints/{endpoint_id}",
+                http.patch(&one)
+                    .json(&json!({"auth_secret": "whsec_rotated"})),
+            ),
+            ("DELETE /admin/endpoints/{endpoint_id}", http.delete(&one)),
+        ];
+
+        for (route, request) in cases {
+            let response = request
+                .header(header::AUTHORIZATION, "Bearer not-the-token")
+                .send()
+                .await
+                .expect("the request must reach the admin listener");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{route} must refuse a wrong token before it does anything else"
+            );
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_no_bound_listener_when_republished_should_fail_closed() {
+        // A mutation that cannot reproject the route table must answer 500
+        // rather than report success. For a revoke or a rotate the old table is
+        // still honouring the credential the operator believes is now dead, so
+        // the take-access-away variant drops the routes on its way out.
+        let mut config = crate::test_support::config(Some("github"), &[ENDPOINT_ONE]);
+        config.listen_addr = format!("127.0.0.1:{}", free_port());
+        let state = Arc::new(ServerState::new(&config));
+
+        let failure = republish(&state)
+            .await
+            .expect("an unbound address cannot be reprojected");
+        let fail_closed = republish_or_close(&state)
+            .await
+            .expect("and the take-access-away variant must report it too");
+
+        assert_eq!(failure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(fail_closed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn given_valid_request_when_endpoint_registered_should_generate_a_secret_path() {
         let fixture = Fixture::start(Some(TOKEN)).await;
 

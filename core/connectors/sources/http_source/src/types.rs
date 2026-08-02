@@ -219,6 +219,21 @@ mod tests {
     }
 
     #[test]
+    fn given_rejected_id_when_displayed_should_name_the_reason() {
+        assert_eq!(
+            EndpointIdError::InvalidLength(4).to_string(),
+            format!(
+                "endpoint_id must be exactly {} characters, got 4",
+                EndpointId::LENGTH
+            )
+        );
+        assert_eq!(
+            EndpointIdError::InvalidCharacter('g').to_string(),
+            "endpoint_id must be lowercase hex, found: g"
+        );
+    }
+
+    #[test]
     fn given_short_value_when_clamped_should_pass_through() {
         assert_eq!(clamp_header_value("api-client/1.0"), Some("api-client/1.0"));
     }
