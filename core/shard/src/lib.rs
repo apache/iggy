@@ -803,6 +803,13 @@ const DEFAULT_BUS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// still below the new peer's retained floor.
 const STATE_TRANSFER_MAX_STALL_RETRIES: u32 = 5;
 
+/// Decode-failure rounds a receiver spends on ONE snapshot generation before
+/// refusing to pull it again. Keyed on the offered `snapshot_seq`: a peer that
+/// checkpoints resets the budget (new bytes are worth full retries), while a
+/// generation this build cannot decode ends up costing one refused descriptor
+/// per repair round instead of a full snapshot pull.
+const STATE_TRANSFER_MAX_DECODE_RETRIES: u32 = 5;
+
 /// Serving-side offer lifetime, as a multiple of the repair-retry interval. An
 /// offer resets its counter on every chunk it serves, so this only expires one
 /// that stopped being pulled -- a receiver that finished installing (the
@@ -1012,12 +1019,23 @@ where
     ///
     /// Deliberately NOT on [`MetadataTransferSession`]: three of the four
     /// arming sites mint a fresh session, so a per-session counter bounded
-    /// nothing -- a permanently undecodable peer cycled abandon -> repair ->
-    /// `RangeEvicted` -> re-arm at zero forever. Held here it survives the
-    /// cycle, and it is reset by actual progress (see
+    /// nothing. Held here it survives the abandon -> repair -> re-arm cycle,
+    /// and chunk arrival resets it (see
     /// [`IggyShard::note_metadata_transfer_progress`]) so scattered transient
     /// stalls cannot accumulate into abandoning a nearly-complete transfer.
+    /// That reset also means it bounds SILENT peers only: decode failures keep
+    /// frames flowing, and are bounded separately by
+    /// [`Self::metadata_transfer_decode_failures`].
     metadata_transfer_attempts: Cell<u32>,
+
+    /// Decode failures charged against one snapshot generation, as
+    /// `(snapshot_seq, failures)`. `None` until a pulled artifact set first
+    /// fails to decode; cleared by a successful install. Past
+    /// [`STATE_TRANSFER_MAX_DECODE_RETRIES`] the generation's descriptors are
+    /// refused outright -- without that gate every repair round would re-pull
+    /// the full snapshot just to fail the same way, since each pulled chunk
+    /// legitimately resets [`Self::metadata_transfer_attempts`].
+    metadata_transfer_decode_failures: Cell<Option<(u64, u32)>>,
 }
 
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -1116,6 +1134,7 @@ where
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
+            metadata_transfer_decode_failures: Cell::new(None),
         })
     }
 
@@ -1350,6 +1369,7 @@ where
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
+            metadata_transfer_decode_failures: Cell::new(None),
         }
     }
 
@@ -3381,6 +3401,38 @@ where
             );
             return;
         }
+        // The snapshot artifact's frontier is the generation the decode budget
+        // is keyed on; a manifest without one cannot install on this plane
+        // anyway. Left armed, the session falls to the stall sweep.
+        let Some(generation) = manifest
+            .iter()
+            .find(|entry| entry.kind == consensus::artifact_kind::METADATA_SNAPSHOT)
+            .map(|entry| entry.frontier)
+        else {
+            tracing::error!(
+                shard = self.id,
+                peer = header.replica,
+                "state transfer descriptor carries no metadata snapshot artifact; ignoring"
+            );
+            return;
+        };
+        if self.decode_budget_exhausted(generation) {
+            // Pulling this generation again cannot end differently; refuse the
+            // descriptor so the failure costs one frame per stall round, not a
+            // full snapshot. Only a plain return: dropping the session here
+            // and re-requesting repair would loop repair -> `RangeEvicted` ->
+            // re-arm -> refuse at network rate, while the armed session is
+            // paced by the stall sweep. The budget resets the moment the peer
+            // offers a new generation.
+            tracing::error!(
+                shard = self.id,
+                peer = header.replica,
+                snapshot_seq = generation,
+                "state transfer generation kept failing to decode; refusing it \
+                 until the peer checkpoints a new one"
+            );
+            return;
+        }
 
         {
             let mut session = self.metadata_transfer.borrow_mut();
@@ -3530,6 +3582,31 @@ where
     /// nearly done, throwing away every byte already pulled.
     fn note_metadata_transfer_progress(&self) {
         self.metadata_transfer_attempts.set(0);
+    }
+
+    /// Charge one decode failure against `snapshot_seq`'s generation; `true`
+    /// once that generation's budget is spent. A different generation restarts
+    /// the count: the peer checkpointed since, so the artifacts are new bytes
+    /// worth full retries.
+    fn burn_decode_failure(&self, snapshot_seq: u64) -> bool {
+        let failures = match self.metadata_transfer_decode_failures.get() {
+            Some((seq, failures)) if seq == snapshot_seq => failures + 1,
+            _ => 1,
+        };
+        self.metadata_transfer_decode_failures
+            .set(Some((snapshot_seq, failures)));
+        failures > STATE_TRANSFER_MAX_DECODE_RETRIES
+    }
+
+    /// Whether `snapshot_seq`'s generation already spent its decode budget.
+    /// Gates descriptor acceptance, so an exhausted generation costs one
+    /// refused descriptor per repair round instead of a full pull.
+    const fn decode_budget_exhausted(&self, snapshot_seq: u64) -> bool {
+        matches!(
+            self.metadata_transfer_decode_failures.get(),
+            Some((seq, failures))
+                if seq == snapshot_seq && failures > STATE_TRANSFER_MAX_DECODE_RETRIES
+        )
     }
 
     /// Serve one chunk out of the cached offer. An unknown nonce (offer
@@ -3789,8 +3866,14 @@ where
         // install would otherwise be silently dropped.
         let mut snapshot: Option<Vec<u8>> = None;
         let mut table: Option<(Vec<u8>, u64)> = None;
+        // Captured before the integrity checks so a damaged pull still knows
+        // which generation to charge the decode budget against.
+        let mut generation: Option<u64> = None;
         let mut damaged = false;
         for (index, artifact) in session.artifacts.into_iter().enumerate() {
+            if artifact.entry.kind == consensus::artifact_kind::METADATA_SNAPSHOT {
+                generation = Some(artifact.entry.frontier);
+            }
             let actual = consensus::state_artifact_checksum(&artifact.buf);
             if actual != artifact.entry.checksum {
                 tracing::error!(
@@ -3822,13 +3905,12 @@ where
         let decoded = if damaged {
             None
         } else if let (Some(snapshot), Some((table_bytes, table_frontier))) = (snapshot, table) {
-            // Decode against the LIVE table's capacity, not a separately
-            // plumbed config cell. The serving primary's table can legitimately
-            // hold more entries than this node's configured cap -- heterogeneous
-            // config, or homogeneous config after a cap reduction, since
-            // `from_snapshot` sizes capacity to `max(min_slots, highest_slot +
-            // 1)`. Against the raw config value that is a deterministic
-            // `TooManyEntries` every round: a permanent, log-only join failure.
+            // The live table's capacity is only the floor: `decode` grows to
+            // the received entry count (bounded by the slot ceiling), because
+            // the serving primary can legitimately hold more sessions than
+            // this node's cap and a cold-boot receiver sits at exactly the raw
+            // config value -- rejecting on the local figure made a join under
+            // cap reduction fail deterministically.
             let capacity = planes.0.client_table_capacity();
             match consensus::ClientTable::decode(&table_bytes, capacity) {
                 Ok(table) => Some((snapshot, table, table_frontier)),
@@ -3854,16 +3936,19 @@ where
             // Damage is usually transit corruption, which a re-fetch fixes. But
             // it can also be permanent -- a peer whose artifacts this build
             // cannot decode, or an unknown artifact kind -- and that re-offers
-            // identically every round. The budget lives on the shard, so it
-            // survives the abandon -> repair -> re-arm cycle and a re-fetch that
-            // keeps failing gives up instead of pulling the whole snapshot
-            // forever. Distinct from the stall path: frames ARE flowing here, so
-            // `idle_ticks` never accumulates and that sweep can never fire.
-            if self.burn_metadata_transfer_attempt() {
+            // identically every round. The stall sweep can never bound this
+            // path (frames ARE flowing, so `idle_ticks` never accumulates, and
+            // every accepted chunk legitimately resets that budget), so decode
+            // failures are charged per snapshot generation instead: a
+            // generation past its budget is refused at descriptor time until
+            // the peer checkpoints a new one.
+            let exhausted =
+                generation.is_some_and(|generation| self.burn_decode_failure(generation));
+            if exhausted {
                 tracing::warn!(
                     shard = self.id,
                     peer,
-                    attempts = self.metadata_transfer_attempts.get(),
+                    snapshot_seq = generation,
                     "state transfer artifacts kept failing to decode; abandoning \
                      and falling back to journal repair"
                 );
@@ -3891,9 +3976,10 @@ where
         {
             Ok(outcome) => {
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
-                // A completed install: the budget starts fresh for any later
-                // rejoin rather than carrying this one's stalls forward.
+                // A completed install: both budgets start fresh for any later
+                // rejoin rather than carrying this one's failures forward.
                 self.note_metadata_transfer_progress();
+                self.metadata_transfer_decode_failures.set(None);
                 if outcome.pairing_durable {
                     // `applied_frontier`, not the transferred snapshot's op: the install
                     // returns `max(snapshot_seq, local_applied)`, which differs whenever a
