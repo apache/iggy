@@ -798,6 +798,37 @@ mod tests {
     }
 
     #[test]
+    fn given_oversized_forward_header_when_validated_should_reject() {
+        // Valid as an HTTP name, too long to become a HeaderKey. Rejected here
+        // rather than dropped later, so the operator learns the header they
+        // asked to forward would never have ridden along.
+        let long_header = "x".repeat(256);
+        let config = parse(&format!(
+            r#"{{"listen_addr": "0.0.0.0:9090", "forward_headers": ["{long_header}"]}}"#
+        ));
+        assert!(matches!(
+            config.validate(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("Iggy header key")
+        ));
+    }
+
+    #[test]
+    fn given_auth_types_when_asked_for_an_algorithm_should_map_each_exactly_once() {
+        // A swapped arm would validate SHA-1 signatures with SHA-256 and
+        // reject every request the sender signs correctly.
+        assert_eq!(
+            EndpointAuthType::HmacSha256.hmac_algorithm(),
+            Some(HmacAlgorithm::HmacSha256)
+        );
+        assert_eq!(
+            EndpointAuthType::HmacSha1.hmac_algorithm(),
+            Some(HmacAlgorithm::HmacSha1)
+        );
+        assert_eq!(EndpointAuthType::Bearer.hmac_algorithm(), None);
+        assert_eq!(EndpointAuthType::None.hmac_algorithm(), None);
+    }
+
+    #[test]
     fn given_invalid_endpoint_id_when_deserialized_should_reject() {
         let result = serde_json::from_str::<HttpSourceConfig>(
             r#"{

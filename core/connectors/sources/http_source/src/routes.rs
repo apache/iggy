@@ -336,6 +336,18 @@ mod tests {
                 claimed_by: 7,
             }
         );
+        // The rendered form reaches the operator's log through
+        // `Error::InvalidConfigValue`, and the id is the credential for a
+        // secret-path endpoint.
+        let message = conflict.to_string();
+        assert!(
+            message.contains(&ENDPOINT_ONE[..8]),
+            "the message must identify which endpoint collided: {message}"
+        );
+        assert!(
+            !message.contains(ENDPOINT_ONE),
+            "but never in full: {message}"
+        );
     }
 
     #[test]
