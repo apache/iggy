@@ -18,9 +18,8 @@
 //! Kafka response frame parsing and human-readable summaries for `send` / `verify`.
 
 use bytes::Bytes;
-use iggy_gateway_kafka::protocol::header::response_header_version;
 use kafka_protocol::messages::{
-    ApiVersionsResponse, CreateTopicsResponse, FetchResponse, ListOffsetsResponse,
+    ApiKey, ApiVersionsResponse, CreateTopicsResponse, FetchResponse, ListOffsetsResponse,
     MetadataResponse, ProduceResponse,
 };
 use kafka_protocol::protocol::Decodable;
@@ -105,9 +104,9 @@ fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
         return true;
     }
     match api_key {
-        0 => error_code == 6,   // Produce stub: NOT_LEADER_OR_FOLLOWER
-        3 => error_code == 3,   // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
-        19 => error_code == 41, // CreateTopics stub: NOT_CONTROLLER
+        0..=2 => error_code == 6, // Produce/Fetch/ListOffsets stub: NOT_LEADER_OR_FOLLOWER
+        3 => error_code == 3,     // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
+        19 => error_code == 41,   // CreateTopics stub: NOT_CONTROLLER
         _ => false,
     }
 }
@@ -133,7 +132,11 @@ pub fn analyze_response(
     }
 
     let correlation_id = i32::from_be_bytes(payload[0..4].try_into().expect("4 bytes"));
-    let resp_hdr_ver = response_header_version(api_key, api_version);
+    // Header version comes from kafka-protocol's own per-response `HeaderVersion` impl, not the
+    // gateway's table under test - otherwise a bug in the gateway's threshold would identically
+    // mis-summarize its own responses and this tool would never catch it.
+    let resp_hdr_ver =
+        ApiKey::try_from(api_key).map_or(0, |key| key.response_header_version(api_version));
     let body_start = if resp_hdr_ver >= 1 {
         5 // correlation_id + empty tagged fields (0x00)
     } else {

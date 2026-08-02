@@ -111,7 +111,7 @@ fn first_flexible_version_threshold(api_key: i16) -> i16 {
         51 => 0,        // AlterUserScramCredentials - always flexible
         55 => 0,        // DescribeQuorum - always flexible
         56 => 0,        // AlterPartition - always flexible
-        57 => 1,        // UpdateFeatures
+        57 => 0,        // UpdateFeatures - always flexible
         60 => 0,        // DescribeCluster - always flexible
         61 => 0,        // DescribeProducers - always flexible
         64 => 0,        // UnregisterBroker - always flexible

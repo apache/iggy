@@ -56,6 +56,26 @@ fn i32_array_length_above_max_returns_collection_too_large() {
 }
 
 #[test]
+fn fetch_max_declared_topics_count_with_empty_body_returns_error_not_large_alloc() {
+    // Declares the maximum allowed topics_count (65_536) but supplies no element bytes at
+    // all. Guards against pre-reserving a Vec directly off the wire count before validating
+    // any element bytes are present - decode must fail fast on the first missing byte, not
+    // attempt a large upfront allocation.
+    let mut body = Vec::new();
+    body.extend_from_slice(&0_i32.to_be_bytes()); // replica_id
+    body.extend_from_slice(&0_i32.to_be_bytes()); // max_wait_ms
+    body.extend_from_slice(&0_i32.to_be_bytes()); // min_bytes
+    body.extend_from_slice(&0_i32.to_be_bytes()); // max_bytes (version >= 3)
+    body.push(0); // isolation_level (version >= 4)
+    let topics_count = i32::try_from(MAX_COLLECTION_LEN).expect("fits i32");
+    body.extend_from_slice(&topics_count.to_be_bytes());
+    // no topic bytes follow
+
+    let err = decode_fetch_request(4, Bytes::from(body)).unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+}
+
+#[test]
 fn produce_decoder_rejects_truncated_flexible_body() {
     let mut body = Vec::new();
     body.push(0x00); // transactional_id null (compact)

@@ -130,7 +130,7 @@ Follow C1 with A2 on the **same** `nc` session to confirm the connection is not 
 | ID | Test | Steps | Expected |
 | ---- | ------ | ------- | ---------- |
 | E1 | Broker advertise address | Start gateway on `127.0.0.1:9093`; Metadata v0 | Broker host=`127.0.0.1`, port=`9093` |
-| E2 | Wildcard bind + advertised host | `KAFKA_BIND_ADDR=0.0.0.0:19093` + `KAFKA_ADVERTISED_HOST=kafka.internal`, restart | Metadata broker host/port match advertised values |
+| E2 | Wildcard bind + advertised host | `IGGY_KAFKA_BIND_ADDR=0.0.0.0:19093` + `IGGY_KAFKA_ADVERTISED_HOST=kafka.internal`, restart | Metadata broker host/port match advertised values |
 | E3 | Unknown topic stub | Metadata with topic name `my-topic` | Topic error `3` (UNKNOWN_TOPIC_OR_PARTITION), name `unknown-topic` |
 | E4 | Multiple topics | Metadata request listing 3 topics | 3 topic entries, each with error 3 |
 
@@ -255,7 +255,7 @@ _________________________________
 | Symptom | Likely cause | Fix |
 | --------- | -------------- | ----- |
 | `Connection refused` on 9093 | Gateway not running | Start `iggy-gateway-kafka` |
-| `decode_validation_tests` panic | Missing fixtures | Run `kafka-message-gen generate` |
+| `decode_validation_tests` skips silently | Missing fixtures | Run `kafka-message-gen generate` (set `KAFKA_FIXTURES_REQUIRED=1` to turn skips into failures) |
 | `ec=35` for in-range version | Version not in `SUPPORTED_RANGES` | Check `SCOPE.md` and `api.rs` |
 | kcat hangs | Timeout waiting for data | Set `-m 1000`; check gateway logs |
 | Buffer underflow on Metadata v9+ | Flexible decode mismatch | File issue; check `api.rs` metadata encoder |

@@ -71,7 +71,7 @@ fn from_server_config_rejects_wildcard_bind_without_advertised_host() {
     };
     let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
     let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
-    assert!(err.to_string().contains("KAFKA_ADVERTISED_HOST"));
+    assert!(err.to_string().contains("IGGY_KAFKA_ADVERTISED_HOST"));
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn from_server_config_rejects_advertised_host_exceeding_kafka_string_limit() {
     };
     let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
     let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
-    assert!(err.to_string().contains("KAFKA_ADVERTISED_HOST"));
+    assert!(err.to_string().contains("IGGY_KAFKA_ADVERTISED_HOST"));
 }
 
 #[test]

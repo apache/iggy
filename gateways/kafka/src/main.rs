@@ -27,18 +27,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let mut config = ServerConfig::default();
-    if let Ok(bind_addr) = std::env::var("KAFKA_BIND_ADDR") {
+    if let Ok(bind_addr) = std::env::var("IGGY_KAFKA_BIND_ADDR") {
         config.bind_addr = bind_addr;
     }
-    if let Ok(advertised_host) = std::env::var("KAFKA_ADVERTISED_HOST") {
+    if let Ok(advertised_host) = std::env::var("IGGY_KAFKA_ADVERTISED_HOST") {
         config.advertised_host = Some(advertised_host);
     }
-    if let Ok(advertised_port) = std::env::var("KAFKA_ADVERTISED_PORT") {
-        config.advertised_port = Some(
-            advertised_port
-                .parse()
-                .map_err(|e| format!("invalid KAFKA_ADVERTISED_PORT `{advertised_port}`: {e}"))?,
-        );
+    if let Ok(advertised_port) = std::env::var("IGGY_KAFKA_ADVERTISED_PORT") {
+        config.advertised_port =
+            Some(advertised_port.parse().map_err(|e| {
+                format!("invalid IGGY_KAFKA_ADVERTISED_PORT `{advertised_port}`: {e}")
+            })?);
+    }
+    if let Ok(max_connections) = std::env::var("IGGY_KAFKA_MAX_CONNECTIONS") {
+        config.max_connections = max_connections
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_MAX_CONNECTIONS `{max_connections}`: {e}"))?;
+    }
+    if let Ok(idle_timeout_secs) = std::env::var("IGGY_KAFKA_IDLE_TIMEOUT_SECS") {
+        let secs: u64 = idle_timeout_secs.parse().map_err(|e| {
+            format!("invalid IGGY_KAFKA_IDLE_TIMEOUT_SECS `{idle_timeout_secs}`: {e}")
+        })?;
+        config.idle_timeout = std::time::Duration::from_secs(secs);
+    }
+    if let Ok(drain_secs) = std::env::var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
+        let secs: u64 = drain_secs.parse().map_err(|e| {
+            format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{drain_secs}`: {e}")
+        })?;
+        config.shutdown_drain_timeout = std::time::Duration::from_secs(secs);
     }
     let listener = TcpListener::bind(&config.bind_addr)
         .await

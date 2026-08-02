@@ -18,7 +18,7 @@
 use bytes::Bytes;
 
 use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::codec::{Decoder, Encoder};
+use crate::protocol::codec::{Decoder, Encoder, PREALLOC_HINT};
 use crate::protocol::requests::{
     ProduceDecodeResult, decode_create_topics_request, decode_fetch_request,
     decode_list_offsets_request, decode_produce_request,
@@ -183,18 +183,24 @@ pub fn handle_request(
 
 /// Produce is the only request the wire protocol allows to go unanswered
 /// (`acks=0`), so it gets its own path that may return [`HandleOutcome::NoResponse`].
+///
+/// The firewall check runs AFTER decoding `acks`, not before: `ApiVersions` advertises
+/// Produce min=0 (see [`advertised_min_version`]) while the firewall's real floor is 3, so a
+/// spec-compliant client can legitimately send Produce v0-2 with `acks=0`. Rejecting those
+/// versions before reading `acks` would send an error response the client never expects,
+/// desyncing the next correlation id it reads.
 fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
-    if !is_supported_version(API_KEY_PRODUCE, api_version) {
-        return HandleOutcome::Respond(encode_produce_error_response(
-            api_version,
-            ERROR_UNSUPPORTED_VERSION,
-        ));
-    }
     match decode_produce_request(api_version, body) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
         ProduceDecodeResult::Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
         ProduceDecodeResult::Ok(req) => {
+            if !is_supported_version(API_KEY_PRODUCE, api_version) {
+                return HandleOutcome::Respond(encode_produce_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ));
+            }
             HandleOutcome::Respond(encode_produce_response(api_version, &req))
         }
         ProduceDecodeResult::Err {
@@ -209,10 +215,12 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
         }
         ProduceDecodeResult::Err { error, .. } => {
             tracing::warn!("Failed to decode Produce request: {:?}", error);
-            HandleOutcome::Respond(encode_produce_error_response(
-                api_version,
-                ERROR_INVALID_REQUEST,
-            ))
+            let code = if is_supported_version(API_KEY_PRODUCE, api_version) {
+                ERROR_INVALID_REQUEST
+            } else {
+                ERROR_UNSUPPORTED_VERSION
+            };
+            HandleOutcome::Respond(encode_produce_error_response(api_version, code))
         }
     }
 }
@@ -432,7 +440,7 @@ fn encode_metadata_response(
     } else {
         e.write_i32(1); // brokers array length
         e.write_i32(1); // node_id
-        // broker.host is config-derived (KAFKA_ADVERTISED_HOST), not request-decoded - use
+        // broker.host is config-derived (IGGY_KAFKA_ADVERTISED_HOST), not request-decoded - use
         // the checked variant so an overly long hostname returns an error instead of panicking.
         if e.write_nullable_string(Some(&broker.host)).is_err() {
             return encode_error_only_response(ERROR_INVALID_REQUEST);
@@ -478,16 +486,20 @@ pub fn encode_error_only_response(error_code: i16) -> Bytes {
 
 /// Decodes the requested topic names from a Metadata request body so the
 /// response can echo them back; clients match metadata by name, not position.
+///
+/// A null topics array - `-1` legacy count, or `varint=0` compact count - means "all topics"
+/// per the Kafka spec, not a malformed request; both decode to an empty list here since the
+/// stub doesn't implement real topic listing yet.
 pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> Result<Vec<String>> {
     let mut d = Decoder::new(body);
     let flexible = api_version >= 9;
     let topics_count = if flexible {
         d.read_compact_array_count()?
     } else {
-        d.read_i32_array_count()?
+        d.read_i32_array_count_nullable()?
     };
 
-    let mut topics = Vec::with_capacity(topics_count);
+    let mut topics = Vec::with_capacity(topics_count.min(PREALLOC_HINT));
     for _ in 0..topics_count {
         if flexible && api_version >= 10 {
             // MetadataRequestTopic.topic_id: 16-byte UUID before name (v10+).
@@ -522,6 +534,23 @@ mod tests {
         ]);
         let err = decode_metadata_request_topics(body, 0).unwrap_err();
         assert!(matches!(err, KafkaProtocolError::NullTopicName));
+    }
+
+    #[test]
+    fn decode_metadata_request_topics_legacy_null_array_means_all_topics() {
+        // -1 is the spec-defined "all topics" sentinel for the legacy i32 array count, not a
+        // malformed request - must decode to an empty list, not InvalidArrayLength.
+        let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
+        let topics = decode_metadata_request_topics(body, 0).unwrap();
+        assert!(topics.is_empty());
+    }
+
+    #[test]
+    fn decode_metadata_request_topics_legacy_other_negative_counts_still_fail() {
+        // Only -1 is the null sentinel; any other negative count is genuinely malformed.
+        let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xfe]); // -2
+        let err = decode_metadata_request_topics(body, 0).unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::InvalidArrayLength(-2)));
     }
 
     #[test]

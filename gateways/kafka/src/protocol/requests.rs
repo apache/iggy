@@ -19,7 +19,7 @@
 
 #![allow(clippy::too_many_lines, clippy::doc_markdown)]
 use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::codec::Decoder;
+use crate::protocol::codec::{Decoder, PREALLOC_HINT};
 use bytes::Bytes;
 
 /// Produce Request (API Key 0)
@@ -114,7 +114,7 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult 
         }
     );
 
-    let mut topics = Vec::with_capacity(topics_count);
+    let mut topics = Vec::with_capacity(topics_count.min(PREALLOC_HINT));
     for _ in 0..topics_count {
         let topic = produce_decode!(
             acks_read,
@@ -135,7 +135,7 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult 
             }
         );
 
-        let mut partitions = Vec::with_capacity(partitions_count);
+        let mut partitions = Vec::with_capacity(partitions_count.min(PREALLOC_HINT));
         for _ in 0..partitions_count {
             let partition = produce_decode!(acks_read, d.read_i32());
             let records = produce_decode!(
@@ -226,7 +226,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
         d.read_i32_array_count()?
     };
 
-    let mut topics = Vec::with_capacity(topics_count);
+    let mut topics = Vec::with_capacity(topics_count.min(PREALLOC_HINT));
     for _ in 0..topics_count {
         let topic = if flexible {
             d.read_compact_nullable_string()?
@@ -242,7 +242,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
             d.read_i32_array_count()?
         };
 
-        let mut partitions = Vec::with_capacity(partitions_count);
+        let mut partitions = Vec::with_capacity(partitions_count.min(PREALLOC_HINT));
         for _ in 0..partitions_count {
             let partition = d.read_i32()?;
 
@@ -344,7 +344,8 @@ pub struct ListOffsetsPartition {
     pub partition: i32,
     pub timestamp: i64, // -2 = earliest, -1 = latest
 }
-/// Collapse to `Result` for tests and callers that only need a successful `decode_list_offsets_request`.
+/// Decodes a raw byte stream into a `ListOffsetsRequest`.
+///
 /// # Errors
 ///
 /// Returns an error if the byte stream is malformed or if the API version is unsupported.
@@ -362,7 +363,7 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
         d.read_i32_array_count()?
     };
 
-    let mut topics = Vec::with_capacity(topics_count);
+    let mut topics = Vec::with_capacity(topics_count.min(PREALLOC_HINT));
     for _ in 0..topics_count {
         let topic = if flexible {
             d.read_compact_nullable_string()?
@@ -378,7 +379,7 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
             d.read_i32_array_count()?
         };
 
-        let mut partitions = Vec::with_capacity(partitions_count);
+        let mut partitions = Vec::with_capacity(partitions_count.min(PREALLOC_HINT));
         for _ in 0..partitions_count {
             let partition = d.read_i32()?;
 
@@ -433,7 +434,8 @@ pub struct CreatableTopic {
     pub replication_factor: i16,
 }
 
-/// Collapse to `Result` for tests and callers that only need a successful `decode_create_topics_request`.
+/// Decodes a raw byte stream into a `CreateTopicsRequest`.
+///
 /// # Errors
 ///
 /// Returns an error if the byte stream is malformed or if the API version is unsupported.
@@ -447,7 +449,7 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
         d.read_i32_array_count()?
     };
 
-    let mut topics = Vec::with_capacity(topics_count);
+    let mut topics = Vec::with_capacity(topics_count.min(PREALLOC_HINT));
     for _ in 0..topics_count {
         let name = if flexible {
             d.read_compact_nullable_string()?

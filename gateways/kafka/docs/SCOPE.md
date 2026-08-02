@@ -16,7 +16,7 @@ Foundation layer only: a TCP listener on the Kafka wire port that decodes reques
 | Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/requests.rs` |
 | Graceful errors (`UNSUPPORTED_VERSION`, corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
 | Adversarial decode safety tests | Done | `tests/decode_safety_tests.rs` |
-| Regression test suite (103 tests) | Done | `tests/` — catalog in [`TEST_SUITE.md`](TEST_SUITE.md) |
+| Regression test suite | Done | `tests/` — see [`TEST_SUITE.md`](TEST_SUITE.md) |
 | Manual testing procedure | Done | [`MANUAL_TESTING.md`](MANUAL_TESTING.md) |
 | Wire fixture tool for manual/integration testing | Done | `tools/kafka-tool/` |
 
@@ -118,4 +118,4 @@ Items from the [hybrid architecture review](https://github.com/apache/iggy/discu
 ### Open questions (ask maintainers before Phase 2)
 
 - [ ] Repo placement: `gateways/kafka/` in [apache/iggy](https://github.com/apache/iggy) vs separate proxy repo (affects workspace deps and CI)
-- [ ] Confirm bridge dependency strategy with spetz/hubcio ([Discussion #3081](https://github.com/apache/iggy/discussions/3081), [#3252](https://github.com/apache/iggy/discussions/3252))
+- [ ] Confirm bridge dependency strategy ([Discussion #3081](https://github.com/apache/iggy/discussions/3081), [#3252](https://github.com/apache/iggy/discussions/3252))

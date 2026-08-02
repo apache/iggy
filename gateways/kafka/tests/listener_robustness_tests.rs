@@ -89,8 +89,11 @@ async fn e2e_frame_within_custom_max_frame_size_accepted() {
         advertised_host: None,
         advertised_port: None,
         max_frame_size: max_frame,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
     })
     .await;
 
@@ -117,8 +120,11 @@ async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
         advertised_host: None,
         advertised_port: None,
         max_frame_size: max_frame,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
     })
     .await;
 
@@ -144,8 +150,11 @@ async fn e2e_truncated_frame_body_closes_connection() {
         advertised_host: None,
         advertised_port: None,
         max_frame_size: 8 * 1024 * 1024,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(1),
         write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
     })
     .await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -259,8 +268,11 @@ async fn e2e_slow_client_can_complete_request_within_read_timeout() {
         advertised_host: None,
         advertised_port: None,
         max_frame_size: 8 * 1024 * 1024,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
     })
     .await;
 
@@ -451,8 +463,11 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
         advertised_host: None,
         advertised_port: None,
         max_frame_size: 8 * 1024 * 1024,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(3),
         write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
     })
     .await;
 

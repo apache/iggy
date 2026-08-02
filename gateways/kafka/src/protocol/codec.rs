@@ -35,6 +35,14 @@ use crate::error::{KafkaProtocolError, Result};
 /// Matches typical broker limits and prevents OOM from adversarial length prefixes.
 pub const MAX_COLLECTION_LEN: usize = 65_536;
 
+/// Initial `Vec::with_capacity` hint for wire-decoded array counts.
+///
+/// A count up to `MAX_COLLECTION_LEN` is still validated as a count, but pre-reserving on it
+/// directly lets a few-byte frame declaring a huge count force a multi-megabyte allocation
+/// before any element bytes are checked present. Clamp the reservation; genuine large arrays
+/// still grow correctly via `Vec::push`'s amortized doubling once real elements are decoded.
+pub const PREALLOC_HINT: usize = 128;
+
 pub struct Decoder {
     bytes: Bytes,
 }
@@ -102,6 +110,30 @@ impl Decoder {
     /// Legacy array length: signed i32 count (must be non-negative).
     pub fn read_i32_array_count(&mut self) -> Result<usize> {
         let n = self.read_i32()?;
+        if n < 0 {
+            return Err(KafkaProtocolError::InvalidArrayLength(n));
+        }
+        // Safe: n is in [0, i32::MAX]; i32::MAX (2_147_483_647) fits in usize
+        // on all 32-bit and 64-bit platforms this crate targets.
+        let count = n as usize;
+        if count > MAX_COLLECTION_LEN {
+            return Err(KafkaProtocolError::CollectionTooLarge {
+                count,
+                max: MAX_COLLECTION_LEN,
+            });
+        }
+        Ok(count)
+    }
+
+    /// Legacy nullable array length: signed i32 count, where -1 is the spec-defined null
+    /// (`all items`) sentinel - used by Metadata's `topics` field to mean "all topics" - treated
+    /// as empty (0 elements) rather than an error, mirroring how `read_compact_array_count`
+    /// treats a null compact array.
+    pub fn read_i32_array_count_nullable(&mut self) -> Result<usize> {
+        let n = self.read_i32()?;
+        if n == -1 {
+            return Ok(0);
+        }
         if n < 0 {
             return Err(KafkaProtocolError::InvalidArrayLength(n));
         }

@@ -70,9 +70,14 @@ async fn read_frame_reads_valid_payload() {
     frame.extend_from_slice(&payload);
     client.write_all(&frame).await.unwrap();
 
-    let parsed = read_frame(&mut server, 4096, Duration::from_secs(1))
-        .await
-        .unwrap();
+    let parsed = read_frame(
+        &mut server,
+        4096,
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
     assert_eq!(parsed, payload);
 }
 
@@ -99,9 +104,14 @@ async fn read_frame_rejects_invalid_lengths() {
     let (mut client, mut server) = tcp_pair().await;
 
     client.write_all(&0i32.to_be_bytes()).await.unwrap();
-    let err = read_frame(&mut server, 128, Duration::from_secs(1))
-        .await
-        .expect_err("zero frame must fail");
+    let err = read_frame(
+        &mut server,
+        128,
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect_err("zero frame must fail");
     assert!(err.to_string().contains("invalid frame length"));
 
     // Ensure connection can still be reused for a second scenario by writing a valid new prefix+payload.
@@ -109,9 +119,14 @@ async fn read_frame_rejects_invalid_lengths() {
     frame.extend_from_slice(&(200i32).to_be_bytes());
     frame.resize(4 + 200, 0);
     client.write_all(&frame).await.unwrap();
-    let err = read_frame(&mut server, 64, Duration::from_secs(1))
-        .await
-        .expect_err("large frame must fail");
+    let err = read_frame(
+        &mut server,
+        64,
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect_err("large frame must fail");
     assert!(err.to_string().contains("exceeds max frame size"));
 }
 
@@ -147,9 +162,14 @@ async fn read_frame_does_not_consume_pipelined_frame_bytes() {
     both.extend_from_slice(payload2);
     client.write_all(&both).await.unwrap();
 
+    let idle_timeout = Duration::from_secs(5);
     let timeout = Duration::from_secs(1);
-    let frame1 = read_frame(&mut server, 4096, timeout).await.unwrap();
-    let frame2 = read_frame(&mut server, 4096, timeout).await.unwrap();
+    let frame1 = read_frame(&mut server, 4096, idle_timeout, timeout)
+        .await
+        .unwrap();
+    let frame2 = read_frame(&mut server, 4096, idle_timeout, timeout)
+        .await
+        .unwrap();
 
     assert_eq!(&frame1[..], payload1);
     assert_eq!(&frame2[..], payload2);

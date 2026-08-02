@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NONE, ERROR_UNSUPPORTED_VERSION,
+    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNSUPPORTED_VERSION,
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
@@ -141,16 +141,8 @@ async fn e2e_sequential_requests_on_one_connection() {
     }
 }
 
-#[tokio::test]
-async fn e2e_negative_frame_length_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    stream.write_all(&(-1i32).to_be_bytes()).await.unwrap();
-
-    let mut buf = [0u8; 1];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
-    assert_eq!(n, 0, "server should close after invalid frame length");
-}
+// Negative-frame-length-closes-connection coverage lives in listener_robustness_tests.rs
+// (uses a timeout-guarded read helper, so a regression fails fast instead of hanging).
 
 #[tokio::test]
 async fn e2e_oversized_frame_is_rejected() {
@@ -364,7 +356,7 @@ async fn produce_v3_through_v9_e2e_preserve_correlation_id() {
 // ── ListOffsets supported versions ──────────────────────────────────────────
 
 #[tokio::test]
-async fn list_offsets_v1_through_v6_e2e_return_partition_error_zero() {
+async fn list_offsets_v1_through_v6_e2e_return_retriable_not_leader() {
     let (addr, _shutdown) = spawn_test_server().await;
 
     for version in 1i16..=6 {
@@ -391,7 +383,7 @@ async fn list_offsets_v1_through_v6_e2e_return_partition_error_zero() {
         d.read_i32().unwrap();
         assert_eq!(
             d.read_i16().unwrap(),
-            ERROR_NONE,
+            ERROR_NOT_LEADER_OR_FOLLOWER,
             "ListOffsets v{version} stub partition error"
         );
     }

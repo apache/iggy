@@ -22,7 +22,7 @@ use std::time::Duration;
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use tokio::time::{timeout, timeout_at};
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -43,14 +43,25 @@ const READ_CHUNK: usize = 65536;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    /// Hostname or IP advertised in Metadata (`KAFKA_ADVERTISED_HOST`). Required when `bind_addr`
-    /// uses a wildcard address (`0.0.0.0` / `::`).
+    /// Hostname or IP advertised in Metadata (`IGGY_KAFKA_ADVERTISED_HOST`). Required when
+    /// `bind_addr` uses a wildcard address (`0.0.0.0` / `::`).
     pub advertised_host: Option<String>,
-    /// Port advertised in Metadata (`KAFKA_ADVERTISED_PORT`). Defaults to the bind port.
+    /// Port advertised in Metadata (`IGGY_KAFKA_ADVERTISED_PORT`). Defaults to the bind port.
     pub advertised_port: Option<u16>,
     pub max_frame_size: usize,
+    /// Maximum concurrent connections accepted before new ones are rejected.
+    pub max_connections: usize,
+    /// Bound on how long an accepted connection may sit idle before sending the next
+    /// frame's length prefix. Kafka brokers default `connections.max.idle.ms` to 10 minutes;
+    /// match that so well-behaved idle clients aren't dropped.
+    pub idle_timeout: Duration,
     pub read_timeout: Duration,
     pub write_timeout: Duration,
+    /// Cap on how long graceful shutdown waits for in-flight connections to finish. Without
+    /// this, a connection idling inside `idle_timeout` (10 minutes by default) would otherwise
+    /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
+    /// 30s `terminationGracePeriodSeconds`).
+    pub shutdown_drain_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -60,8 +71,11 @@ impl Default for ServerConfig {
             advertised_host: None,
             advertised_port: None,
             max_frame_size: 8 * 1024 * 1024,
+            max_connections: 1024,
+            idle_timeout: Duration::from_mins(10),
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
+            shutdown_drain_timeout: Duration::from_secs(25),
         }
     }
 }
@@ -84,20 +98,21 @@ impl BrokerAdvertise {
             let trimmed = advertised.trim();
             if trimmed.is_empty() {
                 return Err(KafkaProtocolError::InvalidConfig(
-                    "KAFKA_ADVERTISED_HOST must not be empty".into(),
+                    "IGGY_KAFKA_ADVERTISED_HOST must not be empty".into(),
                 ));
             }
             if trimmed.len() > i16::MAX as usize {
                 return Err(KafkaProtocolError::InvalidConfig(
-                    "KAFKA_ADVERTISED_HOST exceeds Kafka nullable string limit (32767 bytes)"
+                    "IGGY_KAFKA_ADVERTISED_HOST exceeds Kafka nullable string limit (32767 bytes)"
                         .into(),
                 ));
             }
             trimmed.to_string()
         } else if local_addr.ip().is_unspecified() {
             return Err(KafkaProtocolError::InvalidConfig(
-                "binding to a wildcard address (0.0.0.0 or ::) requires KAFKA_ADVERTISED_HOST \
-                 to be set to a reachable hostname or IP for Metadata broker advertisement"
+                "binding to a wildcard address (0.0.0.0 or ::) requires \
+                 IGGY_KAFKA_ADVERTISED_HOST to be set to a reachable hostname or IP for \
+                 Metadata broker advertisement"
                     .into(),
             ));
         } else {
@@ -144,7 +159,9 @@ impl KafkaServer {
         );
 
         let tracker = TaskTracker::new();
-        let broker = Arc::clone(&broker);
+        let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
+
+        let drain_timeout = self.config.shutdown_drain_timeout;
 
         loop {
             tokio::select! {
@@ -152,20 +169,17 @@ impl KafkaServer {
                     match result {
                         Ok(()) => {
                             info!("kafka listener shutdown requested");
-                            tracker.close();
-                            tracker.wait().await;
+                            drain(&tracker, drain_timeout).await;
                             break;
                         }
                         // Capacity-1 channel: lagged means a signal was sent before we polled - treat as shutdown.
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             info!("kafka listener shutdown requested (lagged)");
-                            tracker.close();
-                            tracker.wait().await;
+                            drain(&tracker, drain_timeout).await;
                             break;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            tracker.close();
-                            tracker.wait().await;
+                            drain(&tracker, drain_timeout).await;
                             break;
                         }
                     }
@@ -173,6 +187,10 @@ impl KafkaServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer)) => {
+                            let Ok(permit) = Arc::clone(&conn_limiter).try_acquire_owned() else {
+                                warn!(%peer, max_connections = self.config.max_connections, "connection limit reached, rejecting");
+                                continue;
+                            };
                             if let Err(e) = stream.set_nodelay(true) {
                                 warn!(%peer, "TCP_NODELAY failed: {e}");
                             }
@@ -182,6 +200,7 @@ impl KafkaServer {
                             let cfg = Arc::clone(&self.config);
                             let broker = Arc::clone(&broker);
                             tracker.spawn(async move {
+                                let _permit = permit;
                                 if let Err(err) = handle_connection(stream, cfg, peer, broker).await {
                                     warn!(%peer, "connection closed with error: {err}");
                                 }
@@ -194,7 +213,10 @@ impl KafkaServer {
                             }
                             warn!(%e, "transient accept error, continuing");
                         }
-                        Err(e) => return Err(e.into()),
+                        Err(e) => {
+                            drain(&tracker, drain_timeout).await;
+                            return Err(e.into());
+                        }
                     }
                 }
 
@@ -204,12 +226,23 @@ impl KafkaServer {
     }
 }
 
-fn is_transient_accept_error(err: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
+/// Close the tracker to new spawns and wait for in-flight connections to finish, but not past
+/// `deadline` - an idle connection can otherwise hold shutdown open for up to `idle_timeout`
+/// (10 minutes by default), past typical orchestrator grace periods.
+async fn drain(tracker: &TaskTracker, deadline: Duration) {
+    tracker.close();
+    if timeout(deadline, tracker.wait()).await.is_err() {
+        warn!(
+            ?deadline,
+            "shutdown drain deadline exceeded; abandoning in-flight connections"
+        );
+    }
+}
 
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
-        ErrorKind::Interrupted | ErrorKind::ConnectionAborted | ErrorKind::WouldBlock
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::WouldBlock
     ) || matches!(
         err.raw_os_error(),
         // EMFILE / ENFILE are common across Unix platforms when fd limits are hit.
@@ -232,7 +265,13 @@ async fn handle_connection(
     debug!(%peer, "connection accepted");
 
     loop {
-        let frame = match read_frame(&mut stream, config.max_frame_size, config.read_timeout).await
+        let frame = match read_frame(
+            &mut stream,
+            config.max_frame_size,
+            config.idle_timeout,
+            config.read_timeout,
+        )
+        .await
         {
             Ok(f) => f,
             Err(KafkaProtocolError::Io(ref e))
@@ -367,21 +406,25 @@ fn correlation_id_from_frame(frame: &bytes::Bytes) -> i32 {
 pub async fn read_frame(
     stream: &mut TcpStream,
     max_frame_size: usize,
+    idle_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<bytes::Bytes> {
     let mut len_buf = [0u8; 4];
-    // Idle: block until client starts next frame (or EOF). No read_timeout here.
-    stream.read_exact(&mut len_buf).await?;
+    // Idle: bounded wait for the client to start the next frame (or EOF).
+    match timeout(idle_timeout, stream.read_exact(&mut len_buf)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout").into()),
+    }
 
     let frame_len_i32 = i32::from_be_bytes(len_buf);
     if frame_len_i32 <= 0 {
         return Err(KafkaProtocolError::InvalidFrameLength(frame_len_i32));
     }
-    let frame_len =
-        usize::try_from(frame_len_i32).map_err(|_| KafkaProtocolError::FrameTooLarge {
-            max_bytes: max_frame_size,
-            actual_bytes: usize::MAX,
-        })?;
+    // frame_len_i32 is validated > 0 above, so it always fits usize on every
+    // platform this crate targets (32-bit and 64-bit).
+    #[allow(clippy::cast_sign_loss)]
+    let frame_len = frame_len_i32 as usize;
     if frame_len > max_frame_size {
         return Err(KafkaProtocolError::FrameTooLarge {
             max_bytes: max_frame_size,
@@ -391,17 +434,22 @@ pub async fn read_frame(
 
     // In-flight: read_timeout applies only after the length prefix is complete.
     let deadline = tokio::time::Instant::now() + read_timeout;
-    // read_buf() exposes all BytesMut spare capacity to the OS; after reserve(n) the
-    // allocator may give more than n bytes, so the OS can fill past frame_len and silently
-    // consume bytes belonging to the next pipelined frame. Use read() with a bounded slice
-    // so each OS call is limited to exactly the remaining bytes needed.
-    let mut data = BytesMut::with_capacity(frame_len);
+    // Reserve incrementally, one chunk ahead of what's actually been received, instead of
+    // BytesMut::with_capacity(frame_len) up front - frame_len comes straight from the wire
+    // (bounded only by max_frame_size), so an attacker who sends a valid length prefix and
+    // then no body would otherwise force a full max_frame_size allocation per connection
+    // before a single body byte arrives (same amplification class as PREALLOC_HINT).
+    let mut data = BytesMut::with_capacity(frame_len.min(READ_CHUNK));
     while data.len() < frame_len {
         let remaining = frame_len - data.len();
         let chunk = remaining.min(READ_CHUNK);
-        let prev = data.len();
-        data.resize(prev + chunk, 0);
-        let n = match timeout_at(deadline, stream.read(&mut data[prev..prev + chunk])).await {
+        data.reserve(chunk);
+        // `.limit(chunk)` bounds how much of BytesMut's spare capacity read_buf may fill,
+        // so a single OS read still can't consume bytes belonging to the next pipelined
+        // frame - the same guarantee the old resize()+read() approach had - but without
+        // pre-zeroing the chunk first, since read_buf only writes into its own spare
+        // capacity via chunk_mut() rather than requiring pre-initialized memory.
+        match timeout_at(deadline, stream.read_buf(&mut (&mut data).limit(chunk))).await {
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout").into()),
             Ok(Ok(0)) => {
                 return Err(
@@ -409,9 +457,8 @@ pub async fn read_frame(
                 );
             }
             Ok(Err(e)) => return Err(e.into()),
-            Ok(Ok(n)) => n,
-        };
-        data.truncate(prev + n);
+            Ok(Ok(_)) => {}
+        }
     }
     Ok(data.freeze())
 }
@@ -493,9 +540,14 @@ mod tests {
     async fn read_frame_rejects_negative_length() {
         let (mut client, mut server) = tcp_pair().await;
         client.write_all(&(-1_i32).to_be_bytes()).await.unwrap();
-        let err = read_frame(&mut server, 64, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let err = read_frame(
+            &mut server,
+            64,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, KafkaProtocolError::InvalidFrameLength(-1)));
     }
 
@@ -504,9 +556,14 @@ mod tests {
         let (mut client, mut server) = tcp_pair().await;
         client.write_all(&(5_i32).to_be_bytes()).await.unwrap();
         client.shutdown().await.unwrap();
-        let err = read_frame(&mut server, 64, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let err = read_frame(
+            &mut server,
+            64,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("connection closed"));
     }
 
@@ -515,10 +572,86 @@ mod tests {
         let (mut client, mut server) = tcp_pair().await;
         client.write_all(&(5_i32).to_be_bytes()).await.unwrap();
         client.write_all(&[1, 2]).await.unwrap();
-        let err = read_frame(&mut server, 64, Duration::from_millis(50))
-            .await
-            .unwrap_err();
+        let err = read_frame(
+            &mut server,
+            64,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("read timeout"));
+    }
+
+    #[tokio::test]
+    async fn read_frame_times_out_when_client_sends_nothing() {
+        let (_client, mut server) = tcp_pair().await;
+        let err = read_frame(
+            &mut server,
+            64,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("idle timeout"));
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_does_not_stall_past_drain_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = broadcast::channel(1);
+        let server = KafkaServer::new(ServerConfig {
+            // Idle timeout is intentionally long - the drain deadline, not the idle timeout,
+            // must be what bounds shutdown here.
+            idle_timeout: Duration::from_mins(10),
+            shutdown_drain_timeout: Duration::from_millis(100),
+            ..ServerConfig::default()
+        });
+        let handle = tokio::spawn(async move { server.run(listener, rx).await });
+
+        // Held open, never sends a frame: the in-flight connection task is parked in
+        // read_frame's idle wait for the full 600s idle_timeout unless drain cuts it short.
+        let _held = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("shutdown must return well within the 600s idle_timeout")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_rejects_connections_beyond_max_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = broadcast::channel(1);
+        let server = KafkaServer::new(ServerConfig {
+            max_connections: 1,
+            ..ServerConfig::default()
+        });
+        let handle = tokio::spawn(async move { server.run(listener, rx).await });
+
+        // First connection holds the only permit by never sending a frame.
+        let held = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second connection should be accepted at the TCP level (backlog) but closed
+        // immediately by the server once the permit acquisition fails.
+        let mut rejected = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut buf))
+            .await
+            .expect("server should close rejected connection promptly")
+            .unwrap();
+        assert_eq!(n, 0, "rejected connection should be closed with EOF");
+
+        tx.send(()).unwrap();
+        drop(held);
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -564,10 +697,41 @@ mod tests {
             .await
             .unwrap();
         client.write_all(&payload).await.unwrap();
-        let frame = read_frame(&mut server, max_frame_size, Duration::from_secs(1))
+        let frame = read_frame(
+            &mut server,
+            max_frame_size,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame.len(), max_frame_size);
+    }
+
+    #[tokio::test]
+    async fn read_frame_reassembles_frame_spanning_multiple_read_chunks() {
+        // frame_len exceeds READ_CHUNK, forcing the incremental reserve()+read_buf loop
+        // through more than one iteration - guards the switch away from a single
+        // BytesMut::with_capacity(frame_len) upfront allocation.
+        let (mut client, mut server) = tcp_pair().await;
+        let frame_len = READ_CHUNK + 1024;
+        let payload: Vec<u8> = (0..frame_len)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 < 256"))
+            .collect();
+        client
+            .write_all(&i32::try_from(frame_len).unwrap().to_be_bytes())
             .await
             .unwrap();
-        assert_eq!(frame.len(), max_frame_size);
+        client.write_all(&payload).await.unwrap();
+        let frame = read_frame(
+            &mut server,
+            frame_len,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&frame[..], &payload[..]);
     }
 
     #[tokio::test]
@@ -575,9 +739,14 @@ mod tests {
         let (mut client, mut server) = tcp_pair().await;
         let max_frame_size = 64usize;
         client.write_all(&65_i32.to_be_bytes()).await.unwrap();
-        let err = read_frame(&mut server, max_frame_size, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let err = read_frame(
+            &mut server,
+            max_frame_size,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             KafkaProtocolError::FrameTooLarge {

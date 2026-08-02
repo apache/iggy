@@ -32,8 +32,11 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
         advertised_host: None,
         advertised_port: None,
         max_frame_size: 8 * 1024 * 1024,
+        max_connections: 1024,
+        idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
+        shutdown_drain_timeout: Duration::from_secs(5),
     })
     .await
 }

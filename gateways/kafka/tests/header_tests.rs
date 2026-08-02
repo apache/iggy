@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use kafka_protocol::messages::ApiKey;
+
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_PRODUCE,
@@ -107,7 +109,8 @@ fn response_header_v1_encodes_correlation_id_plus_tagged_fields() {
 
 // ── Header version lookup ───────────────────────────────────────────────────
 
-/// Flexible-encoding threshold per API key (mirrors `protocol/header.rs`).
+/// Flexible-encoding threshold per API key (mirrors `protocol/header.rs`; cross-checked against
+/// the independent `kafka-protocol` crate below rather than trusted on its own).
 const API_KEY_FLEXIBLE_FROM: &[(i16, i16)] = &[
     (0, 9),
     (1, 12),
@@ -163,7 +166,7 @@ const API_KEY_FLEXIBLE_FROM: &[(i16, i16)] = &[
     (51, 0),
     (55, 0),
     (56, 0),
-    (57, 1),
+    (57, 0),
     (60, 0),
     (61, 0),
     (64, 0),
@@ -182,6 +185,29 @@ const API_KEY_FLEXIBLE_FROM: &[(i16, i16)] = &[
     (79, 0),
     (80, 0),
 ];
+
+#[test]
+fn request_header_version_matches_independent_kafka_protocol_crate() {
+    // API_KEY_FLEXIBLE_FROM is hand-transcribed from header.rs's threshold table, so comparing
+    // request_header_version only against that same mirror can't catch a value wrong in both
+    // places (the same transcription mistake copied twice). Cross-check against the third-party
+    // `kafka-protocol` crate's own per-key header-version logic instead, over every version that
+    // crate considers actually valid for the key - outside that range a version never appeared
+    // on the real wire, so there's no independently-meaningful answer to compare against.
+    for &(api_key, _) in API_KEY_FLEXIBLE_FROM {
+        let Ok(external) = ApiKey::try_from(api_key) else {
+            continue;
+        };
+        let range = external.valid_versions();
+        for version in range.min..=range.max {
+            assert_eq!(
+                request_header_version(api_key, version),
+                external.request_header_version(version),
+                "api_key={api_key} version={version}: gateway vs kafka-protocol header version"
+            );
+        }
+    }
+}
 
 #[test]
 fn request_header_version_hits_every_api_key_match_arm() {

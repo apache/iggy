@@ -136,7 +136,14 @@ pub fn encode_fetch_error_response(version: i16, error_code: i16) -> Bytes {
 }
 #[must_use]
 pub fn encode_fetch_response(version: i16, req: &FetchRequest) -> Bytes {
-    encode_fetch_response_inner(version, &req.topics, Some(ERROR_NONE), ERROR_NONE)
+    // Stub: discard payload and return a retriable error so clients don't mistake
+    // "no real data yet" for a genuinely empty partition (same philosophy as Produce).
+    encode_fetch_response_inner(
+        version,
+        &req.topics,
+        Some(ERROR_NONE),
+        ERROR_NOT_LEADER_OR_FOLLOWER,
+    )
 }
 
 fn encode_fetch_response_inner(
@@ -231,7 +238,9 @@ pub fn encode_list_offsets_error_response(version: i16, error_code: i16) -> Byte
 }
 #[must_use]
 pub fn encode_list_offsets_response(version: i16, req: &ListOffsetsRequest) -> Bytes {
-    encode_list_offsets_response_inner(version, &req.topics, ERROR_NONE)
+    // Stub: discard payload and return a retriable error, matching Produce/Fetch - a genuine
+    // offset lookup requires the same partition-leadership the stub doesn't have yet.
+    encode_list_offsets_response_inner(version, &req.topics, ERROR_NOT_LEADER_OR_FOLLOWER)
 }
 
 fn encode_list_offsets_response_inner(

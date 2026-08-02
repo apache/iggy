@@ -50,10 +50,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+kafka-protocol = "0.17"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 [lints.clippy]
 enum_glob_use = "deny"
-#Ported Kafka wire codec; pedantic cleanup tracked for a follow-up PR.
+# Ported Kafka wire codec; pedantic cleanup tracked for a follow-up PR.
 pedantic = "warn"
 nursery = "warn"

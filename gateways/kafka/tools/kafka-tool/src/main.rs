@@ -19,8 +19,22 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
+use kafka_protocol::messages::add_partitions_to_txn_request::*;
+use kafka_protocol::messages::create_topics_request::*;
+use kafka_protocol::messages::delete_records_request::*;
+use kafka_protocol::messages::delete_topics_request::*;
+use kafka_protocol::messages::describe_configs_request::*;
+use kafka_protocol::messages::fetch_request::*;
+use kafka_protocol::messages::join_group_request::*;
+use kafka_protocol::messages::list_offsets_request::*;
+use kafka_protocol::messages::offset_commit_request::*;
+use kafka_protocol::messages::produce_request::*;
+use kafka_protocol::messages::txn_offset_commit_request::*;
 use kafka_protocol::messages::*;
 use kafka_protocol::protocol::{Encodable, StrBytes};
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -272,10 +286,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
             r.encode(&mut buf, version).context("Metadata")?;
         }
         0 => {
-            use kafka_protocol::messages::produce_request::*;
-            use kafka_protocol::records::{
-                Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-            };
             let rec = Record {
                 transactional: false,
                 control: false,
@@ -317,7 +327,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
             r.encode(&mut buf, version).context("Produce")?;
         }
         1 => {
-            use kafka_protocol::messages::fetch_request::*;
             let fp = FetchPartition::default()
                 .with_partition(0)
                 .with_fetch_offset(0)
@@ -343,7 +352,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
             r.encode(&mut buf, version).context("Fetch")?;
         }
         2 => {
-            use kafka_protocol::messages::list_offsets_request::*;
             let p = ListOffsetsPartition::default()
                 .with_partition_index(0)
                 .with_timestamp(-1);
@@ -358,7 +366,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("ListOffsets")?;
         }
         8 => {
-            use kafka_protocol::messages::offset_commit_request::*;
             let p = OffsetCommitRequestPartition::default()
                 .with_partition_index(0)
                 .with_committed_offset(42)
@@ -386,7 +393,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("FindCoordinator")?;
         }
         11 => {
-            use kafka_protocol::messages::join_group_request::*;
             let p = JoinGroupRequestProtocol::default()
                 .with_name(StrBytes::from_static_str("range"))
                 .with_metadata(Bytes::from_static(b"\x00\x00\x00\x01\x00\x0atest-topic"));
@@ -444,7 +450,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("SaslHandshake")?;
         }
         19 => {
-            use kafka_protocol::messages::create_topics_request::*;
             let t = CreatableTopic::default()
                 .with_name(TopicName::from(StrBytes::from_static_str(
                     "iggy-test-topic",
@@ -459,7 +464,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("CreateTopics")?;
         }
         20 => {
-            use kafka_protocol::messages::delete_topics_request::*;
             let r = if version >= 6 {
                 DeleteTopicsRequest::default()
                     .with_topics(vec![DeleteTopicState::default().with_name(Some(
@@ -476,7 +480,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
             r.encode(&mut buf, version).context("DeleteTopics")?;
         }
         21 => {
-            use kafka_protocol::messages::delete_records_request::*;
             let p = DeleteRecordsPartition::default()
                 .with_partition_index(0)
                 .with_offset(0);
@@ -497,7 +500,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("InitProducerId")?;
         }
         24 => {
-            use kafka_protocol::messages::add_partitions_to_txn_request::*;
             let t = AddPartitionsToTxnTopic::default()
                 .with_name(TopicName::from(StrBytes::from_static_str("test-topic")))
                 .with_partitions(vec![0i32]);
@@ -530,7 +532,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("EndTxn")?;
         }
         28 => {
-            use kafka_protocol::messages::txn_offset_commit_request::*;
             let p = TxnOffsetCommitRequestPartition::default()
                 .with_partition_index(0)
                 .with_committed_offset(42)
@@ -548,7 +549,6 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("TxnOffsetCommit")?;
         }
         32 => {
-            use kafka_protocol::messages::describe_configs_request::*;
             let r = DescribeConfigsResource::default()
                 .with_resource_type(2)
                 .with_resource_name(StrBytes::from_static_str("test-topic"));

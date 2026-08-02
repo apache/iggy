@@ -25,12 +25,7 @@
 //!   header v2: [`client_id`] `COMPACT_NULLABLE_STRING` + request-header tagged fields
 //!   [request body]                             ← properly encoded per spec (flexible or not)
 
-use std::path::PathBuf;
-
-use bytes::Bytes;
-
-use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
-use iggy_gateway_kafka::protocol::header::{RequestHeader, request_header_version};
+use iggy_gateway_kafka::protocol::codec::Encoder;
 use iggy_gateway_kafka::protocol::requests::{
     decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
     decode_produce_request,
@@ -40,40 +35,12 @@ use iggy_gateway_kafka::protocol::responses::{
     encode_produce_response,
 };
 
+#[path = "common/fixtures.rs"]
+mod fixtures;
 #[path = "common/wire.rs"]
 mod wire;
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/kafka-tool/kafka_messages")
-}
-
-/// Load a kafka-tool `.bin` file and return just the request body bytes, or `None`
-/// (after a standardized skip note) when the gitignored fixture is absent, so a fresh
-/// clone skips rather than panicking.
-fn load_body(api_key: i16, api_name: &str, version: i16) -> Option<Bytes> {
-    let filename = format!("{api_key:03}_{api_name}_v{version}.bin");
-    let path = fixtures_dir().join(&filename);
-    let Ok(data) = std::fs::read(&path) else {
-        eprintln!(
-            "skipping {filename}: wire fixture missing - generate with \
-             `gateways/kafka/scripts/ci-wire-fixtures.sh generate` (or the kafka-tool \
-             `generate` subcommand)"
-        );
-        return None;
-    };
-
-    let frame = Bytes::copy_from_slice(&data[4..]);
-    let hdr_ver = request_header_version(api_key, version);
-    let mut decoder = Decoder::new(frame);
-    RequestHeader::decode_from(&mut decoder, hdr_ver).expect("fixture request header must decode");
-    Some(
-        decoder
-            .read_bytes(decoder.remaining())
-            .expect("fixture request body must decode"),
-    )
-}
+use fixtures::load_fixture_body_or_skip as load_body;
 
 // ── Produce (API key 0) ───────────────────────────────────────────────────────
 

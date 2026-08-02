@@ -38,7 +38,10 @@ use iggy_gateway_kafka::protocol::requests::{ProduceDecodeResult, decode_produce
 use fixtures::load_fixture_body_or_skip;
 use scope::default_broker;
 use tcp::{build_metadata_legacy_request, build_produce_v3_body};
-use wire::{build_metadata_flexible_request, build_metadata_flexible_request_v10};
+use wire::{
+    build_metadata_flexible_request, build_metadata_flexible_request_v10,
+    build_produce_legacy_request,
+};
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
 
@@ -328,7 +331,7 @@ fn produce_stub_response_returns_retriable_not_leader() {
 }
 
 #[test]
-fn fetch_stub_response_has_zero_partition_error() {
+fn fetch_stub_response_returns_retriable_not_leader() {
     for version in 4i16..=12 {
         let Some(body) = load_fixture_body_or_skip(1, "Fetch", version) else {
             continue;
@@ -356,14 +359,14 @@ fn fetch_stub_response_has_zero_partition_error() {
         let _partition = d.read_i32().unwrap();
         assert_eq!(
             d.read_i16().unwrap(),
-            ERROR_NONE,
+            ERROR_NOT_LEADER_OR_FOLLOWER,
             "Fetch v{version} partition error"
         );
     }
 }
 
 #[test]
-fn list_offsets_stub_response_has_zero_error() {
+fn list_offsets_stub_response_returns_retriable_not_leader() {
     for version in 1i16..=6 {
         let Some(body) = load_fixture_body_or_skip(2, "ListOffsets", version) else {
             continue;
@@ -385,7 +388,11 @@ fn list_offsets_stub_response_has_zero_error() {
             let _parts = d.read_i32().unwrap();
         }
         let _partition = d.read_i32().unwrap();
-        assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "ListOffsets v{version}");
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_LEADER_OR_FOLLOWER,
+            "ListOffsets v{version}"
+        );
     }
 }
 
@@ -660,6 +667,21 @@ fn produce_acks_zero_malformed_body_decode_carries_acks() {
         handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
         "handler must not respond when acks=0 even if decode fails after acks"
     );
+}
+
+#[test]
+fn produce_acks_zero_stays_silent_on_advertised_but_unsupported_version() {
+    // ApiVersions advertises Produce min=0 (KAFKA-18659) while the firewall's real floor is 3
+    // (SUPPORTED_RANGES). A spec-compliant client can legitimately send v0-2 with acks=0; the
+    // firewall must not run before acks is decoded, or this silence contract breaks for exactly
+    // the versions ApiVersions told the client were fine to use.
+    for version in 0i16..3 {
+        let body = build_produce_legacy_request(version, 0, None, None);
+        assert!(
+            handle_request(API_KEY_PRODUCE, version, body, &default_broker()).is_no_response(),
+            "Produce v{version} acks=0 must stay silent even though the firewall doesn't accept v{version}"
+        );
+    }
 }
 
 // ── Metadata topic name echo (must not hardcode a placeholder topic name) ──
