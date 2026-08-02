@@ -49,6 +49,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sinks/surrealdb_sink",
     "core/connectors/sources/elasticsearch_source",
+    "core/connectors/sources/http_source",
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
@@ -90,6 +91,7 @@ aligned-vec = "0.6.4"
 anyhow = "1.0.104"
 apache-avro = "0.22.0"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+arc-swap = "1.7.1"
 argon2 = "0.6.0"
 # arrow 58: iceberg 0.10.1 and deltalake 0.32.4 still require it.
 arrow = "58.4.0"
