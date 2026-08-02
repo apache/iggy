@@ -96,14 +96,21 @@ The connectors codebase is intentionally repetitive across plugins. Cross-plugin
 
 ### Secrets
 
-Any credential-bearing field (connection strings, API keys, bearer tokens, AWS keys) must be `SecretString` from the `secrecy` crate, with the workspace serde wrapper applied so `Debug` and serialization both redact. Runtime exposes plugin configs over the `/stats` HTTP surface via serialization - plain `String` leaks the secret to anyone who can hit the endpoint. Plain `String` for a credential is a review-blocker. Pattern (from `sinks/postgres_sink/src/lib.rs::PostgresSinkConfig`):
+Any credential-bearing field (connection strings, API keys, bearer tokens, AWS keys) must be `SecretString` from the `secrecy` crate. Plain `String` for a credential is a review-blocker: `SecretString` redacts on `Debug`, so it is what keeps a credential out of a log line that formats the whole config.
+
+**`serde_secret::serialize_secret` EXPOSES the secret. It does not redact.** It calls `expose_secret()` and writes the plaintext. `SecretString` deliberately has no `Serialize` impl, and that absence is the protection - so adding `serialize_with` is what *unblocks* the derive and turns a compile-time guarantee into plaintext output. Use it only where the plaintext is the point: a wire payload, a persisted config, an API response that exposes credentials by design.
+
+So the default for a plugin config struct is **do not derive `Serialize` at all**. The runtime keeps plugin configuration as the `serde_json::Value` it parsed from TOML and never deserializes into a plugin's config struct, so nothing needs the impl. Leaving it off makes the property compiler-enforced instead of convention-enforced (`sources/http_source/src/lib.rs::HttpSourceConfig` does this, and comments the omission so nobody adds it back).
+
+Pattern:
 
 ```rust
 use secrecy::{ExposeSecret, SecretString};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// No `Serialize`: nothing needs it, and leaving it off is what makes the
+// credential unserializable rather than merely un-serialized.
+#[derive(Debug, Clone, Deserialize)]
 pub struct MyConfig {
-    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
     pub connection_string: SecretString,
 }
 
@@ -113,7 +120,11 @@ let pool = PgPoolOptions::new()
     .await?;
 ```
 
-In-tree uses: `sinks/{postgres,mongodb,elasticsearch,influxdb,delta}_sink`, `sources/{postgres,elasticsearch,influxdb}_source`.
+If a config struct genuinely needs `Serialize`, `serde_secret::serialize_redacted` (and `serialize_optional_redacted`) write `[REDACTED]` in place of the value. Reach for `serialize_secret` only when the caller must get the real thing back. The sinks and sources listed below predate that helper and use the exposing one; the annotation is inert today, but it is not the protection it looks like.
+
+Note that none of this protects the credential from the runtime's own control API, which returns plugin configuration verbatim - see #3802. Plugin-side annotations are inert there because the runtime never routes through them.
+
+In-tree uses of the exposing helpers: `sinks/{postgres,mongodb,elasticsearch,influxdb,s3,surrealdb}_sink`, `sources/{postgres,elasticsearch,influxdb}_source`.
 
 ### Errors
 
@@ -193,7 +204,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 | `flume::unbounded()` channel                                            | `runtime/src/source.rs::spawn_source_handler` / `source_forwarding_loop`           | MPSC handoff from SDK async task to runtime loop  |
 | `tokio::sync::watch::channel(())`                                       | `sdk/src/{sink,source}.rs`, `runtime/src/sink.rs`, `runtime/src/manager/*`         | One-shot shutdown broadcast                       |
 | `dashmap::DashMap`                                                      | `runtime/src/manager/sink.rs`, `source.rs::SOURCE_SENDERS`, SDK `INSTANCES`        | Lock-free concurrent keyed access                 |
-| `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | Auto-redact on Debug/Display + serialization      |
+| `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | `Debug` redacts; `serialize_secret` EXPOSES       |
 
 ## Drop accounting
 
