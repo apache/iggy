@@ -1671,8 +1671,9 @@ where
         // `(commit_min, commit_op]`. The client table still installs below:
         // it comes from the serving primary's LIVE state at `table_frontier
         // == commit_op`, which is never behind this replica.
-        let local_applied = consensus.commit_min();
-        let snapshot_ahead = snapshot_seq > local_applied;
+        // Preliminary read, only to decide whether the gates are needed; the
+        // binding decision is re-derived under them below.
+        let snapshot_ahead = snapshot_seq > consensus.commit_min();
 
         // Serialize the whole install against a concurrent checkpoint, in the
         // checkpoint's own lock order (`checkpoint_lock` then
@@ -1705,6 +1706,17 @@ where
         } else {
             None
         };
+
+        // The gate waits above suspend this task while commits -- and whole
+        // checkpoints -- run, so the preliminary read is stale once the locks
+        // are held. `commit_min` is monotonic, so the only possible flip is
+        // ahead -> not-ahead, landing in the table-only arm below; deciding on
+        // the stale value instead would overwrite a newer checkpoint's
+        // snapshot.bin, regress its pairing, and rewind the STM below the
+        // applied frontier -- then panic on `set_commit_floor`'s anti-rewind
+        // assert with the damage already durable.
+        let local_applied = consensus.commit_min();
+        let snapshot_ahead = snapshot_seq > local_applied;
 
         if snapshot_ahead {
             if let Some(coordinator) = &self.coordinator {
