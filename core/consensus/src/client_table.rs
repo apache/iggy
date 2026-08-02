@@ -966,7 +966,8 @@ pub enum ClientTableWireError {
     BadMagic,
     /// Trailing hash does not match the content.
     ChecksumMismatch { expected: u64, actual: u64 },
-    /// Encoded entry count exceeds this table's capacity.
+    /// Encoded entry count exceeds [`CLIENTS_TABLE_SLOT_MAX`], the allocation
+    /// ceiling no valid table can reach.
     TooManyEntries { count: u32, max: usize },
     /// A cached reply's bytes do not parse as a valid reply message.
     InvalidReply,
@@ -1087,20 +1088,26 @@ impl ClientTable {
         out
     }
 
-    /// Decode a table encoded by [`Self::encode`] into a fresh table of
-    /// `max_clients` capacity.
+    /// Decode a table encoded by [`Self::encode`] into a fresh table of at
+    /// least `min_slots` capacity, grown to the received entry count.
+    ///
+    /// Growing mirrors [`Self::from_snapshot`]: a serving primary can
+    /// legitimately hold more live sessions than this node's configured cap
+    /// (its own table grew from a checkpoint, or it runs a larger cap), and a
+    /// cold-boot receiver sits at exactly the raw config value -- rejecting on
+    /// the local cap would make such a join fail deterministically.
     ///
     /// The denormalized `latest_commit` is rebuilt from the decoded ring's
     /// back, not trusted from the wire, so it cannot drift from the ring.
     ///
     /// # Errors
-    /// [`ClientTableWireError`] on truncation, magic/checksum mismatch,
-    /// capacity overflow, a duplicate `client_id`, an out-of-range ring
-    /// length, or an undecodable cached reply.
+    /// [`ClientTableWireError`] on truncation, magic/checksum mismatch, an
+    /// entry count past [`CLIENTS_TABLE_SLOT_MAX`], a duplicate `client_id`,
+    /// an out-of-range ring length, or an undecodable cached reply.
     ///
     /// # Panics
     /// Unreachable: slice-to-array conversions are length-checked first.
-    pub fn decode(bytes: &[u8], max_clients: usize) -> Result<Self, ClientTableWireError> {
+    pub fn decode(bytes: &[u8], min_slots: usize) -> Result<Self, ClientTableWireError> {
         let content = split_verified_trailer(bytes).map_err(|mismatch| match mismatch {
             Some((expected, actual)) => ClientTableWireError::ChecksumMismatch { expected, actual },
             None => ClientTableWireError::Truncated,
@@ -1111,14 +1118,17 @@ impl ClientTable {
             return Err(ClientTableWireError::BadMagic);
         }
         let count = reader.u32()?;
-        if count as usize > max_clients {
+        // Bound the allocation on the same slot ceiling `from_snapshot` uses;
+        // `count` is a peer-supplied u32 and this is the only check between it
+        // and `Self::new`'s eager Vec resize.
+        if count as usize > CLIENTS_TABLE_SLOT_MAX {
             return Err(ClientTableWireError::TooManyEntries {
                 count,
-                max: max_clients,
+                max: CLIENTS_TABLE_SLOT_MAX,
             });
         }
 
-        let mut table = Self::new(max_clients);
+        let mut table = Self::new(min_slots.max(count as usize));
         for slot_idx in 0..count as usize {
             let client_id = reader.u128()?;
             let epoch = reader.u64()?;
@@ -2042,12 +2052,6 @@ mod tests {
             Err(ClientTableWireError::ChecksumMismatch { .. } | ClientTableWireError::Truncated)
         ));
 
-        // Capacity overflow.
-        assert!(matches!(
-            ClientTable::decode(&encoded, 0),
-            Err(ClientTableWireError::TooManyEntries { .. })
-        ));
-
         let empty = ClientTable::new(4).encode();
         assert_eq!(
             ClientTable::decode(&empty, 4)
@@ -2089,6 +2093,52 @@ mod tests {
         assert!(matches!(
             ClientTable::decode(&reseal(duped), 2),
             Err(ClientTableWireError::DuplicateClientId { client_id: 7, .. })
+        ));
+    }
+
+    // A serving primary can hold more live sessions than this node's cap: a
+    // cold-boot receiver sits at the raw config value, so rejecting on it
+    // would make a join under cap reduction fail deterministically. Decode
+    // grows to the received count instead, as `from_snapshot` does.
+    #[test]
+    fn decode_grows_capacity_to_the_received_count() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10));
+        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20));
+        let encoded = table.encode();
+
+        let grown = ClientTable::decode(&encoded, 1).expect("decode grows past the local floor");
+        assert_eq!(grown.count(), 2);
+        assert_eq!(grown.capacity(), 2);
+
+        let floored = ClientTable::decode(&encoded, 8).expect("floor kept when larger");
+        assert_eq!(floored.capacity(), 8);
+    }
+
+    // The received count is the only bound between a peer-supplied u32 and the
+    // eager slot allocation, so it must stop at the same ceiling
+    // `from_snapshot` enforces.
+    #[test]
+    fn decode_rejects_a_count_past_the_slot_ceiling() {
+        let mut table = ClientTable::new(1);
+        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10));
+        let encoded = table.encode();
+
+        let content = &encoded[..encoded.len() - size_of::<u64>()];
+        let mut oversized = content.to_vec();
+        let count_at = CLIENT_TABLE_MAGIC.len();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            oversized[count_at..count_at + size_of::<u32>()]
+                .copy_from_slice(&(CLIENTS_TABLE_SLOT_MAX as u32 + 1).to_le_bytes());
+        }
+
+        assert!(matches!(
+            ClientTable::decode(&reseal(oversized), 1),
+            Err(ClientTableWireError::TooManyEntries {
+                max: CLIENTS_TABLE_SLOT_MAX,
+                ..
+            })
         ));
     }
 
