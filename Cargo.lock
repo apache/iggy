@@ -6964,6 +6964,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_http_source"
+version = "0.4.1-edge.1"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "crossfire",
+ "dashmap",
+ "hex",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "prometheus-client",
+ "rand 0.10.2",
+ "reqwest 0.13.4",
+ "ring",
+ "rmp-serde",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 1.1.3+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_iceberg_sink"
 version = "0.5.0-edge.4"
 dependencies = [
@@ -7432,6 +7457,7 @@ dependencies = [
  "figment",
  "futures",
  "harness_derive",
+ "hex",
  "humantime",
  "iggy",
  "iggy-cli",
@@ -7451,6 +7477,7 @@ dependencies = [
  "reqwest 0.13.4",
  "reqwest-middleware",
  "reqwest-retry",
+ "ring",
  "rmcp",
  "rust-s3",
  "secrecy",
