@@ -66,7 +66,9 @@ runs:
       if: runner.os == 'Linux' && inputs.install-system-dependencies == 'true'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libhwloc-dev pkg-config libudev-dev
+        # protobuf-compiler: fluss-rs compiles its protocol definitions in a build
+        # script, so the Apache Fluss connector needs protoc at build time.
+        sudo apt-get install -y libhwloc-dev pkg-config libudev-dev protobuf-compiler
       shell: bash
 
     - name: Install system dependencies (macOS)
@@ -78,6 +80,9 @@ runs:
         curl -fsSL https://raw.githubusercontent.com/Homebrew/homebrew-core/bb1e23f8e5eacf4d31acd489f6079c8a53ebd690/Formula/h/hwloc.rb \
           -o "$(brew --repository iggy/local-hwloc)/Formula/hwloc.rb"
         brew install iggy/local-hwloc/hwloc
+        # protobuf-compiler equivalent: fluss-rs compiles its protocol definitions in
+        # a build script, so the Apache Fluss connector needs protoc at build time.
+        brew install protobuf
       shell: bash
 
     - name: Setup Rust toolchain
