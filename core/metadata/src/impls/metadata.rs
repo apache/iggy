@@ -1772,6 +1772,26 @@ where
             // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
             // frontier (this is the op-jump the tail repair resumes from) and
             // let the announced commit point pull the walk target forward.
+            //
+            // TODO(suffix-truncation): this hands the commit walk a floor it never
+            // verified. `set_snapshot_op` above only marks entries at or below the
+            // floor EVICTABLE -- everything above it stays resident -- and the walk
+            // matches WAL entries by op number alone, with no view or hash-chain
+            // check. A node carrying a pre-crash prepared-but-uncommitted suffix that
+            // a view change has since reassigned cluster-side will therefore apply
+            // those stale bodies as committed. The client table is shielded (the
+            // `client_table_frontier` fence skips table effects at or below the
+            // transferred frontier); the state machine is not.
+            //
+            // Same root cause as the `TODO(suffix-truncation)` in
+            // `VsrConsensus::handle_start_view`, and the same missing piece closes
+            // both: a durable truncate-from-op primitive on the journal, so a floor
+            // jump can discard the suffix above it instead of leaving it to be
+            // matched by op number. The floor jump does not create the hole, but it
+            // widens exposure to it precisely on the nodes guaranteed to have a stale
+            // log -- every state-transfer receiver is one. Deliberately out of scope
+            // here (flagged in review as follow-up): the primitive is a journal
+            // durability change, not a state-transfer one.
             consensus.set_commit_floor(snapshot_seq);
             if snapshot_seq > consensus.sequencer().current_sequence() {
                 consensus.sequencer().set_sequence(snapshot_seq);

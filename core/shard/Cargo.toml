@@ -47,7 +47,6 @@ prometheus-client = { workspace = true }
 server_common = { path = "../server_common" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-twox-hash = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

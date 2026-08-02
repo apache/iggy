@@ -12024,7 +12024,6 @@ dependencies = [
  "server_common",
  "thiserror 2.0.19",
  "tracing",
- "twox-hash",
 ]
 
 [[package]]
