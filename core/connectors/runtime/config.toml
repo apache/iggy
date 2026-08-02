@@ -17,8 +17,10 @@
 
 [http] # Optional HTTP API configuration
 enabled = true
+# Loopback on purpose: the configuration endpoints return plugin credentials in
+# plaintext. Set api_key in the same edit if you move this off loopback.
 address = "127.0.0.1:8081"
-api_key = "" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
 [http.cors] # Optional CORS configuration for HTTP API
 enabled = false

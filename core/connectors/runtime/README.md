@@ -136,8 +136,10 @@ Connector runtime has an optional HTTP API that can be enabled by setting the `e
 ```toml
 [http] # Optional HTTP API configuration
 enabled = true
+# Loopback on purpose: the configuration endpoints return plugin credentials in
+# plaintext. Set api_key in the same edit if you move this off loopback.
 address = "127.0.0.1:8081"
-api_key = "" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
 [http.cors] # Optional CORS configuration for HTTP API
 enabled = false
@@ -157,6 +159,19 @@ enabled = false
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 ```
+
+> [!IMPORTANT]
+> **Treat this API as privileged.** The configuration endpoints return plugin
+> configuration exactly as it was parsed from TOML, credentials included - a
+> database connection string, an S3 secret key, a webhook signing secret. There
+> is no redaction layer. `api_key` is empty by default, which means
+> authentication is **off** by default; the loopback default `address` is what
+> confines that to local processes.
+>
+> If you change `address` to reach the API from outside a container, set
+> `api_key` in the same edit. The runtime logs a warning at startup when the
+> address resolves beyond loopback with no key configured, but nothing prevents
+> it.
 
 Currently, it does expose the following endpoints:
 
