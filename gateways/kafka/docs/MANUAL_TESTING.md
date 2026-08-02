@@ -21,7 +21,7 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 ### Build and start gateway
 
 ```bash
-# From iggy workspace root
+# From iggy workspace root (or iggy-gateway-kafka subdir)
 cargo build -p iggy-gateway-kafka
 
 # Terminal 1 — start listener (default 127.0.0.1:9093)
