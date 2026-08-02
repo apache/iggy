@@ -460,6 +460,41 @@ mod tests {
     }
 
     #[test]
+    fn given_revoked_dynamic_endpoint_when_restored_should_keep_the_tombstone() {
+        // No static counterpart, which is the ordinary case: revoke a
+        // dynamically registered endpoint, restart, and the leaked URL must
+        // still be dead.
+        let mut persisted = EndpointRegistry::default();
+        assert!(persisted.insert(dynamic_endpoint(ENDPOINT_TWO)));
+        persisted.revoke(ENDPOINT_TWO, "compromised".to_string(), 42);
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1);
+
+        let endpoint = restored
+            .endpoint(ENDPOINT_TWO)
+            .expect("the tombstone must survive the restart, not vanish with it");
+        assert!(!endpoint.is_active());
+        assert_eq!(restored.serving_count(0), 0);
+    }
+
+    #[test]
+    fn given_registered_endpoint_when_removed_should_drop_it_without_a_tombstone() {
+        let mut registry = EndpointRegistry::default();
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
+
+        assert!(registry.remove(ENDPOINT_ONE));
+        assert!(
+            !registry.remove(ENDPOINT_ONE),
+            "removing twice must report that there was nothing left to undo"
+        );
+        assert!(!registry.remove(ENDPOINT_TWO));
+        // Outright, not tombstoned: this only undoes a registration that never
+        // became reachable, so there is no revocation to preserve.
+        assert!(registry.endpoint(ENDPOINT_ONE).is_none());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
     fn given_active_endpoint_in_both_when_restored_should_prefer_static_config() {
         let mut persisted = EndpointRegistry::default();
         assert!(persisted.insert(dynamic_endpoint(ENDPOINT_ONE)));
