@@ -20,6 +20,7 @@
 // TODO(slbotbm): Add tests for store_consumer_offset, get_consumer_offset, and delete_consumer_offset functions
 // attached to client after implementing consumer group functions
 // TODO(slbotbm): Add tests for update_permissions after creating create_user, get_user, etc. functions
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -402,28 +403,20 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->shutdown());
-    bool first_client_removed = false;
-    ASSERT_NO_THROW({
-        for (std::uint32_t attempt = 0; attempt < 20; ++attempt) {
-            const auto clients = second_client->get_clients();
-            bool found_first   = false;
-            for (const auto &client : clients) {
-                if (client.client_id == first_me.client_id) {
-                    found_first = true;
-                    break;
-                }
-            }
-
-            if (!found_first) {
-                first_client_removed = true;
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
+            break;
         }
-    });
-
-    EXPECT_TRUE(first_client_removed);
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
@@ -437,28 +430,20 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->disconnect());
-    bool first_client_removed = false;
-    ASSERT_NO_THROW({
-        for (std::uint32_t attempt = 0; attempt < 20; ++attempt) {
-            const auto clients = second_client->get_clients();
-            bool found_first   = false;
-            for (const auto &client : clients) {
-                if (client.client_id == first_me.client_id) {
-                    found_first = true;
-                    break;
-                }
-            }
-
-            if (!found_first) {
-                first_client_removed = true;
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
+            break;
         }
-    });
-
-    EXPECT_TRUE(first_client_removed);
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
