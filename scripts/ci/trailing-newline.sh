@@ -118,7 +118,7 @@ for file in "${CHANGED_FILES[@]}"; do
   fi
 
   # Skip binary files
-  if file "$file" | grep -qE "binary|data|executable|compressed"; then
+  if [ "$(file -bL --mime-encoding "$file" 2>/dev/null)" = "binary" ]; then
     continue
   fi
 

@@ -582,7 +582,7 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 /// Scenario:
 /// 1. Send 300 messages (3 segments at 100KB each)
 /// 2. Consumer reads only 50 messages (stored offset ~49, within segment 0)
-/// 3. Wait for all segments to expire (2s expiry)
+/// 3. Wait for all segments to expire (4s expiry)
 /// 4. Verify consumer can still poll Next() and get contiguous offsets
 ///
 /// On unfixed code: the cleaner deletes segments 0+1 (expired, consumer offset
@@ -594,7 +594,11 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     let stream = client.create_stream(TEST_STREAM).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    // Expiry must outlast the send + first-poll phase: 300 serial sends with
+    // per-message fsync (and VSR quorum in cluster mode) take ~3s under load.
+    // If segments expire before the consumer commits its first offset, there is
+    // no barrier yet and the cleaner legally deletes them, breaking the premise.
+    let expiry = Duration::from_secs(4);
     let topic = client
         .create_topic(
             &Identifier::named(TEST_STREAM).unwrap(),

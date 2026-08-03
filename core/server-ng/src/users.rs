@@ -97,11 +97,11 @@ where
 ///
 /// When the target resolves (`stored_hash` is `Some`) the supplied
 /// `current_password` is verified against it first. A mismatch does NOT deny
-/// pre-consensus: that would consume the client's request id without advancing
-/// the replicated `ClientTable`, gapping the sequence so the next replicated op
-/// is dropped (`RequestGap`) and the caller stalls. Instead the new password is
-/// emptied, which signals the committed apply to reject with
-/// `InvalidCredentials` (a committed no-op that keeps the sequence contiguous).
+/// pre-consensus: that would consume the client's request id without recording
+/// it in the replicated `ClientTable`, so a retry of that id would re-execute
+/// instead of deduping. Instead the new password is emptied, which signals the
+/// committed apply to reject with `InvalidCredentials` (a committed no-op that
+/// advances the watermark).
 ///
 /// Either way the current password is stripped and the accepted new one hashed,
 /// so no plaintext credential ever enters consensus. An unresolved target keeps

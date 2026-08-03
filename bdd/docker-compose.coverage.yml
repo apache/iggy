@@ -32,9 +32,9 @@ services:
         rustup component add llvm-tools-preview \
         && cargo install cargo-llvm-cov \
         && case "$$BDD_FEATURE" in
-          basic_messaging)    cargo llvm-cov test -p bdd --features bdd --test basic_messaging --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
-          leader_redirection) cargo llvm-cov test -p bdd --features bdd --test leader_redirection --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
-          *)                  cargo llvm-cov test -p bdd --features bdd --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
+          basic_messaging)    cargo llvm-cov test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
+          leader_redirection) cargo llvm-cov test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
+          *)                  cargo llvm-cov test -p bdd --features "$$BDD_RUST_FEATURES" --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
         esac
 
   python-bdd:

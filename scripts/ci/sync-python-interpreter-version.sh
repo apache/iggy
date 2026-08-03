@@ -314,6 +314,21 @@ ensure_wheel_interpreters() {
 
 ensure_classifiers "$SOURCE_FILE"
 
+PYTHON_VERSION_FILES=(
+    "foreign/python/.python-version"
+    "bdd/python/.python-version"
+    "examples/python/.python-version"
+)
+
+for python_version_file in "${PYTHON_VERSION_FILES[@]}"; do
+    ensure_line \
+        "$python_version_file" \
+        "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$" \
+        "^${PYTHON_VERSION_REGEX}$" \
+        "$PYTHON_VERSION" \
+        "pyenv Python version"
+done
+
 ensure_line \
     "foreign/python/Dockerfile.test" \
     "^(FROM python:)[0-9]+\\.[0-9]+(-slim-trixie AS base)$" \

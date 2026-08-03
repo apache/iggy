@@ -22,4 +22,5 @@ export * from './get-group.command.js';
 export * from './get-groups.command.js';
 export * from './join-group.command.js';
 export * from './leave-group.command.js';
+export * from './sync-group.command.js';
 export * from './ensure-group.virtual.command.js';

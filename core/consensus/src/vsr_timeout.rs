@@ -99,7 +99,6 @@ impl Timeout {
 #[allow(unused)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimeoutKind {
-    Ping,
     Prepare,
     CommitMessage,
     NormalHeartbeat,
@@ -115,7 +114,6 @@ pub enum TimeoutKind {
 #[allow(unused)]
 #[derive(Debug)]
 pub struct TimeoutManager {
-    ping: Timeout,
     prepare: Timeout,
     commit_message: Timeout,
     normal_heartbeat: Timeout,
@@ -130,19 +128,36 @@ pub struct TimeoutManager {
 impl TimeoutManager {
     // Timeout durations in ticks (10ms per tick).
     // TODO define 10ms per tick in a separate constant.
-    const PING_TICKS: u64 = 100;
-    const PREPARE_TICKS: u64 = 25;
-    const COMMIT_MESSAGE_TICKS: u64 = 50;
-    const NORMAL_HEARTBEAT_TICKS: u64 = 500;
-    const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
-    const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
-    const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
-    const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
+    /// Public so the runtime can pin its `[cluster] prepare_retransmit_interval`
+    /// config default against this built-in.
+    pub const PREPARE_TICKS: u64 = 25;
+    /// Public so the runtime can pin its `[cluster] commit_broadcast_interval`
+    /// config default against this built-in.
+    pub const COMMIT_MESSAGE_TICKS: u64 = 50;
+    /// Public so the runtime can pin its config default (`[cluster]
+    /// heartbeat_timeout`) against this built-in with a static assert.
+    pub const NORMAL_HEARTBEAT_TICKS: u64 = 500;
+    /// Public so the runtime can pin its `[cluster]
+    /// view_change_retransmit_interval` config default against this built-in.
+    /// Deliberately equal to [`Self::DO_VIEW_CHANGE_MESSAGE_TICKS`]: one config
+    /// knob drives both retransmit timers.
+    pub const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
+    /// Public so the runtime can pin its `[cluster] view_change_status_timeout`
+    /// config default against this built-in.
+    pub const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
+    /// Public so the runtime can pin its `[cluster]
+    /// view_change_retransmit_interval` config default against this built-in.
+    /// Deliberately equal to [`Self::START_VIEW_CHANGE_MESSAGE_TICKS`]: one
+    /// config knob drives both retransmit timers.
+    pub const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
+    /// Public so the runtime can pin its `[cluster]
+    /// request_start_view_retransmit_interval` config default against this
+    /// built-in.
+    pub const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
 
-    // TODO: add #[must_use] -- constructor, discarding is always a bug.
+    #[must_use]
     pub fn new(replica_id: u128) -> Self {
         Self {
-            ping: Timeout::new(replica_id, Self::PING_TICKS),
             prepare: Timeout::new(replica_id, Self::PREPARE_TICKS),
             commit_message: Timeout::new(replica_id, Self::COMMIT_MESSAGE_TICKS),
             normal_heartbeat: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
@@ -162,11 +177,64 @@ impl TimeoutManager {
         }
     }
 
+    /// Override the backup's primary-liveness window (`[cluster]
+    /// heartbeat_timeout`). Replaces the timeout object, so any countdown
+    /// already in flight is discarded: call before the replica starts
+    /// ticking (i.e. before `init` / `init_as_backup`).
+    pub const fn set_normal_heartbeat_ticks(&mut self, ticks: u64) {
+        self.normal_heartbeat = Timeout::new(self.normal_heartbeat.id, ticks);
+    }
+
+    /// Override the primary's commit-broadcast interval (`[cluster]
+    /// commit_broadcast_interval`). Replaces the timeout object, so any
+    /// countdown already in flight is discarded: call before the replica
+    /// starts ticking (i.e. before `init`).
+    pub const fn set_commit_message_ticks(&mut self, ticks: u64) {
+        self.commit_message = Timeout::new(self.commit_message.id, ticks);
+    }
+
+    /// Override the primary's prepare-retransmit interval (`[cluster]
+    /// prepare_retransmit_interval`). Replaces the timeout object, so any
+    /// countdown already in flight is discarded: call before the replica
+    /// starts ticking (i.e. before `init`).
+    pub const fn set_prepare_ticks(&mut self, ticks: u64) {
+        self.prepare = Timeout::new(self.prepare.id, ticks);
+    }
+
+    /// Override the view-change retransmit interval (`[cluster]
+    /// view_change_retransmit_interval`), in consensus ticks. Drives BOTH the
+    /// `StartViewChange` and `DoViewChange` retransmit timers - kept equal by
+    /// design so a view change retransmits both messages at one cadence.
+    /// Replaces the timeout objects, so any countdown already in flight is
+    /// discarded: call before the replica starts ticking (i.e. before `init`).
+    pub const fn set_view_change_retransmit_ticks(&mut self, ticks: u64) {
+        self.start_view_change_message = Timeout::new(self.start_view_change_message.id, ticks);
+        self.do_view_change_message = Timeout::new(self.do_view_change_message.id, ticks);
+    }
+
+    /// Override the view-change status backstop (`[cluster]
+    /// view_change_status_timeout`), in consensus ticks. A view change stalled
+    /// this long escalates to a fresh cluster-wide election. Replaces the
+    /// timeout object, so any countdown already in flight is discarded: call
+    /// before the replica starts ticking (i.e. before `init`).
+    pub const fn set_view_change_status_ticks(&mut self, ticks: u64) {
+        self.view_change_status = Timeout::new(self.view_change_status.id, ticks);
+    }
+
+    /// Override the request-start-view retransmit interval (`[cluster]
+    /// request_start_view_retransmit_interval`), in consensus ticks: how often
+    /// a recovering or view-change backup re-requests the current view's
+    /// `StartView`. Replaces the timeout object, so any countdown already in
+    /// flight is discarded: call before the replica starts ticking (i.e. before
+    /// `init`).
+    pub const fn set_request_start_view_ticks(&mut self, ticks: u64) {
+        self.request_start_view_message = Timeout::new(self.request_start_view_message.id, ticks);
+    }
+
     /// Tick all timeouts
     /// This is the first phase of the two-phase tick-based timeout mechanism.
     /// 2nd phase is checking which timeouts have fired and calling the appropriate handlers.
     pub const fn tick(&mut self) {
-        self.ping.tick();
         self.prepare.tick();
         self.commit_message.tick();
         self.normal_heartbeat.tick();
@@ -181,9 +249,9 @@ impl TimeoutManager {
         self.get(kind).fired()
     }
 
+    #[must_use]
     pub const fn get(&self, kind: TimeoutKind) -> &Timeout {
         match kind {
-            TimeoutKind::Ping => &self.ping,
             TimeoutKind::Prepare => &self.prepare,
             TimeoutKind::CommitMessage => &self.commit_message,
             TimeoutKind::NormalHeartbeat => &self.normal_heartbeat,
@@ -196,7 +264,6 @@ impl TimeoutManager {
 
     pub const fn get_mut(&mut self, kind: TimeoutKind) -> &mut Timeout {
         match kind {
-            TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
@@ -221,7 +288,6 @@ impl TimeoutManager {
 
     pub fn backoff(&mut self, kind: TimeoutKind) {
         let timeout = match kind {
-            TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
