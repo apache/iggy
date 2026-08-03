@@ -116,11 +116,11 @@ pub mod frame_drop_variant {
 /// `PARK_OVERFLOW` ticks when a partition frame arrives for a namespace this
 /// shard has not materialised and the per-namespace park buffer is already at
 /// its cap, so the frame is shed with no reply. `PARK_DROPPED` ticks when a
-/// frame that did park leaves the buffer without being served: it outlived
-/// `MAX_PARKED_PASSES`, or its namespace was torn down. A client request also
-/// bumps `partition_requests_denied_transient_total` there, since it gets a
-/// reply; replicated traffic has nobody to answer, so this counter is the only
-/// record that the op was destroyed.
+/// frame that did park leaves unserved: its namespace became unreachable, or a
+/// request outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request
+/// also bumps `partition_requests_denied_transient_total` when answered;
+/// replicated traffic has nobody to answer, so this is the only record the op
+/// was destroyed.
 pub mod frame_drop_reason {
     pub const FULL: &str = "full";
     pub const DISCONNECTED: &str = "disconnected";
@@ -131,6 +131,10 @@ pub mod frame_drop_reason {
     pub const PARK_DROPPED: &str = "park_dropped";
 }
 
+// Minted in full, so 7 x 7 includes pairs no drop site produces:
+// `park_overflow` and `park_dropped` pair only with `PARTITION`, leaving 12
+// unreachable. Free while nothing scrapes these (module `TODO(hubcio)`); mint
+// per drop site once a registry lands, so the scrape carries no permanent zeroes.
 const VARIANT_COUNT: usize = 7;
 const REASON_COUNT: usize = 7;
 
@@ -183,6 +187,7 @@ pub struct ShardMetrics {
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
     partition_frames_rejected_stale_total: Counter,
+    partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
 }
 
@@ -214,6 +219,7 @@ impl ShardMetrics {
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
+            partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
         }
     }
@@ -268,6 +274,16 @@ impl ShardMetrics {
     /// operator can actually alert on today.
     pub fn record_partition_frame_rejected_stale(&self) {
         self.partition_frames_rejected_stale_total.inc();
+    }
+
+    /// Bumped when a parked frame carries an epoch AHEAD of the one its
+    /// partition materialised at: the recreate committed between the reconciler
+    /// snapshotting the epoch for `InsertOwned` and the pump applying it. Split
+    /// from `partition_frames_rejected_stale_total` so that counter keeps meaning
+    /// caught correctness anomaly; this direction is an expected race and would
+    /// fire the alert on ordinary delete + recreate churn. Both still reject.
+    pub fn record_partition_frame_rejected_ahead(&self) {
+        self.partition_frames_rejected_ahead_total.inc();
     }
 
     /// Total frame drops across every `{variant, reason}` pair.
@@ -335,6 +351,14 @@ impl ShardMetrics {
     #[must_use]
     pub fn partition_frames_rejected_stale_value(&self) -> u64 {
         self.partition_frames_rejected_stale_total.get()
+    }
+
+    /// Snapshot of `partition_frames_rejected_ahead_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_frames_rejected_ahead_value(&self) -> u64 {
+        self.partition_frames_rejected_ahead_total.get()
     }
 
     /// Snapshot of one `frame_drops_total{variant, reason}` pair, or 0 when the

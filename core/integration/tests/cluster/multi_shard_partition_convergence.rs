@@ -51,6 +51,7 @@
 #![cfg(feature = "vsr")]
 
 use iggy::prelude::*;
+use integration::harness::TestHarness;
 use integration::iggy_harness;
 
 const STREAM: &str = "convergence-stream";
@@ -119,6 +120,25 @@ async fn poll_payloads(
         .collect()
 }
 
+/// Assert no park path degraded. All three modes log at `warn`, which the
+/// harness captures by default, so counting them pins the mechanism positively:
+/// the round trips stay green whether a produce parked and re-dispatched or was
+/// denied and replayed, and only these markers tell the two apart.
+fn assert_no_degraded_park_paths(harness: &TestHarness) {
+    for marker in [
+        "park buffer at capacity",
+        "outlived their admission window",
+        "rejecting parked partition frame",
+    ] {
+        assert_eq!(
+            harness.server().stdout_occurrences(marker),
+            0,
+            "server log must not contain {marker:?}: the park buffer degraded instead of \
+             converging"
+        );
+    }
+}
+
 /// Topics are created in a batch first, so several materialisations are in
 /// flight at once when the produces start.
 #[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "2"))]
@@ -148,6 +168,7 @@ async fn given_two_shards_when_producing_right_after_create_topic_should_round_t
             "topic {index} must return the message produced right after its creation"
         );
     }
+    assert_no_degraded_park_paths(harness);
 }
 
 /// Delete + recreate reuses the freed slab keys, so the namespace is
@@ -156,14 +177,14 @@ async fn given_two_shards_when_producing_right_after_create_topic_should_round_t
 /// multi-shard node: the recreated topic serves its own data and none of the
 /// dead incarnation's.
 ///
-/// It does NOT exercise the incarnation fence. Each step here is a completed
-/// round trip, so the reconciler converges before the next one starts and
-/// `serves_committed_incarnation` never denies (verified: zero "unverified
-/// incarnation" denials in the server log across a full run). Driving the fence
-/// needs a produce concurrent with the delete, from a second connection --
-/// worth adding, but it is a different test. What this one catches is the
-/// steady-state failure modes: a rebuild that wedges, or stale segments
-/// surviving the delete and being served under the recycled identity.
+/// Does NOT exercise the incarnation fence. Every step is a completed round
+/// trip, so the reconciler converges before the next starts and
+/// `serves_committed_incarnation` has nothing to deny. That is an argument from
+/// sequencing, not an observation: the deny logs at `debug` and the harness runs
+/// the server at `info`, so its absence from the log proves nothing. Driving the
+/// fence needs a produce concurrent with the delete from a second connection,
+/// which is a different test. This one catches the steady-state failures: a
+/// rebuild that wedges, or stale segments served under the recycled identity.
 #[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "2"))]
 async fn given_two_shards_when_recreating_a_topic_should_serve_only_the_new_incarnation(
     harness: &TestHarness,
@@ -198,4 +219,5 @@ async fn given_two_shards_when_recreating_a_topic_should_serve_only_the_new_inca
             "topic {index} must serve only the recreated incarnation"
         );
     }
+    assert_no_degraded_park_paths(harness);
 }
