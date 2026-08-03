@@ -26,6 +26,7 @@
 //! net.
 
 use super::COMPONENT_NG;
+use super::cluster::STATE_CHUNK_HEADER_LEN;
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
@@ -198,6 +199,18 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             eprintln!(
                 "{COMPONENT_NG} cluster.repair_chunk_max ({}) must be < message_bus.peer_queue_capacity ({}): repair frames ride the per-peer bus queue, so a chunk that fills or overruns it drops frames and wedges repair",
                 self.cluster.repair_chunk_max, self.message_bus.peer_queue_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // State-transfer chunks ride the same bus. A cap that cannot carry one
+        // header plus a byte of payload makes every rejoin that needs a
+        // transfer impossible, and the failure surfaces only as a replica
+        // connection tearing down when the frame is rejected on the read side.
+        let bus_cap = self.message_bus.max_message_size.as_bytes_u64();
+        if bus_cap <= STATE_CHUNK_HEADER_LEN {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.max_message_size ({bus_cap}) must exceed the {STATE_CHUNK_HEADER_LEN}-byte state-chunk header: state transfer serves artifact chunks over this bus, and a frame above the cap is rejected by the receiving transport, which tears down the whole replica connection"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }

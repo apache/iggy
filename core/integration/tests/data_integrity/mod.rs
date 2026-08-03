@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Requires state transfer: the 5 MB bench fill is thousands of ops while the
-// partition journal's evicted ring retains only the last 4096, so a restarted
-// replica's rejoin window exceeds what journal repair can serve. The commit
-// floor lets recovered segments stand in for the evicted prefix, but the
-// sub-floor stats/offset seeding this test asserts (exact messages_count /
-// size_bytes across the restart) is state transfer's job.
-#[cfg(not(feature = "vsr"))]
+// Partially vsr-gated inside the module: the bench-fill test requires
+// PARTITION-plane state transfer (sub-floor stats/offset seeding), which is
+// not implemented yet; the metadata-only deletion/restart test runs under
+// vsr (metadata journal repair covers its rejoin window).
 mod verify_after_server_restart;
 mod verify_user_login_after_restart;
 

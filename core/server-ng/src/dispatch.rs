@@ -25,8 +25,8 @@
 mod authz;
 
 use crate::auth::{
-    complete_login_register, send_login_failure_reply, surface_login_failure,
-    verify_login_credentials, verify_pat_credentials,
+    complete_login_register, surface_login_failure, verify_login_credentials,
+    verify_pat_credentials,
 };
 use crate::bootstrap::{ShellBus, ShellShard, ShellShardHandle};
 use crate::cluster_meta::ClusterRoster;
@@ -341,7 +341,7 @@ fn submit_auto_commit<B, MJ, S>(
         .partitions()
         .with_partition(&namespace, |partition| {
             let consensus = partition.consensus();
-            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
                 AutoCommitGate::NotPrimary
             } else if partition.is_auto_commit_offset_covered(
                 applied.kind,
@@ -2773,9 +2773,15 @@ async fn handle_login_register_request<B, MJ, S>(
 
     warn!(
         transport_client_id,
-        "dropping register request with unsupported payload shape"
+        "rejecting register request with unsupported payload shape"
     );
-    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+    send_login_eviction(
+        shard,
+        transport_client_id,
+        request.header().client,
+        EvictionReason::MalformedLogin,
+    )
+    .await;
 }
 
 /// Best-effort login-rejection eviction. Terminal one-way frame; a gone
@@ -2784,7 +2790,7 @@ async fn handle_login_register_request<B, MJ, S>(
 /// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
 /// plus the protocol window on `IncompatibleProtocol`.
 #[allow(clippy::future_not_send)]
-async fn send_login_eviction<B, MJ, S>(
+pub(crate) async fn send_login_eviction<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     transport_client_id: u128,
     vsr_client_id: u128,
@@ -3092,6 +3098,7 @@ mod tests {
             Some(consensus),
             Some(journal),
             None,
+            None,
             TestMux::default(),
             None,
         );
@@ -3212,7 +3219,7 @@ mod tests {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
 
         let bus = SpyBus::default();
-        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -3335,7 +3342,7 @@ mod tests {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
 
         let bus = SpyBus::default();
-        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -3397,7 +3404,7 @@ mod tests {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
 
         let bus = SpyBus::default();
-        let metadata = IggyMetadata::new(None, None, None, TestMux::default(), None);
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {

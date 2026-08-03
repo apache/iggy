@@ -19,6 +19,10 @@
 //! primitive, so `FLUSH_UNSAVED_BUFFER` must surface a typed
 //! `FeatureUnavailable` over the SDK rather than the non-replicated catch-all's
 //! empty-ok, which would fake a durability guarantee.
+//!
+//! `FLUSH_UNSAVED_BUFFER` is slated for removal from the protocol. This test
+//! pins the deny contract only until then: delete this file together with the
+//! command (and the SDK method), do not port it anywhere.
 
 use iggy::prelude::*;
 use integration::iggy_harness;
