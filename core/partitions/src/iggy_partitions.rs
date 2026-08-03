@@ -26,7 +26,7 @@ use iggy_binary_protocol::{
     Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
 use message_bus::MessageBus;
-use server_common::send_messages2::{convert_request_message, encrypt_batch_request};
+use server_common::send_messages2::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
@@ -509,7 +509,11 @@ where
         let message = if message.header().operation == Operation::SendMessages
             && let Some(encryptor) = &self.config().encryptor
         {
-            let canonical = convert_request_message(namespace, message)
+            // Compute the batch checksum: this canonical output is validated by
+            // `encrypt_batch_request`'s decode before re-encryption, and the
+            // re-encrypted batch (checksum kept by `encrypt_batch_request`) then
+            // re-enters `convert` as the canonical-vs-legacy discriminator.
+            let canonical = convert_request_message(namespace, message, ChecksumMode::Compute)
                 .and_then(|message| encrypt_batch_request(message, encryptor));
             match canonical {
                 Ok(message) => message,

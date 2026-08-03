@@ -57,7 +57,8 @@ use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
     send_messages2::{
-        convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
+        ChecksumMode, convert_request_message, decode_prepare_slice, decode_prepare_slice_trusted,
+        stamp_prepare_for_persistence, verify_received_send_messages,
     },
     sharding::IggyNamespace,
 };
@@ -1139,7 +1140,13 @@ where
             );
 
             let message = if message.header().operation == Operation::SendMessages {
-                match convert_request_message(namespace, message) {
+                // Skip the batch-checksum pass: on the partition ingest path
+                // nothing reads it before `stamp_prepare_for_persistence`
+                // recomputes it over the stamped header. An already-canonical
+                // batch (native v2, or the plane's pre-encrypt convert output)
+                // returns early above, so Skip only affects the legacy
+                // transcode, whose output goes straight to project/stamp.
+                match convert_request_message(namespace, message, ChecksumMode::Skip) {
                     Ok(message) => message,
                     Err(error) => {
                         emit_partition_diag(
@@ -1522,6 +1529,32 @@ where
                 );
             }
         }
+        // First blob-integrity check on the replicated path. The consensus
+        // layer never validates the body (PrepareHeader integrity fields are
+        // inert zeros) and the batch checksum is recomputed locally at stamp,
+        // so a follower must verify each message's stamp-invariant per-message
+        // checksum before journaling transit bytes. Follower-only: the primary
+        // (and single-node self-replicate) produced these bytes and already
+        // checked the client batch at ingest, so they must not pay this pass.
+        // Fail closed on mismatch - drop without journaling, forwarding, or
+        // acking; the primary retransmits on prepare-timeout.
+        if is_backup
+            && header.operation == Operation::SendMessages
+            && let Err(error) = verify_received_send_messages(message.as_slice())
+        {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "rejecting replicated send_messages: per-message checksum mismatch",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op)
+                .with_error(error.to_string()),
+            );
+            return;
+        }
+
         // Durability-before-ack: clone for chain-replicate, forward only
         // AFTER apply_replicated_operation persists. Forward-first would
         // give downstream an op whose WAL entry we never wrote, that violates
@@ -1931,11 +1964,15 @@ where
                         }
                         continue;
                     }
-                    // A resident committed SendMessages entry decoded once at append
-                    // (the offset index) with its checksum stamped over these exact
-                    // bytes, so it must decode again here. Guard the invariant for a
-                    // future disk read-back path that could make decode fallible.
-                    let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
+                    // Resident committed SendMessages entry: this node stamped it
+                    // in `append_messages` (recomputing the batch checksum over these
+                    // exact bytes), so a validating re-decode would only re-hash ~1
+                    // MiB to confirm our own write. Trust the structural decode; the
+                    // batch-checksum recompute belongs at network ingress (repair
+                    // validation + the follower receive gate), not on locally-stamped
+                    // bytes. Guard the invariant for a future disk read-back path that
+                    // could make decode fallible.
+                    let Ok(batch) = decode_prepare_slice_trusted(entry.as_slice()) else {
                         tracing::error!(
                             target: "iggy.partitions.diag",
                             namespace_raw = self.namespace().inner(),
@@ -2335,8 +2372,11 @@ where
         let Some(entry) = self.log.journal().inner.entry(prepare_header).await else {
             return Err(IggyError::InvalidCommand);
         };
-        let batch =
-            decode_prepare_slice(entry.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
+        // Trusted (no batch-hash): the entry was read back from this replica's
+        // own journal, where it was stamped/validated at append; only header
+        // stats are needed, so re-hashing the ~1 MiB blob is redundant.
+        let batch = decode_prepare_slice_trusted(entry.as_slice())
+            .map_err(|_| IggyError::InvalidCommand)?;
         let message_count = batch.message_count();
         if message_count == 0 {
             return Ok(None);
