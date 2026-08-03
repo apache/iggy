@@ -55,5 +55,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 
 [lints.clippy]
 enum_glob_use = "deny"
-pedantic = "warn"
+pedantic = "deny"
 nursery = "warn"

@@ -29,6 +29,10 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
+[package.metadata.cargo-machete]
+# rust-s3's library name is `s3`, not `rust-s3` - machete's name matching misses `use s3::...`.
+ignored = ["rust-s3"]
+
 [lib]
 crate-type = ["cdylib", "lib"]
 

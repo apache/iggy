@@ -23,7 +23,8 @@ license = "Apache-2.0"
 publish = false
 
 [package.metadata.cargo-machete]
-ignored = ["cfg_aliases"]
+# rust-s3's library name is `s3`, not `rust-s3` - machete's name matching misses `use s3::...`.
+ignored = ["cfg_aliases", "rust-s3"]
 
 # Some tests are failing in CI due to lack of IPv6 interfaces
 # inside the docker containers. This is a temporary workaround (hopefully).
