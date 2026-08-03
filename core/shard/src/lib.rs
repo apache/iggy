@@ -58,10 +58,6 @@ use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-// Read only by the durable-before-send tripwire, which is `debug_assertions`-only, so
-// an unconditional import warns in release builds. CI's `-D warnings` rides clippy,
-// which builds debug, so that warning goes unobserved there.
-#[cfg(debug_assertions)]
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
