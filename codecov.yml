@@ -65,6 +65,12 @@ flag_management:
     - name: node
       paths:
         - foreign/node/
+    - name: node-e2e
+      paths:
+        - foreign/node/
+    - name: node-e2e-vsr
+      paths:
+        - foreign/node/
     - name: go
       paths:
         - foreign/go/

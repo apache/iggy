@@ -86,7 +86,10 @@ aligned-vec = "0.6.4"
 anyhow = "1.0.104"
 apache-avro = "0.21.0"
 apple-native-keyring-store = { version = "1.0.1", features = ["keychain"] }
-argon2 = "0.5.3"
+# "std" is load-bearing: it cascades to rand_core/getrandom, which the
+# crypto module's `OsRng` import needs even when no sibling crate in the
+# build graph happens to enable it via feature unification.
+argon2 = { version = "0.5.3", features = ["std"] }
 # Pinned to 57 because iceberg 0.9.1 still requires arrow/parquet 57.
 arrow = "57.3.1"
 arrow-array = "57.3.1"
@@ -147,7 +150,7 @@ csv = "1.4.0"
 ctor = "1.0.9"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
-cyper = { version = "0.9.0", features = ["rustls"], default-features = false }
+cyper = { version = "0.9.0", features = ["rustls", "stream"], default-features = false }
 cyper-axum = { version = "0.9.0" }
 cyper-core = { version = "0.9.0", default-features = false }
 darling = "0.23"
@@ -197,10 +200,10 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.10.3-edge.2" }
+iggy = { path = "core/sdk", version = "0.10.3-edge.3" }
 iggy-cli = { path = "core/cli", version = "0.13.1-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.3-edge.2" }
-iggy_common = { path = "core/common", version = "0.10.3-edge.2" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.3-edge.3" }
+iggy_common = { path = "core/common", version = "0.10.3-edge.3" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }
