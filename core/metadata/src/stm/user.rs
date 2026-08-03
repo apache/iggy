@@ -563,7 +563,7 @@ impl StateHandler for ChangePasswordRequest {
         // `verify_and_rewrite_change_password`): the accept path always
         // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
         // here (rather than denying pre-consensus) commits the op as a no-op,
-        // keeping the client's request sequence contiguous in the ClientTable.
+        // recording the request id in the ClientTable so a retry of it dedups.
         if self.new_password.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
@@ -731,6 +731,11 @@ pub struct PermissionerSnapshot {
 }
 
 /// Snapshot representation for the Users state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items`, `personal_access_tokens`, and the permissioner's maps stay ordered
+/// (`Vec` / `BTreeMap`) even though the runtime holds them in `AHashMap`s. Swapping
+/// any to an unordered map breaks the checkpoint checksum cross-check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsersSnapshot {
     pub items: Vec<(usize, UserSnapshot)>,
@@ -806,10 +811,29 @@ impl Snapshotable for Users {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        Ok(UsersInner::inner_from_snapshot(snapshot).into())
+    }
+}
+
+impl UsersInner {
+    /// Rebuild from a snapshot section IN PLACE (state transfer), absorbed on
+    /// both left-right buffers.
+    ///
+    /// Nothing here is shared across buffers the way `StreamsInner`'s stats
+    /// registry is, so a wholesale replace is correct.
+    pub(crate) fn restore_in_place(&mut self, snapshot: UsersSnapshot) {
+        *self = Self::inner_from_snapshot(snapshot);
+    }
+
+    /// Build a complete `UsersInner` from a snapshot section. Shared by
+    /// wrapper construction ([`Snapshotable::from_snapshot`]) and the
+    /// in-place restore command (state transfer), which absorbs it on both
+    /// left-right buffers.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn inner_from_snapshot(snapshot: UsersSnapshot) -> Self {
         let mut index: AHashMap<Arc<str>, UserId> = AHashMap::new();
         let mut user_entries: Vec<(usize, User)> = Vec::new();
 
@@ -869,7 +893,7 @@ impl Snapshotable for Users {
                 .init_permissions_for_user(user_id as UserId, user.permissions.as_deref().cloned());
         }
 
-        let inner = UsersInner {
+        Self {
             index,
             items,
             personal_access_tokens,
@@ -877,8 +901,7 @@ impl Snapshotable for Users {
             personal_access_token_expiry_index,
             permissioner,
             last_result: None,
-        };
-        Ok(inner.into())
+        }
     }
 }
 

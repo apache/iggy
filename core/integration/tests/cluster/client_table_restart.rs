@@ -21,43 +21,55 @@
 //! node crash must be able to continue: a retry of an already-committed
 //! request id must be answered from the dedup cache (never re-applied,
 //! never silently dropped), and the next request id must be admitted.
-//! Today the table lives only in memory, so a rebooted node has no record
-//! of the session or its request watermark and both scenarios fail.
 //!
-//! The Rust SDK cannot drive this: it resets its `ConsensusSession` on every
-//! disconnect and re-registers under a fresh identity. The frames are
-//! therefore hand-crafted on a raw TCP socket, same technique as the
-//! protocol-version gate tests.
+//! Server-side this rests on three landed pieces:
 //!
-//! What has to land for these tests to go green, in order:
+//! 1. WAL-replay table recovery: `metadata::impls::recovery::recover`
+//!    replays registers (minting the same epochs) and re-caches committed
+//!    replies byte-identically, so a rebooted node remembers where each
+//!    client left off. Sessions whose register fell below the snapshot
+//!    floor are not recovered yet (no checkpoint artifact - IGGY-137
+//!    remainder).
+//! 2. Resume through the login path: a reconnecting client re-authenticates
+//!    presenting its previous `client_id`. The rebind commits a Register --
+//!    `submit_register_in_process` verifies the authenticated user owns the
+//!    entry, then proposes -- so the entry's fence moves to the new register's
+//!    commit op while keeping its watermark and reply ring. The client
+//!    continues under the NEW epoch from the login reply; frames stamped with
+//!    the pre-restart epoch are fenced zombies. There is deliberately no
+//!    credential-free rebind; `given_live_session_when_unauthenticated_peer_*`
+//!    pins that.
+//! 3. A crash leaves no `Logout` behind. Every transport disconnect releases
+//!    its session (`submit_disconnect_logout`), so what makes the entry
+//!    survivable is that the process died with the connection still open --
+//!    hence these tests restart before closing the socket. Holding the slot
+//!    open past a graceful disconnect would make resume work there too, but
+//!    it needs a timer of its own; see that function's rustdoc.
 //!
-//! 1. Persist the clients table (IGGY-137, standalone): include the
-//!    (client id, last request id, cached reply) entries in the checkpoint
-//!    and recover them on boot from WAL replay, so a rebooted node
-//!    remembers where each client left off.
-//! 2. The client stops forgetting itself on disconnect: keep client id,
-//!    session id and request counter across reconnects and present the old
-//!    identity instead of a fresh Register.
-//! 3. The server accepts a resumed identity: look the session up in the
-//!    replicated table, rebind the new transport to it, and answer with
-//!    the last committed request id so the client knows whether its
-//!    in-doubt request went through. Define the conflict rule for the same
-//!    session arriving on two connections (evict the older).
-//! 4. SDK retry rule change: a replicated write may only be retried under
-//!    the same (client id, request id); the path that re-issues an
-//!    in-doubt write under a fresh session after failover goes away.
+//! The Rust SDK cannot drive this yet: it resets its `ConsensusSession` on
+//! every disconnect and re-registers under a fresh identity (the
+//! `sdk/vsr.rs` retry TODO). The frames are therefore hand-crafted on a raw
+//! TCP socket, same technique as the protocol-version gate tests. SDK-side
+//! identity stability (keep client id + request counter across reconnects,
+//! retry replicated writes only under the same identity) is the remaining
+//! client half.
 //!
-//! Steps 2+3 must ship together; 1 is standalone. An alternative to 2-4 is
-//! a per-request idempotency key that is independent of the session, the
-//! way TigerBeetle does it: no session resume at all, retries from a fresh
-//! client session stay safe because dedup keys off the request, not the
-//! (client, session) pair.
+//! The topology matrix covers two distinct recovery paths:
 //!
-//! These tests pin the implicit-rebind contract: a resumed client simply
-//! keeps sending under its old `(client, session)` on a fresh connection and
-//! the server rebinds the transport from the persisted table. If the
-//! session-resume work settles on an explicit resume handshake instead,
-//! adjust `resume_request` to speak it.
+//! - **1 node**: the restarted node rebuilds the table from its own WAL and
+//!   the client resumes against it (restart recovery).
+//! - **3 nodes**: `restart_server` reboots node 0 only; the survivors elect
+//!   a new primary, whose table was maintained by its own `commit_journal`
+//!   applies all along. The client resumes against whichever node answers
+//!   as primary — a follower cannot commit replicated TCP writes (no
+//!   follower forwarding for TCP yet), so the continuation loop probes
+//!   every node the way a leader-aware SDK re-routes (failover resume).
+//!
+//! These tests pin the resume contract: a client re-authenticates on the
+//! fresh connection under its old `client_id` and the server binds it back to
+//! the recovered entry rather than minting a new one. If the session-resume
+//! work later settles on an explicit resume handshake, adjust `resume_request`
+//! to speak it -- but it must stay credential-bearing.
 
 #![cfg(feature = "vsr")]
 
@@ -102,28 +114,39 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-#[iggy_harness]
-#[ignore = "red until clients-table persistence + session resume land"]
+#[iggy_harness(cluster_nodes = [1, 3])]
 async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     harness: &mut TestHarness,
 ) {
     let addr = tcp_addr(harness);
     let (mut stream, session) = register(addr).await;
     let create_stream = create_stream_payload("iggy137-dedup");
-    commit_request(&mut stream, session, 1, &create_stream).await;
-    drop(stream);
+    let committed = commit_request(&mut stream, session, 1, &create_stream).await;
 
+    // Restart BEFORE dropping the socket, because the ordering is the scenario.
+    // A crash takes the process down with the connection still open, so no
+    // `Logout` is committed and the session is still in the WAL for replay to
+    // rebuild. Closing first would model a graceful goodbye instead, and a
+    // graceful disconnect ends the session by design
+    // (`submit_disconnect_logout` releases the slot).
+    //
+    // Deterministic, not a race: the harness stops the node with SIGTERM, and
+    // the per-connection cleanup in the bus installer skips `remove_client_meta`
+    // once the bus token is triggered -- so a shutdown fires no
+    // connection-lost callback for any still-open socket.
     harness.restart_server().await.unwrap();
+    drop(stream);
 
     // The reply for request 1 was already delivered, but the client cannot
     // know that in the crash window; retrying the same id must converge on
-    // the cached reply, never on a second apply or a silent drop.
-    let addr = tcp_addr(harness);
-    resume_request(addr, session, 1, &create_stream).await;
+    // the cached reply, never on a second apply or a silent drop. The
+    // committed reply is passed in so the replay is proved byte-identical
+    // rather than inferred from a duplicate-name rejection.
+    let addrs = tcp_addrs(harness);
+    resume_request(&addrs, session, 1, &create_stream, Some(&committed)).await;
 }
 
-#[iggy_harness]
-#[ignore = "red until clients-table persistence + session resume land"]
+#[iggy_harness(cluster_nodes = [1, 3])]
 async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
     harness: &mut TestHarness,
 ) {
@@ -136,25 +159,106 @@ async fn given_bound_session_when_node_restarts_should_accept_next_request_id(
         &create_stream_payload("iggy137-first"),
     )
     .await;
-    drop(stream);
 
+    // Crash ordering, see the sibling test.
     harness.restart_server().await.unwrap();
+    drop(stream);
 
     // Continuation, not retry: the session advances to the next id. A node
     // that forgot the watermark sees request 2 on an unknown session and
     // either drops it as a gap or bounces the session entirely.
-    let addr = tcp_addr(harness);
-    resume_request(addr, session, 2, &create_stream_payload("iggy137-second")).await;
+    let addrs = tcp_addrs(harness);
+    // A continuation is a fresh op, so there is no cached reply to compare.
+    resume_request(
+        &addrs,
+        session,
+        2,
+        &create_stream_payload("iggy137-second"),
+        None,
+    )
+    .await;
 }
 
-fn tcp_addr(harness: &TestHarness) -> SocketAddr {
+/// Session resume must cost a credential.
+///
+/// An earlier revision rebound any unbound transport that merely presented a
+/// matching `(client, session)`, treating the pair as a bearer token, and
+/// logged the connection in as the entry's cached `user_id` -- a pre-auth
+/// session takeover, trivially reachable because HTTP mints `client_id` from a
+/// per-process counter seeded at 1.
+///
+/// This pins the contract: a transport that never authenticated gets the
+/// unbound-transport fail-fast, never a binding, no matter what identity it
+/// presents. Resume happens through the login path (see `resume_request`).
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_live_session_when_unauthenticated_peer_presents_it_should_refuse_bind(
+    harness: &mut TestHarness,
+) {
+    let addr = tcp_addr(harness);
+    let (mut owner, session) = register(addr).await;
+    let payload = create_stream_payload("iggy137-auth-gap-owner");
+    commit_request(&mut owner, session, 1, &payload).await;
+
+    // Fresh connection, no login, presenting the live identity verbatim, and
+    // asking for a write the owner never made -- so a bound impostor shows up
+    // as an outright committed success rather than a name collision.
+    let mut impostor = TcpStream::connect(addr).await.unwrap();
+    let intruder_payload = create_stream_payload("iggy137-auth-gap-intruder");
+    let header = request_header(Operation::CreateStream, session, 2, intruder_payload.len());
+    let verdict = exchange(&mut impostor, &header, &intruder_payload)
+        .await
+        .verdict();
+    assert!(
+        matches!(
+            verdict,
+            Verdict::NoResultSection | Verdict::Evicted(_) | Verdict::Ignored
+        ),
+        "an unauthenticated peer presenting (client={CLIENT_ID:#x}, session={session}) \
+         must not be bound; got {verdict:?}"
+    );
+
+    // Low request ids are equally refused: the guard is authentication, not
+    // watermark position.
+    let low = request_header(Operation::CreateStream, session, 1, payload.len());
+    let verdict = exchange(&mut impostor, &low, &payload).await.verdict();
+    assert!(
+        !matches!(verdict, Verdict::Success(_)),
+        "unauthenticated replay of a committed id must not succeed; got {verdict:?}"
+    );
+
+    // The owner's own session is untouched by the attempt.
+    commit_request(
+        &mut owner,
+        session,
+        2,
+        &create_stream_payload("iggy137-auth-gap-live"),
+    )
+    .await;
+}
+
+pub(super) fn tcp_addr(harness: &TestHarness) -> SocketAddr {
     harness
         .server()
         .tcp_addr()
         .expect("server must expose a TCP address")
 }
 
-fn create_stream_payload(name: &str) -> Bytes {
+/// Every node's TCP address. The continuation loop probes all of them the
+/// way a leader-aware SDK re-routes: after a node restart in a cluster the
+/// primary may be any survivor, and only the primary commits (or answers
+/// dedup for) replicated requests.
+pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
+    (0..harness.cluster_size())
+        .map(|node| {
+            harness
+                .node(node)
+                .tcp_addr()
+                .expect("every node must expose a TCP address")
+        })
+        .collect()
+}
+
+pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
     }
@@ -187,7 +291,25 @@ fn request_header(
 /// so the pre-restart request must reuse the returned stream. Replays on
 /// transient rejections: right after boot the single node may not have
 /// elected itself yet.
-async fn register(addr: SocketAddr) -> (TcpStream, u64) {
+pub(super) async fn register(addr: SocketAddr) -> (TcpStream, u64) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        if let Some(session) = login_on(&mut stream).await {
+            return (stream, session);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "register did not commit within {COMMIT_BUDGET:?}"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+}
+
+/// Root login/register for `CLIENT_ID` on an already-connected socket.
+/// `Some(session)` on a committed register, `None` on a transient rejection
+/// (right after boot the node may not have elected itself yet).
+async fn login_on(stream: &mut TcpStream) -> Option<u64> {
     let body = LoginRegisterRequest {
         version_info: ClientVersionInfo {
             protocol_version: IGGY_PROTOCOL_VERSION,
@@ -201,32 +323,32 @@ async fn register(addr: SocketAddr) -> (TcpStream, u64) {
     .to_bytes();
     let header = request_header(Operation::Register, 0, 0, body.len());
 
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let deadline = Instant::now() + COMMIT_BUDGET;
-    loop {
-        match exchange(&mut stream, &header, &body).await.verdict() {
-            Verdict::Success(payload) => {
-                let response = LoginRegisterResponse::decode_from(&payload)
-                    .expect("register payload must decode");
-                assert_ne!(response.session, 0, "server must bind a nonzero session");
-                return (stream, response.session);
-            }
-            Verdict::Rejected(code) if is_transient(code) && Instant::now() < deadline => {
-                sleep(RETRY_PAUSE).await;
-            }
-            other => panic!("register did not commit: {other:?}"),
+    match exchange(stream, &header, &body).await.verdict() {
+        Verdict::Success(reply) => {
+            let response = LoginRegisterResponse::decode_from(&reply.payload)
+                .expect("register payload must decode");
+            assert_ne!(response.session, 0, "server must bind a nonzero session");
+            Some(response.session)
         }
+        Verdict::Rejected(code) if is_transient(code) => None,
+        other => panic!("register did not commit: {other:?}"),
     }
 }
 
 /// Send one replicated metadata request on the registered connection and
-/// require a committed success within `COMMIT_BUDGET`.
-async fn commit_request(stream: &mut TcpStream, session: u64, request: u64, body: &Bytes) {
+/// require a committed success within `COMMIT_BUDGET`. Returns the committed
+/// reply so a later replay can be compared against it byte for byte.
+pub(super) async fn commit_request(
+    stream: &mut TcpStream,
+    session: u64,
+    request: u64,
+    body: &Bytes,
+) -> CommittedReply {
     let header = request_header(Operation::CreateStream, session, request, body.len());
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
         match exchange(stream, &header, body).await.verdict() {
-            Verdict::Success(_) => return,
+            Verdict::Success(reply) => return reply,
             Verdict::Rejected(code) if is_transient(code) && Instant::now() < deadline => {
                 sleep(RETRY_PAUSE).await;
             }
@@ -235,22 +357,65 @@ async fn commit_request(stream: &mut TcpStream, session: u64, request: u64, body
     }
 }
 
-/// Post-restart continuation: keep presenting the old identity until the
-/// server commits (or serves the cached reply for) the request. Every
-/// attempt uses a fresh connection, both because the old one died with the
-/// node and so an unanswered frame cannot desync the next attempt. Panics
+/// Post-restart continuation: re-authenticate under the OLD `client_id`, then
+/// keep presenting the old identity, round-robin across every node, until one
+/// commits (or serves the cached reply for) the request.
+///
+/// The re-login is the resume, and it is a rebind: the ownership-gated
+/// Register commits, the recovered entry's fence moves to that register's op,
+/// the login reply hands back the NEW epoch. Continuation frames must stamp
+/// it -- the pre-restart epoch is a fenced zombie from here on. Watermark and
+/// reply ring survive the rebind, which is what the dedup assertion rests on.
+/// There is deliberately NO way to rebind without credentials -- an unbound
+/// transport that merely presents `(client, session)` gets the empty-reply
+/// fail-fast (see `given_unauthenticated_resume_*`).
+///
+/// Every attempt uses a fresh connection, both because the old one died with
+/// the node and so an unanswered frame cannot desync the next attempt. Panics
 /// with the last observed failure mode when the budget runs out.
-async fn resume_request(addr: SocketAddr, session: u64, request: u64, body: &Bytes) {
-    let header = request_header(Operation::CreateStream, session, request, body.len());
+pub(super) async fn resume_request(
+    addrs: &[SocketAddr],
+    session: u64,
+    request: u64,
+    body: &Bytes,
+    expect_replay_of: Option<&CommittedReply>,
+) {
     let deadline = Instant::now() + RESUME_BUDGET;
     let mut last_failure = "the listener never came back".to_string();
+    let mut attempt = 0usize;
     while Instant::now() < deadline {
+        let addr = addrs[attempt % addrs.len()];
+        attempt += 1;
         let Ok(mut stream) = TcpStream::connect(addr).await else {
             sleep(RETRY_PAUSE).await;
             continue;
         };
+        // Re-authenticate on the fresh connection. The rebind commits a
+        // Register, so the epoch strictly advances past the pre-restart one
+        // (op-derived; regression would mean the fence can be replayed into).
+        let resumed = match login_on(&mut stream).await {
+            Some(resumed) => {
+                assert!(
+                    resumed > session,
+                    "rebind must move the fence above the pre-restart epoch \
+                     (old {session}, got {resumed})"
+                );
+                resumed
+            }
+            None => {
+                last_failure = "re-login did not commit".to_string();
+                sleep(RETRY_PAUSE).await;
+                continue;
+            }
+        };
+        let header = request_header(Operation::CreateStream, resumed, request, body.len());
         match exchange(&mut stream, &header, body).await.verdict() {
-            Verdict::Success(_) => return,
+            Verdict::Success(reply) => {
+                if let Some(original) = expect_replay_of {
+                    assert_replayed_from_cache(original, &reply, request);
+                }
+                return;
+            }
             Verdict::Rejected(code) if is_transient(code) => {
                 last_failure = format!("still transient (code {code})");
             }
@@ -262,21 +427,21 @@ async fn resume_request(addr: SocketAddr, session: u64, request: u64, body: &Byt
             }
             Verdict::NoResultSection => {
                 last_failure = format!(
-                    "request {request} got the unbound-transport empty Reply: the \
-                     restarted node does not recognize session {session}"
+                    "request {request} got the unbound-transport empty Reply on \
+                     {addr}: that node does not recognize session {session}"
                 );
             }
             Verdict::Ignored => {
                 last_failure = format!(
                     "request {request} on session {session} was silently ignored for \
-                     {REPLY_WAIT:?} (RequestGap-style drop: the restarted node lost \
-                     the request watermark)"
+                     {REPLY_WAIT:?} (RequestGap-style drop: the node lost the \
+                     request watermark)"
                 );
             }
             Verdict::Evicted(reason) => {
                 last_failure = format!(
                     "session {session} was evicted with reason {reason} instead of \
-                     being rebound from the persisted table"
+                     being rebound from the recovered table"
                 );
             }
         }
@@ -287,12 +452,50 @@ async fn resume_request(addr: SocketAddr, session: u64, request: u64, body: &Byt
     );
 }
 
+/// Prove a retry was answered from the dedup cache rather than re-executed.
+///
+/// `build_reply_message` derives every reply field from the prepare header, and
+/// recovery re-caches the committed reply from that same prepare, so a cached
+/// replay is byte-identical to the reply the client originally received. A
+/// re-apply cannot be: it commits at a fresh op, which changes `op`/`commit`
+/// and therefore the frame `checksum`.
+///
+/// This is the direct proof. Without it the test rests on `CreateStream`
+/// rejecting a duplicate name, which cannot distinguish "replayed the cached
+/// reply" from "re-applied and rejected as a duplicate".
+fn assert_replayed_from_cache(original: &CommittedReply, replayed: &CommittedReply, request: u64) {
+    let field = |bytes: &[u8; HEADER_SIZE], offset: usize| {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    };
+    let op_offset = offset_of!(ReplyHeader, op);
+    let commit_offset = offset_of!(ReplyHeader, commit);
+    assert_eq!(
+        field(&replayed.header, op_offset),
+        field(&original.header, op_offset),
+        "request {request} was re-applied at a new op instead of replayed from cache"
+    );
+    assert_eq!(
+        field(&replayed.header, commit_offset),
+        field(&original.header, commit_offset),
+        "request {request} replay carries a different commit than the original"
+    );
+    assert_eq!(
+        replayed.header, original.header,
+        "request {request} replay is not the cached bytes (headers differ)"
+    );
+    assert_eq!(
+        replayed.payload, original.payload,
+        "request {request} replay is not the cached bytes (payloads differ)"
+    );
+}
+
 /// Everything one request/reply exchange can end in, spelled out so the
 /// red-test panic names the exact failure mode instead of a decode error.
 #[derive(Debug)]
 enum Verdict {
-    /// Committed success; carries the payload after the result section.
-    Success(Bytes),
+    /// Committed success; carries the reply header plus the payload after the
+    /// result section.
+    Success(CommittedReply),
     /// Committed (or pre-consensus transient) rejection code.
     Rejected(u32),
     /// A Reply with no result section, i.e. the empty Reply the server emits
@@ -304,9 +507,28 @@ enum Verdict {
     Evicted(u8),
 }
 
+/// A committed `Reply`, split into the wire header and the post-result-section
+/// payload.
+///
+/// The header is boxed to keep it off the stack in `Verdict`/`Exchange`: at
+/// `HEADER_SIZE` inline it dwarfs every other variant.
+#[derive(Debug)]
+pub(super) struct CommittedReply {
+    header: Box<[u8; HEADER_SIZE]>,
+    payload: Bytes,
+}
+
 enum Exchange {
-    Reply { status: u32, body: Bytes },
-    Eviction { reason: u8 },
+    Reply {
+        status: u32,
+        /// Raw reply header, kept so a replay can be proved byte-identical to
+        /// the original committed reply.
+        header: Box<[u8; HEADER_SIZE]>,
+        body: Bytes,
+    },
+    Eviction {
+        reason: u8,
+    },
     Ignored,
 }
 
@@ -318,11 +540,14 @@ impl Exchange {
             // A nonzero status is the pre-commit deny channel (authz etc.);
             // fold it into the rejection space, the codes are shared.
             Self::Reply { status, .. } if status != 0 => Verdict::Rejected(status),
-            Self::Reply { body, .. } => match result_code(&body) {
+            Self::Reply { header, body, .. } => match result_code(&body) {
                 None => Verdict::NoResultSection,
                 Some(0) => {
                     let payload_start = result_section_len(&body).unwrap();
-                    Verdict::Success(body.slice(payload_start..))
+                    Verdict::Success(CommittedReply {
+                        header,
+                        payload: body.slice(payload_start..),
+                    })
                 }
                 Some(code) => Verdict::Rejected(code),
             },
@@ -372,6 +597,7 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
         .expect("reply body read failed");
     Exchange::Reply {
         status,
+        header: Box::new(reply_header),
         body: body.into(),
     }
 }

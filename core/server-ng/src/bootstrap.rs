@@ -35,11 +35,13 @@ use configs::ng_sharding::{
 };
 use configs::server_ng::{NgSystemConfig, ServerNgConfig};
 use consensus::{
-    LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
+    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer,
+    VsrConsensus,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
+use consensus::VsrState;
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::defaults::{
@@ -48,6 +50,7 @@ use iggy_common::defaults::{
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
+use journal::superblock::{DynSuperblockStore, PingPongSuperblock};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
@@ -69,7 +72,7 @@ use message_bus::{
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
-use metadata::impls::recovery::recover;
+use metadata::impls::recovery::{ReplicaIdentity, recover};
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -94,6 +97,7 @@ use shard::{
 };
 use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -101,7 +105,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
@@ -214,10 +218,12 @@ pub type ServerNgShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnap
 ///
 /// Carries the cross-thread shutdown flag and one OS-thread `JoinHandle`
 /// per shard. The caller flips the flag via [`Self::install_ctrlc_handler`]
-/// and then drains every shard via [`Self::join_all`].
+/// and then drains every shard via [`Self::join_all`], bounded by
+/// `join_timeout` (`system.sharding.shutdown_join_timeout`).
 pub struct ShardHandles {
     shutdown_flag: Arc<AtomicBool>,
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)>,
+    join_timeout: Duration,
 }
 
 impl ShardHandles {
@@ -245,27 +251,60 @@ impl ShardHandles {
         })
     }
 
-    /// Drain every shard thread. Each shard's outcome is logged
-    /// (`info` on clean exit, `error` on Err or panic). If any shard
-    /// failed, returns every failure together as
+    /// Drain every shard thread. This is the main thread's park for the
+    /// server's whole lifetime, so shards are awaited WITHOUT any time
+    /// bound while the server runs; the `shutdown_join_timeout` clock
+    /// only starts once the cross-thread shutdown flag flips (Ctrl-C or
+    /// a shard failure). Each shard's outcome is logged (`info` on clean
+    /// exit, `error` on Err, panic, or wedge). If any shard failed,
+    /// returns every failure together as
     /// [`ServerNgError::ShardJoinFailures`] so the operator sees the
     /// full set rather than just the first.
+    ///
+    /// A shard whose thread is still running when the post-shutdown
+    /// deadline passes is abandoned (its `JoinHandle` dropped, the OS
+    /// thread left to die with the process) and reported as
+    /// [`ShardJoinFailureKind::Wedged`]: a wedged pump or listener must
+    /// not block process exit forever.
     ///
     /// # Errors
     ///
     /// Returns [`ServerNgError::ShardJoinFailures`] if any shard
-    /// returned a `Result::Err` or panicked. The variant carries every
-    /// per-shard failure (`ShardJoinFailureKind::Error` or
-    /// `ShardJoinFailureKind::Panic`) in shard-id order so the caller
-    /// does not need to read the trace log to discover late-failing shards.
+    /// returned a `Result::Err`, panicked, or wedged past the deadline.
+    /// The variant carries every per-shard failure in shard-id order so
+    /// the caller does not need to read the trace log to discover
+    /// late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
+        // Armed on the first poll that observes the shutdown flag, shared
+        // across all shards: one budget covers the whole drain, not one
+        // budget per shard.
+        let mut deadline: Option<Instant> = None;
         // Shards run thread-per-core with compio's blocking fallback pool
         // disabled, so an io_uring opcode the kernel lacks aborts every shard
         // with the same panic. Surface the actionable diagnostic once.
         let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
-            match handle.join() {
+            let Some(joined) = join_until_shutdown_deadline(
+                handle,
+                &self.shutdown_flag,
+                self.join_timeout,
+                &mut deadline,
+            ) else {
+                error!(
+                    shard_id,
+                    waited = ?self.join_timeout,
+                    "shard thread still running at the shutdown join deadline; abandoning it"
+                );
+                failures.push(ShardJoinFailure {
+                    shard_id,
+                    kind: ShardJoinFailureKind::Wedged {
+                        waited: self.join_timeout,
+                    },
+                });
+                continue;
+            };
+            match joined {
                 Ok(Ok(())) => {
                     info!(shard_id, "shard thread exited cleanly");
                 }
@@ -301,6 +340,41 @@ impl ShardHandles {
     }
 }
 
+/// Poll cadence for the bounded shard joins. Coarse enough to cost
+/// nothing during a normal drain, fine enough that exit latency past
+/// the last shard's return stays imperceptible.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Join `handle`, waiting indefinitely while the server runs. The
+/// `join_timeout` clock starts only when `shutdown_flag` is observed set
+/// (arming the caller-shared `deadline` once, so all shards drain under
+/// ONE budget); a running server parked here for hours must never be
+/// mistaken for a wedged shard. `None` means the thread was still
+/// running at the post-shutdown deadline and the handle was dropped
+/// (the OS thread keeps running detached; process exit reaps it).
+/// `JoinHandle` has no timed join, so this polls `is_finished` at
+/// [`JOIN_POLL_INTERVAL`]; the closing `join()` on a finished thread
+/// returns immediately.
+fn join_until_shutdown_deadline(
+    handle: thread::JoinHandle<Result<(), ServerNgError>>,
+    shutdown_flag: &AtomicBool,
+    join_timeout: Duration,
+    deadline: &mut Option<Instant>,
+) -> Option<thread::Result<Result<(), ServerNgError>>> {
+    while !handle.is_finished() {
+        if deadline.is_none() && shutdown_flag.load(Ordering::Relaxed) {
+            *deadline = Some(Instant::now() + join_timeout);
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= *deadline
+        {
+            return None;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL);
+    }
+    Some(handle.join())
+}
+
 /// Best-effort extraction of the panic message from a
 /// `Box<dyn Any + Send>` returned by `JoinHandle::join`. Tries the two
 /// payload shapes the standard library guarantees (`&'static str` and
@@ -316,73 +390,44 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     "<panic payload not String/&str>".to_string()
 }
 
-/// Joins survivor shard threads after a partial-spawn failure without
-/// panicking the bootstrap thread on `pthread_create` EAGAIN.
+/// Joins survivor shard threads after a partial-spawn failure, bounded
+/// by the same `shutdown_join_timeout` budget as the normal exit path.
 ///
-/// Bare `thread::spawn` panics on EAGAIN, which is the most likely OS
-/// state on this path since the parent `Builder::spawn` already failed
-/// for the same reason. A panic would unwind `bootstrap()` while
-/// survivor shard threads keep driving their compio runtimes and
-/// `io_uring` rings, orphaning them across process exit.
-///
-/// Uses `thread::Builder::spawn` and hands each survivor over via a
-/// one-shot `sync_channel(1)` so an `Err` drops the rx (not the
-/// survivor `JoinHandle`), letting us fall back to a sequential
-/// `survivor.join()` instead. Once one cleanup spawn fails, treats the
-/// OS as exhausted and routes every remaining survivor straight to the
-/// sequential pool to avoid re-trying spawn.
-///
-/// This routine bounds CPU/IO via the survivor's own
-/// `shutdown_drain_timeout` (driven by each shard's watchdog after
-/// `shutdown_flag` is set by the caller), not via a wall-clock
-/// deadline here. If a survivor's `shard_main` blocks past the drain
-/// window without observing the flag, this join hangs - that scenario
-/// is the same surface as the deferred watchdog-detach gap and is not
-/// addressed by this helper.
-///
-/// TODO(hubcio): no hard time limit on shard shutdown here. If a
-/// survivor's `shard_main` never returns, `survivor.join()` blocks
-/// forever.
+/// Polls every survivor's `is_finished` in one loop instead of spawning
+/// per-survivor joiner threads: the likely OS state on this path is
+/// `pthread_create` EAGAIN (the parent spawn just failed with it), so
+/// nothing here may create threads, and polling drains all survivors in
+/// parallel anyway. A survivor still running at the deadline is
+/// abandoned with an error log so the failed bootstrap can surface its
+/// spawn error instead of hanging on a wedged shard.
 fn join_partial_shard_survivors(
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)>,
+    join_timeout: Duration,
 ) {
-    let mut joiners = Vec::with_capacity(shard_threads.len());
-    let mut sequential_join: Vec<thread::JoinHandle<Result<(), ServerNgError>>> = Vec::new();
-    let mut spawn_exhausted = false;
-    for (sid, survivor) in shard_threads {
-        if spawn_exhausted {
-            sequential_join.push(survivor);
-            continue;
-        }
-        let (handover_tx, handover_rx) =
-            std::sync::mpsc::sync_channel::<thread::JoinHandle<Result<(), ServerNgError>>>(1);
-        match thread::Builder::new()
-            .name(format!("shard-{sid}-cleanup"))
-            .spawn(move || {
-                if let Ok(survivor) = handover_rx.recv() {
-                    let _ = survivor.join();
-                }
-            }) {
-            Ok(joiner) => {
-                let _ = handover_tx.send(survivor);
-                joiners.push(joiner);
-            }
-            Err(spawn_err) => {
-                warn!(
-                    error = %spawn_err,
-                    shard_id = sid,
-                    "cleanup helper thread spawn failed; falling back to sequential survivor join"
-                );
-                spawn_exhausted = true;
-                sequential_join.push(survivor);
+    let deadline = Instant::now() + join_timeout;
+    let mut remaining = shard_threads;
+    loop {
+        let mut still_running = Vec::with_capacity(remaining.len());
+        for (shard_id, survivor) in remaining {
+            if survivor.is_finished() {
+                let _ = survivor.join();
+                info!(shard_id, "survivor shard thread drained");
+            } else {
+                still_running.push((shard_id, survivor));
             }
         }
+        remaining = still_running;
+        if remaining.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL);
     }
-    for joiner in joiners {
-        let _ = joiner.join();
-    }
-    for survivor in sequential_join {
-        let _ = survivor.join();
+    for (shard_id, _survivor) in remaining {
+        error!(
+            shard_id,
+            waited = ?join_timeout,
+            "survivor shard thread still running at the shutdown join deadline; abandoning it"
+        );
     }
 }
 
@@ -481,6 +526,7 @@ struct TcpTopology {
     replica_listen_addr: Option<SocketAddr>,
     ws_listen_addr: Option<SocketAddr>,
     quic_listen_addr: Option<SocketAddr>,
+    http_listen_addr: Option<SocketAddr>,
     tcp_tls_listen_addr: Option<SocketAddr>,
     peers: Vec<(u8, SocketAddr)>,
 }
@@ -740,7 +786,10 @@ pub fn bootstrap(
                 drop(metadata_bundle_rx);
                 drop(ready_tx);
                 drop(ready_rx);
-                join_partial_shard_survivors(shard_threads);
+                join_partial_shard_survivors(
+                    shard_threads,
+                    config.system.sharding.shutdown_join_timeout.get_duration(),
+                );
                 return Err(ServerNgError::ShardSpawnFailed { shard_id, source });
             }
         };
@@ -764,6 +813,7 @@ pub fn bootstrap(
     Ok(ShardHandles {
         shutdown_flag,
         shard_threads,
+        join_timeout: config.system.sharding.shutdown_join_timeout.get_duration(),
     })
 }
 
@@ -796,8 +846,15 @@ fn run_shard_thread(
         .bind_memory()
         .map_err(|source| ServerNgError::MemoryAffinityFailed { shard_id, source })?;
 
-    let runtime = create_shard_executor()
-        .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
+    // `enrich_runtime_create_error` folds the io_uring remediation (raise
+    // `ulimit -l`, unblock seccomp, kernel-flag floor) into the error, so the
+    // guidance survives into the shard-join failure report instead of only
+    // stderr. Multi-shard boxes exhaust RLIMIT_MEMLOCK on per-shard rings
+    // before the bootstrap runtime does, so this path needs it most.
+    let runtime = create_shard_executor().map_err(|source| {
+        let source = server_common::diagnostics::enrich_runtime_create_error(source);
+        ServerNgError::ShardRuntimeCreateFailed { shard_id, source }
+    })?;
 
     let result = runtime.block_on(async move {
         // `shard_main`'s future grows past clippy's `large_futures` cap
@@ -883,8 +940,13 @@ async fn shard_main(
             // shifts one slab id and root is lost after the first restart.
             let recovered = recover::<ServerNgMuxStateMachine>(
                 data_dir,
-                topology.replica_count == 1,
+                ReplicaIdentity {
+                    cluster: topology.cluster_id,
+                    replica_id: topology.self_replica_id,
+                    replica_count: topology.replica_count,
+                },
                 config.metadata.journal_slots,
+                config.metadata.clients_table_max,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
@@ -920,12 +982,16 @@ async fn shard_main(
             .await?;
             (
                 recovered.mux_stm,
-                Some((
-                    recovered.journal,
-                    recovered.snapshot,
-                    recovered.last_applied_op,
-                    recovered.last_journaled_op,
-                )),
+                Some(RecoveredOwnerState {
+                    journal: recovered.journal,
+                    snapshot: recovered.snapshot,
+                    last_applied_op: recovered.last_applied_op,
+                    last_journaled_op: recovered.last_journaled_op,
+                    client_table: recovered.client_table,
+                    superblock: recovered.superblock,
+                    recovered_state: recovered.recovered_state,
+                    snapshot_checkpoint: recovered.snapshot_checkpoint,
+                }),
             )
         }
         MetadataHandoff::Waiter { bundle_rx } => {
@@ -943,33 +1009,59 @@ async fn shard_main(
     // Metadata consensus + journal + snapshot live only on shard 0.
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
     // so peer shards have no caller that reads `journal` or `snapshot`.
-    let (metadata_consensus, journal_for_metadata, snapshot_for_metadata) =
-        if let Some((journal, snapshot, last_applied_op, last_journaled_op)) = owner_state {
-            let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-            let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
-            let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
-            let consensus = restore_metadata_consensus(
-                &journal,
-                restored_op,
-                commit_watermark,
-                topology.cluster_id,
-                topology.self_replica_id,
-                topology.replica_count,
-                Rc::clone(&bus),
-                config.metadata.prepare_queue_depth,
-                cluster_heartbeat_ticks(config),
-            );
-            (Some(consensus), Some(journal), snapshot)
-        } else {
-            (None, None, None)
-        };
+    let (
+        metadata_consensus,
+        journal_for_metadata,
+        snapshot_for_metadata,
+        superblock_for_metadata,
+        checkpoint_seed,
+        recovered_client_table,
+    ) = if let Some(owner) = owner_state {
+        // `recover()` already opened the superblock, read `recovered_state`, and
+        // verified the on-disk snapshot against its checkpoint pairing BEFORE decoding
+        // it. Reuse that superblock rather than re-opening it, which would fork the
+        // ping-pong sequence counter. Consensus recovers its true (view, log_view)
+        // from `recovered_state` instead of inferring a stale view from the WAL.
+        let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
+        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(owner.superblock);
+        (
+            Some(consensus),
+            Some(owner.journal),
+            owner.snapshot,
+            Some(superblock),
+            owner.snapshot_checkpoint,
+            Some(owner.client_table),
+        )
+    } else {
+        (None, None, None, None, (0, 0), None)
+    };
     let metadata = ServerNgMetadata::new(
         metadata_consensus,
         journal_for_metadata,
         snapshot_for_metadata,
+        superblock_for_metadata,
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
+    // Size the VSR client table before listeners bind and any client registers.
+    // Must precede the recovered-table install below: the setter rebuilds the
+    // table from scratch, so running it afterwards would drop every resumed
+    // session (and trip its empty-table assert).
+    metadata.set_clients_table_max(config.metadata.clients_table_max);
+    // Reinstall the sessions recovery restored from the checkpoint and the WAL
+    // suffix, so a rebooted node dedups retries and admits continuations from
+    // clients that kept their identity across the restart (IGGY-137). Recovery
+    // sized this table from the same config value, so the install preserves the
+    // configured cap.
+    if let Some(client_table) = recovered_client_table {
+        // Refusal (a client registered before this ran) keeps the live table
+        // and is logged by the callee; boot continues either way.
+        let _ = metadata.install_client_table(client_table);
+    }
+    // Seed the coordinator's last-checkpoint pairing so the first post-boot
+    // view-change superblock write records the real (checkpoint_op, checksum)
+    // instead of (0, 0). No-op on peer shards, which have no coordinator.
+    metadata.seed_checkpoint_ref(checkpoint_seed.0, checkpoint_seed.1);
     // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
     // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
@@ -1205,6 +1297,21 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
+        // Reseed the client-id minter above every recovered entry before any
+        // listener accepts. The counter is per process; the table it must not
+        // collide with was rebuilt from the previous boot's WAL. Keyed by view
+        // so a later promotion refolds the table (the minting path calls the
+        // same method, see `HttpInner::register_session_once`).
+        let boot_view = shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .map_or(0, consensus::VsrConsensus::view);
+        coord.seed_client_sequence(
+            boot_view,
+            shard.plane.metadata().client_table.borrow().client_ids(),
+        );
         let on_client_request =
             make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
         let (accepted_replica, dialed_replica) =
@@ -1472,20 +1579,14 @@ fn spawn_shutdown_watchdog(
 
 /// Copy the configured cluster roster plus this node's own client ports into
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
-/// the real topology. `self_*` back only the cluster-disabled self-synthesis;
-/// the HTTP port is read from config since HTTP binds outside this topology.
+/// the real topology. `self_*` back only the cluster-disabled self-synthesis
+/// and carry the requested listener ports from the resolved topology, not the
+/// bound ones (a `:0` wildcard is reported as 0).
 fn build_cluster_roster(
     config: &ServerNgConfig,
     topology: &TcpTopology,
     metadata_view: Arc<AtomicU64>,
 ) -> ClusterRoster {
-    let http_port = if config.http.enabled {
-        parse_socket_addr("http.address", &config.http.address)
-            .ok()
-            .map(|addr| addr.port())
-    } else {
-        None
-    };
     ClusterRoster {
         enabled: config.cluster.enabled,
         name: config.cluster.name.clone(),
@@ -1494,7 +1595,7 @@ fn build_cluster_roster(
         self_ports: configs::ng_cluster::TransportPorts {
             tcp: Some(topology.client_listen_addr.port()),
             quic: topology.quic_listen_addr.map(|addr| addr.port()),
-            http: http_port,
+            http: topology.http_listen_addr.map(|addr| addr.port()),
             websocket: topology.ws_listen_addr.map(|addr| addr.port()),
             tcp_replica: None,
         },
@@ -1674,6 +1775,16 @@ async fn build_shard_for_thread(
     .map_err(ServerNgError::ShardConstruction)?;
 
     let shard = Rc::new(built.shard);
+    // Repair pacing is shared by both planes' repair loops, so it is a
+    // per-shard tunable set once here rather than per consensus group.
+    shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
+    // Bounds a served state-transfer chunk. A frame above the bus ceiling is
+    // rejected by the RECEIVING transport, which tears the replica connection
+    // down rather than dropping one message.
+    shard.set_bus_max_message_size(
+        usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
+    );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1690,30 +1801,179 @@ const _: () = assert!(
     configs::ng_metadata::DEFAULT_METADATA_JOURNAL_SLOTS
         == journal::prepare_journal::DEFAULT_SLOT_COUNT
 );
-/// `[cluster] heartbeat_timeout` in consensus ticks, floored at one tick.
-/// Every consensus group (metadata and per-partition planes alike) gets the
-/// same window: the failure it guards against - a primary that stopped
-/// heartbeating - is host-level, not per-plane.
-pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
-    let window = config.cluster.heartbeat_timeout.get_duration().as_millis();
-    u64::try_from((window / shard::CONSENSUS_TICK_INTERVAL.as_millis()).max(1)).unwrap_or(u64::MAX)
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH
+        == consensus::PIPELINE_PREPARE_QUEUE_MAX
+);
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX
+);
+const _: () =
+    assert!(configs::ng_cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_EVICTED_RING_CAPACITY == partitions::EVICTED_RING_CAPACITY
+);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_EVICTED_RING_BYTES_MAX == partitions::EVICTED_RING_BYTES_MAX
+);
+const _: () =
+    assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(
+    configs::ng_cluster::STATE_CHUNK_HEADER_LEN
+        == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
+);
+/// Convert a consensus-timer interval to whole ticks, floored at one tick so a
+/// sub-tick value still fires and saturated on overflow.
+fn duration_to_ticks(interval: Duration) -> u64 {
+    let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
+    u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
+/// (metadata and per-partition planes alike) gets the same window: the failure
+/// it guards against - a primary that stopped heartbeating - is host-level, not
+/// per-plane.
+pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
+}
+
+/// Floor for the post-restart read-recovery deadline (see
+/// [`recovery_barrier_deadline`]). At and below the 5s default heartbeat the
+/// worst-case recovery is dominated by the heartbeat-independent term - the
+/// `ViewChangeStatus` backstop plus election ceremony and suffix recommit,
+/// empirically ~7s - so the scaled value must never fall under this or a
+/// fast-heartbeat cluster would 503 legitimate reads mid-recovery. The backstop
+/// is the configurable `[cluster] view_change_status_timeout`; raising it past
+/// its 5s default is why `recovery_barrier_deadline` scales that knob in too
+/// rather than leaning on this floor to cover it.
+const RECOVERY_BARRIER_DEADLINE_FLOOR: Duration = Duration::from_secs(15);
+
+/// Safety factor applied to each scaled term of the recovery deadline: a slower
+/// heartbeat stretches election and suffix recommit proportionally, and a wider
+/// status backstop stretches the ceremony it bounds. 3x reproduces the
+/// empirically chosen 15s margin at the shared 5s default (3 x 5s = 15s) and
+/// holds that factor as either knob grows.
+const RECOVERY_BARRIER_MULTIPLIER: u32 = 3;
+
+/// How long the post-restart read path waits for the recovered WAL suffix to
+/// re-commit before failing loud (retryable 503): the largest of the fixed
+/// floor, a `[cluster] heartbeat_timeout`-scaled window, and a
+/// `[cluster] view_change_status_timeout`-scaled window. Both knobs feed it
+/// because either, raised far past its default, stretches worst-case recovery
+/// past the fixed floor; see `await_recovery_barrier` for the read-side wait.
+pub(crate) fn recovery_barrier_deadline(
+    heartbeat: Duration,
+    view_change_status: Duration,
+) -> Duration {
+    // saturating: neither timeout has a config ceiling, plain `*` panics
+    heartbeat
+        .saturating_mul(RECOVERY_BARRIER_MULTIPLIER)
+        .max(view_change_status.saturating_mul(RECOVERY_BARRIER_MULTIPLIER))
+        .max(RECOVERY_BARRIER_DEADLINE_FLOOR)
+}
+
+/// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
+/// primary broadcasts its commit point, the cluster's liveness feed. Applied
+/// to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn commit_broadcast_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.commit_broadcast_interval.get_duration())
+}
+
+/// `[cluster] prepare_retransmit_interval` in consensus ticks: how often the
+/// primary retransmits un-acked prepares. Applied to every consensus group,
+/// matching `cluster_heartbeat_ticks`.
+pub(crate) fn prepare_retransmit_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.prepare_retransmit_interval.get_duration())
+}
+
+/// `[cluster] view_change_retransmit_interval` in consensus ticks: how often a
+/// replica retransmits its `StartViewChange` / `DoViewChange` during a view
+/// change. Applied to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn view_change_retransmit_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(
+        config
+            .cluster
+            .view_change_retransmit_interval
+            .get_duration(),
+    )
+}
+
+/// `[cluster] view_change_status_timeout` in consensus ticks: the stalled
+/// view-change backstop before escalating to a fresh election. Applied to every
+/// consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn view_change_status_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.view_change_status_timeout.get_duration())
+}
+
+/// `[cluster] request_start_view_retransmit_interval` in consensus ticks: how
+/// often a recovering or view-change backup re-requests the current `StartView`.
+/// Applied to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn request_start_view_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(
+        config
+            .cluster
+            .request_start_view_retransmit_interval
+            .get_duration(),
+    )
+}
+
+/// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
+/// journal-repair stream waits before re-requesting its window. Both planes'
+/// repair loops share it, so it is applied once per shard (not per consensus
+/// group). Clamped to `u32`, the width of the session idle-tick counter.
+pub(crate) fn repair_retry_ticks(config: &ServerNgConfig) -> u32 {
+    u32::try_from(duration_to_ticks(
+        config.cluster.repair_retry_interval.get_duration(),
+    ))
+    .unwrap_or(u32::MAX)
+}
+
+/// Shard 0's half of a metadata recovery: everything [`recover`] produced except the
+/// state machine, which every shard receives through the factory bundle.
+///
+/// Named rather than a positional tuple: the fields are same-typed `Option<u64>`s and
+/// `(u64, u128)` pairs that a reorder would silently rebind, and one of them decides
+/// what view the replica boots into.
+struct RecoveredOwnerState {
+    journal: PrepareJournal,
+    snapshot: Option<IggySnapshot>,
+    last_applied_op: Option<u64>,
+    last_journaled_op: Option<u64>,
+    client_table: ClientTable,
+    superblock: PingPongSuperblock,
+    recovered_state: Option<VsrState>,
+    snapshot_checkpoint: (u64, u128),
+}
+
+/// Rebuild metadata consensus from what recovery read off this replica's own disk.
+///
+/// Takes the recovery result, topology and config whole rather than the dozen-plus
+/// scalars it needs from them: most were `u64` tick counts, where a misordered
+/// argument type-checks and mistunes a timeout silently.
 fn restore_metadata_consensus(
-    journal: &PrepareJournal,
-    restored_op: u64,
-    commit_watermark: u64,
-    cluster_id: u128,
-    self_replica_id: u8,
-    replica_count: u8,
+    owner: &RecoveredOwnerState,
+    topology: &TcpTopology,
+    config: &ServerNgConfig,
     bus: Rc<IggyMessageBus>,
-    prepare_queue_depth: usize,
-    normal_heartbeat_ticks: u64,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
+    let journal = &owner.journal;
+    let replica_count = topology.replica_count;
+    let recovered_state = owner.recovered_state;
+    let snapshot_floor = owner
+        .snapshot
+        .as_ref()
+        .map_or(0, IggySnapshot::sequence_number);
+    let commit_watermark = owner.last_applied_op.unwrap_or(snapshot_floor);
+    let restored_op = owner.last_journaled_op.unwrap_or(snapshot_floor);
+    let recovery_deadline = recovery_barrier_deadline(
+        config.cluster.heartbeat_timeout.get_duration(),
+        config.cluster.view_change_status_timeout.get_duration(),
+    );
+    let prepare_queue_depth = config.metadata.prepare_queue_depth;
+
     let mut consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
+        topology.cluster_id,
+        topology.self_replica_id,
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
@@ -1722,30 +1982,64 @@ fn restore_metadata_consensus(
         // in-flight prepares and drain as prepares commit.
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
-    consensus.set_normal_heartbeat_ticks(normal_heartbeat_ticks);
+    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
+    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
+    // Fresh random incarnation each boot, so a StartView addressed to a previous
+    // incarnation still in flight is ignored (`handle_start_view` guard). `| 1`
+    // guarantees the non-zero the guard treats as set. The deterministic simulator
+    // overrides this with a seed-derived value bumped per restart.
+    consensus.set_incarnation(rand::random::<u128>() | 1);
 
     let last_header = journal
         .last_op()
         .and_then(|op| usize::try_from(op).ok())
         .and_then(|op| journal.header(op).map(|header| *header));
-    if let Some(header) = last_header {
+    // View and log_view come from the durable superblock when present. A present but
+    // unreadable superblock already refused boot in `recover()`, so reaching the
+    // `else` means it is genuinely absent: a fresh node, or one that took writes but
+    // never checkpointed or changed view. There, inferring the view from the last WAL
+    // prepare is safe, since the persist-before-send gate guarantees this replica
+    // never externalized a view beyond what a re-probe re-derives, and it re-probes
+    // as a backup below. log_view cannot be inferred and stays 0 until the next
+    // superblock write.
+    if let Some(state) = recovered_state {
+        consensus.set_view(state.view);
+        consensus.set_log_view(state.log_view);
+        consensus.mark_superblock_durable(state.view, state.log_view);
+    } else if let Some(header) = last_header {
         consensus.set_view(header.view);
     }
 
-    // On a RESTART in a cluster (a non-empty WAL proves a prior life),
-    // rejoin as a quorum-invisible backup and probe for the current view
-    // (`RequestStartView`): the view's primary answers with a `StartView`,
-    // the replica adopts it as a backup, and journal repair fills any WAL
-    // gap. A probing replica never resumes primaryship -- if this replica
-    // IS the current primary-by-index, its probe makes the backups elect
-    // past it.
+    // On a RESTART in a cluster, rejoin as a quorum-invisible backup and
+    // probe for the current view (`RequestStartView`): the view's primary
+    // answers with a `StartView`, the replica adopts it as a backup, and
+    // journal repair fills any WAL gap. A probing replica never resumes
+    // primaryship -- if this replica IS the current primary-by-index, its
+    // probe makes the backups elect past it.
     // The probe re-broadcasts on its timeout, so it needs no live mesh at
-    // boot. A FRESH boot (empty WAL) keeps the plain init: the cluster
-    // needs its view-0 primary to exist, and a single-replica cluster has
-    // no peer to ask.
-    if replica_count > 1 && restored_op > 0 {
+    // boot. A FRESH boot keeps the plain init: the cluster needs its view-0
+    // primary to exist, and a single-replica cluster has no peer to ask.
+    //
+    // Prior life is EITHER a non-empty WAL or a recovered superblock. A view
+    // change persists without touching the WAL, so a replica that changed
+    // view before its first metadata write comes back with a non-zero view
+    // and an empty journal; gating on the WAL alone would `init()` it into
+    // `Status::Normal` as primary for a view the cluster may have moved past,
+    // with `ceded_primaryship` false and no probe to correct it.
+    if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
         consensus.init_as_backup();
         consensus.begin_view_probe();
+        // Restart in a cluster: replace snapshot-shaped metadata state
+        // (snapshot + client table) from the live primary the probe finds,
+        // then journal-repair the tail. If the probe exhausts instead --
+        // full-cluster bootstrap, nobody live to fetch from -- the election
+        // fallback clears the stage and this local recovery stands.
+        consensus.begin_state_transfer_await();
     } else {
         consensus.init();
     }
@@ -1787,10 +2081,11 @@ fn restore_metadata_consensus(
     // primary; via StartView adoption + the local commit walk on a rejoined
     // backup), serving reads would show pre-restart state that clients already
     // saw acked -- gate them on the barrier regardless of role. If the suffix
-    // never committed cluster-wide, the barrier times out on the read path and
-    // serving resumes (`await_recovery_barrier`).
+    // never re-commits cluster-wide, the read path fails loud with a retryable
+    // 503 once the paired deadline expires (`await_recovery_barrier`).
     if commit_watermark < restored_op {
         consensus.set_recovery_barrier(restored_op);
+        consensus.set_recovery_deadline(recovery_deadline);
     }
 
     // Re-pipeline the prepared-but-uncommitted suffix so the primary's
@@ -1816,7 +2111,7 @@ fn restore_metadata_consensus(
                 break;
             };
             let mut entry = PipelineEntry::new(*header);
-            entry.add_ack(self_replica_id);
+            entry.add_ack(topology.self_replica_id);
             pipeline.push(entry);
         }
     }
@@ -1838,15 +2133,24 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
         bus,
-        LocalPipeline::new(),
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
+    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
     // A recovered partition lost its consensus state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
     // this replica cannot know the group's (op, commit). In a cluster it
@@ -1886,6 +2190,13 @@ async fn load_partition(
             })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    // Recovered partitions honor the same config-surfaced ring ceilings as the
+    // fresh-create path (build_partition_fresh). Retention is already off for
+    // single-replica groups, so this only sizes the multi-replica ring.
+    partition.log.journal().inner.set_ring_caps(
+        config.partition.evicted_ring_capacity,
+        config.partition.evicted_ring_bytes_max.as_bytes_u64(),
+    );
     partition.set_partition_dir(config.system.get_partition_path(
         stream_id,
         topic_id,
@@ -2026,6 +2337,8 @@ fn resolve_tcp_topology(
     )?;
     let default_quic_addr =
         resolve_optional_listener_addr(config.quic.enabled, "quic.address", &config.quic.address)?;
+    let default_http_addr =
+        resolve_optional_listener_addr(config.http.enabled, "http.address", &config.http.address)?;
     if !config.cluster.enabled {
         if let Some(replica_id) = current_replica_id
             && replica_id != SHARD_REPLICA_ID
@@ -2048,6 +2361,7 @@ fn resolve_tcp_topology(
             replica_listen_addr: Some(SocketAddr::new(default_client_addr.ip(), 0)),
             ws_listen_addr: default_ws_addr,
             quic_listen_addr: default_quic_addr,
+            http_listen_addr: default_http_addr,
             tcp_tls_listen_addr: config.tcp.tls.enabled.then_some(default_client_addr),
             peers: Vec::new(),
         });
@@ -2068,19 +2382,25 @@ fn resolve_tcp_topology(
             count: config.cluster.nodes.len(),
         }
     })?;
-    let (client_listen_addr, ws_listen_addr, quic_listen_addr) = resolve_cluster_client_addrs(
+    let ClusterClientAddrs {
+        client: client_listen_addr,
+        ws: ws_listen_addr,
+        quic: quic_listen_addr,
+        http: http_listen_addr,
+    } = resolve_cluster_client_addrs(
         self_node,
         default_client_addr,
         default_ws_addr,
         default_quic_addr,
+        default_http_addr,
     )?;
-    let replica_port =
-        self_node
-            .ports
-            .tcp_replica
-            .ok_or(ServerNgError::ClusterReplicaPortMissing {
-                replica_id: self_node.replica_id,
-            })?;
+    let replica_port = self_node
+        .ports
+        .tcp_replica
+        .ok_or(ServerNgError::ClusterPortMissing {
+            transport: "tcp_replica",
+            replica_id: self_node.replica_id,
+        })?;
     let replica_listen_addr = Some(socket_addr_from_parts(
         "cluster.nodes[*].ports.tcp_replica",
         &self_node.ip,
@@ -2096,6 +2416,7 @@ fn resolve_tcp_topology(
         replica_listen_addr,
         ws_listen_addr,
         quic_listen_addr,
+        http_listen_addr,
         tcp_tls_listen_addr: config.tcp.tls.enabled.then_some(client_listen_addr),
         peers,
     })
@@ -2112,44 +2433,107 @@ fn resolve_optional_listener_addr(
     Ok(None)
 }
 
+/// Client-facing listener addresses resolved for this cluster node. Each port
+/// comes from the node's roster entry; there is no fallback to the top-level
+/// listener port, an enabled transport without a roster port refuses to boot.
+/// Every transport keeps the bind interface from its own `address` config: the
+/// roster ip is advertised, not bound.
+struct ClusterClientAddrs {
+    client: SocketAddr,
+    ws: Option<SocketAddr>,
+    quic: Option<SocketAddr>,
+    http: Option<SocketAddr>,
+}
+
 fn resolve_cluster_client_addrs(
     self_node: &configs::ng_cluster::ClusterNodeConfig,
-    default_client_addr: SocketAddr,
+    default_tcp_addr: SocketAddr,
     default_ws_addr: Option<SocketAddr>,
     default_quic_addr: Option<SocketAddr>,
-) -> Result<(SocketAddr, Option<SocketAddr>, Option<SocketAddr>), ServerNgError> {
+    default_http_addr: Option<SocketAddr>,
+) -> Result<ClusterClientAddrs, ServerNgError> {
     let client_port = self_node
         .ports
         .tcp
-        .unwrap_or_else(|| default_client_addr.port());
-    let client_listen_addr =
-        socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
-    let ws_listen_addr = resolve_cluster_optional_addr(
-        self_node,
-        "cluster.nodes[*].ports.websocket",
-        default_ws_addr,
-        |ports| ports.websocket,
-    )?;
-    let quic_listen_addr = resolve_cluster_optional_addr(
-        self_node,
-        "cluster.nodes[*].ports.quic",
-        default_quic_addr,
-        |ports| ports.quic,
-    )?;
-    Ok((client_listen_addr, ws_listen_addr, quic_listen_addr))
+        .ok_or(ServerNgError::ClusterPortMissing {
+            transport: "tcp",
+            replica_id: self_node.replica_id,
+        })?;
+    let client =
+        merge_roster_port_with_bind_ip("tcp", &self_node.ip, default_tcp_addr, client_port);
+    let ws = resolve_cluster_optional_addr(self_node, "websocket", default_ws_addr, |ports| {
+        ports.websocket
+    })?;
+    let quic =
+        resolve_cluster_optional_addr(self_node, "quic", default_quic_addr, |ports| ports.quic)?;
+    let http =
+        resolve_cluster_optional_addr(self_node, "http", default_http_addr, |ports| ports.http)?;
+    Ok(ClusterClientAddrs {
+        client,
+        ws,
+        quic,
+        http,
+    })
 }
 
 fn resolve_cluster_optional_addr(
     self_node: &configs::ng_cluster::ClusterNodeConfig,
-    context: &'static str,
+    transport: &'static str,
     default_addr: Option<SocketAddr>,
     port_selector: impl Fn(&configs::ng_cluster::TransportPorts) -> Option<u16>,
 ) -> Result<Option<SocketAddr>, ServerNgError> {
     let Some(default_addr) = default_addr else {
         return Ok(None);
     };
-    let port = port_selector(&self_node.ports).unwrap_or_else(|| default_addr.port());
-    socket_addr_from_parts(context, &self_node.ip, port).map(Some)
+    // No fallback to the top-level port: two same-host nodes leaving the same
+    // transport port unset would race for one socket. Either the roster is
+    // explicit or the server refuses to boot.
+    let port = port_selector(&self_node.ports).ok_or(ServerNgError::ClusterPortMissing {
+        transport,
+        replica_id: self_node.replica_id,
+    })?;
+    Ok(Some(merge_roster_port_with_bind_ip(
+        transport,
+        &self_node.ip,
+        default_addr,
+        port,
+    )))
+}
+
+/// Combine the roster-supplied `port` with the bind interface the transport's
+/// own `address` config asked for.
+///
+/// The roster ip is what the cluster advertises (metadata, follower-to-primary
+/// HTTP forwarding targets); the transport's own `address` decides the bind
+/// interface. Merging keeps a loopback-only `127.0.0.1` private and a
+/// `0.0.0.0` wide in cluster mode instead of silently rebinding to the roster
+/// interface, which would strand every co-located dialer (sidecars, health
+/// probes, on-host consumers) on `ECONNREFUSED`.
+fn merge_roster_port_with_bind_ip(
+    transport: &'static str,
+    roster_ip: &str,
+    bind_addr: SocketAddr,
+    port: u16,
+) -> SocketAddr {
+    let listen_addr = SocketAddr::new(bind_addr.ip(), port);
+    if roster_ip_unreachable_from_bind_addr(roster_ip, listen_addr) {
+        warn!(
+            "{transport} listener binds {listen_addr} but the roster advertises {roster_ip}:{port}; \
+             peers and clients dialing the advertised endpoint may not reach this node"
+        );
+    }
+    listen_addr
+}
+
+/// Whether a dialer aiming at the advertised roster ip misses `listen_addr`. An
+/// unspecified bind covers every interface, and a roster ip that parses as
+/// neither IPv4 nor IPv6 (a DNS name, say) can resolve to the bound interface,
+/// so both cases stay quiet.
+fn roster_ip_unreachable_from_bind_addr(roster_ip: &str, listen_addr: SocketAddr) -> bool {
+    !listen_addr.ip().is_unspecified()
+        && roster_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|parsed| parsed != listen_addr.ip())
 }
 
 fn resolve_cluster_replica_peers(
@@ -2161,12 +2545,13 @@ fn resolve_cluster_replica_peers(
         if node.replica_id == self_replica_id {
             continue;
         }
-        let replica_port =
-            node.ports
-                .tcp_replica
-                .ok_or(ServerNgError::ClusterReplicaPortMissing {
-                    replica_id: node.replica_id,
-                })?;
+        let replica_port = node
+            .ports
+            .tcp_replica
+            .ok_or(ServerNgError::ClusterPortMissing {
+                transport: "tcp_replica",
+                replica_id: node.replica_id,
+            })?;
         peers.push((
             node.replica_id,
             socket_addr_from_parts("cluster.nodes[*].ports.tcp_replica", &node.ip, replica_port)?,
@@ -2208,8 +2593,7 @@ async fn start_tcp_runtime(
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds independently. Shard-0 gating comes from the sole
     // caller of this function.
-    if config.http.enabled {
-        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+    if let Some(http_addr) = topology.http_listen_addr {
         let self_ports = configs::ng_cluster::TransportPorts {
             tcp: config
                 .tcp
@@ -2223,6 +2607,7 @@ async fn start_tcp_runtime(
             shard,
             http_addr,
             &config.http,
+            config.metadata.clients_table_max,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
@@ -2756,18 +3141,23 @@ async fn start_client_listeners(
 
 /// Build the replica auth context from cluster config. Returns `None` when the
 /// cluster or replica auth is disabled, keeping the handshake in legacy mode.
-/// Only the derived MAC key is carried onward in [`ReplicaAuth`]; the raw secret
-/// (masked in config logs via `config_env(secret)`) is read here only to derive
-/// that key. `ClusterConfig::validate` guarantees a non-empty secret whenever
-/// both `cluster.enabled` and `cluster.auth.enabled` are set (validate
-/// early-returns `Ok` while `cluster.enabled` is false).
+/// Only the derived MAC keys are carried onward in [`ReplicaAuth`]; the raw
+/// secrets (masked in config logs via `config_env(secret)`) are read here only
+/// to derive them. A non-empty `previous_shared_secret` opens the verify-only
+/// rotation acceptance window (see the [`ReplicaAuth`] rustdoc for the rolling
+/// rotation procedure). `ClusterConfig::validate` guarantees a non-empty
+/// secret whenever both `cluster.enabled` and `cluster.auth.enabled` are set
+/// (validate early-returns `Ok` while `cluster.enabled` is false).
 fn load_replica_auth(config: &ServerNgConfig) -> Option<ReplicaAuth> {
     if !config.cluster.enabled || !config.cluster.auth.enabled {
         return None;
     }
-    Some(ReplicaAuth::new(
-        config.cluster.auth.shared_secret.as_bytes(),
-    ))
+    let auth = ReplicaAuth::new(config.cluster.auth.shared_secret.as_bytes());
+    let previous_shared_secret = &config.cluster.auth.previous_shared_secret;
+    if previous_shared_secret.is_empty() {
+        return Some(auth);
+    }
+    Some(auth.with_previous_secret(previous_shared_secret.as_bytes()))
 }
 
 /// Build the replica TLS context from cluster config. Returns `None` when
@@ -2845,17 +3235,15 @@ fn load_replica_tls_ctx(
     };
     client.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
 
-    // Replica ids form a bijection onto 0..nodes.len() (validated at
-    // boot), so sorting by id yields a Vec indexable by replica id.
-    // TODO(hubcio): dynamic replica join will break this positional
-    // indexing (sparse ids silently map to the wrong SNI/verify name);
-    // key peer names by replica id explicitly before supporting it.
-    let mut roster: Vec<_> = config.cluster.nodes.iter().collect();
-    roster.sort_unstable_by_key(|node| node.replica_id);
-    let peer_names = roster
+    // Keyed by replica id, never by roster position: sparse ids (dynamic
+    // replica join) would make a positional lookup verify against another
+    // peer's SNI name.
+    let peer_names = config
+        .cluster
+        .nodes
         .iter()
         .map(|node| {
-            ServerName::try_from(node.ip.clone()).map_err(|error| {
+            let name = ServerName::try_from(node.ip.clone()).map_err(|error| {
                 credential_error(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -2863,9 +3251,10 @@ fn load_replica_tls_ctx(
                         node.name, node.ip
                     ),
                 ))
-            })
+            })?;
+            Ok((node.replica_id, name))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<HashMap<_, _>, ServerNgError>>()?;
 
     Ok(Some(ReplicaTlsCtx {
         server: Arc::new(server),
@@ -3080,6 +3469,264 @@ mod tests {
             config_default, built_in,
             "[cluster] heartbeat_timeout default drifted from \
              TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_holds_the_floor_for_small_heartbeats() {
+        // Below the 5s default the heartbeat-independent recovery term (~7s of
+        // ViewChangeStatus backstop plus ceremony) dominates, so the floor
+        // governs however small the heartbeat is; 3 x 5s lands exactly on it.
+        // A default-sized status backstop stays on the floor, not above it.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(1), Duration::from_secs(5)),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(5), Duration::from_secs(5)),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_scales_past_the_floor_for_large_heartbeats() {
+        // Once 3 x heartbeat clears the floor the scaled window governs, so a
+        // slow-heartbeat cluster is not failed 503 before its longer recovery
+        // can finish. A default-sized status backstop stays under it.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(10), Duration::from_secs(5)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(15), Duration::from_secs(5)),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_scales_with_the_status_backstop() {
+        // A raised view-change status backstop stretches worst-case recovery
+        // even when the heartbeat stays fast, so the deadline must track it or
+        // post-restart reads 503 before a slow election settles.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(1), Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_at_config_defaults_matches_the_floor() {
+        // Folding the status term in must not move the stock deadline: at the
+        // shared 5s defaults each scaled term lands exactly on the 15s floor,
+        // so an un-tuned cluster keeps its pre-existing recovery window.
+        let cluster = configs::ng_cluster::ClusterConfig::default();
+        assert_eq!(
+            recovery_barrier_deadline(
+                cluster.heartbeat_timeout.get_duration(),
+                cluster.view_change_status_timeout.get_duration(),
+            ),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_saturates_instead_of_panicking() {
+        // Neither timeout has a config ceiling, so both multiplies must
+        // saturate rather than abort boot on an absurd parseable value.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::MAX, Duration::from_secs(5)),
+            Duration::MAX
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(5), Duration::MAX),
+            Duration::MAX
+        );
+    }
+
+    #[test]
+    fn default_commit_broadcast_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .commit_broadcast_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::COMMIT_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] commit_broadcast_interval default drifted from \
+             TimeoutManager::COMMIT_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_prepare_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .prepare_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::PREPARE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] prepare_retransmit_interval default drifted from \
+             TimeoutManager::PREPARE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_partition_prepare_queue_depth_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml and flows
+        // through PartitionConfig::default(); keep the embedded value in
+        // lockstep with the pipeline depth LocalPipeline::new() (the simulator
+        // and tests) runs on, so a default deployment is byte-identical.
+        let config_default = configs::ng_partition::PartitionConfig::default().prepare_queue_depth;
+        assert_eq!(
+            config_default,
+            consensus::PIPELINE_PREPARE_QUEUE_MAX,
+            "[partition] prepare_queue_depth default drifted from \
+             consensus::PIPELINE_PREPARE_QUEUE_MAX"
+        );
+    }
+
+    #[test]
+    fn default_view_change_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it). One knob drives both view-change
+        // retransmit timers, which are equal by design, so pin it against both.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .view_change_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let start_view_change =
+            u128::from(consensus::TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS)
+                * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        let do_view_change = u128::from(consensus::TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, start_view_change,
+            "[cluster] view_change_retransmit_interval default drifted from \
+             TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS"
+        );
+        assert_eq!(
+            config_default, do_view_change,
+            "[cluster] view_change_retransmit_interval default drifted from \
+             TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_view_change_status_timeout_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .view_change_status_timeout
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] view_change_status_timeout default drifted from \
+             TimeoutManager::VIEW_CHANGE_STATUS_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_request_start_view_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .request_start_view_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] request_start_view_retransmit_interval default drifted from \
+             TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_view_probe_attempts_max_matches_consensus_constant() {
+        // Belt and suspenders with the static assert above: that pins the
+        // duplicated configs-crate literal, this pins the shipped config.toml
+        // value the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default().view_probe_attempts_max;
+        assert_eq!(
+            config_default,
+            consensus::PROBE_ATTEMPTS_MAX,
+            "[cluster] view_probe_attempts_max default drifted from \
+             consensus::PROBE_ATTEMPTS_MAX"
+        );
+    }
+
+    #[test]
+    fn default_repair_retry_interval_matches_partitions_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .repair_retry_interval
+            .get_duration()
+            .as_millis();
+        let built_in =
+            u128::from(partitions::REPAIR_RETRY_TICKS) * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] repair_retry_interval default drifted from \
+             partitions::REPAIR_RETRY_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_repair_chunk_max_matches_shard_constant() {
+        // Belt and suspenders with the static assert above: that pins the
+        // duplicated configs-crate literal, this pins the shipped config.toml
+        // value the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default().repair_chunk_max;
+        assert_eq!(
+            config_default as u64,
+            shard::REPAIR_CHUNK_MAX,
+            "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn default_evicted_ring_capacity_matches_partitions_constant() {
+        // Belt and suspenders with the static assert above; this pins the
+        // shipped config.toml value.
+        let config_default =
+            configs::ng_partition::PartitionConfig::default().evicted_ring_capacity;
+        assert_eq!(
+            config_default,
+            partitions::EVICTED_RING_CAPACITY,
+            "[partition] evicted_ring_capacity default drifted from \
+             partitions::EVICTED_RING_CAPACITY"
+        );
+    }
+
+    #[test]
+    fn default_evicted_ring_bytes_max_matches_partitions_constant() {
+        // Belt and suspenders with the static assert above; this pins the
+        // shipped config.toml value.
+        let config_default = configs::ng_partition::PartitionConfig::default()
+            .evicted_ring_bytes_max
+            .as_bytes_u64();
+        assert_eq!(
+            config_default,
+            partitions::EVICTED_RING_BYTES_MAX,
+            "[partition] evicted_ring_bytes_max default drifted from \
+             partitions::EVICTED_RING_BYTES_MAX"
         );
     }
 
@@ -3302,5 +3949,219 @@ mod tests {
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 2 }),
             "expected MetadataHandoffAborted, got {err:?}"
         );
+    }
+
+    fn cluster_node(ip: &str, http: Option<u16>) -> configs::ng_cluster::ClusterNodeConfig {
+        cluster_node_with_ports(ip, Some(18070), http)
+    }
+
+    fn cluster_node_with_ports(
+        ip: &str,
+        tcp: Option<u16>,
+        http: Option<u16>,
+    ) -> configs::ng_cluster::ClusterNodeConfig {
+        configs::ng_cluster::ClusterNodeConfig {
+            name: "node".to_owned(),
+            ip: ip.to_owned(),
+            advertised_address: None,
+            replica_id: 0,
+            ports: configs::ng_cluster::TransportPorts {
+                tcp,
+                http,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn addr(value: &str) -> SocketAddr {
+        value.parse().expect("valid socket address literal")
+    }
+
+    #[test]
+    fn cluster_http_addr_takes_port_from_roster() {
+        // A byte-identical top-level [http].address is shared across nodes on
+        // one host; the per-node roster port is the only port source so each
+        // node binds a distinct HTTP socket.
+        let node = cluster_node("127.0.0.1", Some(18090));
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:8090"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        )
+        .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.http, Some(addr("127.0.0.1:18090")));
+    }
+
+    #[test]
+    fn cluster_http_addr_merges_config_ip_with_roster_port() {
+        // Docker/Helm bind `0.0.0.0` and probe loopback; the roster ip is
+        // only the advertised address. Cluster mode must keep the configured
+        // interface and take just the port from the roster.
+        let node = cluster_node("10.0.0.5", Some(18090));
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("0.0.0.0:8090"),
+            None,
+            None,
+            Some(addr("0.0.0.0:3000")),
+        )
+        .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.http, Some(addr("0.0.0.0:18090")));
+    }
+
+    #[test]
+    fn cluster_http_addr_requires_roster_port_for_enabled_transport() {
+        // No fallback to the top-level port: a silent default could collide
+        // with another same-host node, so a missing roster port for an
+        // enabled transport must refuse to boot.
+        let node = cluster_node("10.0.0.5", None);
+        let result = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:8090"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        );
+        assert!(matches!(
+            result,
+            Err(ServerNgError::ClusterPortMissing {
+                transport: "http",
+                replica_id: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn cluster_http_addr_is_none_when_http_disabled() {
+        // http.enabled = false collapses default_http_addr to None; no roster
+        // port can revive a listener the operator turned off.
+        let node = cluster_node("127.0.0.1", Some(18090));
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.http, None);
+    }
+
+    /// Regression: the shutdown-join deadline must arm at SHUTDOWN, not
+    /// at boot. The original bound measured from `join_all` entry, so any
+    /// healthy server outliving `shutdown_join_timeout` (30s default) was
+    /// abandoned as "wedged" and the process exited - every BDD run died
+    /// at t+30s while the test container was still compiling.
+    #[test]
+    fn join_waits_unbounded_while_the_server_runs() {
+        let shutdown_flag = AtomicBool::new(false);
+        // Thread outlives a deliberately tiny join budget; with the flag
+        // clear the budget must never even arm.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(20),
+            &mut deadline,
+        );
+        assert!(
+            matches!(joined, Some(Ok(Ok(())))),
+            "a running server must be awaited indefinitely, not abandoned as wedged"
+        );
+        assert!(
+            deadline.is_none(),
+            "the join deadline must not arm before the shutdown flag flips"
+        );
+    }
+
+    #[test]
+    fn join_abandons_a_wedged_shard_after_the_shutdown_deadline() {
+        let shutdown_flag = AtomicBool::new(true);
+        // Never finishes: stands in for a wedged pump. The thread leaks
+        // into the test process, which exits right after.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(100),
+            &mut deadline,
+        );
+        assert!(
+            joined.is_none(),
+            "a shard still running past the post-shutdown budget must be abandoned"
+        );
+        assert!(deadline.is_some(), "the deadline arms once the flag is set");
+    }
+
+    #[test]
+    fn cluster_tcp_addr_takes_port_from_roster() {
+        // Same rule as the other transports: the roster owns the port so
+        // same-host nodes sharing one [tcp].address still bind distinct
+        // sockets.
+        let node = cluster_node("127.0.0.1", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("127.0.0.1:18070"));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_merges_config_ip_with_roster_port() {
+        // The roster ip is advertised, not bound. Binding it directly would
+        // strand every co-located dialer (sidecars, health probes, on-host
+        // consumers) that reaches this node over loopback.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("0.0.0.0:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("0.0.0.0:18070"));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_requires_roster_port() {
+        // tcp is always enabled in cluster mode, so a roster entry without a
+        // tcp port refuses to boot rather than falling back to [tcp].address.
+        let node = cluster_node_with_ports("10.0.0.5", None, None);
+        let result = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None);
+        assert!(matches!(
+            result,
+            Err(ServerNgError::ClusterPortMissing {
+                transport: "tcp",
+                replica_id: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn cluster_tcp_addr_keeps_loopback_bind_and_warns_on_roster_mismatch() {
+        // A loopback [tcp].address under a routable roster ip is honoured
+        // as configured; remote peers cannot reach it, so the mismatch is
+        // warned about instead of silently rebinding.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.client, addr("127.0.0.1:18070"));
+        assert!(roster_ip_unreachable_from_bind_addr(&node.ip, addrs.client));
+    }
+
+    #[test]
+    fn roster_mismatch_warning_is_silent_for_wildcard_and_hostname_rosters() {
+        // A wildcard bind covers the roster interface, and a DNS roster entry
+        // can resolve to the bound one; neither is a misconfiguration.
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("0.0.0.0:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "node-1.example.com",
+            addr("127.0.0.1:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("10.0.0.5:18070")
+        ));
     }
 }

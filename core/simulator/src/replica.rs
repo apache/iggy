@@ -18,13 +18,14 @@
 use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server_ng::NgSystemConfig;
-use consensus::{ConsensusClock, LocalPipeline, VsrConsensus};
+use consensus::{ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
-use metadata::IggyMetadata;
+use journal::superblock::DynSuperblockStore;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
+use metadata::{IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionsConfig};
 use server_common::crypto;
 use server_common::sharding::{METADATA_CONSENSUS_NAMESPACE, ShardId};
@@ -55,7 +56,9 @@ pub const SHELL_ROOT_PASSWORD: &str = "iggy";
 // shard per replica always resolves to shard 0.
 pub type Replica = shard::IggyShard<
     SharedSimOutbox,
-    SimJournal<MemStorage>, // MJ: metadata journal
+    // MJ: metadata journal, behind an `Rc` so the harness retains it across a
+    // replica restart; the WAL bytes and index survive the drop.
+    Rc<SimJournal<MemStorage>>,
     SimSnapshot,
     SimMuxStateMachine,
     PapayaShardsTable,
@@ -104,7 +107,7 @@ pub const SIM_INBOX_CAPACITY: usize = 8192;
 /// Panics if `senders` is not in canonical order (a bug in the caller's
 /// mesh construction), or if `reader_bundle` disagrees with `shard_idx`
 /// (peer without a bundle, or shard 0 with one).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn new_shard(
     replica_id: u8,
     shard_idx: u16,
@@ -116,6 +119,10 @@ pub fn new_shard(
     clock: ConsensusClock,
     shell: bool,
     reader_bundle: Option<SimMetadataBundle>,
+    superblock: Option<Rc<dyn DynSuperblockStore>>,
+    metadata_journal: Option<Rc<SimJournal<MemStorage>>>,
+    recovered_state: Option<VsrState>,
+    incarnation: u128,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring server-ng bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -128,7 +135,16 @@ pub fn new_shard(
         reader_bundle.is_none(),
         "shard 0 is the metadata writer (no bundle); peers are readers (bundle)"
     );
-    let (mux, metadata_bundle) = reader_bundle.map_or_else(
+    // Head of the retained metadata WAL, shard 0 only and `None` on a peer shard or a
+    // fresh boot. Its committed prefix drives both the STM replay below and the
+    // consensus op/commit restore, so a restart recovers committed metadata from its
+    // own disk instead of an empty state.
+    let solo = replica_count == 1;
+    let restored_op = metadata_journal
+        .as_ref()
+        .and_then(|journal| journal.last_op());
+
+    let mux = reader_bundle.map_or_else(
         // Writer shard (shard 0). Seed the root user at slab id 0, matching
         // production bootstrap (`ensure_root_user`); it is undeletable in-apply,
         // so it stays in slot 0 and the workload's users land at slab id 1+, out
@@ -137,7 +153,9 @@ pub fn new_shard(
         // user (the login gate Argon2-checks the stored hash), so seed a real
         // hash of `SHELL_ROOT_PASSWORD`; otherwise a deterministic placeholder,
         // since login never runs and a random per-run argon2 salt would break
-        // state equality.
+        // state equality. Committed metadata replays into it from the retained WAL
+        // after `IggyMetadata` is built (see below), so the factory bundle is minted
+        // only then.
         || {
             let users: Users = UsersInner::new().into();
             let root_password_hash = if shell {
@@ -147,12 +165,10 @@ pub fn new_shard(
             };
             users.ensure_root_user(SHELL_ROOT_USERNAME, &root_password_hash);
             let streams: Streams = StreamsInner::new().into();
-            let mux = SimMuxStateMachine::new(variadic!(users, streams));
-            let bundle = mux.factory_bundle();
-            (mux, Some(bundle))
+            SimMuxStateMachine::new(variadic!(users, streams))
         },
         // Peer shard: reader-mode mirror over shard 0's shared read handle.
-        |bundle| (SimMuxStateMachine::from_factory_bundle(bundle), None),
+        SimMuxStateMachine::from_factory_bundle,
     );
 
     // The production metadata consensus namespace, not 0: the router
@@ -160,7 +176,7 @@ pub fn new_shard(
     // by comparing against this exact value; anything else hashes to an
     // arbitrary shard with no metadata consensus.
     let metadata_consensus = (shard_idx == 0).then(|| {
-        let consensus = VsrConsensus::with_clock(
+        let mut consensus = VsrConsensus::with_clock(
             CLUSTER_ID,
             replica_id,
             replica_count,
@@ -169,19 +185,97 @@ pub fn new_shard(
             LocalPipeline::new(),
             clock.clone(),
         );
-        consensus.init();
+        // Seed-derived incarnation, bumped per restart by the harness, so a StartView
+        // from a previous incarnation is ignored while replay stays deterministic; an
+        // OS-random nonce would break byte-identical replay.
+        consensus.set_incarnation(incarnation);
+        // View/log_view come from the durable superblock; op, commit, and the
+        // last-prepare markers come from the retained WAL. Independent inputs,
+        // mirroring server-ng's restore_metadata_consensus.
+        let last_header = metadata_journal
+            .as_ref()
+            .and_then(|journal| journal.last_header());
+        if let Some(state) = recovered_state {
+            consensus.set_view(state.view);
+            consensus.set_log_view(state.log_view);
+            consensus.mark_superblock_durable(state.view, state.log_view);
+        } else if let Some(header) = last_header {
+            // No superblock: a fresh node, one that never changed view, or the
+            // first boot after an upgrade. Production infers the view from the
+            // last WAL prepare here, so mirror it -- otherwise the branch every
+            // existing deployment takes has no sim coverage.
+            consensus.set_view(header.view);
+        }
+        // Prior life is EITHER a non-empty WAL or a recovered superblock: a view
+        // change persists without touching the WAL, so an empty journal no longer
+        // proves a fresh boot. A clustered replica with a prior life rejoins as a
+        // quorum-invisible probing backup, since the live primary re-forms its view
+        // and re-commits any uncommitted suffix; a solo replica has no peer to ask,
+        // so it inits and resumes as its own primary. Matches
+        // restore_metadata_consensus exactly. Production's primary-only re-pipeline
+        // of an uncommitted suffix is skipped, since a rejoining replica is always a
+        // backup.
+        let restored_head = restored_op.unwrap_or(0);
+        if !solo && (restored_head > 0 || recovered_state.is_some()) {
+            consensus.init_as_backup();
+            consensus.begin_view_probe();
+        } else {
+            consensus.init();
+        }
+        if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
+            let commit_watermark = journal.recovery_commit_watermark(solo);
+            consensus.sequencer().set_sequence(head);
+            consensus.restore_commit_state(commit_watermark, commit_watermark);
+            if let Some(header) = last_header {
+                consensus.set_last_prepare_checksum(header.checksum);
+                consensus.observe_prepare_timestamp(header.timestamp);
+            }
+            // The suffix past the committed watermark is prepared but not proven
+            // committed, so gate reads until the cluster re-commits it, as production
+            // does. Solo has no such suffix: the head IS the commit point.
+            if commit_watermark < head {
+                consensus.set_recovery_barrier(head);
+            }
+        }
         consensus
     });
-    let metadata_journal = (shard_idx == 0).then(SimJournal::<MemStorage>::default);
     let metadata_snapshot = (shard_idx == 0).then(SimSnapshot::default);
 
     let metadata = IggyMetadata::new(
         metadata_consensus,
         metadata_journal,
         metadata_snapshot,
+        superblock,
         mux,
         None,
     );
+
+    // Reconstruct shard 0's committed metadata from the retained WAL, the sim analog
+    // of production's snapshot + WAL replay. `apply_committed_prepare` is the SAME
+    // apply path the commit walk uses, so it rebuilds BOTH the state machine and the
+    // client table (sessions + at-most-once dedup), which a restart would otherwise
+    // reset. The consensus setup above already restored `commit_min` to the committed
+    // watermark; this only rebuilds derived state, and does nothing on a fresh boot.
+    // The commit notifier is unwired during recovery, hence the no-op hook.
+    if let Some(journal) = metadata.journal.as_ref() {
+        let commit_watermark = journal.recovery_commit_watermark(solo);
+        for op in 1..=commit_watermark {
+            if let Some(entry) = journal.entry_sync(op) {
+                // `true`: the sim performs no state transfer, so no frontier
+                // shields any op from the table half of the apply.
+                apply_committed_prepare(
+                    &metadata.mux_stm,
+                    &metadata.client_table,
+                    true,
+                    |_| {},
+                    entry,
+                );
+            }
+        }
+    }
+    // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
+    // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
+    let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());
 
     let partitions_config = PartitionsConfig {
         messages_required_to_save: 1000,
@@ -200,7 +294,7 @@ pub fn new_shard(
 
     // The deferred handlers upgrade this weak self-reference per frame; it
     // stays `None` until the shard is built and downgraded into it below.
-    let shard_handle: ShellShardHandle<SharedSimOutbox, SimJournal<MemStorage>, SimSnapshot> =
+    let shard_handle: ShellShardHandle<SharedSimOutbox, Rc<SimJournal<MemStorage>>, SimSnapshot> =
         Rc::new(RefCell::new(None));
     let ShellHandlers {
         on_replica_message,

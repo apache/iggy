@@ -127,11 +127,11 @@ where
     decision.err().map(|error| error.as_code())
 }
 
-/// Reply to a denied partition op with the op's frame: empty body + nonzero
-/// `status`. Distinct from `send_empty_partition_reply` (status 0, the
-/// fail-fast "not routable" ack); here the SDK peeks the status and surfaces
-/// the typed authorization error. Same lockstep reasoning: a silent drop would
-/// wedge every later request on the connection.
+/// Reply to a denied or transiently unroutable partition op with the op's
+/// frame: empty body + nonzero `status`. Distinct from
+/// `send_empty_partition_reply` (status 0, the unresolvable-namespace ack);
+/// here the SDK peeks the status and surfaces the typed error. Same lockstep
+/// reasoning: a silent drop would wedge every later request on the connection.
 #[allow(clippy::future_not_send)]
 pub(super) async fn send_partition_deny_reply<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,

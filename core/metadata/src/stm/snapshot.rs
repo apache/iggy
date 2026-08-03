@@ -36,10 +36,23 @@ pub enum SnapshotError {
         stage: PersistStage,
         source: std::io::Error,
     },
-    /// Checksum mismatch on snapshot load.
-    ChecksumMismatch { expected: u32, actual: u32 },
+    /// The snapshot's integrity trailer does not match its payload: a torn or
+    /// bit-rotted checkpoint. Refuse to restore from it rather than feed corrupt state
+    /// into the state machine.
+    ChecksumMismatch { expected: u128, actual: u128 },
     /// Snapshot file is too short to contain a valid checksum.
     Truncated { size: u64 },
+    /// A state-transfer descriptor's frontiers contradict its artifacts: a
+    /// `commit_op` below the snapshot the same offer ships, or a client-table
+    /// frontier above that commit point. Both are impossible from a
+    /// caught-up-primary offer, so the install is refused and the receiver falls
+    /// back to journal repair rather than moving its frontiers off a bad
+    /// manifest.
+    IncoherentManifest {
+        snapshot_seq: u64,
+        commit_op: u64,
+        table_frontier: u64,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -71,13 +84,24 @@ impl fmt::Display for SnapshotError {
             Self::ChecksumMismatch { expected, actual } => {
                 write!(
                     f,
-                    "snapshot checksum mismatch: expected {expected:#010x}, actual {actual:#010x}"
+                    "snapshot checksum mismatch: expected {expected:#034x}, actual {actual:#034x}"
                 )
             }
             Self::Truncated { size } => {
                 write!(
                     f,
                     "snapshot file truncated: {size} bytes (too short for checksum)"
+                )
+            }
+            Self::IncoherentManifest {
+                snapshot_seq,
+                commit_op,
+                table_frontier,
+            } => {
+                write!(
+                    f,
+                    "incoherent state transfer manifest: snapshot at op {snapshot_seq}, \
+                     commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
         }
@@ -90,7 +114,9 @@ impl std::error::Error for SnapshotError {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
-            Self::ChecksumMismatch { .. } | Self::Truncated { .. } => None,
+            Self::ChecksumMismatch { .. }
+            | Self::Truncated { .. }
+            | Self::IncoherentManifest { .. } => None,
         }
     }
 }
@@ -103,6 +129,15 @@ impl From<std::io::Error> for SnapshotError {
 
 /// The snapshot container for all metadata state machines.
 /// Each field corresponds to one state machine's serialized state.
+///
+/// Serialized-form invariant: every collection here and in the nested `*Snapshot`
+/// types must keep a deterministic order (`Vec` or `BTreeMap`, never an unordered
+/// `HashMap`/`HashSet`/`AHashMap`). The checkpoint pairing hashes bytes on both sides
+/// (`impls::metadata::checkpoint_checksum`), so it no longer depends on this, but
+/// cross-replica state comparison and any future content-addressed transfer do: two
+/// replicas with identical state must serialize identically. Regression guards:
+/// `stream::tests::populated_streams_snapshot_reencode_is_byte_stable` and
+/// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
     /// Snapshot format version for forward/backward compatibility.
@@ -117,6 +152,12 @@ pub struct MetadataSnapshot {
     /// Streams state machine snapshot data (consumer groups are nested inside
     /// each topic).
     pub streams: Option<StreamsSnapshot>,
+    /// Client-table state (sessions + at-most-once dedup replies) at the checkpoint
+    /// op. Not a state machine, but folded in so a restart that drained the WAL
+    /// prefix still recovers pre-checkpoint sessions. `#[serde(default)]` so a
+    /// snapshot predating this field decodes as `None`.
+    #[serde(default)]
+    pub client_table: Option<consensus::ClientTableSnapshot>,
 }
 
 impl Default for MetadataSnapshot {
@@ -140,6 +181,7 @@ impl MetadataSnapshot {
             sequence_number,
             users: None,
             streams: None,
+            client_table: None,
         }
     }
 
@@ -243,6 +285,41 @@ pub trait RestoreSnapshot<S>: Sized {
     fn restore_snapshot(snapshot: &S) -> Result<Self, SnapshotError>;
 }
 
+/// Restore a LIVE state machine from a snapshot without reconstructing it.
+///
+/// [`RestoreSnapshot`] builds a fresh instance -- boot-time only, because a
+/// running system shares read handles (left-right factories) across shards
+/// that a swap would orphan. This variant replaces the state THROUGH the
+/// existing write handle (an absorbed `RestoreSnapshot` command), so every
+/// reader observes the restored state on its next read. State transfer
+/// installs with this.
+#[allow(clippy::missing_errors_doc)]
+pub trait RestoreSnapshotInPlace<S> {
+    /// Replace this state machine's contents from the snapshot.
+    fn restore_snapshot_in_place(&self, snapshot: &S) -> Result<(), SnapshotError>;
+
+    /// Whether this state machine can restore from `snapshot`, WITHOUT
+    /// mutating anything.
+    ///
+    /// A mux restores its halves one at a time, so a snapshot missing the
+    /// second half would otherwise leave the first restored and the second on
+    /// pre-transfer state -- a split the caller cannot undo, because the
+    /// transferred snapshot was already persisted and its pairing seeded.
+    /// Every half agrees here before any half mutates.
+    fn check_restorable(&self, snapshot: &S) -> Result<(), SnapshotError>;
+}
+
+/// Base case for the recursive tuple pattern - unit type terminates the recursion.
+impl<S> RestoreSnapshotInPlace<S> for () {
+    fn restore_snapshot_in_place(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    fn check_restorable(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+}
+
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
 impl<S> FillSnapshot<S> for () {
     fn fill_snapshot(&self, _snapshot: &mut S) -> Result<(), SnapshotError> {
@@ -298,6 +375,49 @@ macro_rules! impl_fill_restore {
                 Self::from_snapshot(snap)
             }
         }
+
+        impl $crate::stm::snapshot::RestoreSnapshotInPlace<$crate::stm::snapshot::MetadataSnapshot>
+            for $wrapper
+        {
+            fn restore_snapshot_in_place(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                paste::paste! {
+                    let snap = snapshot.$field.clone().ok_or_else(|| {
+                        SnapshotError::Deserialize(rmp_serde::decode::Error::custom(
+                            format_args!("Snapshot Restore Error: {}", stringify!($field)),
+                        ))
+                    })?;
+                    self.inner
+                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap))
+                        .map_err(|err| {
+                            SnapshotError::Io(std::io::Error::other(format!(
+                                "in-place restore on a reader-only state machine: {err}"
+                            )))
+                        })
+                }
+            }
+
+            fn check_restorable(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                if snapshot.$field.is_none() {
+                    return Err(SnapshotError::Deserialize(
+                        rmp_serde::decode::Error::custom(format_args!(
+                            "Snapshot Restore Error: {}",
+                            stringify!($field)
+                        )),
+                    ));
+                }
+                Ok(())
+            }
+        }
     };
 }
 
@@ -317,6 +437,7 @@ mod tests {
         assert_eq!(decoded.sequence_number, 42);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
+        assert!(decoded.client_table.is_none());
     }
 
     #[test]
@@ -361,7 +482,10 @@ mod tests {
                                 purge_generation: 0,
                             }],
                             consumer_groups: Vec::new(),
-                            next_consumer_group_id: 1,
+                            // Nonzero and distinct from every id above so the
+                            // roundtrip assert below proves the field survives
+                            // instead of matching a default.
+                            next_consumer_group_id: 5,
                         },
                     )],
                 },
@@ -388,6 +512,9 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
+        // the field were dropped from the wire format, so pin its survival.
+        assert_eq!(topic.next_consumer_group_id, 5);
     }
 
     #[test]

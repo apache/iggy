@@ -204,9 +204,8 @@ impl IggyClient {
     /// Login and logout codes are rejected with `InvalidCommand`. Use the
     /// `login_user` / `logout_user` methods so SDK session state stays correct.
     ///
-    /// Custom codes only work on the classic protocol. Under `vsr` the encoder
-    /// is closed-world: an unknown code yields `InvalidCommand`, a replicated
-    /// code with no mapping yields `UnknownReplicatedCommand`.
+    /// Custom codes are forwarded to the server, which is the authority on
+    /// whether it implements them.
     pub async fn send_binary_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
         if SESSION_CONTROL_CODES.contains(&code) {
             return Err(IggyError::InvalidCommand);

@@ -176,8 +176,13 @@ pub(in crate::http) async fn login_user(
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
     // recovered WAL suffix (which may carry the user's create/password ops)
-    // re-commits, like every other local read.
-    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
+    // re-commits, like every other local read. On barrier expiry, fail with a
+    // retryable 503 rather than validating against rolled-back credentials:
+    // this route's error currency is `IggyError -> CustomError`, and
+    // `TransientNotCommitted` is the variant `CustomError` renders 503.
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
+        .await
+        .map_err(|_| IggyError::TransientNotCommitted)?;
     let user_id = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -191,7 +196,11 @@ pub(in crate::http) async fn login_with_personal_access_token(
     State(state): State<HttpState>,
     Json(command): Json<LoginWithPersonalAccessToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
+    // Same recovery-barrier wait and retryable-503-on-expiry mapping as
+    // `login_user`.
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
+        .await
+        .map_err(|_| IggyError::TransientNotCommitted)?;
     let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id)
@@ -1411,8 +1420,8 @@ pub(in crate::http) async fn delete_user(
 /// replicated), and verifies `current_password` against the target's stored
 /// hash. A wrong current password is not denied pre-consensus: the op still
 /// commits, carrying an empty new-password hash the replicated apply turns into
-/// an `InvalidCredentials` no-op (surfaced here as 400), so the caller's request
-/// sequence stays contiguous.
+/// an `InvalidCredentials` no-op (surfaced here as 400), so the failure is
+/// recorded against the caller's request id like any other committed outcome.
 pub(in crate::http) async fn change_password(
     State(state): State<HttpState>,
     identity: Authenticated,

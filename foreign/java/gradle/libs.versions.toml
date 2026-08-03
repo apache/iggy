@@ -53,7 +53,7 @@ picocli = "4.7.7"
 
 # Build plugins
 spotless = "8.8.0"
-shadow = "9.5.1"
+shadow = "9.6.0"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"
 
