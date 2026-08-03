@@ -1540,15 +1540,13 @@ where
     /// Re-drive the re-dispatch for namespaces whose frames the inbox refused.
     ///
     /// Runs on the pump, wherever [`Self::apply_reconcile_ops`] does, so it
-    /// fires right after a frame was consumed and a slot freed. Namespaces are
-    /// drained out of the set before the retry and put back only by another
-    /// refusal, so the set empties itself.
+    /// fires right after a frame was consumed and a slot freed. Only another
+    /// refusal puts a namespace back, so the set empties itself.
     ///
-    /// The epoch comes from the routing row rather than being carried here:
-    /// `InsertOwned` writes both the partition and its row in one step, so a
-    /// materialised namespace always has one. A missing row means teardown
-    /// removed it, and the matching `ConfirmRemove` / `RemoveRouted` answers
-    /// the frames.
+    /// The epoch comes from the routing row: `InsertOwned` writes it alongside
+    /// the partition, so a materialised namespace always has one. Skipped when
+    /// the row is gone or the namespace is fenced -- teardown did both, and the
+    /// reconciler sweep answers the frames.
     fn retry_reparked_frames(&self) {
         let pending: Vec<IggyNamespace> = {
             let mut reparked = self.reparked_partition_namespaces.borrow_mut();
@@ -1557,7 +1555,11 @@ where
             }
             std::mem::take(&mut *reparked).into_iter().collect()
         };
+        let partitions = self.plane.partitions();
         for namespace in pending {
+            if partitions.is_tombstoned(&namespace) {
+                continue;
+            }
             let Some(epoch) = self.shards_table.epoch_for(namespace) else {
                 continue;
             };

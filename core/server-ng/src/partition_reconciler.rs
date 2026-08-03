@@ -659,6 +659,17 @@ fn reconcile_parked_frames(
         if staged_this_pass.contains(&ns) {
             continue;
         }
+        // Tombstoned but still in the map, so `contains` is true: the fence
+        // forbids serving these frames and only `ConfirmRemove` would otherwise
+        // reach them, which a wedged disk delete postpones indefinitely (it
+        // retries under `FailureCause::Delete` backoff, clamped at 60s, past the
+        // client's read timeout). Nothing will ever serve them, so reclaim now
+        // rather than aging towards the same outcome.
+        if partitions.is_tombstoned(&ns) {
+            ctx.shard.reclaim_parked_partition_frames(ns);
+            counters.parked_reclaimed += 1;
+            continue;
+        }
         if partitions.contains(&ns) {
             // Materialised, yet frames remain: the re-dispatch found the inbox
             // full and re-parked them. The pump retries on every iteration, so
@@ -3181,6 +3192,47 @@ mod tests {
             drain_inbox(&inbox).0,
             1,
             "the frame must reach the pump as a consensus frame, not be answered away"
+        );
+    }
+
+    /// A namespace mid-teardown is still in `IggyPartitions`, so it reads as
+    /// materialised while the fence forbids serving anything. `ConfirmRemove`
+    /// would answer its frames, but a disk delete that keeps failing never
+    /// enqueues one, so the sweep must reclaim them itself.
+    #[compio::test]
+    async fn parked_frames_of_a_tombstoned_namespace_are_reclaimed_without_confirm_remove() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-tombstone-park");
+        seed_topic(&mux, 2, 0, "topic-tombstone-park", vec![assignment(0, 1)]);
+
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 1);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        park_one_request(&shard, ns).await;
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            1,
+            "the full inbox must have re-parked the frame"
+        );
+
+        // Teardown's synchronous fence, without the `ConfirmRemove` a wedged
+        // disk delete never reaches.
+        shard.plane.partitions().tombstone(ns);
+        shard.shards_table().remove(&ns);
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            0,
+            "frames behind a tombstone must not wait on a ConfirmRemove that may never come"
+        );
+        assert!(
+            shard.plane.partitions().is_tombstoned(&ns),
+            "and the fence must still be standing, so this was the sweep's doing"
         );
     }
 
