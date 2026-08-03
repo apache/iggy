@@ -1254,20 +1254,24 @@ impl Client {
     pub fn update_user(
         &self,
         user_id: ffi::Identifier,
+        has_username: bool,
         username: String,
+        has_status: bool,
         status: u8,
     ) -> Result<(), String> {
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
-        let rust_status = RustUserStatus::from_code(status)
+        let rust_status = has_status
+            .then(|| RustUserStatus::from_code(status))
+            .transpose()
             .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner
                 .update_user(
                     &rust_user_id,
-                    Some(&username),
-                    Some(rust_status),
+                    has_username.then_some(username.as_str()),
+                    rust_status,
                     &UserUpdateOptions::default(),
                 )
                 .await

@@ -613,7 +613,9 @@ mod ffi {
         fn update_user(
             self: &Client,
             user_id: Identifier,
+            has_username: bool,
             username: String,
+            has_status: bool,
             status: u8,
         ) -> Result<()>;
         fn update_permissions(

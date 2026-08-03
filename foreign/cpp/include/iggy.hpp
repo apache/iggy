@@ -447,425 +447,427 @@ class TopicOption final {
 
   private:
     TopicOption() = delete;
-    /**
-     * @brief Exception thrown when an Iggy client operation fails.
-     */
-    class IggyException : public std::runtime_error {
-      public:
-        explicit IggyException(const char *message) : std::runtime_error(message) {}
-        explicit IggyException(const std::string &message) : std::runtime_error(message) {}
-    };
+};
+
+/**
+ * @brief Exception thrown when an Iggy client operation fails.
+ */
+class IggyException : public std::runtime_error {
+  public:
+    explicit IggyException(const char *message) : std::runtime_error(message) {}
+    explicit IggyException(const std::string &message) : std::runtime_error(message) {}
+};
+
+/**
+ * @brief Owning client connection to an Apache Iggy server.
+ *
+ * Create instances with Builder or FromConnectionString(). The client owns the
+ * underlying Rust-backed connection and releases it when destroyed.
+ *
+ * Builder initializes a TCP client. To use QUIC, HTTP, or WebSocket, create the
+ * client with FromConnectionString().
+ *
+ * @code{.cpp}
+ * auto client = iggy::IggyBlockingClient::Builder()
+ *                   .WithServerAddress("127.0.0.1:8090")
+ *                   .Build();
+ * client.Connect();
+ * client.Login("iggy", "iggy");
+ * @endcode
+ */
+class IggyBlockingClient final {
+  public:
+    class Builder;
+
+    /** @brief IggyBlockingClient is move-only. */
+    IggyBlockingClient(const IggyBlockingClient &)            = delete;
+    IggyBlockingClient &operator=(const IggyBlockingClient &) = delete;
 
     /**
-     * @brief Owning client connection to an Apache Iggy server.
+     * @brief Transfers ownership of a client.
+     * @param other Client whose connection ownership is transferred.
      *
-     * Create instances with Builder or FromConnectionString(). The client owns the
-     * underlying Rust-backed connection and releases it when destroyed.
-     *
-     * Builder initializes a TCP client. To use QUIC, HTTP, or WebSocket, create the
-     * client with FromConnectionString().
-     *
-     * @code{.cpp}
-     * auto client = iggy::IggyBlockingClient::Builder()
-     *                   .WithServerAddress("127.0.0.1:8090")
-     *                   .Build();
-     * client.Connect();
-     * client.Login("iggy", "iggy");
-     * @endcode
+     * The moved-from client may be destroyed or assigned a new value, but must
+     * not be used for client operations.
      */
-    class IggyBlockingClient final {
-      public:
-        class Builder;
-
-        /** @brief IggyBlockingClient is move-only. */
-        IggyBlockingClient(const IggyBlockingClient &)            = delete;
-        IggyBlockingClient &operator=(const IggyBlockingClient &) = delete;
-
-        /**
-         * @brief Transfers ownership of a client.
-         * @param other Client whose connection ownership is transferred.
-         *
-         * The moved-from client may be destroyed or assigned a new value, but must
-         * not be used for client operations.
-         */
-        IggyBlockingClient(IggyBlockingClient &&other) noexcept;
-
-        /**
-         * @brief Replaces this client by taking ownership from another client.
-         * @param other Client whose connection ownership is transferred.
-         * @return Reference to this client.
-         *
-         * Any client currently owned by this object is released first. The
-         * moved-from client must not be used for client operations.
-         */
-        IggyBlockingClient &operator=(IggyBlockingClient &&other) noexcept;
-
-        /**
-         * @brief Releases the underlying Rust client.
-         *
-         * Cleanup errors cannot be reported from the destructor. Call Shutdown()
-         * explicitly when graceful transport shutdown must be observed.
-         */
-        ~IggyBlockingClient();
-
-        /**
-         * @brief Creates a client from an Iggy connection string.
-         *
-         * Connection strings use one of these forms:
-         *
-         * - `iggy://<credentials>@<host>:<port>[?<options>]` for TCP.
-         * - `iggy+tcp://<credentials>@<host>:<port>[?<options>]` for TCP.
-         * - `iggy+quic://<credentials>@<host>:<port>[?<options>]` for QUIC.
-         * - `iggy+http://<credentials>@<host>:<port>[?<options>]` for HTTP.
-         * - `iggy+ws://<credentials>@<host>:<port>[?<options>]` for WebSocket.
-         *
-         * Credentials are either `<username>:<password>` or a personal access
-         * token. Multiple query parameters are separated with `&`.
-         *
-         * Connection string examples:
-         *
-         * - Username and password:
-         *   `iggy+tcp://iggy:iggy@127.0.0.1:8090`
-         * - Personal access token:
-         *   `iggy+tcp://iggypat-1234567890abcdef@127.0.0.1:8090`
-         * - TCP with TLS:
-         *   `iggy+tcp://iggy:iggy@localhost:8090?tls=true&tls_domain=localhost`
-         *
-         * TCP accepts these query parameters:
-         *
-         * - `tls=<bool>`
-         * - `tls_domain=<string>`
-         * - `tls_ca_file=<path>`
-         * - `reconnection_retries=<uint32|unlimited>`
-         * - `reconnection_interval=<duration>`
-         * - `reestablish_after=<duration>`
-         * - `heartbeat_interval=<duration>`
-         * - `nodelay=<bool>`
-         *
-         * QUIC accepts these query parameters:
-         *
-         * - `response_buffer_size=<uint64>`
-         * - `max_concurrent_bidi_streams=<uint64>`
-         * - `datagram_send_buffer_size=<uint64>`
-         * - `initial_mtu=<uint16>`
-         * - `send_window=<uint64>`
-         * - `receive_window=<uint64>`
-         * - `keep_alive_interval=<uint64>`
-         * - `max_idle_timeout=<uint64>`
-         * - `validate_certificate=<bool>`
-         * - `heartbeat_interval=<duration>`
-         * - `reconnection_max_retries=<uint32|unlimited>`
-         * - `reconnection_interval=<duration>`
-         * - `reconnection_reestablish_after=<duration>`
-         *
-         * HTTP accepts these query parameters:
-         *
-         * - `heartbeat_interval=<duration>`
-         * - `retries=<uint32>`
-         *
-         * WebSocket accepts these query parameters:
-         *
-         * - `heartbeat_interval=<duration>`
-         * - `reconnection_retries=<uint32|unlimited>`
-         * - `reconnection_interval=<duration>`
-         * - `reestablish_after=<duration>`
-         * - `read_buffer_size=<unsigned integer>`
-         * - `write_buffer_size=<unsigned integer>`
-         * - `max_write_buffer_size=<unsigned integer>`
-         * - `max_message_size=<unsigned integer>`
-         * - `max_frame_size=<unsigned integer>`
-         * - `accept_unmasked_frames=<bool>`
-         * - `tls=<bool>`
-         * - `tls_domain=<string>`
-         * - `tls_ca_file=<path>`
-         * - `tls_validate_certificate=<bool>`
-         *
-         * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
-         * Boolean values are `true` or `false`.
-         *
-         * Credentials embedded in the connection string configure automatic login
-         * for Connect() and later reconnections. This method parses configuration
-         * but does not establish a network connection.
-         *
-         * @param connection_string Connection string containing client configuration.
-         * @return Configured, disconnected client.
-         * @throws IggyException if the connection string is invalid or the client
-         *         cannot be created.
-         */
-        static IggyBlockingClient FromConnectionString(std::string connection_string);
-
-        /**
-         * @brief Connects to the configured Iggy server.
-         *
-         * Establishes the configured transport connection and starts heartbeat
-         * processing. If automatic login was configured, authentication is also
-         * performed. Calling this on an already connected client has no effect.
-         *
-         * @note HTTP is stateless; connecting initializes heartbeat processing but
-         *       does not open a persistent transport connection.
-         * @throws IggyException if the connection or automatic authentication
-         *         fails.
-         */
-        void Connect() const;
-
-        /**
-         * @brief Disconnects from the configured Iggy server.
-         *
-         * Disconnect is temporary. It drops the active transport connection and
-         * changes the client state to disconnected, but keeps the client reusable.
-         * Call Connect() to establish a new connection. Configured automatic login
-         * is applied when reconnecting.
-         *
-         * @note The HTTP transport is stateless and treats this operation as a
-         *       no-op.
-         * @throws IggyException if the client cannot disconnect cleanly.
-         * @see Shutdown()
-         */
-        void Disconnect() const;
-
-        /**
-         * @brief Shuts down the client and its background tasks.
-         *
-         * Shutdown is terminal for stateful transports. It gracefully closes the
-         * active transport where supported, releases transport resources, and
-         * changes the client state to shutdown. Binary operations then fail with a
-         * client-shutdown error, which also causes the background heartbeat task to
-         * stop. Create a new client instead of reusing a shut-down client.
-         *
-         * @note The HTTP transport is stateless and treats this operation as a
-         *       no-op.
-         * @throws IggyException if shutdown fails.
-         * @see Disconnect()
-         */
-        void Shutdown() const;
-
-        /**
-         * @brief Authenticates with a username and password.
-         *
-         * For TCP, QUIC, and WebSocket, call Connect() first. A successful login
-         * leaves the transport connected and marks the session authenticated. For
-         * HTTP, the returned access token is stored by the client and used for
-         * subsequent authenticated requests.
-         *
-         * @param username Iggy user name.
-         * @param password Iggy user password.
-         * @return Information about the authenticated session.
-         * @throws IggyException if authentication fails.
-         */
-        LoginInfo Login(std::string username, std::string password) const;
-
-        /**
-         * @brief Ends the current authenticated session.
-         *
-         * Logout does not disconnect the transport. For binary transports, the
-         * client returns to the connected but unauthenticated state. For HTTP, the
-         * stored access token is cleared after the server accepts the logout.
-         * Protected operations require another successful Login() or an automatic
-         * login during reconnection.
-         *
-         * @throws IggyException if logout fails.
-         * @see Disconnect()
-         */
-        void Logout() const;
-
-      private:
-        explicit IggyBlockingClient(ffi::Client *client);
-
-        void Reset() noexcept;
-
-        ffi::Client *client_;
-    };
+    IggyBlockingClient(IggyBlockingClient &&other) noexcept;
 
     /**
-     * @brief Fluent builder for IggyBlockingClient.
+     * @brief Replaces this client by taking ownership from another client.
+     * @param other Client whose connection ownership is transferred.
+     * @return Reference to this client.
      *
-     * The builder creates TCP clients only. Use
-     * IggyBlockingClient::FromConnectionString() to select another transport.
-     * Configuration methods return the builder by reference and may be chained.
-     * Unless documented otherwise, settings are validated and applied by Build().
+     * Any client currently owned by this object is released first. The
+     * moved-from client must not be used for client operations.
      */
-    class IggyBlockingClient::Builder final {
-      public:
-        /**
-         * @brief Creates a builder with the default TCP endpoint, 127.0.0.1:8090.
-         *
-         * Automatic login and TLS are disabled. Reconnection is enabled with
-         * unlimited retries, a one-second retry interval, and a five-second delay
-         * before reestablishing a previously working connection. The heartbeat
-         * interval is five seconds. TCP_NODELAY is disabled. Build() always returns
-         * a disconnected client.
-         */
-        Builder();
+    IggyBlockingClient &operator=(IggyBlockingClient &&other) noexcept;
 
-        /**
-         * @brief Sets the TCP server address.
-         *
-         * The address is trimmed and validated during Build(). Host names, IPv4,
-         * and bracketed IPv6 are accepted. A non-zero port is required.
-         *
-         * @param server_address Server address in host:port form.
-         * @return Reference to this builder.
-         * @note Build() throws IggyException if the address is invalid.
-         */
-        Builder &WithServerAddress(std::string server_address);
+    /**
+     * @brief Releases the underlying Rust client.
+     *
+     * Cleanup errors cannot be reported from the destructor. Call Shutdown()
+     * explicitly when graceful transport shutdown must be observed.
+     */
+    ~IggyBlockingClient();
 
-        /**
-         * @brief Enables automatic authentication with user credentials.
-         *
-         * The credentials are used whenever Connect() establishes a connection,
-         * including reconnections. This replaces a previously configured personal
-         * access token.
-         *
-         * @param username Iggy user name.
-         * @param password Iggy user password.
-         * @return Reference to this builder.
-         * @see IggyBlockingClient::Connect()
-         * @see IggyBlockingClient::Login()
-         */
-        Builder &WithAutoLogin(std::string username, std::string password);
+    /**
+     * @brief Creates a client from an Iggy connection string.
+     *
+     * Connection strings use one of these forms:
+     *
+     * - `iggy://<credentials>@<host>:<port>[?<options>]` for TCP.
+     * - `iggy+tcp://<credentials>@<host>:<port>[?<options>]` for TCP.
+     * - `iggy+quic://<credentials>@<host>:<port>[?<options>]` for QUIC.
+     * - `iggy+http://<credentials>@<host>:<port>[?<options>]` for HTTP.
+     * - `iggy+ws://<credentials>@<host>:<port>[?<options>]` for WebSocket.
+     *
+     * Credentials are either `<username>:<password>` or a personal access
+     * token. Multiple query parameters are separated with `&`.
+     *
+     * Connection string examples:
+     *
+     * - Username and password:
+     *   `iggy+tcp://iggy:iggy@127.0.0.1:8090`
+     * - Personal access token:
+     *   `iggy+tcp://iggypat-1234567890abcdef@127.0.0.1:8090`
+     * - TCP with TLS:
+     *   `iggy+tcp://iggy:iggy@localhost:8090?tls=true&tls_domain=localhost`
+     *
+     * TCP accepts these query parameters:
+     *
+     * - `tls=<bool>`
+     * - `tls_domain=<string>`
+     * - `tls_ca_file=<path>`
+     * - `reconnection_retries=<uint32|unlimited>`
+     * - `reconnection_interval=<duration>`
+     * - `reestablish_after=<duration>`
+     * - `heartbeat_interval=<duration>`
+     * - `nodelay=<bool>`
+     *
+     * QUIC accepts these query parameters:
+     *
+     * - `response_buffer_size=<uint64>`
+     * - `max_concurrent_bidi_streams=<uint64>`
+     * - `datagram_send_buffer_size=<uint64>`
+     * - `initial_mtu=<uint16>`
+     * - `send_window=<uint64>`
+     * - `receive_window=<uint64>`
+     * - `keep_alive_interval=<uint64>`
+     * - `max_idle_timeout=<uint64>`
+     * - `validate_certificate=<bool>`
+     * - `heartbeat_interval=<duration>`
+     * - `reconnection_max_retries=<uint32|unlimited>`
+     * - `reconnection_interval=<duration>`
+     * - `reconnection_reestablish_after=<duration>`
+     *
+     * HTTP accepts these query parameters:
+     *
+     * - `heartbeat_interval=<duration>`
+     * - `retries=<uint32>`
+     *
+     * WebSocket accepts these query parameters:
+     *
+     * - `heartbeat_interval=<duration>`
+     * - `reconnection_retries=<uint32|unlimited>`
+     * - `reconnection_interval=<duration>`
+     * - `reestablish_after=<duration>`
+     * - `read_buffer_size=<unsigned integer>`
+     * - `write_buffer_size=<unsigned integer>`
+     * - `max_write_buffer_size=<unsigned integer>`
+     * - `max_message_size=<unsigned integer>`
+     * - `max_frame_size=<unsigned integer>`
+     * - `accept_unmasked_frames=<bool>`
+     * - `tls=<bool>`
+     * - `tls_domain=<string>`
+     * - `tls_ca_file=<path>`
+     * - `tls_validate_certificate=<bool>`
+     *
+     * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
+     * Boolean values are `true` or `false`.
+     *
+     * Credentials embedded in the connection string configure automatic login
+     * for Connect() and later reconnections. This method parses configuration
+     * but does not establish a network connection.
+     *
+     * @param connection_string Connection string containing client configuration.
+     * @return Configured, disconnected client.
+     * @throws IggyException if the connection string is invalid or the client
+     *         cannot be created.
+     */
+    static IggyBlockingClient FromConnectionString(std::string connection_string);
 
-        /**
-         * @brief Enables automatic authentication with a personal access token.
-         *
-         * The token is used whenever Connect() establishes a connection, including
-         * reconnections. This replaces previously configured username and password
-         * credentials.
-         *
-         * @param token Personal access token.
-         * @return Reference to this builder.
-         * @see IggyBlockingClient::Connect()
-         */
-        Builder &WithPersonalAccessToken(std::string token);
+    /**
+     * @brief Connects to the configured Iggy server.
+     *
+     * Establishes the configured transport connection and starts heartbeat
+     * processing. If automatic login was configured, authentication is also
+     * performed. Calling this on an already connected client has no effect.
+     *
+     * @note HTTP is stateless; connecting initializes heartbeat processing but
+     *       does not open a persistent transport connection.
+     * @throws IggyException if the connection or automatic authentication
+     *         fails.
+     */
+    void Connect() const;
 
-        /**
-         * @brief Sets the maximum number of reconnection attempts.
-         *
-         * Reconnection is enabled by default. A value of zero disables retries
-         * after the initial connection attempt. This replaces a previous call to
-         * WithoutReconnectionLimit().
-         *
-         * @param retries Maximum number of attempts.
-         * @return Reference to this builder.
-         */
-        Builder &WithReconnectionMaxRetries(std::uint32_t retries);
+    /**
+     * @brief Disconnects from the configured Iggy server.
+     *
+     * Disconnect is temporary. It drops the active transport connection and
+     * changes the client state to disconnected, but keeps the client reusable.
+     * Call Connect() to establish a new connection. Configured automatic login
+     * is applied when reconnecting.
+     *
+     * @note The HTTP transport is stateless and treats this operation as a
+     *       no-op.
+     * @throws IggyException if the client cannot disconnect cleanly.
+     * @see Shutdown()
+     */
+    void Disconnect() const;
 
-        /**
-         * @brief Removes the limit on reconnection attempts.
-         *
-         * This is the default and replaces a previous finite retry limit.
-         *
-         * @return Reference to this builder.
-         */
-        Builder &WithoutReconnectionLimit();
+    /**
+     * @brief Shuts down the client and its background tasks.
+     *
+     * Shutdown is terminal for stateful transports. It gracefully closes the
+     * active transport where supported, releases transport resources, and
+     * changes the client state to shutdown. Binary operations then fail with a
+     * client-shutdown error, which also causes the background heartbeat task to
+     * stop. Create a new client instead of reusing a shut-down client.
+     *
+     * @note The HTTP transport is stateless and treats this operation as a
+     *       no-op.
+     * @throws IggyException if shutdown fails.
+     * @see Disconnect()
+     */
+    void Shutdown() const;
 
-        /**
-         * @brief Sets the delay between reconnection attempts.
-         *
-         * The default interval is one second. This interval applies between failed
-         * connection attempts.
-         *
-         * @param interval Non-negative reconnection interval.
-         * @return Reference to this builder.
-         * @throws IggyException if @p interval is negative.
-         */
-        Builder &WithReconnectionInterval(std::chrono::microseconds interval);
+    /**
+     * @brief Authenticates with a username and password.
+     *
+     * For TCP, QUIC, and WebSocket, call Connect() first. A successful login
+     * leaves the transport connected and marks the session authenticated. For
+     * HTTP, the returned access token is stored by the client and used for
+     * subsequent authenticated requests.
+     *
+     * @param username Iggy user name.
+     * @param password Iggy user password.
+     * @return Information about the authenticated session.
+     * @throws IggyException if authentication fails.
+     */
+    LoginInfo Login(std::string username, std::string password) const;
 
-        /**
-         * @brief Sets the delay before restoring a lost established connection.
-         *
-         * The default delay is five seconds. This cooldown is distinct from the
-         * interval between failed connection attempts.
-         *
-         * @param duration Non-negative delay.
-         * @return Reference to this builder.
-         * @throws IggyException if @p duration is negative.
-         */
-        Builder &WithReestablishAfter(std::chrono::microseconds duration);
+    /**
+     * @brief Ends the current authenticated session.
+     *
+     * Logout does not disconnect the transport. For binary transports, the
+     * client returns to the connected but unauthenticated state. For HTTP, the
+     * stored access token is cleared after the server accepts the logout.
+     * Protected operations require another successful Login() or an automatic
+     * login during reconnection.
+     *
+     * @throws IggyException if logout fails.
+     * @see Disconnect()
+     */
+    void Logout() const;
 
-        /**
-         * @brief Enables or disables TLS.
-         *
-         * TLS is disabled by default. TLS domain, CA file, and certificate
-         * validation settings are applied only when TLS is enabled.
-         *
-         * @param enabled Whether TLS is enabled.
-         * @return Reference to this builder.
-         */
-        Builder &WithTlsEnabled(bool enabled = true);
+  private:
+    explicit IggyBlockingClient(ffi::Client *client);
 
-        /**
-         * @brief Sets the domain used for TLS server-name verification.
-         *
-         * When empty, the domain is derived from the configured server address.
-         * This setting has no effect unless TLS is enabled.
-         *
-         * @param domain TLS domain name.
-         * @return Reference to this builder.
-         */
-        Builder &WithTlsDomain(std::string domain);
+    void Reset() noexcept;
 
-        /**
-         * @brief Sets the certificate-authority file used by TLS.
-         *
-         * When omitted, system root certificates are used. This setting has no
-         * effect unless TLS is enabled.
-         *
-         * @param path Path to a PEM-encoded certificate-authority file.
-         * @return Reference to this builder.
-         */
-        Builder &WithTlsCaFile(std::string path);
+    ffi::Client *client_;
+};
 
-        /**
-         * @brief Enables or disables TLS certificate validation.
-         *
-         * Certificate validation is enabled by default. Disabling it accepts
-         * certificates without verifying their trust chain or server identity and
-         * should be limited to controlled development environments. This setting
-         * has no effect unless TLS is enabled.
-         *
-         * @param enabled Whether the server certificate is validated.
-         * @return Reference to this builder.
-         */
-        Builder &WithTlsCertificateValidation(bool enabled = true);
+/**
+ * @brief Fluent builder for IggyBlockingClient.
+ *
+ * The builder creates TCP clients only. Use
+ * IggyBlockingClient::FromConnectionString() to select another transport.
+ * Configuration methods return the builder by reference and may be chained.
+ * Unless documented otherwise, settings are validated and applied by Build().
+ */
+class IggyBlockingClient::Builder final {
+  public:
+    /**
+     * @brief Creates a builder with the default TCP endpoint, 127.0.0.1:8090.
+     *
+     * Automatic login and TLS are disabled. Reconnection is enabled with
+     * unlimited retries, a one-second retry interval, and a five-second delay
+     * before reestablishing a previously working connection. The heartbeat
+     * interval is five seconds. TCP_NODELAY is disabled. Build() always returns
+     * a disconnected client.
+     */
+    Builder();
 
-        /**
-         * @brief Enables TCP_NODELAY on the client socket.
-         *
-         * TCP_NODELAY disables Nagle's algorithm to reduce latency for small
-         * writes, potentially increasing packet count. It is disabled by default.
-         *
-         * @return Reference to this builder.
-         */
-        Builder &WithNoDelay();
+    /**
+     * @brief Sets the TCP server address.
+     *
+     * The address is trimmed and validated during Build(). Host names, IPv4,
+     * and bracketed IPv6 are accepted. A non-zero port is required.
+     *
+     * @param server_address Server address in host:port form.
+     * @return Reference to this builder.
+     * @note Build() throws IggyException if the address is invalid.
+     */
+    Builder &WithServerAddress(std::string server_address);
 
-        /**
-         * @brief Builds an owning Iggy blocking client.
-         *
-         * Build() validates the TCP configuration and creates an independent
-         * client. The builder is not consumed and may be reused. The returned
-         * client is always disconnected; call IggyBlockingClient::Connect()
-         * explicitly before using operations that require a connection.
-         *
-         * @return Configured client.
-         * @throws IggyException if validation or client creation fails.
-         */
-        IggyBlockingClient Build() const;
+    /**
+     * @brief Enables automatic authentication with user credentials.
+     *
+     * The credentials are used whenever Connect() establishes a connection,
+     * including reconnections. This replaces a previously configured personal
+     * access token.
+     *
+     * @param username Iggy user name.
+     * @param password Iggy user password.
+     * @return Reference to this builder.
+     * @see IggyBlockingClient::Connect()
+     * @see IggyBlockingClient::Login()
+     */
+    Builder &WithAutoLogin(std::string username, std::string password);
 
-      private:
-        std::string server_address_;
-        std::string auto_login_kind_ = "disabled";
-        std::string auto_login_username_;
-        std::string auto_login_password_;
-        std::string personal_access_token_;
-        bool set_reconnection_max_retries_ = false;
-        std::optional<std::uint32_t> reconnection_max_retries_;
-        std::optional<std::uint64_t> reconnection_interval_micros_;
-        std::optional<std::uint64_t> reestablish_after_micros_;
-        std::optional<bool> tls_enabled_;
-        std::string tls_domain_;
-        std::string tls_ca_file_;
-        std::optional<bool> tls_validate_certificate_;
-        bool no_delay_ = false;
-    };
+    /**
+     * @brief Enables automatic authentication with a personal access token.
+     *
+     * The token is used whenever Connect() establishes a connection, including
+     * reconnections. This replaces previously configured username and password
+     * credentials.
+     *
+     * @param token Personal access token.
+     * @return Reference to this builder.
+     * @see IggyBlockingClient::Connect()
+     */
+    Builder &WithPersonalAccessToken(std::string token);
+
+    /**
+     * @brief Sets the maximum number of reconnection attempts.
+     *
+     * Reconnection is enabled by default. A value of zero disables retries
+     * after the initial connection attempt. This replaces a previous call to
+     * WithoutReconnectionLimit().
+     *
+     * @param retries Maximum number of attempts.
+     * @return Reference to this builder.
+     */
+    Builder &WithReconnectionMaxRetries(std::uint32_t retries);
+
+    /**
+     * @brief Removes the limit on reconnection attempts.
+     *
+     * This is the default and replaces a previous finite retry limit.
+     *
+     * @return Reference to this builder.
+     */
+    Builder &WithoutReconnectionLimit();
+
+    /**
+     * @brief Sets the delay between reconnection attempts.
+     *
+     * The default interval is one second. This interval applies between failed
+     * connection attempts.
+     *
+     * @param interval Non-negative reconnection interval.
+     * @return Reference to this builder.
+     * @throws IggyException if @p interval is negative.
+     */
+    Builder &WithReconnectionInterval(std::chrono::microseconds interval);
+
+    /**
+     * @brief Sets the delay before restoring a lost established connection.
+     *
+     * The default delay is five seconds. This cooldown is distinct from the
+     * interval between failed connection attempts.
+     *
+     * @param duration Non-negative delay.
+     * @return Reference to this builder.
+     * @throws IggyException if @p duration is negative.
+     */
+    Builder &WithReestablishAfter(std::chrono::microseconds duration);
+
+    /**
+     * @brief Enables or disables TLS.
+     *
+     * TLS is disabled by default. TLS domain, CA file, and certificate
+     * validation settings are applied only when TLS is enabled.
+     *
+     * @param enabled Whether TLS is enabled.
+     * @return Reference to this builder.
+     */
+    Builder &WithTlsEnabled(bool enabled = true);
+
+    /**
+     * @brief Sets the domain used for TLS server-name verification.
+     *
+     * When empty, the domain is derived from the configured server address.
+     * This setting has no effect unless TLS is enabled.
+     *
+     * @param domain TLS domain name.
+     * @return Reference to this builder.
+     */
+    Builder &WithTlsDomain(std::string domain);
+
+    /**
+     * @brief Sets the certificate-authority file used by TLS.
+     *
+     * When omitted, system root certificates are used. This setting has no
+     * effect unless TLS is enabled.
+     *
+     * @param path Path to a PEM-encoded certificate-authority file.
+     * @return Reference to this builder.
+     */
+    Builder &WithTlsCaFile(std::string path);
+
+    /**
+     * @brief Enables or disables TLS certificate validation.
+     *
+     * Certificate validation is enabled by default. Disabling it accepts
+     * certificates without verifying their trust chain or server identity and
+     * should be limited to controlled development environments. This setting
+     * has no effect unless TLS is enabled.
+     *
+     * @param enabled Whether the server certificate is validated.
+     * @return Reference to this builder.
+     */
+    Builder &WithTlsCertificateValidation(bool enabled = true);
+
+    /**
+     * @brief Enables TCP_NODELAY on the client socket.
+     *
+     * TCP_NODELAY disables Nagle's algorithm to reduce latency for small
+     * writes, potentially increasing packet count. It is disabled by default.
+     *
+     * @return Reference to this builder.
+     */
+    Builder &WithNoDelay();
+
+    /**
+     * @brief Builds an owning Iggy blocking client.
+     *
+     * Build() validates the TCP configuration and creates an independent
+     * client. The builder is not consumed and may be reused. The returned
+     * client is always disconnected; call IggyBlockingClient::Connect()
+     * explicitly before using operations that require a connection.
+     *
+     * @return Configured client.
+     * @throws IggyException if validation or client creation fails.
+     */
+    IggyBlockingClient Build() const;
+
+  private:
+    std::string server_address_;
+    std::string auto_login_kind_ = "disabled";
+    std::string auto_login_username_;
+    std::string auto_login_password_;
+    std::string personal_access_token_;
+    bool set_reconnection_max_retries_ = false;
+    std::optional<std::uint32_t> reconnection_max_retries_;
+    std::optional<std::uint64_t> reconnection_interval_micros_;
+    std::optional<std::uint64_t> reestablish_after_micros_;
+    std::optional<bool> tls_enabled_;
+    std::string tls_domain_;
+    std::string tls_ca_file_;
+    std::optional<bool> tls_validate_certificate_;
+    bool no_delay_ = false;
+};
 
 }  // namespace iggy
