@@ -251,7 +251,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/node/**"
-    tasks: ["lint", "test", "build", "e2e"]
+    tasks: ["lint", "test", "build", "e2e", "e2e-vsr"]
 
   sdk-go:
     depends_on:

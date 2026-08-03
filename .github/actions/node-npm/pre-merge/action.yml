@@ -20,7 +20,7 @@ description: Node.js pre-merge testing github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, test, build, e2e)"
+    description: "Task to run (lint, test, build, e2e, e2e-vsr)"
     required: true
 
 runs:
@@ -39,11 +39,11 @@ runs:
       shell: bash
 
     - name: Setup Rust with cache
-      if: inputs.task == 'e2e'
+      if: inputs.task == 'e2e' || inputs.task == 'e2e-vsr'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Install netcat
-      if: inputs.task == 'e2e'
+      if: inputs.task == 'e2e' || inputs.task == 'e2e-vsr'
       run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
       shell: bash
 
@@ -82,8 +82,6 @@ runs:
           echo "Warning: dist directory not found after build"
         fi
       shell: bash
-
-
     - name: Test
       if: inputs.task == 'test'
       run: |
@@ -114,6 +112,74 @@ runs:
         IGGY_SERVER_HOST: 127.0.0.1
         IGGY_SERVER_TCP_PORT: 8090
       shell: bash
+
+    - name: Start Iggy VSR server 0
+      id: iggy-vsr-0
+      if: inputs.task == 'e2e-vsr'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-node-vsr-0.pid
+        log-file: ${{ runner.temp }}/iggy-node-vsr-0.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-node-vsr-0-data
+
+    - name: Start Iggy VSR server 1
+      id: iggy-vsr-1
+      if: inputs.task == 'e2e-vsr'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "1"
+        tcp_address: 127.0.0.1:8091
+        http_address: 127.0.0.1:3001
+        pid-file: ${{ runner.temp }}/iggy-node-vsr-1.pid
+        log-file: ${{ runner.temp }}/iggy-node-vsr-1.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-node-vsr-1-data
+
+    - name: VSR E2E tests
+      if: inputs.task == 'e2e-vsr'
+      run: |
+        cd foreign/node
+        mkdir -p ../../reports/node-coverage/e2e-vsr
+        npx c8 --reporter=lcov \
+          --reports-dir=../../reports/node-coverage/e2e-vsr \
+          npm run test:e2e:vsr
+      env:
+        IGGY_TEST_PROTOCOL: vsr
+      shell: bash
+
+    - name: Stop Iggy VSR server 1
+      if: always() && inputs.task == 'e2e-vsr'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-vsr-1.outputs.pid_file }}
+        log-file: ${{ steps.iggy-vsr-1.outputs.log_file }}
+
+    - name: Stop Iggy VSR server 0
+      if: always() && inputs.task == 'e2e-vsr'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-vsr-0.outputs.pid_file }}
+        log-file: ${{ steps.iggy-vsr-0.outputs.log_file }}
+
+    - name: Upload VSR server logs
+      if: always() && inputs.task == 'e2e-vsr'
+      uses: actions/upload-artifact@v7
+      with:
+        name: iggy-node-vsr-server-logs
+        path: |
+          ${{ steps.iggy-vsr-0.outputs.log_file }}
+          ${{ steps.iggy-vsr-1.outputs.log_file }}
+        if-no-files-found: ignore
 
     - name: Stop Iggy server (plain)
       if: always() && inputs.task == 'e2e'

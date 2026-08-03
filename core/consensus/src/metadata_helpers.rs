@@ -125,7 +125,7 @@ where
             request,
             is_primary = consensus.is_primary(),
             is_normal = consensus.is_normal(),
-            is_syncing = consensus.is_syncing(),
+            is_transferring = consensus.is_transferring(),
             commit_min = consensus.commit_min(),
             commit_max = consensus.commit_max(),
             "request_preflight: not caught up, not ready"
@@ -281,7 +281,7 @@ where
             client_id,
             is_primary = consensus.is_primary(),
             is_normal = consensus.is_normal(),
-            is_syncing = consensus.is_syncing(),
+            is_transferring = consensus.is_transferring(),
             commit_min = consensus.commit_min(),
             commit_max = consensus.commit_max(),
             "register_preflight: not caught up, drop"
@@ -432,9 +432,10 @@ fn build_eviction_from_header(header: EvictionHeader) -> Message<EvictionHeader>
 /// `false` -> caller silent-drops; client retry lands on peer or here
 /// post-catch-up.
 ///
-/// `is_syncing` is currently hardcoded `false` (inert clause); safety rests
-/// on `commit_min == commit_max`, correlated (a syncing replica also has
-/// `commit_min < commit_max`). Do not weaken commit-equality.
+/// `is_transferring` is real (state transfer replaces snapshot-shaped state
+/// on a cluster-restart rejoin), but safety still rests on
+/// `commit_min == commit_max` -- a transferring replica also fails that. Do
+/// not weaken commit-equality.
 pub fn is_caught_up_primary<B, P>(consensus: &VsrConsensus<B, P>) -> bool
 where
     B: MessageBus,
@@ -443,7 +444,7 @@ where
     consensus.is_primary()
         && !consensus.has_ceded_primaryship()
         && consensus.is_normal()
-        && !consensus.is_syncing()
+        && !consensus.is_transferring()
         && consensus.commit_min() == consensus.commit_max()
         // Recovery re-pipelines the WAL's prepared-but-uncommitted suffix;
         // those ops were acked to clients before the restart, so admitting
@@ -845,9 +846,8 @@ mod tests {
         assert!(sends.is_empty(), "silent drop until catch-up");
     }
 
-    // Direct gate test. is_syncing is hardcoded false today; clause is
-    // inert. Test exercises primary, normal, commit_min == commit_max.
-    // Extends naturally when is_syncing becomes real.
+    // Direct gate test: primary, normal, commit_min == commit_max, and not
+    // mid-state-transfer.
     #[test]
     fn is_caught_up_primary_gate_states() {
         // Primary, normal, equal commits -> true.
@@ -855,8 +855,15 @@ mod tests {
         primary.init();
         assert!(primary.is_primary());
         assert!(primary.is_normal());
-        assert!(!primary.is_syncing(), "is_syncing inert; pin");
+        assert!(!primary.is_transferring());
         assert_eq!(primary.commit_min(), primary.commit_max());
+        assert!(is_caught_up_primary(&primary));
+
+        // Mid-transfer -> false, even with equal commits.
+        primary.begin_state_transfer_await();
+        assert!(primary.is_transferring());
+        assert!(!is_caught_up_primary(&primary));
+        primary.set_state_transfer_stage(crate::StateTransferStage::Idle);
         assert!(is_caught_up_primary(&primary));
 
         // commit_min < commit_max -> false.

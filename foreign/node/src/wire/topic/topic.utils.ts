@@ -123,8 +123,8 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
   const id = p.readUInt32LE(pos);
   const createdAt = toDate(p.readBigUint64LE(pos + 4));
   const partitionsCount = p.readUInt32LE(pos + 12);
-  const compressionAlgorithm = p.readUInt8(pos + 16);
-  const messageExpiry = p.readBigUInt64LE(pos + 17);
+  const messageExpiry = p.readBigUInt64LE(pos + 16);
+  const compressionAlgorithm = p.readUInt8(pos + 24);
   const maxTopicSize = p.readBigUInt64LE(pos + 25);
   const replicationFactor = p.readUInt8(pos + 33);
   const sizeBytes = p.readBigUInt64LE(pos + 34);

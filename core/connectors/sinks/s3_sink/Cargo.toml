@@ -29,8 +29,10 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
+# `rust-s3`'s lib target is `s3`, so machete greps for `rust_s3`, never finds
+# it, and reports the crate unused. It is used throughout (`use s3::{Bucket,
+# Region}`); removing it does not compile.
 [package.metadata.cargo-machete]
-# rust-s3's library name is `s3`, not `rust-s3` - machete's name matching misses `use s3::...`.
 ignored = ["rust-s3"]
 
 [lib]

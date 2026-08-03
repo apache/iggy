@@ -244,7 +244,7 @@ pub fn install_replica_outbound(
                     .await
                 }
                 Some(tls) => {
-                    let Some(peer_name) = tls.peer_names.get(usize::from(peer_id)) else {
+                    let Some(peer_name) = tls.peer_names.get(&peer_id) else {
                         warn!(
                             peer = %peer,
                             "no TLS peer name for replica id; dropping dialed connection"
