@@ -3225,8 +3225,10 @@ dependencies = [
  "message_bus",
  "rand 0.10.2",
  "rand_xoshiro",
+ "serde",
  "server_common",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -7424,6 +7426,7 @@ dependencies = [
  "compio",
  "configs",
  "configs_derive",
+ "consensus",
  "ctor 1.0.9",
  "deltalake",
  "dtor 1.0.5",
@@ -7437,6 +7440,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_doris_sink",
  "iggy_connector_sdk",
+ "journal",
  "jsonwebtoken",
  "keyring-core",
  "lazy_static",
@@ -7678,6 +7682,8 @@ dependencies = [
  "iggy_binary_protocol",
  "server_common",
  "tempfile",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]

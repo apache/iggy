@@ -39,8 +39,10 @@ iggy_common = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+serde = { workspace = true }
 server_common = { workspace = true }
 tracing = { workspace = true }
+twox-hash = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
