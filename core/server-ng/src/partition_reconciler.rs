@@ -50,9 +50,10 @@
 //!   `redispatch_parked_frames` for why absence of a committed revision is not
 //!   evidence of a prior incarnation. Re-queuing appends, so a parked frame is
 //!   ordered behind whatever is already in the inbox rather than restored to its
-//!   original arrival position; a frame the inbox refuses is re-parked for the
-//!   next pass rather than answered, since the deny would ride the same full
-//!   sender.
+//!   original arrival position; a frame the inbox refuses is re-parked rather
+//!   than answered, since the deny would ride the same full sender, and the pump
+//!   re-drives it on its next iteration (`retry_reparked_frames`) once a slot
+//!   has freed.
 //! - `IggyShard::serves_committed_incarnation` refuses a namespace whose
 //!   committed `created_revision` disagrees with the epoch on the local row, so
 //!   a request arriving mid-teardown cannot be acked against the incarnation
@@ -84,9 +85,14 @@
 //! Park residency is bounded on three axes, because the frame count alone bounds
 //! nothing useful (`Message::into_generic` is a retag, so each entry retains its
 //! whole buffer, up to 64 MiB): a per-namespace frame cap, a shard-wide byte
-//! budget, and an age in reconciler passes. Anything shed or aged out is
-//! answered with a retriable status and counted under
-//! `frame_drops_total{variant=partition}`.
+//! budget, and an age in reconciler passes. The per-namespace byte cap is waived
+//! for the first frame of an empty entry, or a frame larger than it could never
+//! park at all and a replicated prepare would be lost outright. Every frame that
+//! leaves the buffer unserved is counted under
+//! `frame_drops_total{variant=partition}` -- `park_overflow` when it was shed on
+//! arrival, `park_dropped` when it parked and then aged out or lost its
+//! namespace. A client request is additionally answered with a retriable status;
+//! a prepare has nobody to answer, which is why the counter is the record.
 //!
 //! # Known gaps
 //!
@@ -408,9 +414,9 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     let target_set: AHashSet<IggyNamespace> = target.iter().map(|(ns, _)| *ns).collect();
     let mut counters = PassCounters::default();
 
-    reconcile_additions(ctx, target, &mut counters).await;
+    let staged = reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
-    reconcile_parked_frames(ctx, &mut counters);
+    reconcile_parked_frames(ctx, &staged, &mut counters);
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
     reconcile_segment_truncations(ctx, &mut counters);
     reconcile_partition_purges(ctx);
@@ -451,14 +457,19 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     true
 }
 
+/// Returns the namespaces whose `ReconcileOp::InsertOwned` this pass staged.
+/// They are not in `IggyPartitions` yet -- the pump applies the op on its own
+/// task -- so [`reconcile_parked_frames`] would otherwise read them as
+/// un-materialised and age their frames on the very pass that built them.
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
     target: Vec<(IggyNamespace, u64)>,
     counters: &mut PassCounters,
-) {
+) -> AHashSet<IggyNamespace> {
     let shard_id = ctx.shard.id;
     let partitions = ctx.shard.plane.partitions();
     let total_shards = u32::from(ctx.total_shards);
+    let mut staged = AHashSet::new();
 
     for (ns, epoch) in target {
         if partitions.contains(&ns) {
@@ -572,6 +583,7 @@ async fn reconcile_additions(
                 });
                 ctx.record_success(ns, FailureCause::Add);
                 counters.materialised += 1;
+                staged.insert(ns);
             }
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
@@ -587,6 +599,8 @@ async fn reconcile_additions(
             }
         }
     }
+
+    staged
 }
 
 /// Answer parked frames for namespaces this shard is not going to materialise.
@@ -625,7 +639,15 @@ async fn reconcile_additions(
 /// rather than one. The bound is residency only -- the SDK replays the identical
 /// request, so answering a late frame does not stop its operation from being
 /// applied late (see `ParkedFrame::passes`).
-fn reconcile_parked_frames(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+///
+/// A namespace in `staged_this_pass` is exempt: its `ReconcileOp::InsertOwned`
+/// is queued for the pump but not applied, so it reads as un-materialised here
+/// and would burn one of its three passes on the pass that built it.
+fn reconcile_parked_frames(
+    ctx: &ReconcilerCtx,
+    staged_this_pass: &AHashSet<IggyNamespace>,
+    counters: &mut PassCounters,
+) {
     let parked = ctx.shard.parked_namespaces();
     if parked.is_empty() {
         return;
@@ -634,7 +656,21 @@ fn reconcile_parked_frames(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let total_shards = u32::from(ctx.total_shards);
     let now = Instant::now();
     for ns in parked {
+        if staged_this_pass.contains(&ns) {
+            continue;
+        }
         if partitions.contains(&ns) {
+            // Materialised, yet frames remain: the re-dispatch found the inbox
+            // full and re-parked them. The pump retries on every iteration, so
+            // this is only the residency backstop for an inbox that never
+            // drains. Aging, not reclaiming: a refusal is transient, and
+            // `MAX_PARKED_PASSES` is the same bound the un-materialised case
+            // gets. Without it the frames have no exit at all -- the branch
+            // below never runs for a namespace already in `IggyPartitions`, and
+            // `reconcile_additions` stages no second `InsertOwned` for one.
+            if ctx.shard.age_parked_partition_frames(ns) > 0 {
+                counters.parked_reclaimed += 1;
+            }
             continue;
         }
         // This shard will never materialise a namespace it does not own. The
@@ -1051,7 +1087,8 @@ mod tests {
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command2, GenericHeader, Operation, PrepareHeader, RequestHeader, WireIdentifier,
+        Command2, GenericHeader, Operation, PrepareHeader, ReplyHeader, RequestHeader,
+        WireIdentifier,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1164,8 +1201,8 @@ mod tests {
         // Header validation rejects a zero session / request on a non-register
         // op, and the park path runs after that validation.
         header.session = 1;
-        header.request = 1;
-        header.client = 1;
+        header.request = TEST_REQUEST_ID;
+        header.client = TEST_CLIENT_ID;
         msg.into_generic()
     }
 
@@ -1195,8 +1232,8 @@ mod tests {
         header.operation = Operation::SendMessages;
         header.namespace = namespace.inner();
         header.session = 1;
-        header.request = 1;
-        header.client = 1;
+        header.request = TEST_REQUEST_ID;
+        header.client = TEST_CLIENT_ID;
         msg.into_generic()
     }
 
@@ -2787,6 +2824,12 @@ mod tests {
     /// request must still be answered: the transports decode replies in
     /// lockstep, so a silent shed leaves the connection waiting out its full
     /// response read-timeout.
+    ///
+    /// Driven against a registered in-process client, so the assertion is that a
+    /// reply reached a waiter -- not that a counter moved. With no client on the
+    /// bus every send fails as `ClientNotFound` and a counter bumped before the
+    /// send reports an answer nobody received, which is the failure this test
+    /// exists to catch.
     #[compio::test]
     async fn park_overflow_answers_the_client_instead_of_shedding_silently() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -2797,6 +2840,7 @@ mod tests {
 
         let shard = build_test_shard(0, &config, mux);
         let ns = IggyNamespace::new(0, 0, 0);
+        let (_slot, reply_rx) = register_waiting_client(&shard);
 
         // Fill the buffer to its cap, then one more.
         for _ in 0..PARK_CAP {
@@ -2828,11 +2872,141 @@ mod tests {
         // The point of the fix: shedding is unavoidable at the cap, silence is
         // not. Without the deny the connection waits out its whole response
         // read-timeout on a frame that is already gone.
+        let reply = reply_rx
+            .await
+            .expect("the shed request must reach the waiting client");
+        assert_eq!(
+            reply_status(&reply),
+            iggy_common::IggyError::TransientNotAccepted.as_code(),
+            "the shed request must be answered with a retriable status"
+        );
         assert_eq!(
             shard.metrics().partition_requests_denied_transient_value(),
             1,
-            "the shed request must be answered with a retriable status"
+            "and the counter must credit that delivered answer"
         );
+    }
+
+    /// The counter must credit only denies the bus delivered. It previously
+    /// incremented before `send_to_client`, so a shard with no client registered
+    /// still reported the request answered - which blinded
+    /// `park_overflow_answers_the_client_instead_of_shedding_silently`, the one
+    /// test that asserts the client hears back.
+    #[compio::test]
+    async fn overflow_deny_is_not_counted_when_the_client_is_gone() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-overflow-gone");
+        seed_topic(&mux, 2, 0, "topic-overflow-gone", vec![assignment(0, 1)]);
+
+        // No client registered: every `send_to_client` fails `ClientNotFound`.
+        let shard = build_test_shard(0, &config, mux);
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        for _ in 0..=PARK_CAP {
+            park_one_request(&shard, ns).await;
+        }
+
+        assert_eq!(
+            park_overflow_count(&shard),
+            1,
+            "the frame past the cap is still shed and counted"
+        );
+        assert_eq!(
+            shard.metrics().partition_requests_denied_transient_value(),
+            0,
+            "a deny the bus could not deliver must not be counted as an answer"
+        );
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::PARTITION,
+                shard::metrics::frame_drop_reason::DELIVERY_FAILED,
+            ),
+            1,
+            "it must be counted as an undelivered reply instead"
+        );
+    }
+
+    /// A parked prepare that ages out has no client to answer, so nothing is
+    /// staged and `partition_requests_denied_transient_total` stays put. The op
+    /// is destroyed all the same - the primary retransmits only what has not
+    /// reached quorum - so `park_dropped` is the only record it existed.
+    #[compio::test]
+    async fn aged_out_prepare_is_counted_even_though_nobody_can_be_answered() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-prepare-age");
+        seed_topic(&mux, 2, 0, "topic-prepare-age", vec![assignment(0, 1)]);
+
+        let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        park_one_prepare(&shard, ns, 7).await;
+        for _ in 0..=PARK_MAX_PASSES {
+            shard.age_parked_partition_frames(ns);
+        }
+
+        assert_eq!(shard.parked_frame_count(ns), 0, "the prepare aged out");
+        assert_eq!(
+            drain_staged_client_sends(&inbox),
+            0,
+            "a prepare has no client to answer"
+        );
+        assert_eq!(
+            shard.metrics().partition_requests_denied_transient_value(),
+            0,
+            "and must not be reported as an answered request"
+        );
+        assert_eq!(
+            park_dropped_count(&shard),
+            1,
+            "the destroyed op must leave a record; silence here is invisible loss"
+        );
+    }
+
+    /// A frame larger than the per-namespace byte cap used to fail the check
+    /// even against an empty entry, so it could never park on any attempt. For a
+    /// replicated prepare that is unrecoverable: `retransmit_targets` skips an op
+    /// that already reached quorum, so the backup stays permanently short of it.
+    #[compio::test]
+    async fn a_frame_over_the_namespace_byte_cap_still_parks_into_an_empty_entry() {
+        const OVER_NAMESPACE_CAP: usize = 5 * 1024 * 1024;
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-oversize");
+        seed_topic(&mux, 2, 0, "topic-oversize", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        shard
+            .on_message(build_partition_request_sized(ns, OVER_NAMESPACE_CAP))
+            .await;
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            1,
+            "the first frame of an empty entry must park regardless of the per-namespace cap"
+        );
+        assert_eq!(
+            park_overflow_count(&shard),
+            0,
+            "and must not be shed doing it"
+        );
+
+        // The waiver is for the first frame only; the cap still applies after.
+        shard
+            .on_message(build_partition_request_sized(ns, OVER_NAMESPACE_CAP))
+            .await;
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            1,
+            "a second oversize frame must be shed, or one namespace eats the shard budget"
+        );
+        assert_eq!(park_overflow_count(&shard), 1);
     }
 
     /// A namespace whose build is still in flight keeps its frames -- but not
@@ -2957,10 +3131,97 @@ mod tests {
         );
     }
 
+    /// A re-dispatch the inbox refuses re-parks the frame, and by then the
+    /// namespace is materialised - which closes every other exit. The sweep
+    /// skips a namespace in `IggyPartitions`, and `reconcile_additions` stages
+    /// no second `InsertOwned` for one, so before the pump-side retry the frame
+    /// sat there until a topic delete: the client never answered, the shard-wide
+    /// byte budget never returned, and the revision fast-skip never re-armed.
+    #[compio::test]
+    async fn a_re_parked_frame_is_re_dispatched_once_the_inbox_drains() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-repark");
+        seed_topic(&mux, 2, 0, "topic-repark", vec![assignment(0, 1)]);
+
+        // Capacity 1: `enqueue_reconcile_op`'s `ReconcileApply` marker takes the
+        // only slot, so the re-dispatch that follows is refused with `Full`.
+        let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 1);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        park_one_request(&shard, ns).await;
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            shard.plane.partitions().contains(&ns),
+            "the namespace must have materialised"
+        );
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            1,
+            "the full inbox must have re-parked the frame rather than dropping it"
+        );
+
+        // What the pump does every iteration: consume a frame, then re-drive.
+        let (_served, _answered) = drain_inbox(&inbox);
+        shard.apply_reconcile_ops();
+
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            0,
+            "the freed slot must let the retry drain the entry"
+        );
+        assert!(
+            !shard.has_parked_partition_frames(),
+            "and the byte budget must return, so the revision fast-skip can re-arm"
+        );
+        assert_eq!(
+            drain_inbox(&inbox).0,
+            1,
+            "the frame must reach the pump as a consensus frame, not be answered away"
+        );
+    }
+
+    /// Residency backstop for the same path: an inbox that never drains must not
+    /// hold a re-parked frame forever. `MAX_PARKED_PASSES` applies to a
+    /// materialised namespace too, so the sweep eventually answers it.
+    #[compio::test]
+    async fn a_re_parked_frame_ages_out_when_the_inbox_never_drains() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-repark-age");
+        seed_topic(&mux, 2, 0, "topic-repark-age", vec![assignment(0, 1)]);
+
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 1);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        park_one_request(&shard, ns).await;
+        reconcile_pass(&ctx).await;
+        assert_eq!(shard.parked_frame_count(ns), 1, "re-parked on a full inbox");
+
+        for _ in 0..=PARK_MAX_PASSES {
+            reconcile_pass(&ctx).await;
+        }
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            0,
+            "a materialised namespace must still be aged, or the frame is stranded"
+        );
+        assert!(!shard.has_parked_partition_frames());
+    }
+
     /// Mirrors `MAX_PARKED_PER_NAMESPACE` in `shard::park_if_unmaterialised`.
     const PARK_CAP: usize = 128;
     /// Mirrors `MAX_PARKED_PASSES`.
     const PARK_MAX_PASSES: u32 = 3;
+    /// Top 16 bits are the owning shard, so this resolves to shard 0's registry
+    /// and `send_to_client` takes the local path instead of a forward fn.
+    const TEST_CLIENT_ID: u128 = 1;
+    const TEST_REQUEST_ID: u64 = 1;
 
     /// `cluster::multi_shard_partition_convergence` exists to drive the
     /// cross-core path, which only happens for namespaces the connection's shard
@@ -2987,5 +3248,41 @@ mod tests {
             shard::metrics::frame_drop_variant::PARTITION,
             shard::metrics::frame_drop_reason::PARK_OVERFLOW,
         )
+    }
+
+    fn park_dropped_count(shard: &TestShard) -> u64 {
+        shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::PARTITION,
+            shard::metrics::frame_drop_reason::PARK_DROPPED,
+        )
+    }
+
+    /// Register the client id [`build_partition_request`] stamps, with a waiter
+    /// for its request id, so a deny that reaches the bus resolves a oneshot the
+    /// test can await. The guard keeps the slot installed.
+    fn register_waiting_client(
+        shard: &TestShard,
+    ) -> (
+        message_bus::ReplySlotGuard<'_, u128>,
+        futures::channel::oneshot::Receiver<message_bus::BusMessage>,
+    ) {
+        shard
+            .bus
+            .clients()
+            .insert_in_process(TEST_CLIENT_ID)
+            .expect("fresh client key");
+        shard
+            .bus
+            .clients()
+            .install_reply_slot(TEST_CLIENT_ID, TEST_REQUEST_ID)
+            .expect("reply slot installs")
+    }
+
+    fn reply_status(reply: &message_bus::BusMessage) -> u32 {
+        bytemuck::checked::try_from_bytes::<ReplyHeader>(
+            &reply.as_ref()[..size_of::<ReplyHeader>()],
+        )
+        .expect("deny reply carries a valid ReplyHeader")
+        .status
     }
 }

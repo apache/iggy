@@ -115,7 +115,12 @@ pub mod frame_drop_variant {
 /// receives a Consensus frame whose target shard is not `self.id`.
 /// `PARK_OVERFLOW` ticks when a partition frame arrives for a namespace this
 /// shard has not materialised and the per-namespace park buffer is already at
-/// its cap, so the frame is shed with no reply.
+/// its cap, so the frame is shed with no reply. `PARK_DROPPED` ticks when a
+/// frame that did park leaves the buffer without being served: it outlived
+/// `MAX_PARKED_PASSES`, or its namespace was torn down. A client request also
+/// bumps `partition_requests_denied_transient_total` there, since it gets a
+/// reply; replicated traffic has nobody to answer, so this counter is the only
+/// record that the op was destroyed.
 pub mod frame_drop_reason {
     pub const FULL: &str = "full";
     pub const DISCONNECTED: &str = "disconnected";
@@ -123,10 +128,11 @@ pub mod frame_drop_reason {
     pub const DELIVERY_FAILED: &str = "delivery_failed";
     pub const MISROUTED: &str = "misrouted";
     pub const PARK_OVERFLOW: &str = "park_overflow";
+    pub const PARK_DROPPED: &str = "park_dropped";
 }
 
 const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 6;
+const REASON_COUNT: usize = 7;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -145,6 +151,7 @@ const REASONS: [&str; REASON_COUNT] = [
     frame_drop_reason::DELIVERY_FAILED,
     frame_drop_reason::MISROUTED,
     frame_drop_reason::PARK_OVERFLOW,
+    frame_drop_reason::PARK_DROPPED,
 ];
 
 fn variant_index(s: &str) -> Option<usize> {
