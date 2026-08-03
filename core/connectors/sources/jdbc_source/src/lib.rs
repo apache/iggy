@@ -1321,7 +1321,11 @@ impl JdbcSource {
                         .to_string(),
                 ));
             };
-            if !query_orders_by_tracking_column(&self.config.query, tracking_column) {
+            if !query_orders_by_tracking_column(
+                &self.config.query,
+                tracking_column,
+                self.config.snake_case_columns,
+            ) {
                 return Err(Error::InvalidConfigValue(format!(
                     "incremental mode requires the query to order by the tracking column so each \
                      batch is a contiguous ascending range; add `ORDER BY {tracking_column}` (or \
@@ -1567,40 +1571,112 @@ fn strip_offset_predicate(query: &str) -> String {
 /// `ORDER BY`, and must not be descending.
 ///
 /// This is a lexical check, not a SQL parser, so it errs strict: it inspects the
-/// last `ORDER BY` in the text (the outer query's, not a subquery's), takes the
-/// first ordering term, and requires it to be the `{tracking_column}` placeholder
-/// or an identifier whose final path segment equals the tracking column
-/// (case-insensitive). A trailing `DESC` is rejected, and a composite
-/// `ORDER BY other, tracking` (tracking not primary) is rejected, because
-/// truncation then yields a prefix ordered by `other`.
-fn query_orders_by_tracking_column(query: &str, tracking_column: &str) -> bool {
-    let lower = query.to_lowercase();
-    let Some(pos) = lower.rfind("order by") else {
+/// last `ORDER BY` at parenthesis depth zero (the outer query's clause, never one
+/// inside a subquery or a window function's `OVER (...)`), takes the first
+/// ordering term, and requires it to be the `{tracking_column}` placeholder or an
+/// identifier whose final path segment equals the tracking column. Matching
+/// mirrors the read-time `tracking_column_matches`: case-insensitive against the
+/// raw identifier and, when `snake_case_columns` is set, against its snake_cased
+/// form, so a CamelCase `ORDER BY OrderDate` with `tracking_column = "order_date"`
+/// validates exactly as it matches when reading rows (otherwise validation would
+/// reject a config that runs correctly). A trailing `DESC` is rejected, and a
+/// composite `ORDER BY other, tracking` (tracking not primary) is rejected,
+/// because truncation then yields a prefix ordered by `other`.
+fn query_orders_by_tracking_column(
+    query: &str,
+    tracking_column: &str,
+    snake_case_columns: bool,
+) -> bool {
+    let Some(order_by) = outer_order_by(query) else {
         return false;
     };
-    let after = lower[pos + "order by".len()..].trim_start();
-    let first_term = after.split(',').next().unwrap_or("").trim();
+    let first_term = order_by.split(',').next().unwrap_or("").trim();
     let mut tokens = first_term.split_whitespace();
     let key = tokens.next().unwrap_or("");
     // Any explicit descending direction breaks ascending offset advancement.
-    if tokens.any(|token| token == "desc") {
+    if tokens.any(|token| token.eq_ignore_ascii_case("desc")) {
         return false;
     }
     if key.starts_with("{tracking_column}") {
         return true;
     }
-    // Compare the final path segment (`t.updated_at` -> `updated_at`), keeping
-    // only leading identifier characters so trailing punctuation is ignored.
-    let key_ident: String = key
+    // Compare the final path segment (`t.updated_at` -> `updated_at`), first
+    // stripping a surrounding identifier quote (`"pg"`, `` `mysql` ``, `[mssql]`)
+    // then keeping only leading identifier characters so trailing punctuation is
+    // ignored. A case-preserving column such as PostgreSQL's `ORDER BY
+    // "OrderDate"` must validate against the same `tracking_column` that matches
+    // its unquoted driver label when reading rows.
+    let segment = key
         .rsplit('.')
         .next()
         .unwrap_or(key)
+        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+    let key_ident: String = segment
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect();
-    let tracking_lower = tracking_column.to_lowercase();
-    let tracking_ident = tracking_lower.rsplit('.').next().unwrap_or(&tracking_lower);
-    !key_ident.is_empty() && key_ident == tracking_ident
+    if key_ident.is_empty() {
+        return false;
+    }
+    // Normalize identically to the read-time path so validate-time cannot reject
+    // a config whose ORDER BY column would match a returned row at runtime.
+    let normalized = if snake_case_columns {
+        to_snake_case(&key_ident)
+    } else {
+        key_ident.clone()
+    };
+    tracking_column_matches(tracking_column, &key_ident, &normalized)
+}
+
+/// Return the text following the outer `ORDER BY` (the last `order by` token at
+/// parenthesis depth zero), or `None` if the query has no top-level ordering. An
+/// `ORDER BY` inside a subquery or a window function's `OVER (...)` sits at depth
+/// greater than zero and is ignored, so a window's internal ordering (which
+/// orders values within the frame, not the emitted ResultSet) is never mistaken
+/// for the row-emission order. Single-quoted string literals are skipped so a
+/// parenthesis or the words `order by` inside a literal cannot perturb the depth
+/// or produce a spurious match.
+fn outer_order_by(query: &str) -> Option<&str> {
+    const NEEDLE: &[u8] = b"order by";
+    let bytes = query.as_bytes();
+    // ASCII lowercasing is byte-length-preserving, so indices into `lower` map
+    // one-to-one onto `query`; this keeps the matched key in its original case.
+    let lower = query.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+    let mut depth: u32 = 0;
+    let mut in_quote = false;
+    let mut last_end = None;
+    for i in 0..bytes.len() {
+        let byte = bytes[i];
+        if in_quote {
+            if byte == b'\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' => in_quote = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && lower_bytes[i..].starts_with(NEEDLE)
+                && (i == 0 || !is_identifier_byte(bytes[i - 1])) =>
+            {
+                let end = i + NEEDLE.len();
+                if bytes.get(end).is_none_or(|next| !is_identifier_byte(*next)) {
+                    last_end = Some(end);
+                }
+            }
+            _ => {}
+        }
+    }
+    last_end.map(|end| query[end..].trim_start())
+}
+
+/// Whether a byte is part of an unquoted SQL identifier (ASCII alphanumeric or
+/// `_`), used to require whole-token boundaries around a matched keyword.
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Whether a configured `tracking_column` name refers to this result column.
@@ -1971,25 +2047,30 @@ mod tests {
     fn test_query_orders_by_tracking_column_accepts_valid() {
         assert!(query_orders_by_tracking_column(
             "SELECT * FROM t WHERE id > {last_offset} ORDER BY id",
-            "id"
+            "id",
+            false
         ));
         // Placeholder form, case/whitespace variance, explicit ASC.
         assert!(query_orders_by_tracking_column(
             "select * from t order by {tracking_column}",
-            "updated_at"
+            "updated_at",
+            false
         ));
         assert!(query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY Updated_At ASC",
-            "updated_at"
+            "updated_at",
+            false
         ));
         // Table-qualified column, and the outer ORDER BY after a subquery.
         assert!(query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY t.updated_at",
-            "updated_at"
+            "updated_at",
+            false
         ));
         assert!(query_orders_by_tracking_column(
             "SELECT * FROM (SELECT * FROM t ORDER BY x) s ORDER BY id",
-            "id"
+            "id",
+            false
         ));
     }
 
@@ -1998,31 +2079,120 @@ mod tests {
         // No ORDER BY.
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t WHERE id > 0",
-            "id"
+            "id",
+            false
         ));
         // Different column.
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY name",
-            "id"
+            "id",
+            false
         ));
         // Descending breaks ascending offset advancement.
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY updated_at DESC",
-            "updated_at"
+            "updated_at",
+            false
         ));
         // Substring-only match must not pass (id is a substring of valid_flag/id_backup).
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY valid_flag",
-            "id"
+            "id",
+            false
         ));
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY id_backup",
-            "id"
+            "id",
+            false
         ));
         // Tracking column not the primary (first) ordering term.
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t ORDER BY name, id",
-            "id"
+            "id",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_query_orders_by_tracking_column_ignores_window_order_by() {
+        // A window function's internal ORDER BY orders values within the frame,
+        // not the emitted ResultSet, so it must not satisfy the outer-ordering
+        // requirement even though it is the only `order by` in the text.
+        assert!(!query_orders_by_tracking_column(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM t",
+            "id",
+            false
+        ));
+        assert!(!query_orders_by_tracking_column(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM t WHERE id > {last_offset}",
+            "id",
+            false
+        ));
+        // A window ORDER BY plus a genuine outer ORDER BY is accepted on the outer.
+        assert!(query_orders_by_tracking_column(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY x) rn FROM t ORDER BY id",
+            "id",
+            false
+        ));
+        // A parenthesis inside a string literal must not shift the depth and hide
+        // the real outer ORDER BY.
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t WHERE note = 'a (b' ORDER BY id",
+            "id",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_query_orders_by_tracking_column_snake_case_matches_read_time() {
+        // snake_case_columns = true: a CamelCase ORDER BY column with a
+        // snake_cased tracking_column validates, mirroring tracking_column_matches
+        // so validate-time never rejects a config that reads rows correctly.
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY OrderDate",
+            "order_date",
+            true
+        ));
+        // Without normalization enabled the same pair does not match (the driver
+        // label would not be snake_cased at read time either).
+        assert!(!query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY OrderDate",
+            "order_date",
+            false
+        ));
+        // Raw label match still works regardless of the normalization flag.
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY OrderDate",
+            "orderdate",
+            true
+        ));
+    }
+
+    #[test]
+    fn test_query_orders_by_tracking_column_strips_identifier_quotes() {
+        // PostgreSQL preserves case only for quoted identifiers, so a genuinely
+        // CamelCase column is ordered as `"OrderDate"`; the surrounding quotes
+        // must not defeat the match against its unquoted driver label.
+        assert!(query_orders_by_tracking_column(
+            r#"SELECT * FROM t ORDER BY "OrderDate""#,
+            "order_date",
+            true
+        ));
+        assert!(query_orders_by_tracking_column(
+            r#"SELECT * FROM t ORDER BY "updated_at""#,
+            "updated_at",
+            false
+        ));
+        // MySQL backtick and SQL Server bracket quoting.
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY `updated_at`",
+            "updated_at",
+            false
+        ));
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY [updated_at]",
+            "updated_at",
+            false
         ));
     }
 

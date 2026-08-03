@@ -44,7 +44,7 @@ driver_jar_path = "/opt/jdbc-drivers/postgresql-42.6.0.jar"
 # Can include JOINs, aggregations, complex WHERE clauses, etc.
 query = """
 SELECT
-    p.product_id,\
+    p.product_id,
     p.product_name,
     p.category,
     p.price,

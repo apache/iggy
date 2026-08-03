@@ -225,9 +225,16 @@ connector refuses to start otherwise):
   `ORDER BY {tracking_column}` or the column name (optionally table-qualified,
   e.g. `ORDER BY t.updated_at`). A composite order such as `ORDER BY other, id`
   (tracking column not first) or a `DESC` order is rejected at `open()`.
-  The `ORDER BY` check is a lexical heuristic that validates single-block
-  `SELECT`s; `UNION`, window-function, or CTE queries may not be validated
-  correctly, so verify the result ordering yourself for those.
+  The `ORDER BY` check is a lexical heuristic, not a full SQL parser: it inspects
+  the last `ORDER BY` at parenthesis depth zero, so an `ORDER BY` inside a
+  subquery, CTE, or a window function's `OVER (...)` is ignored rather than
+  mistaken for the outer ordering (a query whose only ordering sits inside such a
+  construct is rejected, since it has no outer `ORDER BY`). A surrounding
+  identifier quote (`"OrderDate"`, `` `col` ``, `[col]`) and, when
+  `snake_case_columns` is set, snake_case folding are both accounted for, so the
+  same `tracking_column` that matches a row at read time also passes validation.
+  The check does not interpret `UNION`; for a multi-branch `UNION` verify the
+  result ordering yourself.
 
 The connector takes the tracking value of the **last row** of each ordered batch
 as the next cursor, so the cursor always matches the database's own `ORDER BY`.
