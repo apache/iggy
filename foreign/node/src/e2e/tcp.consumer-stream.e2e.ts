@@ -32,8 +32,10 @@ describe('e2e -> consumer-stream', async () => {
 
   const [host, port] = getIggyAddress();
   const credentials = { username: 'iggy', password: 'iggy' };
+  const vsr = process.env.IGGY_TEST_PROTOCOL === 'vsr';
 
   const opt = {
+    protocol: (vsr ? 'vsr' : 'classic') as 'vsr' | 'classic',
     transport: 'TCP' as const,
     options: { host, port },
     credentials
@@ -58,7 +60,11 @@ describe('e2e -> consumer-stream', async () => {
   it('e2e -> consumer-stream::send-messages', async () => {
     for (let i = 0; i < ct; i += 100) {
       await sendSomeMessages(c.clientProvider)(
-        streamName, topicName, Partitioning.MessageKey(`k-${i % 300}`)
+        streamName,
+        topicName,
+        vsr
+          ? Partitioning.PartitionId((i / 100) % 3)
+          : Partitioning.MessageKey(`k-${i % 300}`)
       );
     }
   });

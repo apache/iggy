@@ -33,18 +33,7 @@ fn main() -> Result<(), ServerNgError> {
     let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
         Err(e) => {
-            match e.kind() {
-                std::io::ErrorKind::InvalidInput => {
-                    server_common::diagnostics::print_invalid_io_uring_args_info();
-                }
-                std::io::ErrorKind::OutOfMemory => {
-                    server_common::diagnostics::print_locked_memory_limit_info();
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    server_common::diagnostics::print_io_uring_permission_info();
-                }
-                _ => {}
-            }
+            let e = server_common::diagnostics::enrich_runtime_create_error(e);
             panic!("Cannot create server-ng bootstrap executor: {e}");
         }
     };

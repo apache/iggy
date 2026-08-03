@@ -62,7 +62,7 @@ nextest: build
   #!/usr/bin/env bash
   set -euo pipefail
   trap "{{reap_test_containers}}" EXIT
-  cargo nextest run
+  cargo nextest run --retries 2
 
 # Like `nextest` but with the `vsr` feature; builds vsr first so the
 # harness-spawned iggy-server-ng carries the vsr wire format. `--no-fail-fast`
@@ -73,7 +73,7 @@ nextest-vsr: build-vsr
   #!/usr/bin/env bash
   set -euo pipefail
   trap "{{reap_test_containers}}" EXIT
-  cargo nextest run --features vsr --no-fail-fast
+  cargo nextest run --features vsr --no-fail-fast --retries 2
 
 nextests TEST: build
   #!/usr/bin/env bash

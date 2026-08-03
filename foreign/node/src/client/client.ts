@@ -21,6 +21,7 @@ import type { RawClient, ClientConfig } from "./client.type.js"
 import { getRawClient } from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
+import { normalizeClientConfig } from './client.config.js';
 
 
 /**
@@ -43,23 +44,25 @@ const createPoolFactory = (config: ClientConfig) => ({
  * Automatically acquires and releases clients from the pool.
  *
  * @param config - Client configuration including pool size options
- * @returns Client provider function with attached pool reference
+ * @returns Client provider and its connection pool
  */
-const poolClientProvider = (config: ClientConfig) => {
-  const min = config.poolSize?.min || 1;
-  const max = config.poolSize?.max || 4;
-  const pool = createPool(createPoolFactory(config), { min, max });
-  const poolClientProvider = async () => {
-    const c = await pool.acquire();
+const createPooledClientProvider = (config: ClientConfig) => {
+  const minPoolSize = config.poolSize?.min || 1;
+  const maxPoolSize = config.poolSize?.max || 4;
+  const pool = createPool(createPoolFactory(config), {
+    min: minPoolSize,
+    max: maxPoolSize
+  });
+  const clientProvider = async () => {
+    const client = await pool.acquire();
     debug('client acquired from pool. pool size is', pool.size);
-    c.once('finishQueue', () => {
-      pool.release(c)
+    client.once('finishQueue', () => {
+      pool.release(client)
       debug('client released to pool. pool size is', pool.size);
     });
-    return c;
+    return client;
   }
-  poolClientProvider._pool = pool;
-  return poolClientProvider;
+  return { clientProvider, pool };
 };
 
 
@@ -76,14 +79,16 @@ export class Client extends CommandAPI {
   /**
    * Creates a new pooled client.
    *
-   * @param config - Client configuration
-   */
+  * @param config - Client configuration
+  */
   constructor(config: ClientConfig) {
-    const pcp = poolClientProvider(config);
-    super(pcp);
-    this._config = config;
-    this._pool = pcp._pool;
-  };
+    const normalizedConfig = normalizeClientConfig(config);
+    const { clientProvider, pool } =
+      createPooledClientProvider(normalizedConfig);
+    super(clientProvider);
+    this._config = normalizedConfig;
+    this._pool = pool;
+  }
 
   /**
    * Destroys the client and drains all connections from the pool.
@@ -102,10 +107,10 @@ export class Client extends CommandAPI {
  * @param config - Client configuration
  * @returns Client provider function that always returns the same client
  */
-const singleClientProvider = (config: ClientConfig) => {
-  const c = getRawClient(config);
-  return async function singleClientProvider() {
-    return c;
+const createSingleClientProvider = (config: ClientConfig) => {
+  const client = getRawClient(config);
+  return async function clientProvider() {
+    return client;
   }
 }
 
@@ -120,10 +125,10 @@ export class SingleClient extends CommandAPI {
   /**
    * Creates a new single-connection client.
    *
-   * @param config - Client configuration
-   */
+  * @param config - Client configuration
+  */
   constructor(config: ClientConfig) {
-    super(singleClientProvider(config));
+    super(createSingleClientProvider(config));
     this._config = config;
   }
 
@@ -131,10 +136,10 @@ export class SingleClient extends CommandAPI {
    * Destroys the client connection.
    */
   async destroy() {
-    const s = await this.clientProvider();
-    s.destroy();
+    const client = await this.clientProvider();
+    client.destroy();
   }
-};
+}
 
 
 /**
@@ -155,11 +160,11 @@ export class SimpleClient extends CommandAPI {
    * Destroys the underlying client connection.
    */
   async destroy() {
-    const s = await this.clientProvider();
-    s.destroy();
+    const client = await this.clientProvider();
+    client.destroy();
   }
 
-};
+}
 
 /**
  * Creates a SimpleClient with the given configuration.
@@ -169,6 +174,6 @@ export class SimpleClient extends CommandAPI {
  * @returns SimpleClient instance
  */
 export const getClient = async (config: ClientConfig) => {
-  const cli = getRawClient(config);
-  return new SimpleClient(cli);
+  const client = getRawClient(config);
+  return new SimpleClient(client);
 };

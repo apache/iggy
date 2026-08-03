@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::{POLL_CONVERGENCE_TIMEOUT, POLL_RETRY_INTERVAL};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::Credentials;
@@ -283,7 +284,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         std::slice::from_ref(&active_segment_offset),
     )
     .await;
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
     assert_segment_file_sizes(
         &partition_path,
         std::slice::from_ref(&active_segment_offset),
@@ -422,7 +423,7 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
     // Only the active segment remains — delete is a no-op
     let active = *layout.last().expect("layout is non-empty");
     await_segment_layout(&partition_path, std::slice::from_ref(&active)).await;
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
 
     client
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
@@ -580,7 +581,7 @@ pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
         [*EXPECTED_SEGMENT_OFFSETS.last().unwrap()],
         "Only active segment remains after consuming all messages"
     );
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
 
     // Cleanup: consumer group auto-managed, just delete stream resources
     drop(consumer);
@@ -818,7 +819,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .unwrap();
     maybe_restart(harness, restart_server).await;
     await_segment_layout(&partition_path, &active_only).await;
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
 
     // Cleanup: drop high-level consumer, delete stream resources
     drop(fast_consumer);
@@ -956,14 +957,16 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     // Verify offset files exist on disk
     let consumers_dir = format!("{partition_path}/offsets/consumers");
     let groups_dir = format!("{partition_path}/offsets/groups");
-    assert!(
-        !is_dir_empty(&consumers_dir),
-        "Consumer offset file must exist before purge"
-    );
-    assert!(
-        !is_dir_empty(&groups_dir),
-        "Consumer group offset file must exist before purge"
-    );
+    await_dir_not_empty(
+        &consumers_dir,
+        "Consumer offset file must exist before purge",
+    )
+    .await;
+    await_dir_not_empty(
+        &groups_dir,
+        "Consumer group offset file must exist before purge",
+    )
+    .await;
 
     // --- Purge topic ---
     // Drop high-level consumer before purge to release group membership
@@ -1301,6 +1304,21 @@ fn get_sorted_segment_offsets(partition_path: &str) -> Vec<u64> {
     offsets
 }
 
+/// Wait until `dir` contains at least one entry, panicking with `context`
+/// once [`POLL_CONVERGENCE_TIMEOUT`] expires.
+///
+/// A stored consumer offset is served from memory as soon as the store is
+/// acked, while the offset file is created asynchronously, so a single-shot
+/// existence check can run ahead of the flush. An offset that is never
+/// flushed still fails once the deadline expires.
+async fn await_dir_not_empty(dir: &str, context: &str) {
+    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    while is_dir_empty(dir) {
+        assert!(std::time::Instant::now() < deadline, "{context}");
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
+}
+
 fn is_dir_empty(dir: &str) -> bool {
     read_dir(dir)
         .map(|mut entries| entries.next().is_none())
@@ -1335,20 +1353,28 @@ fn assert_fresh_empty_partition(partition_path: &str) {
     );
 }
 
-/// Asserts no orphaned segment files remain after deletion.
-/// `get_sorted_segment_offsets` only checks .log files — this additionally verifies
-/// that the .index file count matches, catching stale .index files left behind.
-fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: usize) {
-    let log_count = count_files_with_ext(partition_path, LOG_EXTENSION);
-    let index_count = count_files_with_ext(partition_path, INDEX_EXTENSION);
-    assert_eq!(
-        log_count, expected_count,
-        "Expected {expected_count} .log files, found {log_count}"
-    );
-    assert_eq!(
-        index_count, expected_count,
-        "Expected {expected_count} .index files, found {index_count}"
-    );
+/// Asserts no orphaned segment files remain after deletion, polling until the
+/// counts converge or [`POLL_CONVERGENCE_TIMEOUT`] expires.
+///
+/// `get_sorted_segment_offsets` only checks .log files -- this additionally
+/// verifies that the .index file count matches, catching stale .index files
+/// left behind. server-ng unlinks a segment's .log and .index files across
+/// separate awaits, so a layout that already converged on .log files can
+/// transiently show one extra .index file.
+async fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: usize) {
+    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    loop {
+        let log_count = count_files_with_ext(partition_path, LOG_EXTENSION);
+        let index_count = count_files_with_ext(partition_path, INDEX_EXTENSION);
+        if log_count == expected_count && index_count == expected_count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Expected {expected_count} .log and .index files, found {log_count} .log and {index_count} .index"
+        );
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
 }
 
 fn count_files_with_ext(dir: &str, ext: &str) -> usize {

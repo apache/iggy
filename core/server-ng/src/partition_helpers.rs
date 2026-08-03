@@ -487,14 +487,25 @@ pub async fn build_partition_fresh(
             source
         })?;
 
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
         bus,
-        LocalPipeline::new(),
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
+    consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(crate::bootstrap::commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(crate::bootstrap::prepare_retransmit_ticks(config));
+    consensus
+        .set_view_change_retransmit_ticks(crate::bootstrap::view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(crate::bootstrap::view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(crate::bootstrap::request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
     // A partition directory that already holds segment bytes is a RESTART
     // materialization, not a fresh create: this replica's group state died
     // with the process, so claiming view-0 primaryship would heartbeat
@@ -512,6 +523,14 @@ pub async fn build_partition_fresh(
     }
 
     let mut partition = IggyPartition::new(stats, consensus);
+    // Surface the evicted-ring ceilings from config onto the fresh journal.
+    // IggyPartition::new has already disabled retention for single-replica
+    // groups (nobody to serve), so this only sizes the multi-replica ring; the
+    // caps are inert while retention is off.
+    partition.log.journal().inner.set_ring_caps(
+        config.partition.evicted_ring_capacity,
+        config.partition.evicted_ring_bytes_max.as_bytes_u64(),
+    );
     partition.set_partition_dir(config.system.get_partition_path(
         stream_id,
         topic_id,

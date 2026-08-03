@@ -16,23 +16,16 @@
 // under the License.
 //
 
-import { type Id } from '../identifier.utils.js';
-import { serializeTargetGroup } from './group.utils.js';
+import {
+  serializeTargetGroup,
+  type TargetGroup,
+} from './group.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
-/**
- * Parameters for the delete consumer group command.
- */
-export type DeleteGroup = {
-  /** Stream identifier (ID or name) */
-  streamId: Id,
-  /** Topic identifier (ID or name) */
-  topicId: Id,
-  /** Consumer group identifier (ID or name) */
-  groupId: Id
-};
+/** Parameters for the delete consumer group command. */
+export type DeleteGroup = TargetGroup;
 
 /**
  * Delete consumer group command definition.

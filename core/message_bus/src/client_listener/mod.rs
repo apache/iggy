@@ -104,8 +104,9 @@ pub mod wss;
 /// with the `TcpSocket` builder; this preserves the prior `nodelay(true)`
 /// bind. `SO_REUSEADDR` is set so a restarted server can rebind the port
 /// while a previous client connection lingers in `TIME_WAIT` (matching the
-/// replica and QUIC listeners); `SO_REUSEPORT` is intentionally not set:
-/// only shard 0 binds the client listeners (see each caller).
+/// replica and TLS listeners; QUIC sets no reuse flag since UDP has no
+/// `TIME_WAIT`); `SO_REUSEPORT` is intentionally not set: only shard 0
+/// binds the client listeners (see each caller).
 ///
 /// # Errors
 ///
@@ -130,7 +131,7 @@ pub async fn bind_nodelay_listener(
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let listener = socket
-        .listen(128)
+        .listen(libc::SOMAXCONN)
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener

@@ -52,7 +52,12 @@ pub fn resolve_config_paths(
         };
 
         let mapping = ServerConfig::find_by_config_path(resolved_path)
-            .or_else(|| ServerConfig::find_by_config_path(&format!("system.{}", resolved_path)));
+            .or_else(|| ServerConfig::find_by_config_path(&format!("system.{}", resolved_path)))
+            // Fields that exist only in the next-gen server's config (e.g.
+            // `metadata.*`, `cluster.*`, `message_bus.*`). Env names share
+            // the `IGGY_` prefix, so the resolved variable reaches whichever
+            // binary the harness spawns; the legacy server ignores unknowns.
+            .or_else(|| configs::server_ng::ServerNgConfig::find_by_config_path(resolved_path));
 
         match mapping {
             Some(m) => {

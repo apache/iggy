@@ -1,0 +1,26 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Dedicated scratch config_dir (see cdc_restart_connectors/): this test posts
+# new plugin_config versions at runtime via the local config provider, which
+# globs every *.toml under config_dir on startup. Pointing that at the shared
+# ../connectors/sources/postgres_source directory (used by other postgres
+# source tests) would let a stray version leak into whichever of those tests
+# happens to boot its own runtime while this one is mid-run.
+[connectors]
+config_type = "local"
+config_dir = "tests/connectors/postgres/cdc_restart_connectors"

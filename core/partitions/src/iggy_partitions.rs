@@ -479,7 +479,7 @@ where
             let consensus = partition.consensus();
             let lagging = consensus.is_follower()
                 || !consensus.is_normal()
-                || consensus.is_syncing()
+                || consensus.is_transferring()
                 || consensus.commit_min() < consensus.commit_max();
             (partition.nth_oldest_sealed_end_offset(count), lagging)
         })

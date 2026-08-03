@@ -25,6 +25,7 @@ services:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
       - BDD_FEATURE=${BDD_FEATURE:-all}
+      - BDD_RUST_FEATURES=${BDD_RUST_FEATURES:-bdd}
       - RUST_LOG=debug
       - RUSTFLAGS=-C linker=gcc
     volumes:
@@ -36,10 +37,10 @@ services:
       - -c
       - |
         case "$$BDD_FEATURE" in
-          basic_messaging)    cargo test -p bdd --features bdd --test basic_messaging ;;
-          leader_redirection) cargo test -p bdd --features bdd --test leader_redirection ;;
-          raw_command)        cargo test -p bdd --features bdd --test raw_command ;;
-          *)                  cargo test -p bdd --features bdd ;;
+          basic_messaging)    cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging ;;
+          leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
+          raw_command)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test raw_command ;;
+          *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
     networks:
       - iggy-bdd-network

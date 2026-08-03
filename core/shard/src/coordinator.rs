@@ -58,6 +58,16 @@ use std::cell::Cell;
 use std::rc::Rc;
 use tracing::warn;
 
+/// Bit position of the target-shard tag inside a minted client id: the top 16
+/// bits carry the shard, the bottom 112 the mint sequence.
+const CLIENT_ID_SHARD_SHIFT: u32 = 112;
+
+/// Sequence half of a minted client id. The tag above it is the inter-shard
+/// reply routing key (`message_bus::client_id_owning_shard`), so a sequence
+/// that bled past this mask would silently re-route a connection's replies to
+/// another shard for the process lifetime.
+const CLIENT_SEQUENCE_MASK: u128 = (1 << CLIENT_ID_SHARD_SHIFT) - 1;
+
 /// Coordinator owned by shard 0 only.
 ///
 /// Wrapped in `Rc` by the bootstrap and shared with the replica listener,
@@ -79,6 +89,10 @@ pub struct ShardZeroCoordinator {
     replica_rr: Cell<u16>,
     client_rr: Cell<u16>,
     client_seq: Cell<u128>,
+    /// View the mint counter was last seeded for. `None` until the first seed.
+    /// Tracked so [`Self::seed_client_sequence`] can be called on the minting
+    /// path and fold the table exactly once per view instead of per mint.
+    seeded_view: Cell<Option<u32>>,
 }
 
 impl ShardZeroCoordinator {
@@ -111,6 +125,7 @@ impl ShardZeroCoordinator {
             replica_rr: Cell::new(0),
             client_rr: Cell::new(0),
             client_seq: Cell::new(1),
+            seeded_view: Cell::new(None),
         })
     }
 
@@ -140,10 +155,70 @@ impl ShardZeroCoordinator {
 
     /// Mint a client id encoding `target_shard` in the top 16 bits and a
     /// monotonic per-coordinator counter in the bottom 112 bits.
+    ///
+    /// The sequence is masked into its half of the id. Counting there cannot
+    /// reach 2^112, but the counter is also SEEDED from recovered client-table
+    /// ids ([`Self::seed_client_sequence`]), and those include values a client
+    /// supplied on the wire -- so without the mask a chosen id near the top of
+    /// the range would, after a restart, push the next mint's carry into the
+    /// shard tag and misroute that connection's replies. Zero is skipped
+    /// because the wire header rejects `client == 0`.
     fn mint_client_id(&self, target_shard: u16) -> u128 {
-        let seq = self.client_seq.get();
-        self.client_seq.set(seq.wrapping_add(1));
-        (u128::from(target_shard) << 112) | seq
+        let mut seq = self.client_seq.get() & CLIENT_SEQUENCE_MASK;
+        if seq == 0 {
+            seq = 1;
+        }
+        self.client_seq
+            .set(seq.wrapping_add(1) & CLIENT_SEQUENCE_MASK);
+        (u128::from(target_shard) << CLIENT_ID_SHARD_SHIFT) | seq
+    }
+
+    /// Reseed the mint counter above every sequence in `recovered_ids`, once
+    /// per `view`.
+    ///
+    /// The counter is per process and starts at 1, while the client table it
+    /// must not collide with is REPLICATED -- so it holds ids minted by other
+    /// nodes' counters, and by this node's previous boot. Left alone, a mint
+    /// lands on an id that is already taken: a different user's login is then
+    /// refused outright (the register ownership gate), and the same user's
+    /// rebinds and inherits a watermark it never wrote. Seeding past the
+    /// table's high-water mark makes that unreachable instead of handled.
+    ///
+    /// Two moments need it, which is why `view` is the key rather than "call
+    /// this at boot": startup, where the table was rebuilt from the previous
+    /// boot's WAL, and PROMOTION, where a node starts minting against ids its
+    /// predecessor committed from an unrelated counter. A view change is the
+    /// observable edge for the second, and re-seeding for a view already
+    /// covered is skipped, so this is cheap enough to call from the minting
+    /// path.
+    ///
+    /// Never lowers the counter, so a redundant call cannot hand back an id
+    /// this process already minted.
+    ///
+    /// Only ids whose tag names a shard of this node are folded in. The table
+    /// also holds ids a client chose for itself (the TCP login path takes
+    /// `client` straight off the wire), and those carry arbitrary tags; folding
+    /// them would let one login steer this node's counter. A chosen id with a
+    /// *plausible* tag can still move it, which is why the mint masks -- the
+    /// worst case is then a counter that wraps low and collides with live
+    /// entries, which the register ownership gate refuses rather than
+    /// mis-serves.
+    pub fn seed_client_sequence(&self, view: u32, recovered_ids: impl Iterator<Item = u128>) {
+        if self.seeded_view.get() == Some(view) {
+            return;
+        }
+        self.seeded_view.set(Some(view));
+        let highest = recovered_ids
+            .filter(|id| (id >> CLIENT_ID_SHARD_SHIFT) < u128::from(self.total_shards))
+            .map(|id| id & CLIENT_SEQUENCE_MASK)
+            .max();
+        let Some(highest) = highest else {
+            return;
+        };
+        let next = highest.saturating_add(1) & CLIENT_SEQUENCE_MASK;
+        if next > self.client_seq.get() {
+            self.client_seq.set(next);
+        }
     }
 
     /// Mint a client id for a connection that terminates locally on shard 0
@@ -484,6 +559,157 @@ mod tests {
         let id = coord.mint_client_id(5);
         assert_eq!((id >> 112) as u16, 5);
         assert_eq!(id & ((1u128 << 112) - 1), 1, "first seq is 1");
+    }
+
+    // A restarted node recovers table entries keyed by the previous boot's
+    // ids while the minter restarts at 1. Reseeding past the recovered
+    // high-water mark is what keeps a fresh login off an existing entry.
+    #[test]
+    fn seed_client_sequence_mints_above_recovered_ids() {
+        let senders = build_senders(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        // Recovered ids carry their own shard tags; only the sequence matters.
+        let recovered = [
+            (1u128 << CLIENT_ID_SHARD_SHIFT) | 0x07,
+            (3u128 << CLIENT_ID_SHARD_SHIFT) | 0x2a,
+            9,
+        ];
+        // total_shards is 4, so tags 1 and 3 are this node's and fold in.
+        coord.seed_client_sequence(0, recovered.into_iter());
+
+        let id = coord.mint_client_id(2);
+        assert_eq!(
+            id & ((1u128 << CLIENT_ID_SHARD_SHIFT) - 1),
+            0x2b,
+            "must mint above the highest recovered sequence"
+        );
+        assert_eq!((id >> CLIENT_ID_SHARD_SHIFT) as u16, 2, "tag preserved");
+    }
+
+    // Never lower the counter: a later reseed (or an empty table) must not
+    // hand back ids this process already minted.
+    #[test]
+    fn seed_client_sequence_never_lowers_the_counter() {
+        let senders = build_senders(2);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            2,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        for _ in 0..5 {
+            let _ = coord.mint_client_id(0);
+        }
+        coord.seed_client_sequence(0, std::iter::empty());
+        coord.seed_client_sequence(1, [1u128, 2].into_iter());
+
+        let id = coord.mint_client_id(0);
+        assert_eq!(
+            id & ((1u128 << CLIENT_ID_SHARD_SHIFT) - 1),
+            6,
+            "counter must keep advancing from where minting left off"
+        );
+    }
+
+    // The sequence must never carry into the shard tag: that tag is the
+    // inter-shard reply routing key, so a carry would send a live connection's
+    // replies to a different shard for the process lifetime. Reachable only
+    // because the counter is seeded from recovered ids, and the TCP login path
+    // takes `client` straight off the wire -- so a client can choose one near
+    // the ceiling and a restart folds it in.
+    #[test]
+    fn mint_never_carries_the_sequence_into_the_shard_tag() {
+        let senders = build_senders(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        // A chosen id with a plausible tag, sequence at the ceiling.
+        coord.seed_client_sequence(0, std::iter::once(CLIENT_SEQUENCE_MASK));
+        for _ in 0..4 {
+            let id = coord.mint_shard_zero_client_id();
+            assert_eq!(
+                id >> CLIENT_ID_SHARD_SHIFT,
+                0,
+                "shard-0 mint must keep tag 0, got id {id:#x}"
+            );
+            assert_ne!(id, 0, "the wire header rejects client == 0");
+        }
+    }
+
+    // Ids a client chose for itself carry arbitrary tags. Folding those into
+    // this node's counter would let one login steer it.
+    #[test]
+    fn seed_ignores_ids_tagged_outside_this_node() {
+        let senders = build_senders(2);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            2,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        // Tag 9 is not a shard of a 2-shard node: caller-supplied, ignored.
+        coord.seed_client_sequence(
+            0,
+            std::iter::once((9u128 << CLIENT_ID_SHARD_SHIFT) | 0x0f_ff_ff),
+        );
+        assert_eq!(
+            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
+            1,
+            "an id tagged outside this node must not move the counter"
+        );
+    }
+
+    // Promotion is the second moment the counter can be wrong: the new primary
+    // mints against ids its predecessor committed from an unrelated counter.
+    // A view change is the observable edge, and re-seeding within one view is
+    // skipped so this is cheap enough to sit on the minting path.
+    #[test]
+    fn seed_refolds_the_table_once_per_view() {
+        let senders = build_senders(2);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            2,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        coord.seed_client_sequence(4, std::iter::once(0x10));
+        assert_eq!(
+            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
+            0x11
+        );
+
+        // Same view: the table is not refolded, so a later entry is ignored.
+        coord.seed_client_sequence(4, std::iter::once(0x80));
+        assert_eq!(
+            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
+            0x12
+        );
+
+        // Promotion: new view, so the predecessor's high-water mark is folded.
+        coord.seed_client_sequence(5, std::iter::once(0x80));
+        assert_eq!(
+            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
+            0x81,
+            "a promoted primary must mint above what its predecessor committed"
+        );
     }
 
     #[test]
