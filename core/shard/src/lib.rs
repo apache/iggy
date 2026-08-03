@@ -1034,6 +1034,11 @@ where
     /// function of the namespaces alone.
     reparked_partition_namespaces: RefCell<BTreeSet<IggyNamespace>>,
 
+    /// Set while the shard-wide budget is shedding for namespaces holding no
+    /// park entry of their own, which have no [`ParkEntry::shed`] to warn once
+    /// from. Cleared when the park map empties, so one episode warns once.
+    shard_park_shedding: Cell<bool>,
+
     /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
     /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
     /// `[cluster] repair_chunk_max` at bootstrap.
@@ -1164,6 +1169,7 @@ where
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             reparked_partition_namespaces: RefCell::new(BTreeSet::new()),
+            shard_park_shedding: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             metadata_transfer_offers: RefCell::new(HashMap::new()),
@@ -1401,6 +1407,7 @@ where
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             reparked_partition_namespaces: RefCell::new(BTreeSet::new()),
+            shard_park_shedding: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             metadata_transfer_offers: RefCell::new(HashMap::new()),
@@ -1762,7 +1769,14 @@ impl ParkEntry {
     }
 }
 
-/// Per-namespace ceiling on parked frames.
+/// Per-namespace ceiling on parked CLIENT REQUESTS.
+///
+/// Requests only, like the byte budgets: a header-only frame charges
+/// [`MESSAGE_ALIGN`], so 128 of them is 512 KiB against a 4 MiB per-namespace
+/// budget. Applied to prepares this would be the binding constraint for every
+/// footprint under 32 KiB and would shed them long before any byte budget could,
+/// which is the loss class the split exists to remove. A prepare is bounded by
+/// [`MAX_PARKED_BYTES_PER_NAMESPACE`] instead: 1024 header-only frames.
 const MAX_PARKED_PER_NAMESPACE: usize = 128;
 
 /// Shard-wide ceiling on parked bytes, measured as resident footprint (see
@@ -2019,15 +2033,21 @@ where
         self.reparked_partition_namespaces
             .borrow_mut()
             .remove(&namespace);
-        let entry = self
-            .pending_partition_frames
-            .borrow_mut()
-            .remove(&namespace)?;
+        let (entry, converged) = {
+            let mut pending = self.pending_partition_frames.borrow_mut();
+            let entry = pending.remove(&namespace)?;
+            let converged = pending.is_empty();
+            (entry, converged)
+        };
         self.parked_partition_bytes.set(
             self.parked_partition_bytes
                 .get()
                 .saturating_sub(entry.bytes),
         );
+        if converged {
+            // Episode over: the next entryless shed is a new one and warns.
+            self.shard_park_shedding.set(false);
+        }
         Some(entry.frames)
     }
 
@@ -2104,7 +2124,10 @@ where
     /// A frame the inbox refuses is re-parked: retained, so not counted as a
     /// drop. Re-queuing appends, so a pass materialising many namespaces can
     /// overrun the inbox; staging a deny is futile because it rides the same
-    /// sender with no await in between. The first `Full` ends the loop, since
+    /// sender with no await in between. One namespace alone can now do it, since
+    /// [`MAX_PARKED_BYTES_PER_NAMESPACE`] admits 1024 header-only prepares
+    /// against a default `inbox_capacity` of 1024. That costs other namespaces a
+    /// later convergence, not a frame. The first `Full` ends the loop, since
     /// the sole consumer of `senders[self.id]` is the pump task running this
     /// call and no later frame can find a slot the first one could not.
     ///
@@ -2274,8 +2297,9 @@ where
         count
     }
 
-    /// How many frames are parked under `namespace`. Bounded by
-    /// `MAX_PARKED_PER_NAMESPACE`; a shed frame must never grow it past that.
+    /// How many frames are parked under `namespace`. Client requests are bounded
+    /// by `MAX_PARKED_PER_NAMESPACE`, prepares by
+    /// `MAX_PARKED_BYTES_PER_NAMESPACE`; a shed frame must never grow either.
     ///
     /// Test/simulator accessor: nothing in production branches on a per-namespace
     /// park depth, and gating keeps it that way.
@@ -2430,21 +2454,37 @@ where
         } else {
             parked_bytes.saturating_add(frame_cost) > MAX_PARKED_BYTES
         };
-        if parked_len >= MAX_PARKED_PER_NAMESPACE || namespace_budget_spent || shard_budget_spent {
+        // The frame cap is request-only for the same reason. Applied to both it
+        // would be the binding constraint for any footprint under
+        // `MAX_PARKED_BYTES_PER_NAMESPACE / MAX_PARKED_PER_NAMESPACE` (32 KiB),
+        // so header-only prepares would shed at 128 frames, 512 KiB into a 4 MiB
+        // budget, and the byte budgets above would never get a say.
+        let frame_cap_spent = !replicated && parked_len >= MAX_PARKED_PER_NAMESPACE;
+        if frame_cap_spent || namespace_budget_spent || shard_budget_spent {
             self.metrics.record_frame_drop(
                 crate::metrics::frame_drop_variant::PARTITION,
                 crate::metrics::frame_drop_reason::PARK_OVERFLOW,
             );
-            // Warn once per namespace on the transition into shedding, then
-            // `debug`. A full buffer is this branch's trigger, not a rate limit:
-            // every later frame lands here too, and one formatted `warn` apiece
-            // is enough for the non-blocking appender to shed unrelated lines.
-            // The counter carries the volume.
-            let first_shed = existing.is_none_or(|entry| {
-                let first = entry.shed == 0;
-                entry.shed = entry.shed.saturating_add(1);
-                first
-            });
+            // Warn once per namespace on entering the shed, then `debug`: a
+            // full buffer is this branch's trigger, not a rate limit, so every
+            // later frame lands here too, and one formatted `warn` apiece makes
+            // the non-blocking appender shed unrelated lines. The counter
+            // carries the volume.
+            //
+            // An entryless namespace has no `ParkEntry::shed` to gate on and is
+            // reachable only via the shard-wide budget (the other two conditions
+            // need a non-empty entry), which is the many-namespace burst
+            // `MAX_PARKED_BYTES` is sized for. Hence the shard-level gate, and
+            // not `entry().or_default()`, which leaves the empty entry the read
+            // above avoids.
+            let first_shed = match existing {
+                Some(entry) => {
+                    let first = entry.shed == 0;
+                    entry.shed = entry.shed.saturating_add(1);
+                    first
+                }
+                None => !self.shard_park_shedding.replace(true),
+            };
             if first_shed {
                 tracing::warn!(
                     shard = self.id,

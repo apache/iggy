@@ -91,14 +91,18 @@
 //! shed request costs a retry: answered with a retriable status, re-issued by
 //! the SDK. A shed prepare is permanent loss on this replica, with no client to
 //! answer and `consensus::retransmit_targets` skipping any op that already
-//! reached quorum. So a request is refused the moment admitting it would cross a
-//! budget, and answered once it outlives `MAX_PARKED_PASSES`; a prepare never
-//! expires by age and is refused only once a budget is already spent. That caps
-//! prepare residency at one frame of overshoot per budget instead of at the
-//! budget, and is what makes an oversize frame parkable at all: measured against
-//! an empty entry, a 5 MiB append would fail the per-namespace check on every
-//! attempt. A parked prepare is destroyed only for a namespace this shard cannot
-//! serve at all, tombstoned or not hashing here.
+//! reached quorum.
+//!
+//! All three bind a request: refused when admitting it would cross a byte budget
+//! or the frame cap, answered past `MAX_PARKED_PASSES`. Only the byte budgets
+//! bind a prepare, and only once one is spent. Excluding the frame cap is
+//! deliberate: a header-only frame charges `MESSAGE_ALIGN`, so 128 is 512 KiB
+//! against a 4 MiB namespace budget, and a shared cap would shed small prepares
+//! before any byte budget spoke. Prepares admit 1024 header-only frames per
+//! namespace, overshooting each budget by one frame rather than stopping at it,
+//! which also makes an oversize frame parkable: against an empty entry a 5 MiB
+//! append fails the per-namespace check every attempt. A parked prepare dies only
+//! for a namespace this shard cannot serve, tombstoned or not hashing here.
 //!
 //! Everything leaving the buffer unserved is counted under
 //! `frame_drops_total{variant=partition}`: `park_overflow` when shed on arrival,
@@ -117,7 +121,7 @@
 //! in `on_start_view` -- `tick_partitions` re-drives an existing session but
 //! cannot open one -- so the backup stays behind `commit_max` until an unrelated
 //! view change. It needs a normal-status repair driver. The park policy above
-//! shrinks the exposure to two cases, a genuinely exhausted budget and a
+//! shrinks the exposure to two cases, a genuinely exhausted byte budget and a
 //! namespace this shard cannot serve, but only the repair driver removes it.
 //!
 //! TODO(krishna): the park stamp is not stable across re-entry. A re-dispatched
@@ -3180,6 +3184,61 @@ mod tests {
         );
     }
 
+    /// The frame cap is request-only. Applied to prepares it is the binding
+    /// constraint for any footprint under `NAMESPACE_BUDGET / PARK_CAP` (32 KiB),
+    /// so header-only prepares would shed at 128 frames, 512 KiB into a 4 MiB
+    /// budget, and the byte budgets would never speak. Small-append prepares
+    /// would then be destroyed exactly as before the class split, at every
+    /// replica count: quorum always leaves at least one surplus backup, so a
+    /// lagging one loses shed prepares with nobody noticing.
+    #[compio::test]
+    async fn the_frame_cap_bounds_requests_only_so_small_prepares_reach_the_byte_budget() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-frame-cap");
+        seed_topic(&mux, 2, 0, "topic-frame-cap", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        // Well past the frame cap, prepares keep parking.
+        let beyond_cap = PARK_CAP + 72;
+        for op in 0..beyond_cap {
+            park_one_prepare(&shard, ns, op as u64).await;
+        }
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            beyond_cap,
+            "the frame cap must not shed prepares"
+        );
+        assert_eq!(park_overflow_count(&shard), 0);
+
+        // A request into that same deep entry is still capped.
+        park_one_request(&shard, ns).await;
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            beyond_cap,
+            "a request past the cap must still be shed"
+        );
+        assert_eq!(park_overflow_count(&shard), 1);
+
+        // The per-namespace byte budget is what finally stops the prepares.
+        for op in beyond_cap..=HEADER_FRAMES_PER_NAMESPACE {
+            park_one_prepare(&shard, ns, op as u64).await;
+        }
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            HEADER_FRAMES_PER_NAMESPACE,
+            "prepares must admit up to the byte budget, not the frame cap"
+        );
+        assert_eq!(
+            park_overflow_count(&shard),
+            2,
+            "and the frame crossing the byte budget is the only further shed"
+        );
+    }
+
     /// The frame cap bounds count, not residency: `Message::into_generic` is a
     /// retag, so each entry keeps its whole buffer, up to 64 MiB. With only a
     /// frame cap one namespace could pin 128 x 64 MiB, so bytes must bite first.
@@ -3249,16 +3308,22 @@ mod tests {
         );
 
         // One frame into an empty entry: per-namespace waived, shard-wide not.
-        let crossing = IggyNamespace::new(0, filled, 0);
-        shard
-            .on_message(build_partition_request_sized(crossing, MIB_BODY))
-            .await;
-        assert_eq!(
-            shard.parked_frame_count(crossing),
-            0,
-            "the frame that would cross the shard-wide budget must be shed"
-        );
-        assert_eq!(park_overflow_count(&shard), 1);
+        // Two distinct fresh namespaces, so the entryless shed path runs twice.
+        // It has no `ParkEntry` to warn once from and is gated shard-wide
+        // instead; the gate is log volume only, so the counter still records
+        // every shed.
+        for offset in 0..2 {
+            let crossing = IggyNamespace::new(0, filled + offset, 0);
+            shard
+                .on_message(build_partition_request_sized(crossing, MIB_BODY))
+                .await;
+            assert_eq!(
+                shard.parked_frame_count(crossing),
+                0,
+                "the frame that would cross the shard-wide budget must be shed"
+            );
+        }
+        assert_eq!(park_overflow_count(&shard), 2);
     }
 
     /// A refused re-dispatch re-parks the frame, and by then the namespace is
@@ -3394,6 +3459,11 @@ mod tests {
     /// pushes a 1 MiB body into the next page.
     const MIB_BODY: usize = 1024 * 1024;
     const MIB_FOOTPRINT: usize = MIB_BODY + 4096;
+    /// Footprint of a header-only frame: buffers are `MESSAGE_ALIGN`-granular.
+    const HEADER_FOOTPRINT: usize = 4096;
+    /// Header-only frames one namespace admits before its byte budget refuses
+    /// more. Requests stop at [`PARK_CAP`] long before this; prepares do not.
+    const HEADER_FRAMES_PER_NAMESPACE: usize = NAMESPACE_BUDGET / HEADER_FOOTPRINT;
     /// [`MIB_BODY`] frames one namespace admits before its budget refuses more.
     const PER_NAMESPACE_MIB_FRAMES: usize = NAMESPACE_BUDGET / MIB_FOOTPRINT;
     /// Mirrors `MAX_PARKED_PASSES`.
