@@ -116,6 +116,7 @@ pub(crate) fn make_client_request_handler<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> RequestHandler
 where
     B: ShellBus,
@@ -144,6 +145,7 @@ where
             Rc::clone(&shard),
             Rc::clone(&sessions),
             Arc::clone(&system_config),
+            max_tokens_per_user,
             Rc::clone(&queues),
             Rc::clone(&active),
             client_id,
@@ -339,7 +341,7 @@ fn submit_auto_commit<B, MJ, S>(
         .partitions()
         .with_partition(&namespace, |partition| {
             let consensus = partition.consensus();
-            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
                 AutoCommitGate::NotPrimary
             } else if partition.is_auto_commit_offset_covered(
                 applied.kind,
@@ -444,6 +446,7 @@ pub(crate) fn make_deferred_client_request_handler<B, MJ, S>(
     shard_handle: &ShellShardHandle<B, MJ, S>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> RequestHandler
 where
     B: ShellBus,
@@ -486,7 +489,16 @@ where
                 active.borrow_mut().remove(&client_id);
                 return;
             };
-            drain_client_requests(shard, sessions, system_config, queues, active, client_id).await;
+            drain_client_requests(
+                shard,
+                sessions,
+                system_config,
+                max_tokens_per_user,
+                queues,
+                active,
+                client_id,
+            )
+            .await;
         });
     })
 }
@@ -620,10 +632,12 @@ where
 // An unbound transport sending a replicated frame therefore gets the
 // empty-reply fail-fast below and must log in.
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue_client_request<B, MJ, S>(
     shard: Rc<ShellShard<B, MJ, S>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -645,7 +659,16 @@ fn enqueue_client_request<B, MJ, S>(
 
     let bus = shard.bus.clone();
     bus.spawn(async move {
-        drain_client_requests(shard, sessions, system_config, queues, active, client_id).await;
+        drain_client_requests(
+            shard,
+            sessions,
+            system_config,
+            max_tokens_per_user,
+            queues,
+            active,
+            client_id,
+        )
+        .await;
     });
 }
 
@@ -654,6 +677,7 @@ async fn drain_client_requests<B, MJ, S>(
     shard: Rc<ShellShard<B, MJ, S>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -667,7 +691,15 @@ async fn drain_client_requests<B, MJ, S>(
         let Some(message) = pop_next_client_request(&queues, &active, client_id) else {
             return;
         };
-        handle_client_request(&shard, &sessions, &system_config, client_id, message).await;
+        handle_client_request(
+            &shard,
+            &sessions,
+            &system_config,
+            max_tokens_per_user,
+            client_id,
+            message,
+        )
+        .await;
     }
 }
 
@@ -696,6 +728,7 @@ async fn handle_client_request<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
 ) where
@@ -856,19 +889,48 @@ async fn handle_client_request<B, MJ, S>(
             new_header.session = bound_session;
         }
     });
-    let (request, raw_pat_token) =
-        match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
-            Ok(rewritten) => rewritten,
-            Err(error) => {
+    let (request, raw_pat_token) = match maybe_rewrite_pat_request(
+        sessions,
+        transport_client_id,
+        max_tokens_per_user,
+        |user_id| {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| users.pat_count_of(user_id))
+        },
+        request,
+    ) {
+        Ok(rewritten) => rewritten,
+        Err(error) => {
+            // Pre-consensus rejection (token cap reached, malformed body, or a
+            // lost session binding): deny fast with the typed code. A silent
+            // drop would wedge every later request on the connection until the
+            // socket read timeout.
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "denying personal-access-token request"
+            );
+            let commit = current_metadata_commit(shard);
+            let reply = build_deny_reply(&header, transport_client_id, 0, commit, error.as_code());
+            if let Err(send_error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
                 warn!(
                     transport_client_id,
-                    error = %error,
-                    operation = ?header.operation,
-                    "dropping request with invalid PAT replication context"
+                    error = %send_error,
+                    "failed to send personal-access-token deny reply"
                 );
-                return;
             }
-        };
+            return;
+        }
+    };
     // Hash raw passwords and, for ChangePassword, verify the current password
     // on the primary before replication; see `crate::users`. Replicas store the
     // hash directly. A wrong current password is not denied here: it rides

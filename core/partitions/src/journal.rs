@@ -719,6 +719,16 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
     #[rustfmt::skip]
     type HeaderRef<'a> = &'a Self::Header;
 
+    /// No snapshot bookkeeping: the partition plane has no checkpoint of its
+    /// own yet, so nothing supersedes journaled entries. Answered explicitly
+    /// (the trait has no default) so partition-plane state transfer has to
+    /// decide this deliberately rather than inherit it.
+    fn snapshot_op(&self) -> u64 {
+        0
+    }
+
+    fn set_snapshot_op(&self, _op: u64) {}
+
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = unsafe { &mut *self.headers.get() };
         headers.get(idx)

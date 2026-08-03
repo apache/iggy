@@ -42,6 +42,17 @@ pub enum SnapshotError {
     ChecksumMismatch { expected: u128, actual: u128 },
     /// Snapshot file is too short to contain a valid checksum.
     Truncated { size: u64 },
+    /// A state-transfer descriptor's frontiers contradict its artifacts: a
+    /// `commit_op` below the snapshot the same offer ships, or a client-table
+    /// frontier above that commit point. Both are impossible from a
+    /// caught-up-primary offer, so the install is refused and the receiver falls
+    /// back to journal repair rather than moving its frontiers off a bad
+    /// manifest.
+    IncoherentManifest {
+        snapshot_seq: u64,
+        commit_op: u64,
+        table_frontier: u64,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -82,6 +93,17 @@ impl fmt::Display for SnapshotError {
                     "snapshot file truncated: {size} bytes (too short for checksum)"
                 )
             }
+            Self::IncoherentManifest {
+                snapshot_seq,
+                commit_op,
+                table_frontier,
+            } => {
+                write!(
+                    f,
+                    "incoherent state transfer manifest: snapshot at op {snapshot_seq}, \
+                     commit_op {commit_op}, table frontier {table_frontier}"
+                )
+            }
         }
     }
 }
@@ -92,7 +114,9 @@ impl std::error::Error for SnapshotError {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
-            Self::ChecksumMismatch { .. } | Self::Truncated { .. } => None,
+            Self::ChecksumMismatch { .. }
+            | Self::Truncated { .. }
+            | Self::IncoherentManifest { .. } => None,
         }
     }
 }
@@ -261,6 +285,41 @@ pub trait RestoreSnapshot<S>: Sized {
     fn restore_snapshot(snapshot: &S) -> Result<Self, SnapshotError>;
 }
 
+/// Restore a LIVE state machine from a snapshot without reconstructing it.
+///
+/// [`RestoreSnapshot`] builds a fresh instance -- boot-time only, because a
+/// running system shares read handles (left-right factories) across shards
+/// that a swap would orphan. This variant replaces the state THROUGH the
+/// existing write handle (an absorbed `RestoreSnapshot` command), so every
+/// reader observes the restored state on its next read. State transfer
+/// installs with this.
+#[allow(clippy::missing_errors_doc)]
+pub trait RestoreSnapshotInPlace<S> {
+    /// Replace this state machine's contents from the snapshot.
+    fn restore_snapshot_in_place(&self, snapshot: &S) -> Result<(), SnapshotError>;
+
+    /// Whether this state machine can restore from `snapshot`, WITHOUT
+    /// mutating anything.
+    ///
+    /// A mux restores its halves one at a time, so a snapshot missing the
+    /// second half would otherwise leave the first restored and the second on
+    /// pre-transfer state -- a split the caller cannot undo, because the
+    /// transferred snapshot was already persisted and its pairing seeded.
+    /// Every half agrees here before any half mutates.
+    fn check_restorable(&self, snapshot: &S) -> Result<(), SnapshotError>;
+}
+
+/// Base case for the recursive tuple pattern - unit type terminates the recursion.
+impl<S> RestoreSnapshotInPlace<S> for () {
+    fn restore_snapshot_in_place(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    fn check_restorable(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+}
+
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
 impl<S> FillSnapshot<S> for () {
     fn fill_snapshot(&self, _snapshot: &mut S) -> Result<(), SnapshotError> {
@@ -314,6 +373,49 @@ macro_rules! impl_fill_restore {
                     )))
                 })?;
                 Self::from_snapshot(snap)
+            }
+        }
+
+        impl $crate::stm::snapshot::RestoreSnapshotInPlace<$crate::stm::snapshot::MetadataSnapshot>
+            for $wrapper
+        {
+            fn restore_snapshot_in_place(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                paste::paste! {
+                    let snap = snapshot.$field.clone().ok_or_else(|| {
+                        SnapshotError::Deserialize(rmp_serde::decode::Error::custom(
+                            format_args!("Snapshot Restore Error: {}", stringify!($field)),
+                        ))
+                    })?;
+                    self.inner
+                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap))
+                        .map_err(|err| {
+                            SnapshotError::Io(std::io::Error::other(format!(
+                                "in-place restore on a reader-only state machine: {err}"
+                            )))
+                        })
+                }
+            }
+
+            fn check_restorable(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                if snapshot.$field.is_none() {
+                    return Err(SnapshotError::Deserialize(
+                        rmp_serde::decode::Error::custom(format_args!(
+                            "Snapshot Restore Error: {}",
+                            stringify!($field)
+                        )),
+                    ));
+                }
+                Ok(())
             }
         }
     };

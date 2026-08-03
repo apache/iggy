@@ -578,6 +578,11 @@ impl PrepareJournal {
         self.last_op.get()
     }
 
+    /// Current snapshot watermark: entries at or below it are evictable.
+    pub const fn snapshot_op(&self) -> u64 {
+        self.snapshot_op.get()
+    }
+
     /// How many entries the opening scan replayed unverified
     /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
     /// warns while it is not, so the fail-open stretch is visible to an operator.
@@ -695,6 +700,14 @@ impl Journal<FileStorage> for PrepareJournal {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a> = Ref<'a, PrepareHeader>;
+
+    fn snapshot_op(&self) -> u64 {
+        Self::snapshot_op(self)
+    }
+
+    fn set_snapshot_op(&self, op: u64) {
+        Self::set_snapshot_op(self, op);
+    }
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = self.headers.borrow();
