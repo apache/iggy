@@ -49,6 +49,7 @@ members = [
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
+    "core/connectors/sources/mssql_source",
     "core/connectors/sources/random_source",
     "core/consensus",
     "core/cpu_allocation",
