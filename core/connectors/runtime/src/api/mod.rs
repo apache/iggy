@@ -168,7 +168,26 @@ async fn get_stats(State(context): State<Arc<RuntimeContext>>) -> Json<Connector
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configs::connectors::create_connectors_config_provider;
+    use crate::configs::runtime::{ConnectorsConfig, LocalConnectorsConfig};
+    use crate::manager::sink::SinkManager;
+    use crate::manager::source::SourceManager;
+    use crate::metrics::Metrics;
+    use crate::stream::IggyClients;
+    use iggy::prelude::IggyClient;
+    use iggy_common::IggyTimestamp;
     use secrecy::SecretString;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+    use tracing::Level;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+
+    /// Reserved for documentation (RFC 5737), so it is never assignable on a
+    /// real host. Used to reach the warning without binding: any non-loopback
+    /// address that binds successfully would expose a port on every interface
+    /// for the duration of the test.
+    const UNASSIGNABLE_ROUTABLE_ADDRESS: &str = "192.0.2.1:8081";
 
     fn config(address: &str, api_key: &str) -> HttpConfig {
         HttpConfig {
@@ -176,6 +195,138 @@ mod tests {
             api_key: SecretString::from(api_key.to_owned()),
             ..HttpConfig::default()
         }
+    }
+
+    fn captured() -> &'static Mutex<Vec<String>> {
+        static WARNINGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        WARNINGS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Installs the capture once for the whole test binary, since a global
+    /// subscriber can only be set once. Every test filters the captured lines
+    /// by its own address, so events from tests running in parallel cannot be
+    /// mistaken for each other.
+    fn capture_warnings() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let subscriber = tracing_subscriber::registry().with(CaptureWarnings);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test in this binary installs a subscriber");
+        });
+    }
+
+    fn warned_about(address: &str) -> bool {
+        captured()
+            .lock()
+            .expect("the capture mutex is only held to push a line")
+            .iter()
+            .any(|warning| warning.contains(address))
+    }
+
+    struct CaptureWarnings;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureWarnings {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: LayerContext<'_, S>) {
+            if *event.metadata().level() != Level::WARN {
+                return;
+            }
+            let mut recorded = Recorded(String::new());
+            event.record(&mut recorded);
+            captured()
+                .lock()
+                .expect("the capture mutex is only held to push a line")
+                .push(recorded.0);
+        }
+    }
+
+    /// Every field the event carried, rendered into one line.
+    ///
+    /// Unconditional on purpose. These tests only ask whether a warning
+    /// mentioned a given address, so singling out the `message` field would add
+    /// a branch to the scaffolding whose other side nothing here would ever
+    /// take. `record_str` needs no impl either: it forwards here by default,
+    /// and a formatted `warn!` message arrives as `fmt::Arguments` regardless.
+    struct Recorded(String);
+
+    impl Visit for Recorded {
+        fn record_debug(&mut self, _field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{value:?} "));
+        }
+    }
+
+    /// The cheapest context `init` will accept. Nothing here reaches Iggy: the
+    /// clients are never connected, and the warning is decided from the config
+    /// alone.
+    async fn context() -> (Arc<RuntimeContext>, TempDir) {
+        let directory = tempfile::tempdir().expect("a temp dir must be available");
+        let config_provider =
+            create_connectors_config_provider(&ConnectorsConfig::Local(LocalConnectorsConfig {
+                config_dir: directory.path().display().to_string(),
+            }))
+            .await
+            .expect("an empty config dir must initialize with no connectors");
+
+        let context = RuntimeContext {
+            sinks: SinkManager::new(vec![]),
+            sources: SourceManager::new(vec![]),
+            api_key: SecretString::from(String::new()),
+            config_provider: Arc::from(config_provider),
+            metrics: Arc::new(Metrics::init()),
+            start_time: IggyTimestamp::now(),
+            iggy_clients: Arc::new(IggyClients {
+                producer: IggyClient::default(),
+                consumer: IggyClient::default(),
+            }),
+            state_path: directory.path().display().to_string(),
+        };
+        (Arc::new(context), directory)
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("the loopback interface must offer a port")
+            .local_addr()
+            .expect("a bound listener has an address")
+            .port()
+    }
+
+    #[tokio::test]
+    async fn given_no_key_and_a_routable_address_when_initialized_should_warn_before_binding() {
+        capture_warnings();
+        let (context, _directory) = context().await;
+        let config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "");
+
+        // `init` panics when the bind fails, which is what makes this the
+        // ordering test: the warning has to already be out by then, or an
+        // operator whose bind fails never learns the API was unauthenticated.
+        let bind_failed = tokio::spawn(async move { init(&config, context).await })
+            .await
+            .is_err();
+
+        assert!(
+            bind_failed,
+            "a documentation-range address must not be bindable, or this test \
+             would be exposing a port instead of exercising the warning"
+        );
+        assert!(
+            warned_about(UNASSIGNABLE_ROUTABLE_ADDRESS),
+            "init must consult the guard and name the address it is exposing"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_loopback_address_when_initialized_should_not_warn() {
+        capture_warnings();
+        let address = format!("127.0.0.1:{}", free_port());
+        let (context, _directory) = context().await;
+
+        init(&config(&address, ""), context).await;
+
+        assert!(
+            !warned_about(&address),
+            "the shipped posture is loopback with no key; warning about it \
+             would teach operators to ignore the one that matters"
+        );
     }
 
     #[test]
