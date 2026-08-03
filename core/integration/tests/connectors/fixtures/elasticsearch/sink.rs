@@ -33,7 +33,7 @@ use uuid::Uuid;
 const SINK_INDEX_PREFIX: &str = "iggy_messages";
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
-const REFRESH_PROBE_TIMEOUT_MS: u64 = 2_000;
+const PROBE_REQUEST_TIMEOUT_MS: u64 = 2_000;
 
 pub struct ElasticsearchSinkFixture {
     container: ElasticsearchContainer,
@@ -65,7 +65,7 @@ impl ElasticsearchSinkFixture {
         let mut last_error: Option<TestBinaryError> = None;
 
         for _ in 0..POLL_ATTEMPTS {
-            // Short-timeout probe: create_http_client() is 30s + 3 retries and
+            // Short-timeout probes: create_http_client() is 30s + 3 retries and
             // would inflate failure-path wait_for_documents up to minutes.
             if let Err(error) = self.refresh_index_probe().await {
                 last_error = Some(error);
@@ -73,7 +73,7 @@ impl ElasticsearchSinkFixture {
                 continue;
             }
 
-            match self.count_documents(&self.index).await {
+            match self.count_documents_probe().await {
                 Ok(count) if count >= expected_count => {
                     info!("Found {count} documents in Elasticsearch (expected {expected_count})");
                     return Ok(count);
@@ -88,7 +88,7 @@ impl ElasticsearchSinkFixture {
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
-        let final_count = self.count_documents(&self.index).await.unwrap_or(0);
+        let final_count = self.count_documents_probe().await.unwrap_or(0);
         let detail = last_error
             .map(|error| format!("; last error: {error}"))
             .unwrap_or_default();
@@ -109,12 +109,7 @@ impl ElasticsearchSinkFixture {
 
     /// Refresh with a short-timeout client for the document poll loop.
     async fn refresh_index_probe(&self) -> Result<(), TestBinaryError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(REFRESH_PROBE_TIMEOUT_MS))
-            .build()
-            .map_err(|error| TestBinaryError::InvalidState {
-                message: format!("Failed to build refresh probe client: {error}"),
-            })?;
+        let client = probe_client()?;
         let url = format!("{}/{}/_refresh", self.container.base_url, self.index);
         let response =
             client
@@ -133,6 +128,52 @@ impl ElasticsearchSinkFixture {
         }
         Ok(())
     }
+
+    /// Count with a short-timeout client for the document poll loop.
+    ///
+    /// `count_documents` (via `ElasticsearchOps`) goes through the shared
+    /// `create_http_client()` - 30s timeout plus 3 retries - so a degraded
+    /// `_count` endpoint could block this poll for minutes even though
+    /// `refresh_index_probe` already uses a short timeout.
+    async fn count_documents_probe(&self) -> Result<usize, TestBinaryError> {
+        let client = probe_client()?;
+        let url = format!("{}/{}/_count", self.container.base_url, self.index);
+        let response =
+            client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|error| TestBinaryError::InvalidState {
+                    message: format!("Failed to count documents: {error}"),
+                })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(TestBinaryError::InvalidState {
+                message: format!("Failed to count documents: status={status}, body={body}"),
+            });
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CountResponse {
+            count: usize,
+        }
+        let count_response = response.json::<CountResponse>().await.map_err(|error| {
+            TestBinaryError::InvalidState {
+                message: format!("Failed to parse count response: {error}"),
+            }
+        })?;
+        Ok(count_response.count)
+    }
+}
+
+fn probe_client() -> Result<reqwest::Client, TestBinaryError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(PROBE_REQUEST_TIMEOUT_MS))
+        .build()
+        .map_err(|error| TestBinaryError::InvalidState {
+            message: format!("Failed to build probe client: {error}"),
+        })
 }
 
 #[async_trait]

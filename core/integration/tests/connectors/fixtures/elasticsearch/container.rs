@@ -145,7 +145,7 @@ impl ElasticsearchContainer {
 
                 if !container_is_removable_wedged().await {
                     warn!(
-                        "Elasticsearch start failed and '{ELASTICSEARCH_CONTAINER_NAME}' is not in a removable wedged state; leaving it in place: {first_error}"
+                        "Elasticsearch start failed and '{ELASTICSEARCH_CONTAINER_NAME}' is not in a removable wedged state; leaving it in place. If the cluster is actually wedged (ES process up but HTTP unresponsive or cluster red), run `docker rm -f {ELASTICSEARCH_CONTAINER_NAME}` manually and retry: {first_error}"
                     );
                     return Err(first_error);
                 }
@@ -421,11 +421,18 @@ async fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
 /// True only when Docker says the shared container is in a state safe to
 /// force-remove without yanking a healthy instance from a peer process.
 ///
-/// Removable: exited/dead/created/paused/restarting, or Docker healthcheck
-/// `unhealthy`. A plain `running` container (even if ES HTTP is flaky) is left
-/// alone: readiness flakes must not `docker rm -f` a shared Always-reuse box.
+/// Removable: exited/dead/created/paused/restarting. A plain `running`
+/// container is left alone, even if ES HTTP is flaky or genuinely wedged
+/// (process up, cluster red or HTTP unresponsive): a container-level status
+/// check cannot tell that apart from a transient readiness flake, and
+/// removing a `running` shared Always-reuse box risks yanking a healthy
+/// instance out from under a peer nextest process. A wedged-but-running
+/// container needs a manual `docker rm -f` (see the warning this function's
+/// caller logs). No `Docker healthcheck` leg here: the `elasticsearch` image
+/// ships no `HEALTHCHECK`, so `.State.Health` is always absent and that
+/// status is unreachable in practice.
 async fn container_is_removable_wedged() -> bool {
-    let inspect_format = "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}";
+    let inspect_format = "{{.State.Status}}";
     let Some(stdout) = docker_command_stdout(
         &[
             "inspect",
@@ -440,14 +447,10 @@ async fn container_is_removable_wedged() -> bool {
         return false;
     };
 
-    let mut parts = stdout.trim().split('|');
-    let status = parts.next().unwrap_or("").trim();
-    let health = parts.next().unwrap_or("").trim();
-
     matches!(
-        status,
+        stdout.trim(),
         "exited" | "dead" | "created" | "paused" | "restarting"
-    ) || health == "unhealthy"
+    )
 }
 
 async fn docker_command_stdout(args: &[&str], timeout_secs: u64) -> Option<String> {
