@@ -327,6 +327,15 @@ impl TcpClient {
         stream: &mut ConnectionStreamKind,
     ) -> Result<Bytes, IggyError> {
         if status != 0 {
+            let mut message = IggyError::from_code_as_string(status).to_string();
+            if length > 0 {
+                let mut response_buffer = BytesMut::with_capacity(length as usize);
+                response_buffer.put_bytes(0, length as usize);
+                if stream.read(&mut response_buffer).await.is_ok() {
+                    message = String::from_utf8_lossy(&response_buffer).to_string();
+                }
+            }
+
             // TEMP: See https://github.com/apache/iggy/pull/604 for context.
             if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
                 || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
@@ -337,17 +346,16 @@ impl TcpClient {
                 tracing::debug!(
                     "Received a server resource already exists response: {} ({})",
                     status,
-                    IggyError::from_code_as_string(status)
+                    message
                 )
             } else {
                 error!(
                     "Received an invalid response with status: {} ({}).",
-                    status,
-                    IggyError::from_code_as_string(status),
+                    status, message,
                 );
             }
 
-            return Err(IggyError::from_code(status));
+            return Err(IggyError::ServerError(status, message));
         }
 
         trace!("Status: OK. Response length: {}", length);

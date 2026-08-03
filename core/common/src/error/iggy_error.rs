@@ -178,6 +178,8 @@ pub enum IggyError {
     CannotParseHeaderKind(String) = 209,
     #[error("HTTP response error, status: {0}, body: {1}")]
     HttpResponseError(u16, String) = 300,
+    #[error("Server error, status: {0}, message: {1}")]
+    ServerError(u32, String) = 311,
     #[error("Invalid HTTP request")]
     InvalidHttpRequest = 301,
     #[error("Invalid JSON response")]
@@ -545,7 +547,7 @@ impl IggyError {
     }
 
     pub fn from_code(code: u32) -> Self {
-        IggyError::from_repr(code).unwrap_or(IggyError::Error)
+        IggyError::ServerError(code, IggyError::from_code_as_string(code).to_string())
     }
 
     pub fn from_code_as_string(code: u32) -> &'static str {

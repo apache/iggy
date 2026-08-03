@@ -354,13 +354,29 @@ impl QuicClient {
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
             if status != 0 {
+                let length = u32::from_le_bytes(
+                    buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                let message = if length > 0
+                    && buffer.len() >= RESPONSE_INITIAL_BYTES_LENGTH + length as usize
+                {
+                    String::from_utf8_lossy(
+                        &buffer[RESPONSE_INITIAL_BYTES_LENGTH
+                            ..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
+                    )
+                    .to_string()
+                } else {
+                    IggyError::from_code_as_string(status).to_string()
+                };
+
                 error!(
                     "Received an invalid response with status: {} ({}).",
-                    status,
-                    IggyError::from_code_as_string(status)
+                    status, message
                 );
 
-                return Err(IggyError::from_code(status));
+                return Err(IggyError::ServerError(status, message));
             }
 
             let length = u32::from_le_bytes(
