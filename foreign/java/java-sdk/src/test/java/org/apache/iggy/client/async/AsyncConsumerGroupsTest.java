@@ -377,7 +377,10 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
     /**
      * Leaves the group from each client concurrently. {@code CONSUMER_GROUP_NOT_JOINED}
      * (already left / never a member) is treated as success so a partial leave batch
-     * cannot livelock when retried. Other failures propagate.
+     * cannot livelock when retried. Transient not-found errors (see {@link #TRANSIENT_NOT_FOUND_CODES})
+     * are also treated as success: if the leave genuinely didn't happen, the membership
+     * count polled afterward still won't match and the test fails there instead. Other
+     * failures propagate.
      */
     private static void leaveConcurrentlyToleratingAlreadyLeft(List<AsyncIggyTcpClient> clients, ConsumerId groupId)
             throws Exception {
@@ -397,6 +400,9 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
             Throwable cause = unwrap(error);
             if (cause instanceof IggyServerException serverException
                     && serverException.getErrorCode() == IggyErrorCode.CONSUMER_GROUP_NOT_JOINED) {
+                return null;
+            }
+            if (isTransientNotFound(cause)) {
                 return null;
             }
             if (cause instanceof RuntimeException runtimeException) {
@@ -449,13 +455,22 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
             if (pollMillis <= 0) {
                 break;
             }
-            Optional<ConsumerGroupDetails> group = client.consumerGroups()
-                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(pollMillis, TimeUnit.MILLISECONDS);
-            if (group.isPresent()
-                    && group.get().membersCount() == expectedCount
-                    && group.get().members().size() == expectedCount) {
-                return;
+            try {
+                Optional<ConsumerGroupDetails> group = client.consumerGroups()
+                        .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
+                        .get(pollMillis, TimeUnit.MILLISECONDS);
+                if (group.isPresent()
+                        && group.get().membersCount() == expectedCount
+                        && group.get().members().size() == expectedCount) {
+                    return;
+                }
+            } catch (ExecutionException exception) {
+                // Same transient not-found class the join retry tolerates; anything else is real.
+                if (!isTransientNotFound(unwrap(exception))) {
+                    throw exception;
+                }
+            } catch (TimeoutException exception) {
+                // Slow poll response under concurrent load; not yet converged, keep polling.
             }
             sleepInterruptibly(TRANSIENT_RETRY_BACKOFF);
         }
