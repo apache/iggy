@@ -48,7 +48,6 @@ use std::cell::Cell;
 use std::hash::Hasher;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 
@@ -78,6 +77,18 @@ const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
 const MAX_PAYLOAD_LEN: usize = 4096;
 /// Largest record `read_slot` will read into memory.
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN;
+
+/// First retry delay after a failed superblock write, doubling per failure.
+///
+/// Starts near the 10 ms consensus tick, so a one-off failure costs no
+/// latency, and a persistent one stops re-running `atomic_replace` per tick.
+pub const SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS: u64 = 10_000;
+/// Ceiling on the retry delay. A replica fenced this long is not coming back without
+/// operator action, but the retry must stay frequent enough to recover on its own the
+/// moment the disk does.
+pub const SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS: u64 = 1_000_000;
+/// Caps the doubling so the shift cannot overflow before the ceiling clamps it.
+pub const SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT: u64 = 8;
 
 const FILE_A: &str = "superblock.a";
 const FILE_B: &str = "superblock.b";
@@ -127,33 +138,6 @@ pub trait SuperblockStore {
     /// version failure is NOT an I/O error: it surfaces as
     /// [`SuperblockContents::Unreadable`] so the caller decides how to respond.
     fn read_latest(&self) -> impl Future<Output = io::Result<SuperblockContents>>;
-}
-
-/// A boxed, lifetime-bound future, for the object-safe superblock adapter.
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
-
-/// Object-safe adapter over [`SuperblockStore`].
-///
-/// Lets a superblock be held as `Rc<dyn DynSuperblockStore>` without threading a
-/// generic through the consensus and metadata layers. Writes happen only on a
-/// view change or checkpoint, so the boxed future is off every hot path. The
-/// `dyn_` prefix avoids clashing with the inherent methods under the blanket impl.
-pub trait DynSuperblockStore {
-    /// See [`SuperblockStore::write`].
-    fn dyn_write<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, io::Result<()>>;
-
-    /// See [`SuperblockStore::read_latest`].
-    fn dyn_read_latest(&self) -> BoxFuture<'_, io::Result<SuperblockContents>>;
-}
-
-impl<T: SuperblockStore> DynSuperblockStore for T {
-    fn dyn_write<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(self.write(payload))
-    }
-
-    fn dyn_read_latest(&self) -> BoxFuture<'_, io::Result<SuperblockContents>> {
-        Box::pin(self.read_latest())
-    }
 }
 
 #[derive(Clone, Copy)]

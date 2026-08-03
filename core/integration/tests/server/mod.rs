@@ -48,6 +48,10 @@ mod cluster_metadata_vsr;
 // across a replica restart.
 #[cfg(feature = "vsr")]
 mod cluster_view_durability_vsr;
+// A partition view change must persist the advanced view in that group's own
+// superblock and recover it from disk across a replica restart.
+#[cfg(feature = "vsr")]
+mod partition_view_durability_vsr;
 // A metadata checkpoint must drain the WAL and recover from the snapshot fold plus
 // the WAL suffix across a restart.
 #[cfg(feature = "vsr")]

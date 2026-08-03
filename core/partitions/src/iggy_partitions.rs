@@ -25,6 +25,7 @@ use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
 use server_common::send_messages2::{convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
@@ -65,7 +66,7 @@ impl Drop for BorrowGuard<'_> {
 /// For example, shard 0 might have `partition_ids` [0, 2, 4] while shard 1
 /// has `partition_ids` [1, 3, 5]. The `LocalIdx` provides the actual index
 /// into the `partitions` Vec.
-pub struct IggyPartitions<B>
+pub struct IggyPartitions<B, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
@@ -79,7 +80,7 @@ where
     /// only on the shard's pump task. Reconciler routes mutations
     /// through `ReconcileOp` + `ReconcileApply`. Cross-task
     /// access would be UB under cooperative `.await` interleaving.
-    partitions: UnsafeCell<Vec<IggyPartition<B>>>,
+    partitions: UnsafeCell<Vec<IggyPartition<B, SB>>>,
     /// Same single-pump invariant as `partitions`.
     ///
     /// `BTreeMap`, not `HashMap`: iteration order via [`Self::namespaces`] must
@@ -112,9 +113,10 @@ where
     borrow_active: Cell<u32>,
 }
 
-impl<B> IggyPartitions<B>
+impl<B, SB> IggyPartitions<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     #[must_use]
     pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
@@ -147,7 +149,7 @@ where
         &self.config
     }
 
-    fn partitions(&self) -> &Vec<IggyPartition<B>> {
+    fn partitions(&self) -> &Vec<IggyPartition<B, SB>> {
         // SAFETY: see the `partitions` field doc. The returned `&` is sound only
         // while not held across an `.await` on a non-pump task (a sibling
         // reconcile could realloc); single-threadedness alone is not enough.
@@ -179,13 +181,13 @@ where
     }
 
     /// Get partition by local index.
-    pub fn get(&self, local_idx: LocalIdx) -> Option<&IggyPartition<B>> {
+    pub fn get(&self, local_idx: LocalIdx) -> Option<&IggyPartition<B, SB>> {
         self.partitions().get(*local_idx)
     }
 
     /// Get mutable partition by local index.
     #[allow(clippy::mut_from_ref)]
-    fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition<B>> {
+    fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition<B, SB>> {
         // SAFETY: `&mut` is sound on the pump task only (the sole mutator); see
         // `namespace_map_mut`. Single-threadedness alone is not enough.
         unsafe { (&mut *self.partitions.get()).get_mut(*local_idx) }
@@ -211,7 +213,7 @@ where
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
     /// pump-only, so it cannot alias this same-task mutation).
     #[doc(hidden)]
-    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B>) -> LocalIdx {
+    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B, SB>) -> LocalIdx {
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.borrow_active.get(),
@@ -247,7 +249,7 @@ where
     /// the borrow to a synchronous closure, and must never hold the reference
     /// across an `.await` (a sibling task's reconcile could reallocate the vec
     /// mid-await).
-    pub fn get_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B>> {
+    pub fn get_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B, SB>> {
         if self.is_tombstoned(namespace) {
             return None;
         }
@@ -264,7 +266,7 @@ where
     pub fn with_partition<R>(
         &self,
         namespace: &IggyNamespace,
-        f: impl FnOnce(&IggyPartition<B>) -> R,
+        f: impl FnOnce(&IggyPartition<B, SB>) -> R,
     ) -> Option<R> {
         let partition = self.get_by_ns(namespace)?;
         #[cfg(debug_assertions)]
@@ -295,7 +297,7 @@ where
     /// Get mutable partition by namespace directly. Tombstone-gated like
     /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
-    pub fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B>> {
+    pub fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B, SB>> {
         if self.is_tombstoned(namespace) {
             return None;
         }
@@ -325,7 +327,7 @@ where
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
     /// pump-only, so it cannot alias this same-task mutation).
     #[doc(hidden)]
-    pub fn remove(&self, namespace: &IggyNamespace) -> Option<IggyPartition<B>> {
+    pub fn remove(&self, namespace: &IggyNamespace) -> Option<IggyPartition<B, SB>> {
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.borrow_active.get(),
@@ -364,7 +366,7 @@ where
     ///
     /// Same pump-only safety discipline as [`Self::remove`].
     #[doc(hidden)]
-    pub fn remove_many(&self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition<B>> {
+    pub fn remove_many(&self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition<B, SB>> {
         namespaces.iter().filter_map(|ns| self.remove(ns)).collect()
     }
 
@@ -486,9 +488,10 @@ where
     }
 }
 
-impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>
+impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
@@ -589,9 +592,10 @@ where
     }
 }
 
-impl<B> PlaneIdentity<VsrConsensus<B>> for IggyPartitions<B>
+impl<B, SB> PlaneIdentity<VsrConsensus<B>> for IggyPartitions<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B> as Consensus>::Message<H>) -> bool
     where

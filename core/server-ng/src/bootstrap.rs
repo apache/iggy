@@ -25,7 +25,8 @@ use crate::dispatch::{
 };
 use crate::http;
 use crate::partition_helpers::{
-    configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
+    configure_consumer_offsets, ensure_initial_segment, open_partition_superblock,
+    restore_partition_view, validate_namespace_bounds,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
@@ -50,7 +51,7 @@ use iggy_common::defaults::{
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
-use journal::superblock::{DynSuperblockStore, PingPongSuperblock};
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
@@ -134,10 +135,12 @@ pub(crate) type ServerNgMetadata = IggyMetadata<
 /// (`T`) are pinned, being identical in production and the simulator.
 /// Production instantiates it as [`ServerNgShard`]; the simulator supplies its
 /// own `B`/`MJ`/`S`.
-pub type ShellShard<B, MJ, S> = IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable>;
+pub type ShellShard<B, MJ, S, SB = PingPongSuperblock> =
+    IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable, SB>;
 
 /// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
-pub type ShellShardHandle<B, MJ, S> = Rc<RefCell<Option<Weak<ShellShard<B, MJ, S>>>>>;
+pub type ShellShardHandle<B, MJ, S, SB = PingPongSuperblock> =
+    Rc<RefCell<Option<Weak<ShellShard<B, MJ, S, SB>>>>>;
 
 /// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
 /// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
@@ -185,9 +188,9 @@ impl ShellHandlers {
 /// They share one fresh [`SessionManager`]. The caller must set the weak
 /// self-reference in `shard_handle` once the shard is built, so the
 /// handlers can upgrade it per frame.
-pub fn wire_shell_handlers<B, MJ, S>(
+pub fn wire_shell_handlers<B, MJ, S, SB>(
     bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     system_config: Arc<NgSystemConfig>,
     max_tokens_per_user: u32,
 ) -> ShellHandlers
@@ -196,6 +199,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
     ShellHandlers {
@@ -1025,7 +1029,7 @@ async fn shard_main(
         // ping-pong sequence counter. Consensus recovers its true (view, log_view)
         // from `recovered_state` instead of inferring a stale view from the WAL.
         let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
-        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(owner.superblock);
+        let superblock = Rc::new(owner.superblock);
         (
             Some(consensus),
             Some(owner.journal),
@@ -2147,7 +2151,7 @@ async fn load_partition(
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let consensus = VsrConsensus::new(
+    let mut consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
@@ -2162,10 +2166,27 @@ async fn load_partition(
     consensus.set_view_change_status_ticks(view_change_status_ticks(config));
     consensus.set_request_start_view_ticks(request_start_view_ticks(config));
     consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-    // A recovered partition lost its consensus state with the process: the
+
+    // (view, log_view) come from the group's durable superblock when present;
+    // a present but unverifiable record already refused boot inside
+    // `open_partition_superblock`. Restored BEFORE choosing how to join, so
+    // the backup probe below never advertises a view older than the recorded
+    // one.
+    let partition_dir = config
+        .system
+        .get_partition_path(stream_id, topic_id, partition_id);
+    let (superblock, recovered_state) =
+        open_partition_superblock(&partition_dir, cluster_id, self_replica_id, replica_count)
+            .await?;
+    if let Some(state) = recovered_state.as_ref() {
+        restore_partition_view(&mut consensus, state);
+    }
+
+    // A recovered partition lost its journal state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
-    // this replica cannot know the group's (op, commit). In a cluster it
-    // boots as a quorum-invisible backup and probes for the current view
+    // this replica cannot know the group's (op, commit) even when the
+    // superblock restored its view. In a cluster it boots as a
+    // quorum-invisible backup and probes for the current view
     // (`RequestStartView`): the view's primary answers with a `StartView`,
     // journal repair fills the rejoin window, and the commit floor settles
     // at the serving peer's retention point. The probe re-broadcasts on its
@@ -2201,6 +2222,7 @@ async fn load_partition(
             })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition.set_superblock(superblock);
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
     // single-replica groups, so this only sizes the multi-replica ring.
@@ -2208,11 +2230,7 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
-    partition.set_partition_dir(config.system.get_partition_path(
-        stream_id,
-        topic_id,
-        partition_id,
-    ));
+    partition.set_partition_dir(partition_dir);
     hydrate_partition_log(
         &mut partition,
         config,

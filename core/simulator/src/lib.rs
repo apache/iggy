@@ -34,7 +34,6 @@ use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
 use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use iggy_common::IggyError;
-use journal::superblock::DynSuperblockStore;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
 use network::Network;
@@ -280,9 +279,8 @@ impl Simulator {
                     .expect("mesh yields exactly one inbox per shard");
                 // Only shard 0 owns metadata consensus, so only it carries the
                 // superblock. Peer shards persist nothing.
-                let shard_superblock: Option<Rc<dyn DynSuperblockStore>> = if shard_idx == 0 {
-                    let sb: Rc<dyn DynSuperblockStore> = superblock.clone();
-                    Some(sb)
+                let shard_superblock = if shard_idx == 0 {
+                    Some(superblock.clone())
                 } else {
                     None
                 };
@@ -771,9 +769,8 @@ impl Simulator {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
                 .expect("mesh yields exactly one inbox per shard");
-            let shard_superblock: Option<Rc<dyn DynSuperblockStore>> = if shard_idx == 0 {
-                let sb: Rc<dyn DynSuperblockStore> = superblock.clone();
-                Some(sb)
+            let shard_superblock = if shard_idx == 0 {
+                Some(superblock.clone())
             } else {
                 None
             };

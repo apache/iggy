@@ -52,6 +52,11 @@ use iggy_common::{
     IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
 };
 use journal::Journal as _;
+use journal::local_gate::LocalGate;
+use journal::superblock::{
+    PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
+    SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT, SuperblockStore,
+};
 use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
@@ -61,8 +66,9 @@ use server_common::{
     },
     sharding::IggyNamespace,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -76,8 +82,7 @@ use tracing::{debug, warn};
 // `SendMessages` retries are at-least-once and may commit multiple times.
 // Consumers handle duplicate messages via `server_common::MessageDeduplicator`
 // (message-id based) if they care.
-#[derive(Debug)]
-pub struct IggyPartition<B = IggyMessageBus>
+pub struct IggyPartition<B = IggyMessageBus, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
@@ -139,6 +144,49 @@ where
     /// generation against this and resets only when it advances, so a redundant
     /// reconcile pass never re-wipes a partition already at this generation.
     applied_purge_generation: u64,
+    /// Durable superblock for this partition's consensus group, recording
+    /// `(view, log_view)` across a crash so this replica can never
+    /// re-participate in a view older than one it advertised. `None` for
+    /// in-memory / simulated partitions, where the persist gate is a no-op
+    /// and views stay process-lifetime only. Behind `Rc<dyn ...>` because
+    /// the boot path opens the store once and hands the same instance here:
+    /// re-opening would fork the ping-pong sequence counter.
+    superblock: Option<Rc<SB>>,
+    /// Serializes this partition's superblock writes so at most one is in
+    /// flight: `PingPongSuperblock::write` picks its slot before it awaits,
+    /// so two overlapping writers would target the same slot and could tear
+    /// it while both report success. Per partition, not per shard -- every
+    /// group owns its own two-file store, so writes to different partitions
+    /// never contend.
+    superblock_lock: LocalGate,
+    /// Consecutive failed superblock writes, and the clock reading after which
+    /// the next attempt may run. A persistent `ENOSPC` / `EIO` would otherwise
+    /// re-run a full `atomic_replace` on every 10 ms consensus tick. Reset on
+    /// the first success. See [`Self::persist_superblock_if_needed`] for the
+    /// terminal policy.
+    superblock_write_failures: Cell<u64>,
+    superblock_retry_after_micros: Cell<u64>,
+}
+
+impl<B, SB> fmt::Debug for IggyPartition<B, SB>
+where
+    B: MessageBus,
+{
+    // Hand-written because `Rc<dyn DynSuperblockStore>` has no `Debug`; the
+    // fields listed are the ones diagnostics actually key on.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IggyPartition")
+            .field("namespace", &self.consensus.namespace())
+            .field("offset", &self.offset)
+            .field("dirty_offset", &self.dirty_offset)
+            .field("should_increment_offset", &self.should_increment_offset)
+            .field("partition_dir", &self.partition_dir)
+            .field("repair", &self.repair)
+            .field("recovered_durable_offset", &self.recovered_durable_offset)
+            .field("observed_view", &self.observed_view)
+            .field("applied_purge_generation", &self.applied_purge_generation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Post-preflight dispatch in `on_request`: replicate via VSR or take the
@@ -219,9 +267,10 @@ impl PendingConsumerOffsetCommit {
     }
 }
 
-impl<B> IggyPartition<B>
+impl<B, SB> IggyPartition<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
@@ -249,6 +298,10 @@ where
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
             applied_purge_generation: 0,
+            superblock: None,
+            superblock_lock: LocalGate::new(),
+            superblock_write_failures: Cell::new(0),
+            superblock_retry_after_micros: Cell::new(0),
         };
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
@@ -292,6 +345,132 @@ where
 
     pub fn set_partition_dir(&mut self, partition_dir: String) {
         self.partition_dir = Some(partition_dir);
+    }
+
+    /// Attach the durable superblock store the boot path opened for this
+    /// partition's group. Boot seeds consensus with the recovered
+    /// `(view, log_view)` and marks them durable before attaching; from then
+    /// on [`Self::persist_superblock_if_needed`] keeps the record current.
+    pub fn set_superblock(&mut self, superblock: Rc<SB>) {
+        self.superblock = Some(superblock);
+    }
+
+    /// Persist this group's VSR state to its superblock when the view changed
+    /// since the last write. The split-brain gate, partition edition: callers
+    /// MUST invoke this before dispatching any view-scoped VSR message for
+    /// this partition, so a replica that acted in a view can never recover an
+    /// older one after a crash.
+    ///
+    /// It fences the SEND, not the ACT. By the time a caller reaches here the
+    /// handler has already moved `view`, `log_view`, `status`, the sequencer
+    /// and the pipeline, and the commit walk runs outside the gate, so a
+    /// failed persist still applies committed ops locally. That is the VSR
+    /// fence and it is sufficient: local state a crash forgets is state no
+    /// peer ever saw, whereas an externalized view must be recoverable.
+    ///
+    /// `true` when the send may proceed, either because the state is now
+    /// durable or because there was nothing to persist (no store attached --
+    /// in-memory / simulated partitions -- or an unchanged view). `false`
+    /// only when a write was attempted and failed, and the caller must
+    /// withhold the send. The in-memory view stays ahead of the durable one,
+    /// which a crash safely rolls back, and the next tick retries.
+    #[allow(clippy::future_not_send)]
+    pub async fn persist_superblock_if_needed(&self) -> bool {
+        let Some(superblock) = self.superblock.as_ref() else {
+            // No store (in-memory / simulated partitions): nothing can be
+            // recorded, so keep the durable cells current instead. The
+            // dispatch tripwire asserts `needs_superblock_persist()` is clear
+            // on every view-scoped send, and for a storeless group "current"
+            // is trivially true -- leaving the cells behind would trip it on
+            // the first view change.
+            self.consensus
+                .mark_superblock_durable(self.consensus.view(), self.consensus.log_view());
+            return true;
+        };
+        // Lock-free fast path: the steady state is an unchanged view with
+        // nothing to write, and skipping the lock keeps every gated send off
+        // it, notably `send_prepare_ok`, which runs this per prepare. Safe
+        // because `view`/`log_view` advance only on this single-threaded
+        // executor and no `.await` sits between the `Cell` read and the
+        // return; a concurrent advance is caught by the re-check below.
+        if !self.consensus.needs_superblock_persist() {
+            return true;
+        }
+        // A write that keeps failing must not re-run a full `atomic_replace`
+        // on every 10 ms tick. Back off first, while still reporting `false`
+        // so the send stays withheld: fail-closed is the point of this gate,
+        // and the backoff only bounds what the retry costs.
+        if self.consensus.clock_realtime_micros() < self.superblock_retry_after_micros.get() {
+            return false;
+        }
+        // Re-check needs-persist AFTER acquiring the lock so check and write
+        // are atomic and a redundant caller coalesces, finding the state
+        // already made durable by the writer it queued behind.
+        let _superblock_guard = self.superblock_lock.acquire().await;
+        if !self.consensus.needs_superblock_persist() {
+            return true;
+        }
+        self.write_superblock(superblock.as_ref()).await
+    }
+
+    /// Write the current VSR state under [`Self::superblock_lock`].
+    ///
+    /// The caller must hold that lock. The state is captured HERE rather than
+    /// passed in: with writes serialized and no await between the capture and
+    /// the write, the last writer carries the freshest view, so the durable
+    /// view cannot regress. `mark_superblock_durable` takes the WRITTEN
+    /// values, never a re-read, because the in-memory view can advance across
+    /// the write's `.await`.
+    ///
+    /// # Terminal policy
+    /// There is none beyond staying fenced: a replica that cannot record the
+    /// view it is in must not act in it, so it withholds every view-scoped
+    /// send for this group, goes quiet, and its peers elect around it. Only
+    /// THIS partition's group is fenced; the rest of the node keeps serving.
+    #[allow(clippy::future_not_send)]
+    async fn write_superblock(&self, superblock: &SB) -> bool {
+        // No partition checkpoint exists yet, so the pairing fields stay
+        // `(0, 0)` until partition-plane state transfer introduces one.
+        // `commit_max` rides along as the recovery lower bound that state
+        // transfer will read.
+        let state = self.consensus.vsr_state(0, 0);
+        match superblock.write(&state.to_bytes()).await {
+            Ok(()) => {
+                self.consensus
+                    .mark_superblock_durable(state.view, state.log_view);
+                self.superblock_write_failures.set(0);
+                self.superblock_retry_after_micros.set(0);
+                true
+            }
+            Err(error) => {
+                let failures = self.superblock_write_failures.get() + 1;
+                self.superblock_write_failures.set(failures);
+                let backoff = SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS
+                    .saturating_mul(1 << failures.min(SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT))
+                    .min(SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
+                self.superblock_retry_after_micros
+                    .set(self.consensus.clock_realtime_micros() + backoff);
+                // Rate-limited to the backoff steps: the tick would otherwise
+                // emit this every 10 ms for as long as the disk stays broken.
+                if failures.is_power_of_two() {
+                    tracing::error!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        replica_id = self.consensus.replica(),
+                        namespace_raw = self.consensus.namespace(),
+                        view = state.view,
+                        log_view = state.log_view,
+                        superblock_write_failures = failures,
+                        retry_in_micros = backoff,
+                        %error,
+                        "partition superblock persist failed; withholding every view-scoped \
+                         send for this group until it succeeds, so this replica stays \
+                         quorum-invisible there"
+                    );
+                }
+                false
+            }
+        }
     }
 
     pub fn configure_consumer_offset_storage(
@@ -906,9 +1085,10 @@ where
     }
 }
 
-impl<B> Partition for IggyPartition<B>
+impl<B, SB> Partition for IggyPartition<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     async fn append_messages(
         &mut self,
@@ -1012,9 +1192,10 @@ where
     }
 }
 
-impl<B> IggyPartition<B>
+impl<B, SB> IggyPartition<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
@@ -3301,6 +3482,15 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
+        // Durable-before-send: a PrepareOk implies this replica's
+        // (view, log_view), so it must not leave until they are durable, or a
+        // crash could recover an older view than the one this ack helped
+        // commit in, losing a committed op. Mirrors the view-change dispatch
+        // gate; withhold on persist failure and let the primary's prepare
+        // retransmit re-drive the ack once a later persist succeeds.
+        if !self.persist_superblock_if_needed().await {
+            return;
+        }
         // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
         // Both `SendMessages` (via `append_send_messages_to_journal`) and
         // consumer-offset ops (via `apply_replicated_operation`) append
@@ -3487,12 +3677,203 @@ mod tests {
         )
     }
 
+    /// Partition whose consensus already advanced to `(view, log_view)` with
+    /// nothing marked durable, as after a view change and before the persist
+    /// gate runs.
+    fn partition_at_view(
+        view: u32,
+        log_view: u32,
+    ) -> IggyPartition<IggyMessageBus, RecordingSuperblock> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            3,
+            namespace.inner(),
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(view);
+        consensus.set_log_view(log_view);
+        consensus.init_as_backup();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        )
+    }
+
+    /// In-memory superblock double: records every payload, counts attempts,
+    /// and injects write failures.
+    #[derive(Default)]
+    struct RecordingSuperblock {
+        writes: RefCell<Vec<Vec<u8>>>,
+        attempts: Cell<u32>,
+        fail_writes: Cell<bool>,
+    }
+
+    impl journal::superblock::SuperblockStore for RecordingSuperblock {
+        async fn write(&self, payload: &[u8]) -> std::io::Result<()> {
+            self.attempts.set(self.attempts.get() + 1);
+            if self.fail_writes.get() {
+                return Err(std::io::Error::other("injected superblock write failure"));
+            }
+            self.writes.borrow_mut().push(payload.to_vec());
+            Ok(())
+        }
+
+        async fn read_latest(&self) -> std::io::Result<journal::superblock::SuperblockContents> {
+            Ok(self
+                .writes
+                .borrow()
+                .last()
+                .map_or(journal::superblock::SuperblockContents::Empty, |bytes| {
+                    journal::superblock::SuperblockContents::Present(bytes.clone())
+                }))
+        }
+    }
+
+    #[compio::test]
+    async fn given_storeless_partition_when_persist_gate_runs_should_mark_current_view_durable() {
+        let partition = partition_at_view(2, 1);
+        assert!(partition.consensus().needs_superblock_persist());
+
+        assert!(partition.persist_superblock_if_needed().await);
+
+        assert!(
+            !partition.consensus().needs_superblock_persist(),
+            "a storeless partition must record durable = current, or the dispatch \
+             tripwire would fire on its first view-scoped send"
+        );
+    }
+
+    #[compio::test]
+    async fn given_advanced_view_when_persist_gate_runs_should_write_vsr_state_once() {
+        let mut partition = partition_at_view(3, 2);
+        let store = Rc::new(RecordingSuperblock::default());
+        partition.set_superblock(store.clone());
+
+        assert!(partition.persist_superblock_if_needed().await);
+
+        let state = consensus::VsrState::try_from(store.writes.borrow()[0].as_slice())
+            .expect("recorded payload decodes as a VsrState");
+        assert_eq!(state.cluster, TEST_CLUSTER);
+        assert_eq!(state.view, 3);
+        assert_eq!(state.log_view, 2);
+        assert_eq!(
+            (state.checkpoint_op, state.checkpoint_checksum),
+            (0, 0),
+            "no partition checkpoint exists yet, so the pairing fields stay zero"
+        );
+        assert!(!partition.consensus().needs_superblock_persist());
+
+        assert!(partition.persist_superblock_if_needed().await);
+        assert_eq!(
+            store.attempts.get(),
+            1,
+            "an unchanged view must take the lock-free fast path, not rewrite"
+        );
+    }
+
+    #[compio::test]
+    async fn given_undurable_view_when_sending_prepare_ok_should_withhold_until_persisted() {
+        let bus = RecordingBus::default();
+        let replica_frames = bus.sent_to_replicas.clone();
+        let mut consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            3,
+            IggyNamespace::new(1, 1, 0).inner(),
+            bus,
+            LocalPipeline::new(),
+        );
+        consensus.set_view(1);
+        consensus.set_log_view(1);
+        consensus.init_as_backup();
+        let mut partition: IggyPartition<RecordingBus, RecordingSuperblock> =
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(1024 * 1024),
+                false,
+            );
+        let store = Rc::new(RecordingSuperblock::default());
+        store.fail_writes.set(true);
+        partition.set_superblock(store.clone());
+        // The ack path drops an op past the local head, so the head must cover it.
+        partition.consensus().sequencer().set_sequence(1);
+        let size = std::mem::size_of::<PrepareHeader>();
+        let prepare = Message::<PrepareHeader>::new(size).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command2::Prepare;
+                header.op = 1;
+                // Current view: an older-view prepare is fenced as deposed-primary
+                // traffic and would never reach the ack send under test.
+                header.view = 1;
+                header.size = u32::try_from(size).expect("prepare header size fits in u32");
+            },
+        );
+        let header = *prepare.header();
+
+        partition.send_prepare_ok(&header).await;
+
+        assert!(
+            replica_frames.borrow().is_empty(),
+            "an ack must not leave while the advanced view is not durable"
+        );
+        assert_eq!(store.attempts.get(), 1);
+
+        // Outwait the write-failure backoff (base 10 ms doubled once by the
+        // first failure), then retry with the store healthy: the ack must
+        // persist first and then go out.
+        store.fail_writes.set(false);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        partition.send_prepare_ok(&header).await;
+
+        assert_eq!(
+            replica_frames.borrow().len(),
+            1,
+            "the retried ack must go out once the view persisted"
+        );
+        assert!(!partition.consensus().needs_superblock_persist());
+    }
+
+    #[compio::test]
+    async fn given_failing_superblock_when_persist_gate_runs_should_withhold_and_back_off() {
+        let mut partition = partition_at_view(1, 1);
+        let store = Rc::new(RecordingSuperblock::default());
+        store.fail_writes.set(true);
+        partition.set_superblock(store.clone());
+
+        assert!(
+            !partition.persist_superblock_if_needed().await,
+            "a failed write must withhold the send"
+        );
+        assert_eq!(store.attempts.get(), 1);
+
+        assert!(
+            !partition.persist_superblock_if_needed().await,
+            "the backoff window must withhold without retrying the write"
+        );
+        assert_eq!(
+            store.attempts.get(),
+            1,
+            "a call inside the backoff window must not touch the store"
+        );
+        assert!(
+            partition.consensus().needs_superblock_persist(),
+            "the view stays undurable until a write lands"
+        );
+    }
+
     /// Client-facing bus that records every `send_to_client` frame so tests
     /// can assert on reply bytes without a connection registry (whose slot
     /// guard would borrow the partition across `on_request(&mut self)`).
     #[derive(Debug, Default)]
     struct RecordingBus {
         sent_to_clients: Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>,
+        sent_to_replicas: Rc<RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>>,
     }
 
     impl MessageBus for RecordingBus {
@@ -3509,9 +3890,10 @@ mod tests {
 
         async fn send_to_replica(
             &self,
-            _replica: u8,
-            _data: Frozen<MESSAGE_ALIGN>,
+            replica: u8,
+            data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
+            self.sent_to_replicas.borrow_mut().push((replica, data));
             Ok(())
         }
 

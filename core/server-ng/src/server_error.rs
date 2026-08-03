@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use consensus::VsrStateError;
 use metadata::impls::recovery::RecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
 use shard_allocator::ShardingError;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -102,6 +104,41 @@ pub enum ServerNgError {
     Logging(#[source] LogError),
     #[error("failed to recover metadata snapshot and journal")]
     MetadataRecovery(#[source] RecoveryError),
+    #[error("failed to open partition superblock at {dir}")]
+    PartitionSuperblockIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    // Refuses boot rather than treating the group as fresh or reading through
+    // to a superseded view: mirrors the metadata plane's
+    // `RecoveryError::SuperblockUnreadable` policy. Quarantining just the one
+    // partition is future work; skipping it here could hand the reconciler a
+    // reason to re-create it empty.
+    #[error(
+        "partition superblock at {dir} holds no record this build can trust \
+         (version {version:?}); refusing boot"
+    )]
+    PartitionSuperblockUnreadable { dir: PathBuf, version: Option<u16> },
+    #[error(
+        "partition superblock at {dir} was checksum-clean but did not decode; \
+         refusing boot rather than infer a stale view"
+    )]
+    PartitionSuperblockUndecodable {
+        dir: PathBuf,
+        #[source]
+        source: VsrStateError,
+    },
+    #[error(
+        "partition superblock at {dir} belongs to a different {field}: expected \
+         {expected}, found {found}; a copied or misplaced data directory"
+    )]
+    PartitionSuperblockIdentityMismatch {
+        dir: PathBuf,
+        field: &'static str,
+        expected: u128,
+        found: u128,
+    },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
          factory bundle; shard 0 dropped its sender (most likely it failed to recover)"

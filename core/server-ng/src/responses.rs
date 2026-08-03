@@ -79,6 +79,7 @@ use iggy_binary_protocol::{
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::{EncryptorKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
@@ -97,8 +98,8 @@ use system_stats::SystemProbe;
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
-pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) -> GetPersonalAccessTokensResponse
@@ -107,6 +108,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // PATs are per-user; list the requesting connection's own tokens, resolved
     // from this shard's `SessionManager` (like `get_me`) then read out of the
@@ -133,8 +135,8 @@ where
     })
 }
 
-pub(crate) fn build_get_me_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn build_get_me_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) -> ClientDetailsResponse
@@ -143,6 +145,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let mut client = sessions
         .borrow()
@@ -207,8 +210,8 @@ where
 /// `consumer_groups_count` is resolved from the connection's bound VSR client
 /// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
 /// transport id). Connections that never bound (pre-register) count 0.
-pub(crate) fn connected_client_to_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn connected_client_to_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     info: &ConnectedClientInfo,
 ) -> ClientResponse
 where
@@ -216,6 +219,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let consumer_groups_count = info.vsr_client_id.map_or(0, |vsr_client_id| {
         #[allow(clippy::cast_possible_truncation)]
@@ -244,8 +248,8 @@ where
 /// touch the offset of a partition it currently owns. `Ok` for individual
 /// consumers (no fence) and for owned group partitions; `Err` otherwise so a
 /// stale client re-syncs instead of corrupting the shared group offset.
-fn fence_group_offset<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn fence_group_offset<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -257,6 +261,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if consumer.kind != KIND_CONSUMER_GROUP {
         return Ok(());
@@ -287,8 +292,8 @@ where
 
 /// Fence a consumer-group offset op then resolve its target partition
 /// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
-fn fence_and_resolve_offset_namespace<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -300,6 +305,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     fence_group_offset(
         shard,
@@ -312,8 +318,8 @@ where
     resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
-pub(crate) fn resolve_partition_request_namespace<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn resolve_partition_request_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
     body: &[u8],
     client_id: u128,
@@ -323,6 +329,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let namespace = match operation {
         Operation::SendMessages => {
@@ -404,8 +411,8 @@ where
     Ok(namespace.inner())
 }
 
-fn resolve_send_messages_namespace<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn resolve_send_messages_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     header: &SendMessagesHeader,
 ) -> Result<IggyNamespace, IggyError>
 where
@@ -413,6 +420,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let partition_id = match &header.partitioning {
         WirePartitioning::PartitionId(partition_id) => *partition_id,
@@ -439,8 +447,8 @@ where
     )
 }
 
-pub(crate) fn resolve_partition_namespace<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn resolve_partition_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
@@ -450,6 +458,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
     shard
@@ -464,8 +473,8 @@ where
 /// `user_id` is the authenticated caller, used only by the identity-scoped
 /// reads (currently the PAT list); every other arm ignores it. Authorization
 /// stays with the per-transport gates that run before this builder.
-pub(crate) fn build_non_replicated_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
     body: &[u8],
     user_id: Option<u32>,
@@ -476,6 +485,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     match code {
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
@@ -594,15 +604,16 @@ where
 /// The leader marking comes from this shard's consensus view; a shard without
 /// consensus (any shard but 0) still serves the full roster, only with no node
 /// marked leader.
-fn build_cluster_metadata_response<B, MJ, S>(
+fn build_cluster_metadata_response<B, MJ, S, SB>(
     roster: &ClusterRoster,
-    shard: &Rc<ShellShard<B, MJ, S>>,
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
 ) -> ClusterMetadataResponse
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Shard 0 reads its live consensus; delegated shards use the view shard 0
     // publishes into the roster, so leader marking works on every shard.
@@ -641,14 +652,15 @@ where
     }
 }
 
-fn build_stats_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_stats_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
 ) -> Result<StatsResponse, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let (
         streams_count,
@@ -844,8 +856,8 @@ fn probe_system_stats() -> SystemStats {
     }
 }
 
-fn build_get_stream_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_get_stream_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
 ) -> Result<Option<GetStreamResponse>, IggyError>
 where
@@ -853,6 +865,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     let default_message_expiry = shard.plane.metadata().default_message_expiry();
@@ -877,14 +890,15 @@ where
     })
 }
 
-fn build_get_streams_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_get_streams_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
 ) -> Result<GetStreamsResponse, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         streams
@@ -906,14 +920,15 @@ fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyE
     })
 }
 
-fn build_get_users_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_get_users_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
 ) -> Result<GetUsersResponse, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.users().read(|users| {
         users
@@ -925,8 +940,8 @@ where
     })
 }
 
-fn build_get_user_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_get_user_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: &WireIdentifier,
 ) -> Result<Option<UserDetailsResponse>, IggyError>
 where
@@ -934,6 +949,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.users().read(|users| {
         let resolved = match user_id {
@@ -974,8 +990,8 @@ fn personal_access_tokens_response(
     Ok(GetPersonalAccessTokensResponse { tokens })
 }
 
-fn build_get_topic_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_get_topic_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
 ) -> Result<Option<GetTopicResponse>, IggyError>
@@ -984,6 +1000,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     let default_message_expiry = shard.plane.metadata().default_message_expiry();
@@ -1013,8 +1030,8 @@ where
     })
 }
 
-fn build_get_topics_response<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn build_get_topics_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
 ) -> Result<GetTopicsResponse, IggyError>
 where
@@ -1022,6 +1039,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     let default_message_expiry = shard.plane.metadata().default_message_expiry();
@@ -1044,8 +1062,8 @@ where
 /// Reject a consumer-group read whose parent stream/topic is absent with the
 /// legacy typed error naming the level that missed; the group itself missing
 /// stays the shared not-found reply (empty over TCP, 404 over HTTP).
-fn ensure_topic_exists<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn ensure_topic_exists<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
 ) -> Result<(), IggyError>
@@ -1054,6 +1072,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let resolved_stream =
@@ -1419,12 +1438,13 @@ pub(crate) fn build_reply_with_body(
     reply
 }
 
-pub(crate) fn current_metadata_commit<B, MJ, S>(shard: &Rc<ShellShard<B, MJ, S>>) -> u64
+pub(crate) fn current_metadata_commit<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> u64
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard
         .plane

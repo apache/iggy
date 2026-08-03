@@ -45,6 +45,7 @@ use iggy_binary_protocol::{
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
 use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -61,7 +62,6 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 // an unconditional import warns in release builds. CI's `-D warnings` rides clippy,
 // which builds debug, so that warning goes unobserved there.
 #[cfg(debug_assertions)]
-use server_common::sharding::METADATA_CONSENSUS_NAMESPACE;
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
@@ -71,8 +71,8 @@ use std::rc::Rc;
 #[cfg(any(test, feature = "simulator"))]
 use std::sync::Arc;
 
-pub type ShardPlane<B, J, S, M> =
-    MuxPlane<variadic!(IggyMetadata<VsrConsensus<B>, J, S, M>, IggyPartitions<B>)>;
+pub type ShardPlane<B, J, S, M, SB = PingPongSuperblock> =
+    MuxPlane<variadic!(IggyMetadata<VsrConsensus<B>, J, S, M, SB>, IggyPartitions<B, SB>)>;
 
 pub struct ShardIdentity {
     pub id: u16,
@@ -643,7 +643,7 @@ pub enum LifecycleFrame {
 /// Funnelling through the pump keeps `IggyPartitions` single-writer:
 /// without it the cooperative `.await` scheduler would race
 /// `insert` / `remove` against the pump's live `&mut IggyPartition` (UB).
-pub enum ReconcileOp<B>
+pub enum ReconcileOp<B, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
@@ -653,7 +653,7 @@ where
     /// reconcile pass can detect a slab-key-reused stale partition.
     InsertOwned {
         namespace: IggyNamespace,
-        partition: Box<IggyPartition<B>>,
+        partition: Box<IggyPartition<B, SB>>,
         epoch: u64,
     },
     /// Seed a routing row for a partition owned by a peer shard.
@@ -894,13 +894,13 @@ enum ChunkReply {
     UnknownOffer,
 }
 
-pub struct IggyShard<B, MJ, S, M, T = ()>
+pub struct IggyShard<B, MJ, S, M, T = (), SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
     pub id: u16,
     pub name: String,
-    pub plane: ShardPlane<B, MJ, S, M>,
+    pub plane: ShardPlane<B, MJ, S, M, SB>,
 
     /// Handle to the local bus. Retained alongside the bus owned by every
     /// consensus plane so the router can reach the `ConnectionInstaller`
@@ -989,7 +989,7 @@ where
 
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
-    reconcile_queue: RefCell<VecDeque<ReconcileOp<B>>>,
+    reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
 
     /// Partition-plane frames that arrived before this shard's reconciler
     /// materialised the namespace (post-`CreateTopic` convergence window).
@@ -1038,10 +1038,11 @@ where
     metadata_transfer_decode_failures: Cell<Option<(u64, u32)>>,
 }
 
-impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
     B: MessageBus + 'static,
     T: ShardsTable,
+    SB: SuperblockStore,
 {
     /// Depth of this shard's inbound frame queue.
     ///
@@ -1091,8 +1092,8 @@ where
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
         on_partition_read: PartitionReadHandler,
-        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-        partitions: IggyPartitions<B>,
+        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
+        partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
         shards_table: T,
@@ -1325,8 +1326,8 @@ where
     pub fn without_inbox(
         identity: ShardIdentity,
         bus: B,
-        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-        partitions: IggyPartitions<B>,
+        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
+        partitions: IggyPartitions<B, SB>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
@@ -1411,7 +1412,7 @@ where
     /// Marker `try_send` is best-effort; the pump's tail drain on every
     /// frame and its consensus-tick drain catch dropped markers, so the
     /// queue never strands ops for longer than one tick.
-    pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B>) {
+    pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B, SB>) {
         self.reconcile_queue.borrow_mut().push_back(op);
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
@@ -1476,7 +1477,7 @@ where
     where
         B: MessageBus + 'static,
     {
-        let staged: Vec<ReconcileOp<B>> = {
+        let staged: Vec<ReconcileOp<B, SB>> = {
             let mut q = self.reconcile_queue.borrow_mut();
             if q.is_empty() {
                 return;
@@ -1613,9 +1614,10 @@ enum ParkOutcome<H> {
 
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
-impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     /// Dispatch an incoming network message to the appropriate consensus plane.
     ///
@@ -2107,12 +2109,12 @@ where
     #[allow(clippy::mut_from_ref)]
     fn resolve_partition_target<'a>(
         &self,
-        partitions: &'a IggyPartitions<B>,
+        partitions: &'a IggyPartitions<B, SB>,
         namespace: u64,
         view: u32,
         replica: u8,
         frame: &'static str,
-    ) -> Option<&'a mut IggyPartition<B>>
+    ) -> Option<&'a mut IggyPartition<B, SB>>
     where
         B: MessageBus,
     {
@@ -2173,8 +2175,10 @@ where
         };
         let consensus = partition.consensus();
         let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-        dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if partition.persist_superblock_if_needed().await {
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -2223,8 +2227,12 @@ where
         };
         let consensus = partition.consensus();
         let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-        dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if partition.persist_superblock_if_needed().await {
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        }
+        // Outside the gate: the persist fences the SEND, not the local commit
+        // walk (state a crash forgets is state no peer ever saw).
         if actions
             .iter()
             .any(|action| matches!(action, VsrAction::CommitJournal))
@@ -2335,8 +2343,13 @@ where
         };
         let consensus = partition.consensus();
         let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-        dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if partition.persist_superblock_if_needed().await {
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        }
+        // Outside the gate: the persist fences the SEND, not the local commit
+        // walk or the repair fetch below (a fetch asks to LEARN, it does not
+        // advertise this replica's view).
         if actions
             .iter()
             .any(|action| matches!(action, VsrAction::CommitJournal))
@@ -2452,10 +2465,13 @@ where
         match consensus.handle_commit(&header) {
             CommitOutcome::Advanced => partition.commit_journal(config).await,
             CommitOutcome::RespondStartView => {
-                // Partition consensus is not superblock-durable yet, so there is no
-                // view to persist before answering here; the metadata arm above
-                // gates its StartView on the durable view.
-                respond_start_view::<B, _, MJ>(consensus).await;
+                // Durable-before-send, as the metadata arm above: the StartView
+                // advertises this replica's current view. Withhold on failure;
+                // the stale peer keeps heartbeating, so it re-triggers once a
+                // later persist succeeds.
+                if partition.persist_superblock_if_needed().await {
+                    respond_start_view::<B, _, MJ>(consensus).await;
+                }
             }
             CommitOutcome::Accepted => {}
         }
@@ -2496,7 +2512,9 @@ where
         };
         let consensus = partition.consensus();
         let actions = consensus.handle_request_start_view(PlaneKind::Partitions, &header);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        if partition.persist_superblock_if_needed().await {
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        }
     }
 
     /// Serve a repair range from this replica's journal: stream
@@ -4054,8 +4072,13 @@ where
 
             let consensus = partition.consensus();
             let actions = consensus.tick(PlaneKind::Partitions);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+            // The tick emits view-scoped sends (heartbeats, view-change
+            // retransmits), so it persists first like every dispatch site;
+            // it is also what retries a persist an earlier site withheld on.
+            if partition.persist_superblock_if_needed().await {
+                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+                dispatch_partition_journal_actions(consensus, partition, &actions).await;
+            }
 
             // Stall retry: repair frames are fire-and-forget, so a lost
             // frame (or a peer that went silent mid-stream) would leave the
@@ -4436,36 +4459,35 @@ async fn dispatch_vsr_actions<B, P, J>(
     // Centralized durable-before-send tripwire: a view-scoped message must never
     // advertise a (view, log_view) the superblock has not recorded, or a crash could
     // recover an older view than one a peer already saw, splitting the brain or
-    // losing a commit. Every metadata caller persists first (the view-change dispatch
-    // sites and the on_replicate / on_commit send gates), so this asserts they did
-    // rather than letting a future bypass through silently. Metadata plane only:
-    // partition consensus has no superblock to record a view in, so it is exempt and
-    // the namespace test below is what does the work (its `needs_superblock_persist`
-    // is not a stand-in: that predicate reads clean at view 0, which is where a
-    // partition group spends most of its life). `RequestStartView` is exempt too,
-    // being a probe that asks to LEARN the view rather than advertise it.
+    // losing a commit. Every caller on BOTH planes persists first (the view-change
+    // dispatch sites, the tick, and each plane's PrepareOk send gate), so this
+    // asserts they did rather than letting a future bypass through silently.
+    // `RequestStartView` is exempt, being a probe that asks to LEARN the view rather
+    // than advertise it. Partitions without an attached superblock (in-memory,
+    // simulated) pass vacuously: their persist gate records "durable = current"
+    // instead of writing, precisely so this assert stays meaningful for the groups
+    // that do have a store.
     #[cfg(debug_assertions)]
-    if consensus.namespace() == METADATA_CONSENSUS_NAMESPACE {
-        for action in actions {
-            let advertises_view = matches!(
-                action,
-                VsrAction::SendStartViewChange { .. }
-                    | VsrAction::SendDoViewChange { .. }
-                    | VsrAction::SendStartView { .. }
-                    | VsrAction::SendPrepareOk { .. }
-                    // A backup drops a Commit whose view differs from its own, and a
-                    // primary answers an older-view one with a StartView, so the
-                    // heartbeat advertises a view like the rest. Gated today only
-                    // because its sole emitter rides the tick, which persists first.
-                    | VsrAction::SendCommit { .. }
-            );
-            debug_assert!(
-                !advertises_view || !consensus.needs_superblock_persist(),
-                "durable-before-send violated: dispatching a view-scoped metadata action \
-                 while the superblock is behind the in-memory view {}",
-                consensus.view(),
-            );
-        }
+    for action in actions {
+        let advertises_view = matches!(
+            action,
+            VsrAction::SendStartViewChange { .. }
+                | VsrAction::SendDoViewChange { .. }
+                | VsrAction::SendStartView { .. }
+                | VsrAction::SendPrepareOk { .. }
+                // A backup drops a Commit whose view differs from its own, and a
+                // primary answers an older-view one with a StartView, so the
+                // heartbeat advertises a view like the rest. Gated today only
+                // because its sole emitter rides the tick, which persists first.
+                | VsrAction::SendCommit { .. }
+        );
+        debug_assert!(
+            !advertises_view || !consensus.needs_superblock_persist(),
+            "durable-before-send violated: dispatching a view-scoped action for \
+             namespace {} while the superblock is behind the in-memory view {}",
+            consensus.namespace(),
+            consensus.view(),
+        );
     }
 
     for action in actions {
@@ -4690,9 +4712,9 @@ async fn dispatch_vsr_actions<B, P, J>(
     clippy::too_many_lines,
     clippy::cast_possible_truncation
 )]
-async fn dispatch_partition_journal_actions<B, P>(
+async fn dispatch_partition_journal_actions<B, P, SB>(
     consensus: &VsrConsensus<B, P>,
-    partition: &IggyPartition<B>,
+    partition: &IggyPartition<B, SB>,
     actions: &[VsrAction],
 ) where
     B: MessageBus,
