@@ -25,7 +25,7 @@
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo r --bin iggy-server
+//     cargo run --bin iggy-server
 //
 // Run this example (from repo root):
 //   cargo run --example tcp-tls-producer -p iggy_examples

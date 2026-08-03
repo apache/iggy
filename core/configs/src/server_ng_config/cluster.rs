@@ -71,6 +71,12 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
 
+/// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
+/// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server-ng`'s bootstrap static-asserts it
+/// against the real header. Used to reject a `[message_bus] max_message_size`
+/// too small to carry a single state-transfer chunk.
+pub const STATE_CHUNK_HEADER_LEN: u64 = 256;
+
 /// Upper bound on `repair_chunk_max`. A chunk rides the per-peer bus queue, so
 /// the load-bearing rule is `repair_chunk_max < message_bus.peer_queue_capacity`
 /// (enforced at the top level); this standalone ceiling is a typo guard.
