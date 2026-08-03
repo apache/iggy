@@ -57,7 +57,6 @@ ignored = [
     "opentelemetry-semantic-conventions",
     "opentelemetry_sdk",
     "papaya",
-    "prometheus-client",
     "rand",
     "ringbuffer",
     "rmp-serde",
