@@ -608,7 +608,7 @@ class IggyBlockingClient final {
      * @throws IggyException if the connection or automatic authentication
      *         fails.
      */
-    void Connect() const;
+    void Connect();
 
     /**
      * @brief Disconnects from the configured Iggy server.
@@ -623,7 +623,7 @@ class IggyBlockingClient final {
      * @throws IggyException if the client cannot disconnect cleanly.
      * @see Shutdown()
      */
-    void Disconnect() const;
+    void Disconnect();
 
     /**
      * @brief Shuts down the client and its background tasks.
@@ -639,7 +639,7 @@ class IggyBlockingClient final {
      * @throws IggyException if shutdown fails.
      * @see Disconnect()
      */
-    void Shutdown() const;
+    void Shutdown();
 
     /**
      * @brief Authenticates with a username and password.
@@ -654,7 +654,7 @@ class IggyBlockingClient final {
      * @return Information about the authenticated session.
      * @throws IggyException if authentication fails.
      */
-    LoginInfo Login(std::string username, std::string password) const;
+    LoginInfo Login(std::string username, std::string password);
 
     /**
      * @brief Ends the current authenticated session.
@@ -668,7 +668,7 @@ class IggyBlockingClient final {
      * @throws IggyException if logout fails.
      * @see Disconnect()
      */
-    void Logout() const;
+    void Logout();
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);

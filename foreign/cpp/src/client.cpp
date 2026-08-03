@@ -44,7 +44,7 @@ IggyBlockingClient IggyBlockingClient::FromConnectionString(std::string connecti
     }
 }
 
-void IggyBlockingClient::Connect() const {
+void IggyBlockingClient::Connect() {
     try {
         client_->connect();
     } catch (const std::exception &error) {
@@ -52,7 +52,7 @@ void IggyBlockingClient::Connect() const {
     }
 }
 
-void IggyBlockingClient::Disconnect() const {
+void IggyBlockingClient::Disconnect() {
     try {
         client_->disconnect();
     } catch (const std::exception &error) {
@@ -60,7 +60,7 @@ void IggyBlockingClient::Disconnect() const {
     }
 }
 
-void IggyBlockingClient::Shutdown() const {
+void IggyBlockingClient::Shutdown() {
     try {
         client_->shutdown();
     } catch (const std::exception &error) {
@@ -68,7 +68,7 @@ void IggyBlockingClient::Shutdown() const {
     }
 }
 
-LoginInfo IggyBlockingClient::Login(std::string username, std::string password) const {
+LoginInfo IggyBlockingClient::Login(std::string username, std::string password) {
     try {
         return client_->login_user(std::move(username), std::move(password));
     } catch (const std::exception &error) {
@@ -76,7 +76,7 @@ LoginInfo IggyBlockingClient::Login(std::string username, std::string password) 
     }
 }
 
-void IggyBlockingClient::Logout() const {
+void IggyBlockingClient::Logout() {
     try {
         client_->logout_user();
     } catch (const std::exception &error) {
