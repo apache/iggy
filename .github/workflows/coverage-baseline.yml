@@ -52,6 +52,7 @@ jobs:
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
+          install-nextest: "true"
           # Also warms the GitHub Actions build cache for subsequent PR builds
           save-cache: "true"
           # llvm-cov instrumentation roughly doubles object sizes; the light
