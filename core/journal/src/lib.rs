@@ -60,6 +60,22 @@ where
     ) -> impl Future<Output = io::Result<Vec<Self::Entry>>> {
         async { Ok(Vec::new()) }
     }
+
+    /// Snapshot watermark: entries at or below it are evictable. `0` for
+    /// journals without snapshot bookkeeping.
+    ///
+    /// Required rather than defaulted, and paired with
+    /// [`Self::set_snapshot_op`]: a wrapper that forwards one while inheriting
+    /// the other is silently broken in one direction and panics in the other
+    /// (an implementation whose setter asserts monotonicity would see a getter
+    /// stuck at `0` hand it a watermark below the real one). Journals without
+    /// snapshot bookkeeping answer `0` and no-op the setter EXPLICITLY.
+    fn snapshot_op(&self) -> u64;
+
+    /// Advance the snapshot watermark (see [`Self::snapshot_op`]). State
+    /// transfer uses this to mark pre-transfer residents superseded by the
+    /// installed snapshot.
+    fn set_snapshot_op(&self, op: u64);
 }
 
 // TODO: Move to other crate.

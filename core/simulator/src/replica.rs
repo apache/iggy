@@ -17,6 +17,7 @@
 
 use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
+use configs::server::PersonalAccessTokenConfig;
 use configs::server_ng::NgSystemConfig;
 use consensus::{ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
@@ -261,7 +262,15 @@ pub fn new_shard(
         let commit_watermark = journal.recovery_commit_watermark(solo);
         for op in 1..=commit_watermark {
             if let Some(entry) = journal.entry_sync(op) {
-                apply_committed_prepare(&metadata.mux_stm, &metadata.client_table, |_| {}, entry);
+                // `true`: the sim performs no state transfer, so no frontier
+                // shields any op from the table half of the apply.
+                apply_committed_prepare(
+                    &metadata.mux_stm,
+                    &metadata.client_table,
+                    true,
+                    |_| {},
+                    entry,
+                );
             }
         }
     }
@@ -301,6 +310,9 @@ pub fn new_shard(
             &SharedSimOutbox(Rc::clone(bus)),
             &shard_handle,
             Arc::new(NgSystemConfig::default()),
+            // Default-config PAT cap, like the system config above, so sim
+            // ingress admits exactly what a default-configured server does.
+            PersonalAccessTokenConfig::default().max_tokens_per_user,
         )
     } else {
         ShellHandlers::noop()

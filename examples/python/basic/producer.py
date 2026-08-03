@@ -60,35 +60,26 @@ async def main():
 
 
 async def init_system(client: IggyClient):
-    try:
-        logger.info(f"Creating stream with name {STREAM_NAME}...")
-        stream: StreamDetails | None = await client.get_stream(STREAM_NAME)
-        if stream is None:
-            await client.create_stream(name=STREAM_NAME)
-            logger.info("Stream was created successfully.")
-        else:
-            logger.warning(f"Stream {stream.name} already exists with ID {stream.id}")
+    logger.info(f"Creating stream with name {STREAM_NAME}...")
+    stream: StreamDetails | None = await client.get_stream(STREAM_NAME)
+    if stream is None:
+        await client.create_stream(name=STREAM_NAME)
+        logger.info("Stream was created successfully.")
+    else:
+        logger.warning(f"Stream {stream.name} already exists with ID {stream.id}")
 
-    except Exception as error:
-        logger.error(f"Error creating stream: {error}")
-        logger.exception(error)
-
-    try:
-        logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
-        topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
-        if topic is None:
-            await client.create_topic(
-                stream=STREAM_NAME,
-                partitions_count=1,
-                name=TOPIC_NAME,
-                replication_factor=1,
-            )
-            logger.info("Topic was created successfully.")
-        else:
-            logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")
-    except Exception as error:
-        logger.error(f"Error creating topic {error}")
-        logger.exception(error)
+    logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
+    topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
+    if topic is None:
+        await client.create_topic(
+            stream=STREAM_NAME,
+            partitions_count=1,
+            name=TOPIC_NAME,
+            replication_factor=1,
+        )
+        logger.info("Topic was created successfully.")
+    else:
+        logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")
 
 
 async def produce_messages(client: IggyClient):
@@ -127,6 +118,7 @@ async def produce_messages(client: IggyClient):
         except Exception as error:
             logger.error(f"Exception type: {type(error).__name__}, message: {error}")
             logger.exception(error)
+            break
 
         await asyncio.sleep(interval)
     logger.info(f"Sent {n_sent_batches} batches of messages, exiting.")

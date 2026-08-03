@@ -3228,6 +3228,7 @@ dependencies = [
  "serde",
  "server_common",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
