@@ -684,6 +684,15 @@ enabled = false
 # logs, never persisted) over storing it on disk. Ignored when enabled = false.
 shared_secret = ""
 
+# Retiring pre-shared key, accepted for verification only during a rolling key
+# rotation (this node keeps signing with shared_secret). Rotate in three rolls:
+# 1) shared_secret = old + previous_shared_secret = new on every node,
+# 2) shared_secret = new + previous_shared_secret = old on every node,
+# 3) shared_secret = new alone. Leave empty outside a rotation. Same length
+# floor and env-var preference as shared_secret
+# (IGGY_CLUSTER_AUTH_PREVIOUS_SHARED_SECRET).
+previous_shared_secret = ""
+
 # Replica-to-replica TLS for the consensus (tcp_replica) port.
 [cluster.tls]
 # When true every replica connection is wrapped in TLS 1.3 (ALPN
@@ -715,10 +724,13 @@ ca_file = ""
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
 #
-# 'ip' is the node's roster address. Replica-to-replica traffic,
-# follower-to-primary HTTP forwarding, and the TCP listener use it. It is not
-# the bind interface for quic/http/websocket, which comes from each transport's
-# own 'address' setting above.
+# 'ip' is the node's roster address. Replica-to-replica traffic and
+# follower-to-primary HTTP forwarding use it. It is not the bind interface for
+# tcp/quic/http/websocket, which comes from each transport's own 'address'
+# setting above; the roster supplies those transports their port only. A
+# cluster spread across hosts therefore needs each transport's 'address' set to
+# '0.0.0.0' or the routable NIC; the defaults below listen on loopback only,
+# and a bind that cannot serve the advertised 'ip' is warned about at startup.
 #
 # Each node may also set 'advertised_address': the client-facing address
 # handed out in cluster metadata and leader redirects. Set it when 'ip' is
@@ -795,6 +807,12 @@ shutdown_drain_timeout = "10 s"
 # cost; the default keeps shutdown observably prompt without measurable
 # scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
 shutdown_poll_interval = "50 ms"
+
+# Hard wall-clock deadline for joining shard threads at process exit. A
+# shard whose pump or listener wedges past this budget is abandoned with
+# an error log instead of blocking exit forever. Must be at least
+# shutdown_drain_timeout, or shards would be abandoned mid-drain.
+shutdown_join_timeout = "30 s"
 
 # Safety-tick cadence for the partition reconciliation loop. The reconciler
 # also wakes on every metadata commit from shard 0, so this only covers

@@ -19,15 +19,13 @@ use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
 };
-use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
+use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFrame};
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
-use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use server_common::{Message, MessageBag};
 
@@ -86,6 +84,22 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
             (h.0.operation, h.0.namespace, m.into_generic())
         }
         MessageBag::RepairRangeReply(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestStateTransfer(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StateTransferTarget(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestStateChunk(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StateChunk(m) => {
             let h = *m.header();
             (h.operation(), h.namespace, m.into_generic())
         }
@@ -285,11 +299,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + StreamsFrontend,
+        M: RestorableMetadataStm,
     {
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
@@ -421,11 +431,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + StreamsFrontend,
+        M: RestorableMetadataStm,
     {
         match frame {
             ShardFrame::Consensus { message, .. } => {

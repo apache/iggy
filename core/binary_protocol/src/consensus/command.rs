@@ -59,6 +59,17 @@ pub enum Command2 {
     RepairPrepare = 19,
     RepairDone = 20,
     RangeEvicted = 21,
+
+    // State transfer (metadata plane): a restarted replica replaces its
+    // snapshot-shaped state (metadata snapshot + client table) from the
+    // current primary, then journal repair covers the tail. Pull-based:
+    // the requester asks for the target descriptor, then fetches each
+    // artifact in bounded chunks (per-peer bus queues drop overruns
+    // silently, so push cannot work).
+    RequestStateTransfer = 22,
+    StateTransferTarget = 23,
+    RequestStateChunk = 24,
+    StateChunk = 25,
 }
 
 // SAFETY: Command2 is #[repr(u8)] with no padding bytes.
@@ -69,7 +80,7 @@ unsafe impl CheckedBitPattern for Command2 {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= Self::RangeEvicted as u8
+        *bits <= Self::StateChunk as u8
     }
 }
 
@@ -90,8 +101,8 @@ mod tests {
 
     #[test]
     fn replica_auth_commands_are_valid_bit_patterns() {
-        // Locks the is_valid_bit_pattern bump: 14..=21 parse, 22 still rejects.
-        for command in 14u8..=21 {
+        // Locks the is_valid_bit_pattern bump: 14..=25 parse, 26 still rejects.
+        for command in 14u8..=25 {
             let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
             buf.resize(256, 0);
             buf[60] = command;
@@ -99,7 +110,7 @@ mod tests {
         }
         let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
         buf.resize(256, 0);
-        buf[60] = 22;
+        buf[60] = 26;
         assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

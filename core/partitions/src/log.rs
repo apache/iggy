@@ -80,6 +80,30 @@ where
     fn entry(&self, header: &Self::Header) -> impl Future<Output = Option<Self::Entry>> {
         self.inner.entry(header)
     }
+
+    // Forward EVERY method, including the ones the trait could default. A
+    // wrapper that silently substitutes a default for its inner journal is a
+    // trap: `snapshot_op` would answer 0 and `set_snapshot_op` would vanish,
+    // so a state-transfer install through this wrapper would neither evict
+    // superseded entries nor advance the watermark it thinks it advanced.
+    fn snapshot_op(&self) -> u64 {
+        self.inner.snapshot_op()
+    }
+
+    fn set_snapshot_op(&self, op: u64) {
+        self.inner.set_snapshot_op(op);
+    }
+
+    fn remaining_capacity(&self) -> Option<usize> {
+        self.inner.remaining_capacity()
+    }
+
+    fn drain(
+        &self,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> impl Future<Output = std::io::Result<Vec<Self::Entry>>> {
+        self.inner.drain(ops)
+    }
 }
 
 impl<J: Default> Default for JournalState<J> {
