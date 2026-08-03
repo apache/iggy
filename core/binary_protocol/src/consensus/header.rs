@@ -1048,15 +1048,30 @@ pub struct StartViewHeader {
     /// max(commit) from all DVCs.
     pub commit: u64,
     pub namespace: u64,
-    pub reserved: [u8; 104],
+    pub reserved: [u8; 88],
+    /// Sender's incarnation, echoed from the `RequestStartView` this answers so a
+    /// recovering replica can prove the reply post-dates its restart (see
+    /// `RequestStartViewHeader::incarnation`). `0` on an unsolicited `StartView`
+    /// (a normal view-change completion), which carries no freshness claim.
+    ///
+    /// Carved from the tail of the former `reserved` region and placed LAST so it
+    /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
+    /// A peer that predates it sends zeros, decoding as `incarnation == 0`, which
+    /// the `handle_start_view` guard treats as no claim rather than as a foreign
+    /// one, so a mixed-version rolling upgrade is wire-compatible: the pre-upgrade
+    /// peer's `StartView` is judged by the view checks alone, as before the field.
+    pub incarnation: u128,
 }
 const _: () = {
     assert!(size_of::<StartViewHeader>() == HEADER_SIZE);
+    // op/commit/namespace keep their pre-incarnation offsets.
     assert!(
         offset_of!(StartViewHeader, op)
             == offset_of!(StartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StartViewHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE);
+    // `incarnation` is last and 16-aligned, so the struct has no padding.
+    assert!(offset_of!(StartViewHeader, incarnation) + size_of::<u128>() == HEADER_SIZE);
+    assert!(offset_of!(StartViewHeader, incarnation) % 16 == 0);
 };
 
 impl ConsensusHeader for StartViewHeader {
@@ -1097,8 +1112,11 @@ impl ConsensusHeader for StartViewHeader {
 /// Recovering replica -> all replicas: resend me the current `StartView`.
 ///
 /// Header-only; only the current view's primary answers, with a targeted
-/// `StartView` (adoption is fenced by the receiver's view monotonicity and
-/// the sender-is-primary check, so no nonce is needed).
+/// `StartView`. Adoption is fenced by the receiver's view monotonicity and the
+/// sender-is-primary check; `incarnation` additionally proves the reply
+/// post-dates this replica's restart, so a `StartView` from a previous
+/// incarnation still in flight cannot be adopted (see the `handle_start_view`
+/// recovering-status guard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct RequestStartViewHeader {
@@ -1113,15 +1131,26 @@ pub struct RequestStartViewHeader {
     pub reserved_frame: [u8; 66],
 
     pub namespace: u64,
-    pub reserved: [u8; 120],
+    pub reserved: [u8; 104],
+    /// The requester's per-boot incarnation, echoed back in the answering
+    /// `StartView` so a reply from a previous incarnation is detectable.
+    ///
+    /// Carved from the tail of the former `reserved` region and placed LAST so it
+    /// lands 16-aligned with no padding WITHOUT moving `namespace`. A peer that
+    /// predates it sends zeros, decoding as `incarnation == 0`, so a mixed-version
+    /// rolling upgrade is wire-compatible.
+    pub incarnation: u128,
 }
 const _: () = {
     assert!(size_of::<RequestStartViewHeader>() == HEADER_SIZE);
+    // namespace keeps its pre-incarnation offset.
     assert!(
         offset_of!(RequestStartViewHeader, namespace)
             == offset_of!(RequestStartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestStartViewHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
+    // `incarnation` is last and 16-aligned, so the struct has no padding.
+    assert!(offset_of!(RequestStartViewHeader, incarnation) + size_of::<u128>() == HEADER_SIZE);
+    assert!(offset_of!(RequestStartViewHeader, incarnation) % 16 == 0);
 };
 
 impl ConsensusHeader for RequestStartViewHeader {
@@ -1275,6 +1304,302 @@ impl ConsensusHeader for RepairRangeReplyHeader {
                 expected: Command2::RepairDone,
                 found: self.command,
             });
+        }
+        Ok(())
+    }
+}
+
+// State transfer: descriptor + chunk pull frames.
+//
+// Plane-agnostic: the descriptor's BODY carries a state manifest (see the
+// consensus crate's `state_manifest`) listing N artifacts, and the chunk
+// frames address bytes by `(manifest index, offset)`. The metadata plane
+// ships two artifacts (snapshot + client table); the partition plane ships
+// its own set (segment logs, offsets) through the same frames.
+
+// RequestStateTransferHeader - restarted replica -> current primary
+
+/// Ask the current primary for a state-transfer target descriptor.
+///
+/// Answered with `StateTransferTarget`. Sent by a restarted replica after it
+/// adopts a view from a live primary; `nonce` correlates the whole transfer
+/// session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestStateTransferHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub namespace: u64,
+    pub reserved: [u8; 104],
+}
+const _: () = {
+    assert!(size_of::<RequestStateTransferHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestStateTransferHeader, nonce)
+            == offset_of!(RequestStateTransferHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(
+        offset_of!(RequestStateTransferHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE
+    );
+};
+
+impl ConsensusHeader for RequestStateTransferHeader {
+    const COMMAND: Command2 = Command2::RequestStateTransfer;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestStateTransfer {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestStateTransfer,
+                found: self.command,
+            });
+        }
+        // Header-only frame, so the size is fully determined. `EvictionHeader`
+        // pins the same way; the generic `Message::try_from` bound makes this
+        // safe either way, but a validate that checks what it can keeps the
+        // surface uniform across frames.
+        if self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidSize {
+                expected: HEADER_SIZE as u32,
+                found: self.size,
+            });
+        }
+        Ok(())
+    }
+}
+
+// StateTransferTargetHeader - serving primary -> requester
+
+/// The transfer target descriptor.
+///
+/// The artifact list rides the BODY as an encoded state manifest (`size`
+/// spans header + manifest); the header carries only the session nonce and
+/// the serving peer's applied frontier. `available == 0` means the serving
+/// peer cannot serve right now (not a caught-up primary, or it has never
+/// checkpointed, so the requester's journal repair can cover the whole gap)
+/// and the frame is header-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct StateTransferTargetHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    /// Serving primary's applied frontier (`commit_min`) when the descriptor
+    /// was built. The receiver's tail repair targets past this.
+    pub commit_op: u64,
+    pub namespace: u64,
+    pub available: u8,
+    pub reserved: [u8; 95],
+}
+const _: () = {
+    assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(StateTransferTargetHeader, nonce)
+            == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for StateTransferTargetHeader {
+    const COMMAND: Command2 = Command2::StateTransferTarget;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::StateTransferTarget {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::StateTransferTarget,
+                found: self.command,
+            });
+        }
+        if self.available > 1 {
+            return Err(ConsensusError::InvalidField(
+                "available must be 0 or 1".to_string(),
+            ));
+        }
+        // Unavailable is a bare refusal; a manifest body on it would be
+        // ambiguous (which offer would the chunks belong to?). An
+        // `available == 1` body is left unbounded here on purpose: it carries
+        // the state manifest, whose entry count and per-artifact/total lengths
+        // are bounded where it is decoded (`STATE_MANIFEST_ENTRIES_MAX`, plus
+        // the receiver's artifact caps), and the generic `Message::try_from`
+        // bound already keeps `size` inside the frame.
+        if self.available == 0 && self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidField(
+                "unavailable descriptor must be header-only".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// RequestStateChunkHeader - requester -> serving primary
+
+/// Pull one bounded chunk of an artifact.
+///
+/// Lockstep per artifact: the requester keeps at most one chunk in flight,
+/// so the bounded per-peer bus queue can never drop a burst tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestStateChunkHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub offset: u64,
+    pub namespace: u64,
+    pub len: u32,
+    /// Index into the offered state manifest. Range-checked by the serving
+    /// handler against the cached offer (the header cannot know the count).
+    pub artifact: u32,
+    pub reserved: [u8; 88],
+}
+const _: () = {
+    assert!(size_of::<RequestStateChunkHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestStateChunkHeader, nonce)
+            == offset_of!(RequestStateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RequestStateChunkHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RequestStateChunkHeader {
+    const COMMAND: Command2 = Command2::RequestStateChunk;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestStateChunk {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestStateChunk,
+                found: self.command,
+            });
+        }
+        if self.len == 0 {
+            return Err(ConsensusError::InvalidField(
+                "chunk len must be non-zero".to_string(),
+            ));
+        }
+        // Header-only frame; the requested `len` describes the REPLY, which the
+        // serving side clamps against its own chunk size and the bus ceiling.
+        if self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidSize {
+                expected: HEADER_SIZE as u32,
+                found: self.size,
+            });
+        }
+        Ok(())
+    }
+}
+
+// StateChunkHeader - serving primary -> requester (carries payload)
+
+/// One chunk of artifact bytes at `offset`.
+///
+/// The payload rides the body (`size` spans header + payload). Transit
+/// integrity is checked at the artifact level (descriptor checksums), not
+/// per chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct StateChunkHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub offset: u64,
+    pub namespace: u64,
+    /// Index into the offered state manifest. Range-checked by the receiving
+    /// handler against its accepted manifest.
+    pub artifact: u32,
+    pub reserved: [u8; 92],
+}
+const _: () = {
+    assert!(size_of::<StateChunkHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(StateChunkHeader, nonce)
+            == offset_of!(StateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(StateChunkHeader, reserved) + size_of::<[u8; 92]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for StateChunkHeader {
+    const COMMAND: Command2 = Command2::StateChunk;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::StateChunk {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::StateChunk,
+                found: self.command,
+            });
+        }
+        if (self.size as usize) < HEADER_SIZE {
+            return Err(ConsensusError::InvalidField(
+                "state chunk size below header size".to_string(),
+            ));
         }
         Ok(())
     }

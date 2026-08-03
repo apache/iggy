@@ -42,6 +42,7 @@ use crate::dispatch::submit_register_on_owner;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
+use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
     forget_if_same, live_entry, sweep_expired,
@@ -87,6 +88,10 @@ pub(in crate::http) struct HttpInner {
     /// clients out of the shared VSR client table. Read by `resolve_session`
     /// when admitting a fresh session.
     pub(in crate::http) max_http_sessions: usize,
+    /// Configured `[personal_access_token] max_tokens_per_user`, enforced
+    /// pre-consensus by the PAT rewrite inside the write submit (the cap is
+    /// config-derived, so it must never branch inside the replicated apply).
+    pub(in crate::http) max_tokens_per_user: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
@@ -94,6 +99,9 @@ pub(in crate::http) struct HttpInner {
     /// Follower-to-primary forwarding context: outbound client, scheme, body
     /// bound, and its own in-flight budget (see `http::forward`).
     pub(in crate::http) forward: ForwardState,
+    /// Legacy-parity metric registry served by the scrape route; the router's
+    /// counting layer holds a clone of its request counter.
+    pub(in crate::http) metrics: HttpMetrics,
 }
 
 impl HttpInner {

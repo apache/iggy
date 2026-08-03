@@ -48,15 +48,6 @@ const MAX_ALLOWED_MEMORY_BYTES: u64 = 200 * 1024 * 1024;
 /// Uses all available transports from the harness (TCP, HTTP, QUIC, WebSocket).
 /// 2 producers are spawned per protocol, all writing to the same partition.
 pub async fn run(harness: &TestHarness) {
-    // HTTP (REST) carries no VSR framing, so under vsr the race runs over the
-    // three VSR transports; the legacy path exercises all four.
-    #[cfg(feature = "vsr")]
-    let transports = [
-        TransportProtocol::Tcp,
-        TransportProtocol::Quic,
-        TransportProtocol::WebSocket,
-    ];
-    #[cfg(not(feature = "vsr"))]
     let transports = [
         TransportProtocol::Tcp,
         TransportProtocol::Http,

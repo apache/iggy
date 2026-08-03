@@ -20,7 +20,10 @@ import { Readable } from "node:stream";
 import type { ClientConfig } from "../client/client.type.js";
 import type { Id } from '../wire/identifier.utils.js';
 import { getClient } from "../client/client.js";
-import { type PollMessages } from "../wire/message/poll-messages.command.js";
+import {
+  NO_ASSIGNED_PARTITION,
+  type PollMessages
+} from "../wire/message/poll-messages.command.js";
 import {
   type PollingStrategy,
   type CommandAPI,
@@ -43,6 +46,10 @@ async function* genEagerUntilPoll(
 
   while (true) {
     const r = await c.message.poll(poll);
+    if (r.count === 0 && r.partitionId === NO_ASSIGNED_PARTITION) {
+      await wait(interval);
+      continue;
+    }
     yield r;
     state.set(`${r.partitionId}`, r.count);
 
