@@ -22,13 +22,11 @@ This module provides pytest fixtures for setting up test environments
 and connecting to Iggy servers in various configurations.
 """
 
-# TODO(slbotbm): Create text fixture for clean up after
-# delete_stream() has been implemented.
-
 import asyncio
 import os
 import secrets
 import string
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
@@ -37,9 +35,32 @@ from apache_iggy import IggyClient
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
+_ROOT_USER_ID = 0
 
-@pytest.fixture(scope="session")
-async def iggy_client() -> IggyClient:
+
+async def _delete_test_resources(client: IggyClient) -> None:
+    streams = await client.get_streams()
+
+    for stream in streams:
+        topics = await client.get_topics(stream.id)
+        for topic in topics:
+            consumer_groups = await client.get_consumer_groups(stream.id, topic.id)
+            for consumer_group in consumer_groups:
+                await client.delete_consumer_group(
+                    stream.id, topic.id, consumer_group.id
+                )
+
+    for stream in streams:
+        await client.delete_stream(stream.id)
+
+    users = await client.get_users()
+    for user in users:
+        if user.id != _ROOT_USER_ID:
+            await client.delete_user(user.id)
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def iggy_client() -> AsyncGenerator[IggyClient, None]:
     """
     Create and configure an Iggy client for testing.
 
@@ -50,7 +71,7 @@ async def iggy_client() -> IggyClient:
     4. Authenticates with default credentials
     5. Verifies connectivity with ping
 
-    Returns:
+    Yields:
         IggyClient: Authenticated client ready for testing
     """
     host, port = get_server_config()
@@ -68,7 +89,9 @@ async def iggy_client() -> IggyClient:
     # Authenticate
     await client.login_user("iggy", "iggy")
 
-    return client
+    yield client
+
+    await _delete_test_resources(client)
 
 
 @pytest.fixture
