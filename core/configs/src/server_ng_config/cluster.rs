@@ -71,6 +71,12 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
 
+/// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
+/// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server-ng`'s bootstrap static-asserts it
+/// against the real header. Used to reject a `[message_bus] max_message_size`
+/// too small to carry a single state-transfer chunk.
+pub const STATE_CHUNK_HEADER_LEN: u64 = 256;
+
 /// Upper bound on `repair_chunk_max`. A chunk rides the per-peer bus queue, so
 /// the load-bearing rule is `repair_chunk_max < message_bus.peer_queue_capacity`
 /// (enforced at the top level); this standalone ceiling is a typo guard.
@@ -299,6 +305,20 @@ pub struct ClusterAuthConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub shared_secret: String,
+    /// Retiring pre-shared key, accepted for VERIFICATION only during a key
+    /// rotation window; every MAC this node produces uses [`Self::shared_secret`].
+    ///
+    /// Enables rolling PSK rotation without an auth outage, three rolls:
+    /// 1. every node gets `shared_secret = old, previous_shared_secret = new`;
+    /// 2. every node gets `shared_secret = new, previous_shared_secret = old`;
+    /// 3. every node gets `shared_secret = new` alone, closing the window.
+    ///
+    /// Leave empty (default) outside a rotation. Same 32-byte minimum and
+    /// provisioning rules as `shared_secret`
+    /// (`IGGY_CLUSTER_AUTH_PREVIOUS_SHARED_SECRET`).
+    #[serde(default, skip_serializing)]
+    #[config_env(secret)]
+    pub previous_shared_secret: String,
 }
 
 /// Replica-to-replica TLS for the consensus (`tcp_replica`) port.
@@ -860,6 +880,24 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        // Rotation window key: same typo guard as the primary, plus a
+        // distinctness check - a window equal to the primary means the
+        // operator rolled the config without changing the key, so the
+        // "rotation" would silently be a no-op.
+        if !self.auth.previous_shared_secret.is_empty() {
+            if self.auth.previous_shared_secret.len() < MIN_SHARED_SECRET_LEN {
+                eprintln!(
+                    "Invalid cluster configuration: cluster.auth.previous_shared_secret must be >= {MIN_SHARED_SECRET_LEN} bytes"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            if self.auth.previous_shared_secret == self.auth.shared_secret {
+                eprintln!(
+                    "Invalid cluster configuration: cluster.auth.previous_shared_secret must differ from cluster.auth.shared_secret (an identical window is a no-op rotation)"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+        }
 
         // Replica TLS. Both cert modes run one-directional TLS (no client
         // certificate anywhere), so TLS only authenticates the acceptor to
@@ -923,6 +961,7 @@ mod tests {
             auth: ClusterAuthConfig {
                 enabled: true,
                 shared_secret: "current-psk-MUST-NOT-be-persisted".to_owned(),
+                previous_shared_secret: "retiring-psk-MUST-NOT-be-persisted".to_owned(),
             },
             tls: ClusterTlsConfig::default(),
         };
@@ -1518,6 +1557,36 @@ mod cluster_validate_tests {
         c.auth.enabled = true;
         c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_valid_rotation_window() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.auth.previous_shared_secret = "b".repeat(MIN_SHARED_SECRET_LEN);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_short_previous_secret() {
+        // Same typo guard as the primary key.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.auth.previous_shared_secret = "b".repeat(MIN_SHARED_SECRET_LEN - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_rotation_window_equal_to_primary() {
+        // An identical window is a no-op rotation: the operator rolled the
+        // config without changing the key.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.auth.previous_shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        assert!(c.validate().is_err());
     }
 
     fn tls_files() -> ClusterTlsConfig {

@@ -19,13 +19,14 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
+use iggy_connector_sdk::retry::{exponential_backoff, jitter};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
 use reqwest::{Method, StatusCode, header};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -47,8 +48,9 @@ const MAX_REDIRECTS: u8 = 5;
 // keep the worst-case label well under that limit.
 const MAX_LABEL_PREFIX_LEN: usize = 16;
 const MAX_LABEL_NAME_LEN: usize = 16;
-// A single 64-bit (16-hex) joint hash over the raw (prefix, stream, topic)
-// triple. 64 bits keeps the adversarial birthday bound high enough that a
+// A single 64-bit (16-hex) joint hash over the raw
+// (prefix, table, stream, topic) identity. 64 bits keeps the
+// adversarial birthday bound high enough that a
 // multi-tenant namer can't cheaply force the label collisions that Doris's
 // server-side dedupe would turn into silent data loss. One joint hash (not one
 // per segment) buys that for the same length budget, leaving the sanitized names
@@ -58,6 +60,20 @@ const LABEL_HASH_HEX_LEN: usize = 16;
 // returns a giant body can't flood the logs. Bounds only what we *log*, not peak
 // memory — `response.text()` already buffers the full body first.
 const MAX_RESPONSE_LOG_BYTES: usize = 4096;
+// In-request retry budget for *transient* Stream Load failures (5xx/408/429,
+// transport errors, and duplicate labels whose existing job is RUNNING or
+// CANCELLED).
+// The runtime commits the consumer
+// offset at poll time before consume() runs, so a transient failure we don't
+// retry here is lost — an in-request re-PUT under the same label (which Doris
+// dedupes) is the connector's only redelivery lever. Keep the worst-case budget
+// well inside Doris's label_keep_max_second so a retry still dedupes.
+const DEFAULT_MAX_RETRIES: u32 = 3;
+// Higher values are still honored, but warn because the retry loop runs inside
+// an uncancellable consume() call and can substantially delay graceful shutdown.
+const MAX_RETRIES_WARNING_THRESHOLD: u32 = 10;
+const DEFAULT_RETRY_DELAY: &str = "200ms";
+const DEFAULT_MAX_RETRY_DELAY: &str = "5s";
 
 #[derive(Debug)]
 pub struct DorisSink {
@@ -85,6 +101,11 @@ struct Connected {
     // off `self` instead of threading it through every call.
     allow_insecure_redirect: bool,
     allowed_redirect_hosts: Option<Vec<String>>,
+    // In-request retry policy for transient Stream Load failures, resolved once
+    // at `open()`. `max_retries` is the total attempt count (1 = no retry).
+    max_retries: u32,
+    retry_delay: Duration,
+    max_retry_delay: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +128,20 @@ pub struct DorisSinkConfig {
     /// cross-region or cold-start FEs that are slow to accept the connection.
     pub connect_timeout: Option<String>,
     pub batch_size: Option<u32>,
+    /// Total number of Stream Load attempts per batch on a *transient* failure
+    /// (HTTP 5xx/408/429, a transport error, or a duplicate label whose existing
+    /// job is `RUNNING` or `CANCELLED`). `0` or `1` disables retries. Each retry
+    /// re-PUTs under the same label — which Doris dedupes — so an ambiguous
+    /// success (e.g. a 2xx with a missing or unreadable body) is absorbed rather
+    /// than doubled. Default 3. Values above 10 are honored but emit a startup
+    /// warning because they can substantially delay graceful shutdown.
+    pub max_retries: Option<u32>,
+    /// Base backoff before the first retry, as a human-readable duration (e.g.
+    /// "200ms"). Doubles each attempt up to `max_retry_delay`, with ±20% jitter.
+    pub retry_delay: Option<String>,
+    /// Strict upper bound on a single retry backoff, including jitter, as a
+    /// human-readable duration (e.g. "5s").
+    pub max_retry_delay: Option<String>,
     /// Permit a redirect that downgrades the scheme (e.g. `https://` FE ->
     /// `http://` BE). Off by default: a downgrade would push Basic-auth
     /// credentials onto a cleartext hop, so we refuse it unless the operator
@@ -135,6 +170,9 @@ struct StreamLoadResponse {
     #[serde(rename = "NumberFilteredRows")]
     #[serde(default)]
     number_filtered_rows: u64,
+    #[serde(rename = "ExistingJobStatus")]
+    #[serde(default)]
+    existing_job_status: Option<String>,
 }
 
 impl DorisSink {
@@ -160,8 +198,8 @@ impl DorisSink {
     }
 
     fn build_client(&self) -> Result<reqwest::Client, Error> {
-        let timeout = parse_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
-        let connect_timeout = parse_duration(
+        let timeout = parse_request_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
+        let connect_timeout = parse_request_duration(
             self.config.connect_timeout.as_deref(),
             DEFAULT_CONNECT_TIMEOUT,
         );
@@ -177,15 +215,10 @@ impl DorisSink {
 
     async fn send_stream_load(
         &self,
+        connected: &Connected,
         label: &str,
         body: Bytes,
     ) -> Result<StreamLoadResponse, Error> {
-        let connected = self.connected.as_ref().ok_or_else(|| {
-            Error::InitError(format!(
-                "Doris sink ID {} called before open() — not connected",
-                self.id
-            ))
-        })?;
         // `base_url` is the redirect-validation baseline (original FE scheme/host)
         // and the parsed first-hop target.
         let mut url = connected.base_url.clone();
@@ -269,8 +302,8 @@ impl DorisSink {
                     // certainly persisted the load, but we can't read the row
                     // counts to confirm. Classify transient — not a fabricated
                     // parse failure — so a retry re-PUTs under the same label and
-                    // Doris's dedupe reveals the real outcome instead of DLQing a
-                    // success.
+                    // Doris's dedupe reveals the real outcome instead of
+                    // surfacing a committed load as a permanent failure.
                     warn!(
                         "Doris sink ID {} failed to read 2xx response body: {e}; treating as retryable",
                         self.id
@@ -283,7 +316,8 @@ impl DorisSink {
                 Err(e) => {
                     // Non-2xx with an unreadable body: log it, then fall back to
                     // an empty body so the status-based handling below still
-                    // classifies the outcome (empty body on a non-2xx => permanent).
+                    // lets the HTTP status mapping below determine whether the
+                    // outcome is transient or permanent.
                     warn!(
                         "Doris sink ID {} failed to read response body: {e}",
                         self.id
@@ -299,7 +333,8 @@ impl DorisSink {
                     self.id
                 );
                 error!("{msg}");
-                // 408/429 are 4xx but transient — retry them, don't DLQ.
+                // 408/429 are 4xx but transient, so include them in the bounded
+                // in-request retry path.
                 return Err(match status {
                     StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
                         Error::CannotStoreData(msg)
@@ -310,6 +345,54 @@ impl DorisSink {
             }
 
             return parse_stream_load_response(&response_text);
+        }
+    }
+
+    /// Load one batch with bounded in-request retry. `send_stream_load` performs
+    /// a single full FE -> BE attempt; this wraps it (plus status
+    /// classification) so a *transient* failure re-PUTs under the same `label`.
+    /// The runtime commits the consumer offset before consume() runs, so this is
+    /// the connector's only redelivery path on a transient outage; the shared
+    /// label lets Doris dedupe a prior attempt that actually landed (e.g. a 2xx
+    /// with a missing or unreadable body). A `PermanentHttpError` returns
+    /// immediately — retrying bad data would just hammer the FE.
+    async fn load_batch(&self, label: &str, body: Bytes) -> Result<StreamLoadResponse, Error> {
+        let connected = self.connected.as_ref().ok_or_else(|| {
+            Error::InitError(format!(
+                "Doris sink ID {} called before open() — not connected",
+                self.id
+            ))
+        })?;
+
+        let mut attempt = 0u32;
+        loop {
+            let error = match self
+                .send_stream_load(connected, label, body.clone())
+                .await
+                .and_then(|response| classify_status(self.id, &response).map(|()| response))
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+
+            attempt += 1;
+            if attempt >= connected.max_retries || !is_transient_error(&error) {
+                return Err(error);
+            }
+
+            // `attempt` counts completed attempts. Subtract one so the first
+            // retry waits exactly the configured base delay (base * 2^0).
+            let delay = jitter(exponential_backoff(
+                connected.retry_delay,
+                attempt - 1,
+                connected.max_retry_delay,
+            ))
+            .min(connected.max_retry_delay);
+            warn!(
+                "Doris sink ID {} transient Stream Load failure on attempt {attempt}/{} (label={label}): {error}; retrying in {delay:?}",
+                self.id, connected.max_retries
+            );
+            tokio::time::sleep(delay).await;
         }
     }
 }
@@ -428,26 +511,28 @@ fn split_host_port(entry: &str) -> (&str, Option<u16>) {
 }
 
 /// Parse a human-readable duration (e.g. "30s"), falling back to `default` with
-/// a warning on a malformed *or zero* value. Mirrors the http/influxdb sinks.
-///
-/// A zero duration parses fine but is degenerate: reqwest treats a zero
-/// timeout/connect-timeout as an immediate deadline, so every request fails with
-/// a `TimedOut` error before it can complete. Treat it like a malformed value.
+/// a warning when malformed. Zero is valid for retry backoff configuration.
 fn parse_duration(input: Option<&str>, default: &str) -> Duration {
     let raw = input.unwrap_or(default);
-    let fallback = || *HumanDuration::from_str(default).expect("default duration must be valid");
-    let parsed = HumanDuration::from_str(raw)
+    HumanDuration::from_str(raw)
         .map(|d| *d)
         .unwrap_or_else(|e| {
             warn!("Invalid duration '{raw}': {e}, using default '{default}'");
-            fallback()
-        });
+            *HumanDuration::from_str(default).expect("default duration must be valid")
+        })
+}
+
+/// Parse a reqwest request timeout. Unlike retry delays, a zero request timeout
+/// is degenerate because every request expires immediately.
+fn parse_request_duration(input: Option<&str>, default: &str) -> Duration {
+    let raw = input.unwrap_or(default);
+    let parsed = parse_duration(input, default);
     if parsed.is_zero() {
         warn!(
             "Duration '{raw}' is zero, which would time out every request immediately; \
              using default '{default}'"
         );
-        return fallback();
+        return *HumanDuration::from_str(default).expect("default duration must be valid");
     }
     parsed
 }
@@ -484,6 +569,16 @@ fn effective_batch_size(configured: Option<u32>) -> usize {
     configured.unwrap_or(DEFAULT_BATCH_SIZE).max(1) as usize
 }
 
+/// Total Stream Load attempts per batch. An unset value uses the default;
+/// configured `0` or `1` both mean one attempt with no retry.
+fn effective_max_retries(configured: Option<u32>) -> u32 {
+    configured.unwrap_or(DEFAULT_MAX_RETRIES).max(1)
+}
+
+fn should_warn_for_retry_count(max_retries: u32) -> bool {
+    max_retries > MAX_RETRIES_WARNING_THRESHOLD
+}
+
 /// Build a validated Stream Load header value, surfacing a bad byte (CR/LF,
 /// non-visible-ASCII) as a startup-time `InvalidConfigValue` instead of a
 /// per-batch `HttpRequestFailed` (reqwest defers `HeaderValue::try_from` to
@@ -512,16 +607,17 @@ fn sanitize_segment(value: &str, max_len: usize) -> String {
         .collect()
 }
 
-/// A single blake3 fingerprint over the *raw* (unsanitized) `prefix`, `stream`,
-/// and `topic`, truncated to `LABEL_HASH_HEX_LEN` hex chars. This disambiguates
+/// A single blake3 fingerprint over the *raw* (unsanitized) `prefix`, target
+/// table, `stream`, and `topic`, truncated to `LABEL_HASH_HEX_LEN` hex
+/// chars. This disambiguates
 /// identities that sanitize+truncate to the same string (e.g. `events.v1` vs
 /// `events_v1`, or prefixes `prod_events_us_east_1` vs `..._2`), which would
 /// otherwise produce identical labels and cause silent data loss via Doris's
-/// server-side label dedupe. Inputs are length-prefixed so distinct triples
-/// can't alias into one digest (e.g. `("ab","c",..)` vs `("a","bc",..)`).
-fn identity_hash(prefix: &str, stream: &str, topic: &str) -> String {
+/// database-scoped label dedupe. Inputs are length-prefixed so distinct tuples
+/// cannot alias into one digest.
+fn identity_hash(prefix: &str, table: &str, stream: &str, topic: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    for part in [prefix, stream, topic] {
+    for part in [prefix, table, stream, topic] {
         hasher.update(&(part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
@@ -533,14 +629,17 @@ fn identity_hash(prefix: &str, stream: &str, topic: &str) -> String {
 /// `{prefix_san}-{stream_san}-{topic_san}-{hash16}-{partition}-{first}-{last}`.
 ///
 /// The segment caps bound the total under Doris's 128-char label limit (worst
-/// case 120), and the joint `hash16` over the raw (prefix, stream, topic) keeps
-/// labels distinct even when the sanitized segments collide.
+/// case 120), and the joint `hash16` over the raw source and target identity
+/// keeps labels distinct even when the sanitized segments collide. The target
+/// table must participate because Doris labels are scoped to a database rather
+/// than to an individual table.
 ///
 /// `#[doc(hidden)]`: `pub` only so the integration test harness can reproduce
 /// labels; not part of the connector's supported API.
 #[doc(hidden)]
 pub fn build_label(
     prefix: &str,
+    table: &str,
     stream: &str,
     topic: &str,
     partition_id: u32,
@@ -552,7 +651,7 @@ pub fn build_label(
         sanitize_segment(prefix, MAX_LABEL_PREFIX_LEN),
         sanitize_segment(stream, MAX_LABEL_NAME_LEN),
         sanitize_segment(topic, MAX_LABEL_NAME_LEN),
-        identity_hash(prefix, stream, topic),
+        identity_hash(prefix, table, stream, topic),
         partition_id,
         first_offset,
         last_offset,
@@ -573,10 +672,28 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     format!("{}...(truncated, total {} bytes)", &s[..end], s.len())
 }
 
+fn serialize_json_batch<T>(batch: &T) -> Result<Bytes, Error>
+where
+    T: Serialize + ?Sized,
+{
+    simd_json::to_vec(batch)
+        .map(Bytes::from)
+        .map_err(|e| Error::Serialization(format!("Failed to serialize batch for Doris: {e}")))
+}
+
 fn parse_stream_load_response(body: &str) -> Result<StreamLoadResponse, Error> {
-    // An unparsable 200-OK body (Doris bug, proxy-injected HTML, future schema
-    // change) isn't cured by retrying the same bytes — default to permanent so
-    // the runtime DLQs the batch instead of looping.
+    if body.is_empty() {
+        // A readable but empty 2xx body leaves the commit outcome ambiguous in
+        // exactly the same way as a body-read failure. Retrying the identical
+        // request under the same label lets Doris reveal or dedupe the outcome.
+        return Err(Error::CannotStoreData(
+            "Doris Stream Load returned an empty 2xx response body".to_string(),
+        ));
+    }
+
+    // A non-empty, unparsable 2xx body (Doris bug, proxy-injected HTML, future
+    // schema change) isn't cured by retrying the same bytes, so classify it as
+    // permanent and surface it without spending the retry budget.
     serde_json::from_str(body).map_err(|e| {
         Error::PermanentHttpError(format!(
             "Failed to parse Doris stream load response: {e}. Body: {}",
@@ -599,31 +716,59 @@ fn validate_identifier(name: &str, field: &str, id: u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn classify_status(response: &StreamLoadResponse) -> Result<(), Error> {
+/// Transient Stream Load failures worth an in-request retry: HTTP 5xx/408/429,
+/// transport errors, and duplicate labels whose existing Doris job is `RUNNING`
+/// or `CANCELLED`. `PermanentHttpError` (4xx, "Fail", schema/redirect problems,
+/// non-empty unparsable body) is never retried — re-PUTing bad data just hammers
+/// the FE.
+fn is_transient_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::CannotStoreData(_) | Error::HttpRequestFailed(_)
+    )
+}
+
+fn classify_status(id: u32, response: &StreamLoadResponse) -> Result<(), Error> {
     match response.status.as_str() {
         "Success" => Ok(()),
-        "Label Already Exists" => {
-            // Idempotent replay — the data was already loaded with this label.
-            // Treat as success so the runtime advances the consumer offset.
-            info!(
-                "Doris reported 'Label Already Exists' (loaded={}, filtered={}); treating as success.",
-                response.number_loaded_rows, response.number_filtered_rows
+        "Label Already Exists" => match response.existing_job_status.as_deref() {
+            Some("FINISHED") => {
+                info!(
+                    "Doris sink ID {id} confirmed duplicate label belongs to a FINISHED job; treating as success"
+                );
+                Ok(())
+            }
+            Some(existing_status @ ("RUNNING" | "CANCELLED")) => {
+                Err(Error::CannotStoreData(format!(
+                    "Doris sink ID {id} found duplicate label with retryable existing job status '{}': {}",
+                    existing_status, response.message
+                )))
+            }
+            Some(existing_status) => Err(Error::PermanentHttpError(format!(
+                "Doris sink ID {id} found duplicate label with unsupported existing job status '{existing_status}': {}",
+                response.message
+            ))),
+            None => Err(Error::PermanentHttpError(format!(
+                "Doris sink ID {id} found duplicate label without ExistingJobStatus: {}",
+                response.message
+            ))),
+        },
+        "Publish Timeout" => {
+            warn!(
+                "Doris sink ID {id} stream load committed but publish visibility timed out; treating as success: {}",
+                response.message
             );
             Ok(())
         }
-        "Publish Timeout" => Err(Error::CannotStoreData(format!(
-            "Doris stream load Publish Timeout: {}",
-            response.message
-        ))),
         "Fail" => Err(Error::PermanentHttpError(format!(
-            "Doris stream load failed: {}",
+            "Doris sink ID {id} stream load failed: {}",
             response.message
         ))),
         // Default unknown statuses to permanent: surfacing an unrecognized
-        // failure (e.g. a future Doris error variant) and letting the runtime DLQ
-        // it beats silently retrying it against the FE forever.
+        // failure (e.g. a future Doris error variant) beats silently retrying it
+        // against the FE until the in-request budget is exhausted.
         other => Err(Error::PermanentHttpError(format!(
-            "Doris stream load returned unexpected status '{other}': {}",
+            "Doris sink ID {id} stream load returned unexpected status '{other}': {}",
             response.message
         ))),
     }
@@ -710,6 +855,30 @@ impl Sink for DorisSink {
             None => None,
         };
 
+        let retry_delay = parse_duration(self.config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let max_retry_delay = parse_duration(
+            self.config.max_retry_delay.as_deref(),
+            DEFAULT_MAX_RETRY_DELAY,
+        );
+        let max_retries = effective_max_retries(self.config.max_retries);
+        if should_warn_for_retry_count(max_retries) {
+            warn!(
+                "Doris sink ID {} configured max_retries={max_retries}, above the warning threshold {MAX_RETRIES_WARNING_THRESHOLD}; the value is honored, but an unavailable FE can keep each chunk in consume() for tens of minutes or hours and delay graceful shutdown",
+                self.id
+            );
+        }
+        // `exponential_backoff` already caps at the max, but a base above the cap
+        // is a config mistake worth surfacing rather than silently flattening.
+        let (retry_delay, max_retry_delay) = if retry_delay > max_retry_delay {
+            warn!(
+                "Doris sink ID {}: retry_delay ({retry_delay:?}) exceeds max_retry_delay ({max_retry_delay:?}); clamping base to the cap",
+                self.id
+            );
+            (max_retry_delay, max_retry_delay)
+        } else {
+            (retry_delay, max_retry_delay)
+        };
+
         self.connected = Some(Connected {
             client: self.build_client()?,
             base_url,
@@ -718,6 +887,9 @@ impl Sink for DorisSink {
             where_header,
             allow_insecure_redirect: self.config.allow_insecure_redirect.unwrap_or(false),
             allowed_redirect_hosts: self.config.allowed_redirect_hosts.clone(),
+            max_retries,
+            retry_delay,
+            max_retry_delay,
         });
 
         info!(
@@ -787,19 +959,21 @@ impl Sink for DorisSink {
                 continue;
             };
 
-            let body = match simd_json::to_vec(&json_values) {
-                Ok(b) => Bytes::from(b),
-                Err(e) => {
-                    error!("Doris sink ID {} failed to serialize batch: {e}", self.id);
-                    first_error.get_or_insert(Error::CannotStoreData(format!(
-                        "Failed to serialize batch for Doris: {e}"
-                    )));
+            let body = match serialize_json_batch(&json_values) {
+                Ok(body) => body,
+                Err(error) => {
+                    error!(
+                        "Doris sink ID {} failed to serialize batch: {error}",
+                        self.id
+                    );
+                    first_error.get_or_insert(error);
                     continue;
                 }
             };
 
             let label = build_label(
                 label_prefix,
+                &self.config.table,
                 &topic_metadata.stream,
                 &topic_metadata.topic,
                 messages_metadata.partition_id,
@@ -807,39 +981,36 @@ impl Sink for DorisSink {
                 last_msg.offset,
             );
 
-            match self.send_stream_load(&label, body).await {
-                Ok(response) => match classify_status(&response) {
-                    Ok(()) => {
-                        if response.number_filtered_rows > 0 {
-                            // Filtered rows usually mean schema drift upstream.
-                            // Surface above debug so operators can alert on it.
-                            warn!(
-                                "Doris sink ID {} loaded {} rows but FILTERED {} rows for {}.{} (label={label}); \
-                                 likely schema drift upstream",
-                                self.id,
-                                response.number_loaded_rows,
-                                response.number_filtered_rows,
-                                self.config.database,
-                                self.config.table,
-                            );
-                        } else {
-                            debug!(
-                                "Doris sink ID {} loaded {} rows into {}.{} (label={label})",
-                                self.id,
-                                response.number_loaded_rows,
-                                self.config.database,
-                                self.config.table,
-                            );
-                        }
+            match self.load_batch(&label, body).await {
+                Ok(response) => {
+                    if response.number_filtered_rows > 0 {
+                        // Filtered rows usually mean schema drift upstream.
+                        // Surface above debug so operators can alert on it.
+                        warn!(
+                            "Doris sink ID {} loaded {} rows but FILTERED {} rows for {}.{} (label={label}); \
+                             likely schema drift upstream",
+                            self.id,
+                            response.number_loaded_rows,
+                            response.number_filtered_rows,
+                            self.config.database,
+                            self.config.table,
+                        );
+                    } else {
+                        debug!(
+                            "Doris sink ID {} loaded {} rows into {}.{} (label={label})",
+                            self.id,
+                            response.number_loaded_rows,
+                            self.config.database,
+                            self.config.table,
+                        );
                     }
-                    Err(e) => {
-                        error!("Doris sink ID {} batch failed: {e}", self.id);
-                        first_error.get_or_insert(e);
-                    }
-                },
-                Err(e) => {
-                    error!("Doris sink ID {} HTTP failed: {e}", self.id);
-                    first_error.get_or_insert(e);
+                }
+                Err(error) => {
+                    error!(
+                        "Doris sink ID {} batch failed (label={label}): {error}",
+                        self.id
+                    );
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -876,6 +1047,19 @@ mod tests {
             batch_size: None,
             allow_insecure_redirect: None,
             allowed_redirect_hosts: None,
+            max_retries: None,
+            retry_delay: None,
+            max_retry_delay: None,
+        }
+    }
+
+    fn stream_load_response(status: &str, existing_job_status: Option<&str>) -> StreamLoadResponse {
+        StreamLoadResponse {
+            status: status.into(),
+            message: String::new(),
+            number_loaded_rows: 0,
+            number_filtered_rows: 0,
+            existing_job_status: existing_job_status.map(String::from),
         }
     }
 
@@ -922,8 +1106,8 @@ mod tests {
 
     #[test]
     fn label_is_deterministic() {
-        let a = build_label("iggy", "events", "orders", 7, 100, 199);
-        let b = build_label("iggy", "events", "orders", 7, 100, 199);
+        let a = build_label("iggy", "test_tbl", "events", "orders", 7, 100, 199);
+        let b = build_label("iggy", "test_tbl", "events", "orders", 7, 100, 199);
         assert_eq!(a, b);
         // Format: {prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first}-{last}
         let parts: Vec<&str> = a.split('-').collect();
@@ -940,7 +1124,7 @@ mod tests {
 
     #[test]
     fn label_sanitizes_illegal_chars() {
-        let label = build_label("iggy", "events.v1", "orders/inbound", 0, 0, 0);
+        let label = build_label("iggy", "test_tbl", "events.v1", "orders/inbound", 0, 0, 0);
         // dots and slashes are not allowed in Doris labels.
         assert!(!label.contains('.'));
         assert!(!label.contains('/'));
@@ -953,8 +1137,8 @@ mod tests {
         // names so the final labels differ. Without this, two streams could
         // silently dedupe against each other in Doris.
         assert_ne!(
-            build_label("iggy", "events.v1", "orders", 0, 0, 0),
-            build_label("iggy", "events_v1", "orders", 0, 0, 0),
+            build_label("iggy", "test_tbl", "events.v1", "orders", 0, 0, 0),
+            build_label("iggy", "test_tbl", "events_v1", "orders", 0, 0, 0),
             "labels must NOT collide for names that sanitize to the same string"
         );
     }
@@ -965,8 +1149,24 @@ mod tests {
         // but with prefixes that collapse to the same sanitized+truncated
         // segment must still get distinct labels — otherwise Doris's label
         // dedupe silently drops the second tenant's batch.
-        let a = build_label("prod_events_us_east_1", "events", "orders", 0, 0, 0);
-        let b = build_label("prod_events_us_east_2", "events", "orders", 0, 0, 0);
+        let a = build_label(
+            "prod_events_us_east_1",
+            "test_tbl",
+            "events",
+            "orders",
+            0,
+            0,
+            0,
+        );
+        let b = build_label(
+            "prod_events_us_east_2",
+            "test_tbl",
+            "events",
+            "orders",
+            0,
+            0,
+            0,
+        );
         // Precondition: the sanitized prefix segments collide (both truncate to
         // the same 16 chars).
         assert_eq!(
@@ -983,24 +1183,35 @@ mod tests {
     }
 
     #[test]
+    fn label_disambiguates_target_tables_in_same_database() {
+        let first = build_label("iggy", "orders", "events", "created", 0, 0, 99);
+        let second = build_label("iggy", "orders_archive", "events", "created", 0, 0, 99);
+
+        assert_ne!(
+            first, second,
+            "Doris labels are database-scoped, so the target table must affect the label"
+        );
+    }
+
+    #[test]
     fn identity_hash_is_not_aliased_by_boundary_shift() {
         // The joint hash is length-prefixed so shifting any boundary cannot
-        // produce the same digest: distinct (prefix, stream, topic) triples must
+        // produce the same digest: distinct source/target identity tuples must
         // map to distinct hashes, otherwise two identities could share a label
         // and silently dedupe in Doris.
         assert_ne!(
-            identity_hash("iggy", "ab", "c"),
-            identity_hash("iggy", "a", "bc")
+            identity_hash("iggy", "test_tbl", "ab", "c"),
+            identity_hash("iggy", "test_tbl", "a", "bc")
         );
         assert_ne!(
-            identity_hash("iggy", "events", "orders"),
-            identity_hash("iggy", "event", "sorders")
+            identity_hash("iggy", "test_tbl", "events", "orders"),
+            identity_hash("iggy", "test_tbl", "event", "sorders")
         );
         // The prefix participates too: shifting the prefix/stream boundary must
         // not alias.
         assert_ne!(
-            identity_hash("ab", "c", "topic"),
-            identity_hash("a", "bc", "topic")
+            identity_hash("ab", "test_tbl", "c", "topic"),
+            identity_hash("a", "test_tbl", "bc", "topic")
         );
     }
 
@@ -1012,7 +1223,15 @@ mod tests {
         let prefix = "p".repeat(100);
         let stream = "s".repeat(100);
         let topic = "t".repeat(100);
-        let label = build_label(&prefix, &stream, &topic, u32::MAX, u64::MAX, u64::MAX);
+        let label = build_label(
+            &prefix,
+            "test_tbl",
+            &stream,
+            &topic,
+            u32::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
         assert!(
             label.len() <= 128,
             "label exceeds Doris's 128-char cap: {} chars: {label}",
@@ -1028,52 +1247,83 @@ mod tests {
     }
 
     #[test]
-    fn classify_success_returns_ok() {
-        let r = StreamLoadResponse {
-            status: "Success".into(),
-            message: String::new(),
-            number_loaded_rows: 10,
-            number_filtered_rows: 0,
-        };
-        assert!(classify_status(&r).is_ok());
+    fn effective_max_retries_uses_default_and_floors_at_one() {
+        assert_eq!(effective_max_retries(None), DEFAULT_MAX_RETRIES);
+        assert_eq!(effective_max_retries(Some(0)), 1);
+        assert_eq!(effective_max_retries(Some(1)), 1);
+        assert_eq!(effective_max_retries(Some(5)), 5);
+        assert_eq!(
+            effective_max_retries(Some(MAX_RETRIES_WARNING_THRESHOLD + 1)),
+            MAX_RETRIES_WARNING_THRESHOLD + 1
+        );
     }
 
     #[test]
-    fn classify_label_already_exists_returns_ok() {
-        let r = StreamLoadResponse {
-            status: "Label Already Exists".into(),
-            message: String::new(),
-            number_loaded_rows: 0,
-            number_filtered_rows: 0,
-        };
-        assert!(classify_status(&r).is_ok());
-    }
-
-    #[test]
-    fn classify_publish_timeout_is_transient() {
-        let r = StreamLoadResponse {
-            status: "Publish Timeout".into(),
-            message: "be unreachable".into(),
-            number_loaded_rows: 0,
-            number_filtered_rows: 0,
-        };
-        assert!(matches!(
-            classify_status(&r).unwrap_err(),
-            Error::CannotStoreData(_)
+    fn retry_count_warning_starts_above_threshold() {
+        assert!(!should_warn_for_retry_count(MAX_RETRIES_WARNING_THRESHOLD));
+        assert!(should_warn_for_retry_count(
+            MAX_RETRIES_WARNING_THRESHOLD + 1
         ));
     }
 
     #[test]
+    fn classify_success_returns_ok() {
+        let mut response = stream_load_response("Success", None);
+        response.number_loaded_rows = 10;
+        assert!(classify_status(1, &response).is_ok());
+    }
+
+    #[test]
+    fn classify_finished_duplicate_returns_ok() {
+        let response = stream_load_response("Label Already Exists", Some("FINISHED"));
+        assert!(classify_status(1, &response).is_ok());
+    }
+
+    #[test]
+    fn classify_running_or_cancelled_duplicate_is_transient() {
+        for existing_status in ["RUNNING", "CANCELLED"] {
+            let response = stream_load_response("Label Already Exists", Some(existing_status));
+            assert!(matches!(
+                classify_status(1, &response),
+                Err(Error::CannotStoreData(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn classify_unconfirmed_duplicate_is_permanent() {
+        for existing_status in [None, Some(""), Some("PRECOMMITTED"), Some("UNKNOWN")] {
+            let response = stream_load_response("Label Already Exists", existing_status);
+            assert!(matches!(
+                classify_status(1, &response),
+                Err(Error::PermanentHttpError(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn classify_publish_timeout_returns_ok() {
+        let mut response = stream_load_response("Publish Timeout", None);
+        response.message = "publish visibility delayed".into();
+        assert!(classify_status(1, &response).is_ok());
+    }
+
+    #[test]
     fn classify_fail_is_permanent() {
-        let r = StreamLoadResponse {
-            status: "Fail".into(),
-            message: "schema mismatch".into(),
-            number_loaded_rows: 0,
-            number_filtered_rows: 0,
-        };
+        let mut response = stream_load_response("Fail", None);
+        response.message = "schema mismatch".into();
         assert!(matches!(
-            classify_status(&r).unwrap_err(),
+            classify_status(1, &response).unwrap_err(),
             Error::PermanentHttpError(_)
+        ));
+    }
+
+    #[test]
+    fn classify_unknown_status_is_permanent() {
+        let response = stream_load_response("Future Doris Status", None);
+        assert!(matches!(
+            classify_status(1, &response),
+            Err(Error::PermanentHttpError(_))
         ));
     }
 
@@ -1086,14 +1336,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_stream_load_response_rejects_garbage_as_permanent() {
-        // An unparsable body must surface as PermanentHttpError so the
-        // runtime DLQs the batch instead of retrying the same garbage forever.
+    fn parse_stream_load_response_treats_empty_body_as_transient() {
+        assert!(matches!(
+            parse_stream_load_response("").unwrap_err(),
+            Error::CannotStoreData(_)
+        ));
+    }
+
+    #[test]
+    fn parse_stream_load_response_rejects_nonempty_garbage_as_permanent() {
+        // An unparsable body must surface as PermanentHttpError instead of
+        // retrying the same garbage for the whole in-request budget.
         let body = "not json";
         assert!(matches!(
             parse_stream_load_response(body).unwrap_err(),
             Error::PermanentHttpError(_)
         ));
+    }
+
+    #[test]
+    fn serialize_json_batch_maps_local_failure_to_serialization_error() {
+        let invalid_json_map = std::collections::BTreeMap::from([(true, 1)]);
+        let error = serialize_json_batch(&invalid_json_map).unwrap_err();
+
+        assert!(matches!(&error, Error::Serialization(_)));
+        assert!(!is_transient_error(&error));
     }
 
     #[test]
@@ -1119,18 +1386,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_parses_and_falls_back() {
+    fn parse_duration_parses_zero_and_falls_back_for_invalid_input() {
         assert_eq!(parse_duration(Some("10s"), "30s"), Duration::from_secs(10));
         assert_eq!(parse_duration(None, "30s"), Duration::from_secs(30));
-        // A malformed value falls back to the default rather than erroring.
         assert_eq!(
             parse_duration(Some("not_a_duration"), "30s"),
             Duration::from_secs(30)
         );
-        // A zero duration is degenerate (reqwest times out every request
-        // immediately) and falls back to the default.
-        assert_eq!(parse_duration(Some("0s"), "30s"), Duration::from_secs(30));
-        assert_eq!(parse_duration(Some("0ms"), "5s"), Duration::from_secs(5));
+        assert_eq!(parse_duration(Some("0ms"), "5s"), Duration::ZERO);
+    }
+
+    #[test]
+    fn parse_request_duration_rejects_zero() {
+        assert_eq!(
+            parse_request_duration(Some("0s"), "30s"),
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]
@@ -1163,6 +1434,10 @@ mod tests {
         reqwest::Url::parse(s).unwrap()
     }
 
+    fn opened_connection(sink: &DorisSink) -> &Connected {
+        sink.connected.as_ref().expect("sink should be open")
+    }
+
     /// Build a `Connected` for redirect-validation tests: a throwaway client and
     /// no precomputed headers, with the redirect policy under test.
     fn connected(
@@ -1178,6 +1453,9 @@ mod tests {
             where_header: None,
             allow_insecure_redirect: allow_insecure,
             allowed_redirect_hosts: allowed_hosts,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_delay: Duration::from_millis(1),
+            max_retry_delay: Duration::from_millis(5),
         }
     }
 
@@ -1443,7 +1721,11 @@ mod tests {
         sink.open().await.expect("open should succeed");
 
         let result = sink
-            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .send_stream_load(
+                opened_connection(&sink),
+                "iggy-test-label",
+                Bytes::from_static(b"[{\"a\":1}]"),
+            )
             .await;
 
         assert!(
@@ -1476,7 +1758,11 @@ mod tests {
         let mut sink = DorisSink::new(1, cfg);
         sink.open().await.expect("open should succeed");
         let result = sink
-            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .send_stream_load(
+                opened_connection(&sink),
+                "iggy-test-label",
+                Bytes::from_static(b"[{\"a\":1}]"),
+            )
             .await;
 
         assert!(
@@ -1504,7 +1790,11 @@ mod tests {
         let mut sink = DorisSink::new(1, cfg);
         sink.open().await.expect("open should succeed");
         let result = sink
-            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .send_stream_load(
+                opened_connection(&sink),
+                "iggy-test-label",
+                Bytes::from_static(b"[{\"a\":1}]"),
+            )
             .await;
 
         assert!(
@@ -1533,12 +1823,319 @@ mod tests {
         let mut sink = DorisSink::new(1, cfg);
         sink.open().await.expect("open should succeed");
         let result = sink
-            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .send_stream_load(
+                opened_connection(&sink),
+                "iggy-test-label",
+                Bytes::from_static(b"[{\"a\":1}]"),
+            )
             .await;
 
         assert!(
             matches!(&result, Err(Error::PermanentHttpError(_))),
             "expected PermanentHttpError on relative Location, got {result:?}",
+        );
+    }
+
+    /// A transient failure (HTTP 503) is retried through the public `consume`
+    /// path. Both mocks match the generated label and serialized body, proving
+    /// the retry re-PUTs the same batch under the same idempotency key.
+    #[tokio::test]
+    async fn transient_failure_is_retried_then_succeeds() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(3);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+        let expected_label = build_label("iggy", "test_tbl", "events", "orders", 0, 0, 0);
+        let expected_body = serde_json::json!([{"k": 1}]);
+
+        // wiremock serves the first matching mock in mount order, so mount the
+        // single-shot 503 first: it serves attempt 1, then — capped at one
+        // response — stops matching, and attempt 2 falls through to the success.
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .and(header("label", expected_label.as_str()))
+            .and(body_json(expected_body.clone()))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .and(header("label", expected_label.as_str()))
+            .and(body_json(expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"Status": "Success", "NumberLoadedRows": 1})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .consume(&topic_meta(), messages_meta(), vec![json_msg(0)])
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "expected consume() to succeed after one retry, got {result:?}",
+        );
+    }
+
+    /// A readable but empty 2xx response leaves the commit outcome unknown.
+    /// Retry the identical request and let Doris's label state confirm that the
+    /// first attempt finished, without loading the batch twice.
+    #[test]
+    fn empty_success_body_is_retried_under_same_label() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should build");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            let mut cfg = make_config();
+            cfg.fe_url = server.uri();
+            cfg.max_retries = Some(3);
+            cfg.retry_delay = Some("1ms".into());
+            cfg.max_retry_delay = Some("5ms".into());
+
+            let label = "iggy-test-label";
+            let body = serde_json::json!([{"a": 1}]);
+            Mock::given(method("PUT"))
+                .and(path("/api/test_db/test_tbl/_stream_load"))
+                .and(header("label", label))
+                .and(body_json(body.clone()))
+                .respond_with(ResponseTemplate::new(200))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/api/test_db/test_tbl/_stream_load"))
+                .and(header("label", label))
+                .and(body_json(body))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "Status": "Label Already Exists",
+                    "ExistingJobStatus": "FINISHED",
+                    "Message": "job finished",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut sink = DorisSink::new(1, cfg);
+            sink.open().await.expect("open should succeed");
+            let result = sink
+                .load_batch(label, Bytes::from_static(b"[{\"a\":1}]"))
+                .await;
+
+            assert!(
+                matches!(&result, Ok(response) if response.existing_job_status.as_deref() == Some("FINISHED")),
+                "expected the retry to confirm the first attempt, got {result:?}",
+            );
+        });
+    }
+
+    /// A non-empty malformed 2xx body is a protocol failure, not an ambiguous
+    /// missing response. It must remain permanent and consume only one attempt.
+    #[test]
+    fn nonempty_malformed_success_body_is_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should build");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            let mut cfg = make_config();
+            cfg.fe_url = server.uri();
+            cfg.max_retries = Some(3);
+            cfg.retry_delay = Some("1ms".into());
+            cfg.max_retry_delay = Some("5ms".into());
+
+            Mock::given(method("PUT"))
+                .and(path("/api/test_db/test_tbl/_stream_load"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string("<html>proxy error</html>"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut sink = DorisSink::new(1, cfg);
+            sink.open().await.expect("open should succeed");
+            let result = sink
+                .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+                .await;
+
+            assert!(
+                matches!(&result, Err(Error::PermanentHttpError(_))),
+                "expected non-empty malformed response to stay permanent, got {result:?}",
+            );
+        });
+    }
+
+    /// An unfinished duplicate label means Doris may still be completing an
+    /// earlier ambiguous attempt. Retry the same request until Doris confirms
+    /// that job is FINISHED, then accept it without issuing a third request.
+    #[tokio::test]
+    async fn running_duplicate_is_retried_until_finished() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(3);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        let label = "iggy-test-label";
+        let body = serde_json::json!([{"a": 1}]);
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .and(header("label", label))
+            .and(body_json(body.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Status": "Label Already Exists",
+                "ExistingJobStatus": "RUNNING",
+                "Message": "job is still running",
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .and(header("label", label))
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Status": "Label Already Exists",
+                "ExistingJobStatus": "FINISHED",
+                "Message": "job finished",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch(label, Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Ok(response) if response.existing_job_status.as_deref() == Some("FINISHED")),
+            "expected FINISHED duplicate after one retry, got {result:?}",
+        );
+    }
+
+    /// Doris documents Publish Timeout as a committed transaction whose data
+    /// may not yet be visible. Treat it as success and do not retry the payload.
+    #[tokio::test]
+    async fn publish_timeout_is_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(3);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Status": "Publish Timeout",
+                "Message": "transaction committed; publish is delayed",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Ok(response) if response.status == "Publish Timeout"),
+            "expected Publish Timeout to be accepted without a retry, got {result:?}",
+        );
+    }
+
+    /// When every attempt fails transiently, the budget is exhausted and the
+    /// last transient error is surfaced. `.expect(2)` pins the attempt count to
+    /// exactly `max_retries` (1 initial + 1 retry) — no over- or under-retry.
+    #[tokio::test]
+    async fn transient_failure_exhausts_retries_and_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(2);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::CannotStoreData(_))),
+            "expected CannotStoreData after exhausting retries, got {result:?}",
+        );
+    }
+
+    /// A permanent failure (HTTP 400) returns on the first attempt with no
+    /// retry, even with `max_retries` high. `.expect(1)` pins it to one attempt.
+    #[tokio::test]
+    async fn permanent_failure_is_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(5);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::PermanentHttpError(_))),
+            "expected PermanentHttpError with no retry, got {result:?}",
         );
     }
 }

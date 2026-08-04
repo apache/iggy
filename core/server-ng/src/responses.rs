@@ -1345,12 +1345,17 @@ pub(crate) fn build_raw_pat_reply(
             .map_err(|_| IggyError::InvalidFormat)?;
     let commit = committed_header.commit;
     let size = committed_header.size as usize;
-    // A committed create can still be a business rejection (duplicate name,
-    // invalid expiry) whose reply body carries a nonzero result code. Splice
-    // the secret only into a genuine success; pass everything else through
-    // untouched so the client decodes the committed error instead of a
-    // success-shaped token reply (the minted raw secret is simply dropped).
-    // Mirrors the HTTP handler's `committed_payload` gate.
+    // A `Reply` whose result section is nonzero is not a successful commit:
+    // a committed business rejection (duplicate name, invalid expiry) or a
+    // `TransientNotCommitted` retry frame, both with no payload and no token
+    // to ship. Splice the secret only into a genuine success; pass everything
+    // else through untouched so the client decodes the typed result (and, for
+    // a transient, replays) instead of having a raw token grafted onto a
+    // rejection body. Mirrors the HTTP handler's `committed_payload` gate.
+    //
+    // Bounded by the header's own `size` rather than running to the end of the
+    // buffer, so a short frame reads as "no result section" instead of into
+    // allocation padding.
     let reply_body = committed
         .as_slice()
         .get(header_len..size)
@@ -1432,7 +1437,7 @@ where
 /// Size of the in-storage (`IggyMessage2`) per-message header inside a
 /// `SendMessages2` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
 /// + `timestamp_delta`(4) + `user_headers_length`(4) + `payload_length`(4)
-/// + reserved(8). See `server_common::send_messages2::from_legacy_request`.
+/// + reserved(8). See `server_common::send_messages2::SendMessages2Owned::from_messages`.
 const STORED_MESSAGE_HEADER_SIZE: usize = 48;
 
 /// Build the `PolledMessages` reply body from the owning shard's poll

@@ -35,11 +35,13 @@ use configs::ng_sharding::{
 };
 use configs::server_ng::{NgSystemConfig, ServerNgConfig};
 use consensus::{
-    LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
+    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer,
+    VsrConsensus,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
+use consensus::VsrState;
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::defaults::{
@@ -48,6 +50,7 @@ use iggy_common::defaults::{
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
+use journal::superblock::{DynSuperblockStore, PingPongSuperblock};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
@@ -69,7 +72,7 @@ use message_bus::{
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
-use metadata::impls::recovery::recover;
+use metadata::impls::recovery::{ReplicaIdentity, recover};
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -94,6 +97,7 @@ use shard::{
 };
 use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -101,7 +105,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
@@ -185,6 +189,7 @@ pub fn wire_shell_handlers<B, MJ, S>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> ShellHandlers
 where
     B: ShellBus,
@@ -200,6 +205,7 @@ where
             shard_handle,
             &sessions,
             system_config,
+            max_tokens_per_user,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
@@ -214,10 +220,12 @@ pub type ServerNgShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnap
 ///
 /// Carries the cross-thread shutdown flag and one OS-thread `JoinHandle`
 /// per shard. The caller flips the flag via [`Self::install_ctrlc_handler`]
-/// and then drains every shard via [`Self::join_all`].
+/// and then drains every shard via [`Self::join_all`], bounded by
+/// `join_timeout` (`system.sharding.shutdown_join_timeout`).
 pub struct ShardHandles {
     shutdown_flag: Arc<AtomicBool>,
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)>,
+    join_timeout: Duration,
 }
 
 impl ShardHandles {
@@ -245,27 +253,60 @@ impl ShardHandles {
         })
     }
 
-    /// Drain every shard thread. Each shard's outcome is logged
-    /// (`info` on clean exit, `error` on Err or panic). If any shard
-    /// failed, returns every failure together as
+    /// Drain every shard thread. This is the main thread's park for the
+    /// server's whole lifetime, so shards are awaited WITHOUT any time
+    /// bound while the server runs; the `shutdown_join_timeout` clock
+    /// only starts once the cross-thread shutdown flag flips (Ctrl-C or
+    /// a shard failure). Each shard's outcome is logged (`info` on clean
+    /// exit, `error` on Err, panic, or wedge). If any shard failed,
+    /// returns every failure together as
     /// [`ServerNgError::ShardJoinFailures`] so the operator sees the
     /// full set rather than just the first.
+    ///
+    /// A shard whose thread is still running when the post-shutdown
+    /// deadline passes is abandoned (its `JoinHandle` dropped, the OS
+    /// thread left to die with the process) and reported as
+    /// [`ShardJoinFailureKind::Wedged`]: a wedged pump or listener must
+    /// not block process exit forever.
     ///
     /// # Errors
     ///
     /// Returns [`ServerNgError::ShardJoinFailures`] if any shard
-    /// returned a `Result::Err` or panicked. The variant carries every
-    /// per-shard failure (`ShardJoinFailureKind::Error` or
-    /// `ShardJoinFailureKind::Panic`) in shard-id order so the caller
-    /// does not need to read the trace log to discover late-failing shards.
+    /// returned a `Result::Err`, panicked, or wedged past the deadline.
+    /// The variant carries every per-shard failure in shard-id order so
+    /// the caller does not need to read the trace log to discover
+    /// late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
+        // Armed on the first poll that observes the shutdown flag, shared
+        // across all shards: one budget covers the whole drain, not one
+        // budget per shard.
+        let mut deadline: Option<Instant> = None;
         // Shards run thread-per-core with compio's blocking fallback pool
         // disabled, so an io_uring opcode the kernel lacks aborts every shard
         // with the same panic. Surface the actionable diagnostic once.
         let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
-            match handle.join() {
+            let Some(joined) = join_until_shutdown_deadline(
+                handle,
+                &self.shutdown_flag,
+                self.join_timeout,
+                &mut deadline,
+            ) else {
+                error!(
+                    shard_id,
+                    waited = ?self.join_timeout,
+                    "shard thread still running at the shutdown join deadline; abandoning it"
+                );
+                failures.push(ShardJoinFailure {
+                    shard_id,
+                    kind: ShardJoinFailureKind::Wedged {
+                        waited: self.join_timeout,
+                    },
+                });
+                continue;
+            };
+            match joined {
                 Ok(Ok(())) => {
                     info!(shard_id, "shard thread exited cleanly");
                 }
@@ -301,6 +342,41 @@ impl ShardHandles {
     }
 }
 
+/// Poll cadence for the bounded shard joins. Coarse enough to cost
+/// nothing during a normal drain, fine enough that exit latency past
+/// the last shard's return stays imperceptible.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Join `handle`, waiting indefinitely while the server runs. The
+/// `join_timeout` clock starts only when `shutdown_flag` is observed set
+/// (arming the caller-shared `deadline` once, so all shards drain under
+/// ONE budget); a running server parked here for hours must never be
+/// mistaken for a wedged shard. `None` means the thread was still
+/// running at the post-shutdown deadline and the handle was dropped
+/// (the OS thread keeps running detached; process exit reaps it).
+/// `JoinHandle` has no timed join, so this polls `is_finished` at
+/// [`JOIN_POLL_INTERVAL`]; the closing `join()` on a finished thread
+/// returns immediately.
+fn join_until_shutdown_deadline(
+    handle: thread::JoinHandle<Result<(), ServerNgError>>,
+    shutdown_flag: &AtomicBool,
+    join_timeout: Duration,
+    deadline: &mut Option<Instant>,
+) -> Option<thread::Result<Result<(), ServerNgError>>> {
+    while !handle.is_finished() {
+        if deadline.is_none() && shutdown_flag.load(Ordering::Relaxed) {
+            *deadline = Some(Instant::now() + join_timeout);
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= *deadline
+        {
+            return None;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL);
+    }
+    Some(handle.join())
+}
+
 /// Best-effort extraction of the panic message from a
 /// `Box<dyn Any + Send>` returned by `JoinHandle::join`. Tries the two
 /// payload shapes the standard library guarantees (`&'static str` and
@@ -316,73 +392,44 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     "<panic payload not String/&str>".to_string()
 }
 
-/// Joins survivor shard threads after a partial-spawn failure without
-/// panicking the bootstrap thread on `pthread_create` EAGAIN.
+/// Joins survivor shard threads after a partial-spawn failure, bounded
+/// by the same `shutdown_join_timeout` budget as the normal exit path.
 ///
-/// Bare `thread::spawn` panics on EAGAIN, which is the most likely OS
-/// state on this path since the parent `Builder::spawn` already failed
-/// for the same reason. A panic would unwind `bootstrap()` while
-/// survivor shard threads keep driving their compio runtimes and
-/// `io_uring` rings, orphaning them across process exit.
-///
-/// Uses `thread::Builder::spawn` and hands each survivor over via a
-/// one-shot `sync_channel(1)` so an `Err` drops the rx (not the
-/// survivor `JoinHandle`), letting us fall back to a sequential
-/// `survivor.join()` instead. Once one cleanup spawn fails, treats the
-/// OS as exhausted and routes every remaining survivor straight to the
-/// sequential pool to avoid re-trying spawn.
-///
-/// This routine bounds CPU/IO via the survivor's own
-/// `shutdown_drain_timeout` (driven by each shard's watchdog after
-/// `shutdown_flag` is set by the caller), not via a wall-clock
-/// deadline here. If a survivor's `shard_main` blocks past the drain
-/// window without observing the flag, this join hangs - that scenario
-/// is the same surface as the deferred watchdog-detach gap and is not
-/// addressed by this helper.
-///
-/// TODO(hubcio): no hard time limit on shard shutdown here. If a
-/// survivor's `shard_main` never returns, `survivor.join()` blocks
-/// forever.
+/// Polls every survivor's `is_finished` in one loop instead of spawning
+/// per-survivor joiner threads: the likely OS state on this path is
+/// `pthread_create` EAGAIN (the parent spawn just failed with it), so
+/// nothing here may create threads, and polling drains all survivors in
+/// parallel anyway. A survivor still running at the deadline is
+/// abandoned with an error log so the failed bootstrap can surface its
+/// spawn error instead of hanging on a wedged shard.
 fn join_partial_shard_survivors(
     shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)>,
+    join_timeout: Duration,
 ) {
-    let mut joiners = Vec::with_capacity(shard_threads.len());
-    let mut sequential_join: Vec<thread::JoinHandle<Result<(), ServerNgError>>> = Vec::new();
-    let mut spawn_exhausted = false;
-    for (sid, survivor) in shard_threads {
-        if spawn_exhausted {
-            sequential_join.push(survivor);
-            continue;
-        }
-        let (handover_tx, handover_rx) =
-            std::sync::mpsc::sync_channel::<thread::JoinHandle<Result<(), ServerNgError>>>(1);
-        match thread::Builder::new()
-            .name(format!("shard-{sid}-cleanup"))
-            .spawn(move || {
-                if let Ok(survivor) = handover_rx.recv() {
-                    let _ = survivor.join();
-                }
-            }) {
-            Ok(joiner) => {
-                let _ = handover_tx.send(survivor);
-                joiners.push(joiner);
-            }
-            Err(spawn_err) => {
-                warn!(
-                    error = %spawn_err,
-                    shard_id = sid,
-                    "cleanup helper thread spawn failed; falling back to sequential survivor join"
-                );
-                spawn_exhausted = true;
-                sequential_join.push(survivor);
+    let deadline = Instant::now() + join_timeout;
+    let mut remaining = shard_threads;
+    loop {
+        let mut still_running = Vec::with_capacity(remaining.len());
+        for (shard_id, survivor) in remaining {
+            if survivor.is_finished() {
+                let _ = survivor.join();
+                info!(shard_id, "survivor shard thread drained");
+            } else {
+                still_running.push((shard_id, survivor));
             }
         }
+        remaining = still_running;
+        if remaining.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL);
     }
-    for joiner in joiners {
-        let _ = joiner.join();
-    }
-    for survivor in sequential_join {
-        let _ = survivor.join();
+    for (shard_id, _survivor) in remaining {
+        error!(
+            shard_id,
+            waited = ?join_timeout,
+            "survivor shard thread still running at the shutdown join deadline; abandoning it"
+        );
     }
 }
 
@@ -741,7 +788,10 @@ pub fn bootstrap(
                 drop(metadata_bundle_rx);
                 drop(ready_tx);
                 drop(ready_rx);
-                join_partial_shard_survivors(shard_threads);
+                join_partial_shard_survivors(
+                    shard_threads,
+                    config.system.sharding.shutdown_join_timeout.get_duration(),
+                );
                 return Err(ServerNgError::ShardSpawnFailed { shard_id, source });
             }
         };
@@ -765,6 +815,7 @@ pub fn bootstrap(
     Ok(ShardHandles {
         shutdown_flag,
         shard_threads,
+        join_timeout: config.system.sharding.shutdown_join_timeout.get_duration(),
     })
 }
 
@@ -891,7 +942,11 @@ async fn shard_main(
             // shifts one slab id and root is lost after the first restart.
             let recovered = recover::<ServerNgMuxStateMachine>(
                 data_dir,
-                topology.replica_count == 1,
+                ReplicaIdentity {
+                    cluster: topology.cluster_id,
+                    replica_id: topology.self_replica_id,
+                    replica_count: topology.replica_count,
+                },
                 config.metadata.journal_slots,
                 config.metadata.clients_table_max,
                 |mux_stm| {
@@ -929,13 +984,16 @@ async fn shard_main(
             .await?;
             (
                 recovered.mux_stm,
-                Some((
-                    recovered.journal,
-                    recovered.snapshot,
-                    recovered.last_applied_op,
-                    recovered.last_journaled_op,
-                    recovered.client_table,
-                )),
+                Some(RecoveredOwnerState {
+                    journal: recovered.journal,
+                    snapshot: recovered.snapshot,
+                    last_applied_op: recovered.last_applied_op,
+                    last_journaled_op: recovered.last_journaled_op,
+                    client_table: recovered.client_table,
+                    superblock: recovered.superblock,
+                    recovered_state: recovered.recovered_state,
+                    snapshot_checkpoint: recovered.snapshot_checkpoint,
+                }),
             )
         }
         MetadataHandoff::Waiter { bundle_rx } => {
@@ -953,42 +1011,37 @@ async fn shard_main(
     // Metadata consensus + journal + snapshot live only on shard 0.
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
     // so peer shards have no caller that reads `journal` or `snapshot`.
-    let (metadata_consensus, journal_for_metadata, snapshot_for_metadata, recovered_client_table) =
-        if let Some((journal, snapshot, last_applied_op, last_journaled_op, client_table)) =
-            owner_state
-        {
-            let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-            let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
-            let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
-            let consensus = restore_metadata_consensus(
-                &journal,
-                restored_op,
-                commit_watermark,
-                topology.cluster_id,
-                topology.self_replica_id,
-                topology.replica_count,
-                Rc::clone(&bus),
-                config.metadata.prepare_queue_depth,
-                cluster_heartbeat_ticks(config),
-                commit_broadcast_ticks(config),
-                prepare_retransmit_ticks(config),
-                view_change_retransmit_ticks(config),
-                view_change_status_ticks(config),
-                request_start_view_ticks(config),
-                config.cluster.view_probe_attempts_max,
-                recovery_barrier_deadline(
-                    config.cluster.heartbeat_timeout.get_duration(),
-                    config.cluster.view_change_status_timeout.get_duration(),
-                ),
-            );
-            (Some(consensus), Some(journal), snapshot, Some(client_table))
-        } else {
-            (None, None, None, None)
-        };
+    let (
+        metadata_consensus,
+        journal_for_metadata,
+        snapshot_for_metadata,
+        superblock_for_metadata,
+        checkpoint_seed,
+        recovered_client_table,
+    ) = if let Some(owner) = owner_state {
+        // `recover()` already opened the superblock, read `recovered_state`, and
+        // verified the on-disk snapshot against its checkpoint pairing BEFORE decoding
+        // it. Reuse that superblock rather than re-opening it, which would fork the
+        // ping-pong sequence counter. Consensus recovers its true (view, log_view)
+        // from `recovered_state` instead of inferring a stale view from the WAL.
+        let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
+        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(owner.superblock);
+        (
+            Some(consensus),
+            Some(owner.journal),
+            owner.snapshot,
+            Some(superblock),
+            owner.snapshot_checkpoint,
+            Some(owner.client_table),
+        )
+    } else {
+        (None, None, None, None, (0, 0), None)
+    };
     let metadata = ServerNgMetadata::new(
         metadata_consensus,
         journal_for_metadata,
         snapshot_for_metadata,
+        superblock_for_metadata,
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
@@ -997,15 +1050,20 @@ async fn shard_main(
     // table from scratch, so running it afterwards would drop every resumed
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
-    // Reinstall the sessions the WAL replay rebuilt, so a rebooted node
-    // dedups retries and admits continuations from clients that kept their
-    // identity across the restart (IGGY-137). Recovery sized this table from
-    // the same config value, so the install preserves the configured cap.
+    // Reinstall the sessions recovery restored from the checkpoint and the WAL
+    // suffix, so a rebooted node dedups retries and admits continuations from
+    // clients that kept their identity across the restart (IGGY-137). Recovery
+    // sized this table from the same config value, so the install preserves the
+    // configured cap.
     if let Some(client_table) = recovered_client_table {
         // Refusal (a client registered before this ran) keeps the live table
         // and is logged by the callee; boot continues either way.
         let _ = metadata.install_client_table(client_table);
     }
+    // Seed the coordinator's last-checkpoint pairing so the first post-boot
+    // view-change superblock write records the real (checkpoint_op, checksum)
+    // instead of (0, 0). No-op on peer shards, which have no coordinator.
+    metadata.seed_checkpoint_ref(checkpoint_seed.0, checkpoint_seed.1);
     // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
     // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
@@ -1256,8 +1314,12 @@ async fn shard_main(
             boot_view,
             shard.plane.metadata().client_table.borrow().client_ids(),
         );
-        let on_client_request =
-            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
+        let on_client_request = make_client_request_handler(
+            &shard,
+            &sessions,
+            Arc::clone(&config.system),
+            config.personal_access_token.max_tokens_per_user,
+        );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -1685,7 +1747,12 @@ async fn build_shard_for_thread(
         on_list_clients,
         on_partition_read,
         sessions,
-    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
+    } = wire_shell_handlers(
+        &bus,
+        &shard_handle,
+        Arc::clone(&config.system),
+        config.personal_access_token.max_tokens_per_user,
+    );
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -1723,6 +1790,12 @@ async fn build_shard_for_thread(
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
     shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
+    // Bounds a served state-transfer chunk. A frame above the bus ceiling is
+    // rejected by the RECEIVING transport, which tears the replica connection
+    // down rather than dropping one message.
+    shard.set_bus_max_message_size(
+        usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
+    );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1756,6 +1829,10 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(
+    configs::ng_cluster::STATE_CHUNK_HEADER_LEN
+        == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
+);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {
@@ -1862,28 +1939,52 @@ pub(crate) fn repair_retry_ticks(config: &ServerNgConfig) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Shard 0's half of a metadata recovery: everything [`recover`] produced except the
+/// state machine, which every shard receives through the factory bundle.
+///
+/// Named rather than a positional tuple: the fields are same-typed `Option<u64>`s and
+/// `(u64, u128)` pairs that a reorder would silently rebind, and one of them decides
+/// what view the replica boots into.
+struct RecoveredOwnerState {
+    journal: PrepareJournal,
+    snapshot: Option<IggySnapshot>,
+    last_applied_op: Option<u64>,
+    last_journaled_op: Option<u64>,
+    client_table: ClientTable,
+    superblock: PingPongSuperblock,
+    recovered_state: Option<VsrState>,
+    snapshot_checkpoint: (u64, u128),
+}
+
+/// Rebuild metadata consensus from what recovery read off this replica's own disk.
+///
+/// Takes the recovery result, topology and config whole rather than the dozen-plus
+/// scalars it needs from them: most were `u64` tick counts, where a misordered
+/// argument type-checks and mistunes a timeout silently.
 fn restore_metadata_consensus(
-    journal: &PrepareJournal,
-    restored_op: u64,
-    commit_watermark: u64,
-    cluster_id: u128,
-    self_replica_id: u8,
-    replica_count: u8,
+    owner: &RecoveredOwnerState,
+    topology: &TcpTopology,
+    config: &ServerNgConfig,
     bus: Rc<IggyMessageBus>,
-    prepare_queue_depth: usize,
-    normal_heartbeat_ticks: u64,
-    commit_message_ticks: u64,
-    prepare_ticks: u64,
-    view_change_retransmit_ticks: u64,
-    view_change_status_ticks: u64,
-    request_start_view_ticks: u64,
-    probe_attempts_max: u32,
-    recovery_deadline: Duration,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
+    let journal = &owner.journal;
+    let replica_count = topology.replica_count;
+    let recovered_state = owner.recovered_state;
+    let snapshot_floor = owner
+        .snapshot
+        .as_ref()
+        .map_or(0, IggySnapshot::sequence_number);
+    let commit_watermark = owner.last_applied_op.unwrap_or(snapshot_floor);
+    let restored_op = owner.last_journaled_op.unwrap_or(snapshot_floor);
+    let recovery_deadline = recovery_barrier_deadline(
+        config.cluster.heartbeat_timeout.get_duration(),
+        config.cluster.view_change_status_timeout.get_duration(),
+    );
+    let prepare_queue_depth = config.metadata.prepare_queue_depth;
+
     let mut consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
+        topology.cluster_id,
+        topology.self_replica_id,
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
@@ -1892,36 +1993,64 @@ fn restore_metadata_consensus(
         // in-flight prepares and drain as prepares commit.
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
-    consensus.set_normal_heartbeat_ticks(normal_heartbeat_ticks);
-    consensus.set_commit_message_ticks(commit_message_ticks);
-    consensus.set_prepare_ticks(prepare_ticks);
-    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks);
-    consensus.set_view_change_status_ticks(view_change_status_ticks);
-    consensus.set_request_start_view_ticks(request_start_view_ticks);
-    consensus.set_probe_attempts_max(probe_attempts_max);
+    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
+    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
+    // Fresh random incarnation each boot, so a StartView addressed to a previous
+    // incarnation still in flight is ignored (`handle_start_view` guard). `| 1`
+    // guarantees the non-zero the guard treats as set. The deterministic simulator
+    // overrides this with a seed-derived value bumped per restart.
+    consensus.set_incarnation(rand::random::<u128>() | 1);
 
     let last_header = journal
         .last_op()
         .and_then(|op| usize::try_from(op).ok())
         .and_then(|op| journal.header(op).map(|header| *header));
-    if let Some(header) = last_header {
+    // View and log_view come from the durable superblock when present. A present but
+    // unreadable superblock already refused boot in `recover()`, so reaching the
+    // `else` means it is genuinely absent: a fresh node, or one that took writes but
+    // never checkpointed or changed view. There, inferring the view from the last WAL
+    // prepare is safe, since the persist-before-send gate guarantees this replica
+    // never externalized a view beyond what a re-probe re-derives, and it re-probes
+    // as a backup below. log_view cannot be inferred and stays 0 until the next
+    // superblock write.
+    if let Some(state) = recovered_state {
+        consensus.set_view(state.view);
+        consensus.set_log_view(state.log_view);
+        consensus.mark_superblock_durable(state.view, state.log_view);
+    } else if let Some(header) = last_header {
         consensus.set_view(header.view);
     }
 
-    // On a RESTART in a cluster (a non-empty WAL proves a prior life),
-    // rejoin as a quorum-invisible backup and probe for the current view
-    // (`RequestStartView`): the view's primary answers with a `StartView`,
-    // the replica adopts it as a backup, and journal repair fills any WAL
-    // gap. A probing replica never resumes primaryship -- if this replica
-    // IS the current primary-by-index, its probe makes the backups elect
-    // past it.
+    // On a RESTART in a cluster, rejoin as a quorum-invisible backup and
+    // probe for the current view (`RequestStartView`): the view's primary
+    // answers with a `StartView`, the replica adopts it as a backup, and
+    // journal repair fills any WAL gap. A probing replica never resumes
+    // primaryship -- if this replica IS the current primary-by-index, its
+    // probe makes the backups elect past it.
     // The probe re-broadcasts on its timeout, so it needs no live mesh at
-    // boot. A FRESH boot (empty WAL) keeps the plain init: the cluster
-    // needs its view-0 primary to exist, and a single-replica cluster has
-    // no peer to ask.
-    if replica_count > 1 && restored_op > 0 {
+    // boot. A FRESH boot keeps the plain init: the cluster needs its view-0
+    // primary to exist, and a single-replica cluster has no peer to ask.
+    //
+    // Prior life is EITHER a non-empty WAL or a recovered superblock. A view
+    // change persists without touching the WAL, so a replica that changed
+    // view before its first metadata write comes back with a non-zero view
+    // and an empty journal; gating on the WAL alone would `init()` it into
+    // `Status::Normal` as primary for a view the cluster may have moved past,
+    // with `ceded_primaryship` false and no probe to correct it.
+    if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
         consensus.init_as_backup();
         consensus.begin_view_probe();
+        // Restart in a cluster: replace snapshot-shaped metadata state
+        // (snapshot + client table) from the live primary the probe finds,
+        // then journal-repair the tail. If the probe exhausts instead --
+        // full-cluster bootstrap, nobody live to fetch from -- the election
+        // fallback clears the stage and this local recovery stands.
+        consensus.begin_state_transfer_await();
     } else {
         consensus.init();
     }
@@ -1993,7 +2122,7 @@ fn restore_metadata_consensus(
                 break;
             };
             let mut entry = PipelineEntry::new(*header);
-            entry.add_ack(self_replica_id);
+            entry.add_ack(topology.self_replica_id);
             pipeline.push(entry);
         }
     }
@@ -2490,6 +2619,7 @@ async fn start_tcp_runtime(
             http_addr,
             &config.http,
             config.metadata.clients_table_max,
+            config.personal_access_token.max_tokens_per_user,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
@@ -3023,18 +3153,23 @@ async fn start_client_listeners(
 
 /// Build the replica auth context from cluster config. Returns `None` when the
 /// cluster or replica auth is disabled, keeping the handshake in legacy mode.
-/// Only the derived MAC key is carried onward in [`ReplicaAuth`]; the raw secret
-/// (masked in config logs via `config_env(secret)`) is read here only to derive
-/// that key. `ClusterConfig::validate` guarantees a non-empty secret whenever
-/// both `cluster.enabled` and `cluster.auth.enabled` are set (validate
-/// early-returns `Ok` while `cluster.enabled` is false).
+/// Only the derived MAC keys are carried onward in [`ReplicaAuth`]; the raw
+/// secrets (masked in config logs via `config_env(secret)`) are read here only
+/// to derive them. A non-empty `previous_shared_secret` opens the verify-only
+/// rotation acceptance window (see the [`ReplicaAuth`] rustdoc for the rolling
+/// rotation procedure). `ClusterConfig::validate` guarantees a non-empty
+/// secret whenever both `cluster.enabled` and `cluster.auth.enabled` are set
+/// (validate early-returns `Ok` while `cluster.enabled` is false).
 fn load_replica_auth(config: &ServerNgConfig) -> Option<ReplicaAuth> {
     if !config.cluster.enabled || !config.cluster.auth.enabled {
         return None;
     }
-    Some(ReplicaAuth::new(
-        config.cluster.auth.shared_secret.as_bytes(),
-    ))
+    let auth = ReplicaAuth::new(config.cluster.auth.shared_secret.as_bytes());
+    let previous_shared_secret = &config.cluster.auth.previous_shared_secret;
+    if previous_shared_secret.is_empty() {
+        return Some(auth);
+    }
+    Some(auth.with_previous_secret(previous_shared_secret.as_bytes()))
 }
 
 /// Build the replica TLS context from cluster config. Returns `None` when
@@ -3112,17 +3247,15 @@ fn load_replica_tls_ctx(
     };
     client.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
 
-    // Replica ids form a bijection onto 0..nodes.len() (validated at
-    // boot), so sorting by id yields a Vec indexable by replica id.
-    // TODO(hubcio): dynamic replica join will break this positional
-    // indexing (sparse ids silently map to the wrong SNI/verify name);
-    // key peer names by replica id explicitly before supporting it.
-    let mut roster: Vec<_> = config.cluster.nodes.iter().collect();
-    roster.sort_unstable_by_key(|node| node.replica_id);
-    let peer_names = roster
+    // Keyed by replica id, never by roster position: sparse ids (dynamic
+    // replica join) would make a positional lookup verify against another
+    // peer's SNI name.
+    let peer_names = config
+        .cluster
+        .nodes
         .iter()
         .map(|node| {
-            ServerName::try_from(node.ip.clone()).map_err(|error| {
+            let name = ServerName::try_from(node.ip.clone()).map_err(|error| {
                 credential_error(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -3130,9 +3263,10 @@ fn load_replica_tls_ctx(
                         node.name, node.ip
                     ),
                 ))
-            })
+            })?;
+            Ok((node.replica_id, name))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<HashMap<_, _>, ServerNgError>>()?;
 
     Ok(Some(ReplicaTlsCtx {
         server: Arc::new(server),
@@ -3919,6 +4053,61 @@ mod tests {
         let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:8090"), None, None, None)
             .expect("cluster address resolution must succeed");
         assert_eq!(addrs.http, None);
+    }
+
+    /// Regression: the shutdown-join deadline must arm at SHUTDOWN, not
+    /// at boot. The original bound measured from `join_all` entry, so any
+    /// healthy server outliving `shutdown_join_timeout` (30s default) was
+    /// abandoned as "wedged" and the process exited - every BDD run died
+    /// at t+30s while the test container was still compiling.
+    #[test]
+    fn join_waits_unbounded_while_the_server_runs() {
+        let shutdown_flag = AtomicBool::new(false);
+        // Thread outlives a deliberately tiny join budget; with the flag
+        // clear the budget must never even arm.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(20),
+            &mut deadline,
+        );
+        assert!(
+            matches!(joined, Some(Ok(Ok(())))),
+            "a running server must be awaited indefinitely, not abandoned as wedged"
+        );
+        assert!(
+            deadline.is_none(),
+            "the join deadline must not arm before the shutdown flag flips"
+        );
+    }
+
+    #[test]
+    fn join_abandons_a_wedged_shard_after_the_shutdown_deadline() {
+        let shutdown_flag = AtomicBool::new(true);
+        // Never finishes: stands in for a wedged pump. The thread leaks
+        // into the test process, which exits right after.
+        let handle = thread::spawn(|| -> Result<(), ServerNgError> {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let mut deadline = None;
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            Duration::from_millis(100),
+            &mut deadline,
+        );
+        assert!(
+            joined.is_none(),
+            "a shard still running past the post-shutdown budget must be abandoned"
+        );
+        assert!(deadline.is_some(), "the deadline arms once the flag is set");
     }
 
     #[test]

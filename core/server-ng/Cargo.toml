@@ -57,7 +57,6 @@ ignored = [
     "opentelemetry-semantic-conventions",
     "opentelemetry_sdk",
     "papaya",
-    "prometheus-client",
     "rand",
     "ringbuffer",
     "rmp-serde",
@@ -185,6 +184,13 @@ vergen-git2 = { workspace = true }
 assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
 iggy = { workspace = true }
+# Reconciler unit tests assert on `ShardMetrics` snapshots and
+# `IggyShard::parked_frame_count`, gated to test/simulator so they cannot grow
+# production callers. `shard`'s own `cfg(test)` is false when compiled as our
+# dependency, so the feature is how those accessors become visible. The resolver
+# keeps a dev-dependency's features out of non-test targets, so a production
+# build still links `shard` without `simulator`.
+shard = { workspace = true, features = ["simulator"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints.clippy]

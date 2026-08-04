@@ -133,7 +133,12 @@ pub fn self_signed_replica_tls_ctx(replica_count: u8) -> Rc<ReplicaTlsCtx> {
             .with_no_client_auth();
     client.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
     let peer_names = (0..replica_count)
-        .map(|_| ServerName::try_from("localhost").expect("static server name"))
+        .map(|replica_id| {
+            (
+                replica_id,
+                ServerName::try_from("localhost").expect("static server name"),
+            )
+        })
         .collect();
     Rc::new(ReplicaTlsCtx {
         server: Arc::new(server),
