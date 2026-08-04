@@ -33,9 +33,9 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
-    "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
@@ -56,10 +56,10 @@ __all__ = [
     "Topic",
     "TopicDetails",
     "TopicPermissions",
+    "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
-    "UserHeaders",
 ]
 
 class AutoCommit:
@@ -357,6 +357,105 @@ class ConsumerGroupMember:
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
+class GlobalPermissions:
+    r"""
+    Global permissions, applied to all streams without specifying them one by one.
+    """
+    @property
+    def manage_servers(self) -> builtins.bool:
+        r"""
+        Whether managing servers is allowed; includes `read_servers`.
+        """
+    @property
+    def read_servers(self) -> builtins.bool:
+        r"""
+        Whether reading server info (stats, clients) is allowed.
+        """
+    @property
+    def manage_users(self) -> builtins.bool:
+        r"""
+        Whether managing users is allowed; includes `read_users`.
+        """
+    @property
+    def read_users(self) -> builtins.bool:
+        r"""
+        Whether reading user info is allowed.
+        """
+    @property
+    def manage_streams(self) -> builtins.bool:
+        r"""
+        Whether managing all streams is allowed; includes `read_streams` and
+        `manage_topics`.
+        """
+    @property
+    def read_streams(self) -> builtins.bool:
+        r"""
+        Whether reading all streams is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing all topics is allowed; includes `read_topics` and
+        `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading all topics and managing consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from all streams and managing consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to all streams is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_servers: builtins.bool = False,
+        read_servers: builtins.bool = False,
+        manage_users: builtins.bool = False,
+        read_users: builtins.bool = False,
+        manage_streams: builtins.bool = False,
+        read_streams: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> GlobalPermissions:
+        r"""
+        Create global permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_streams` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_servers: Allow managing servers; includes `read_servers`.
+            read_servers: Allow reading server info (stats, clients).
+            manage_users: Allow managing users; includes `read_users`.
+            read_users: Allow reading user info.
+            manage_streams: Allow managing all streams; includes `read_streams`
+                and `manage_topics`.
+            read_streams: Allow reading all streams; includes `read_topics`.
+            manage_topics: Allow managing all topics; includes `read_topics`
+                and `send_messages`.
+            read_topics: Allow reading all topics and managing consumer groups
+                (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from all streams and managing
+                consumer offsets.
+            send_messages: Allow sending messages to all streams.
         """
 
 class HeaderKey:
@@ -708,105 +807,6 @@ class HeaderValue:
         @property
         def value(self) -> builtins.float: ...
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
-
-@typing.final
-class GlobalPermissions:
-    r"""
-    Global permissions, applied to all streams without specifying them one by one.
-    """
-    @property
-    def manage_servers(self) -> builtins.bool:
-        r"""
-        Whether managing servers is allowed; includes `read_servers`.
-        """
-    @property
-    def read_servers(self) -> builtins.bool:
-        r"""
-        Whether reading server info (stats, clients) is allowed.
-        """
-    @property
-    def manage_users(self) -> builtins.bool:
-        r"""
-        Whether managing users is allowed; includes `read_users`.
-        """
-    @property
-    def read_users(self) -> builtins.bool:
-        r"""
-        Whether reading user info is allowed.
-        """
-    @property
-    def manage_streams(self) -> builtins.bool:
-        r"""
-        Whether managing all streams is allowed; includes `read_streams` and
-        `manage_topics`.
-        """
-    @property
-    def read_streams(self) -> builtins.bool:
-        r"""
-        Whether reading all streams is allowed; includes `read_topics`.
-        """
-    @property
-    def manage_topics(self) -> builtins.bool:
-        r"""
-        Whether managing all topics is allowed; includes `read_topics` and
-        `send_messages`.
-        """
-    @property
-    def read_topics(self) -> builtins.bool:
-        r"""
-        Whether reading all topics and managing consumer groups is allowed;
-        includes `poll_messages`.
-        """
-    @property
-    def poll_messages(self) -> builtins.bool:
-        r"""
-        Whether polling messages from all streams and managing consumer
-        offsets is allowed.
-        """
-    @property
-    def send_messages(self) -> builtins.bool:
-        r"""
-        Whether sending messages to all streams is allowed.
-        """
-    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
-    def __new__(
-        cls,
-        *,
-        manage_servers: builtins.bool = False,
-        read_servers: builtins.bool = False,
-        manage_users: builtins.bool = False,
-        read_users: builtins.bool = False,
-        manage_streams: builtins.bool = False,
-        read_streams: builtins.bool = False,
-        manage_topics: builtins.bool = False,
-        read_topics: builtins.bool = False,
-        poll_messages: builtins.bool = False,
-        send_messages: builtins.bool = False,
-    ) -> GlobalPermissions:
-        r"""
-        Create global permissions. Every flag defaults to `False`.
-
-        The `includes` notes below are transitive: a flag also grants everything
-        its included flags grant. For example `manage_streams` includes
-        `manage_topics`, and through it `read_topics`, `poll_messages`, and
-        `send_messages`.
-
-        Args:
-            manage_servers: Allow managing servers; includes `read_servers`.
-            read_servers: Allow reading server info (stats, clients).
-            manage_users: Allow managing users; includes `read_users`.
-            read_users: Allow reading user info.
-            manage_streams: Allow managing all streams; includes `read_streams`
-                and `manage_topics`.
-            read_streams: Allow reading all streams; includes `read_topics`.
-            manage_topics: Allow managing all topics; includes `read_topics`
-                and `send_messages`.
-            read_topics: Allow reading all topics and managing consumer groups
-                (including create and delete); includes `poll_messages`.
-            poll_messages: Allow polling messages from all streams and managing
-                consumer offsets.
-            send_messages: Allow sending messages to all streams.
-        """
 
 @typing.final
 class IggyClient:
@@ -1795,6 +1795,10 @@ class ReceiveMessage:
     def user_headers(self) -> UserHeaders | None:
         r"""
         Retrieves user headers attached to the received message.
+
+        Returns `None` when no headers are present or when the headers
+        on the wire are structurally malformed (those errors are logged
+        internally). Only known semantic decode errors raise `ValueError`.
         """
 
 @typing.final
@@ -2308,6 +2312,36 @@ class TopicPermissions:
         """
 
 @typing.final
+class UserHeaders(dict):
+    r"""
+    User headers dictionary returned by `ReceiveMessage.user_headers`.
+
+    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
+    operations work) that additionally exposes `to_scalar_dict` for the convenient
+    scalar form.
+    """
+    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
+        r"""
+        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
+
+        Accepts a dict whose keys and values can each independently be
+        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
+        int | float`). The inherited `dict` initializer copies the provided
+        mapping.
+        """
+    def __setitem__(self, key: typing.Any, value: typing.Any) -> None: ...
+    def to_scalar_dict(
+        self,
+    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
+        r"""
+        Converts these headers into the convenient plain dictionary form.
+
+        Returns an error if two distinct typed keys map to the same plain
+        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+        become `int(1)`), or if a stored field cannot be decoded.
+        """
+
+@typing.final
 class UserInfo:
     @property
     def id(self) -> builtins.int:
@@ -2372,31 +2406,3 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
-
-class UserHeaders(dict):
-    r"""
-    User headers dictionary returned by `ReceiveMessage.user_headers`.
-
-    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
-    operations work) that additionally exposes `to_scalar_dict` for the convenient
-    scalar form.
-    """
-    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
-        r"""
-        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
-
-        Accepts a dict whose keys and values can each independently be
-        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
-        int | float`). The inherited `dict` initializer copies the provided
-        mapping.
-        """
-    def to_scalar_dict(
-        self,
-    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
-        r"""
-        Converts these headers into the convenient plain dictionary form.
-
-        Returns an error if two distinct typed keys map to the same plain
-        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
-        become `int(1)`), or if a stored field cannot be decoded.
-        """
