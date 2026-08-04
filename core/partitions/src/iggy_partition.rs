@@ -26,7 +26,7 @@ use crate::poll_plan::{
     PartitionDirResolution, PollPlan, PollTier, ResidentTailSnapshot,
 };
 use crate::segment::Segment;
-use crate::state_transfer::PartitionTransferSession;
+use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
 use crate::types::{RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
@@ -149,8 +149,8 @@ where
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
     /// in-memory / simulated partitions, where the persist gate is a no-op
-    /// and views stay process-lifetime only. Behind `Rc<dyn ...>` because
-    /// the boot path opens the store once and hands the same instance here:
+    /// and views stay process-lifetime only. Behind `Rc` because the boot
+    /// path opens the store once and hands the same instance here:
     /// re-opening would fork the ping-pong sequence counter.
     superblock: Option<Rc<SB>>,
     /// Serializes this partition's superblock writes so at most one is in
@@ -177,9 +177,18 @@ where
     /// cycled abandon -> repair -> refusal -> re-arm at zero forever. Reset
     /// only by [`Self::note_transfer_progress`].
     pub transfer_attempts: u32,
-    /// Decode failures charged per offered generation:
-    /// `(generation, failures)`, generation = the offer's `commit_op`.
-    pub transfer_decode_failures: Option<(u64, u32)>,
+    /// CONSECUTIVE transfer failures of any class (decode, spill, install,
+    /// peer-unavailable, stall exhaustion). Deliberately NOT keyed on the
+    /// offered generation: a committing primary advances its generation
+    /// every round, and a generation-keyed count reset to 1 forever, so a
+    /// deterministic local failure (ENOSPC, an undecodable artifact) looped
+    /// at network round-trip rate. Reset only by
+    /// [`Self::note_transfer_installed`]; drives the re-arm backoff.
+    pub transfer_failures: u32,
+    /// A scheduled transfer re-arm: try `peer` again once `after_ticks`
+    /// consensus ticks elapse. Owned by the shard tick sweep; while one is
+    /// pending, the repair-refusal trigger must not arm concurrently.
+    pub transfer_rearm: Option<PendingTransferRearm>,
     /// Serving-side offer cache, keyed by the `commit_op` it was built at, so
     /// simultaneous rejoiners share one manifest instead of re-reading every
     /// segment per requester. Invalidated by `purge` (same commit frontier,
@@ -192,8 +201,8 @@ impl<B, SB> fmt::Debug for IggyPartition<B, SB>
 where
     B: MessageBus,
 {
-    // Hand-written because `Rc<dyn DynSuperblockStore>` has no `Debug`; the
-    // fields listed are the ones diagnostics actually key on.
+    // Hand-written because `SB` carries no `Debug` bound; the fields listed
+    // are the ones diagnostics actually key on.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IggyPartition")
             .field("namespace", &self.consensus.namespace())
@@ -324,7 +333,8 @@ where
             superblock_retry_after_micros: Cell::new(0),
             transfer: None,
             transfer_attempts: 0,
-            transfer_decode_failures: None,
+            transfer_failures: 0,
+            transfer_rearm: None,
             transfer_offer_cache: RefCell::new(None),
         };
         if single_replica {
@@ -505,37 +515,29 @@ where
         self.transfer_attempts > consensus::STATE_TRANSFER_MAX_STALL_RETRIES
     }
 
-    /// Real transfer progress: reset the retry budget. The budget bounds
-    /// CONSECUTIVE failures, not lifetime ones; without this a handful of
+    /// Real transfer progress: reset the stall budget. The budget bounds
+    /// CONSECUTIVE stalls, not lifetime ones; without this a handful of
     /// stalls scattered across a large transfer would abandon one that was
     /// nearly done, throwing away every byte already pulled.
     pub const fn note_transfer_progress(&mut self) {
         self.transfer_attempts = 0;
     }
 
-    /// Charge one decode failure against `generation` (the offered
-    /// `commit_op`); `true` once that generation's budget is spent. A
-    /// different generation restarts the count: the peer committed since,
-    /// so the artifacts are new bytes worth full retries.
-    pub const fn burn_transfer_decode_failure(&mut self, generation: u64) -> bool {
-        let failures = match self.transfer_decode_failures {
-            Some((current, failures)) if current == generation => failures + 1,
-            _ => 1,
-        };
-        self.transfer_decode_failures = Some((generation, failures));
-        failures > consensus::STATE_TRANSFER_MAX_DECODE_RETRIES
+    /// Charge one transfer failure (any class) and return the consecutive
+    /// count; the shard scales its re-arm backoff by it. Never resets on a
+    /// new generation or on received chunks -- a deterministic failure
+    /// re-pulls successfully every round and still must back off -- only
+    /// [`Self::note_transfer_installed`] clears it.
+    pub const fn record_transfer_failure(&mut self) -> u32 {
+        self.transfer_failures = self.transfer_failures.saturating_add(1);
+        self.transfer_failures
     }
 
-    /// Whether `generation`'s decode budget is already spent. Gates
-    /// descriptor acceptance, so an exhausted generation costs one refused
-    /// descriptor per repair round instead of a full pull.
-    #[must_use]
-    pub const fn transfer_decode_budget_exhausted(&self, generation: u64) -> bool {
-        matches!(
-            self.transfer_decode_failures,
-            Some((current, failures))
-                if current == generation && failures > consensus::STATE_TRANSFER_MAX_DECODE_RETRIES
-        )
+    /// A completed install: the one signal that genuinely proves the
+    /// transfer pipeline works end to end, so it alone resets the
+    /// consecutive-failure count.
+    pub const fn note_transfer_installed(&mut self) {
+        self.transfer_failures = 0;
     }
 
     pub fn configure_consumer_offset_storage(
@@ -3930,7 +3932,7 @@ mod tests {
         // first failure), then retry with the store healthy: the ack must
         // persist first and then go out.
         store.fail_writes.set(false);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        compio::time::sleep(std::time::Duration::from_millis(50)).await;
         partition.send_prepare_ok(&header).await;
 
         assert_eq!(
@@ -4616,8 +4618,6 @@ mod tests {
                 peer: 0,
                 commit_op: 0,
                 artifacts: Vec::new(),
-                spilled: Vec::new(),
-                staged: Vec::new(),
                 target_accepted: false,
                 idle_ticks: 0,
             });
@@ -4628,19 +4628,22 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_decode_failures_when_generation_advances_should_reset_budget() {
+    async fn given_repeated_failures_when_only_generation_advances_should_keep_counting() {
         let mut partition = test_partition();
-        for _ in 0..consensus::STATE_TRANSFER_MAX_DECODE_RETRIES {
-            assert!(!partition.burn_transfer_decode_failure(7));
-        }
-        assert!(!partition.transfer_decode_budget_exhausted(7));
-        assert!(partition.burn_transfer_decode_failure(7));
-        assert!(partition.transfer_decode_budget_exhausted(7));
-        assert!(
-            !partition.transfer_decode_budget_exhausted(8),
-            "a new generation is new bytes worth full retries"
+        // A committing primary advances its generation every round; the
+        // consecutive count must keep growing regardless, or a
+        // deterministic local failure retries at network round-trip rate
+        // forever. Only a completed install resets it.
+        assert_eq!(partition.record_transfer_failure(), 1);
+        assert_eq!(partition.record_transfer_failure(), 2);
+        partition.note_transfer_progress();
+        assert_eq!(
+            partition.record_transfer_failure(),
+            3,
+            "received chunks are not install progress"
         );
-        assert!(!partition.burn_transfer_decode_failure(8));
+        partition.note_transfer_installed();
+        assert_eq!(partition.record_transfer_failure(), 1, "install resets");
     }
 
     #[compio::test]

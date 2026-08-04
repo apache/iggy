@@ -160,8 +160,8 @@ pub use state_manifest::{
 };
 pub mod state_transfer;
 pub use state_transfer::{
-    ArtifactProgress, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES,
-    append_chunk, next_pending_chunk, verify_state_artifact,
+    ArtifactProgress, ChunkProgress, STATE_TRANSFER_MAX_DECODE_RETRIES,
+    STATE_TRANSFER_MAX_STALL_RETRIES, append_chunk, next_pending_chunk, verify_state_artifact,
 };
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;

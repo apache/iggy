@@ -67,6 +67,7 @@ pub async fn load_persisted_segments(
     let partition_path = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
+    sweep_staging_files(&partition_path);
     let mut start_offsets = collect_segment_start_offsets(&partition_path)?;
     start_offsets.sort_unstable();
 
@@ -170,7 +171,69 @@ pub async fn load_persisted_segments(
         last.segment.sealed = false;
     }
 
+    ensure_contiguous_chain(&recovered, stream_id, topic_id, partition_id)?;
+
     Ok(recovered)
+}
+
+/// Contiguity guard: recovery takes every `.log` stem in the directory, so a
+/// stray file (an unlink a failed state-transfer install could not finish,
+/// an operator copy) would otherwise splice a hole or an overlap into the
+/// chain and push `current_offset` past data this replica does not hold.
+/// Refuse loudly instead of serving a holed log.
+fn ensure_contiguous_chain(
+    recovered: &[RecoveredSegment],
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<(), ServerNgError> {
+    for pair in recovered.windows(2) {
+        let previous = &pair[0].segment;
+        let next = &pair[1].segment;
+        // A torn-tail segment recovered as empty has `end_offset ==
+        // start_offset` with zero size; only sized segments carry a real
+        // end to check against.
+        if previous.size == IggyByteSize::default() {
+            continue;
+        }
+        if next.start_offset != previous.end_offset + 1 {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                previous_start = previous.start_offset,
+                previous_end = previous.end_offset,
+                next_start = next.start_offset,
+                "recovered segment chain is not contiguous; refusing to serve a holed log"
+            );
+            return Err(IggyError::CannotReadPartitions.into());
+        }
+    }
+    Ok(())
+}
+
+/// Unlink every `*.staging` spill file in the partition directory. Boot is
+/// the one sweep that always runs: the install-time and reuse-time sweeps
+/// only fire on the NEXT transfer attempt, so a transfer abandoned for good
+/// would otherwise leak a full partition copy across restarts. Staging files
+/// are pure scratch (never a rename source until an install owns them), so
+/// unlinking is always safe here.
+fn sweep_staging_files(partition_path: &str) {
+    let Ok(entries) = fs::read_dir(partition_path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_staging = path.to_str().is_some_and(|path| path.ends_with(".staging"));
+        if is_staging && let Err(error) = fs::remove_file(&path) {
+            warn!(
+                partition_path,
+                path = %path.display(),
+                %error,
+                "failed to sweep a stale staging file at boot"
+            );
+        }
+    }
 }
 
 /// Parses the zero-padded start offset out of every `.log` file name in the

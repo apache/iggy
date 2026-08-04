@@ -33,15 +33,22 @@ use std::fmt;
 use std::mem::size_of;
 use std::path::PathBuf;
 
-/// Framing marker for the consumer-offsets wire artifact, "IPO1".
-pub const PARTITION_OFFSETS_MAGIC: [u8; 4] = *b"IPO1";
+/// Framing marker for the consumer-offsets wire artifact, "ICO1".
+pub const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
+
+/// Version byte following the magic.
+///
+/// Bump when the layout changes shape in a way appending fields cannot
+/// express; a decoder rejects versions it does not know instead of
+/// misreading trailing bytes as `Truncated`.
+pub const CONSUMER_OFFSETS_VERSION: u8 = 1;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
 /// A corruption guard, not a target: it bounds the allocation `decode`
 /// makes from a length field a peer sent, exactly like the manifest's own
 /// entry ceiling.
-pub const PARTITION_OFFSETS_ENTRIES_MAX: u32 = 1 << 20;
+pub const CONSUMER_OFFSETS_ENTRIES_MAX: u32 = 1 << 20;
 
 /// One in-flight partition state transfer on the receiving replica.
 ///
@@ -61,24 +68,93 @@ pub struct PartitionTransferSession {
     /// as the decode-budget generation: segments are append-only, so a new
     /// commit frontier genuinely means new bytes.
     pub commit_op: u64,
-    /// One entry per offered artifact, pulled in manifest order. A spilled
-    /// `SEGMENT_LOG` artifact keeps its entry but frees `buf`; completion is
-    /// then tracked by its `StagedSegmentMeta`.
-    pub artifacts: Vec<ArtifactProgress>,
-    /// Per-artifact "validated and spilled to staging" flags, index-aligned
-    /// with `artifacts` (set at manifest accept). A spilled artifact frees
-    /// its buffer, so `ArtifactProgress::complete` alone cannot answer
-    /// "done" for it.
-    pub spilled: Vec<bool>,
-    /// Walk results for segment artifacts already validated and staged,
-    /// in manifest (ascending base offset) order.
-    pub staged: Vec<StagedSegmentMeta>,
+    /// One slot per offered artifact, in manifest order. A slot moves from
+    /// `Pending` to `Staged` when its segment payload is validated and
+    /// spilled (freeing the buffer); the single enum makes a
+    /// progress/spilled/staged desync unrepresentable.
+    pub artifacts: Vec<TransferArtifact>,
     /// Whether a descriptor has been accepted (an accepted EMPTY manifest is
     /// distinguishable from "still waiting").
     pub target_accepted: bool,
     /// Ticks with no frame progress; at the configured repair-retry
     /// threshold the missing piece is re-requested.
     pub idle_ticks: u32,
+}
+
+/// A scheduled transfer re-arm (see `IggyPartition::transfer_rearm`).
+///
+/// The shard tick sweep counts `after_ticks` down and arms a fresh session
+/// against `peer` when it reaches zero, provided nothing else armed one in
+/// the meantime.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingTransferRearm {
+    pub peer: u8,
+    pub after_ticks: u32,
+}
+
+/// One artifact slot of an in-flight partition transfer.
+///
+/// `SEGMENT_LOG` artifacts pass through both states; the consumer-offsets
+/// artifact stays `Pending` until the install consumes its buffer.
+#[derive(Debug)]
+pub enum TransferArtifact {
+    /// Still pulling: manifest entry plus the bytes received so far.
+    Pending(ArtifactProgress),
+    /// Validated and spilled to `.staging` files; the buffer is freed and
+    /// the walk metadata is what the install consumes.
+    Staged(StagedSegmentMeta),
+}
+
+impl TransferArtifact {
+    #[must_use]
+    pub const fn pending(&self) -> Option<&ArtifactProgress> {
+        match self {
+            Self::Pending(progress) => Some(progress),
+            Self::Staged(_) => None,
+        }
+    }
+
+    pub const fn pending_mut(&mut self) -> Option<&mut ArtifactProgress> {
+        match self {
+            Self::Pending(progress) => Some(progress),
+            Self::Staged(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        match self {
+            Self::Pending(progress) => progress.complete(),
+            Self::Staged(_) => true,
+        }
+    }
+}
+
+impl consensus::ChunkProgress for TransferArtifact {
+    fn declared_len(&self) -> u64 {
+        match self {
+            Self::Pending(progress) => progress.entry.len,
+            Self::Staged(meta) => meta.size,
+        }
+    }
+
+    fn received_len(&self) -> u64 {
+        match self {
+            Self::Pending(progress) => progress.buf.len() as u64,
+            // Staged == validated == every declared byte arrived; the chunk
+            // cursor then skips it, subsuming the old `spilled` flags.
+            Self::Staged(meta) => meta.size,
+        }
+    }
+
+    fn extend_from_chunk(&mut self, payload: &[u8]) {
+        match self {
+            Self::Pending(progress) => progress.buf.extend_from_slice(payload),
+            // Unreachable through `append_chunk`: a staged slot reports
+            // itself complete, so no in-window offset can address it.
+            Self::Staged(_) => debug_assert!(false, "chunk appended to a staged artifact"),
+        }
+    }
 }
 
 /// What the receiver learned walking one validated, staged segment artifact:
@@ -112,30 +188,41 @@ pub struct StagedSegmentMeta {
 /// generation and the reconciler would immediately re-wipe it, costing a
 /// full extra transfer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PartitionOffsetsWire {
+pub struct ConsumerOffsetsWire {
     pub purge_generation: u64,
+    /// The origin group's message-offset frontier: the offset the NEXT
+    /// append will mint, `0` for a partition that never appended. Segments
+    /// alone cannot carry this -- retention can GC every sealed segment
+    /// while the counter stands at N, and installing such an offer without
+    /// this field would restart the receiver's offset space at 0, forking
+    /// every future batch stamp from the rest of the group.
+    pub next_offset: u64,
     /// `(consumer id, offset)`, ascending by id.
     pub consumers: Vec<(u32, u64)>,
     /// `(consumer group id, offset)`, ascending by id.
     pub groups: Vec<(u32, u64)>,
 }
 
-impl PartitionOffsetsWire {
-    /// Encode: `magic | purge_generation u64 | consumer_count u32 |
-    /// group_count u32 | {id u32, offset u64}xN | {id u32, offset u64}xM |
-    /// XxHash3_64 trailer`. Little-endian throughout.
+impl ConsumerOffsetsWire {
+    /// Encode: `magic | version u8 | purge_generation u64 | next_offset u64 |
+    /// consumer_count u32 | group_count u32 | {id u32, offset u64}xN |
+    /// {id u32, offset u64}xM | XxHash3_64 trailer`. Little-endian
+    /// throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         // Size exactly rather than guess; the reservation assert keeps the
         // arithmetic honest as fields are added.
-        let reserved = PARTITION_OFFSETS_MAGIC.len()
-            + size_of::<u64>()
+        let reserved = CONSUMER_OFFSETS_MAGIC.len()
+            + size_of::<u8>()
+            + 2 * size_of::<u64>()
             + 2 * size_of::<u32>()
             + (self.consumers.len() + self.groups.len()) * (size_of::<u32>() + size_of::<u64>())
             + size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
-        out.extend_from_slice(&PARTITION_OFFSETS_MAGIC);
+        out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        out.push(CONSUMER_OFFSETS_VERSION);
         out.extend_from_slice(&self.purge_generation.to_le_bytes());
+        out.extend_from_slice(&self.next_offset.to_le_bytes());
         #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(self.consumers.len() as u32).to_le_bytes());
         #[allow(clippy::cast_possible_truncation)]
@@ -159,30 +246,36 @@ impl PartitionOffsetsWire {
     /// so the install clamps, mirroring boot recovery.
     ///
     /// # Errors
-    /// Any [`PartitionOffsetsWireError`]; the input is never partially
+    /// Any [`ConsumerOffsetsWireError`]; the input is never partially
     /// trusted.
-    pub fn decode(bytes: &[u8]) -> Result<Self, PartitionOffsetsWireError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, ConsumerOffsetsWireError> {
         let content = split_verified_trailer(bytes).map_err(|mismatch| match mismatch {
-            None => PartitionOffsetsWireError::Truncated,
+            None => ConsumerOffsetsWireError::Truncated,
             Some((expected, actual)) => {
-                PartitionOffsetsWireError::ChecksumMismatch { expected, actual }
+                ConsumerOffsetsWireError::ChecksumMismatch { expected, actual }
             }
         })?;
         let mut cursor = LeCursor::new(content);
-        let magic = cursor.take(PARTITION_OFFSETS_MAGIC.len())?;
-        if magic != PARTITION_OFFSETS_MAGIC {
-            return Err(PartitionOffsetsWireError::BadMagic);
+        let magic = cursor.take(CONSUMER_OFFSETS_MAGIC.len())?;
+        if magic != CONSUMER_OFFSETS_MAGIC {
+            return Err(ConsumerOffsetsWireError::BadMagic);
+        }
+        let version = cursor.u8()?;
+        if version != CONSUMER_OFFSETS_VERSION {
+            return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
         let purge_generation = cursor.u64()?;
+        let next_offset = cursor.u64()?;
         let consumer_count = cursor.u32()?;
         let group_count = cursor.u32()?;
         let consumers = Self::decode_section(&mut cursor, "consumers", consumer_count)?;
         let groups = Self::decode_section(&mut cursor, "groups", group_count)?;
         if !cursor.remaining().is_empty() {
-            return Err(PartitionOffsetsWireError::Truncated);
+            return Err(ConsumerOffsetsWireError::Truncated);
         }
         Ok(Self {
             purge_generation,
+            next_offset,
             consumers,
             groups,
         })
@@ -192,14 +285,14 @@ impl PartitionOffsetsWire {
         cursor: &mut LeCursor<'_>,
         section: &'static str,
         count: u32,
-    ) -> Result<Vec<(u32, u64)>, PartitionOffsetsWireError> {
+    ) -> Result<Vec<(u32, u64)>, ConsumerOffsetsWireError> {
         // Ceiling BEFORE the reservation: `count` is peer input and this is
         // the only check between it and an eager allocation.
-        if count > PARTITION_OFFSETS_ENTRIES_MAX {
-            return Err(PartitionOffsetsWireError::TooManyEntries {
+        if count > CONSUMER_OFFSETS_ENTRIES_MAX {
+            return Err(ConsumerOffsetsWireError::TooManyEntries {
                 section,
                 count,
-                max: PARTITION_OFFSETS_ENTRIES_MAX,
+                max: CONSUMER_OFFSETS_ENTRIES_MAX,
             });
         }
         let mut entries = Vec::with_capacity(count as usize);
@@ -210,7 +303,7 @@ impl PartitionOffsetsWire {
             // Ascending-strict doubles as the duplicate reject and makes the
             // encoding canonical: one table, one byte sequence.
             if previous.is_some_and(|previous| id <= previous) {
-                return Err(PartitionOffsetsWireError::DuplicateConsumerId { section, id });
+                return Err(ConsumerOffsetsWireError::DuplicateConsumerId { section, id });
             }
             previous = Some(id);
             entries.push((id, offset));
@@ -223,9 +316,12 @@ impl PartitionOffsetsWire {
 /// Named for the format: the on-disk offset files are a different codec with
 /// different trust (this node's own bytes vs a peer's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartitionOffsetsWireError {
+pub enum ConsumerOffsetsWireError {
     Truncated,
     BadMagic,
+    UnsupportedVersion {
+        version: u8,
+    },
     ChecksumMismatch {
         expected: u64,
         actual: u64,
@@ -241,17 +337,22 @@ pub enum PartitionOffsetsWireError {
     },
 }
 
-impl From<Truncated> for PartitionOffsetsWireError {
+impl From<Truncated> for ConsumerOffsetsWireError {
     fn from(_: Truncated) -> Self {
         Self::Truncated
     }
 }
 
-impl fmt::Display for PartitionOffsetsWireError {
+impl fmt::Display for ConsumerOffsetsWireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Truncated => write!(f, "consumer-offsets artifact is truncated"),
             Self::BadMagic => write!(f, "consumer-offsets artifact carries a foreign magic"),
+            Self::UnsupportedVersion { version } => write!(
+                f,
+                "consumer-offsets artifact version {version} is not understood \
+                 (this build speaks {CONSUMER_OFFSETS_VERSION})"
+            ),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
                 "consumer-offsets artifact checksum mismatch: expected {expected}, got {actual}"
@@ -272,15 +373,16 @@ impl fmt::Display for PartitionOffsetsWireError {
     }
 }
 
-impl std::error::Error for PartitionOffsetsWireError {}
+impl std::error::Error for ConsumerOffsetsWireError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn table() -> PartitionOffsetsWire {
-        PartitionOffsetsWire {
+    fn table() -> ConsumerOffsetsWire {
+        ConsumerOffsetsWire {
             purge_generation: 3,
+            next_offset: 43,
             consumers: vec![(1, 10), (7, 42)],
             groups: vec![(2, 5)],
         }
@@ -290,21 +392,22 @@ mod tests {
     fn given_offset_table_when_encoded_should_round_trip() {
         let encoded = table().encode();
         assert_eq!(
-            PartitionOffsetsWire::decode(&encoded).expect("round trip"),
+            ConsumerOffsetsWire::decode(&encoded).expect("round trip"),
             table()
         );
     }
 
     #[test]
     fn given_empty_table_when_encoded_should_round_trip() {
-        let empty = PartitionOffsetsWire {
+        let empty = ConsumerOffsetsWire {
             purge_generation: 0,
+            next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
         };
         let encoded = empty.encode();
         assert_eq!(
-            PartitionOffsetsWire::decode(&encoded).expect("round trip"),
+            ConsumerOffsetsWire::decode(&encoded).expect("round trip"),
             empty
         );
     }
@@ -314,8 +417,8 @@ mod tests {
         let mut encoded = table().encode();
         encoded[6] ^= 1;
         assert!(matches!(
-            PartitionOffsetsWire::decode(&encoded),
-            Err(PartitionOffsetsWireError::ChecksumMismatch { .. })
+            ConsumerOffsetsWire::decode(&encoded),
+            Err(ConsumerOffsetsWireError::ChecksumMismatch { .. })
         ));
     }
 
@@ -324,10 +427,26 @@ mod tests {
         let encoded = table().encode();
         for len in 0..encoded.len() {
             assert!(
-                PartitionOffsetsWire::decode(&encoded[..len]).is_err(),
+                ConsumerOffsetsWire::decode(&encoded[..len]).is_err(),
                 "strict prefix of {len} bytes must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn given_unknown_version_when_decoded_should_reject() {
+        let mut wrong = table().encode();
+        // Bump the version byte and re-seal so only the version check fires.
+        wrong[CONSUMER_OFFSETS_MAGIC.len()] = CONSUMER_OFFSETS_VERSION + 1;
+        let content_len = wrong.len() - size_of::<u64>();
+        let trailer = state_artifact_checksum(&wrong[..content_len]);
+        wrong[content_len..].copy_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&wrong),
+            Err(ConsumerOffsetsWireError::UnsupportedVersion {
+                version: CONSUMER_OFFSETS_VERSION + 1,
+            })
+        );
     }
 
     #[test]
@@ -339,52 +458,56 @@ mod tests {
         let trailer = state_artifact_checksum(&wrong[..content_len]);
         wrong[content_len..].copy_from_slice(&trailer.to_le_bytes());
         assert_eq!(
-            PartitionOffsetsWire::decode(&wrong),
-            Err(PartitionOffsetsWireError::BadMagic)
+            ConsumerOffsetsWire::decode(&wrong),
+            Err(ConsumerOffsetsWireError::BadMagic)
         );
     }
 
     #[test]
     fn given_count_past_ceiling_when_decoded_should_reject_before_allocating() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&PARTITION_OFFSETS_MAGIC);
+        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        bytes.push(CONSUMER_OFFSETS_VERSION);
         bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&(PARTITION_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         let trailer = state_artifact_checksum(&bytes);
         bytes.extend_from_slice(&trailer.to_le_bytes());
         assert_eq!(
-            PartitionOffsetsWire::decode(&bytes),
-            Err(PartitionOffsetsWireError::TooManyEntries {
+            ConsumerOffsetsWire::decode(&bytes),
+            Err(ConsumerOffsetsWireError::TooManyEntries {
                 section: "consumers",
-                count: PARTITION_OFFSETS_ENTRIES_MAX + 1,
-                max: PARTITION_OFFSETS_ENTRIES_MAX,
+                count: CONSUMER_OFFSETS_ENTRIES_MAX + 1,
+                max: CONSUMER_OFFSETS_ENTRIES_MAX,
             })
         );
     }
 
     #[test]
     fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
-        let duplicate = PartitionOffsetsWire {
+        let duplicate = ConsumerOffsetsWire {
             purge_generation: 0,
+            next_offset: 0,
             consumers: vec![(5, 1), (5, 2)],
             groups: Vec::new(),
         };
         assert_eq!(
-            PartitionOffsetsWire::decode(&duplicate.encode()),
-            Err(PartitionOffsetsWireError::DuplicateConsumerId {
+            ConsumerOffsetsWire::decode(&duplicate.encode()),
+            Err(ConsumerOffsetsWireError::DuplicateConsumerId {
                 section: "consumers",
                 id: 5,
             })
         );
-        let unordered = PartitionOffsetsWire {
+        let unordered = ConsumerOffsetsWire {
             purge_generation: 0,
+            next_offset: 0,
             consumers: Vec::new(),
             groups: vec![(9, 1), (4, 2)],
         };
         assert_eq!(
-            PartitionOffsetsWire::decode(&unordered.encode()),
-            Err(PartitionOffsetsWireError::DuplicateConsumerId {
+            ConsumerOffsetsWire::decode(&unordered.encode()),
+            Err(ConsumerOffsetsWireError::DuplicateConsumerId {
                 section: "groups",
                 id: 4,
             })
@@ -400,8 +523,8 @@ mod tests {
         let trailer = state_artifact_checksum(&padded);
         padded.extend_from_slice(&trailer.to_le_bytes());
         assert_eq!(
-            PartitionOffsetsWire::decode(&padded),
-            Err(PartitionOffsetsWireError::Truncated),
+            ConsumerOffsetsWire::decode(&padded),
+            Err(ConsumerOffsetsWireError::Truncated),
             "bytes past the last section must fail closed"
         );
     }
@@ -432,8 +555,9 @@ pub enum SegmentWalkError {
     BaseOffsetMismatch { expected: u64, actual: u64 },
     /// A batch's base offset does not continue the previous batch.
     NonContiguous { expected: u64, actual: u64 },
-    /// Bytes remained after the last whole batch (or a batch overran).
-    TrailingBytes { position: u64 },
+    /// A batch's offset arithmetic overflows `u64`; the operands are
+    /// peer-controlled, so this is a rejection, not a clamp.
+    OffsetOverflow { position: u64 },
     /// The payload holds no batches; empty segments are never offered.
     Empty,
 }
@@ -452,10 +576,10 @@ impl fmt::Display for SegmentWalkError {
                 f,
                 "segment batch starts at offset {actual}, expected {expected}"
             ),
-            Self::TrailingBytes { position } => {
+            Self::OffsetOverflow { position } => {
                 write!(
                     f,
-                    "segment holds trailing bytes past the last batch at {position}"
+                    "segment batch at byte {position} overflows the offset space"
                 )
             }
             Self::Empty => write!(f, "segment payload holds no batches"),
@@ -514,7 +638,16 @@ pub fn walk_segment_payload(
                 source: iggy_common::IggyError::InvalidMessagesCount,
             });
         }
-        let batch_end = header.base_offset + u64::from(header.message_count) - 1;
+        // Peer-controlled operands under a reject-on-first-invalid contract:
+        // checked, not saturating -- a clamp would misdirect the diagnostic.
+        let Some(batch_end) = header
+            .base_offset
+            .checked_add(u64::from(header.message_count) - 1)
+        else {
+            return Err(SegmentWalkError::OffsetOverflow {
+                position: position as u64,
+            });
+        };
         // The append-time canonical stamp, exactly what the flush path writes
         // into index entries and segment bounds; `origin_timestamp` is
         // client-supplied and would give the installed replica a divergent
@@ -538,14 +671,16 @@ pub fn walk_segment_payload(
                 max_timestamp: previous.max_timestamp.max(timestamp),
             },
         ));
-        next_offset = batch_end + 1;
-        let total = header.total_size();
-        if total == 0 || position + total > bytes.len() {
-            return Err(SegmentWalkError::TrailingBytes {
+        next_offset = batch_end
+            .checked_add(1)
+            .ok_or(SegmentWalkError::OffsetOverflow {
                 position: position as u64,
-            });
-        }
-        position += total;
+            })?;
+        // No trailing-bytes guard: the header decode floors `batch_length`
+        // at the 256-byte command header (no zero-step loop is possible)
+        // and `decode_batch_slice` already rejects a body shorter than
+        // `total_size()`.
+        position += header.total_size();
     }
     stats.map_or(Err(SegmentWalkError::Empty), |stats| {
         Ok((stats, index_bytes))
@@ -561,6 +696,14 @@ pub fn walk_segment_payload(
 pub struct SegmentArtifactSource {
     pub entry: consensus::StateArtifact,
     pub log_path: String,
+}
+
+/// One artifact of an offer, addressed by manifest index: segment payloads
+/// live on disk (loaded at chunk-serve time), the offsets table is resident.
+#[derive(Debug)]
+pub enum PartitionArtifactSource<'a> {
+    Segment(&'a SegmentArtifactSource),
+    Offsets(&'a std::rc::Rc<Vec<u8>>),
 }
 
 /// A built partition state-transfer offer: everything at `commit_op`, with
@@ -586,14 +729,23 @@ impl PartitionStateTransferOffer {
         entries
     }
 
+    /// Never zero: the offsets artifact is always present.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub const fn artifact_count(&self) -> usize {
         self.segments.len() + 1
     }
 
+    /// The artifact at `index` in [`Self::manifest`] order (segments
+    /// ascending, offsets last) without materialising the manifest vec.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        false
+    pub fn artifact_at(&self, index: usize) -> Option<PartitionArtifactSource<'_>> {
+        match index.cmp(&self.segments.len()) {
+            std::cmp::Ordering::Less => {
+                Some(PartitionArtifactSource::Segment(&self.segments[index]))
+            }
+            std::cmp::Ordering::Equal => Some(PartitionArtifactSource::Offsets(&self.offsets.1)),
+            std::cmp::Ordering::Greater => None,
+        }
     }
 
     #[must_use]
@@ -649,7 +801,12 @@ impl std::error::Error for PartitionTransferUnavailable {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionInstallOutcome {
     pub applied_frontier: u64,
-    pub offsets_durable: bool,
+    /// Every transferred offset file was WRITTEN (and the offset
+    /// directories fsynced, so the old files' unlinks stick). Not a
+    /// durability claim for the file contents: `persist_offset` fsyncs only
+    /// under `consumer_offset_enforce_fsync`, matching the normal
+    /// offset-commit path -- shipped default off.
+    pub offsets_written: bool,
 }
 
 /// Failure installing a transferred partition state. Every `check`-phase
@@ -663,7 +820,7 @@ pub enum PartitionInstallError {
         commit_op: u64,
         commit_min: u64,
     },
-    Offsets(PartitionOffsetsWireError),
+    Offsets(ConsumerOffsetsWireError),
     /// Duplicate base offset in the staged set.
     DuplicateSegment {
         start_offset: u64,
@@ -686,6 +843,14 @@ pub enum PartitionInstallError {
     /// state, a restart boot-recovers it.
     SegmentOpen {
         path: String,
+        source: iggy_common::IggyError,
+    },
+    /// The post-failure convergence itself failed: the partition holds no
+    /// serviceable segment chain and every append or poll would panic. The
+    /// caller must fence this one partition (tear it down for the
+    /// reconciler to rebuild from disk) instead of leaving a live handle
+    /// whose first use kills the whole shard.
+    ConvergeFailed {
         source: iggy_common::IggyError,
     },
 }
@@ -716,14 +881,18 @@ impl fmt::Display for PartitionInstallError {
             Self::SegmentOpen { path, source } => {
                 write!(f, "re-opening installed segment {path} failed: {source}")
             }
+            Self::ConvergeFailed { source } => write!(
+                f,
+                "post-failure convergence failed, the partition must be fenced: {source}"
+            ),
         }
     }
 }
 
 impl std::error::Error for PartitionInstallError {}
 
-impl From<PartitionOffsetsWireError> for PartitionInstallError {
-    fn from(source: PartitionOffsetsWireError) -> Self {
+impl From<ConsumerOffsetsWireError> for PartitionInstallError {
+    fn from(source: ConsumerOffsetsWireError) -> Self {
         Self::Offsets(source)
     }
 }
@@ -760,10 +929,13 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
 }
 
 /// fsync the partition directory so a rename made durable stays durable.
-/// Blocking std io: this runs on rare paths (spill completion, install swap)
-/// where two fsyncs already dominate.
-fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
-    std::fs::File::open(partition_dir)?.sync_all()
+/// Async so the wait parks the task instead of the whole shard reactor;
+/// every other future on the pump keeps running through it.
+async fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
+    compio::fs::File::open(partition_dir)
+        .await?
+        .sync_all()
+        .await
 }
 
 impl<B, SB> IggyPartition<B, SB>
@@ -828,32 +1000,24 @@ where
             };
             // Checksum pass over exactly `segment.size` bytes: the file can
             // be LONGER after a failed-index-save rewind, and the size
-            // counter is what readers bound by. Bytes are dropped right
-            // after hashing; only the manifest entry is retained.
-            let bytes = compio::fs::read(&log_path).await.map_err(|source| {
-                PartitionTransferUnavailable::SegmentUnreadable {
+            // counter is what readers bound by. Chunked, with an await per
+            // chunk: this runs on the pump task, and a whole-file read +
+            // hash of a large segment would stall every consensus tick on
+            // this core long enough to trip view-change timers. Resident
+            // footprint is one chunk; only the manifest entry is retained.
+            let checksum = hash_segment_prefix(&log_path, size)
+                .await
+                .map_err(|source| PartitionTransferUnavailable::SegmentUnreadable {
                     start_offset: segment.start_offset,
                     source,
-                }
-            })?;
-            if (bytes.len() as u64) < size {
-                return Err(PartitionTransferUnavailable::SegmentUnreadable {
-                    start_offset: segment.start_offset,
-                    source: std::io::Error::other(format!(
-                        "file holds {} bytes, segment accounts {size}",
-                        bytes.len()
-                    )),
-                });
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let payload = &bytes[..size as usize];
-            let entry = consensus::StateArtifact::for_bytes(
-                artifact_kind::SEGMENT_LOG,
-                segment.start_offset,
-                payload,
-            );
+                })?;
             segments.push(SegmentArtifactSource {
-                entry,
+                entry: consensus::StateArtifact {
+                    kind: artifact_kind::SEGMENT_LOG,
+                    frontier: segment.start_offset,
+                    len: size,
+                    checksum,
+                },
                 log_path: log_path.clone(),
             });
         }
@@ -885,15 +1049,18 @@ where
     /// state; that is safe because their covering ops sit in
     /// `(commit_op, commit_max]`, which the receiver's tail repair replays,
     /// and offset applies converge (monotone auto-commit, verbatim stores).
-    fn offsets_wire_snapshot(&self) -> PartitionOffsetsWire {
+    fn offsets_wire_snapshot(&self) -> ConsumerOffsetsWire {
+        // Every key is minted from a u32 wire id, so the narrowing filter is
+        // an invariant, not a policy: say so out loud instead of silently
+        // shrinking the snapshot when it ever breaks.
         let mut consumers: Vec<(u32, u64)> = self
             .consumer_offsets
             .pin()
             .iter()
             .filter_map(|(id, offset)| {
-                u32::try_from(*id)
-                    .ok()
-                    .map(|id| (id, offset.offset.load(Ordering::Acquire)))
+                let narrowed = u32::try_from(*id).ok();
+                debug_assert!(narrowed.is_some(), "consumer offset key {id} exceeds u32");
+                narrowed.map(|id| (id, offset.offset.load(Ordering::Acquire)))
             })
             .collect();
         consumers.sort_unstable_by_key(|(id, _)| *id);
@@ -902,14 +1069,27 @@ where
             .pin()
             .iter()
             .filter_map(|(id, offset)| {
-                u32::try_from(id.0)
-                    .ok()
-                    .map(|id| (id, offset.offset.load(Ordering::Acquire)))
+                let narrowed = u32::try_from(id.0).ok();
+                debug_assert!(
+                    narrowed.is_some(),
+                    "consumer group offset key {} exceeds u32",
+                    id.0
+                );
+                narrowed.map(|id| (id, offset.offset.load(Ordering::Acquire)))
             })
             .collect();
         groups.sort_unstable_by_key(|(id, _)| *id);
-        PartitionOffsetsWire {
+        // The append counter, not the segment end: retention can GC every
+        // sealed segment while the counter stands at N, and the receiver
+        // must resume minting at N either way.
+        let next_offset = if self.should_increment_offset {
+            self.offset.load(Ordering::Acquire) + 1
+        } else {
+            0
+        };
+        ConsumerOffsetsWire {
             purge_generation: self.applied_purge_generation,
+            next_offset,
             consumers,
             groups,
         }
@@ -926,31 +1106,86 @@ where
     pub async fn spill_transfer_segment(
         &self,
         entry: &consensus::StateArtifact,
-        bytes: &[u8],
-    ) -> Result<StagedSegmentMeta, String> {
+        bytes: Vec<u8>,
+    ) -> Result<StagedSegmentMeta, SpillError> {
         let Some(partition_dir) = self.partition_dir.clone() else {
-            return Err("partition has no on-disk directory".into());
+            return Err(SpillError::NoPartitionDir);
         };
         // Artifact-level integrity FIRST, exactly as the metadata plane
         // verifies every artifact before decoding: the walk's per-batch
         // checksums prove batch bodies, not that these are the bytes the
         // manifest promised (length alone is implied by completion).
-        if !consensus::verify_state_artifact(entry, bytes) {
-            return Err(format!(
-                "segment artifact at base offset {} fails its manifest checksum",
-                entry.frontier
-            ));
+        if !consensus::verify_state_artifact(entry, &bytes) {
+            return Err(SpillError::ManifestChecksum {
+                frontier: entry.frontier,
+            });
         }
         let (stats, index_bytes) =
-            walk_segment_payload(entry.frontier, bytes).map_err(|error| error.to_string())?;
+            walk_segment_payload(entry.frontier, &bytes).map_err(SpillError::Walk)?;
         let (log_staging, index_staging) = staging_paths(&partition_dir, entry.frontier);
-        for (path, payload) in [(&log_staging, bytes), (&index_staging, &index_bytes[..])] {
-            write_staging_file(path, payload)
-                .await
-                .map_err(|source| format!("staging io failed at {}: {source}", path.display()))?;
-        }
+        // Two writes, not a loop: each moves its buffer into compio's
+        // owned-buffer API, so a segment-sized payload is never copied.
+        write_staging_file(&log_staging, bytes)
+            .await
+            .map_err(|source| SpillError::StagingIo {
+                path: log_staging.clone(),
+                source,
+            })?;
+        write_staging_file(&index_staging, index_bytes)
+            .await
+            .map_err(|source| SpillError::StagingIo {
+                path: index_staging.clone(),
+                source,
+            })?;
         fsync_dir(&partition_dir)
-            .map_err(|source| format!("staging dir fsync failed: {source}"))?;
+            .await
+            .map_err(|source| SpillError::StagingIo {
+                path: PathBuf::from(&partition_dir),
+                source,
+            })?;
+        Ok(StagedSegmentMeta {
+            start_offset: entry.frontier,
+            end_offset: stats.end_offset,
+            size: entry.len,
+            start_timestamp: stats.start_timestamp,
+            end_timestamp: stats.end_timestamp,
+            max_timestamp: stats.max_timestamp,
+            log_staging,
+            index_staging,
+        })
+    }
+
+    /// Adopt an already-verified staged log without rewriting it: walk the
+    /// payload once (validation + a rebuilt sparse index), write only the
+    /// index sidecar, and return the walk metadata. The reuse scan calls
+    /// this after `verify_state_artifact` proved the bytes match the
+    /// manifest; rewriting the byte-identical log (and re-verifying a third
+    /// time) is exactly the work reuse exists to skip. The index write
+    /// stays: the scan never checks `.index.staging`, and a missing sidecar
+    /// would hand the install a missing rename source.
+    async fn adopt_staged_segment(
+        &self,
+        entry: &consensus::StateArtifact,
+        bytes: &[u8],
+    ) -> Result<StagedSegmentMeta, SpillError> {
+        let Some(partition_dir) = self.partition_dir.clone() else {
+            return Err(SpillError::NoPartitionDir);
+        };
+        let (stats, index_bytes) =
+            walk_segment_payload(entry.frontier, bytes).map_err(SpillError::Walk)?;
+        let (log_staging, index_staging) = staging_paths(&partition_dir, entry.frontier);
+        write_staging_file(&index_staging, index_bytes)
+            .await
+            .map_err(|source| SpillError::StagingIo {
+                path: index_staging.clone(),
+                source,
+            })?;
+        fsync_dir(&partition_dir)
+            .await
+            .map_err(|source| SpillError::StagingIo {
+                path: PathBuf::from(&partition_dir),
+                source,
+            })?;
         Ok(StagedSegmentMeta {
             start_offset: entry.frontier,
             end_offset: stats.end_offset,
@@ -989,7 +1224,7 @@ where
             if !consensus::verify_state_artifact(entry, &bytes) {
                 continue;
             }
-            if let Ok(meta) = self.spill_transfer_segment(entry, &bytes).await {
+            if let Ok(meta) = self.adopt_staged_segment(entry, &bytes).await {
                 matched_paths.push(meta.log_staging.clone());
                 matched_paths.push(meta.index_staging.clone());
                 #[allow(clippy::cast_possible_truncation)]
@@ -1045,7 +1280,7 @@ where
                 commit_min,
             });
         }
-        let offsets_wire = PartitionOffsetsWire::decode(offsets_bytes)?;
+        let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
         staged.sort_unstable_by_key(|meta| meta.start_offset);
         for pair in staged.windows(2) {
             if pair[1].start_offset == pair[0].start_offset {
@@ -1062,36 +1297,46 @@ where
         }
 
         // ---- mutate phase ----
+        // The write lock spans the convergence too: a mutate failure leaves
+        // the segment vectors drained, and a concurrent replicated append
+        // indexing `segments().len() - 1` on the emptied vec is exactly the
+        // race every other segment-vec mutator takes this lock against.
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
         let outcome = self
             .apply_checked_install(config, commit_op, staged, &offsets_wire, &partition_dir)
             .await;
         if outcome.is_err() {
             // A mutate-phase failure can leave the log drained or half
-            // rebuilt while the disk already holds a contiguous prefix of
-            // the new chain. Converge the LIVE state to what a crash-restart
-            // would recover -- an empty, honestly-lagging partition -- so
-            // the next flush or poll cannot hit an empty segment vec, and
-            // the normal triggers re-transfer the rest.
-            self.converge_to_empty_after_failed_install(config).await;
+            // rebuilt while the disk already holds any prefix of the new
+            // chain. Converge BOTH the live state and the disk to an empty,
+            // honestly-lagging partition, so the next flush or poll cannot
+            // hit an empty segment vec and no stray chain can resurrect at
+            // boot; the normal triggers re-transfer the rest. The offset
+            // counter still seeds from the artifact frontier: a replica
+            // that resumed minting at 0 would fork its batch stamps from
+            // the group. A convergence failure outranks the install error:
+            // the partition cannot serve and the caller must fence it.
+            self.converge_to_empty_after_failed_install(config, offsets_wire.next_offset)
+                .await
+                .map_err(|source| PartitionInstallError::ConvergeFailed { source })?;
         }
         outcome
     }
 
     /// The install's mutate phase; every early return is a failure the
     /// caller converges from. Split out so the convergence handling cannot
-    /// be forgotten on a new error path.
+    /// be forgotten on a new error path. Runs under the caller's write-lock
+    /// guard.
     #[allow(clippy::too_many_lines)]
     async fn apply_checked_install(
         &mut self,
         config: &PartitionsConfig,
         commit_op: u64,
         staged: Vec<StagedSegmentMeta>,
-        offsets_wire: &PartitionOffsetsWire,
+        offsets_wire: &ConsumerOffsetsWire,
         partition_dir: &str,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
-        let write_lock = self.write_lock.clone();
-        let _guard = write_lock.lock().await;
-
         // Sweep staging strays a dead earlier attempt left behind, keeping
         // only what THIS install is about to rename. Bounded disk hygiene;
         // the reuse-scan sweeps too, but an abandoned-to-repair transfer
@@ -1129,39 +1374,68 @@ where
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
+                        // Propagated, not shrugged off: a surviving old
+                        // `.log` outside the staged set resurrects at boot
+                        // (recovery takes every `.log` stem), and can push
+                        // the recovered chain past the installed one. The
+                        // converge path re-sweeps the directory.
                         warn_unlink(namespace_raw, &path, &error);
+                        return Err(PartitionInstallError::SwapIo {
+                            path,
+                            source: error,
+                        });
                     }
                 }
             }
         }
-        fsync_dir(partition_dir).map_err(|source| PartitionInstallError::SwapIo {
-            path: partition_dir.to_owned(),
-            source,
-        })?;
+        fsync_dir(partition_dir)
+            .await
+            .map_err(|source| PartitionInstallError::SwapIo {
+                path: partition_dir.to_owned(),
+                source,
+            })?;
 
-        // Rename staged -> final, ascending, with a directory fsync per
-        // file: a crash mid-loop leaves a strict PREFIX of the new chain
-        // visible, which boots as a shorter contiguous partition and
-        // re-triggers transfer for the rest. INDEX FIRST within each pair:
-        // boot recovery derives segment bounds from the index and treats a
-        // `.log` without its `.index` as fatal, while an orphaned `.index`
-        // is invisible (recovery keys on `.log` stems). Each segment's log
-        // rename is therefore its commit point.
+        // Rename staged -> final: ALL indexes first, one directory fsync,
+        // then each log rename with its own fsync (N+1 total, down from 2N).
+        // Every index is durable before any log rename is issued -- strictly
+        // stronger than index_i-before-log_i -- because boot recovery
+        // derives segment bounds from the index and treats a `.log` without
+        // its `.index` as fatal, while an orphaned `.index` is invisible
+        // (recovery keys on `.log` stems). Each log rename remains its
+        // segment's commit point, and a crash mid-loop leaves a strict
+        // PREFIX of the new chain visible, which boots as a shorter
+        // contiguous partition and re-triggers transfer for the rest. Not
+        // fewer fsyncs than this: one-per-pair would lean on intra-directory
+        // rename ordering POSIX does not grant.
         for meta in &staged {
-            let (log_final, index_final) = final_paths(partition_dir, meta.start_offset);
-            for (from, to) in [
-                (&meta.index_staging, &index_final),
-                (&meta.log_staging, &log_final),
-            ] {
-                std::fs::rename(from, to).map_err(|source| PartitionInstallError::SwapIo {
-                    path: to.clone(),
+            let (_, index_final) = final_paths(partition_dir, meta.start_offset);
+            compio::fs::rename(&meta.index_staging, &index_final)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: index_final.clone(),
                     source,
                 })?;
-                fsync_dir(partition_dir).map_err(|source| PartitionInstallError::SwapIo {
+        }
+        fsync_dir(partition_dir)
+            .await
+            .map_err(|source| PartitionInstallError::SwapIo {
+                path: partition_dir.to_owned(),
+                source,
+            })?;
+        for meta in &staged {
+            let (log_final, _) = final_paths(partition_dir, meta.start_offset);
+            compio::fs::rename(&meta.log_staging, &log_final)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: log_final.clone(),
+                    source,
+                })?;
+            fsync_dir(partition_dir)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
                     path: partition_dir.to_owned(),
                     source,
                 })?;
-            }
         }
 
         // Rebuild the in-memory log over the installed files: sealed
@@ -1170,7 +1444,9 @@ where
         // hydrate pattern; earlier segments are sealed and never written).
         for meta in &staged {
             let (log_final, index_final) = final_paths(partition_dir, meta.start_offset);
-            let index_len = std::fs::metadata(&index_final).map_or(0, |metadata| metadata.len());
+            let index_len = compio::fs::metadata(&index_final)
+                .await
+                .map_or(0, |metadata| metadata.len());
             let storage = SegmentStorage::new(
                 &log_final,
                 &index_final,
@@ -1196,12 +1472,12 @@ where
             self.log.add_persisted_segment(segment, storage, None, None);
         }
         if staged.is_empty() {
-            // Plan-approved v1 shape: an empty offered set (everything GC'd
-            // behind the consumer barrier on the sender) installs a fresh
-            // segment at offset 0; post-install traffic then lands at high
-            // offsets inside `00000000...0.log`. The follow-on stats/name
-            // skew is a recorded limitation.
-            self.install_empty_segment(config, 0)
+            // An empty offered set (everything GC'd behind the consumer
+            // barrier on the sender) installs a fresh segment at the
+            // artifact's frontier, exactly where rotation would have put
+            // it, so post-install traffic lands in a segment named for the
+            // offsets it holds.
+            self.install_empty_segment(config, offsets_wire.next_offset)
                 .await
                 .map_err(|source| PartitionInstallError::SegmentOpen {
                     path: partition_dir.to_owned(),
@@ -1258,15 +1534,18 @@ where
         // transferred entries with locally minted paths, clamped to the
         // installed end like boot recovery clamps.
         let installed_end = staged.last().map(|meta| meta.end_offset);
-        let mut offsets_durable = true;
+        let mut offsets_written = true;
+        // A key that fails the u32 narrowing would strand its old offset
+        // file's delete, which boot can then resurrect: unreachable while
+        // keys are minted from u32 wire ids, so assert it.
         let old_consumer_paths: Vec<String> = {
             let guard = self.consumer_offsets.pin();
             let paths = guard
                 .iter()
                 .filter_map(|(key, _)| {
-                    u32::try_from(*key)
-                        .ok()
-                        .and_then(|id| self.persisted_offset_path(ConsumerKind::Consumer, id))
+                    let narrowed = u32::try_from(*key).ok();
+                    debug_assert!(narrowed.is_some(), "consumer offset key {key} exceeds u32");
+                    narrowed.and_then(|id| self.persisted_offset_path(ConsumerKind::Consumer, id))
                 })
                 .collect();
             guard.clear();
@@ -1277,8 +1556,13 @@ where
             let paths = guard
                 .iter()
                 .filter_map(|(key, _)| {
-                    u32::try_from(key.0)
-                        .ok()
+                    let narrowed = u32::try_from(key.0).ok();
+                    debug_assert!(
+                        narrowed.is_some(),
+                        "consumer group offset key {} exceeds u32",
+                        key.0
+                    );
+                    narrowed
                         .and_then(|id| self.persisted_offset_path(ConsumerKind::ConsumerGroup, id))
                 })
                 .collect();
@@ -1297,7 +1581,7 @@ where
             // Nothing to write the transferred table into: unreachable via
             // the server boot paths (they always configure storage), but if
             // it ever fires the table was dropped and the flag must say so.
-            offsets_durable = false;
+            offsets_written = false;
         }
         if let Some(dir) = self.consumer_offsets_path.clone() {
             for (id, offset) in &offsets_wire.consumers {
@@ -1314,7 +1598,7 @@ where
                         .borrow_mut()
                         .insert((ConsumerKind::Consumer, *id), value);
                 } else {
-                    offsets_durable = false;
+                    offsets_written = false;
                 }
             }
         }
@@ -1334,19 +1618,42 @@ where
                         .borrow_mut()
                         .insert((ConsumerKind::ConsumerGroup, *id), value);
                 } else {
-                    offsets_durable = false;
+                    offsets_written = false;
                 }
             }
         }
+        // Directory fsync so the OLD files' unlinks stick: without it a
+        // crash right after install resurrects the pre-transfer offset
+        // files at boot. The per-file content durability stays governed by
+        // `consumer_offset_enforce_fsync` like every other offset commit.
+        for dir in self
+            .consumer_offsets_path
+            .clone()
+            .into_iter()
+            .chain(self.consumer_group_offsets_path.clone())
+        {
+            if fsync_dir(&dir).await.is_err() {
+                offsets_written = false;
+            }
+        }
 
-        // Counters and stats, exactly as after a boot over these files. The
-        // stats mutate through the EXISTING Arc: partition counters are
-        // never snapshotted, and the data plane's registered handle must
-        // keep reading the same cells.
-        let end = installed_end.unwrap_or(0);
+        // Counters and stats. The offset counter seeds from the ARTIFACT's
+        // frontier, not the installed segments: base offsets are minted
+        // locally per replica, so a counter behind the group (all sealed
+        // segments GC'd at the origin, empty active one skipped) would stamp
+        // the next replicated batch differently from the primary -- same op,
+        // different persisted bytes, different checksum. Segments can only
+        // trail the artifact (both were built at `commit_op`), so take the
+        // max defensively. The stats mutate through the EXISTING Arc:
+        // partition counters are never snapshotted, and the data plane's
+        // registered handle must keep reading the same cells.
+        let next_offset = offsets_wire
+            .next_offset
+            .max(installed_end.map_or(0, |end| end + 1));
+        let end = next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
-        self.should_increment_offset = installed_end.is_some();
+        self.should_increment_offset = next_offset > 0;
         self.recovered_durable_offset = installed_end;
         self.stats.zero_out_all();
         #[allow(clippy::cast_possible_truncation)]
@@ -1382,7 +1689,7 @@ where
 
         Ok(PartitionInstallOutcome {
             applied_frontier: commit_op,
-            offsets_durable,
+            offsets_written,
         })
     }
 }
@@ -1393,17 +1700,25 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    /// Converge the live partition to the empty, honestly-lagging shape a
-    /// crash-restart would recover after a failed install: no segments from
-    /// the old chain (their files may already be gone), a fresh empty
-    /// segment with real writers, an empty journal, and boot-equivalent
-    /// counters. Consensus state (commit floor, view) is left alone; the
-    /// replica is simply behind, and the normal triggers re-transfer.
+    /// Converge the live partition AND its directory to an empty,
+    /// honestly-lagging shape after a failed install: no segment files at
+    /// all (the failure can land anywhere from "old chain unlinked" to
+    /// "new chain fully renamed in", and any survivor would either be
+    /// truncated in place by the empty plant or resurrect at boot in front
+    /// of / behind a later install), a fresh empty segment at the group's
+    /// offset frontier, an empty journal, and boot-equivalent counters.
+    /// Consensus state (commit floor, view) is left alone; the replica is
+    /// simply behind, and the normal triggers re-transfer.
     ///
-    /// Failing to even plant the empty segment leaves a partition every
-    /// flush would panic on; that is the local-divergence shape, and it
-    /// fails fast exactly like the commit path's apply failure does.
-    async fn converge_to_empty_after_failed_install(&mut self, config: &PartitionsConfig) {
+    /// # Errors
+    /// [`iggy_common::IggyError`] when the sweep or the empty plant fails;
+    /// the partition then has no serviceable chain and the caller must
+    /// fence it (see [`PartitionInstallError::ConvergeFailed`]).
+    async fn converge_to_empty_after_failed_install(
+        &mut self,
+        config: &PartitionsConfig,
+        minted_next_offset: u64,
+    ) -> Result<(), iggy_common::IggyError> {
         let segment_count = self.log.segments().len();
         for _ in 0..segment_count {
             self.log.segments_mut().remove(0);
@@ -1415,25 +1730,142 @@ where
         }
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
-        self.install_empty_segment(config, 0).await.expect(
-            "planting an empty segment after a failed install must succeed; \
-                     a partition without an active segment panics on first use",
-        );
-        self.offset.store(0, Ordering::Release);
-        self.dirty_offset.store(0, Ordering::Relaxed);
-        self.should_increment_offset = false;
+
+        // Sweep EVERY segment file, not the in-memory count's worth: after
+        // a late failure the renamed-in new chain is on disk while the
+        // in-memory vectors were already drained, so only the directory
+        // itself knows what needs unlinking.
+        if let Some(partition_dir) = self.partition_dir.clone() {
+            let swept: Vec<PathBuf> = match std::fs::read_dir(&partition_dir) {
+                Ok(entries) => entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.to_str().is_some_and(|path| {
+                            [".log", ".index", ".staging"]
+                                .iter()
+                                .any(|extension| path.ends_with(extension))
+                        })
+                    })
+                    .collect(),
+                Err(error) => {
+                    tracing::error!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.consensus().namespace(),
+                        partition_dir,
+                        %error,
+                        "converge sweep cannot list the partition directory"
+                    );
+                    return Err(iggy_common::IggyError::CannotReadPartitions);
+                }
+            };
+            for path in swept {
+                match compio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn_unlink(
+                            self.consensus().namespace(),
+                            &path.display().to_string(),
+                            &error,
+                        );
+                        return Err(iggy_common::IggyError::CannotDeleteFile);
+                    }
+                }
+            }
+            fsync_dir(&partition_dir)
+                .await
+                .map_err(|_| iggy_common::IggyError::CannotSyncFile)?;
+        }
+
+        self.install_empty_segment(config, minted_next_offset)
+            .await?;
+        // Empty data, but NOT offset zero: the artifact already proved the
+        // group's frontier, and a counter reset would stamp the next
+        // replicated batch differently from the primary. Only the durable
+        // claim goes back to None; the partition is honestly lagging.
+        let end = minted_next_offset.saturating_sub(1);
+        self.offset.store(end, Ordering::Release);
+        self.dirty_offset.store(end, Ordering::Relaxed);
+        self.should_increment_offset = minted_next_offset > 0;
         self.recovered_durable_offset = None;
         self.stats.zero_out_all();
         self.stats.increment_segments_count(1);
         self.repair = None;
         self.transfer_offer_cache.borrow_mut().take();
+        Ok(())
     }
 }
 
-async fn write_staging_file(path: &PathBuf, payload: &[u8]) -> std::io::Result<()> {
+/// Failure validating or staging one transferred segment artifact.
+#[derive(Debug)]
+pub enum SpillError {
+    NoPartitionDir,
+    /// The received bytes are not what the manifest promised.
+    ManifestChecksum {
+        frontier: u64,
+    },
+    /// The payload failed its format validation walk.
+    Walk(SegmentWalkError),
+    /// Writing or syncing a staging file failed.
+    StagingIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for SpillError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPartitionDir => write!(f, "partition has no on-disk directory"),
+            Self::ManifestChecksum { frontier } => write!(
+                f,
+                "segment artifact at base offset {frontier} fails its manifest checksum"
+            ),
+            Self::Walk(source) => write!(f, "{source}"),
+            Self::StagingIo { path, source } => {
+                write!(f, "staging io failed at {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpillError {}
+
+/// Chunk size for the offer build's streaming checksum pass. Large enough
+/// that per-chunk overhead is noise, small enough that the pump yields to
+/// the reactor many times per segment.
+const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
+
+/// `XxHash3_64` over the first `len` bytes of `path`, read in
+/// [`OFFER_HASH_CHUNK_LEN`] chunks with one reactor yield per chunk. Errors
+/// on a file shorter than `len`: the segment accounts bytes the disk does
+/// not hold.
+async fn hash_segment_prefix(path: &str, len: u64) -> std::io::Result<u64> {
+    use compio::io::AsyncReadAtExt;
+    let file = compio::fs::File::open(path).await?;
+    let mut hasher = consensus::state_manifest::StateArtifactHasher::new();
+    let mut position = 0u64;
+    while position < len {
+        #[allow(clippy::cast_possible_truncation)]
+        let want = OFFER_HASH_CHUNK_LEN.min((len - position) as usize);
+        let compio::BufResult(read, buf) = file.read_exact_at(vec![0u8; want], position).await;
+        read.map_err(|_| {
+            std::io::Error::other(format!(
+                "file ends at {position}+, segment accounts {len} bytes"
+            ))
+        })?;
+        hasher.update(&buf);
+        position += want as u64;
+    }
+    Ok(hasher.finish())
+}
+
+async fn write_staging_file(path: &PathBuf, payload: Vec<u8>) -> std::io::Result<()> {
     use compio::io::AsyncWriteAtExt;
     let mut file = compio::fs::File::create(path).await?;
-    let (result, _) = file.write_all_at(payload.to_vec(), 0).await.into();
+    let (result, _) = file.write_all_at(payload, 0).await.into();
     result?;
     file.sync_data().await?;
     Ok(())

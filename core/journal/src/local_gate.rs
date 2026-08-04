@@ -46,6 +46,10 @@ impl LocalGate {
         }
     }
 
+    // A manual `Future` impl does not inherit the async-fn unused lint, so
+    // without these `gate.acquire();` and `gate.acquire().await;` both
+    // compile clean as no-op exclusion (the guard drops at the semicolon).
+    #[must_use = "acquire does nothing until awaited"]
     pub const fn acquire(&self) -> LocalGateAcquire<'_> {
         LocalGateAcquire { gate: self }
     }
@@ -57,6 +61,7 @@ impl Default for LocalGate {
     }
 }
 
+#[must_use = "the acquire future must be awaited to take the gate"]
 pub struct LocalGateAcquire<'a> {
     gate: &'a LocalGate,
 }
@@ -80,6 +85,7 @@ impl<'a> std::future::Future for LocalGateAcquire<'a> {
     }
 }
 
+#[must_use = "dropping the guard immediately releases the gate"]
 pub struct LocalGateGuard<'a> {
     gate: &'a LocalGate,
 }

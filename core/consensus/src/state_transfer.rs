@@ -63,22 +63,53 @@ impl ArtifactProgress {
     }
 }
 
+/// What [`next_pending_chunk`] and [`append_chunk`] need from one slot.
+///
+/// Exists so a plane can track completion in richer shapes -- the
+/// partition receiver spills finished segments to disk and replaces the
+/// buffer with staged metadata -- while both planes share one chunk cursor:
+/// a spilled artifact simply reports itself complete and is skipped.
+pub trait ChunkProgress {
+    fn declared_len(&self) -> u64;
+    fn received_len(&self) -> u64;
+    /// Only called after the cursor checks `received + payload <= declared`,
+    /// so an impl whose slot cannot grow (already complete) never sees it.
+    fn extend_from_chunk(&mut self, payload: &[u8]);
+    fn complete(&self) -> bool {
+        self.received_len() == self.declared_len()
+    }
+}
+
+impl ChunkProgress for ArtifactProgress {
+    fn declared_len(&self) -> u64 {
+        self.entry.len
+    }
+
+    fn received_len(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
+    fn extend_from_chunk(&mut self, payload: &[u8]) {
+        self.buf.extend_from_slice(payload);
+    }
+}
+
 /// Next `(artifact index, offset, len)` to request.
 ///
 /// The first incomplete artifact in manifest order, asked from its current
 /// frontier, clamped to `chunk_len_max`. `None` when every artifact is complete (or the manifest
 /// is empty).
 #[must_use]
-pub fn next_pending_chunk(
-    artifacts: &[ArtifactProgress],
+pub fn next_pending_chunk<T: ChunkProgress>(
+    artifacts: &[T],
     chunk_len_max: u64,
 ) -> Option<(u32, u64, u32)> {
     let (index, artifact) = artifacts
         .iter()
         .enumerate()
         .find(|(_, artifact)| !artifact.complete())?;
-    let offset = artifact.buf.len() as u64;
-    let remaining = artifact.entry.len - offset;
+    let offset = artifact.received_len();
+    let remaining = artifact.declared_len() - offset;
     #[allow(clippy::cast_possible_truncation)]
     let len = remaining.min(chunk_len_max) as u32;
     #[allow(clippy::cast_possible_truncation)]
@@ -99,8 +130,8 @@ pub fn next_pending_chunk(
 /// these now; the guard stays because a peer running an older build still
 /// can.
 #[must_use]
-pub fn append_chunk(
-    artifacts: &mut [ArtifactProgress],
+pub fn append_chunk<T: ChunkProgress>(
+    artifacts: &mut [T],
     artifact_index: u32,
     offset: u64,
     payload: &[u8],
@@ -108,13 +139,13 @@ pub fn append_chunk(
     let Some(artifact) = artifacts.get_mut(artifact_index as usize) else {
         return false;
     };
-    if offset != artifact.buf.len() as u64 {
+    if offset != artifact.received_len() {
         return false;
     }
-    if artifact.buf.len() as u64 + payload.len() as u64 > artifact.entry.len {
+    if artifact.received_len() + payload.len() as u64 > artifact.declared_len() {
         tracing::warn!(
             artifact = artifact_index,
-            declared_len = artifact.entry.len,
+            declared_len = artifact.declared_len(),
             "state chunk overruns the declared artifact length; dropping frame"
         );
         return false;
@@ -122,7 +153,7 @@ pub fn append_chunk(
     if payload.is_empty() {
         return false;
     }
-    artifact.buf.extend_from_slice(payload);
+    artifact.extend_from_chunk(payload);
     true
 }
 
@@ -172,7 +203,7 @@ mod tests {
 
     #[test]
     fn given_complete_or_empty_manifest_when_next_chunk_requested_should_yield_none() {
-        assert_eq!(next_pending_chunk(&[], 64), None);
+        assert_eq!(next_pending_chunk::<ArtifactProgress>(&[], 64), None);
         let mut artifacts = vec![progress(0, 2)];
         artifacts[0].buf = vec![0; 2];
         assert_eq!(next_pending_chunk(&artifacts, 64), None);

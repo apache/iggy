@@ -47,11 +47,24 @@ const PARTITION_ID: u32 = 0;
 const MESSAGES_COUNT: u32 = 200;
 const STORED_CONSUMER_OFFSET: u64 = 17;
 
+/// Dead-peer spec sizing: enough 256 KiB payloads (64 MiB total) that the
+/// transfer spans hundreds of 256 KiB chunk round-trips, keeping the pull
+/// in flight long enough for a marker-gated kill to land mid-transfer (a
+/// 16 MiB pull completed in ~120ms on a release build, inside one marker
+/// poll). Also enough commits (> ring capacity 64) that the fresh
+/// rejoiner's floor refuses.
+const BULKY_MESSAGES_COUNT: u32 = 256;
+const BULKY_PAYLOAD_LEN: usize = 256 * 1024;
+/// Poll for the kill gate: the serving marker appears at descriptor-serve
+/// time and the kill must land within the pull, so the ordinary 200ms
+/// cadence is too coarse here.
+const KILL_GATE_POLL: Duration = Duration::from_millis(10);
+
 const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting to state transfer";
 const INSTALL_MARKER: &str = "partition state transfer installed";
 const SERVING_MARKER: &str = "serving partition state transfer";
 const ABANDON_MARKER: &str =
-    "partition state transfer stalled past its retry budget; abandoning and falling back";
+    "partition state transfer stalled past its retry budget; abandoning with a backed-off re-arm";
 
 /// Transfer end-to-end: adoption, repair round-trip, conversion, chunk pull,
 /// install, tail repair. CI runners are slow; bound without hanging the suite.
@@ -205,29 +218,43 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
     harness: &mut TestHarness,
 ) {
     let client = connect(harness, 0).await;
-    seed_partition(&client).await;
+    seed_topic(&client).await;
+    // Bulky payloads so the pull spans many 256 KiB chunks: the kill below
+    // must land while the transfer is provably in flight, and a small
+    // partition finishes inside the marker-poll latency, leaving the
+    // abandon path untested.
+    produce_bulky(&client, BULKY_MESSAGES_COUNT, BULKY_PAYLOAD_LEN).await;
     sleep(Duration::from_secs(1)).await;
     let _seed_client = client;
 
-    // Wipe node 2, wait until its rejoin CONVERTED to a transfer (armed at
-    // the view-0 primary, node 0), then kill that serving peer. Whatever
-    // in-flight phase the kill lands in, node 2 must not retry into the
-    // corpse forever: the stall budget abandons, the survivors elect past
-    // node 0, and repair -> refusal -> transfer re-runs against the new
-    // primary (node 1).
+    // Wipe node 2, wait until its rejoin CONVERTED to a transfer and the
+    // serving peer (the view-0 primary, node 0) proved it started serving
+    // the pull, then kill that peer mid-pull. Node 2 must not retry into
+    // the corpse forever: the stall budget abandons with a backed-off
+    // re-arm against the next peer, the survivors elect past node 0, and
+    // the transfer re-runs against the new primary (node 1).
     harness
         .restart_node_from_clean_slate(2)
         .expect("clean-slate restart of node 2");
-    await_marker(harness, 2, CONVERSION_MARKER).await;
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    while !harness.node(0).stdout_contains(SERVING_MARKER) {
+        assert!(
+            Instant::now() < deadline,
+            "node 0 never started serving the partition transfer"
+        );
+        sleep(KILL_GATE_POLL).await;
+    }
     harness
         .stop_node(0)
         .expect("stop the serving peer (node 0)");
 
-    // Convergence-only: the install marker within budget. No follow-up
-    // commit is asserted -- the cluster is quorum-marginal with one node
-    // down, and an unanswered read mid-election is not a verdict. The
-    // abandon marker is timing-dependent (the kill can land before the
-    // first chunk or after install) and is logged for diagnosis only.
+    // The abandon is now deterministic: the pull was in flight against a
+    // peer that is gone, so the stall budget must exhaust.
+    await_marker(harness, 2, ABANDON_MARKER).await;
+
+    // Recovery: the scheduled re-arm targets the surviving primary. No
+    // follow-up commit is asserted -- the cluster is quorum-marginal with
+    // one node down, and an unanswered read mid-election is not a verdict.
     let deadline = Instant::now() + TRANSFER_BUDGET;
     loop {
         if harness.node(2).stdout_contains(INSTALL_MARKER) {
@@ -235,9 +262,7 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
         }
         assert!(
             Instant::now() < deadline,
-            "node 2 never installed a partition transfer with node 0 dead \
-             (abandon marker seen: {})",
-            harness.node(2).stdout_contains(ABANDON_MARKER)
+            "node 2 never installed a partition transfer with node 0 dead"
         );
         sleep(MARKER_POLL).await;
     }
@@ -300,6 +325,24 @@ async fn produce(client: &IggyClient, count: u32) {
             )
             .await
             .expect("send message");
+    }
+}
+
+/// Like [`produce`], one commit per send, but with a payload of
+/// `payload_len` filler bytes so the on-disk segment grows fast.
+async fn produce_bulky(client: &IggyClient, count: u32, payload_len: usize) {
+    for sequence in 0..count {
+        let payload = format!("bulky-{sequence}-{}", "x".repeat(payload_len));
+        let mut messages = vec![IggyMessage::from_str(&payload).expect("message")];
+        client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).expect("stream identifier"),
+                &Identifier::named(TOPIC_NAME).expect("topic identifier"),
+                &Partitioning::partition_id(PARTITION_ID),
+                &mut messages,
+            )
+            .await
+            .expect("send bulky message");
     }
 }
 

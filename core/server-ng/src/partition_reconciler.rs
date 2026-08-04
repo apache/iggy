@@ -193,6 +193,11 @@ use tracing::{debug, error, trace, warn};
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
 
+/// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
+/// escalates to an operator-visible error (the backoff is capped, so
+/// retries alone never surface a permanently failing partition).
+const ESCALATE_AFTER_ATTEMPTS: u32 = 10;
+
 /// Doubles per attempt, clamped at `BACKOFF_MAX`.
 fn next_backoff(attempts: u32) -> Duration {
     let shift = attempts.saturating_sub(1).min(6);
@@ -294,6 +299,25 @@ impl ReconcilerCtx {
         });
         entry.attempts = entry.attempts.saturating_add(1);
         entry.next_retry_at = now + next_backoff(entry.attempts);
+        // Operator escalation: persistent on-disk corruption makes every
+        // retry fail identically, and unlike the boot path (which refuses
+        // loudly and fatally), this loop would hide the dead partition
+        // behind per-attempt error logs forever. Escalate once the backoff
+        // has long been at its ceiling, then again each doubling so a log
+        // pipeline cannot miss it.
+        if entry.attempts >= ESCALATE_AFTER_ATTEMPTS
+            && (entry.attempts == ESCALATE_AFTER_ATTEMPTS || entry.attempts.is_power_of_two())
+        {
+            error!(
+                namespace_raw = ns.inner(),
+                ?cause,
+                attempts = entry.attempts,
+                "partition reconciliation keeps failing; retries cannot repair \
+                 persistent on-disk damage -- operator intervention needed \
+                 (inspect the partition directory; moving it aside lets the \
+                 reconciler rebuild the replica from its group)"
+            );
+        }
     }
 
     /// Drop records whose namespace left both target and local sets;

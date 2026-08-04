@@ -94,6 +94,32 @@ pub fn state_artifact_checksum(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Streaming form of [`state_artifact_checksum`].
+///
+/// For payloads too large to hold resident (a serving primary hashing
+/// multi-GiB segment files in chunks between reactor yields). Feeding the
+/// same bytes in any chunking produces the same stamp as the one-shot form.
+#[derive(Default)]
+pub struct StateArtifactHasher {
+    inner: XxHash3_64,
+}
+
+impl StateArtifactHasher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.inner.write(bytes);
+    }
+
+    #[must_use]
+    pub fn finish(&self) -> u64 {
+        self.inner.finish()
+    }
+}
+
 /// Failure decoding an encoded manifest.
 #[derive(Debug)]
 pub enum StateManifestError {

@@ -44,11 +44,14 @@ fn build_server_config(cache_setting: &str) -> TestServerConfig {
     // force every committed batch straight to disk: the restart asserts
     // below need everything durable, and the explicit flush calls are
     // cfg'd out under vsr (`flush_unsaved_buffer` answers
-    // FeatureUnavailable there and is slated for removal).
+    // FeatureUnavailable there and is slated for removal). Legacy keeps its
+    // shipped buffered defaults; the flush loops below are its barrier.
+    #[cfg(feature = "vsr")]
     extra_envs.insert(
         "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
         "1".to_string(),
     );
+    #[cfg(feature = "vsr")]
     extra_envs.insert(
         "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
         "true".to_string(),
