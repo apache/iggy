@@ -195,8 +195,9 @@ async fn handle_messages<T: Source>(
                         continue;
                     }
                 };
-
-                callback(plugin_id, messages.as_ptr(), messages.len());
+                tokio::task::block_in_place(|| {
+                    callback(plugin_id, messages.as_ptr(), messages.len());
+                });
             }
         }
     }
