@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-version: '3.8'
-
 services:
   iggy-server:
     build:
@@ -24,15 +22,22 @@ services:
       dockerfile: core/server/Dockerfile
       args:
         PROFILE: debug
+    command: ["--fresh", "--with-default-root-credentials"]
     container_name: iggy-server-python-test
+    security_opt:
+      - seccomp:unconfined
     networks:
       - python-test-network
     ports:
       - "3000:3000"
       - "8080:8080"
       - "8090:8090"
+    environment:
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:3000/stats" ]
+      test: [ "CMD", "iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
       interval: 5s
       timeout: 5s
       retries: 12
