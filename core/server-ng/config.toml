@@ -739,6 +739,53 @@ ca_file = ""
 # (RFC 1123: ASCII letters, digits, '-' and '.'; no port, no trailing dot).
 # When unset, clients receive 'ip'.
 #
+# When different client networks need different addresses (a public
+# 'advertised_address' would route in-VPC clients out through the public
+# side), add per-network 'advertised_addresses' selectors: clients whose
+# peer IP falls inside 'client_cidr' are handed 'address' instead of the
+# catch-all. 'address' takes the same forms as 'advertised_address'
+# (literal IP or RFC 1123 hostname, never a port - ports always come from
+# 'ports'). At most 16 selectors per node; boot also rejects duplicate
+# 'client_cidr' entries on one node (compared truncated, so '10.0.1.0/16'
+# duplicates '10.0.0.0/16') and any two nodes advertising one host:port
+# to overlapping client sets - reusing a host:port across nodes is legal
+# only when no client would resolve both nodes to it.
+#
+# The longest matching prefix wins; clients matching no selector fall
+# back to 'advertised_address', then 'ip'. Matching is per address
+# family: '0.0.0.0/0' matches no IPv6 client and '::/0' matches no IPv4
+# client, so covering both families takes one selector per family (or the
+# catch-all). IPv4-mapped IPv6 CIDRs ('::ffff:10.0.0.0/104') match like
+# their IPv4 form only at prefix length 96 or longer; shorter ones match
+# native IPv6 clients only. Matching sees the transport-level peer
+# address, so clients behind a proxy or load balancer match the proxy's
+# network, not their own.
+#
+# Every 'address' must be routable from inside its own 'client_cidr':
+# leader-aware SDK clients redial whatever address metadata advertises,
+# so a selector pointing at a host its own clients cannot reach strands
+# them mid-redirect. Prefer literal IPs over hostnames - the SDKs differ
+# in how they compare an advertised hostname against the address they
+# dialed, and a mismatch costs a reconnect on every fresh connect.
+#
+# Note for rolling upgrades: older server binaries reject a TOML config
+# containing 'advertised_addresses' but silently ignore the equivalent
+# 'IGGY_CLUSTER_NODES_*_ADVERTISED_ADDRESSES_*' env vars; either way,
+# upgrade every binary first, then add selectors. Mid-upgrade, an env-var
+# roster would serve selector addresses from upgraded nodes and the
+# catch-all from the rest.
+#
+#   [[cluster.nodes]]
+#   name = "iggy-node-1"
+#   ip = "10.0.1.5"                        # replica plane + last-resort fallback
+#   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
+#   replica_id = 0
+#   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
+#
+#   [[cluster.nodes.advertised_addresses]]
+#   client_cidr = "10.0.0.0/16"            # in-VPC clients stay private
+#   address = "10.0.1.5"
+#
 # In cluster mode, 'ports' is the single source of listener ports: every
 # enabled transport needs an explicit per-node port, otherwise the server
 # refuses to start.

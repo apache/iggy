@@ -3189,6 +3189,7 @@ dependencies = [
  "err_trail",
  "figment",
  "iggy_common",
+ "ipnet",
  "jsonwebtoken",
  "serde",
  "serde_json",

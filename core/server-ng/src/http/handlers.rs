@@ -599,12 +599,13 @@ pub(in crate::http) async fn get_snapshot(
 /// the per-op authorization gate and the consistency gate, and serves from the
 /// roster captured at listener start plus the sync consensus getters, so it
 /// never touches the metadata STM, consensus, or a VSR session and stays fully
-/// synchronous.
+/// synchronous. The caller's peer IP picks each node's advertised address from
+/// its per-client-network selectors.
 pub(in crate::http) async fn get_cluster_metadata(
     State(state): State<HttpState>,
-    _identity: Identity,
+    identity: Identity,
 ) -> Json<ClusterMetadata> {
-    Json(state.build_cluster_metadata())
+    Json(state.build_cluster_metadata(identity.client_ip))
 }
 
 /// `GET /clients`: list every connected client across all shards as the same
