@@ -213,11 +213,10 @@ class TestGetStreams:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test get_streams returns every stream created during the test."""
-        # Reverse-alphabetical names so that id-ascending (creation) order
-        # and name order disagree, proving the list isn't accidentally
-        # name-sorted. The client fixture is session-scoped, so other tests
-        # may have created streams; assert on the ones created here instead
-        # of the full server view.
+        # Stream IDs can be reused after deletion, so creation order does not
+        # imply numeric ID order. The client fixture is session-scoped, so
+        # other tests may have created streams; assert on the ones created
+        # here instead of the full server view.
         created = [unique_name(f"z{index}") for index in range(3, 0, -1)]
         for name in created:
             await iggy_client.create_stream(name)
@@ -226,7 +225,7 @@ class TestGetStreams:
         created_names = set(created)
         mine = [stream for stream in streams if stream.name in created_names]
 
-        assert [stream.name for stream in mine] == created
+        assert {stream.name for stream in mine} == created_names
         assert [stream.id for stream in mine] == sorted(stream.id for stream in mine)
         assert all(stream.created_at > 0 for stream in mine)
         assert all(stream.size_bytes == 0 for stream in mine)
