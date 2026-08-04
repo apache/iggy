@@ -18,20 +18,22 @@
 use crate::MuxStateMachine;
 use crate::stm::authz::gated_apply;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
-use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
+use crate::stm::snapshot::{
+    FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
+};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
-    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, CommitReply, Consensus,
-    EvictionContext, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome,
-    Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
-    ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane, build_eviction_message,
-    build_reply_message, build_reply_message_with, build_result_rejection_reply, emit_sim_event,
-    fence_old_prepare_by_commit, is_caught_up_primary,
-    panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
-    register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
-    send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
+    CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
+    Consensus, EvictionContext, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind,
+    PreflightOutcome, Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind,
+    VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
+    build_eviction_message, build_reply_message, build_reply_message_with,
+    build_result_rejection_reply, emit_sim_event, fence_old_prepare_by_commit,
+    is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
+    pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
+    request_preflight, send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -46,7 +48,9 @@ use iggy_binary_protocol::{
 };
 use iggy_common::IggyError;
 use iggy_common::UserId;
+use iggy_common::calculate_checksum;
 use iggy_common::variadic;
+use journal::superblock::DynSuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
@@ -55,7 +59,7 @@ use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 fn freeze_client_reply(
     message: Message<GenericHeader>,
@@ -100,16 +104,35 @@ impl IggySnapshot {
         &self.snapshot
     }
 
+    /// Mutable view for tests that need to fold state into a checkpoint by hand,
+    /// the way [`Self::persist_snapshot`] does on the live path.
+    #[cfg(test)]
+    pub(crate) const fn snapshot_mut(&mut self) -> &mut MetadataSnapshot {
+        &mut self.snapshot
+    }
+
     /// Persist the snapshot to disk.
     ///
     /// # Errors
     /// Returns `SnapshotError` if serialization or I/O fails.
     pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        Self::write_durably(path, &self.encode()?)
+    }
+
+    /// Write already-encoded snapshot bytes to `path` durably: temp, fsync,
+    /// rename, parent-dir fsync, with the integrity trailer appended.
+    ///
+    /// Split from [`Self::persist`] so the checkpoint path can hash and write one
+    /// buffer instead of encoding the whole snapshot twice under the durability
+    /// lock (the client table is folded in, so a second encode is a full
+    /// re-serialization).
+    ///
+    /// # Errors
+    /// `SnapshotError::Persist` if any write, fsync, or rename fails.
+    fn write_durably(path: &Path, encoded: &[u8]) -> Result<(), SnapshotError> {
         use crate::stm::snapshot::PersistStage;
         use std::fs;
         use std::io::Write;
-
-        let encoded = self.encode()?;
 
         let tmp_path = path.with_extension("bin.tmp");
 
@@ -117,7 +140,17 @@ impl IggySnapshot {
             stage: PersistStage::Write,
             source: e,
         })?;
-        file.write_all(&encoded)
+        file.write_all(encoded)
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
+        // Self-verifying trailer. The superblock's checkpoint pairing cannot stand in:
+        // phase 1 of a checkpoint renames the new snapshot over `snapshot.bin`, so a
+        // crash before the pairing write is the NORMAL crash-inside-a-checkpoint
+        // outcome, and it recovers through the `checkpoint_op < snapshot_op` arm, which
+        // accepts the snapshot with nothing to check it against.
+        file.write_all(&snapshot_trailer(encoded))
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Write,
                 source: e,
@@ -148,18 +181,101 @@ impl IggySnapshot {
         Ok(())
     }
 
-    /// Load a snapshot from disk.
+    /// Load a snapshot from disk, with the [`checkpoint_checksum`] of the exact bytes
+    /// read.
+    ///
+    /// The checksum comes from the file's bytes, never from re-encoding what was
+    /// decoded: the pairing must survive a schema change. Adding a trailing
+    /// `#[serde(default)]` field is the repo's forward-compatible migration, and an
+    /// older file re-encodes with one MORE msgpack array element after it, so a
+    /// re-encode checksum would diverge on the first boot of the new build and refuse
+    /// every checkpointed node with its WAL prefix already drained.
     ///
     /// # Errors
-    /// Returns `SnapshotError` if the file cannot be read or deserialization fails.
-    pub fn load(path: &Path) -> Result<Self, SnapshotError> {
+    /// `SnapshotError::ChecksumMismatch` if the file carries an integrity trailer that
+    /// does not match its payload, or `SnapshotError` if the file cannot be read or
+    /// deserialized.
+    pub fn load(path: &Path) -> Result<(Self, u128), SnapshotError> {
         let data = std::fs::read(path)?;
-
-        // TODO: when checksum is added we need to check
-        // if data.len() is atleast the size of checksum
-
-        Self::decode(data.as_slice())
+        let (payload, checksum) = split_trailer(&data, path)?;
+        Ok((Self::decode(payload)?, checksum))
     }
+}
+
+/// First retry delay after a failed superblock write, doubling per consecutive
+/// failure. Starts near the 10 ms consensus tick, so a one-off failure costs no
+/// latency, and a persistent one stops re-running `atomic_replace` per tick.
+const SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS: u64 = 10_000;
+/// Ceiling on the retry delay. A replica fenced this long is not coming back without
+/// operator action, but the retry must stay frequent enough to recover on its own the
+/// moment the disk does.
+const SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS: u64 = 1_000_000;
+/// Caps the doubling so the shift cannot overflow before the ceiling clamps it.
+const SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT: u64 = 8;
+
+/// Framing marker for the snapshot integrity trailer, "ISNP". Distinguishes a sealed
+/// snapshot from one written before the trailer existed, so a MISSING trailer can be
+/// accepted (unverified, loudly) while a PRESENT but mismatching one refuses boot. A
+/// bare checksum could not tell those apart, and guessing wrong in either direction is
+/// unacceptable: silently accepting corruption, or bricking a healthy node.
+const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
+
+/// `magic` + the payload's [`checkpoint_checksum`].
+const SNAPSHOT_TRAILER_LEN: usize = size_of::<u32>() + size_of::<u128>();
+
+/// The integrity trailer for an encoded snapshot.
+fn snapshot_trailer(encoded: &[u8]) -> [u8; SNAPSHOT_TRAILER_LEN] {
+    let mut trailer = [0u8; SNAPSHOT_TRAILER_LEN];
+    trailer[..4].copy_from_slice(&SNAPSHOT_TRAILER_MAGIC.to_le_bytes());
+    trailer[4..].copy_from_slice(&checkpoint_checksum(encoded).to_le_bytes());
+    trailer
+}
+
+/// Split a snapshot file into `(payload, checkpoint_checksum)`, verifying the trailer
+/// when one is present.
+///
+/// A file without the trailer is a snapshot written before sealing: its whole contents
+/// are the payload and the checksum is computed over them, exactly as the pairing
+/// recorded it, so an upgrade boots. It replays unverified, which is the same trade the
+/// WAL makes for entries no producer sealed, so it is warned about rather than
+/// silently accepted.
+fn split_trailer<'a>(data: &'a [u8], path: &Path) -> Result<(&'a [u8], u128), SnapshotError> {
+    let sealed = data.len() >= SNAPSHOT_TRAILER_LEN
+        && data[data.len() - SNAPSHOT_TRAILER_LEN..][..4] == SNAPSHOT_TRAILER_MAGIC.to_le_bytes();
+    if !sealed {
+        tracing::warn!(
+            path = %path.display(),
+            "metadata snapshot carries no integrity trailer; restored unverified \
+             (written before snapshot sealing)"
+        );
+        return Ok((data, checkpoint_checksum(data)));
+    }
+
+    let (payload, trailer) = data.split_at(data.len() - SNAPSHOT_TRAILER_LEN);
+    let expected = u128::from_le_bytes(
+        trailer[4..]
+            .try_into()
+            .expect("a sealed trailer holds 16 checksum bytes"),
+    );
+    let actual = checkpoint_checksum(payload);
+    if actual != expected {
+        return Err(SnapshotError::ChecksumMismatch { expected, actual });
+    }
+    Ok((payload, expected))
+}
+
+/// The superblock's `checkpoint_checksum` over a snapshot's on-disk bytes: the same
+/// `XxHash3_64` the WAL and superblock use, widened to the `u128` the durable record
+/// reserves.
+///
+/// Both sides of the pairing hash BYTES rather than a state: the checkpoint hashes
+/// what it wrote (`SnapshotCoordinator::persist_snapshot`), recovery hashes what it
+/// read ([`IggySnapshot::load`]). Nothing re-serializes a decoded snapshot, so the
+/// cross-check does not depend on decode-then-encode being byte-identical across
+/// builds.
+#[must_use]
+pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
+    u128::from(calculate_checksum(encoded))
 }
 
 impl Snapshot for IggySnapshot {
@@ -200,7 +316,11 @@ impl Snapshot for IggySnapshot {
 
 /// Coordinates snapshot creation, persistence, and WAL compaction.
 ///
-/// Owns the data directory path and the snapshot creation function.
+/// Owns the data directory path and the snapshot creation function. The
+/// three-phase checkpoint (persist snapshot, record the pairing durably, drain the
+/// WAL) is orchestrated one layer up in [`IggyMetadata::checkpoint_if_needed`], so
+/// the superblock write can sit between persist and drain; this type owns only the
+/// snapshot I/O and the last-checkpoint bookkeeping.
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
     create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
@@ -209,6 +329,10 @@ pub struct SnapshotCoordinator<M> {
     /// least the configured prepare-queue depth (see the static assert and
     /// [`Self::set_checkpoint_margin`]).
     checkpoint_margin: Cell<usize>,
+    /// `(checkpoint_op, checkpoint_checksum)` of the last snapshot persisted or
+    /// recovered at boot, `(0, 0)` when none. A view-change superblock write reads
+    /// this so it records the current pairing instead of regressing it to zero.
+    last_checkpoint: Cell<(u64, u128)>,
 }
 
 impl<M> SnapshotCoordinator<M> {
@@ -227,6 +351,7 @@ impl<M> SnapshotCoordinator<M> {
             data_dir,
             create_snapshot,
             checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
+            last_checkpoint: Cell::new((0, 0)),
         }
     }
 
@@ -239,63 +364,78 @@ impl<M> SnapshotCoordinator<M> {
             .set(margin.max(Self::CHECKPOINT_MARGIN));
     }
 
-    /// Create a snapshot, persist it, and drain snapshotted entries from the
-    /// journal to reclaim WAL space.
-    ///
-    /// # Errors
-    /// Returns `SnapshotError` if snapshotting, persistence, or drain fails.
-    #[allow(clippy::future_not_send)]
-    pub async fn checkpoint<J>(
+    /// On-disk location of the persisted snapshot; also the artifact state
+    /// transfer serves and installs.
+    #[must_use]
+    pub fn snapshot_path(&self) -> std::path::PathBuf {
+        self.data_dir.join(super::METADATA_DIR).join("snapshot.bin")
+    }
+
+    /// The last persisted checkpoint's `(op, checksum)`, `(0, 0)` when none.
+    const fn last_checkpoint(&self) -> (u64, u128) {
+        self.last_checkpoint.get()
+    }
+
+    /// Seed the last-checkpoint pairing at boot from the recovered snapshot, so the
+    /// first post-boot view-change superblock write records the real pairing rather
+    /// than `(0, 0)`.
+    fn seed_last_checkpoint(&self, checkpoint_op: u64, checkpoint_checksum: u128) {
+        self.last_checkpoint
+            .set((checkpoint_op, checkpoint_checksum));
+    }
+
+    /// Whether the journal is low enough on capacity to force a checkpoint. Gates
+    /// on the configurable margin, which bootstrap raises to at least the
+    /// prepare-queue depth; default [`Self::CHECKPOINT_MARGIN`].
+    fn should_checkpoint<J: JournalHandle>(&self, journal: &J) -> bool {
+        journal
+            .handle()
+            .remaining_capacity()
+            .is_some_and(|c| c <= self.checkpoint_margin.get())
+    }
+
+    /// Create and durably persist a snapshot at `commit_op`, record the pairing, and
+    /// return its checksum. Does NOT drain the WAL: the caller must durably record
+    /// the pairing in the superblock first, so a crash between persist and drain
+    /// recovers a consistent checkpoint with the WAL intact. Synchronous, since
+    /// snapshot creation and `std::fs` persistence never await.
+    fn persist_snapshot(
         &self,
         stm: &M,
+        commit_op: u64,
+        created_at: u64,
+        client_table: Option<ClientTableSnapshot>,
+    ) -> Result<u128, SnapshotError> {
+        let mut snapshot = (self.create_snapshot)(stm, commit_op, created_at)?;
+        // Fold in the client table, which `create_snapshot` does not see since it is
+        // not a state machine. Recovery restores it as the reconstruction floor for
+        // the drained WAL prefix.
+        snapshot.snapshot.client_table = client_table;
+        // Encode once: the checksum and the on-disk record share one buffer, so the
+        // snapshot is not serialized twice while the checkpoint lock freezes this
+        // core, and the pairing is provably over the bytes that reach the file.
+        let encoded = snapshot.encode()?;
+        let checksum = checkpoint_checksum(&encoded);
+        let path = self.snapshot_path();
+        IggySnapshot::write_durably(&path, &encoded)?;
+        self.last_checkpoint.set((commit_op, checksum));
+        Ok(checksum)
+    }
+
+    /// Drain the snapshotted prefix `0..=last_op` to reclaim WAL space. Runs only
+    /// after the pairing is durable (see [`Self::persist_snapshot`]).
+    #[allow(clippy::future_not_send)]
+    async fn drain<J: JournalHandle>(
+        &self,
         journal: &J,
         last_op: u64,
-        created_at: u64,
-    ) -> Result<(), SnapshotError>
-    where
-        J: JournalHandle,
-    {
-        let snapshot = (self.create_snapshot)(stm, last_op, created_at)?;
-        let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
-        snapshot.persist(&path)?;
-
-        let _ = journal
+    ) -> Result<(), SnapshotError> {
+        journal
             .handle()
             .drain(0..=last_op)
             .await
             .map_err(SnapshotError::Io)?;
-
         Ok(())
-    }
-
-    /// Force a checkpoint if the journal is running low on capacity.
-    ///
-    /// Returns `Ok(true)` if a checkpoint was taken, `Ok(false)` if not needed.
-    ///
-    /// # Errors
-    /// Returns `SnapshotError` if the checkpoint fails.
-    #[allow(clippy::future_not_send)]
-    pub async fn checkpoint_if_needed<J>(
-        &self,
-        stm: &M,
-        journal: &J,
-        commit_op: u64,
-        created_at: u64,
-    ) -> Result<bool, SnapshotError>
-    where
-        J: JournalHandle,
-    {
-        let needs_checkpoint = journal
-            .handle()
-            .remaining_capacity()
-            .is_some_and(|c| c <= self.checkpoint_margin.get());
-
-        if needs_checkpoint {
-            self.checkpoint(stm, journal, commit_op, created_at).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 }
 
@@ -487,6 +627,87 @@ fn require_shard_zero<'a, T>(
     slot
 }
 
+/// Apply one committed prepare to the state machine and client table.
+///
+/// The backup commit walk's per-op logic, shared so the simulator's WAL
+/// reconstruction reaches identical state from the same log through one apply path.
+/// Register creates or rebinds a session (no state-machine op); Logout drops the
+/// session and rebalances consumer groups; every other op applies to the state
+/// machine and caches the reply for at-most-once dedup. `fire_notifier` runs the
+/// post-commit hook (a no-op during reconstruction, before it is wired). Does not
+/// advance `commit_min`; the caller owns that counter.
+///
+/// `table_mutations_allowed` gates the CLIENT-TABLE half only; the state
+/// machine always applies. After a state transfer the two artifacts sit at
+/// different frontiers -- the snapshot at `S`, the transferred table at
+/// `C >= S` -- so the tail replay over `(S, commit_max]` must run every state
+/// machine effect (they are above the snapshot) while skipping table effects at
+/// or below `C` (they are already in the transferred table). Pass `true`
+/// wherever no transfer is in play.
+///
+/// # Panics
+/// If a committed op fails to apply, which is a decode/corruption bug, since a
+/// business rejection commits as a no-op rather than erroring: the committed log
+/// must apply cleanly on every replica.
+pub fn apply_committed_prepare<M>(
+    mux_stm: &M,
+    client_table: &RefCell<ClientTable>,
+    table_mutations_allowed: bool,
+    fire_notifier: impl Fn(Operation),
+    prepare: Message<PrepareHeader>,
+) where
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = crate::stm::result::ApplyReply,
+            Error = iggy_common::IggyError,
+        >,
+{
+    let header = *prepare.header();
+    if header.operation == Operation::Register {
+        // Register: commit_register creates the session, no state-machine op.
+        if table_mutations_allowed {
+            let reply = build_reply_message(&header, &bytes::Bytes::new());
+            client_table
+                .borrow_mut()
+                .commit_register(header.client, header.user_id, reply);
+        }
+        return;
+    }
+    if header.operation == Operation::Logout {
+        if table_mutations_allowed {
+            client_table.borrow_mut().remove_client(header.client);
+        }
+        // Drop the disconnected client from every consumer group it joined and
+        // rebalance, Logout's only state-machine effect.
+        mux_stm.streams().remove_consumer_group_member(
+            header.client,
+            iggy_common::IggyTimestamp::from(header.timestamp),
+        );
+        return;
+    }
+    // Normal op: apply, build the reply. `Err` is decode/corruption only; a
+    // business rejection commits as a deterministic no-op whose code rides
+    // the reply body, replayed on retry.
+    let apply = gated_apply(mux_stm, prepare).unwrap_or_else(|err| {
+        panic!(
+            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+            header.op
+        );
+    });
+    fire_notifier(header.operation);
+    let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
+        apply.write_reply_body(dst);
+    });
+    // Best-effort cache; a WAL replay may carry a reply for a later-evicted
+    // client, and replica-local eviction makes a stale-request replay
+    // reachable. Both are skips, not faults.
+    if table_mutations_allowed {
+        let outcome = client_table.borrow_mut().commit_reply(header.client, reply);
+        log_commit_reply_outcome(outcome, header.client, header.op);
+    }
+}
+
 /// Late-bound callback invoked after every committed op on shard 0's metadata
 /// commit path (via `gated_apply`, including a gated no-op).
 ///
@@ -514,6 +735,46 @@ pub struct IggyMetadata<C, J, S, M> {
     pub journal: Option<J>,
     /// `Some` on shard 0, `None` on other shards.
     pub snapshot: Option<S>,
+    /// Durable VSR-state record (`view`/`log_view`/`commit`). `Some` only on the
+    /// shard owning metadata consensus (shard 0); `None` on peer shards and in the
+    /// partition plane, which is not yet durable. Behind `Rc<dyn ...>` so the
+    /// simulator harness can keep a clone outliving a replica across a restart.
+    pub superblock: Option<Rc<dyn DynSuperblockStore>>,
+    /// Serializes superblock writes on shard 0 so at most one is in flight.
+    /// View-change persists ([`Self::persist_superblock_if_needed`]) and checkpoints
+    /// ([`Self::checkpoint_if_needed`]) share the one ping-pong superblock, and
+    /// in-process metadata submits each run on their own spawned task, so both can
+    /// reach a write concurrently. `PingPongSuperblock::write` picks its slot before
+    /// it awaits, so two overlapping writers would target the same slot and could
+    /// tear it.
+    ///
+    /// Scoped to the write itself, NOT to a whole checkpoint. A pending view persist
+    /// blocks every gated send behind it, including the ack path's
+    /// `send_prepare_ok`, so it must not also wait out a checkpoint's snapshot
+    /// encode, two `std::fs` fsyncs and an async WAL drain. Whoever writes builds
+    /// its `VsrState` inside this section with no await in between, so the last
+    /// writer carries the freshest view and the durable view cannot regress.
+    ///
+    /// Held across the write `.await`, so it uses the same single-threaded,
+    /// cancel-safe [`LocalGate`] as `journal_gate`, a `Cell` flag with no atomics:
+    /// this shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
+    /// atomic RMW per gated send for exclusion the `Cell` already provides.
+    superblock_lock: LocalGate,
+    /// Serializes whole checkpoints against each other: `persist_snapshot` renames
+    /// over the single `snapshot.bin` and `drain` rewrites the WAL through a shared
+    /// `wal.tmp`, so two concurrent checkpoints would race both. Distinct from
+    /// [`Self::superblock_lock`], which a checkpoint takes only for its own pairing
+    /// write. A checkpoint holds this one and then acquires that one; nothing takes
+    /// them in the other order.
+    checkpoint_lock: LocalGate,
+    /// Consecutive failed superblock writes, and the clock reading after which the
+    /// next attempt may run. A persistent `ENOSPC` / `EIO` would otherwise re-run a
+    /// full `atomic_replace` (create, write, fsync, rename, dir fsync) on every 10 ms
+    /// consensus tick, on the executor that also serves partition traffic. Reset on
+    /// the first success. See [`Self::persist_superblock_if_needed`] for the terminal
+    /// policy.
+    superblock_write_failures: Cell<u64>,
+    superblock_retry_after_micros: Cell<u64>,
     /// State machine - lives on all shards
     pub mux_stm: M,
     pub allocator: ConsensusGroupAllocator,
@@ -543,6 +804,16 @@ pub struct IggyMetadata<C, J, S, M> {
     /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
     /// Defaults to never-expire, matching the shipped server config.
     default_message_expiry: Cell<u64>,
+    /// Client-table mutations at or below this op are already reflected in a
+    /// state-transferred table, so the tail-repair commit walk must skip
+    /// them (re-running `commit_register` would double-bump epochs). `0`
+    /// outside state transfer (no op is skipped). Monotone per install.
+    client_table_frontier: Cell<u64>,
+    /// Last built [`StateTransferOffer`], shared by every requester of the same
+    /// snapshot generation. Rebuilding per request re-reads and re-decodes the
+    /// whole snapshot on shard 0's pump, and hands each requester its own
+    /// multi-MB copy.
+    transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -558,6 +829,7 @@ where
         consensus: Option<C>,
         journal: Option<J>,
         snapshot: Option<S>,
+        superblock: Option<Rc<dyn DynSuperblockStore>>,
         mux_stm: M,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
@@ -568,6 +840,11 @@ where
             consensus,
             journal,
             snapshot,
+            superblock,
+            superblock_lock: LocalGate::new(),
+            checkpoint_lock: LocalGate::new(),
+            superblock_write_failures: Cell::new(0),
+            superblock_retry_after_micros: Cell::new(0),
             mux_stm,
             allocator,
             coordinator,
@@ -576,11 +853,35 @@ where
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
             default_message_expiry: Cell::new(u64::MAX),
+            client_table_frontier: Cell::new(0),
+            transfer_offer_cache: RefCell::new(None),
         }
     }
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+    /// Slot capacity of the LIVE client table, i.e. the largest transferred
+    /// table this replica can absorb.
+    ///
+    /// Read at decode instead of a separately plumbed `clients_table_max`: the
+    /// live table sizes itself to `max(configured, highest recovered slot + 1)`,
+    /// so a serving primary can legitimately hold more entries than this node's
+    /// raw config value and decoding against that value would reject every
+    /// round.
+    #[must_use]
+    pub fn client_table_capacity(&self) -> usize {
+        self.client_table.borrow().capacity()
+    }
+
+    /// Drop the cached state-transfer offer, releasing its snapshot copy.
+    ///
+    /// Called by the shard's expiry sweep once no requester holds an offer:
+    /// the cache exists to collapse repeat builds within one rejoin, not to
+    /// pin a snapshot for the life of the process.
+    pub fn clear_state_transfer_offer_cache(&self) {
+        self.transfer_offer_cache.borrow_mut().take();
+    }
+
     /// Install (or replace) the post-commit notifier. Passing `None`
     /// removes any previous one. Server-ng bootstrap calls this on shard 0
     /// only; peer shards never commit metadata locally.
@@ -588,10 +889,23 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         *self.commit_notifier.borrow_mut() = notifier;
     }
 
+    /// Seed the coordinator's last-checkpoint pairing at boot from the recovered
+    /// snapshot, so the first post-boot view-change superblock write records the real
+    /// `(checkpoint_op, checksum)` instead of `(0, 0)`. No-op without a coordinator
+    /// (peer shards, the simulator). Server-ng bootstrap calls this on shard 0 after
+    /// cross-checking the pairing.
+    pub fn seed_checkpoint_ref(&self, checkpoint_op: u64, checkpoint_checksum: u128) {
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.seed_last_checkpoint(checkpoint_op, checkpoint_checksum);
+        }
+    }
+
     /// Install the client table rebuilt by WAL-replay recovery
     /// ([`crate::impls::recovery::recover`]). Boot-time only, on the owning
     /// shard, before it serves traffic - replacing a live table would drop
-    /// committed session state.
+    /// committed session state. (State transfer replaces a LIVE table via
+    /// [`IggyMetadata::install_state_transfer`], which also stamps the
+    /// frontier.)
     ///
     /// Refuses (leaving the live table in place) when the current table
     /// already holds sessions, which means a client registered before recovery
@@ -616,6 +930,14 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         }
         *current = client_table;
         true
+    }
+
+    /// Client-table mutations at or below the frontier are already in the
+    /// state-transferred table; the commit walk skips them (re-running
+    /// `commit_register` would double-bump epochs). STM effects still apply
+    /// -- the frontier fences the TABLE only.
+    const fn client_table_mutation_allowed(&self, op: u64) -> bool {
+        op > self.client_table_frontier.get()
     }
 
     /// Install the resolved byte value used for `MaxTopicSize::ServerDefault`.
@@ -1042,6 +1364,129 @@ where
     }
 }
 
+/// One state-transfer serving payload.
+///
+/// The on-disk snapshot payload plus the live client table, both
+/// frontier-stamped. Built by [`IggyMetadata::state_transfer_offer`] on the
+/// serving primary; the shard serves chunks out of it and shares one instance
+/// across every requester of the same snapshot generation.
+pub struct StateTransferOffer {
+    /// Serving primary's applied frontier when the offer was built; the
+    /// receiver's tail repair targets past this.
+    pub commit_op: u64,
+    /// The offered snapshot's `sequence_number`, i.e. the generation this
+    /// offer describes. Reused as the cache key: a later checkpoint rewrites
+    /// `snapshot.bin` and invalidates every payload below.
+    pub snapshot_seq: u64,
+    /// Manifest entries paired with their bytes. One `Vec` of pairs rather
+    /// than two index-aligned `Vec`s: the manifest is encoded in one file and
+    /// the chunks served in another, so a desync would be invisible at both
+    /// ends. Metadata plane: `[METADATA_SNAPSHOT (frontier = sequence_number),
+    /// CLIENT_TABLE (frontier = commit_min at encode)]`.
+    ///
+    /// Payloads are refcounted so n simultaneous rejoiners share one copy
+    /// rather than pinning n multi-MB snapshots on shard 0.
+    pub artifacts: Vec<(consensus::StateArtifact, Rc<Vec<u8>>)>,
+}
+
+impl StateTransferOffer {
+    /// Manifest entries for the descriptor body.
+    #[must_use]
+    pub fn manifest(&self) -> Vec<consensus::StateArtifact> {
+        self.artifacts.iter().map(|(entry, _)| *entry).collect()
+    }
+
+    /// Bytes of the artifact at `index` in manifest order.
+    #[must_use]
+    pub fn payload(&self, index: usize) -> Option<&[u8]> {
+        self.artifacts.get(index).map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// Number of artifacts on offer.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.artifacts.len()
+    }
+
+    /// Whether the offer carries no artifacts at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.artifacts.is_empty()
+    }
+
+    /// Total advertised bytes across every artifact.
+    #[must_use]
+    pub fn total_len(&self) -> u64 {
+        self.artifacts.iter().map(|(entry, _)| entry.len).sum()
+    }
+}
+
+/// Why this replica cannot serve a state transfer right now.
+///
+/// Named rather than folded into `None` so the refusal the requester sees is
+/// logged with its actual cause: "no snapshot persisted" and "snapshot.bin is
+/// corrupt" call for opposite operator responses.
+#[derive(Debug)]
+pub enum StateTransferUnavailable {
+    /// Not a caught-up primary, so a client-table read would not be
+    /// authoritative.
+    NotCaughtUpPrimary,
+    /// This shard has no snapshot coordinator, so it never checkpoints.
+    NoCoordinator,
+    /// No snapshot has ever been persisted. The WAL still holds the full
+    /// history, so the requester's journal repair covers its whole gap.
+    NoSnapshot,
+    /// `snapshot.bin` exists but could not be read, or failed its integrity
+    /// trailer. Refusing is strictly better than shipping it: the receiver
+    /// would re-seal the corruption under a fresh valid trailer.
+    SnapshotUnreadable(SnapshotError),
+}
+
+impl std::fmt::Display for StateTransferUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCaughtUpPrimary => write!(f, "not a caught-up primary"),
+            Self::NoCoordinator => write!(f, "no snapshot coordinator on this shard"),
+            Self::NoSnapshot => write!(f, "no snapshot has been persisted yet"),
+            Self::SnapshotUnreadable(source) => {
+                write!(f, "persisted snapshot is unreadable: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateTransferUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SnapshotUnreadable(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// What a completed [`IggyMetadata::install_state_transfer`] landed.
+///
+/// A degraded install is reported HERE rather than as an `Err`, because it is
+/// a success: the snapshot, table, frontiers and commit point are all in
+/// place by the time the pairing write is attempted. Returning it as an error
+/// invites a caller to treat a completed install as a failure and redo it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallOutcome {
+    /// The receiver's new applied frontier, `max(snapshot_seq,
+    /// local_applied)`. These differ whenever a serving peer offered a
+    /// snapshot BEHIND this replica and the local state machine was kept.
+    pub applied_frontier: u64,
+    /// Whether the transferred checkpoint's `(checkpoint_op, checksum)`
+    /// pairing reached the durable superblock.
+    ///
+    /// `false` leaves the install fully usable: the coordinator already holds
+    /// the new pairing, so the next superblock write (view change or
+    /// checkpoint) records it. Until then a crash recovers the PREVIOUS
+    /// checkpoint and this replica transfers again -- correct, just wasted
+    /// work.
+    pub pairing_durable: bool,
+}
+
 impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
 where
     B: MessageBus,
@@ -1054,6 +1499,349 @@ where
             Error = iggy_common::IggyError,
         >,
 {
+    /// Build a state-transfer offer for a restarted peer.
+    ///
+    /// The snapshot is served as the on-disk PAYLOAD, with its integrity
+    /// trailer verified and stripped. Both halves matter. Verified, because a
+    /// flipped bit inside the payload that still msgpack-decodes would
+    /// otherwise be re-sealed on the receiver under a fresh valid trailer and
+    /// a matching pairing: a fault the source node refuses to boot over would
+    /// become undetectable on the second node. Stripped, because the receiver
+    /// re-persists what it is sent through `write_durably`, which appends a
+    /// trailer of its own -- shipping the sealed file grows `snapshot.bin` by
+    /// one trailer per transfer generation and leaves it byte-shape-different
+    /// from a locally checkpointed one.
+    ///
+    /// The snapshot may be stale, which costs nothing: the receiver
+    /// journal-repairs `(snapshot_seq, commit_max]` afterwards through the
+    /// existing repair machinery. The table is encoded live at this instant;
+    /// both frontier stamps read `commit_min` inside one synchronous region,
+    /// so they are mutually consistent.
+    ///
+    /// The result is cached and shared: a repeat request for the same snapshot
+    /// generation reuses it instead of re-reading and re-decoding the file on
+    /// shard 0's pump.
+    ///
+    /// # Errors
+    /// [`StateTransferUnavailable`] naming why this replica cannot serve.
+    pub fn state_transfer_offer(&self) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(StateTransferUnavailable::NoCoordinator)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(StateTransferUnavailable::NotCaughtUpPrimary);
+        }
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(StateTransferUnavailable::NoCoordinator)?;
+        let path = coordinator.snapshot_path();
+        if !path.exists() {
+            return Err(StateTransferUnavailable::NoSnapshot);
+        }
+        let sealed = std::fs::read(&path)
+            .map_err(|source| StateTransferUnavailable::SnapshotUnreadable(source.into()))?;
+        // Verifies the trailer and hands back the payload alone.
+        let (payload, _) =
+            split_trailer(&sealed, &path).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
+        // Still decoded rather than read off `last_checkpoint()`: `write_durably`
+        // renames before the parent-dir fsync, so a DirSync failure leaves the new
+        // file live with that cell stale, and the offer would then under-advertise
+        // the frontier it is actually shipping.
+        let snapshot_seq = IggySnapshot::decode(payload)
+            .map_err(StateTransferUnavailable::SnapshotUnreadable)?
+            .sequence_number();
+
+        // Reuse the cached offer for this generation. Only the SNAPSHOT half is
+        // expensive to rebuild, and the cached table is merely older, never
+        // incoherent: its frontier is stamped at its own encode, and the receiver
+        // replays everything above that frontier during tail repair.
+        if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
+            && cached.snapshot_seq == snapshot_seq
+        {
+            return Ok(Rc::clone(cached));
+        }
+
+        let commit_op = consensus.commit_min();
+        let table = self.client_table.borrow().encode();
+        let offer = Rc::new(StateTransferOffer {
+            commit_op,
+            snapshot_seq,
+            artifacts: vec![
+                (
+                    consensus::StateArtifact::for_bytes(
+                        consensus::artifact_kind::METADATA_SNAPSHOT,
+                        snapshot_seq,
+                        payload,
+                    ),
+                    Rc::new(payload.to_vec()),
+                ),
+                (
+                    consensus::StateArtifact::for_bytes(
+                        consensus::artifact_kind::CLIENT_TABLE,
+                        commit_op,
+                        &table,
+                    ),
+                    Rc::new(table),
+                ),
+            ],
+        });
+        *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
+        Ok(offer)
+    }
+
+    /// Install a fetched state transfer: persist + restore the snapshot,
+    /// replace the client table, and jump the commit state to the snapshot
+    /// floor so the tail repair takes over from there.
+    ///
+    /// Ordering: persist FIRST (a crash mid-install must reboot from the
+    /// transferred state, not the pre-transfer one), then the in-place STM
+    /// restore (readers observe it on their next read), then the table +
+    /// frontier, then journal/commit bookkeeping.
+    ///
+    /// The partition plane is deliberately untouched: partitions load
+    /// whatever their disks hold at boot and repair through their own
+    /// consensus groups. Topology changes the snapshot carries below the
+    /// receiver's old frontier (topics created/deleted while it was down)
+    /// fire no commit notifier -- convergence rests on the partition
+    /// reconciler's periodic full diff against the committed STM, which
+    /// reads the restored state on its next tick.
+    ///
+    /// Returns an [`InstallOutcome`]: the new applied frontier, plus whether
+    /// the transferred checkpoint's pairing reached the durable superblock.
+    ///
+    /// # Errors
+    /// [`SnapshotError`] when the snapshot bytes do not decode, the persist
+    /// fails, or the in-place restore is rejected. Every `Err` here means
+    /// NOTHING was installed.
+    ///
+    /// # Panics
+    /// If called on a shard without consensus (state transfer is a shard-0
+    /// concern).
+    #[allow(clippy::future_not_send)]
+    pub async fn install_state_transfer(
+        &self,
+        snapshot_bytes: &[u8],
+        client_table: ClientTable,
+        table_frontier: u64,
+        commit_op: u64,
+    ) -> Result<InstallOutcome, SnapshotError>
+    where
+        M: RestoreSnapshotInPlace<MetadataSnapshot>,
+    {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("install_state_transfer: consensus only exists on shard 0");
+
+        let snapshot = IggySnapshot::decode(snapshot_bytes)?;
+        let snapshot_seq = snapshot.sequence_number();
+
+        // Manifest coherence. `commit_op` and `table_frontier` arrive from the
+        // serving peer and are applied to THIS replica's frontiers, so a
+        // malformed descriptor would move them somewhere the artifacts do not
+        // justify. A peer cannot have committed less than its own snapshot
+        // contains, nor have encoded a table below its commit point: both are
+        // built from one caught-up-primary read in `state_transfer_offer`.
+        // Refuse rather than install, which drops the caller back to journal
+        // repair with the local state untouched.
+        if commit_op < snapshot_seq || table_frontier > commit_op {
+            tracing::error!(
+                snapshot_seq,
+                commit_op,
+                table_frontier,
+                "incoherent state transfer manifest; refusing to install"
+            );
+            return Err(SnapshotError::IncoherentManifest {
+                snapshot_seq,
+                commit_op,
+                table_frontier,
+            });
+        }
+
+        // Checkpoints are node-local, so a healthy serving primary can offer
+        // a snapshot BEHIND this replica's own applied frontier (each node
+        // snapshots at its own watermark; a backup checkpoints an op or two
+        // below the primary it later replaces). Restoring such a snapshot
+        // would rewind the STM below `commit_min` with no way back: the
+        // commit walk never revisits ops it already counted as applied, so
+        // the rewound-over effects would be lost until the next transfer.
+        // Keep the local STM (it is a superset) and let tail repair cover
+        // `(commit_min, commit_op]`. The client table still installs below:
+        // it comes from the serving primary's LIVE state at `table_frontier
+        // == commit_op`, which is never behind this replica.
+        // Preliminary read, only to decide whether the gates are needed; the
+        // binding decision is re-derived under them below.
+        let snapshot_ahead = snapshot_seq > consensus.commit_min();
+
+        // Serialize the whole install against a concurrent checkpoint, in the
+        // checkpoint's own lock order (`checkpoint_lock` then
+        // `superblock_lock`), so the two cannot deadlock against each other.
+        //
+        // Both do the same pair of steps -- rewrite `snapshot.bin`, record
+        // `(checkpoint_op, checksum)` -- and `checkpoint_if_needed` holds
+        // `checkpoint_lock` across BOTH while taking `superblock_lock` only
+        // around the pairing write. `superblock_lock` alone therefore
+        // serializes nothing against the checkpoint's file rewrite: interleave
+        // them and the file comes from one while the durable pairing describes
+        // the other, which is exactly the torn pairing the superblock exists to
+        // detect (a crash inside that window refuses boot with
+        // `CheckpointChecksumMismatch`). Checkpoints run on spawned tasks, so a
+        // prepare that passed preflight before the transfer armed can drive one
+        // during this install's superblock await -- a transferring replica
+        // withholds acks, but "should not be committing" is not an invariant
+        // this path can rest on.
+        //
+        // Deadlock-free: nothing between here and the superblock write awaits,
+        // and `write_superblock` takes no lock of its own.
+        let _install_gates = if snapshot_ahead {
+            let checkpoint = self.checkpoint_lock.acquire().await;
+            let superblock = if self.superblock.is_some() {
+                Some(self.superblock_lock.acquire().await)
+            } else {
+                None
+            };
+            Some((checkpoint, superblock))
+        } else {
+            None
+        };
+
+        // The gate waits above suspend this task while commits -- and whole
+        // checkpoints -- run, so the preliminary read is stale once the locks
+        // are held. `commit_min` is monotonic, so the only possible flip is
+        // ahead -> not-ahead, landing in the table-only arm below; deciding on
+        // the stale value instead would overwrite a newer checkpoint's
+        // snapshot.bin, regress its pairing, and rewind the STM below the
+        // applied frontier -- then panic on `set_commit_floor`'s anti-rewind
+        // assert with the damage already durable.
+        let local_applied = consensus.commit_min();
+        let snapshot_ahead = snapshot_seq > local_applied;
+
+        if snapshot_ahead {
+            if let Some(coordinator) = &self.coordinator {
+                // The transferred snapshot REPLACES the one the superblock's
+                // `(checkpoint_op, checksum)` pairing describes, so the pairing has
+                // to move with it. Left stale it does not refuse boot -- the
+                // `checkpoint_op < snapshot_op` arm of `verify_checkpoint_pairing`
+                // reads it as a lagging local checkpoint and accepts -- which is
+                // worse than a refusal: the recorded checksum belongs to a snapshot
+                // that no longer exists, so a torn or corrupt transferred snapshot
+                // stops being detectable until some later local checkpoint happens
+                // to rewrite the pairing.
+                //
+                // Write the received bytes verbatim rather than re-encoding the
+                // decoded snapshot: the checksum below is taken over exactly the
+                // bytes that reach the file, so the pairing provably describes it.
+                debug_assert!(
+                    snapshot_seq >= coordinator.last_checkpoint().0,
+                    "a transferred snapshot must not land below the recorded \
+                     checkpoint op ({} < {}); recovery would refuse boot with \
+                     CheckpointAheadOfSnapshot",
+                    snapshot_seq,
+                    coordinator.last_checkpoint().0
+                );
+                let checksum = checkpoint_checksum(snapshot_bytes);
+                IggySnapshot::write_durably(&coordinator.snapshot_path(), snapshot_bytes)?;
+                coordinator.seed_last_checkpoint(snapshot_seq, checksum);
+                tracing::info!(
+                    checkpoint_op = snapshot_seq,
+                    "state transfer recorded its checkpoint pairing"
+                );
+            } else {
+                tracing::warn!(
+                    snapshot_seq,
+                    "installing state transfer without a snapshot coordinator; \
+                     the transferred state will not survive a further restart"
+                );
+            }
+
+            self.mux_stm
+                .restore_snapshot_in_place(snapshot.snapshot())?;
+        } else {
+            tracing::info!(
+                snapshot_seq,
+                local_applied,
+                "transferred snapshot at or below the local applied frontier; \
+                 keeping the local state machine and installing the table only"
+            );
+        }
+
+        *self.client_table.borrow_mut() = client_table;
+        self.client_table_frontier.set(table_frontier);
+
+        if snapshot_ahead {
+            // Entries at or below the installed floor are superseded by the
+            // snapshot; without this the journal's wrap-eviction assert trips
+            // on pre-transfer residents the next time slots recycle.
+            if let Some(journal) = &self.journal {
+                let handle = journal.handle();
+                if snapshot_seq > handle.snapshot_op() {
+                    handle.set_snapshot_op(snapshot_seq);
+                }
+            }
+
+            // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
+            // frontier (this is the op-jump the tail repair resumes from) and
+            // let the announced commit point pull the walk target forward.
+            //
+            // TODO(suffix-truncation): this hands the commit walk a floor it never
+            // verified. `set_snapshot_op` above only marks entries at or below the
+            // floor EVICTABLE -- everything above it stays resident -- and the walk
+            // matches WAL entries by op number alone, with no view or hash-chain
+            // check. A node carrying a pre-crash prepared-but-uncommitted suffix that
+            // a view change has since reassigned cluster-side will therefore apply
+            // those stale bodies as committed. The client table is shielded (the
+            // `client_table_frontier` fence skips table effects at or below the
+            // transferred frontier); the state machine is not.
+            //
+            // Same root cause as the `TODO(suffix-truncation)` in
+            // `VsrConsensus::handle_start_view`, and the same missing piece closes
+            // both: a durable truncate-from-op primitive on the journal, so a floor
+            // jump can discard the suffix above it instead of leaving it to be
+            // matched by op number. The floor jump does not create the hole, but it
+            // widens exposure to it precisely on the nodes guaranteed to have a stale
+            // log -- every state-transfer receiver is one. Deliberately out of scope
+            // here (flagged in review as follow-up): the primitive is a journal
+            // durability change, not a state-transfer one.
+            consensus.set_commit_floor(snapshot_seq);
+            if snapshot_seq > consensus.sequencer().current_sequence() {
+                consensus.sequencer().set_sequence(snapshot_seq);
+            }
+        }
+        // Before the superblock write, so the durable record carries the frontier
+        // this transfer just established rather than the pre-transfer one.
+        consensus.advance_commit_max(commit_op);
+
+        // Make the transferred checkpoint durable, mirroring the ordering a local
+        // checkpoint uses (persist snapshot -> record the pairing -> only then treat
+        // it as the recovery floor). A crash before this lands recovers the previous
+        // checkpoint with the WAL intact and the transfer simply retries; a crash
+        // after it recovers the transferred state. Failing here withholds nothing
+        // already written -- the snapshot on disk subsumes the recorded pairing, which
+        // `verify_checkpoint_pairing` accepts -- so it is reported as a DEGRADED
+        // install rather than a failed one.
+        let mut pairing_durable = true;
+        if snapshot_ahead && let Some(superblock) = self.superblock.as_ref() {
+            // Already under `_install_gates`, acquired above; re-acquiring here
+            // would deadlock on the same non-reentrant gate.
+            pairing_durable = self.write_superblock(consensus, superblock.as_ref()).await;
+            if !pairing_durable {
+                tracing::error!(
+                    snapshot_seq,
+                    commit_op,
+                    "state transfer installed but the superblock write failed; the \
+                     transferred checkpoint is not durable yet"
+                );
+            }
+        }
+
+        Ok(InstallOutcome {
+            applied_frontier: snapshot_seq.max(local_applied),
+            pairing_durable,
+        })
+    }
+
     /// Submit `Register` from in-process, await commit. Wire reply still fires
     /// via `message_bus.send_to_client`; subscriber is additive.
     ///
@@ -1099,7 +1887,7 @@ where
 
         // Wrong node: waiting or queueing cannot fix that, the client must
         // re-route to the primary.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Err(MetadataSubmitError::NotPrimary);
         }
 
@@ -1344,7 +2132,7 @@ where
         // logout-vs-logout race. It simply pipelines behind the in-flight
         // batch and commits with it, so a one-shot client's session
         // teardown is latency, never an error.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Err(MetadataSubmitError::NotPrimary);
         }
 
@@ -1458,7 +2246,7 @@ where
         // client submits compete for.
         if !is_caught_up_primary(consensus) {
             return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
                     MetadataSubmitError::NotCaughtUp
                 } else {
                     MetadataSubmitError::NotPrimary
@@ -1540,7 +2328,7 @@ where
         // deletion on its next sweep.
         if !is_caught_up_primary(consensus) {
             return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
                     MetadataSubmitError::NotCaughtUp
                 } else {
                     MetadataSubmitError::NotPrimary
@@ -1637,7 +2425,7 @@ where
         // simply pipelines behind the in-flight batch (the wire path has
         // always done this); the register-specific invariant is guarded in
         // `submit_register_in_process` / `register_preflight`.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
@@ -1807,7 +2595,7 @@ where
         let Some(consensus) = self.consensus.as_ref() else {
             return;
         };
-        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_syncing() {
+        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
             return;
         }
         let Some(journal) = self.journal.as_ref() else {
@@ -1975,21 +2763,28 @@ where
             let reply = if prepare_header.operation == Operation::Register {
                 // Register: commit_register creates session, no SM.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                self.client_table.borrow_mut().commit_register(
-                    prepare_header.client,
-                    prepare_header.user_id,
-                    reply.clone(),
-                );
+                if self.client_table_mutation_allowed(prepare_header.op) {
+                    self.client_table.borrow_mut().commit_register(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        reply.clone(),
+                    );
+                }
                 reply
             } else if prepare_header.operation == Operation::Logout {
                 // Logout unregisters the VSR client session on every replica.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                self.client_table
-                    .borrow_mut()
-                    .remove_client(prepare_header.client);
+                if self.client_table_mutation_allowed(prepare_header.op) {
+                    self.client_table
+                        .borrow_mut()
+                        .remove_client(prepare_header.client);
+                }
                 // Drop the disconnected client from every consumer group it
                 // joined and rebalance. Deterministic side-effect of the
-                // Logout commit, applied identically on every replica.
+                // Logout commit, applied identically on every replica. Runs
+                // regardless of the table frontier: the STM was restored at
+                // the snapshot floor, so ops above it still owe their STM
+                // effects even where the table already reflects them.
                 self.mux_stm.streams().remove_consumer_group_member(
                     prepare_header.client,
                     iggy_common::IggyTimestamp::from(prepare_header.timestamp),
@@ -2013,12 +2808,16 @@ where
                     build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
                         apply.write_reply_body(dst);
                     });
-                // Best-effort cache; the wire reply ships either way.
-                let outcome = self
-                    .client_table
-                    .borrow_mut()
-                    .commit_reply(prepare_header.client, reply.clone());
-                log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
+                // Best-effort cache; the wire reply ships either way. Ops at
+                // or below the state-transfer frontier are already reflected
+                // in the transferred table and are skipped.
+                if self.client_table_mutation_allowed(prepare_header.op) {
+                    let outcome = self
+                        .client_table
+                        .borrow_mut()
+                        .commit_reply(prepare_header.client, reply.clone());
+                    log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
+                }
                 reply
             };
             consensus.advance_commit_min(prepare_header.op);
@@ -2099,7 +2898,7 @@ where
         let Some(consensus) = self.consensus.as_ref() else {
             return;
         };
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return;
         }
         let stranded_commits = consensus.commit_min() < consensus.commit_max();
@@ -2189,7 +2988,10 @@ where
             // at enqueue time resolves on this prepare's commit.
             assert!(!consensus.is_follower(), "promotion: primary only");
             assert!(consensus.is_normal(), "promotion: status must be normal");
-            assert!(!consensus.is_syncing(), "promotion: must not be syncing");
+            assert!(
+                !consensus.is_transferring(),
+                "promotion: must not be transferring state"
+            );
             consensus.verify_pipeline();
             match reply_sender {
                 Some(sender) => {
@@ -2199,6 +3001,143 @@ where
             }
             self.on_replicate(prepare).await;
         }
+    }
+}
+
+impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    /// Persist the current VSR state to the superblock when the view changed since
+    /// the last write. The split-brain gate: callers MUST invoke this before
+    /// dispatching any view-scoped VSR message, so a replica that acted in a view can
+    /// never recover an older one after a crash.
+    ///
+    /// It fences the SEND, not the ACT. By the time a caller reaches here the handler
+    /// has already moved `view`, `log_view`, `status`, the sequencer and the pipeline,
+    /// and `commit_journal` runs outside the gate, so a failed persist still applies
+    /// committed ops locally. That is the VSR fence and it is sufficient: local state a
+    /// crash forgets is state no peer ever saw, whereas an externalized view must be
+    /// recoverable. Do not read this as "nothing changed until the write lands".
+    ///
+    /// `true` when the send may proceed, either because the state is now durable or
+    /// because there was nothing to persist (peer shard, partition plane, or an
+    /// unchanged view). `false` only when a write was attempted and failed, and the
+    /// caller must withhold the send. The in-memory view stays ahead of the durable
+    /// one, which a crash safely rolls back, and the next tick retries.
+    ///
+    /// Kept on a `B`/`P`-only impl, with no journal/snapshot/state-machine bounds, so
+    /// every VSR dispatch site can gate on it regardless of its own bounds.
+    #[allow(clippy::future_not_send)]
+    pub async fn persist_superblock_if_needed(&self, consensus: &VsrConsensus<B, P>) -> bool {
+        let Some(superblock) = self.superblock.as_ref() else {
+            return true;
+        };
+        // Lock-free fast path: the steady state is an unchanged view with nothing to
+        // write, and skipping the lock keeps every gated send off it, notably
+        // `send_prepare_ok`, which runs this per metadata prepare. Safe because
+        // `view`/`log_view` advance only on this single-threaded executor and no
+        // `.await` sits between the `Cell` read and the return, so the value cannot
+        // change under us; a concurrent advance is caught by the re-check below.
+        if !consensus.needs_superblock_persist() {
+            return true;
+        }
+        // A write that keeps failing must not re-run a full `atomic_replace` on every
+        // 10 ms tick. Back off first, while still reporting `false` so the send stays
+        // withheld: fail-closed is the point of this gate, and the backoff only bounds
+        // what the retry costs.
+        if consensus.clock_realtime_micros() < self.superblock_retry_after_micros.get() {
+            return false;
+        }
+        // Serialize superblock writes on this shard: view-change persists here and
+        // checkpoints share the one ping-pong superblock, whose `write` picks its slot
+        // before it awaits, so two overlapping writers would target the same slot and
+        // could tear it while both report success. Re-check needs-persist AFTER
+        // acquiring the lock so check and write are atomic and a redundant caller
+        // coalesces, finding the state already made durable by the writer it queued
+        // behind.
+        let _superblock = self.superblock_lock.acquire().await;
+        if !consensus.needs_superblock_persist() {
+            return true;
+        }
+        self.write_superblock(consensus, superblock.as_ref()).await
+    }
+
+    /// Write the current VSR state, paired with the last durable checkpoint, under
+    /// [`Self::superblock_lock`].
+    ///
+    /// The caller must hold that lock. The state is captured HERE rather than passed
+    /// in: with writes serialized and no await between the capture and the write, the
+    /// last writer carries the freshest view, so the durable view cannot regress even
+    /// when a checkpoint and a view change interleave. See `mark_superblock_durable`
+    /// for why the written values, not a re-read, mark durability.
+    ///
+    /// # Terminal policy
+    /// There is none beyond staying fenced: a replica that cannot record the view it
+    /// is in must not act in it, so it withholds every view-scoped send, goes quiet,
+    /// and its peers elect around it. Failures are counted and the retry interval backs
+    /// off to [`SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`], with the error logged on the
+    /// first failure and then at each backoff step rather than per tick.
+    ///
+    /// TODO(fail-stop): a replica wedged here is dead weight an operator has to notice
+    /// from logs. Fail-stopping the process is the TigerBeetle-style answer, but this
+    /// layer holds no process-lifecycle handle; wire it where the shard owns shutdown.
+    #[allow(clippy::future_not_send)]
+    async fn write_superblock(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        superblock: &dyn DynSuperblockStore,
+    ) -> bool {
+        // Carry the last durable pairing forward so a view-change write never
+        // regresses the `(checkpoint_op, checksum)` a checkpoint recorded. `(0, 0)`
+        // with no checkpoint taken, or no coordinator (peer shards, the simulator).
+        let (checkpoint_op, checkpoint_checksum) = self
+            .coordinator
+            .as_ref()
+            .map_or((0, 0), SnapshotCoordinator::last_checkpoint);
+        let state = consensus.vsr_state(checkpoint_op, checkpoint_checksum);
+        match superblock.dyn_write(&state.to_bytes()).await {
+            Ok(()) => {
+                consensus.mark_superblock_durable(state.view, state.log_view);
+                self.superblock_write_failures.set(0);
+                self.superblock_retry_after_micros.set(0);
+                true
+            }
+            Err(error) => {
+                let failures = self.superblock_write_failures.get() + 1;
+                self.superblock_write_failures.set(failures);
+                let backoff = SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS
+                    .saturating_mul(1 << failures.min(SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT))
+                    .min(SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
+                self.superblock_retry_after_micros
+                    .set(consensus.clock_realtime_micros() + backoff);
+                // Rate-limited to the backoff steps: the tick would otherwise emit this
+                // every 10 ms for as long as the disk stays broken.
+                if failures.is_power_of_two() {
+                    tracing::error!(
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        view = state.view,
+                        log_view = state.log_view,
+                        superblock_write_failures = failures,
+                        retry_in_micros = backoff,
+                        %error,
+                        "superblock persist failed; withholding every view-scoped send \
+                         until it succeeds, so this replica stays quorum-invisible"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Consecutive failed superblock writes, `0` when the last one succeeded. Read by
+    /// diagnostics: a non-zero value means this replica is fenced out of view changes.
+    #[must_use]
+    pub const fn superblock_write_failures(&self) -> u64 {
+        self.superblock_write_failures.get()
     }
 }
 
@@ -2227,6 +3166,22 @@ where
         let Some(coordinator) = &self.coordinator else {
             return;
         };
+        // Serialize whole checkpoints against each other. In-process metadata submits
+        // each run on their own spawned task (`bus.spawn` in server-ng's metadata submit
+        // handler), so at the checkpoint margin two can enter here concurrently; without
+        // this lock they would run concurrent `persist_snapshot`s over the single
+        // `snapshot.bin` and concurrently `drain` the WAL, which rewrites through a
+        // shared `wal.tmp`. Acquire BEFORE `should_checkpoint` so check and sequence are
+        // atomic: the second caller re-checks under the lock, finds the margin restored
+        // by the first's drain, and coalesces away the redundant work.
+        //
+        // The superblock write below takes `superblock_lock` for itself, so a
+        // concurrent view persist (and with it every gated send, including the ack
+        // path) waits only for that write and not for this whole sequence.
+        let _checkpoint = self.checkpoint_lock.acquire().await;
+        if !coordinator.should_checkpoint(journal) {
+            return;
+        }
 
         // Use commit_min (locally executed), not commit_max. WAL entries
         // between commit_min+1 and commit_max haven't been applied to the
@@ -2236,20 +3191,25 @@ where
         // under the simulator), not the wall clock, so replayed snapshots are
         // byte-identical.
         let created_at = consensus.clock_realtime_micros();
-        match coordinator
-            .checkpoint_if_needed(&self.mux_stm, journal, snap_op, created_at)
-            .await
-        {
-            Ok(true) => {
-                debug!(
-                    target: "iggy.metadata.diag",
-                    plane = "metadata",
-                    replica_id = consensus.replica(),
-                    checkpoint_op = snap_op,
-                    "forced checkpoint completed"
-                );
-            }
-            Ok(false) => {}
+
+        // Durability ordering, must not be reordered: persist the snapshot, durably
+        // record the (checkpoint_op, checksum, commit_max) pairing in the superblock,
+        // THEN drain the snapshotted prefix from the WAL. A crash before the
+        // superblock write recovers the prior checkpoint with the WAL intact; a crash
+        // after it recovers the new one. Draining before the superblock points at the
+        // new snapshot could strand committed ops on a crash. Each fallible step
+        // withholds the rest and returns early, leaving the WAL undrained, so
+        // `should_checkpoint` stays true and the next tick retries from the top at the
+        // then-current commit_min. The prepare being replicated appends regardless
+        // (see the phantom-op comment at the call site).
+        let client_table = self.client_table.borrow().to_snapshot();
+        let checksum = match coordinator.persist_snapshot(
+            &self.mux_stm,
+            snap_op,
+            created_at,
+            Some(client_table),
+        ) {
+            Ok(checksum) => checksum,
             Err(e) => {
                 error!(
                     target: "iggy.metadata.diag",
@@ -2257,10 +3217,60 @@ where
                     replica_id = consensus.replica(),
                     checkpoint_op = snap_op,
                     error = %e,
-                    "forced checkpoint failed; continuing without WAL reclamation"
+                    "checkpoint snapshot persist failed"
                 );
+                return;
+            }
+        };
+
+        if let Some(superblock) = self.superblock.as_ref() {
+            // `persist_snapshot` already recorded the new pairing on the coordinator, so
+            // `write_superblock` picks it up from there. A view persist that interleaves
+            // between those two steps writes the same new pairing, which only makes it
+            // durable sooner.
+            debug_assert_eq!(
+                self.coordinator
+                    .as_ref()
+                    .map(SnapshotCoordinator::last_checkpoint),
+                Some((snap_op, checksum)),
+                "the checkpoint's pairing must be what the superblock write records"
+            );
+            let _superblock = self.superblock_lock.acquire().await;
+            if !self.write_superblock(consensus, superblock.as_ref()).await {
+                error!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    checkpoint_op = snap_op,
+                    "checkpoint superblock write failed; withholding WAL drain"
+                );
+                return;
             }
         }
+
+        if let Err(e) = coordinator.drain(journal, snap_op).await {
+            error!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                checkpoint_op = snap_op,
+                error = %e,
+                "checkpoint WAL drain failed"
+            );
+            return;
+        }
+
+        // Info, not debug: checkpoints are rare and change what a restart can
+        // recover locally, and spec tests pin checkpoint placement by grepping
+        // this line off stdout at the default `info` level
+        // (`metadata_checkpoint_restart`, `metadata_state_transfer`).
+        info!(
+            target: "iggy.metadata.diag",
+            plane = "metadata",
+            replica_id = consensus.replica(),
+            checkpoint_op = snap_op,
+            "forced checkpoint completed"
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2491,47 +3501,22 @@ where
 
             // SM apply + client_table mutation BEFORE `advance_commit_min`
             // (see `on_ack` for matching invariant). No await between table
-            // mutation and counter bump.
-            if header.operation == Operation::Register {
-                // Register: commit_register creates session, no SM.
-                let reply = build_reply_message(&header, &bytes::Bytes::new());
-                self.client_table.borrow_mut().commit_register(
-                    header.client,
-                    header.user_id,
-                    reply,
-                );
-            } else if header.operation == Operation::Logout {
-                self.client_table.borrow_mut().remove_client(header.client);
-                // Mirror the on_ack path: drop the disconnected client from
-                // every consumer group it joined and rebalance.
-                self.mux_stm.streams().remove_consumer_group_member(
-                    header.client,
-                    iggy_common::IggyTimestamp::from(header.timestamp),
-                );
-            } else {
-                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
-                // only; a business rejection commits as a deterministic no-op
-                // whose `code` rides the reply body, replayed on retry.
-                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
-                    panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
-                });
-                // Post-commit notifier (e.g. partition reconciler
-                // wake-up). Same hook fires on backups so reconcilers
-                // converge after replicated commits, not only quorum-acked
-                // ones reached via `on_ack` on the primary.
-                self.fire_commit_notifier(header.operation);
-                let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
-                    apply.write_reply_body(dst);
-                });
-                // Best-effort cache; WAL replay may carry a reply for a
-                // later-evicted client, and replica-local eviction makes a
-                // stale-request replay reachable. Both are skips, not faults.
-                let outcome = self
-                    .client_table
-                    .borrow_mut()
-                    .commit_reply(header.client, reply);
-                log_commit_reply_outcome(outcome, header.client, op);
-            }
+            // mutation and counter bump. The post-commit notifier (e.g. partition
+            // reconciler wake-up) fires on backups too, so reconcilers converge
+            // after replicated commits, not only quorum-acked ones reached via
+            // `on_ack` on the primary.
+            //
+            // Table mutations are skipped at or below the state-transfer
+            // frontier: those ops are already reflected in the transferred
+            // table, while their state-machine effects still have to replay
+            // (the snapshot sits at a lower op).
+            apply_committed_prepare(
+                &self.mux_stm,
+                &self.client_table,
+                self.client_table_mutation_allowed(header.op),
+                |operation| self.fire_commit_notifier(operation),
+                prepare,
+            );
             consensus.advance_commit_min(op);
             debug!("commit_journal: committed op={op}");
         }
@@ -2575,6 +3560,14 @@ where
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
         let consensus = self.consensus.as_ref().unwrap();
+        // Durable-before-send: a PrepareOk implies this replica's (view, log_view), so
+        // it must not leave until they are durable, or a crash could recover an older
+        // view than the one this ack helped commit in, losing a committed op. Mirrors
+        // the view-change dispatch gate; withhold on persist failure and let the
+        // primary's prepare retransmit re-drive the ack once the next tick persists.
+        if !self.persist_superblock_if_needed(consensus).await {
+            return;
+        }
         let journal = self.journal.as_ref().unwrap();
         let persisted = journal.handle().header(header.op as usize).is_some();
         send_prepare_ok_common(consensus, header, Some(persisted)).await;
@@ -2844,6 +3837,12 @@ where
         // UpdateTopic default-size rewrite, and the PAT-cleaner delete), which
         // would otherwise reset it to 0 via `..Default::default()`.
         user_id: request.user_id,
+        // Seal the body integrity field over the rewritten body, exactly as
+        // `Project::project` does for wire-projected prepares. This helper builds
+        // a NEW body, so the wire header's stamp does not describe it; leaving it
+        // zero makes the journal scan read every rewritten entry as corrupt and
+        // refuse boot on the next restart.
+        checksum_body: u128::from(iggy_common::calculate_checksum(body)),
         ..Default::default()
     };
 
@@ -3000,6 +3999,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn populated_snapshot_reencode_and_checksum_are_stable() {
+        // Two replicas holding identical state must serialize it identically, which
+        // holds only while every serialized collection keeps a deterministic order.
+        // Fold a multi-slot client table (the envelope's own Vec) and assert the raw
+        // re-encode survives the round-trip. The streams sub-tree's map-derived Vecs are
+        // covered by
+        // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
+        let mut snapshot = IggySnapshot::new(7);
+        snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            slots: vec![
+                (
+                    0,
+                    consensus::ClientEntrySnapshot {
+                        client_id: 1,
+                        epoch: 10,
+                        user_id: 1,
+                        watermark: 3,
+                        watermark_checksum: 0xabc,
+                        reply: vec![1, 2, 3],
+                    },
+                ),
+                (
+                    2,
+                    consensus::ClientEntrySnapshot {
+                        client_id: 2,
+                        epoch: 20,
+                        user_id: 2,
+                        watermark: 0,
+                        watermark_checksum: 0,
+                        reply: vec![4, 5],
+                    },
+                ),
+            ],
+        });
+
+        let encoded = snapshot.encode().unwrap();
+        let decoded = IggySnapshot::decode(&encoded).unwrap();
+        assert_eq!(
+            encoded,
+            decoded.encode().unwrap(),
+            "a populated snapshot must re-encode byte-identically after a decode; an \
+             unordered collection in the serialized form would make two replicas with \
+             identical state serialize differently"
+        );
+        assert_ne!(
+            checkpoint_checksum(&encoded),
+            checkpoint_checksum(&IggySnapshot::new(7).encode().unwrap()),
+            "the checksum must track content, else it could not detect a torn snapshot"
+        );
+    }
+
+    #[test]
+    fn client_table_reply_bytes_encode_as_a_msgpack_blob() {
+        // A `Vec<u8>` serialized through serde's sequence path spends 2 bytes on every
+        // byte >= 0x80, so a checkpoint's reply payload runs up to roughly double.
+        // Reply bytes are wire messages, mostly high bytes, so pin the `bin` encoding:
+        // the format freezes at release and this is much cheaper to fix now.
+        const REPLY_LEN: usize = 512;
+        let mut snapshot = IggySnapshot::new(1);
+        snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            slots: vec![(
+                0,
+                consensus::ClientEntrySnapshot {
+                    client_id: 1,
+                    epoch: 1,
+                    user_id: 1,
+                    watermark: 0,
+                    watermark_checksum: 0,
+                    reply: vec![0xFF; REPLY_LEN],
+                },
+            )],
+        });
+
+        let encoded = snapshot.encode().unwrap();
+        let baseline = IggySnapshot::new(1).encode().unwrap().len();
+        let reply_cost = encoded.len() - baseline;
+        assert!(
+            reply_cost < REPLY_LEN * 2,
+            "a {REPLY_LEN}-byte reply of high bytes cost {reply_cost} bytes, so it is \
+             still encoding as an integer array rather than a msgpack blob"
+        );
+
+        // And it must decode back to the same bytes.
+        let decoded = IggySnapshot::decode(&encoded).unwrap();
+        let table = decoded.snapshot().client_table.as_ref().unwrap();
+        assert_eq!(table.slots[0].1.reply, vec![0xFF; REPLY_LEN]);
+    }
+
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 
     /// Build a peer-shard-style `IggyMetadata` with `consensus`,
@@ -3008,7 +4096,7 @@ mod tests {
     /// the test picks `()` for `C` / `J` / `S` since no notifier code path
     /// touches their methods.
     fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
-        IggyMetadata::new(None, None, None, TestMux::default(), None)
+        IggyMetadata::new(None, None, None, None, TestMux::default(), None)
     }
 
     #[test]
@@ -3148,6 +4236,7 @@ mod tests {
                 Some(consensus),
                 Some(journal),
                 None,
+                None,
                 TestMux::default(),
                 None,
             );
@@ -3249,7 +4338,7 @@ mod tests {
             LocalPipeline::new(),
         );
         consensus.init();
-        IggyMetadata::new(Some(consensus), None, None, TestMux::default(), None)
+        IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None)
     }
 
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RequestHeader> {
@@ -3416,6 +4505,7 @@ mod tests {
             IggyMetadata::new(
                 Some(consensus),
                 Some(journal),
+                None,
                 None,
                 TestMux::default(),
                 None,
@@ -3593,6 +4683,7 @@ mod tests {
                 Some(consensus),
                 Some(journal),
                 None,
+                None,
                 TestMux::default(),
                 None,
             );
@@ -3743,6 +4834,7 @@ mod tests {
                 Some(consensus),
                 Some(journal),
                 None,
+                None,
                 TestMux::default(),
                 Some(dir.path().to_path_buf()),
             );
@@ -3888,6 +4980,7 @@ mod tests {
                 Some(consensus),
                 Some(journal),
                 None,
+                None,
                 TestMux::default(),
                 None,
             );
@@ -4011,6 +5104,7 @@ mod tests {
             IggyMetadata::new(
                 Some(consensus),
                 Some(journal),
+                None,
                 None,
                 TestMux::default(),
                 None,
@@ -4146,6 +5240,7 @@ mod tests {
             IggyMetadata::new(
                 Some(consensus),
                 Some(journal),
+                None,
                 None,
                 TestMux::default(),
                 None,

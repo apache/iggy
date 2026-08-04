@@ -18,23 +18,27 @@
 pub mod client;
 mod consumer;
 mod identifier;
+mod permissions;
 mod receive_message;
 mod send_message;
 mod stream;
 mod topic;
 mod user;
+mod user_headers;
 
 use client::IggyClient;
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
 };
+use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::SendMessage;
 use stream::StreamDetails;
 use topic::{Topic, TopicDetails};
 use user::{UserInfo, UserInfoDetails, UserStatus};
+use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 
 /// A Python module implemented in Rust.
 #[pymodule]
@@ -57,5 +61,12 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<UserStatus>()?;
     m.add_class::<UserInfo>()?;
     m.add_class::<UserInfoDetails>()?;
+    m.add_class::<UserHeaders>()?;
+    m.add_class::<HeaderKey>()?;
+    m.add_class::<HeaderValue>()?;
+    m.add_class::<Permissions>()?;
+    m.add_class::<GlobalPermissions>()?;
+    m.add_class::<StreamPermissions>()?;
+    m.add_class::<TopicPermissions>()?;
     Ok(())
 }

@@ -19,8 +19,9 @@ use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
     Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, StartViewChangeHeader,
-    StartViewHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+    StateTransferTargetHeader,
 };
 use smallvec::SmallVec;
 use std::{marker::PhantomData, mem::size_of};
@@ -512,6 +513,11 @@ pub enum MessageBag {
     RepairPrepare(Message<RepairPrepareHeader>),
     /// `RepairDone` / `RangeEvicted` (one layout, two commands).
     RepairRangeReply(Message<RepairRangeReplyHeader>),
+    RequestStateTransfer(Message<RequestStateTransferHeader>),
+    StateTransferTarget(Message<StateTransferTargetHeader>),
+    RequestStateChunk(Message<RequestStateChunkHeader>),
+    /// Artifact bytes ride the body (`size` spans header + payload).
+    StateChunk(Message<StateChunkHeader>),
 }
 
 impl MessageBag {
@@ -529,6 +535,10 @@ impl MessageBag {
             Self::RequestPrepares(message) => message.header().command,
             Self::RepairPrepare(message) => message.header().command(),
             Self::RepairRangeReply(message) => message.header().command,
+            Self::RequestStateTransfer(message) => message.header().command,
+            Self::StateTransferTarget(message) => message.header().command,
+            Self::RequestStateChunk(message) => message.header().command,
+            Self::StateChunk(message) => message.header().command,
         }
     }
 
@@ -546,6 +556,10 @@ impl MessageBag {
             Self::RequestPrepares(message) => message.header().size(),
             Self::RepairPrepare(message) => message.header().size(),
             Self::RepairRangeReply(message) => message.header().size(),
+            Self::RequestStateTransfer(message) => message.header().size(),
+            Self::StateTransferTarget(message) => message.header().size(),
+            Self::RequestStateChunk(message) => message.header().size(),
+            Self::StateChunk(message) => message.header().size(),
         }
     }
 
@@ -563,6 +577,10 @@ impl MessageBag {
             Self::RequestPrepares(message) => message.header().operation(),
             Self::RepairPrepare(message) => message.header().operation(),
             Self::RepairRangeReply(message) => message.header().operation(),
+            Self::RequestStateTransfer(message) => message.header().operation(),
+            Self::StateTransferTarget(message) => message.header().operation(),
+            Self::RequestStateChunk(message) => message.header().operation(),
+            Self::StateChunk(message) => message.header().operation(),
         }
     }
 }
@@ -607,6 +625,18 @@ where
             )),
             Command2::RepairDone | Command2::RangeEvicted => Ok(Self::RepairRangeReply(
                 value.try_into_typed::<RepairRangeReplyHeader>()?,
+            )),
+            Command2::RequestStateTransfer => Ok(Self::RequestStateTransfer(
+                value.try_into_typed::<RequestStateTransferHeader>()?,
+            )),
+            Command2::StateTransferTarget => Ok(Self::StateTransferTarget(
+                value.try_into_typed::<StateTransferTargetHeader>()?,
+            )),
+            Command2::RequestStateChunk => Ok(Self::RequestStateChunk(
+                value.try_into_typed::<RequestStateChunkHeader>()?,
+            )),
+            Command2::StateChunk => Ok(Self::StateChunk(
+                value.try_into_typed::<StateChunkHeader>()?,
             )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.

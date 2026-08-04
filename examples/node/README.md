@@ -125,7 +125,7 @@ These examples require a TLS-enabled Iggy server. Start the server with:
 IGGY_TCP_TLS_ENABLED=true \
 IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-cargo r --bin iggy-server
+cargo run --bin iggy-server
 ```
 
 Demonstrates how to configure the client with `transport: 'TLS'` and a custom CA certificate for secure communication.

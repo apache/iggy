@@ -27,7 +27,7 @@ use crate::stm::result::{
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 // Only `seed_namespace` (below, sim/test-gated) uses these at module scope;
@@ -460,6 +460,43 @@ impl StatsRegistry {
             .retain(|(sid, tid, pid), _| {
                 !(*sid == stream_id && *tid == topic_id && *pid >= first_removed)
             });
+    }
+
+    /// Drop every entry the snapshot does not describe, keeping the rest.
+    ///
+    /// Used by the in-place restore (state transfer), which replaces the whole
+    /// stream tree but must not replace the registry: partition counters live
+    /// only here (never snapshotted), so survivors have to keep their `Arc`s
+    /// or every already-materialized partition reads (0,0,0,0) forever. Slab
+    /// keys are recycled, so anything the snapshot dropped has to go with it.
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    fn retain_from_snapshot(&self, snapshot: &StreamsSnapshot) {
+        let mut live_streams: AHashSet<usize> = AHashSet::new();
+        let mut live_topics: AHashSet<(usize, usize)> = AHashSet::new();
+        let mut live_partitions: AHashSet<(usize, usize, usize)> = AHashSet::new();
+        for (stream_key, stream) in &snapshot.items {
+            live_streams.insert(*stream_key);
+            for (topic_key, topic) in &stream.topics {
+                live_topics.insert((*stream_key, *topic_key));
+                for partition in &topic.partitions {
+                    live_partitions.insert((*stream_key, *topic_key, partition.id));
+                }
+            }
+        }
+        self.streams
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|id, _| live_streams.contains(id));
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|key, _| live_topics.contains(key));
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|key, _| live_partitions.contains(key));
     }
 }
 
@@ -1175,15 +1212,29 @@ impl Streams {
     /// byte-identical namespace. That difference is the only thing separating
     /// the two incarnations, so callers can use it to tell a materialised
     /// partition apart from the committed one it is impersonating.
+    /// This sits on the per-request incarnation fence
+    /// (`IggyShard::serves_committed_incarnation`) and on the park stamp, so it
+    /// runs once per partition request rather than once per reconciler pass. A
+    /// plain scan of `partitions` would therefore cost ~N element visits per
+    /// request on an N-partition topic. Partitions are pushed in dense id order by
+    /// `CreateTopicWithAssignments` / `CreatePartitionsWithAssignments`, so the
+    /// direct index hits in one step; the scan stays as the fallback because
+    /// nothing in the type enforces that density.
     #[must_use]
     pub fn created_revision_for_namespace(&self, namespace: IggyNamespace) -> Option<u64> {
         self.inner.read(|inner| {
             let stream = inner.items.get(namespace.stream_id())?;
             let topic = stream.topics.get(namespace.topic_id())?;
+            let partition_id = namespace.partition_id();
+            if let Some(partition) = topic.partitions.get(partition_id)
+                && partition.id == partition_id
+            {
+                return Some(partition.created_revision);
+            }
             topic
                 .partitions
                 .iter()
-                .find(|partition| partition.id == namespace.partition_id())
+                .find(|partition| partition.id == partition_id)
                 .map(|partition| partition.created_revision)
         })
     }
@@ -1850,6 +1901,12 @@ impl StateHandler for DeletePartitionsRequest {
 }
 
 /// Snapshot representation for the Streams state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items` and the nested `topics` / `consumer_groups` / `partitions` stay ordered
+/// `Vec`s even though the runtime holds them in `AHashMap`s and a `Slab`. Swapping
+/// any back to an unordered map reorders on a decode and re-encode, breaking the
+/// checkpoint checksum cross-check recovery relies on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsSnapshot {
     pub items: Vec<(usize, StreamSnapshot)>,
@@ -1939,12 +1996,43 @@ impl Snapshotable for Streams {
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        // Boot: no live registry exists yet, so mint one. Safe because
+        // `new_from_empty` clones this single inner onto the other left-right
+        // buffer rather than building a second one.
+        Ok(StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default())).into())
+    }
+}
+
+impl StreamsInner {
+    /// Rebuild from a snapshot section IN PLACE, keeping the live stats
+    /// registry.
+    ///
+    /// The restore command is absorbed on BOTH left-right buffers, so minting
+    /// a registry here would hand the two buffers different `Arc`s and split
+    /// every direct partition-plane counter increment by publish parity --
+    /// exactly what [`StatsRegistry`] exists to prevent. Carrying the registry
+    /// across also preserves the `Arc<PartitionStats>` the data plane
+    /// registered at bootstrap and reconcile, which nothing in a snapshot can
+    /// reconstruct (partition counters are not snapshotted).
+    pub(crate) fn restore_in_place(&mut self, snapshot: StreamsSnapshot) {
+        let registry = Arc::clone(&self.stats_registry);
+        // Slab keys are recycled, so an entry left over from a stream the
+        // snapshot does not have would hand its counters to whatever lands in
+        // that slot next.
+        registry.retain_from_snapshot(&snapshot);
+        *self = Self::inner_from_snapshot(snapshot, registry);
+    }
+
+    /// Build a complete `StreamsInner` from a snapshot section against
+    /// `stats_registry`. Shared by wrapper construction
+    /// ([`Snapshotable::from_snapshot`]) and the in-place restore command
+    /// (state transfer), which absorbs it on both left-right buffers.
+    pub(crate) fn inner_from_snapshot(
+        snapshot: StreamsSnapshot,
+        stats_registry: Arc<StatsRegistry>,
+    ) -> Self {
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
         let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
-        // Register restored stats in the shared registry so both left-right
-        // buffers (and any post-restore op) reference one `Arc` per
-        // stream/topic (see `StatsRegistry`).
-        let stats_registry = Arc::new(StatsRegistry::default());
 
         for (slab_key, stream_snap) in snapshot.items {
             let stream_stats = stats_registry.stream(slab_key);
@@ -2029,7 +2117,7 @@ impl Snapshotable for Streams {
         }
 
         let items: Slab<Stream> = stream_entries.into_iter().collect();
-        let mut inner = StreamsInner {
+        let mut inner = Self {
             index,
             items,
             revision: snapshot.revision,
@@ -2039,7 +2127,7 @@ impl Snapshotable for Streams {
             stats_registry,
         };
         inner.recompute_pending_revocations_count();
-        Ok(inner.into())
+        inner
     }
 }
 
@@ -2048,6 +2136,7 @@ impl_fill_restore!(Streams, streams);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::snapshot::MetadataSnapshot;
     use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::codec::WireDecode;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -2098,6 +2187,85 @@ mod tests {
             replication_factor: 1,
             name: WireName::new(name).unwrap(),
         }
+    }
+
+    /// Regression guard for the [`StreamsSnapshot`] serialized-form invariant: a
+    /// populated snapshot must re-encode byte-identically after a decode, or the
+    /// checkpoint checksum cross-check (`recovery::verify_checkpoint_pairing`) would
+    /// diverge and refuse boot on a healthy node. Populates the three map-derived
+    /// `Vec`s (`items`, `topics`, `consumer_groups`) with two entries each, since one
+    /// entry cannot reorder and only >= 2 makes a regression observable.
+    #[test]
+    fn populated_streams_snapshot_reencode_is_byte_stable() {
+        let mut inner = StreamsInner::new();
+        for name in ["alpha", "beta"] {
+            create_stream(&mut inner, name);
+        }
+        // Streams are assigned ids 0, 1 in creation order; two topics per stream,
+        // two consumer groups per topic.
+        for stream_id in 0..2u32 {
+            for topic_name in ["logs", "events"] {
+                let create_topic = CreateTopicWithAssignmentsRequest {
+                    request: make_topic_request(stream_id, 2, topic_name),
+                    partitions: vec![
+                        CreatedPartitionAssignment {
+                            partition_id: 0,
+                            consensus_group_id: 1,
+                        },
+                        CreatedPartitionAssignment {
+                            partition_id: 1,
+                            consensus_group_id: 2,
+                        },
+                    ],
+                };
+                let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+            }
+        }
+        for stream_id in 0..2u32 {
+            for topic_id in 0..2u32 {
+                for group_name in ["cg-a", "cg-b"] {
+                    let request = CreateConsumerGroupRequest {
+                        stream_id: WireIdentifier::numeric(stream_id),
+                        topic_id: WireIdentifier::numeric(topic_id),
+                        name: WireName::new(group_name).unwrap(),
+                    };
+                    let _ = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+                }
+            }
+        }
+        let streams: Streams = inner.into();
+
+        let mut snapshot = MetadataSnapshot::new(7);
+        snapshot.streams = Some(streams.to_snapshot());
+
+        // The tree really is populated, else a byte-stable empty snapshot would pass
+        // vacuously.
+        let streams_snapshot = snapshot.streams.as_ref().unwrap();
+        assert_eq!(streams_snapshot.items.len(), 2, "two streams");
+        let (_, first_stream) = &streams_snapshot.items[0];
+        assert_eq!(
+            first_stream.topics.len(),
+            2,
+            "two topics in the first stream"
+        );
+        let (_, first_topic) = &first_stream.topics[0];
+        assert_eq!(
+            first_topic.consumer_groups.len(),
+            2,
+            "two consumer groups in the first topic"
+        );
+
+        let encoded = snapshot.encode().unwrap();
+        let reencoded = MetadataSnapshot::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(
+            encoded, reencoded,
+            "a populated snapshot must re-encode byte-identically after a decode; an \
+             unordered collection would reorder and break the checkpoint checksum \
+             cross-check, refusing boot on a healthy node"
+        );
     }
 
     #[test]
@@ -2372,5 +2540,89 @@ mod tests {
         }
         buffer.as_mut_slice()[header_size..].copy_from_slice(&body);
         Message::try_from(buffer).unwrap()
+    }
+
+    /// One stream, one topic, one partition, materialized in the registry the
+    /// way the data plane does at bootstrap.
+    fn inner_with_registered_partition() -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "alpha");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "logs"),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let topic_stats = inner.items[0].topics[0].stats.clone();
+        inner.stats_registry.partition(0, 0, 0, topic_stats);
+        inner
+    }
+
+    // The restore command is absorbed on BOTH left-right buffers. Minting a
+    // registry per call would hand the two buffers different `Arc`s, so a
+    // direct partition-plane increment would land on one buffer and vanish on
+    // the next publish -- the `messages_count_inconsistent` failure the
+    // registry exists to prevent.
+    #[test]
+    fn in_place_restore_keeps_one_registry_across_both_buffers() {
+        let mut first = inner_with_registered_partition();
+        let snapshot = Streams::from(first.clone()).to_snapshot();
+        let mut second = first.clone();
+
+        first.restore_in_place(snapshot.clone());
+        second.restore_in_place(snapshot);
+
+        assert!(
+            Arc::ptr_eq(&first.stats_registry, &second.stats_registry),
+            "both buffers must keep the one shared registry"
+        );
+        let from_first = first
+            .stats_registry
+            .partition_get(0, 0, 0)
+            .expect("survivor keeps its partition stats");
+        let from_second = second
+            .stats_registry
+            .partition_get(0, 0, 0)
+            .expect("survivor keeps its partition stats");
+        assert!(Arc::ptr_eq(&from_first, &from_second));
+    }
+
+    // Partition counters live only in the registry (never snapshotted), so an
+    // install that dropped them would leave every already-materialized
+    // partition reading zeroes with no way to recover them.
+    #[test]
+    fn in_place_restore_keeps_survivor_partition_stats() {
+        let mut inner = inner_with_registered_partition();
+        let stats = inner.stats_registry.partition_get(0, 0, 0).expect("stats");
+        stats.increment_messages_count(42);
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+
+        inner.restore_in_place(snapshot);
+
+        let after = inner
+            .stats_registry
+            .partition_get(0, 0, 0)
+            .expect("partition survived the restore, so its stats must too");
+        assert!(Arc::ptr_eq(&stats, &after));
+        assert_eq!(after.messages_count_inconsistent(), 42);
+    }
+
+    // Slab keys are recycled: an entry left behind by a stream the snapshot
+    // does not carry would hand its counters to whatever lands in that slot.
+    #[test]
+    fn in_place_restore_prunes_entries_the_snapshot_dropped() {
+        let mut inner = inner_with_registered_partition();
+        // A second stream that the snapshot below will not contain.
+        let empty = Streams::from(StreamsInner::new()).to_snapshot();
+        assert!(inner.stats_registry.partition_get(0, 0, 0).is_some());
+
+        inner.restore_in_place(empty);
+
+        assert!(
+            inner.stats_registry.partition_get(0, 0, 0).is_none(),
+            "a partition the snapshot dropped must not keep its registry entry"
+        );
     }
 }
