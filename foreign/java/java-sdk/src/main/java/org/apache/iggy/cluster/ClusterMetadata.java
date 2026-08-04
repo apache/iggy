@@ -17,26 +17,17 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
-
-import org.apache.iggy.cluster.ClusterMetadata;
-import org.apache.iggy.system.ClientInfo;
-import org.apache.iggy.system.ClientInfoDetails;
-import org.apache.iggy.system.Stats;
+package org.apache.iggy.cluster;
 
 import java.util.List;
 
-public interface SystemClient {
-
-    Stats getStats();
-
-    ClusterMetadata getClusterMetadata();
-
-    ClientInfoDetails getMe();
-
-    ClientInfoDetails getClient(Long clientId);
-
-    List<ClientInfo> getClients();
-
-    String ping();
-}
+/**
+ * Cluster metadata reported by the server.
+ *
+ * <p>A server running without clustering reports the cluster name
+ * {@code "single-node"} with exactly one node.
+ *
+ * @param name  the cluster name
+ * @param nodes the cluster nodes
+ */
+public record ClusterMetadata(String name, List<ClusterNode> nodes) {}

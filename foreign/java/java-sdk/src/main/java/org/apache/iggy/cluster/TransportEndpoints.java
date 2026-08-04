@@ -17,26 +17,15 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.cluster;
 
-import org.apache.iggy.cluster.ClusterMetadata;
-import org.apache.iggy.system.ClientInfo;
-import org.apache.iggy.system.ClientInfoDetails;
-import org.apache.iggy.system.Stats;
-
-import java.util.List;
-
-public interface SystemClient {
-
-    Stats getStats();
-
-    ClusterMetadata getClusterMetadata();
-
-    ClientInfoDetails getMe();
-
-    ClientInfoDetails getClient(Long clientId);
-
-    List<ClientInfo> getClients();
-
-    String ping();
-}
+/**
+ * Per-transport ports of a cluster node. A port of {@code 0} means the
+ * transport is disabled on that node.
+ *
+ * @param tcp       the TCP port
+ * @param quic      the QUIC port
+ * @param http      the HTTP port
+ * @param websocket the WebSocket port
+ */
+public record TransportEndpoints(int tcp, int quic, int http, int websocket) {}

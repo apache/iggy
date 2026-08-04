@@ -17,26 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+@NonNullApi
+package org.apache.iggy.cluster;
 
-import org.apache.iggy.cluster.ClusterMetadata;
-import org.apache.iggy.system.ClientInfo;
-import org.apache.iggy.system.ClientInfoDetails;
-import org.apache.iggy.system.Stats;
-
-import java.util.List;
-
-public interface SystemClient {
-
-    Stats getStats();
-
-    ClusterMetadata getClusterMetadata();
-
-    ClientInfoDetails getMe();
-
-    ClientInfoDetails getClient(Long clientId);
-
-    List<ClientInfo> getClients();
-
-    String ping();
-}
+import org.apache.iggy.NonNullApi;
