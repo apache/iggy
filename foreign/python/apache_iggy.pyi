@@ -32,17 +32,24 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "HeaderKey",
+    "HeaderValue",
+    "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
+    "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
     "StreamDetails",
+    "StreamPermissions",
     "Topic",
     "TopicDetails",
+    "TopicPermissions",
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
+    "UserHeaders",
 ]
 
 class AutoCommit:
@@ -307,6 +314,455 @@ class ConsumerGroupMember:
         Gets the collection of partitions the consumer group member is consuming.
         """
 
+class HeaderKey:
+    r"""
+    Typed key for an Iggy user header.
+
+    Use these constructors when the header key must preserve an explicit
+    wire type instead of using the common string-key dictionary form.
+    """
+    def __hash__(self) -> builtins.int: ...
+    def __richcmp__(self, other: typing.Any, op: int) -> typing.Any: ...
+    def __repr__(self) -> builtins.str: ...
+    @typing.final
+    class Raw(HeaderKey):
+        r"""
+        Raw bytes key. The byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> bytes: ...
+        def __new__(cls, value: bytes) -> HeaderKey.Raw: ...
+
+    @typing.final
+    class String(HeaderKey):
+        r"""
+        UTF-8 string key. The encoded byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.str: ...
+        def __new__(cls, value: builtins.str) -> HeaderKey.String: ...
+
+    @typing.final
+    class Bool(HeaderKey):
+        r"""
+        Boolean key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.bool: ...
+        def __new__(cls, value: builtins.bool) -> HeaderKey.Bool: ...
+
+    @typing.final
+    class Int8(HeaderKey):
+        r"""
+        Signed 8-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int8: ...
+
+    @typing.final
+    class Int16(HeaderKey):
+        r"""
+        Signed 16-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int16: ...
+
+    @typing.final
+    class Int32(HeaderKey):
+        r"""
+        Signed 32-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int32: ...
+
+    @typing.final
+    class Int64(HeaderKey):
+        r"""
+        Signed 64-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int64: ...
+
+    @typing.final
+    class Int128(HeaderKey):
+        r"""
+        Signed 128-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int128: ...
+
+    @typing.final
+    class UnsignedInt8(HeaderKey):
+        r"""
+        Unsigned 8-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt8: ...
+
+    @typing.final
+    class UnsignedInt16(HeaderKey):
+        r"""
+        Unsigned 16-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt16: ...
+
+    @typing.final
+    class UnsignedInt32(HeaderKey):
+        r"""
+        Unsigned 32-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt32: ...
+
+    @typing.final
+    class UnsignedInt64(HeaderKey):
+        r"""
+        Unsigned 64-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt64: ...
+
+    @typing.final
+    class UnsignedInt128(HeaderKey):
+        r"""
+        Unsigned 128-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt128: ...
+
+    @typing.final
+    class Float32(HeaderKey):
+        r"""
+        32-bit floating point key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderKey.Float32: ...
+
+    @typing.final
+    class Float64(HeaderKey):
+        r"""
+        64-bit floating point key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderKey.Float64: ...
+
+class HeaderValue:
+    r"""
+    Typed value for an Iggy user header.
+
+    Use these constructors when the header value must preserve an explicit
+    wire type instead of using the common Python scalar dictionary form.
+    """
+    def __hash__(self) -> builtins.int: ...
+    def __richcmp__(self, other: typing.Any, op: int) -> typing.Any: ...
+    def __repr__(self) -> builtins.str: ...
+    @typing.final
+    class Raw(HeaderValue):
+        r"""
+        Raw bytes value. The byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> bytes: ...
+        def __new__(cls, value: bytes) -> HeaderValue.Raw: ...
+
+    @typing.final
+    class String(HeaderValue):
+        r"""
+        UTF-8 string value. The encoded byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.str: ...
+        def __new__(cls, value: builtins.str) -> HeaderValue.String: ...
+
+    @typing.final
+    class Bool(HeaderValue):
+        r"""
+        Boolean value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.bool: ...
+        def __new__(cls, value: builtins.bool) -> HeaderValue.Bool: ...
+
+    @typing.final
+    class Int8(HeaderValue):
+        r"""
+        Signed 8-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int8: ...
+
+    @typing.final
+    class Int16(HeaderValue):
+        r"""
+        Signed 16-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int16: ...
+
+    @typing.final
+    class Int32(HeaderValue):
+        r"""
+        Signed 32-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int32: ...
+
+    @typing.final
+    class Int64(HeaderValue):
+        r"""
+        Signed 64-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int64: ...
+
+    @typing.final
+    class Int128(HeaderValue):
+        r"""
+        Signed 128-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int128: ...
+
+    @typing.final
+    class UnsignedInt8(HeaderValue):
+        r"""
+        Unsigned 8-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt8: ...
+
+    @typing.final
+    class UnsignedInt16(HeaderValue):
+        r"""
+        Unsigned 16-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt16: ...
+
+    @typing.final
+    class UnsignedInt32(HeaderValue):
+        r"""
+        Unsigned 32-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt32: ...
+
+    @typing.final
+    class UnsignedInt64(HeaderValue):
+        r"""
+        Unsigned 64-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt64: ...
+
+    @typing.final
+    class UnsignedInt128(HeaderValue):
+        r"""
+        Unsigned 128-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt128: ...
+
+    @typing.final
+    class Float32(HeaderValue):
+        r"""
+        32-bit floating point value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderValue.Float32: ...
+
+    @typing.final
+    class Float64(HeaderValue):
+        r"""
+        64-bit floating point value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
+
+@typing.final
+class GlobalPermissions:
+    r"""
+    Global permissions, applied to all streams without specifying them one by one.
+    """
+    @property
+    def manage_servers(self) -> builtins.bool:
+        r"""
+        Whether managing servers is allowed; includes `read_servers`.
+        """
+    @property
+    def read_servers(self) -> builtins.bool:
+        r"""
+        Whether reading server info (stats, clients) is allowed.
+        """
+    @property
+    def manage_users(self) -> builtins.bool:
+        r"""
+        Whether managing users is allowed; includes `read_users`.
+        """
+    @property
+    def read_users(self) -> builtins.bool:
+        r"""
+        Whether reading user info is allowed.
+        """
+    @property
+    def manage_streams(self) -> builtins.bool:
+        r"""
+        Whether managing all streams is allowed; includes `read_streams` and
+        `manage_topics`.
+        """
+    @property
+    def read_streams(self) -> builtins.bool:
+        r"""
+        Whether reading all streams is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing all topics is allowed; includes `read_topics` and
+        `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading all topics and managing consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from all streams and managing consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to all streams is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_servers: builtins.bool = False,
+        read_servers: builtins.bool = False,
+        manage_users: builtins.bool = False,
+        read_users: builtins.bool = False,
+        manage_streams: builtins.bool = False,
+        read_streams: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> GlobalPermissions:
+        r"""
+        Create global permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_streams` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_servers: Allow managing servers; includes `read_servers`.
+            read_servers: Allow reading server info (stats, clients).
+            manage_users: Allow managing users; includes `read_users`.
+            read_users: Allow reading user info.
+            manage_streams: Allow managing all streams; includes `read_streams`
+                and `manage_topics`.
+            read_streams: Allow reading all streams; includes `read_topics`.
+            manage_topics: Allow managing all topics; includes `read_topics`
+                and `send_messages`.
+            read_topics: Allow reading all topics and managing consumer groups
+                (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from all streams and managing
+                consumer offsets.
+            send_messages: Allow sending messages to all streams.
+        """
+
 @typing.final
 class IggyClient:
     r"""
@@ -371,16 +827,16 @@ class IggyClient:
         username: builtins.str,
         password: builtins.str,
         status: UserStatus | None = None,
+        permissions: Permissions | None = None,
     ) -> collections.abc.Awaitable[UserInfoDetails]:
         r"""
         Create a new user.
-
-        The user is created without permissions.
 
         Args:
             username: Username as `str`.
             password: Password as `str`.
             status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+            permissions: Permissions as `Permissions | None`; the user has none when `None`.
 
         Returns:
             An awaitable that resolves to the created `UserInfoDetails`.
@@ -423,6 +879,57 @@ class IggyClient:
 
         Raises:
             PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def update_permissions(
+        self, user_id: builtins.str | builtins.int, permissions: Permissions | None
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Update the permissions of a user by unique ID or username.
+
+        This is a full replacement: the given permissions overwrite the previous
+        ones, and `None` removes them entirely.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            permissions: New permissions as `Permissions | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the permissions are updated.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def change_password(
+        self,
+        user_id: builtins.str | builtins.int,
+        current_password: builtins.str,
+        new_password: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Change the password of a user by unique ID or username.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            current_password: Current password as `str`.
+            new_password: New password as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the password is changed.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the current password is wrong or the request fails.
+        """
+    def logout_user(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Log out the currently authenticated user.
+
+        Returns:
+            An awaitable that resolves to `None` when the user is logged out.
+
+        Raises:
             PyRuntimeError: If the request fails.
         """
     def connect(self) -> collections.abc.Awaitable[None]:
@@ -818,6 +1325,39 @@ class IggyConsumer:
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
+@typing.final
+class Permissions:
+    r"""
+    The permissions of a user: global permissions applied to all streams,
+    optionally extended by per-stream permissions.
+    """
+    @property
+    def global_permissions(self) -> GlobalPermissions:
+        r"""
+        The global permissions, applied to all streams.
+        """
+    @property
+    def streams(self) -> dict[int, StreamPermissions] | None:
+        r"""
+        The per-stream permissions keyed by stream ID, or `None` when not set.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        global_permissions: GlobalPermissions | None = None,
+        streams: dict[int, StreamPermissions] | None = None,
+    ) -> Permissions:
+        r"""
+        Create permissions from global permissions and optional per-stream permissions.
+
+        Args:
+            global_permissions: Global permissions as `GlobalPermissions | None`;
+                defaults to all denied.
+            streams: Per-stream permissions keyed by stream ID as
+                `dict[int, StreamPermissions] | None`; an empty dict is
+                treated as `None`.
+        """
+
 class PollingStrategy:
     @typing.final
     class Offset(PollingStrategy):
@@ -871,6 +1411,11 @@ class ReceiveMessage:
         Retrieves the timestamp of the received message.
         The timestamp represents the time of the message within its topic.
         """
+    def origin_timestamp(self) -> builtins.int:
+        r"""
+        Retrieves the origin timestamp of the received message.
+        The origin timestamp represents when the message was originally created.
+        """
     def id(self) -> builtins.int:
         r"""
         Retrieves the id of the received message.
@@ -890,6 +1435,10 @@ class ReceiveMessage:
         r"""
         Retrieves the partition this message belongs to.
         """
+    def user_headers(self) -> UserHeaders | None:
+        r"""
+        Retrieves user headers attached to the received message.
+        """
 
 @typing.final
 class SendMessage:
@@ -898,7 +1447,12 @@ class SendMessage:
     This class wraps a Rust message meant for sending, facilitating
     the creation of such messages from Python and their subsequent use in Rust.
     """
-    def __new__(cls, data: builtins.str | bytes) -> SendMessage:
+    def __new__(
+        cls,
+        data: builtins.str | bytes,
+        user_headers: dict | None = None,
+        id: builtins.int | None = None,
+    ) -> SendMessage:
         r"""
         Constructs a new `SendMessage` instance from a string or bytes.
         This method allows for the creation of a `SendMessage` instance
@@ -915,6 +1469,88 @@ class StreamDetails:
     def messages_count(self) -> builtins.int: ...
     @property
     def topics_count(self) -> builtins.int: ...
+
+@typing.final
+class StreamPermissions:
+    r"""
+    Permissions for a specific stream and all its topics, optionally refined per topic.
+    They extend the global permissions, they do not override them.
+    """
+    @property
+    def manage_stream(self) -> builtins.bool:
+        r"""
+        Whether managing the stream is allowed; includes `read_stream` and
+        `manage_topics`.
+        """
+    @property
+    def read_stream(self) -> builtins.bool:
+        r"""
+        Whether reading the stream is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing the stream topics is allowed; includes `read_topics`
+        and `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading the stream topics and managing their consumer groups
+        is allowed; includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from the stream and managing its consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to the stream is allowed.
+        """
+    @property
+    def topics(self) -> dict[int, TopicPermissions] | None:
+        r"""
+        The per-topic permissions keyed by topic ID, or `None` when not set.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_stream: builtins.bool = False,
+        read_stream: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+        topics: dict[int, TopicPermissions] | None = None,
+    ) -> StreamPermissions:
+        r"""
+        Create stream permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_stream` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_stream: Allow managing the stream; includes `read_stream`
+                and `manage_topics`.
+            read_stream: Allow reading the stream; includes `read_topics`.
+            manage_topics: Allow managing the stream topics; includes
+                `read_topics` and `send_messages`.
+            read_topics: Allow reading the stream topics and managing their
+                consumer groups (including create and delete); includes
+                `poll_messages`.
+            poll_messages: Allow polling messages from the stream and managing
+                its consumer offsets.
+            send_messages: Allow sending messages to the stream.
+            topics: Per-topic permissions keyed by topic ID as
+                `dict[int, TopicPermissions] | None`; an empty dict is
+                treated as `None`.
+        """
 
 @typing.final
 class Topic:
@@ -973,6 +1609,62 @@ class TopicDetails:
         """
 
 @typing.final
+class TopicPermissions:
+    r"""
+    Permissions for a specific topic of a stream. The lowest level of permissions.
+    They extend the stream and global permissions, they do not override them.
+    """
+    @property
+    def manage_topic(self) -> builtins.bool:
+        r"""
+        Whether managing the topic is allowed; includes `read_topic` and
+        `send_messages`.
+        """
+    @property
+    def read_topic(self) -> builtins.bool:
+        r"""
+        Whether reading the topic and managing its consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from the topic and managing its consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to the topic is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_topic: builtins.bool = False,
+        read_topic: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> TopicPermissions:
+        r"""
+        Create topic permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_topic` includes
+        `read_topic` and `send_messages`, and through `read_topic` also
+        `poll_messages`.
+
+        Args:
+            manage_topic: Allow managing the topic; includes `read_topic` and
+                `send_messages`.
+            read_topic: Allow reading the topic and managing its consumer
+                groups (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from the topic and managing
+                its consumer offsets.
+            send_messages: Allow sending messages to the topic.
+        """
+
+@typing.final
 class UserInfo:
     @property
     def id(self) -> builtins.int:
@@ -1017,6 +1709,11 @@ class UserInfoDetails:
         r"""
         The username of the user.
         """
+    @property
+    def permissions(self) -> Permissions | None:
+        r"""
+        The permissions of the user, or `None` when the user has none assigned.
+        """
 
 @typing.final
 class UserStatus(enum.Enum):
@@ -1032,3 +1729,31 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
+
+class UserHeaders(dict):
+    r"""
+    User headers dictionary returned by `ReceiveMessage.user_headers`.
+
+    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
+    operations work) that additionally exposes `to_scalar_dict` for the convenient
+    scalar form.
+    """
+    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
+        r"""
+        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
+
+        Accepts a dict whose keys and values can each independently be
+        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
+        int | float`). The inherited `dict` initializer copies the provided
+        mapping.
+        """
+    def to_scalar_dict(
+        self,
+    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
+        r"""
+        Converts these headers into the convenient plain dictionary form.
+
+        Returns an error if two distinct typed keys map to the same plain
+        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+        become `int(1)`), or if a stored field cannot be decoded.
+        """

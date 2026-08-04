@@ -25,13 +25,21 @@ describe('e2e -> raw', async () => {
 
   const c = getTestClient();
 
+  const VENDOR_CODE = 60_001;
+
   it('e2e -> raw::ping', async () => {
-    const response = await c.sendBinaryRequest(COMMAND_CODE.Ping, Buffer.alloc(0));
+    const response = await c.sendBinaryRequest(
+      COMMAND_CODE.Ping,
+      Buffer.alloc(0)
+    );
     assert.deepEqual(response, Buffer.alloc(0));
   });
 
   it('e2e -> raw::getStats', async () => {
-    const response = await c.sendBinaryRequest(COMMAND_CODE.GetStats, Buffer.alloc(0));
+    const response = await c.sendBinaryRequest(
+      COMMAND_CODE.GetStats,
+      Buffer.alloc(0)
+    );
     assert.ok(response.length > 0);
   });
 
@@ -41,10 +49,32 @@ describe('e2e -> raw', async () => {
     );
   });
 
-  it('e2e -> raw::unknownCodeRejectedByServer', async () => {
+  it('e2e -> raw::vendorCodeRejectedByServer', async () => {
     await assert.rejects(
-      () => c.sendBinaryRequest(60000, Buffer.alloc(0))
+      () => c.sendBinaryRequest(VENDOR_CODE, Buffer.alloc(0))
     );
+
+    // The rejection is request-level, so the connection stays usable.
+    const response = await c.sendBinaryRequest(
+      COMMAND_CODE.Ping,
+      Buffer.alloc(0)
+    );
+    assert.deepEqual(response, Buffer.alloc(0));
+  });
+
+  it('e2e -> raw::repeatedVendorCodesDoNotGapMetadataRequestIds', async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1)
+      await assert.rejects(
+        () => c.sendBinaryRequest(
+          VENDOR_CODE + attempt,
+          Buffer.from([attempt])
+        )
+      );
+
+    const streamName = `e2e-raw-sequence-${Date.now()}`;
+    const stream = await c.stream.create({ name: streamName });
+    assert.equal(stream.name, streamName);
+    assert.equal(await c.stream.delete({ streamId: streamName }), true);
   });
 
   after(() => {

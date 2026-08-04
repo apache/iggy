@@ -51,7 +51,7 @@ async fn given_index_documents_when_source_polls_should_produce_messages(
         .await
         .expect("index Meilisearch documents");
     fixture
-        .wait_for_documents(TEST_MESSAGE_COUNT)
+        .wait_for_documents(SOURCE_INDEX, TEST_MESSAGE_COUNT)
         .await
         .expect("wait for Meilisearch documents");
 
@@ -111,7 +111,7 @@ async fn given_persisted_state_when_connector_restarts_should_resume_after_last_
         .await
         .expect("index first Meilisearch document batch");
     fixture
-        .wait_for_documents(TEST_MESSAGE_COUNT)
+        .wait_for_documents(SOURCE_INDEX, TEST_MESSAGE_COUNT)
         .await
         .expect("wait for first Meilisearch document batch");
 
@@ -141,7 +141,7 @@ async fn given_persisted_state_when_connector_restarts_should_resume_after_last_
         .await
         .expect("index second Meilisearch document batch");
     fixture
-        .wait_for_documents(TEST_MESSAGE_COUNT * 2)
+        .wait_for_documents(SOURCE_INDEX, TEST_MESSAGE_COUNT * 2)
         .await
         .expect("wait for second Meilisearch document batch");
 

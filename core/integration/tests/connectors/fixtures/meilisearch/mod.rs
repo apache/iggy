@@ -16,7 +16,9 @@
 // under the License.
 
 mod container;
+mod sink;
 mod source;
 
-pub use container::MeilisearchOps;
+pub use container::{MeilisearchOps, TEST_INDEX};
+pub use sink::MeilisearchSinkFixture;
 pub use source::MeilisearchSourceFixture;

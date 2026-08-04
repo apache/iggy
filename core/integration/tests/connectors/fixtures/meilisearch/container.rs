@@ -28,6 +28,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::time::sleep;
 use tracing::info;
+use uuid::Uuid;
 
 const MEILISEARCH_IMAGE: &str = "getmeili/meilisearch";
 const MEILISEARCH_TAG: &str = "v1.13";
@@ -64,6 +65,8 @@ pub struct MeilisearchContainer {
 
 impl MeilisearchContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
+        let unique_network = format!("iggy-meilisearch-{}", Uuid::new_v4());
+
         let container = GenericImage::new(MEILISEARCH_IMAGE, MEILISEARCH_TAG)
             .with_exposed_port(MEILISEARCH_PORT.tcp())
             .with_wait_for(WaitFor::http(
@@ -71,6 +74,7 @@ impl MeilisearchContainer {
                     .with_port(MEILISEARCH_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
+            .with_network(unique_network)
             .with_container_name(fixtures::unique_container_name("meilisearch"))
             .with_env_var("MEILI_ENV", "development")
             .with_mapped_port(0, MEILISEARCH_PORT.tcp())
@@ -257,13 +261,14 @@ pub trait MeilisearchOps: Sync {
 
     fn wait_for_documents(
         &self,
+        index_name: &str,
         expected_count: usize,
     ) -> impl std::future::Future<Output = Result<Vec<serde_json::Value>, TestBinaryError>> + Send
     {
         async move {
             let mut last_count = 0usize;
             for _ in 0..POLL_ATTEMPTS {
-                if let Ok(documents) = self.list_documents(TEST_INDEX).await {
+                if let Ok(documents) = self.list_documents(index_name).await {
                     last_count = documents.len();
                     if documents.len() >= expected_count {
                         return Ok(documents);

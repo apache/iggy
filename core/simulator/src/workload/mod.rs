@@ -203,7 +203,7 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
 
-        // Decode the committed result code. Metadata replies carry a TB-style
+        // Decode the committed result code. Metadata replies carry a
         // result section (see `ApplyReply::to_reply_body`); partition-plane
         // replies do not, hence the `is_metadata` gate.
         let committed_code = if header.operation.is_metadata() {
@@ -233,7 +233,7 @@ impl Workload {
             };
             // The state machine only commits codes its own result enum declares,
             // so an unrecognized one is a server bug (a race still yields a
-            // declared code). TB's "classify never guesses".
+            // declared code). Classify never guesses.
             assert!(
                 result_code_recognized(header.operation, code),
                 "metadata op {:?} returned unrecognized result code {code} \

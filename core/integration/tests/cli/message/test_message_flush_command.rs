@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Tests the `message flush` CLI command itself (`FLUSH_UNSAVED_BUFFER`), not
+// a durability barrier some other assertion needs. The command is slated for
+// removal from the protocol, so this stays out of the vsr pass permanently
+// (today via the whole-`cli`-module gate): delete this file together with the
+// command, do not adapt it.
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };

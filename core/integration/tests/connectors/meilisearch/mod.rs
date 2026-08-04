@@ -15,4 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod meilisearch_sink;
 mod meilisearch_source;

@@ -19,8 +19,9 @@ use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
     Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, StartViewChangeHeader,
-    StartViewHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+    StateTransferTargetHeader,
 };
 use smallvec::SmallVec;
 use std::{marker::PhantomData, mem::size_of};
@@ -512,6 +513,11 @@ pub enum MessageBag {
     RepairPrepare(Message<RepairPrepareHeader>),
     /// `RepairDone` / `RangeEvicted` (one layout, two commands).
     RepairRangeReply(Message<RepairRangeReplyHeader>),
+    RequestStateTransfer(Message<RequestStateTransferHeader>),
+    StateTransferTarget(Message<StateTransferTargetHeader>),
+    RequestStateChunk(Message<RequestStateChunkHeader>),
+    /// Artifact bytes ride the body (`size` spans header + payload).
+    StateChunk(Message<StateChunkHeader>),
 }
 
 impl MessageBag {
@@ -529,6 +535,10 @@ impl MessageBag {
             Self::RequestPrepares(message) => message.header().command,
             Self::RepairPrepare(message) => message.header().command(),
             Self::RepairRangeReply(message) => message.header().command,
+            Self::RequestStateTransfer(message) => message.header().command,
+            Self::StateTransferTarget(message) => message.header().command,
+            Self::RequestStateChunk(message) => message.header().command,
+            Self::StateChunk(message) => message.header().command,
         }
     }
 
@@ -546,6 +556,10 @@ impl MessageBag {
             Self::RequestPrepares(message) => message.header().size(),
             Self::RepairPrepare(message) => message.header().size(),
             Self::RepairRangeReply(message) => message.header().size(),
+            Self::RequestStateTransfer(message) => message.header().size(),
+            Self::StateTransferTarget(message) => message.header().size(),
+            Self::RequestStateChunk(message) => message.header().size(),
+            Self::StateChunk(message) => message.header().size(),
         }
     }
 
@@ -563,6 +577,10 @@ impl MessageBag {
             Self::RequestPrepares(message) => message.header().operation(),
             Self::RepairPrepare(message) => message.header().operation(),
             Self::RepairRangeReply(message) => message.header().operation(),
+            Self::RequestStateTransfer(message) => message.header().operation(),
+            Self::StateTransferTarget(message) => message.header().operation(),
+            Self::RequestStateChunk(message) => message.header().operation(),
+            Self::StateChunk(message) => message.header().operation(),
         }
     }
 }
@@ -608,6 +626,18 @@ where
             Command2::RepairDone | Command2::RangeEvicted => Ok(Self::RepairRangeReply(
                 value.try_into_typed::<RepairRangeReplyHeader>()?,
             )),
+            Command2::RequestStateTransfer => Ok(Self::RequestStateTransfer(
+                value.try_into_typed::<RequestStateTransferHeader>()?,
+            )),
+            Command2::StateTransferTarget => Ok(Self::StateTransferTarget(
+                value.try_into_typed::<StateTransferTargetHeader>()?,
+            )),
+            Command2::RequestStateChunk => Ok(Self::RequestStateChunk(
+                value.try_into_typed::<RequestStateChunkHeader>()?,
+            )),
+            Command2::StateChunk => Ok(Self::StateChunk(
+                value.try_into_typed::<StateChunkHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command2::Reply | Command2::Eviction => {
@@ -634,6 +664,7 @@ mod tests {
     const REQUEST_CLIENT_OFF: usize = std::mem::offset_of!(RequestHeader, client);
     const REQUEST_OPERATION_OFF: usize = std::mem::offset_of!(RequestHeader, operation);
     const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RequestHeader, session);
+    const REQUEST_REQUEST_OFF: usize = std::mem::offset_of!(RequestHeader, request);
 
     fn header_bytes(command: Command2, size: u32) -> Owned<MESSAGE_ALIGN> {
         header_bytes_sized(command, size, 256)
@@ -649,6 +680,10 @@ mod tests {
             // is shared, so this offset works across header types.
             buf[REQUEST_CLIENT_OFF..REQUEST_CLIENT_OFF + 16]
                 .copy_from_slice(&0xCAFE_u128.to_le_bytes());
+            // A zeroed operation is `Reserved`, which validation rejects.
+            // `Register` needs session 0 and request 0, which zeroed bytes
+            // already satisfy.
+            buf[REQUEST_OPERATION_OFF] = Operation::Register as u8;
         }
         o
     }
@@ -873,6 +908,69 @@ mod tests {
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         let result = MessageBag::try_from(generic);
         assert!(matches!(result, Err(ConsensusError::InvalidField(_))));
+    }
+
+    // Ingress validation runs on every client frame at the network boundary,
+    // reached through `MessageBag::try_from` -> `try_into_typed` ->
+    // `RequestHeader::validate`. Several dedup and authz conclusions rest on
+    // it running, so pin the field rules rather than the plumbing: whatever
+    // `request_preflight` and the operation gate see downstream has already
+    // passed these.
+    #[test]
+    fn ingress_validation_enforces_the_request_header_field_rules() {
+        // (operation, session, request, must_pass)
+        let cases: [(Operation, u64, u64, bool); 8] = [
+            // Register carries no session or request of its own.
+            (Operation::Register, 0, 0, true),
+            (Operation::Register, 1, 0, false),
+            (Operation::Register, 0, 1, false),
+            // Replicated client ops need both.
+            (Operation::CreateStream, 1, 1, true),
+            (Operation::CreateStream, 0, 1, false),
+            (Operation::CreateStream, 1, 0, false),
+            // Sessionless by design: ping must work before authentication.
+            (Operation::NonReplicated, 0, 0, true),
+            // Never a real client op; refused before the dedup preflight can
+            // replay this client's own cached reply back to it.
+            (Operation::Reserved, 1, 1, false),
+        ];
+
+        for (operation, session, request, must_pass) in cases {
+            let mut owned = header_bytes(Command2::Request, 256);
+            {
+                let buf = owned.as_mut_slice();
+                buf[REQUEST_OPERATION_OFF] = operation as u8;
+                buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8]
+                    .copy_from_slice(&session.to_le_bytes());
+                buf[REQUEST_REQUEST_OFF..REQUEST_REQUEST_OFF + 8]
+                    .copy_from_slice(&request.to_le_bytes());
+            }
+            let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+            let accepted = MessageBag::try_from(generic).is_ok();
+            assert_eq!(
+                accepted, must_pass,
+                "{operation:?} with session={session} request={request}"
+            );
+        }
+    }
+
+    // `client == 0` is reserved for server-originated ops; the table asserts on
+    // it, so ingress must reject it before it can reach the preflight.
+    #[test]
+    fn ingress_validation_rejects_zero_client() {
+        let mut owned = header_bytes(Command2::Request, 256);
+        {
+            let buf = owned.as_mut_slice();
+            buf[REQUEST_OPERATION_OFF] = Operation::CreateStream as u8;
+            buf[REQUEST_CLIENT_OFF..REQUEST_CLIENT_OFF + 16].copy_from_slice(&0u128.to_le_bytes());
+            buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+            buf[REQUEST_REQUEST_OFF..REQUEST_REQUEST_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+        }
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::InvalidField(_))
+        ));
     }
 
     // deep_copy: byte-level independence after clone-like API
