@@ -16,65 +16,55 @@
 // under the License.
 
 use iggy::prelude::*;
-#[cfg(not(feature = "vsr"))]
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-#[cfg(not(feature = "vsr"))]
 use std::{collections::HashMap, str::FromStr};
-#[cfg(not(feature = "vsr"))]
 use test_case::test_matrix;
 
-#[cfg(not(feature = "vsr"))]
 fn cache_open_segment() -> &'static str {
     "open_segment"
 }
 
-#[cfg(not(feature = "vsr"))]
 fn cache_all() -> &'static str {
     "all"
 }
 
-#[cfg(not(feature = "vsr"))]
 fn cache_none() -> &'static str {
     "none"
 }
 
-#[cfg(not(feature = "vsr"))]
 fn build_server_config(cache_setting: &str) -> TestServerConfig {
     let mut extra_envs = HashMap::new();
     extra_envs.insert(
         "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
         cache_setting.to_string(),
     );
-    // Under vsr this config must ALSO set the eager-flush envs
-    // (`IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE=1`,
-    // `IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC=true`, see
-    // `encryption_scenario::build_server_config`): server-ng serves no
-    // `flush_unsaved_buffer` (the command is slated for removal), so the
-    // flush calls below must be cfg'd out and replaced by eager persistence
-    // when the fill test is ungated.
+    // server-ng flushes on the journal thresholds (no flush primitive), so
+    // force every committed batch straight to disk: the restart asserts
+    // below need everything durable, and the explicit flush calls are
+    // cfg'd out under vsr (`flush_unsaved_buffer` answers
+    // FeatureUnavailable there and is slated for removal).
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
+        "1".to_string(),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
+        "true".to_string(),
+    );
     TestServerConfig::builder().extra_envs(extra_envs).build()
 }
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 //
-// vsr-gated: requires PARTITION-plane state transfer. The 5 MB bench fill is
-// thousands of ops while the partition journal's evicted ring retains only
-// the last 4096, so a restarted replica's rejoin window exceeds what journal
-// repair can serve. The commit floor lets recovered segments stand in for
-// the evicted prefix, but the sub-floor stats/offset seeding this test
-// asserts (exact messages_count / size_bytes across the restart) needs the
-// partition-plane transfer to carry them; the metadata-plane transfer's
-// snapshot stats cannot be stitched to the partition repair window without
-// double-counting.
-//
-// NOT gated on `flush_unsaved_buffer`: this test only uses flush as a
-// durability barrier, and under vsr the calls are replaced by the eager-flush
-// server envs (see `build_server_config`). The other blocker to clear when
-// ungating is the bench harness (`run_bench_and_wait_for_finish`), which is
-// out of the vsr test pass today.
-#[cfg(not(feature = "vsr"))]
+// Under vsr this runs against a 3-node cluster and needs two adaptations:
+// the durability barrier is the eager-flush envs in `build_server_config`
+// (`flush_unsaved_buffer` answers FeatureUnavailable there, so the explicit
+// flush loops are cfg'd out), and `iggy-bench` must be built with
+// `--features vsr` because the SDK framing is chosen at compile time. A
+// default-features bench binary never completes a frame against server-ng
+// and the run trips the bench timeout in `run_bench_and_wait_for_finish`.
 #[test_matrix(
     [cache_all(), cache_open_segment(), cache_none()]
 )]
@@ -111,6 +101,9 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let client = harness.tcp_root_client().await.unwrap();
 
     let topic_id = Identifier::numeric(0).unwrap();
+    // Durability barrier on the legacy server only; server-ng persists
+    // eagerly via the config envs and answers FeatureUnavailable here.
+    #[cfg(not(feature = "vsr"))]
     for i in 0..7 {
         let stream_id = Identifier::numeric(i).unwrap();
         client
@@ -224,14 +217,17 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // Connect and login to server
     let client = harness.tcp_root_client().await.unwrap();
 
-    // Flush unsaved buffer
-    let topic_id = Identifier::numeric(0).unwrap();
-    for i in 0..7 {
-        let stream_id = Identifier::numeric(i).unwrap();
-        client
-            .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
-            .await
-            .unwrap();
+    // Durability barrier on the legacy server only (see the first loop).
+    #[cfg(not(feature = "vsr"))]
+    {
+        let topic_id = Identifier::numeric(0).unwrap();
+        for i in 0..7 {
+            let stream_id = Identifier::numeric(i).unwrap();
+            client
+                .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
+                .await
+                .unwrap();
+        }
     }
 
     // Save stats from the second server (should have double the data)

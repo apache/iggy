@@ -28,6 +28,7 @@ mod messages_writer;
 mod offset_storage;
 mod poll_plan;
 mod segment;
+pub mod state_transfer;
 mod types;
 
 use iggy_binary_protocol::PrepareHeader;
@@ -46,7 +47,8 @@ use server_common::Message;
 pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use types::{
     AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
-    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairSession, SendMessagesResult,
+    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
+    SendMessagesResult,
 };
 
 /// Partition-level data plane operations.

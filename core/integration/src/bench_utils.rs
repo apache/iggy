@@ -24,6 +24,7 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     thread::{self, panicking},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -31,6 +32,11 @@ const BENCH_FILES_PREFIX: &str = "bench_";
 const MESSAGE_BATCHES: u64 = 100;
 const MESSAGES_PER_BATCH: u64 = 100;
 const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
+// Generous for a few MB of traffic even in debug builds. Exists because a
+// protocol mismatch (an SDK framing the server does not speak, e.g. a
+// default-features iggy-bench against a vsr cluster) hangs both sides
+// silently instead of erroring.
+const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub fn run_bench_and_wait_for_finish(
     server_addr: &str,
@@ -102,7 +108,28 @@ pub fn run_bench_and_wait_for_finish(
     }
 
     let mut child = command.spawn().unwrap();
-    let result = child.wait().unwrap();
+    let deadline = Instant::now() + BENCH_WAIT_TIMEOUT;
+    let result = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(stderr_file_path) = &stderr_file_path {
+                    eprintln!(
+                        "Iggy bench stderr:\n{}",
+                        fs::read_to_string(stderr_file_path).unwrap_or_default()
+                    );
+                }
+                panic!(
+                    "iggy-bench did not finish within {BENCH_WAIT_TIMEOUT:?}; if the server \
+                     runs in vsr mode, make sure iggy-bench was built with --features vsr \
+                     (the SDK framing is chosen at compile time)"
+                );
+            }
+            None => thread::sleep(Duration::from_millis(200)),
+        }
+    };
 
     // Cleanup
     if let Ok(output) = child.wait_with_output() {

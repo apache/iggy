@@ -45,8 +45,14 @@ pub mod artifact_kind {
     pub const METADATA_SNAPSHOT: u8 = 0;
     /// Metadata plane: [`crate::ClientTable::encode`] bytes.
     pub const CLIENT_TABLE: u8 = 1;
-    // Partition plane (reserved, not served yet):
-    // SEGMENT_LOG = 2, CONSUMER_OFFSETS = 3.
+    /// Partition plane: one retained segment's `.log` bytes verbatim
+    /// (prepare-stripped `SendMessages2` records); `frontier` = the
+    /// segment's base offset.
+    pub const SEGMENT_LOG: u8 = 2;
+    /// Partition plane: the encoded consumer + consumer-group offset table
+    /// (plus the applied purge generation); `frontier` = the offer's
+    /// `commit_op`.
+    pub const CONSUMER_OFFSETS: u8 = 3;
 }
 
 /// One artifact a serving peer offers: what it is, where its receiver-side

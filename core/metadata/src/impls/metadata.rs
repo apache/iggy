@@ -3757,7 +3757,9 @@ where
         op,
         timestamp,
         operation,
-        namespace: request.namespace,
+        // The group's namespace, never the request's: clients send 0, and a
+        // journaled 0 mis-routes the entry when repair replays it verbatim.
+        namespace: consensus.namespace(),
         // Carry the acting user id so the in-apply RBAC gate sees the same
         // identity on every replica. The default projection copies it (see
         // `Project::project`); this helper builds prepares for the ops it

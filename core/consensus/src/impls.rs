@@ -3079,7 +3079,12 @@ where
                 op,
                 timestamp,
                 operation: old.operation,
-                namespace: old.namespace,
+                // The GROUP's namespace, never the request's: a client
+                // RequestHeader carries namespace 0, and journaling that
+                // would make the stored prepare route to the wrong plane
+                // when repair later ships it verbatim (live replication
+                // masked this; repair replay is what broke).
+                namespace: consensus.namespace,
                 checksum_body,
                 // Copied verbatim: carries the stamped acting user for client
                 // ops (and the authenticated user on Register), so the in-apply

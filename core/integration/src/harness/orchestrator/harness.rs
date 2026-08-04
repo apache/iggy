@@ -330,6 +330,20 @@ impl TestHarness {
         Ok(())
     }
 
+    /// Restart node `index` with its data directory INTACT, so it rejoins the
+    /// still-live cluster from its own recovered state (superblock, segments,
+    /// offset files). The counterpart of
+    /// [`Self::restart_node_from_clean_slate`] for the crash-and-return
+    /// shape rather than the provisioned-replacement one.
+    pub fn restart_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.stop()?;
+        server.start()
+    }
+
     /// Restart node `index` with its data directory wiped, so it rejoins the
     /// still-live cluster as a fresh replica with no local history. The other
     /// nodes stay up throughout (they hold quorum and keep committing), which
