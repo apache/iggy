@@ -2297,6 +2297,18 @@ mod tests {
     /// without injected loss must keep the counters at zero; a non-zero
     /// value means an inbox silently shed a frame (undersized capacity or
     /// a routing bug), which would otherwise hide behind VSR retransmit.
+    ///
+    /// `park_overflow` is deliberately NOT excluded. The simulator never wires
+    /// the partition reconciler (`init_partition` mirrors its outcome directly),
+    /// so nothing here ever drains the park buffer: a parked frame is never
+    /// re-dispatched and never swept. A non-zero `park_overflow` in the simulator
+    /// therefore means frames were shed for a namespace that will never
+    /// materialise -- which is the very fault class this assert exists to catch,
+    /// not the back-pressure it would be in production.
+    ///
+    /// For the same reason the park buffer must be empty at quiescence: a frame
+    /// still parked here has no drainer, so it will neither be delivered nor
+    /// answered.
     fn assert_no_frame_drops(sim: &Simulator) {
         for (replica_idx, replica) in sim.replicas.iter().enumerate() {
             for (shard_idx, shard) in replica.shards.iter().enumerate() {
@@ -2304,6 +2316,11 @@ mod tests {
                     shard.metrics().frame_drops_value(),
                     0,
                     "replica {replica_idx} shard {shard_idx} dropped frames without injected loss"
+                );
+                assert!(
+                    shard.parked_namespaces().is_empty(),
+                    "replica {replica_idx} shard {shard_idx} left partition frames parked; the \
+                     simulator wires no reconciler, so nothing will deliver or answer them"
                 );
             }
         }
