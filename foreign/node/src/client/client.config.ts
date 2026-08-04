@@ -37,9 +37,6 @@ export const normalizeClientConfig = (
       'maxResponseFrameSize must be a safe integer of at least 256 bytes'
     );
 
-  if (protocol === 'vsr' && config.transport === 'TLS')
-    throw new TypeError('VSR framing currently supports the TCP transport only');
-
   if (protocol === 'vsr' &&
       ((config.poolSize?.min ?? 1) > 1 || (config.poolSize?.max ?? 1) > 1))
     throw new TypeError(
