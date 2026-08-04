@@ -26,7 +26,8 @@ use crate::poll_plan::{
     PartitionDirResolution, PollPlan, PollTier, ResidentTailSnapshot,
 };
 use crate::segment::Segment;
-use crate::types::RepairSession;
+use crate::state_transfer::PartitionTransferSession;
+use crate::types::{RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -105,15 +106,15 @@ where
     pub revision_id: u64,
     pub should_increment_offset: bool,
     pub write_lock: Arc<TokioMutex<()>>,
-    consumer_offsets_path: Option<String>,
-    consumer_group_offsets_path: Option<String>,
+    pub(crate) consumer_offsets_path: Option<String>,
+    pub(crate) consumer_group_offsets_path: Option<String>,
     /// Canonical on-disk partition directory, set at construction by the
     /// server builder. Disk polls must not derive this from live writers:
     /// sealed segments drop their writer at rotation, so a writer-derived
     /// path transiently disappears and silently hides the disk tier.
     /// `None` only for in-memory (simulated) partitions.
-    partition_dir: Option<String>,
-    consumer_offset_enforce_fsync: bool,
+    pub(crate) partition_dir: Option<String>,
+    pub(crate) consumer_offset_enforce_fsync: bool,
     /// In-flight journal repair:
     /// set when the recovery handshake finds this replica behind the group's
     /// commit frontier, cleared when `RepairDone` completes the walk.
@@ -124,7 +125,7 @@ where
     /// re-persisting / re-counting them. Immutable after boot, so live
     /// traffic (always above it) is never affected.
     pub recovered_durable_offset: Option<u64>,
-    pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
+    pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Committed-only mirror of each consumer's persisted offset file: the
     /// last value this replica durably wrote per (kind, consumer id). Fed
     /// exclusively by the file-writing paths (replicated commit-apply, the
@@ -137,13 +138,13 @@ where
     /// the tracker rebuilds from disk lazily and deterministically.
     /// `RefCell`: mutated from `&self` paths on the single shard thread;
     /// borrows never cross an await.
-    persisted_offsets: RefCell<HashMap<(ConsumerKind, u32), u64>>,
-    observed_view: u32,
+    pub(crate) persisted_offsets: RefCell<HashMap<(ConsumerKind, u32), u64>>,
+    pub(crate) observed_view: u32,
     /// Highest `PurgeTopic` generation this replica has locally applied (reset
     /// the partition to empty). The reconciler compares the committed metadata
     /// generation against this and resets only when it advances, so a redundant
     /// reconcile pass never re-wipes a partition already at this generation.
-    applied_purge_generation: u64,
+    pub(crate) applied_purge_generation: u64,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -166,6 +167,25 @@ where
     /// terminal policy.
     superblock_write_failures: Cell<u64>,
     superblock_retry_after_micros: Cell<u64>,
+    /// In-flight state transfer for this group (rejoin whose repair floor was
+    /// refused); tail repair takes over at install. See
+    /// [`PartitionTransferSession`].
+    pub transfer: Option<PartitionTransferSession>,
+    /// Consecutive transfer stall rounds, across session re-mints. NOT in the
+    /// session: three of four metadata arming sites re-minted their session,
+    /// so a per-session counter bounded nothing and a permanent failure
+    /// cycled abandon -> repair -> refusal -> re-arm at zero forever. Reset
+    /// only by [`Self::note_transfer_progress`].
+    pub transfer_attempts: u32,
+    /// Decode failures charged per offered generation:
+    /// `(generation, failures)`, generation = the offer's `commit_op`.
+    pub transfer_decode_failures: Option<(u64, u32)>,
+    /// Serving-side offer cache, keyed by the `commit_op` it was built at, so
+    /// simultaneous rejoiners share one manifest instead of re-reading every
+    /// segment per requester. Invalidated by `purge` (same commit frontier,
+    /// different bytes) and released by the shard's offer-expiry sweep.
+    pub(crate) transfer_offer_cache:
+        RefCell<Option<Rc<crate::state_transfer::PartitionStateTransferOffer>>>,
 }
 
 impl<B, SB> fmt::Debug for IggyPartition<B, SB>
@@ -203,7 +223,7 @@ enum Disposition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct PendingConsumerOffsetCommit {
+pub struct PendingConsumerOffsetCommit {
     kind: ConsumerKind,
     consumer_id: u32,
     mutation: PendingConsumerOffsetMutation,
@@ -302,6 +322,10 @@ where
             superblock_lock: LocalGate::new(),
             superblock_write_failures: Cell::new(0),
             superblock_retry_after_micros: Cell::new(0),
+            transfer: None,
+            transfer_attempts: 0,
+            transfer_decode_failures: None,
+            transfer_offer_cache: RefCell::new(None),
         };
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
@@ -471,6 +495,47 @@ where
                 false
             }
         }
+    }
+
+    /// Burn one transfer stall round; `true` once the budget is exhausted.
+    /// Lives on the partition, not the session, so a re-minted session
+    /// cannot reset it (see [`Self::transfer_attempts`]).
+    pub const fn burn_transfer_attempt(&mut self) -> bool {
+        self.transfer_attempts += 1;
+        self.transfer_attempts > consensus::STATE_TRANSFER_MAX_STALL_RETRIES
+    }
+
+    /// Real transfer progress: reset the retry budget. The budget bounds
+    /// CONSECUTIVE failures, not lifetime ones; without this a handful of
+    /// stalls scattered across a large transfer would abandon one that was
+    /// nearly done, throwing away every byte already pulled.
+    pub const fn note_transfer_progress(&mut self) {
+        self.transfer_attempts = 0;
+    }
+
+    /// Charge one decode failure against `generation` (the offered
+    /// `commit_op`); `true` once that generation's budget is spent. A
+    /// different generation restarts the count: the peer committed since,
+    /// so the artifacts are new bytes worth full retries.
+    pub const fn burn_transfer_decode_failure(&mut self, generation: u64) -> bool {
+        let failures = match self.transfer_decode_failures {
+            Some((current, failures)) if current == generation => failures + 1,
+            _ => 1,
+        };
+        self.transfer_decode_failures = Some((generation, failures));
+        failures > consensus::STATE_TRANSFER_MAX_DECODE_RETRIES
+    }
+
+    /// Whether `generation`'s decode budget is already spent. Gates
+    /// descriptor acceptance, so an exhausted generation costs one refused
+    /// descriptor per repair round instead of a full pull.
+    #[must_use]
+    pub const fn transfer_decode_budget_exhausted(&self, generation: u64) -> bool {
+        matches!(
+            self.transfer_decode_failures,
+            Some((current, failures))
+                if current == generation && failures > consensus::STATE_TRANSFER_MAX_DECODE_RETRIES
+        )
     }
 
     pub fn configure_consumer_offset_storage(
@@ -843,7 +908,11 @@ where
         }
     }
 
-    fn persisted_offset_path(&self, kind: ConsumerKind, consumer_id: u32) -> Option<String> {
+    pub(crate) fn persisted_offset_path(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+    ) -> Option<String> {
         match kind {
             ConsumerKind::Consumer => self
                 .consumer_offsets_path
@@ -3051,7 +3120,7 @@ where
     ///
     /// # Errors
     /// If the segment's log / index file cannot be created.
-    async fn install_empty_segment(
+    pub(crate) async fn install_empty_segment(
         &mut self,
         config: &PartitionsConfig,
         start_offset: u64,
@@ -3238,6 +3307,9 @@ where
         self.stats.increment_segments_count(1);
 
         self.applied_purge_generation = generation;
+        // Same commit frontier, different (now empty) bytes: a cached offer
+        // built pre-purge would advertise files the purge just unlinked.
+        self.transfer_offer_cache.borrow_mut().take();
         Ok(())
     }
 
@@ -3328,9 +3400,9 @@ where
     /// peer's eviction point (everything below it is represented by this
     /// replica's recovered segments + offset files) and walk the repaired
     /// window through the normal commit path.
-    pub async fn complete_repair(&mut self, config: &PartitionsConfig) {
+    pub async fn complete_repair(&mut self, config: &PartitionsConfig) -> RepairConclusion {
         let Some(session) = self.repair else {
-            return;
+            return RepairConclusion::Done;
         };
         if let Some(floor) = session.floor {
             // A peer may have evicted past this replica's commit frontier;
@@ -3370,7 +3442,25 @@ where
                      to recovered durable state (needs state transfer)"
                 );
                 self.commit_journal(config).await;
-                return;
+                // A refusal is DEFINITIVE only once the window itself is
+                // fully present (or provably empty): until then more frames
+                // can still lower `first_batch_offset` into connection, so
+                // the session stays armed and the stall retry re-requests.
+                // A complete window that still cannot connect will never
+                // improve -- the peer retains nothing below the floor and
+                // this replica holds nothing either -- and an EMPTY window
+                // (everything evicted) re-raises identically every round.
+                // Both are the state-transfer trigger; the session is
+                // dropped here so the caller's arming funnel starts clean,
+                // and a transfer-unavailable fallback re-arms repair fresh.
+                if self.repaired_window_is_complete(floor, session.to_op) {
+                    self.repair = None;
+                    return RepairConclusion::FloorRefused {
+                        floor,
+                        to_op: session.to_op,
+                    };
+                }
+                return RepairConclusion::InProgress;
             }
             let commit_min = self.consensus().commit_min();
             if floor > commit_min {
@@ -3401,6 +3491,18 @@ where
             done,
             "repair window commit walk finished"
         );
+        if done {
+            RepairConclusion::Done
+        } else {
+            RepairConclusion::InProgress
+        }
+    }
+
+    /// Whether every op in `(floor, to_op]` is journaled. An empty window
+    /// (`floor >= to_op`) counts as complete: there is nothing left that
+    /// could arrive and change the floor verdict.
+    fn repaired_window_is_complete(&self, floor: u64, to_op: u64) -> bool {
+        ((floor + 1)..=to_op).all(|op| self.log.journal().inner.header_by_op(op).is_some())
     }
 
     /// Whether the served repair window `(floor, to_op]` arrived complete and
@@ -4503,13 +4605,57 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_session_remint_when_attempts_burned_should_survive_on_partition() {
+        let mut partition = test_partition();
+        for round in 0..consensus::STATE_TRANSFER_MAX_STALL_RETRIES {
+            assert!(!partition.burn_transfer_attempt());
+            // A re-minted session must not reset the budget: it lives on the
+            // partition precisely because arming sites mint fresh sessions.
+            partition.transfer = Some(crate::state_transfer::PartitionTransferSession {
+                nonce: u128::from(round),
+                peer: 0,
+                commit_op: 0,
+                artifacts: Vec::new(),
+                spilled: Vec::new(),
+                staged: Vec::new(),
+                target_accepted: false,
+                idle_ticks: 0,
+            });
+        }
+        assert!(partition.burn_transfer_attempt(), "budget exhausts");
+        partition.note_transfer_progress();
+        assert!(!partition.burn_transfer_attempt(), "progress resets it");
+    }
+
+    #[compio::test]
+    async fn given_decode_failures_when_generation_advances_should_reset_budget() {
+        let mut partition = test_partition();
+        for _ in 0..consensus::STATE_TRANSFER_MAX_DECODE_RETRIES {
+            assert!(!partition.burn_transfer_decode_failure(7));
+        }
+        assert!(!partition.transfer_decode_budget_exhausted(7));
+        assert!(partition.burn_transfer_decode_failure(7));
+        assert!(partition.transfer_decode_budget_exhausted(7));
+        assert!(
+            !partition.transfer_decode_budget_exhausted(8),
+            "a new generation is new bytes worth full retries"
+        );
+        assert!(!partition.burn_transfer_decode_failure(8));
+    }
+
+    #[compio::test]
     async fn given_no_repaired_batch_when_window_never_arrived_should_refuse_commit_floor() {
         let mut partition = test_partition();
         partition.consensus().advance_commit_max(8);
         partition.repair = Some(armed_session(8, 5, None));
 
-        partition.complete_repair(&repair_config()).await;
+        let conclusion = partition.complete_repair(&repair_config()).await;
 
+        assert_eq!(
+            conclusion,
+            RepairConclusion::InProgress,
+            "an incomplete window is not a definitive refusal"
+        );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(
             partition.repair.is_some(),
@@ -4529,8 +4675,9 @@ mod tests {
         }
         partition.repair = Some(armed_session(8, 5, None));
 
-        partition.complete_repair(&repair_config()).await;
+        let conclusion = partition.complete_repair(&repair_config()).await;
 
+        assert_eq!(conclusion, RepairConclusion::Done);
         assert!(partition.consensus().commit_min() >= 5);
     }
 
@@ -4544,9 +4691,18 @@ mod tests {
         }
         partition.repair = Some(armed_session(8, 5, None));
 
-        partition.complete_repair(&repair_config()).await;
+        let conclusion = partition.complete_repair(&repair_config()).await;
 
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 5, to_op: 8 },
+            "a complete window with an unanchored message op can never connect"
+        );
         assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(
+            partition.repair.is_none(),
+            "a definitive refusal hands recovery to state transfer"
+        );
     }
 
     #[compio::test]
@@ -4555,10 +4711,17 @@ mod tests {
         partition.consensus().advance_commit_max(8);
         partition.repair = Some(armed_session(8, 8, None));
 
-        partition.complete_repair(&repair_config()).await;
+        let conclusion = partition.complete_repair(&repair_config()).await;
 
+        // Everything the peer retained was evicted: a retry re-raises the
+        // identical empty window every round (the wedge state transfer
+        // exists to break), so this refusal is definitive.
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 8, to_op: 8 }
+        );
         assert_eq!(partition.consensus().commit_min(), 0);
-        assert!(partition.repair.is_some());
+        assert!(partition.repair.is_none());
     }
 
     #[compio::test]
@@ -4571,9 +4734,16 @@ mod tests {
         // locally durable nor repaired.
         partition.repair = Some(armed_session(8, 5, Some(3)));
 
-        partition.complete_repair(&repair_config()).await;
+        let conclusion = partition.complete_repair(&repair_config()).await;
 
+        assert_eq!(
+            conclusion,
+            RepairConclusion::InProgress,
+            "with the window incomplete, later frames can still lower the \
+             first batch offset into connection"
+        );
         assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_some());
     }
 }
 

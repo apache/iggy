@@ -1,0 +1,221 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Receiver-side state-transfer session math shared by both planes.
+//!
+//! A transfer pulls the artifacts named by a [`crate::StateArtifact`]
+//! manifest in manifest order, lockstep with one chunk in flight; each
+//! artifact's `buf.len()` doubles as the next request offset. The functions
+//! here are the pure parts of that session -- chunk cursor arithmetic and the
+//! frame-acceptance guards -- so the metadata and partition receivers cannot
+//! drift on the invariants that were review findings on the metadata plane
+//! (sequential offsets, overrun refusal, the zero-byte-payload livelock).
+
+use crate::state_manifest::{StateArtifact, state_artifact_checksum};
+
+/// Stall rounds a receiver spends on ONE peer before abandoning the
+/// transfer and falling back to journal repair.
+///
+/// The retry has no peer re-selection, so this is what keeps a peer that
+/// died mid-transfer from wedging the rejoining node; repair then re-picks
+/// a target and re-arms a transfer if the gap is still below the new peer's
+/// retained floor.
+pub const STATE_TRANSFER_MAX_STALL_RETRIES: u32 = 5;
+
+/// Decode-failure rounds a receiver spends on ONE offered generation
+/// before refusing to pull it again.
+///
+/// Metadata keys on `snapshot_seq`, partitions on the offered `commit_op`. A peer whose generation advances resets the
+/// budget -- new bytes are worth full retries -- while a generation this
+/// build cannot decode ends up costing one refused descriptor per repair
+/// round instead of a full pull.
+pub const STATE_TRANSFER_MAX_DECODE_RETRIES: u32 = 5;
+
+/// One artifact of an accepted transfer target: its manifest entry plus
+/// the bytes received so far.
+///
+/// Chunks are sequential, so `buf.len()` doubles as the next request offset. A receiver that spills completed artifacts to
+/// disk empties `buf` afterwards and tracks completion out of band.
+#[derive(Debug)]
+pub struct ArtifactProgress {
+    pub entry: StateArtifact,
+    pub buf: Vec<u8>,
+}
+
+impl ArtifactProgress {
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.buf.len() as u64 == self.entry.len
+    }
+}
+
+/// Next `(artifact index, offset, len)` to request.
+///
+/// The first incomplete artifact in manifest order, asked from its current
+/// frontier, clamped to `chunk_len_max`. `None` when every artifact is complete (or the manifest
+/// is empty).
+#[must_use]
+pub fn next_pending_chunk(
+    artifacts: &[ArtifactProgress],
+    chunk_len_max: u64,
+) -> Option<(u32, u64, u32)> {
+    let (index, artifact) = artifacts
+        .iter()
+        .enumerate()
+        .find(|(_, artifact)| !artifact.complete())?;
+    let offset = artifact.buf.len() as u64;
+    let remaining = artifact.entry.len - offset;
+    #[allow(clippy::cast_possible_truncation)]
+    let len = remaining.min(chunk_len_max) as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    Some((index as u32, offset, len))
+}
+
+/// Append one received chunk; `true` only when bytes actually landed, which
+/// is the caller's cue to reset its liveness counters and re-drive progress.
+///
+/// Everything else is dropped without side effects: an out-of-range artifact
+/// index, a non-sequential offset (chunks are pulled lockstep, so anything
+/// else is a duplicate or reorder -- the stall retry re-requests from the
+/// current frontier), an overrun past the declared length, and a zero-byte
+/// payload. A zero-byte payload is not progress: it extends nothing and the
+/// same offset is re-requested immediately, and resetting liveness counters
+/// on one is what turned a short rebuilt offer into an unbounded empty-frame
+/// ping-pong on the metadata plane. The serving side refuses to produce
+/// these now; the guard stays because a peer running an older build still
+/// can.
+#[must_use]
+pub fn append_chunk(
+    artifacts: &mut [ArtifactProgress],
+    artifact_index: u32,
+    offset: u64,
+    payload: &[u8],
+) -> bool {
+    let Some(artifact) = artifacts.get_mut(artifact_index as usize) else {
+        return false;
+    };
+    if offset != artifact.buf.len() as u64 {
+        return false;
+    }
+    if artifact.buf.len() as u64 + payload.len() as u64 > artifact.entry.len {
+        tracing::warn!(
+            artifact = artifact_index,
+            declared_len = artifact.entry.len,
+            "state chunk overruns the declared artifact length; dropping frame"
+        );
+        return false;
+    }
+    if payload.is_empty() {
+        return false;
+    }
+    artifact.buf.extend_from_slice(payload);
+    true
+}
+
+/// Whether `bytes` is exactly the artifact the manifest promised:
+/// declared length and `XxHash3_64` checksum.
+///
+/// This proves transit integrity only -- the payload still needs its own
+/// format validation, since the checksum does not prove the peer computed
+/// it over sane bytes.
+#[must_use]
+pub fn verify_state_artifact(entry: &StateArtifact, bytes: &[u8]) -> bool {
+    bytes.len() as u64 == entry.len && state_artifact_checksum(bytes) == entry.checksum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(kind: u8, len: u64) -> ArtifactProgress {
+        ArtifactProgress {
+            entry: StateArtifact {
+                kind,
+                frontier: 0,
+                len,
+                checksum: 0,
+            },
+            buf: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn given_partial_artifacts_when_next_chunk_requested_should_resume_first_incomplete() {
+        let mut artifacts = vec![progress(0, 4), progress(1, 10)];
+        artifacts[0].buf = vec![0; 4];
+        artifacts[1].buf = vec![0; 3];
+
+        assert_eq!(next_pending_chunk(&artifacts, 5), Some((1, 3, 5)));
+    }
+
+    #[test]
+    fn given_short_tail_when_next_chunk_requested_should_clamp_to_remaining() {
+        let mut artifacts = vec![progress(0, 8)];
+        artifacts[0].buf = vec![0; 6];
+
+        assert_eq!(next_pending_chunk(&artifacts, 64), Some((0, 6, 2)));
+    }
+
+    #[test]
+    fn given_complete_or_empty_manifest_when_next_chunk_requested_should_yield_none() {
+        assert_eq!(next_pending_chunk(&[], 64), None);
+        let mut artifacts = vec![progress(0, 2)];
+        artifacts[0].buf = vec![0; 2];
+        assert_eq!(next_pending_chunk(&artifacts, 64), None);
+    }
+
+    #[test]
+    fn given_zero_length_artifact_when_scanned_should_read_complete() {
+        // A zero-length artifact must never be asked for: `start >= len` is
+        // the empty-chunk exchange the serving side refuses.
+        let artifacts = vec![progress(0, 0), progress(1, 1)];
+        assert_eq!(next_pending_chunk(&artifacts, 64), Some((1, 0, 1)));
+    }
+
+    #[test]
+    fn given_sequential_chunks_when_appended_should_accumulate() {
+        let mut artifacts = vec![progress(0, 4)];
+        assert!(append_chunk(&mut artifacts, 0, 0, b"ab"));
+        assert!(append_chunk(&mut artifacts, 0, 2, b"cd"));
+        assert!(artifacts[0].complete());
+    }
+
+    #[test]
+    fn given_bad_frames_when_appended_should_drop_without_side_effects() {
+        let mut artifacts = vec![progress(0, 4)];
+        assert!(append_chunk(&mut artifacts, 0, 0, b"ab"));
+
+        assert!(!append_chunk(&mut artifacts, 1, 0, b"xx"), "index OOB");
+        assert!(!append_chunk(&mut artifacts, 0, 0, b"xx"), "stale offset");
+        assert!(!append_chunk(&mut artifacts, 0, 3, b"xx"), "future offset");
+        assert!(!append_chunk(&mut artifacts, 0, 2, b"xyz"), "overrun");
+        assert!(!append_chunk(&mut artifacts, 0, 2, b""), "empty payload");
+        assert_eq!(artifacts[0].buf, b"ab", "rejected frames must not mutate");
+    }
+
+    #[test]
+    fn given_artifact_bytes_when_verified_should_match_len_and_checksum() {
+        let bytes = b"state transfer artifact".to_vec();
+        let entry = StateArtifact::for_bytes(2, 7, &bytes);
+        assert!(verify_state_artifact(&entry, &bytes));
+
+        let mut flipped = bytes.clone();
+        flipped[0] ^= 1;
+        assert!(!verify_state_artifact(&entry, &flipped));
+        assert!(!verify_state_artifact(&entry, &bytes[1..]));
+    }
+}

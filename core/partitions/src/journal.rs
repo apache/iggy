@@ -283,9 +283,30 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
-    /// Entry bytes for `op`, from the resident journal or the evicted ring.
-    /// `None` when the op predates the ring (bulk-sync territory) or was
-    /// never journaled here.
+    /// Drop EVERYTHING this journal holds: resident entries, the
+    /// op/offset/timestamp indexes, and the evicted repair ring.
+    ///
+    /// State-transfer install only. The installed segments supersede every
+    /// journaled op at or below the new commit floor, and the stale suffix
+    /// ABOVE it (prepared-but-uncommitted ops from a superseded view) would
+    /// collide with the new view's prepares at the same op numbers. The
+    /// journal is memory-only, so a full clear IS the partition plane's
+    /// suffix truncation; the receiver re-fetches the live tail through
+    /// normal journal repair afterwards. Ring caps and the retention flag
+    /// survive: they are configuration, not content.
+    pub fn clear_all(&self) {
+        {
+            let inner = unsafe { &*self.inner.get() };
+            let _ = inner.storage.drain();
+        }
+        unsafe { &mut *self.op_to_storage_offset.get() }.clear();
+        unsafe { &mut *self.offset_to_op.get() }.clear();
+        unsafe { &mut *self.timestamp_to_op.get() }.clear();
+        unsafe { &mut *self.headers.get() }.clear();
+        unsafe { &mut *self.evicted_ring.get() }.clear();
+        self.evicted_ring_bytes.set(0);
+    }
+
     /// Disable repair retention (single-replica groups: nobody to repair).
     pub fn set_repair_retention(&self, enabled: bool) {
         self.repair_retention.set(enabled);
@@ -311,6 +332,9 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         op_to_storage_offset.len()
     }
 
+    /// Entry bytes for `op`, from the resident journal or the evicted ring.
+    /// `None` when the op predates the ring (bulk-sync territory) or was
+    /// never journaled here.
     pub fn repair_entry(&self, op: u64) -> Option<JournalBuffer> {
         {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };

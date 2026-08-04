@@ -31,6 +31,12 @@ publish = false
 name = "iggy-bench"
 path = "src/main.rs"
 
+[features]
+# Switches the SDK to the vsr Register-handshake framing spoken by server-ng
+# clusters. The framing is chosen at compile time, so a default-features bench
+# binary cannot talk to a vsr cluster at all (the first request never frames).
+vsr = ["iggy/vsr"]
+
 [dependencies]
 async-trait = { workspace = true }
 bench-report = { workspace = true }

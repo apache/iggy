@@ -339,6 +339,11 @@ where
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
                     self.tick_partitions().await;
+                    // Runs here, not inside `tick_metadata`: that early-returns
+                    // on shards without metadata consensus, and partition-plane
+                    // offers live on every shard that hosts a serving group --
+                    // parked behind the shard-0 gate they would never expire.
+                    self.expire_idle_state_transfer_offers();
                     // While a cooperative revocation is pending, wake the
                     // reconciler each tick so the handoff completes within ~one
                     // tick of the partition draining, not the periodic pass.
