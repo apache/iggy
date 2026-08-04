@@ -391,9 +391,10 @@ where
     }
 
     /// Build an owned [`PollPlan`] for a partition poll synchronously, under a
-    /// single [`Self::with_partition`] borrow (the in-memory journal tier + the
-    /// resident-tail straddle snapshot are read here; mem reads never yield).
-    /// Returns `None` for a missing or tombstoned namespace.
+    /// single pump-only `&mut` borrow (the in-memory journal tier + the
+    /// resident-tail straddle snapshot are read here, and the sealed-read-handle
+    /// LRU is touched; mem reads never yield). Returns `None` for a missing or
+    /// tombstoned namespace.
     ///
     /// Pairs with [`PollPlan::execute`], which runs the disk read +
     /// offset persist/apply off the borrow on the owned plan. Splitting the
@@ -406,9 +407,11 @@ where
         consumer: PollingConsumer,
         args: &PollingArgs,
     ) -> Option<PollPlan> {
-        self.with_partition(namespace, |partition| {
-            partition.build_poll_plan(consumer, args)
-        })
+        // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
+        // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
+        // inside), so no sibling task can realloc the partitions vec under it.
+        let partition = self.get_mut_by_ns(namespace)?;
+        Some(partition.build_poll_plan(consumer, args))
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully

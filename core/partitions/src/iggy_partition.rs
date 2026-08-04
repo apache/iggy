@@ -724,8 +724,9 @@ where
     /// can run the disk read + offset persist off the partition borrow. The
     /// in-memory journal tier is read here directly (mem reads never yield);
     /// the disk tier is captured as owned descriptors in [`DiskReadPlan`].
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn build_poll_plan(
-        &self,
+        &mut self,
         consumer: PollingConsumer,
         args: &PollingArgs,
     ) -> PollPlan {
@@ -816,13 +817,22 @@ where
         }
 
         let (start_segment, start_position) = self.disk_poll_start(&query);
+        // Cap resident sealed read handles: touch this poll's start segment so
+        // the LRU keeps the hot set and drops the least-recently-used fd +
+        // index (a no-op for the active segment, whose handle never caches).
+        self.log.touch_sealed_read_state(start_segment);
         // Snapshot only the segments the disk walk visits (`start_segment..`),
-        // so `start_position` applies to the first snapshotted segment.
+        // so `start_position` applies to the first snapshotted segment. A sealed
+        // segment carries its shared read-state handle (fd + sparse index) so
+        // the off-borrow read reuses (or fills) it; the active segment opens
+        // fresh and resolves from its resident index.
         let segments = self.log.segments()[start_segment..]
             .iter()
-            .map(|segment| DiskSegment {
+            .zip(self.log.sealed_read_state()[start_segment..].iter())
+            .map(|(segment, read_state)| DiskSegment {
                 start_offset: segment.start_offset,
                 persisted: segment.size.as_bytes_u64(),
+                read_state: segment.sealed.then(|| Rc::clone(read_state)),
             })
             .collect();
         let disk = DiskReadPlan {
@@ -2848,12 +2858,10 @@ where
         let mut deleted_messages = 0u64;
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
-            // victim is index 0 once the previous one is gone.
-            let segment = self.log.segments_mut().remove(0);
-            let mut storage = self.log.storages_mut().remove(0);
-            self.log.indexes_mut().remove(0);
-            self.log.messages_writers_mut().remove(0);
-            self.log.index_writers_mut().remove(0);
+            // victim is the front once the previous one is gone.
+            let Some((segment, mut storage)) = self.log.retire_front() else {
+                break;
+            };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -3004,14 +3012,19 @@ where
 
         let namespace = self.namespace();
 
+        // The purge recreates segment files at the paths it unlinks below, so
+        // an in-flight poll's cached read fd would keep serving the unlinked
+        // pre-purge inodes as live data. Wipe the shared read-state slots
+        // first: the clones held by suspended walks observe the wipe and their
+        // next segment resolve re-opens by path, seeing the fresh empty files.
+        self.log.invalidate_sealed_read_state();
+
         // Drain every segment (including the active one) and unlink its files.
         let segment_count = self.log.segments().len();
         for _ in 0..segment_count {
-            self.log.segments_mut().remove(0);
-            let mut storage = self.log.storages_mut().remove(0);
-            self.log.indexes_mut().remove(0);
-            self.log.messages_writers_mut().remove(0);
-            self.log.index_writers_mut().remove(0);
+            let Some((_, mut storage)) = self.log.retire_front() else {
+                break;
+            };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -3493,7 +3506,7 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poll_plan::DiskReadOutcome;
+    use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
@@ -3949,10 +3962,12 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: 512,
+                    read_state: None,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
+                    read_state: None,
                 },
             ],
             start_position: 0,
@@ -4032,10 +4047,12 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: corrupt_len,
+                    read_state: None,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
+                    read_state: None,
                 },
             ],
             start_position: 0,
@@ -4068,6 +4085,7 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
+                read_state: None,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -4097,6 +4115,7 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
+                read_state: None,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -4114,6 +4133,465 @@ mod tests {
             matches!(outcome, DiskReadOutcome::Faulted),
             "unresolvable dir over file-backed data must fault-close, not serve the journal",
         );
+    }
+
+    /// A sealed-segment poll opens the file once and caches the read fd; a later
+    /// poll of the same segment reuses the cached descriptor. Proven by
+    /// unlinking the file after the first read: a fresh open-by-path would now
+    /// fail, so a successful second read can only come from the cached fd (which
+    /// reads the still-open, unlinked inode).
+    #[compio::test]
+    async fn read_disk_caches_and_reuses_sealed_segment_fd() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-fdcache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        let path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&path)
+                .await
+                .expect("create segment file");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment file");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        // The pump touches the poll's start segment before cloning its handle
+        // into the plan, so a cache-eligible handle is always tracked.
+        handle.tracked.set(true);
+        assert!(handle.fd.borrow().is_none(), "fd cache slot starts empty");
+
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let first = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(first, DiskReadOutcome::Matched { .. }),
+            "first sealed poll must match the batch",
+        );
+        assert!(
+            handle.fd.borrow().is_some(),
+            "first sealed poll must populate the read-fd cache slot",
+        );
+
+        // Unlink the file: a fresh open-by-path would fail now, so the second
+        // read succeeding proves the cached fd was reused.
+        std::fs::remove_file(&path).expect("unlink segment file");
+
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let second = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(second, DiskReadOutcome::Matched { .. }),
+            "cached fd must serve the read after the segment path is unlinked",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An untracked handle (a sealed segment the walk crosses without being the
+    /// poll's start segment, or a slot evicted mid-poll) opens its file
+    /// transiently: the read succeeds but no fd is retained, so the sealed LRU
+    /// cap stays a true bound on resident descriptors.
+    #[compio::test]
+    async fn read_disk_does_not_retain_fd_for_untracked_handle() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-untracked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        let path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&path)
+                .await
+                .expect("create segment file");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment file");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "the transient open must still serve the read",
+        );
+        assert!(
+            handle.fd.borrow().is_none(),
+            "an untracked handle must not retain the fd",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sealed-segment poll reloads the dropped sparse index from the `.index`
+    /// file and resolves the start byte from it, skipping the full-segment scan.
+    /// Proven by prefixing the `.log` with bytes a scan from position 0 would
+    /// fault on: only an index that jumps straight to the batch reads it.
+    #[compio::test]
+    async fn read_disk_reloads_sealed_index_to_skip_scan() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-idxreload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        // `.log`: an undecodable prefix (a scan from byte 0 faults on it) then a
+        // valid batch at offset 5. `.index`: one sparse entry mapping offset 5
+        // to the batch's byte position, so the poll jumps past the prefix.
+        let prefix = vec![0xABu8; 512];
+        let prefix_len = prefix.len() as u64;
+        let batch = build_segment_record(namespace, 5);
+        let mut log_bytes = prefix;
+        log_bytes.extend_from_slice(&batch);
+        let log_len = log_bytes.len() as u64;
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&log_path)
+                .await
+                .expect("create segment log");
+            let (written, _) = file.write_all_at(log_bytes, 0).await.into();
+            written.expect("write segment log");
+            file.sync_all().await.expect("flush segment log");
+        }
+
+        let index_bytes = crate::iggy_index::IggyIndexCache::serialize(
+            &crate::iggy_index::IggyIndex::new(5, 0, prefix_len),
+        );
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        {
+            let mut file = compio::fs::File::create(&index_path)
+                .await
+                .expect("create segment index");
+            let (written, _) = file.write_all_at(index_bytes, 0).await.into();
+            written.expect("write segment index");
+            file.sync_all().await.expect("flush segment index");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: log_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            // Byte 0, exactly what disk_poll_start returns for a sealed segment
+            // whose resident index was dropped.
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 5,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "the reloaded sparse index must skip the prefix; a scan from byte 0 would fault",
+        );
+        assert!(
+            handle.index.borrow().is_some(),
+            "the sealed poll must cache the reloaded sparse index",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sparse index past `SEALED_INDEX_RESIDENT_MAX_BYTES` (a dense flush
+    /// cadence can make it track every message, hundreds of MB per segment) is
+    /// binary-searched on file instead of materialized: the poll still resolves
+    /// the exact start byte (proven by the poison prefix a byte-0 scan would
+    /// fault on) while the handle's index slot stays empty.
+    #[compio::test]
+    async fn read_disk_resolves_oversized_index_without_materializing() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-bigidx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let index_size = crate::iggy_index::IGGY_INDEX_SIZE as u64;
+        let entry_count = crate::poll_plan::SEALED_INDEX_RESIDENT_MAX_BYTES / index_size + 1;
+        let target_offset = entry_count - 1;
+
+        let prefix = vec![0xABu8; 512];
+        let prefix_len = prefix.len() as u64;
+        let batch = build_segment_record(namespace, target_offset);
+        let mut log_bytes = prefix;
+        log_bytes.extend_from_slice(&batch);
+        let log_len = log_bytes.len() as u64;
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&log_path)
+                .await
+                .expect("create segment log");
+            let (written, _) = file.write_all_at(log_bytes, 0).await.into();
+            written.expect("write segment log");
+            file.sync_all().await.expect("flush segment log");
+        }
+
+        // Every entry below the target points at byte 0 (the poison prefix),
+        // so only an exact lower-bound hit on the last entry reads the batch.
+        let mut index_bytes =
+            Vec::with_capacity(usize::try_from(entry_count * index_size).expect("fits in usize"));
+        for entry in 0..entry_count {
+            index_bytes.extend_from_slice(&entry.to_le_bytes());
+            index_bytes.extend_from_slice(&entry.to_le_bytes());
+            let position = if entry == target_offset {
+                prefix_len
+            } else {
+                0
+            };
+            index_bytes.extend_from_slice(&position.to_le_bytes());
+        }
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        {
+            let mut file = compio::fs::File::create(&index_path)
+                .await
+                .expect("create segment index");
+            let (written, _) = file.write_all_at(index_bytes, 0).await.into();
+            written.expect("write segment index");
+            file.sync_all().await.expect("flush segment index");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: log_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: target_offset,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "the on-file lower bound must resolve past the poison prefix",
+        );
+        assert!(
+            handle.index.borrow().is_none(),
+            "an index past the resident cap must never be materialized",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Purge unlinks every segment and recreates the same paths, so a poll
+    /// suspended across the purge must not keep serving the old inodes through
+    /// its cached read state. The wipe reaches the in-flight clone through the
+    /// shared handle: the resumed walk re-opens by path and fails closed on
+    /// the recreated empty segment instead of serving purged messages.
+    #[compio::test]
+    async fn purge_invalidates_sealed_read_state_held_by_in_flight_poll() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-purge-readstate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+
+        // Seal the boot segment and back it with real files so the purge
+        // unlinks and recreates them at the same paths.
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        partition.log.segments_mut()[0].sealed = true;
+        partition.log.storages_mut()[0] =
+            SegmentStorage::new(&log_path, &index_path, 0, 0, false, false, false)
+                .await
+                .expect("create segment storage");
+
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        {
+            let mut file = compio::fs::File::create(&log_path)
+                .await
+                .expect("open segment log");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment log");
+        }
+
+        partition.log.touch_sealed_read_state(0);
+        let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let before_purge = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(before_purge, DiskReadOutcome::Matched { .. }),
+            "the sealed poll must match before the purge",
+        );
+        assert!(
+            handle.fd.borrow().is_some(),
+            "the sealed poll must populate the fd cache slot",
+        );
+
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+
+        assert!(
+            handle.fd.borrow().is_none(),
+            "purge must clear the cached fd inside the shared state",
+        );
+        assert!(
+            handle.index.borrow().is_none(),
+            "purge must clear the cached index inside the shared state",
+        );
+        assert!(
+            !handle.tracked.get(),
+            "purge must untrack the handle so a resumed walk cannot re-cache",
+        );
+
+        // A walk resumed after the purge resolves through the same handle: it
+        // must re-open by path and hit the recreated empty segment, never the
+        // unlinked pre-purge inode.
+        let resumed = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let after_purge = resumed
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            !matches!(after_purge, DiskReadOutcome::Matched { .. }),
+            "a resumed walk must not serve purged messages through a stale fd",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn repair_config() -> PartitionsConfig {

@@ -71,15 +71,16 @@ describe('normalizeClientConfig', () => {
     );
   });
 
-  it('rejects VSR over an untested TLS transport', () => {
-    assert.throws(
-      () => normalizeClientConfig({
-        ...config(),
-        protocol: 'vsr',
-        transport: 'TLS'
-      }),
-      /TCP transport only/
-    );
+  it('supports VSR over TLS', () => {
+    const normalized = normalizeClientConfig({
+      ...config(),
+      protocol: 'vsr',
+      transport: 'TLS'
+    });
+
+    assert.equal(normalized.protocol, 'vsr');
+    assert.equal(normalized.transport, 'TLS');
+    assert.deepEqual(normalized.poolSize, { min: 1, max: 1 });
   });
 
   it('rejects unsafe response frame limits', () => {

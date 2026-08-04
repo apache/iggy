@@ -19,6 +19,14 @@ name: setup-rust-with-cache
 description: Setup Rust toolchain with Swatinem/rust-cache
 
 inputs:
+  install-nextest:
+    description: "Whether to install cargo-nextest"
+    required: false
+    default: "false"
+  install-system-dependencies:
+    description: "Whether to install system packages required by Rust builds"
+    required: false
+    default: "true"
   read-cache:
     description: "Whether to read from cache"
     required: false
@@ -55,14 +63,14 @@ runs:
         aggressive: ${{ inputs.free-disk-space-aggressive }}
 
     - name: Install system dependencies (Linux)
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && inputs.install-system-dependencies == 'true'
       run: |
         sudo apt-get update
         sudo apt-get install -y libhwloc-dev pkg-config libudev-dev
       shell: bash
 
     - name: Install system dependencies (macOS)
-      if: runner.os == 'macOS'
+      if: runner.os == 'macOS' && inputs.install-system-dependencies == 'true'
       run: |
         # Pin version of hwloc to 2.12.2_1
         # brew extract doesn't have this version, so we fetch the formula directly
@@ -117,7 +125,7 @@ runs:
       shell: bash
 
     - name: Install cargo-nextest
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && inputs.install-nextest == 'true'
       run: |
         if command -v cargo-nextest &> /dev/null; then
           echo "cargo-nextest already installed"
