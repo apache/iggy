@@ -42,8 +42,7 @@ otherwise. Please keep the report confidential until the announcement.
 
 The following are not treated as vulnerabilities in Apache Iggy:
 
-- automated scanner or dependency-checker output with no demonstrated exploit against a supported
-  configuration
+- automated scanner or dependency-checker output with no demonstrated exploit
 - reports of vulnerabilities in third-party dependencies with no demonstrated exploitable path through
   Iggy itself; see the ASF guidance on
   [dependency advisories](https://security.apache.org/report-dependency/)
