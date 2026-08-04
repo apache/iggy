@@ -13,7 +13,7 @@ This connector reads data from relational databases using JDBC (Java Database Co
 - **Bulk Mode**: Re-runs the query each poll for snapshots (capped at `batch_size` rows; see limitations)
 - **Type Mapping**: Automatic conversion of SQL types to JSON
 - **Configurable Polling**: Control how frequently data is fetched
-- **State Management**: Automatically tracks offsets to prevent duplicate reads
+- **State Management**: Tracks offsets so rows below the cursor are not re-read (at-least-once across restarts, not exactly-once)
 - **Flexible Queries**: Support for custom SQL queries with placeholders
 
 ## Supported Databases
@@ -203,7 +203,7 @@ topic = "orders"
 | `login_timeout_ms` | u64 | No | 30000 | Bound on establishing the connection (`DriverManager.setLoginTimeout`); rounded up to whole seconds. Stops an unreachable database from hanging startup |
 | `jvm_options` | array | No | [] | Custom JVM options (e.g., ["-Xmx1g"]) |
 | `snake_case_columns` | bool | No | false | Convert column names to snake_case |
-| `include_metadata` | bool | No | true | Include metadata (table, operation, timestamp) |
+| `include_metadata` | bool | No | true | Wrap each row with metadata (operation type, timestamp). `table_name` is a reserved field and is currently always null |
 
 ## Query Placeholders
 
@@ -297,6 +297,9 @@ Each database row is converted to a JSON message:
   }
 }
 ```
+
+`table_name` is always `null` today: it is a reserved field, not derived
+from the query. `operation_type` is always `"SELECT"`.
 
 ### Without Metadata
 
@@ -538,7 +541,7 @@ query = "SELECT * FROM table WHERE {tracking_column} > {last_offset} ORDER BY {t
 
 **Benefits:**
 
-- Prevents duplicate reads
+- Avoids re-reading rows below the tracked offset (at-least-once, not exactly-once)
 - Tracks offset automatically
 - Efficient for large tables
 - Works with timestamps, IDs, or any orderable column
