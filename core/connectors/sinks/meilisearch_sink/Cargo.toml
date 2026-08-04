@@ -16,33 +16,32 @@
 # under the License.
 
 [package]
-name = "apache-iggy"
-version = "0.8.1-dev3"
+name = "iggy_connector_meilisearch_sink"
+version = "0.4.1-edge.1"
+description = "Iggy Meilisearch sink connector"
 edition = "2024"
-authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"
-description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
-documentation = "https://iggy.apache.org/docs/"
+keywords = ["iggy", "messaging", "streaming", "meilisearch", "sink"]
+categories = ["command-line-utilities", "database", "network-programming"]
+homepage = "https://iggy.apache.org"
+documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
+readme = "../../README.md"
+publish = false
 
 [lib]
-name = "apache_iggy"
-crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "stub_gen"
-path = "src/bin/stub_gen.rs"
-doc = false
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
-bytes = "1.12.1"
-futures = "0.3.33"
-iggy = { path = "../../core/sdk", version = "0.10.3-edge.3" }
-paste = "1"
-pyo3 = "0.29.0"
-pyo3-async-runtimes = { version = "0.29.0", features = [
-    "attributes",
-    "tokio-runtime",
-] }
-pyo3-stub-gen = "0.23.0"
-tokio = "1.53.1"
+async-trait = { workspace = true }
+base64 = { workspace = true }
+iggy_common = { workspace = true }
+iggy_connector_sdk = { workspace = true }
+meilisearch-sdk = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }

@@ -33,6 +33,7 @@ use consensus::{
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
+use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
@@ -65,7 +66,7 @@ use server_common::sharding::METADATA_CONSENSUS_NAMESPACE;
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
 #[cfg(any(test, feature = "simulator"))]
@@ -995,9 +996,48 @@ where
     /// materialised the namespace (post-`CreateTopic` convergence window).
     /// Parked here instead of dropped -- there is no consensus retransmit
     /// driver in production yet -- and re-dispatched when the matching
-    /// `ReconcileOp::InsertOwned` lands. Bounded per namespace; overflow
-    /// drops the frame (at-least-once: client/primary retries recover).
-    pending_partition_frames: RefCell<HashMap<IggyNamespace, Vec<Message<GenericHeader>>>>,
+    /// `ReconcileOp::InsertOwned` lands with the epoch they were stamped
+    /// against. Bounded per namespace; a full buffer sheds via
+    /// [`ParkOutcome::Overflow`] so the caller can still answer.
+    ///
+    /// An entry only drains when the namespace materialises or leaves committed
+    /// metadata, so the reconciler reclaims the ones that will do neither -- see
+    /// `partition_reconciler::reconcile_parked_frames`. Without that sweep a
+    /// namespace whose build keeps failing would hold its frames for the process
+    /// lifetime while every client waited out its read timeout.
+    ///
+    /// [`BTreeMap`], not `HashMap`: [`Self::parked_namespaces`] feeds the
+    /// reconciler sweep, which answers frames in the order it walks them.
+    /// `std::collections::HashMap` seeds its hasher per process, so iteration
+    /// order would vary run to run for identical committed state, making the
+    /// simulator's deny ordering unreproducible for a fixed seed -- the same
+    /// hazard `router.rs` documents as its reason for `select_biased!`.
+    pending_partition_frames: RefCell<BTreeMap<IggyNamespace, ParkEntry>>,
+
+    /// Running sum of [`ParkEntry::bytes`], maintained at each mutation site.
+    ///
+    /// Recomputing per arriving frame is O(all parked frames). Footprints floor
+    /// at [`MESSAGE_ALIGN`], so the budget admits 4096 entries: ~8.4M visits per
+    /// admission, on the reactor thread inside the map's `borrow_mut`.
+    parked_partition_bytes: Cell<usize>,
+
+    /// Namespaces holding frames [`Self::redispatch_parked_frames`] could not
+    /// re-queue, for the pump to retry.
+    ///
+    /// Without it a re-parked frame has no exit: its namespace is materialised
+    /// by then, so the sweep skips it and `reconcile_additions` stages no second
+    /// `InsertOwned`. Only a topic delete would reach it. The pump drains the
+    /// inbox, so a refusal usually clears on its next iteration.
+    ///
+    /// [`BTreeSet`] for the reason [`Self::pending_partition_frames`] is a
+    /// [`BTreeMap`]: fixed-seed simulator replay needs iteration order to be a
+    /// function of the namespaces alone.
+    reparked_partition_namespaces: RefCell<BTreeSet<IggyNamespace>>,
+
+    /// Set while the shard-wide budget is shedding for namespaces holding no
+    /// park entry of their own, which have no [`ParkEntry::shed`] to warn once
+    /// from. Cleared when the park map empties, so one episode warns once.
+    shard_park_shedding: Cell<bool>,
 
     /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
     /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
@@ -1126,7 +1166,10 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
-            pending_partition_frames: RefCell::new(HashMap::new()),
+            pending_partition_frames: RefCell::new(BTreeMap::new()),
+            parked_partition_bytes: Cell::new(0),
+            reparked_partition_namespaces: RefCell::new(BTreeSet::new()),
+            shard_park_shedding: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             metadata_transfer_offers: RefCell::new(HashMap::new()),
@@ -1361,7 +1404,10 @@ where
             metrics: crate::metrics::ShardMetrics::for_shard(),
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
-            pending_partition_frames: RefCell::new(HashMap::new()),
+            pending_partition_frames: RefCell::new(BTreeMap::new()),
+            parked_partition_bytes: Cell::new(0),
+            reparked_partition_namespaces: RefCell::new(BTreeSet::new()),
+            shard_park_shedding: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             metadata_transfer_offers: RefCell::new(HashMap::new()),
@@ -1381,6 +1427,36 @@ where
     #[must_use]
     pub const fn metrics(&self) -> &crate::metrics::ShardMetrics {
         &self.metrics
+    }
+
+    /// Attach the sender mesh to a shard built by [`Self::without_inbox`], which
+    /// leaves it empty.
+    ///
+    /// Exists for out-of-crate tests: the paths that hand work back to the pump
+    /// (`stage_transient_deny`, the parked-frame re-dispatch) index
+    /// `senders[self.id]`, so without a mesh they silently no-op and a test
+    /// asserting on them proves nothing. The caller must keep the paired
+    /// receivers alive; dropping one turns every `try_send` into `Disconnected`.
+    ///
+    /// Whole mesh, not one sender: consumers index by shard id and
+    /// `forward_metadata_submit` indexes `senders[0]` unconditionally, so a
+    /// one-element vec is correct only for shard 0. `shard_count` tracks it, as
+    /// in both constructors.
+    ///
+    /// # Panics
+    /// If the mesh is not ordered `senders[i].shard_id() == i` or does not cover
+    /// this shard. Either routes frames to the wrong pump.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn attach_senders(&mut self, senders: Vec<TaggedSender>) {
+        assert!(
+            (self.id as usize) < senders.len(),
+            "attach_senders: mesh of {} does not cover shard {}",
+            senders.len(),
+            self.id
+        );
+        validate_sender_ordering(&senders).expect("attach_senders: mesh must be ordered by shard");
+        self.shard_count = u32::try_from(senders.len()).expect("shard count fits u32");
+        self.senders = senders;
     }
 
     /// `None` removes the handler; subsequent ticks drop with a metric bump.
@@ -1468,6 +1544,35 @@ where
         }));
     }
 
+    /// Re-drive the re-dispatch for namespaces whose frames the inbox refused.
+    ///
+    /// Runs on the pump, wherever [`Self::apply_reconcile_ops`] does, so it
+    /// fires right after a frame was consumed and a slot freed. Only another
+    /// refusal puts a namespace back, so the set empties itself.
+    ///
+    /// Epoch comes from the routing row, which `InsertOwned` writes alongside
+    /// the partition. Skipped when the row is gone or the namespace is fenced;
+    /// teardown does both, and the reconciler sweep retires the frames.
+    fn retry_reparked_frames(&self) {
+        let pending: Vec<IggyNamespace> = {
+            let mut reparked = self.reparked_partition_namespaces.borrow_mut();
+            if reparked.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *reparked).into_iter().collect()
+        };
+        let partitions = self.plane.partitions();
+        for namespace in pending {
+            if partitions.is_tombstoned(&namespace) {
+                continue;
+            }
+            let Some(epoch) = self.shards_table.epoch_for(namespace) else {
+                continue;
+            };
+            self.redispatch_parked_frames(namespace, epoch);
+        }
+    }
+
     /// Drain and apply staged [`ReconcileOp`]s on the pump task.
     /// Synchronous: every arm is in-memory only. `ConfirmRemove`'s fsync +
     /// blocking close is offloaded to a detached task so the pump doesn't
@@ -1476,6 +1581,9 @@ where
     where
         B: MessageBus + 'static,
     {
+        // Ahead of the staged ops and outside their empty-queue early return: a
+        // re-parked frame waits on inbox capacity, not on a reconcile op.
+        self.retry_reparked_frames();
         let staged: Vec<ReconcileOp<B>> = {
             let mut q = self.reconcile_queue.borrow_mut();
             if q.is_empty() {
@@ -1515,34 +1623,7 @@ where
                         PartitionLocation::new(ShardId::new(self_shard_id), epoch),
                     );
                     self.metrics.record_partition_materialised();
-                    // Re-dispatch frames that arrived before this partition
-                    // materialised (see `park_if_unmaterialised`). `dispatch`
-                    // re-routes them onto our own inbox, so the pump
-                    // processes them after this drain completes.
-                    let parked = self
-                        .pending_partition_frames
-                        .borrow_mut()
-                        .remove(&namespace);
-                    if let Some(frames) = parked {
-                        tracing::debug!(
-                            shard = self_shard_id,
-                            namespace_raw = namespace.inner(),
-                            count = frames.len(),
-                            "re-dispatching parked partition frames after materialisation"
-                        );
-                        for frame in frames {
-                            if let Some(sender) = self.senders.get(self_shard_id as usize)
-                                && let Err(error) =
-                                    sender.try_send(ShardFrame::consensus(self_shard_id, frame))
-                            {
-                                tracing::warn!(
-                                    shard = self_shard_id,
-                                    namespace_raw = namespace.inner(),
-                                    "dropping parked partition frame: inbox rejected: {error:?}"
-                                );
-                            }
-                        }
-                    }
+                    self.redispatch_parked_frames(namespace, epoch);
                 }
                 ReconcileOp::InsertRouted {
                     namespace,
@@ -1609,7 +1690,148 @@ enum ParkOutcome<H> {
     /// transient status; replicated traffic still flows to the plane, whose
     /// own tombstone guards drop it.
     Tombstoned(Message<H>),
+    /// Namespace is unmaterialised and its park buffer is at capacity. Client
+    /// requests must be denied with a transient status: the frame is gone, and
+    /// silence would leave a lockstep transport waiting out its response
+    /// read-timeout. Replicated traffic is dropped, recovered by retransmit.
+    Overflow(Message<H>),
 }
+
+/// A partition frame held until its namespace materialises.
+///
+/// `epoch` is the committed `created_revision` observed when the frame was
+/// parked, or `None` when the namespace had no committed partition to read one
+/// from. Delete + recreate recycles the slab keys, so the namespace alone cannot
+/// distinguish incarnations: without this stamp a frame parked against the dead
+/// incarnation would be drained into its replacement by `InsertOwned` and
+/// served, because `serves_committed_incarnation` compares the committed
+/// revision against the routing row - both of which describe the NEW
+/// incarnation - and never the frame's provenance.
+struct ParkedFrame {
+    epoch: Option<u64>,
+    /// Reconciler passes survived. `reconcile_parked_frames` increments it and
+    /// answers CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the
+    /// simulator's virtual clock controls.
+    ///
+    /// Never expires a replicated prepare: no client to answer, and
+    /// `consensus::retransmit_targets` skips an op that already reached quorum,
+    /// so expiry is silent permanent loss. Byte budgets bound those instead.
+    ///
+    /// Bounds RESIDENCY, not staleness. The SDK replays the identical request
+    /// for the rest of its response timeout, so an absolute-offset
+    /// `StoreConsumerOffset` rewinds the group on the replay anyway. What it
+    /// buys: a buffer that cannot grow without limit, and a client that learns
+    /// the outcome from a reply rather than a timeout.
+    passes: u32,
+    message: Message<GenericHeader>,
+}
+
+impl ParkedFrame {
+    fn footprint(&self) -> usize {
+        parked_footprint(self.message.as_slice().len())
+    }
+
+    /// No client on this node: nothing to answer, nothing recovers it.
+    fn is_replicated(&self) -> bool {
+        self.message.header().command != Command2::Request
+    }
+}
+
+/// One namespace's parked frames plus their running footprint.
+///
+/// Carried, not re-summed: `park_if_unmaterialised` reads it per arriving frame
+/// over an entry up to [`MAX_PARKED_PER_NAMESPACE`] deep, so a rescan makes
+/// admission quadratic in the depth it exists to bound.
+#[derive(Default)]
+struct ParkEntry {
+    frames: Vec<ParkedFrame>,
+    bytes: usize,
+    /// Frames shed since the entry was created. Only the first warns.
+    shed: u64,
+}
+
+impl ParkEntry {
+    fn push(&mut self, frame: ParkedFrame) {
+        self.bytes = self.bytes.saturating_add(frame.footprint());
+        self.frames.push(frame);
+    }
+
+    /// Remove the selected frames, returning them and the footprint freed so the
+    /// caller can debit the shard-wide total.
+    fn extract(
+        &mut self,
+        predicate: impl FnMut(&mut ParkedFrame) -> bool,
+    ) -> (Vec<ParkedFrame>, usize) {
+        let taken: Vec<ParkedFrame> = self.frames.extract_if(.., predicate).collect();
+        let freed: usize = taken.iter().map(ParkedFrame::footprint).sum();
+        self.bytes = self.bytes.saturating_sub(freed);
+        (taken, freed)
+    }
+}
+
+/// Per-namespace ceiling on parked CLIENT REQUESTS.
+///
+/// Requests only, like the byte budgets: a header-only frame charges
+/// [`MESSAGE_ALIGN`], so 128 of them is 512 KiB against a 4 MiB per-namespace
+/// budget. Applied to prepares this would be the binding constraint for every
+/// footprint under 32 KiB and would shed them long before any byte budget could,
+/// which is the loss class the split exists to remove. A prepare is bounded by
+/// [`MAX_PARKED_BYTES_PER_NAMESPACE`] instead: 1024 header-only frames.
+const MAX_PARKED_PER_NAMESPACE: usize = 128;
+
+/// Shard-wide ceiling on parked bytes, measured as resident footprint (see
+/// [`parked_footprint`]).
+///
+/// The per-namespace cap counts frames, and `Message::into_generic` is a retag
+/// rather than a copy, so each entry retains its whole buffer -- up to
+/// `message_bus::framing::MAX_MESSAGE_SIZE` (64 MiB). Frames alone therefore
+/// bound nothing useful: 128 × 64 MiB is 8 GiB for a single namespace, and
+/// nothing capped the namespace count. This is the budget that actually bounds
+/// residency, so a burst against many un-materialised namespaces sheds instead
+/// of exhausting the host.
+///
+/// Deliberately well below `MAX_MESSAGE_SIZE`. Sized equal to it, one legal
+/// max-size frame consumes the entire shard-wide budget and head-of-line-blocks
+/// every other namespace's convergence window.
+const MAX_PARKED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-namespace ceiling on parked bytes, so one un-materialised namespace
+/// cannot spend the whole shard's budget and shed everyone else's frames.
+///
+/// Applied only to an entry that already holds something. Sized against an
+/// empty entry a larger frame could never park at all, and for a prepare that is
+/// unrecoverable loss: `consensus::retransmit_targets` skips an op that already
+/// reached quorum. Shipped `message_bus.max_message_size` is 64 MiB, so an
+/// ordinary batched append exceeds this. Cost of the waiver is one convergence
+/// window of shard budget; cost of the loss is the replica.
+const MAX_PARKED_BYTES_PER_NAMESPACE: usize = MAX_PARKED_BYTES / 4;
+
+/// Resident cost of parking a frame of `len` bytes.
+///
+/// A parked frame retains its whole [`server_common::iobuf`] buffer, which is
+/// allocated at [`MESSAGE_ALIGN`] granularity, so a 256-byte frame occupies
+/// 4 KiB. Charging the logical length instead under-counts RSS by up to 16x for
+/// header-only frames, which would let an accounted 16 MiB grow to ~256 MiB
+/// resident per shard.
+const fn parked_footprint(len: usize) -> usize {
+    len.next_multiple_of(MESSAGE_ALIGN)
+}
+
+/// Reconciler passes a frame may survive before it is answered rather than held.
+///
+/// Passes, not seconds, and deliberately not described in seconds: a pass fires
+/// on the periodic interval OR on a commit-tick wake, so the wall-clock window
+/// this maps to spans orders of magnitude. `reconcile_periodic_interval` legally
+/// reaches 30s, which would put four passes at 120s -- four times the SDK's
+/// response read-timeout, so the client times out first and the bound stops
+/// being the thing that answers it. Commit-tick wakes collapse it the other way,
+/// to tens of milliseconds. It bounds residency in units the simulator's virtual
+/// clock governs; it is not a latency guarantee.
+///
+/// TODO(krishna): derive this from `reconcile_periodic_interval` and the SDK
+/// response timeout so the bound tracks the configured interval instead of
+/// assuming one.
+const MAX_PARKED_PASSES: u32 = 3;
 
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
@@ -1669,7 +1891,7 @@ where
                     // reply, and the transports decode replies in lockstep,
                     // so silence wedges the connection until the SDK's
                     // response read-timeout.
-                    ParkOutcome::Tombstoned(request) => {
+                    ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
                         self.deny_partition_request_transient(request.header())
                             .await;
                     }
@@ -1702,7 +1924,10 @@ where
                             }
                         }
                     }
-                    ParkOutcome::Parked => {}
+                    // Shed under a full park buffer, or parked. Either way there
+                    // is no client awaiting a reply on this node; the primary's
+                    // retransmit redelivers.
+                    ParkOutcome::Overflow(_) | ParkOutcome::Parked => {}
                 }
             }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
@@ -1774,36 +1999,383 @@ where
         false
     }
 
-    /// Drop parked frames for a namespace that will never materialise (it was
-    /// removed before its `ReconcileOp::InsertOwned`), so the pending entry is
-    /// reclaimed instead of leaking until process exit. Parked client requests
-    /// are denied with a transient status rather than dropped: the transports
-    /// decode replies in lockstep, so silence wedges the connection until the
-    /// SDK's response read-timeout.
-    fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
-        if let Some(frames) = self
-            .pending_partition_frames
-            .borrow_mut()
-            .remove(&namespace)
+    /// Discard every frame parked under a namespace this shard can never serve:
+    /// gone from committed metadata, mid-teardown, or not hashing here. Client
+    /// requests get a transient deny, not silence; transports decode replies in
+    /// lockstep, so silence wedges the connection until the SDK read-timeout.
+    ///
+    /// The one retirement path a prepare still travels. It is retained
+    /// everywhere else (see [`ParkedFrame::passes`]); here the namespace itself
+    /// is unreachable, so holding it buys nothing.
+    pub fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
+        // Bound the borrow to this statement: the guard in an `if let`
+        // scrutinee otherwise lives to the end of the then-block, holding a
+        // shard-global map locked across the outbound sends below.
+        let parked = self.take_parked_partition_frames(namespace);
+        if let Some(frames) = parked
             && !frames.is_empty()
         {
+            let (answered, dropped) = self.retire_parked_frames(frames);
             tracing::debug!(
                 shard = self.id,
                 namespace_raw = namespace.inner(),
-                count = frames.len(),
-                "discarding parked partition frames for removed namespace"
+                answered,
+                dropped,
+                "discarding parked partition frames for an unreachable namespace"
             );
-            for frame in frames {
-                if frame.header().command == Command2::Request
-                    && let Ok(request) = frame.try_into_typed::<RequestHeader>()
-                {
-                    // Callers are synchronous (`apply_reconcile_ops`), so the
-                    // deny rides the pump's outbound lifecycle path instead of
-                    // an inline bus send.
-                    self.stage_transient_deny(request.header());
-                }
+        }
+    }
+
+    /// Remove a namespace's entry, debiting [`Self::parked_partition_bytes`] and
+    /// disarming the pump retry. Single place an entry leaves the map, so
+    /// neither can drift out of step with it.
+    fn take_parked_partition_frames(&self, namespace: IggyNamespace) -> Option<Vec<ParkedFrame>> {
+        self.reparked_partition_namespaces
+            .borrow_mut()
+            .remove(&namespace);
+        let (entry, converged) = {
+            let mut pending = self.pending_partition_frames.borrow_mut();
+            let entry = pending.remove(&namespace)?;
+            let converged = pending.is_empty();
+            (entry, converged)
+        };
+        self.parked_partition_bytes.set(
+            self.parked_partition_bytes
+                .get()
+                .saturating_sub(entry.bytes),
+        );
+        if converged {
+            // Episode over: the next entryless shed is a new one and warns.
+            self.shard_park_shedding.set(false);
+        }
+        Some(entry.frames)
+    }
+
+    /// Answer client requests, destroy the rest, report `(answered, dropped)`.
+    /// A destroyed frame has nobody to reply to, so
+    /// `frame_drops_total{variant=partition,reason=park_dropped}` is the only
+    /// record it existed.
+    fn retire_parked_frames(&self, frames: Vec<ParkedFrame>) -> (usize, usize) {
+        let mut answered = 0;
+        let mut dropped = 0;
+        for frame in frames {
+            if self.deny_parked_client_request(frame) {
+                answered += 1;
+            } else {
+                dropped += 1;
+                self.metrics.record_frame_drop(
+                    crate::metrics::frame_drop_variant::PARTITION,
+                    crate::metrics::frame_drop_reason::PARK_DROPPED,
+                );
             }
         }
+        (answered, dropped)
+    }
+
+    /// Whether any frame is parked. Cheap enough for the reconciler's per-tick
+    /// fast-skip guard: a non-empty buffer means the shard is by definition not
+    /// converged, so the skip must not fire.
+    ///
+    /// Read from the map, not the byte cell: an empty entry is never left
+    /// behind, but keying convergence off bytes makes that a silent invariant.
+    #[must_use]
+    pub fn has_parked_partition_frames(&self) -> bool {
+        !self.pending_partition_frames.borrow().is_empty()
+    }
+
+    /// Namespaces currently holding parked frames. The reconciler pairs this
+    /// against committed metadata to find the ones that will never materialise,
+    /// which no `ConfirmRemove` / `RemoveRouted` can reach: a namespace that was
+    /// never built is in neither `IggyPartitions` nor the routing table, so
+    /// nothing else names it.
+    #[must_use]
+    pub fn parked_namespaces(&self) -> Vec<IggyNamespace> {
+        self.pending_partition_frames
+            .borrow()
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Re-queue the frames parked for `namespace` now that its partition exists
+    /// at `epoch`, onto this shard's own inbox so the pump serves them after the
+    /// current drain.
+    ///
+    /// A frame stamped with a DIFFERENT incarnation never makes it back: the
+    /// namespace is byte-identical across incarnations, so serving it would land
+    /// a dead topic's write inside the topic that recycled its keys, and the
+    /// downstream fence cannot see it -- that compares the committed revision
+    /// against the routing row, both of which now describe THIS incarnation.
+    ///
+    /// An UNSTAMPED frame (`epoch: None`) is served. `None` means this node's
+    /// metadata held no committed partition for the namespace when the frame
+    /// arrived, which on a metadata-lagging backup is the ordinary case the park
+    /// buffer exists to absorb -- the partition primary materialises and
+    /// replicates as soon as its own metadata commits, well before a lagging
+    /// backup applies the same commit. Treating that as "prior incarnation"
+    /// destroys live traffic: a replicated prepare has no client to answer, so
+    /// it would be dropped with no recovery until an unrelated view change.
+    /// The residual is unchanged from before the stamp existed -- a frame parked
+    /// while the namespace was absent, then recreated under a new incarnation,
+    /// is served against the replacement -- and closing it needs a wire-level
+    /// discriminator (see the `TODO(krishna)` in
+    /// `partition_reconciler`'s module docs), not a `None`-means-stale rule.
+    ///
+    /// A frame the inbox refuses is re-parked: retained, so not counted as a
+    /// drop. Re-queuing appends, so a pass materialising many namespaces can
+    /// overrun the inbox; staging a deny is futile because it rides the same
+    /// sender with no await in between. One namespace alone can now do it, since
+    /// [`MAX_PARKED_BYTES_PER_NAMESPACE`] admits 1024 header-only prepares
+    /// against a default `inbox_capacity` of 1024. That costs other namespaces a
+    /// later convergence, not a frame. The first `Full` ends the loop, since
+    /// the sole consumer of `senders[self.id]` is the pump task running this
+    /// call and no later frame can find a slot the first one could not.
+    ///
+    /// [`MAX_PARKED_PASSES`] does not bound a re-parked frame: the sweep ages a
+    /// namespace only while un-materialised, and by here it is materialised.
+    /// [`Self::repark_partition_frames`] arms the pump retry instead;
+    /// `partition_reconciler::reconcile_parked_frames` is the backstop for an
+    /// inbox that never drains.
+    fn redispatch_parked_frames(&self, namespace: IggyNamespace, epoch: u64)
+    where
+        B: MessageBus + 'static,
+    {
+        let Some(frames) = self.take_parked_partition_frames(namespace) else {
+            return;
+        };
+        tracing::debug!(
+            shard = self.id,
+            namespace_raw = namespace.inner(),
+            count = frames.len(),
+            epoch,
+            "re-dispatching parked partition frames after materialisation"
+        );
+        // Incarnation filter first, independent of the sender: a prior
+        // incarnation is rejected whether or not this shard can re-queue.
+        let mut servable: Vec<ParkedFrame> = Vec::with_capacity(frames.len());
+        for frame in frames {
+            // Only a stamp that exists and disagrees is evidence of a prior
+            // incarnation; see this function's docs on why `None` is not.
+            if let Some(parked_epoch) = frame.epoch
+                && parked_epoch != epoch
+            {
+                self.reject_stale_parked_frame(namespace, epoch, frame);
+            } else {
+                servable.push(frame);
+            }
+        }
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            self.retire_parked_frames(servable);
+            return;
+        };
+        let mut refused_frames: Vec<ParkedFrame> = Vec::new();
+        let mut remaining = servable.into_iter();
+        while let Some(frame) = remaining.next() {
+            let passes = frame.passes;
+            let parked_epoch = frame.epoch;
+            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, frame.message)) else {
+                continue;
+            };
+            let (refused, disconnected) = match error {
+                TrySendError::Full(frame) => (frame, false),
+                TrySendError::Disconnected(frame) => (frame, true),
+            };
+            let ShardFrame::Consensus { message, .. } = refused else {
+                unreachable!("try_send returns the frame it was handed");
+            };
+            let refused_frame = ParkedFrame {
+                epoch: parked_epoch,
+                passes,
+                message,
+            };
+            if disconnected {
+                // Pump gone: re-parking holds the frame until process exit, and
+                // every later send hits the same dead channel.
+                self.metrics.record_frame_drop(
+                    crate::metrics::frame_drop_variant::PARTITION,
+                    crate::metrics::frame_drop_reason::DISCONNECTED,
+                );
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    "re-dispatch of parked partition frames refused: inbox disconnected"
+                );
+                let mut stranded = vec![refused_frame];
+                stranded.extend(remaining);
+                self.retire_parked_frames(stranded);
+                return;
+            }
+            refused_frames.push(refused_frame);
+            refused_frames.extend(remaining);
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                count = refused_frames.len(),
+                passes,
+                "re-parking parked partition frames: inbox full"
+            );
+            break;
+        }
+        if !refused_frames.is_empty() {
+            self.repark_partition_frames(namespace, refused_frames);
+        }
+    }
+
+    /// Put frames back under `namespace` after a refused re-dispatch, keeping
+    /// [`Self::parked_partition_bytes`] in step and arming the pump-side retry.
+    ///
+    /// Deliberately not budget-checked: these bytes were already counted while
+    /// parked, so re-admitting them cannot grow the total past what it held a
+    /// moment ago, and shedding here would answer a frame the inbox merely
+    /// deferred.
+    ///
+    /// Arming [`Self::reparked_partition_namespaces`] is what makes it a
+    /// deferral. Every other exit is closed once materialised: the sweep only
+    /// ages a namespace it has not built, and `reconcile_additions` stages no
+    /// second `InsertOwned` for one already in `IggyPartitions`.
+    fn repark_partition_frames(&self, namespace: IggyNamespace, frames: Vec<ParkedFrame>) {
+        let restored: usize = frames.iter().map(ParkedFrame::footprint).sum();
+        let mut pending = self.pending_partition_frames.borrow_mut();
+        let entry = pending.entry(namespace).or_default();
+        for frame in frames {
+            entry.push(frame);
+        }
+        drop(pending);
+        self.parked_partition_bytes
+            .set(self.parked_partition_bytes.get().saturating_add(restored));
+        self.reparked_partition_namespaces
+            .borrow_mut()
+            .insert(namespace);
+    }
+
+    /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
+    /// past [`MAX_PARKED_PASSES`]. Returns the number answered.
+    ///
+    /// Prepares age but never expire. Expiry destroys a committed op with
+    /// nothing to recover it (see [`ParkedFrame::passes`]), and passes are
+    /// commit-driven: a non-empty buffer defeats the reconciler fast-skip, so a
+    /// create burst elapses four in milliseconds, across every parked namespace
+    /// rather than the one it concerns. Byte budgets bound them instead. Only
+    /// [`Self::discard_parked_partition_frames`] still destroys a prepare.
+    ///
+    /// Passes, not wall-clock, so the simulator's virtual clock governs it.
+    pub fn age_parked_partition_frames(&self, namespace: IggyNamespace) -> usize {
+        let expired = {
+            let mut pending = self.pending_partition_frames.borrow_mut();
+            let Some(entry) = pending.get_mut(&namespace) else {
+                return 0;
+            };
+            for frame in &mut entry.frames {
+                frame.passes = frame.passes.saturating_add(1);
+            }
+            let (expired, freed) =
+                entry.extract(|frame| !frame.is_replicated() && frame.passes > MAX_PARKED_PASSES);
+            let emptied = entry.frames.is_empty();
+            drop(pending);
+            if emptied {
+                // Through the shared remover so the pump-retry set is disarmed
+                // with it; the entry is already empty, so this only unhooks it.
+                self.take_parked_partition_frames(namespace);
+            }
+            self.parked_partition_bytes
+                .set(self.parked_partition_bytes.get().saturating_sub(freed));
+            expired
+        };
+        let count = expired.len();
+        if count > 0 {
+            // Never replicated traffic (the predicate excludes it), so this is
+            // a request whose deny the pump refused: destroyed, and counted.
+            let (answered, unanswered) = self.retire_parked_frames(expired);
+            tracing::warn!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                answered,
+                unanswered,
+                "answering parked partition requests that outlived their admission window"
+            );
+        }
+        count
+    }
+
+    /// How many frames are parked under `namespace`. Client requests are bounded
+    /// by `MAX_PARKED_PER_NAMESPACE`, prepares by
+    /// `MAX_PARKED_BYTES_PER_NAMESPACE`; a shed frame must never grow either.
+    ///
+    /// Test/simulator accessor: nothing in production branches on a per-namespace
+    /// park depth, and gating keeps it that way.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn parked_frame_count(&self, namespace: IggyNamespace) -> usize {
+        self.pending_partition_frames
+            .borrow()
+            .get(&namespace)
+            .map_or(0, |entry| entry.frames.len())
+    }
+
+    /// Retire a frame that will never be served: a client request gets a
+    /// transient deny, replicated traffic is destroyed. Returns `true` only when
+    /// a reply reached the pump.
+    ///
+    /// Callers are synchronous (`apply_reconcile_ops`, the reconciler sweep), so
+    /// the deny rides the pump's lifecycle path, not an inline bus send. A shard
+    /// with no sender stages nothing, hence forwarding
+    /// [`Self::stage_transient_deny`]'s verdict rather than assuming success.
+    ///
+    /// No reply must not mean no record: the primary retransmits only what has
+    /// not reached quorum, so a destroyed prepare is invisible loss. The `false`
+    /// return is what makes callers bump
+    /// `frame_drops_total{variant=partition,reason=park_dropped}`.
+    fn deny_parked_client_request(&self, frame: ParkedFrame) -> bool {
+        if frame.message.header().command == Command2::Request
+            && let Ok(request) = frame.message.try_into_typed::<RequestHeader>()
+        {
+            return self.stage_transient_deny(request.header());
+        }
+        false
+    }
+
+    /// A parked frame addressed an incarnation this shard no longer holds.
+    /// Answering the client is what keeps it from waiting out its read timeout;
+    /// a stale prepare is dropped, since applying it would write a dead
+    /// incarnation's op into its replacement and diverge this replica.
+    fn reject_stale_parked_frame(
+        &self,
+        namespace: IggyNamespace,
+        materialised_epoch: u64,
+        frame: ParkedFrame,
+    ) {
+        // Both directions reject: a frame stamped AHEAD must not be applied into
+        // the incarnation the staleness teardown is about to erase either. Only
+        // BEHIND is the anomaly `partition_frames_rejected_stale_total` is
+        // alerted on. Ahead means the recreate committed between the reconciler
+        // snapshotting `epoch` and the pump applying `InsertOwned`: expected
+        // churn, and counting it there fires the alert on a race by design.
+        let ahead = frame
+            .epoch
+            .is_some_and(|parked_epoch| parked_epoch > materialised_epoch);
+        let replicated = frame.is_replicated();
+        if ahead {
+            self.metrics.record_partition_frame_rejected_ahead();
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                parked_epoch = ?frame.epoch,
+                materialised_epoch,
+                replicated,
+                "rejecting parked partition frame stamped ahead of the materialised incarnation"
+            );
+        } else {
+            self.metrics.record_partition_frame_rejected_stale();
+            tracing::warn!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                parked_epoch = ?frame.epoch,
+                materialised_epoch,
+                replicated,
+                "rejecting parked partition frame from a prior incarnation"
+            );
+        }
+        self.deny_parked_client_request(frame);
     }
 
     /// Park a partition-plane frame whose namespace this shard has not yet
@@ -1815,8 +2387,10 @@ where
     /// client requests instead of feeding them to the plane's silent-drop
     /// guard, while replicated traffic still flows there. Parked frames are
     /// re-dispatched by [`Self::apply_reconcile_ops`] once the matching
-    /// `ReconcileOp::InsertOwned` lands; overflow drops the frame
-    /// (at-least-once: client/primary retries recover).
+    /// `ReconcileOp::InsertOwned` lands, and only if the epoch stamped here
+    /// still matches (see [`ParkedFrame`]); a full buffer reports
+    /// [`ParkOutcome::Overflow`] so the caller can answer rather than shed
+    /// silently.
     fn park_if_unmaterialised<H>(
         &self,
         message: Message<H>,
@@ -1825,8 +2399,8 @@ where
     ) -> ParkOutcome<H>
     where
         H: iggy_binary_protocol::ConsensusHeader,
+        M: StreamsFrontend,
     {
-        const MAX_PARKED_PER_NAMESPACE: usize = 128;
         if !operation.is_partition() {
             return ParkOutcome::Deliver(message);
         }
@@ -1841,23 +2415,114 @@ where
         if partitions.contains(&namespace) {
             return ParkOutcome::Deliver(message);
         }
+        // Read the committed revision before taking the borrow below: the frame
+        // is stamped with the incarnation it was addressed to, so a later drain
+        // can tell it apart from a same-key replacement.
+        let epoch = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace);
+        let frame_cost = parked_footprint(message.as_slice().len());
+        let replicated = message.header().command() != Command2::Request;
         let mut pending = self.pending_partition_frames.borrow_mut();
-        let parked = pending.entry(namespace).or_default();
-        if parked.len() >= MAX_PARKED_PER_NAMESPACE {
-            tracing::warn!(
-                shard = self.id,
-                namespace_raw = namespace.inner(),
-                "parked-frame buffer full; dropping partition frame"
+        let parked_bytes = self.parked_partition_bytes.get();
+        // Read the entry without `entry().or_default()`: inserting first would
+        // leave an empty entry behind on the overflow path below, which reads as
+        // a parked namespace to the reconciler sweep and its fast-skip guard.
+        let existing = pending.get_mut(&namespace);
+        let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
+        let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
+        // A prepare is never shed on a byte budget. No client to answer, and no
+        // recovery: `consensus::retransmit_targets` skips an op that already
+        // reached quorum and the plane opens a repair session only in
+        // `on_start_view`, so shedding one is permanent loss where shedding a
+        // request costs a retry. A request is refused the moment admitting it
+        // would cross a budget; a prepare only once one is already spent. Caps
+        // prepare residency at one frame of overshoot per budget (worst case
+        // `MAX_PARKED_BYTES` + `max_message_size`, 80 MiB per shard) instead of
+        // at the budget, and is what makes an oversize frame parkable at all.
+        let namespace_budget_spent = parked_len > 0
+            && if replicated {
+                namespace_bytes >= MAX_PARKED_BYTES_PER_NAMESPACE
+            } else {
+                namespace_bytes.saturating_add(frame_cost) > MAX_PARKED_BYTES_PER_NAMESPACE
+            };
+        let shard_budget_spent = if replicated {
+            parked_bytes >= MAX_PARKED_BYTES
+        } else {
+            parked_bytes.saturating_add(frame_cost) > MAX_PARKED_BYTES
+        };
+        // The frame cap is request-only for the same reason. Applied to both it
+        // would be the binding constraint for any footprint under
+        // `MAX_PARKED_BYTES_PER_NAMESPACE / MAX_PARKED_PER_NAMESPACE` (32 KiB),
+        // so header-only prepares would shed at 128 frames, 512 KiB into a 4 MiB
+        // budget, and the byte budgets above would never get a say.
+        let frame_cap_spent = !replicated && parked_len >= MAX_PARKED_PER_NAMESPACE;
+        if frame_cap_spent || namespace_budget_spent || shard_budget_spent {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::metrics::frame_drop_reason::PARK_OVERFLOW,
             );
-            return ParkOutcome::Parked;
+            // Warn once per namespace on entering the shed, then `debug`: a
+            // full buffer is this branch's trigger, not a rate limit, so every
+            // later frame lands here too, and one formatted `warn` apiece makes
+            // the non-blocking appender shed unrelated lines. The counter
+            // carries the volume.
+            //
+            // An entryless namespace has no `ParkEntry::shed` to gate on and is
+            // reachable only via the shard-wide budget (the other two conditions
+            // need a non-empty entry), which is the many-namespace burst
+            // `MAX_PARKED_BYTES` is sized for. Hence the shard-level gate, and
+            // not `entry().or_default()`, which leaves the empty entry the read
+            // above avoids.
+            let first_shed = match existing {
+                Some(entry) => {
+                    let first = entry.shed == 0;
+                    entry.shed = entry.shed.saturating_add(1);
+                    first
+                }
+                None => !self.shard_park_shedding.replace(true),
+            };
+            if first_shed {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    parked_frames = parked_len,
+                    namespace_bytes,
+                    parked_bytes,
+                    frame_cost,
+                    replicated,
+                    "park buffer at capacity; shedding partition frames"
+                );
+            } else {
+                tracing::debug!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    parked_bytes,
+                    frame_cost,
+                    replicated,
+                    "park buffer still at capacity; shedding partition frame"
+                );
+            }
+            return ParkOutcome::Overflow(message);
         }
         tracing::debug!(
             shard = self.id,
             namespace_raw = namespace.inner(),
             operation = ?operation,
+            epoch = ?epoch,
             "parking partition frame until namespace materialises"
         );
-        parked.push(message.into_generic());
+        pending.entry(namespace).or_default().push(ParkedFrame {
+            epoch,
+            passes: 0,
+            message: message.into_generic(),
+        });
+        drop(pending);
+        self.parked_partition_bytes
+            .set(parked_bytes.saturating_add(frame_cost));
         ParkOutcome::Parked
     }
 
@@ -1872,11 +2537,19 @@ where
             request_header,
             IggyError::TransientNotAccepted.as_code(),
         );
+        // Count only what the bus accepted, matching `stage_transient_deny` and
+        // `record_partition_request_denied_transient`'s contract: a refused deny
+        // is a shed frame, and crediting it hides the silent shed this counter
+        // exists to expose.
         if let Err(error) = self
             .bus
             .send_to_client(request_header.client, reply.into_generic().into_frozen())
             .await
         {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::metrics::frame_drop_reason::DELIVERY_FAILED,
+            );
             tracing::warn!(
                 shard = self.id,
                 client = request_header.client,
@@ -1884,14 +2557,19 @@ where
                 error = %error,
                 "failed to send transient deny for partition request"
             );
+            return;
         }
+        self.metrics.record_partition_request_denied_transient();
     }
 
     /// [`Self::deny_partition_request_transient`] for synchronous callers:
     /// hand the deny to this shard's own pump as a
     /// [`LifecycleFrame::ForwardClientSend`], whose handler performs the bus
     /// send (same funnel the parked-frame re-dispatch uses).
-    fn stage_transient_deny(&self, request_header: &RequestHeader) {
+    ///
+    /// Returns whether the pump took it. A shard with no sender stages nothing,
+    /// so assuming success logs an answer for a request destroyed unanswered.
+    fn stage_transient_deny(&self, request_header: &RequestHeader) -> bool {
         let reply = build_deny_reply_from_request_header(
             request_header,
             IggyError::TransientNotAccepted.as_code(),
@@ -1900,16 +2578,27 @@ where
             client_id: request_header.client,
             msg: reply.into_generic().into_frozen(),
         });
-        if let Some(sender) = self.senders.get(self.id as usize)
-            && let Err(error) = sender.try_send(frame)
-        {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return false;
+        };
+        // Count only what was actually handed to the pump: crediting before the
+        // send reports an answer to a client that never received one, which is
+        // the opposite of what this counter is read for.
+        if let Err(error) = sender.try_send(frame) {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::coordinator::classify_try_send_err(&error),
+            );
             tracing::warn!(
                 shard = self.id,
                 client = request_header.client,
                 operation = ?request_header.operation,
                 "dropping transient deny for discarded partition frame: inbox rejected: {error:?}"
             );
+            return false;
         }
+        self.metrics.record_partition_request_denied_transient();
+        true
     }
 
     #[allow(clippy::future_not_send)]

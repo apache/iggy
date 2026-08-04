@@ -15,7 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod client_table_restart;
-mod metadata_checkpoint_restart;
-mod metadata_state_transfer;
-mod multi_shard_partition_convergence;
+mod meilisearch_sink;
