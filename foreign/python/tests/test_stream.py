@@ -223,11 +223,13 @@ class TestGetStreams:
             await iggy_client.create_stream(name)
 
         streams = await iggy_client.get_streams()
-        by_name = {stream.name: stream for stream in streams}
-        assert set(created).issubset(by_name)
+        created_names = set(created)
+        mine = [stream for stream in streams if stream.name in created_names]
 
-        mine = [by_name[name] for name in created]
+        assert [stream.name for stream in mine] == created
         assert [stream.id for stream in mine] == sorted(stream.id for stream in mine)
+        assert all(stream.created_at > 0 for stream in mine)
+        assert all(stream.size_bytes == 0 for stream in mine)
         assert all(stream.messages_count == 0 for stream in mine)
         assert all(stream.topics_count == 0 for stream in mine)
 
@@ -264,23 +266,16 @@ class TestGetStreams:
         assert [stream.name for stream in first] == [stream.name for stream in second]
 
     @pytest.mark.asyncio
-    async def test_get_streams_before_connect_fails(self):
-        """Test get_streams requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
-
-        with pytest.raises(RuntimeError):
-            await client.get_streams()
-
-    @pytest.mark.asyncio
-    async def test_get_streams_before_login_fails(self):
-        """Test get_streams requires authentication."""
+    async def test_get_streams_requires_connection_and_auth(self):
+        """Test get_streams fails both before connecting and before logging in."""
         host, port = get_server_config()
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.get_streams()
 
+        await client.connect()
         with pytest.raises(RuntimeError):
             await client.get_streams()
 
@@ -297,33 +292,18 @@ class TestUpdateStream:
         new_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
+        before = await iggy_client.get_stream(stream_name)
+        assert before is not None
 
         await iggy_client.update_stream(stream_id=stream_name, name=new_name)
 
         renamed = await iggy_client.get_stream(new_name)
         assert renamed is not None
         assert renamed.name == new_name
+        assert renamed.id == before.id
 
         old = await iggy_client.get_stream(stream_name)
         assert old is None
-
-    @pytest.mark.asyncio
-    async def test_update_stream_preserves_id(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test update_stream keeps the same numeric id after a rename."""
-        stream_name = unique_name()
-        new_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        before = await iggy_client.get_stream(stream_name)
-        assert before is not None
-
-        await iggy_client.update_stream(stream_id=stream_name, name=new_name)
-
-        after = await iggy_client.get_stream(new_name)
-        assert after is not None
-        assert after.id == before.id
 
     @pytest.mark.asyncio
     async def test_update_stream_by_numeric_id(
@@ -342,6 +322,48 @@ class TestUpdateStream:
         renamed = await iggy_client.get_stream(new_name)
         assert renamed is not None
         assert renamed.name == new_name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "new_name",
+        [
+            pytest.param("a", id="one-byte"),
+            pytest.param("a" * 255, id="255-byte-ascii"),
+            pytest.param(("é" * 127) + "a", id="255-byte-utf8"),
+        ],
+    )
+    async def test_update_stream_accepts_name_boundaries(
+        self, iggy_client: IggyClient, unique_name, new_name: str
+    ):
+        """Test update_stream accepts names at the UTF-8 byte boundaries."""
+        stream_name = unique_name()
+        await iggy_client.create_stream(stream_name)
+
+        await iggy_client.update_stream(stream_id=stream_name, name=new_name)
+
+        renamed = await iggy_client.get_stream(new_name)
+        assert renamed is not None
+        assert renamed.name == new_name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "new_name",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("a" * 256, id="256-byte-ascii"),
+            pytest.param("é" * 128, id="256-byte-utf8"),
+            pytest.param(("😀" * 63) + "aaaa", id="256-byte-four-byte-utf8"),
+        ],
+    )
+    async def test_update_stream_rejects_invalid_name_boundaries(
+        self, iggy_client: IggyClient, unique_name, new_name: str
+    ):
+        """Test update_stream rejects empty and 256-byte names."""
+        stream_name = unique_name()
+        await iggy_client.create_stream(stream_name)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_stream(stream_id=stream_name, name=new_name)
 
     @pytest.mark.asyncio
     async def test_update_stream_applies_repeated_updates(
@@ -384,9 +406,30 @@ class TestUpdateStream:
 
         await iggy_client.create_stream(first_stream)
         await iggy_client.create_stream(second_stream)
+        streams = await iggy_client.get_streams()
+        before = next(stream for stream in streams if stream.name == second_stream)
+        before_metadata = (
+            before.id,
+            before.created_at,
+            before.name,
+            before.size_bytes,
+            before.messages_count,
+            before.topics_count,
+        )
 
         with pytest.raises(RuntimeError):
             await iggy_client.update_stream(stream_id=second_stream, name=first_stream)
+
+        streams = await iggy_client.get_streams()
+        after = next(stream for stream in streams if stream.id == before.id)
+        assert (
+            after.id,
+            after.created_at,
+            after.name,
+            after.size_bytes,
+            after.messages_count,
+            after.topics_count,
+        ) == before_metadata
 
     @pytest.mark.asyncio
     async def test_update_stream_requires_connection_and_auth(self, unique_name):
