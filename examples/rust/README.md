@@ -202,7 +202,7 @@ These examples require a TLS-enabled Iggy server. Start the server with:
 IGGY_TCP_TLS_ENABLED=true \
 IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-cargo r --bin iggy-server
+cargo run --bin iggy-server
 ```
 
 Uses `IggyClientBuilder` with TLS options (`with_tls_enabled`, `with_tls_domain`, `with_tls_ca_file`) to establish TLS-encrypted TCP connections with CA certificate verification.

@@ -1262,7 +1262,7 @@ where
             // replays and its leader recheck re-routes, whereas a panic
             // kills the shard and a silent drop wedges the client until its
             // read timeout.
-            if consensus.is_follower() || !consensus.is_normal() || consensus.is_syncing() {
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
@@ -1342,7 +1342,7 @@ where
     /// dedup. Buffered `SendMessages` retry commits at fresh offset; consumers
     /// dedup by message key / content / producer-id+seq.
     ///
-    /// Per-iteration `is_primary && is_normal && !is_syncing` asserts inlined
+    /// Per-iteration `is_primary && is_normal && !is_transferring` asserts inlined
     /// (closure form's `&consensus` borrow conflicts with `&mut self`). Guards
     /// against view-change-reset flipping status across `on_replicate` await.
     ///
@@ -1370,8 +1370,8 @@ where
                     "drain_request_queue_into_prepares: status must be normal"
                 );
                 assert!(
-                    !consensus.is_syncing(),
-                    "drain_request_queue_into_prepares: must not be syncing"
+                    !consensus.is_transferring(),
+                    "drain_request_queue_into_prepares: must not be transferring state"
                 );
                 let prepare = req.message.project(consensus);
                 consensus.verify_pipeline();

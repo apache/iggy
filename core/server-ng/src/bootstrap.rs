@@ -189,6 +189,7 @@ pub fn wire_shell_handlers<B, MJ, S>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> ShellHandlers
 where
     B: ShellBus,
@@ -204,6 +205,7 @@ where
             shard_handle,
             &sessions,
             system_config,
+            max_tokens_per_user,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
@@ -1312,8 +1314,12 @@ async fn shard_main(
             boot_view,
             shard.plane.metadata().client_table.borrow().client_ids(),
         );
-        let on_client_request =
-            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
+        let on_client_request = make_client_request_handler(
+            &shard,
+            &sessions,
+            Arc::clone(&config.system),
+            config.personal_access_token.max_tokens_per_user,
+        );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -1741,7 +1747,12 @@ async fn build_shard_for_thread(
         on_list_clients,
         on_partition_read,
         sessions,
-    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
+    } = wire_shell_handlers(
+        &bus,
+        &shard_handle,
+        Arc::clone(&config.system),
+        config.personal_access_token.max_tokens_per_user,
+    );
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -1779,6 +1790,12 @@ async fn build_shard_for_thread(
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
     shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
+    // Bounds a served state-transfer chunk. A frame above the bus ceiling is
+    // rejected by the RECEIVING transport, which tears the replica connection
+    // down rather than dropping one message.
+    shard.set_bus_max_message_size(
+        usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
+    );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1812,6 +1829,10 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(
+    configs::ng_cluster::STATE_CHUNK_HEADER_LEN
+        == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
+);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {
@@ -2024,6 +2045,12 @@ fn restore_metadata_consensus(
     if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
         consensus.init_as_backup();
         consensus.begin_view_probe();
+        // Restart in a cluster: replace snapshot-shaped metadata state
+        // (snapshot + client table) from the live primary the probe finds,
+        // then journal-repair the tail. If the probe exhausts instead --
+        // full-cluster bootstrap, nobody live to fetch from -- the election
+        // fallback clears the stage and this local recovery stands.
+        consensus.begin_state_transfer_await();
     } else {
         consensus.init();
     }
@@ -2592,6 +2619,7 @@ async fn start_tcp_runtime(
             http_addr,
             &config.http,
             config.metadata.clients_table_max,
+            config.personal_access_token.max_tokens_per_user,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
