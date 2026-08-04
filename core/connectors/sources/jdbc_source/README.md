@@ -200,6 +200,7 @@ topic = "orders"
 | `initial_offset` | string | No | - | Starting offset value for first poll |
 | `mode` | string | No | "incremental" | Sync mode: "incremental" or "bulk" (bulk works with ALL databases) |
 | `connection_timeout_ms` | u64 | No | 5000 | Timeout (ms) for the per-poll `isValid` liveness check; converted to seconds and capped at 5s |
+| `login_timeout_ms` | u64 | No | 30000 | Bound on establishing the connection (`DriverManager.setLoginTimeout`); rounded up to whole seconds. Stops an unreachable database from hanging startup |
 | `jvm_options` | array | No | [] | Custom JVM options (e.g., ["-Xmx1g"]) |
 | `snake_case_columns` | bool | No | false | Convert column names to snake_case |
 | `include_metadata` | bool | No | true | Include metadata (table, operation, timestamp) |
@@ -316,7 +317,7 @@ JDBC SQL types are automatically mapped to JSON:
 | ---------- | ----------- | ------- |
 | BIT, BOOLEAN | boolean | - |
 | TINYINT, SMALLINT, INTEGER | number | Integer |
-| BIGINT | number | Long integer (values above 2^53 may lose precision in JSON consumers that parse numbers as f64) |
+| BIGINT | string | Emitted as a string to preserve full 64-bit precision (many JSON consumers parse numbers as f64 and would lose precision above 2^53) |
 | FLOAT, REAL | number | Float |
 | DOUBLE | number | Double |
 | NUMERIC, DECIMAL | string | Emitted as a string to preserve arbitrary precision (e.g. money) |
@@ -365,6 +366,15 @@ JDBC SQL types are automatically mapped to JSON:
   so the password is copied onto the JVM heap as an ordinary (non-zeroed) string
   for the lifetime of the connection. This is inherent to the JDBC surface and
   is an accepted risk.
+- **`SecretString` redaction is not end-to-end.** `jdbc_url`/`password` are typed
+  as `SecretString`, and this connector's `Debug` output and startup logs redact
+  them. That redaction does **not** cover the connectors runtime's generic
+  config surface: the `GET /sources/{key}/configs/plugin` control-API endpoint
+  and the runtime's `trace`-level config logging emit the raw, untyped
+  `plugin_config` (credentials included), the same as every other connector. Do
+  not expose the control API to untrusted callers and do not run the runtime at
+  `trace` level in production. This is a known runtime-wide limitation shared by
+  all connectors, not something this connector can address on its own.
 
 ### Credential precedence
 

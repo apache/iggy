@@ -53,7 +53,7 @@ iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 
 # JNI for Java interop with invocation support
-jni = { version = "0.21", features = ["invocation"] }
+jni = { workspace = true }
 
 # For sanitizing passwords in logs
 regex = { workspace = true }

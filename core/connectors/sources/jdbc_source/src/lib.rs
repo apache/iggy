@@ -212,10 +212,22 @@ pub struct JdbcSourceConfig {
     /// establishment.
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_ms: u64,
+
+    /// Bound on establishing the JDBC connection (default: 30000). Applied via
+    /// `DriverManager.setLoginTimeout`, which is expressed in whole seconds, so
+    /// the value is rounded up to at least 1s. Prevents an unreachable or
+    /// slow-DNS database from hanging `open()` (and thus the whole connectors
+    /// runtime, which opens sources sequentially at startup) indefinitely.
+    #[serde(default = "default_login_timeout")]
+    pub login_timeout_ms: u64,
 }
 
 fn default_connection_timeout() -> u64 {
     5000
+}
+
+fn default_login_timeout() -> u64 {
+    30000
 }
 
 fn default_batch_size() -> u32 {
@@ -250,6 +262,7 @@ impl std::fmt::Debug for JdbcSourceConfig {
             .field("snake_case_columns", &self.snake_case_columns)
             .field("include_metadata", &self.include_metadata)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .field("login_timeout_ms", &self.login_timeout_ms)
             .finish()
     }
 }
@@ -490,6 +503,27 @@ impl JdbcSource {
             env,
             env.new_string(self.config.jdbc_url.expose_secret()),
             "Failed to create JDBC URL string"
+        );
+
+        // Bound connection establishment so an unreachable or slow-DNS database
+        // fails instead of hanging open() (which the runtime drives sequentially
+        // at startup) forever. setLoginTimeout is process-wide and in whole
+        // seconds, so round the configured milliseconds up to at least 1s.
+        let login_timeout_secs = self
+            .config
+            .login_timeout_ms
+            .div_ceil(1000)
+            .clamp(1, i32::MAX as u64) as i32;
+        jni_init!(
+            env,
+            env.call_static_method(
+                &driver_manager,
+                "setLoginTimeout",
+                "(I)V",
+                &[JValue::Int(login_timeout_secs)],
+            )
+            .and_then(|v| v.v()),
+            "Failed to set JDBC login timeout"
         );
 
         // If username/password are provided separately, use 3-arg getConnection
@@ -829,9 +863,16 @@ impl JdbcSource {
             // arrive in ascending tracking order (validate_config enforces
             // ORDER BY the tracking column ascending), so the last row is the
             // high-water mark. Using the last row rather than a Rust-side max
-            // keeps the cursor consistent with the database's own ordering, and
-            // degrades to re-reads (safe, at-least-once) rather than skips if the
-            // ordering is ever imperfect.
+            // keeps the cursor consistent with the database's own ordering.
+            //
+            // The next poll resumes with a strict `> last_offset`, so if this
+            // setMaxRows-capped batch ends in the middle of a run of rows sharing
+            // one tracking value (a non-unique column such as a timestamp), the
+            // remaining tied rows are skipped. The tracking column must therefore
+            // be unique / strictly increasing, or batch_size must exceed the
+            // largest group of equal values. See the README tracking-column
+            // requirements; keyset pagination with a tie-break is a planned
+            // follow-up.
             if let Some(offset) = offset {
                 last_offset = Some(offset);
             }
@@ -1112,6 +1153,9 @@ impl JdbcSource {
                 );
                 self.null_or(env, result_set, serde_json::json!(value))
             }
+            // BIGINT is emitted as a string (like NUMERIC/DECIMAL below) so a
+            // value above 2^53 is not silently rounded by a JSON consumer that
+            // parses numbers as f64.
             Types::BIGINT => {
                 let value = jni!(
                     env,
@@ -1119,7 +1163,7 @@ impl JdbcSource {
                         .and_then(|v| v.j()),
                     "Failed to get long"
                 );
-                self.null_or(env, result_set, serde_json::json!(value))
+                self.null_or(env, result_set, serde_json::json!(value.to_string()))
             }
             Types::FLOAT | Types::REAL => {
                 let value = jni!(
@@ -1332,6 +1376,19 @@ impl JdbcSource {
                      `ORDER BY {{tracking_column}}`) to the query"
                 )));
             }
+
+            // The cursor advances with a strict `> last_offset` per batch, so a
+            // group of rows sharing one tracking value that is split across a
+            // batch_size boundary loses its remainder. This cannot be detected
+            // without inspecting the data, so warn: the column should be unique /
+            // strictly increasing, or batch_size must exceed the largest tie group.
+            warn!(
+                "JDBC source [{}] incremental tracking_column '{tracking_column}': ensure it is \
+                 unique / strictly increasing, or that batch_size ({}) exceeds the largest group \
+                 of rows sharing one value. A tie split across a batch boundary skips the \
+                 remaining rows (common for non-unique timestamp columns).",
+                self.id, self.config.batch_size
+            );
         }
 
         // Dry-run the query build so an unresolved placeholder or an invalid
@@ -1356,11 +1413,15 @@ impl Source for JdbcSource {
         // Fail fast on bad config before starting the JVM or opening a connection.
         self.validate_config()?;
 
-        // Initialize JVM
-        self.initialize_jvm()?;
-
-        // Create database connection
-        self.create_connection()?;
+        // JVM boot and DriverManager.getConnection are blocking JNI work. Run
+        // them via block_in_place (like poll()/close()) so they do not monopolize
+        // a shared async-runtime worker; the login timeout set in the connection
+        // path bounds how long a stuck connect can block.
+        tokio::task::block_in_place(|| -> Result<(), Error> {
+            self.initialize_jvm()?;
+            self.create_connection()?;
+            Ok(())
+        })?;
 
         info!("JDBC source connector [{}] opened successfully", self.id);
         Ok(())
@@ -1836,6 +1897,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         }
     }
 
@@ -2386,6 +2448,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2428,6 +2491,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         let state = State {
@@ -2462,6 +2526,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         // No last_offset and no initial_offset: the WHERE predicate is dropped,
@@ -2496,6 +2561,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         assert!(source.build_query(&State::default()).is_err());
@@ -2519,6 +2585,7 @@ mod tests {
             include_metadata: false,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         let state = State::default();
@@ -2554,6 +2621,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, Some(connector_state));
         let state = source.state.lock().unwrap();
@@ -2743,6 +2811,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, Some(connector_state));
         let state = source.state.lock().unwrap();
@@ -2771,6 +2840,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, Some(connector_state));
         let state = source.state.lock().unwrap();
@@ -2796,6 +2866,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         let state = source.state.lock().unwrap();
@@ -2821,6 +2892,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         let state = source.state.lock().unwrap();
@@ -2850,6 +2922,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2879,6 +2952,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2911,6 +2985,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2940,6 +3015,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2967,6 +3043,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2997,6 +3074,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         let state = State {
@@ -3034,6 +3112,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         assert!(source.build_query(&State::default()).is_err());
@@ -3057,6 +3136,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
         let source = JdbcSource::new(1, config, None);
         let state = State {
@@ -3119,6 +3199,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
 
         let debug_output = format!("{:?}", config);
@@ -3157,6 +3238,7 @@ mod tests {
             include_metadata: true,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
+            login_timeout_ms: 30000,
         };
 
         let debug_output = format!("{:?}", config);

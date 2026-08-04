@@ -207,6 +207,7 @@ iggy_common = { path = "core/common", version = "0.10.3-edge.3" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }
+jni = { version = "0.21", features = ["invocation"] }
 journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
