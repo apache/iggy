@@ -301,12 +301,17 @@ function portable_timeout() {
 # Usage: run_readme_commands readme_file grep_pattern [cmd_timeout [grep_exclude]]
 # Reads matching lines, strips backticks/comments, executes each.
 # Calls TRANSFORM_COMMAND function on each command if defined.
-# Returns: sets global EXAMPLES_EXIT_CODE.
+# Returns: sets global EXAMPLES_EXIT_CODE and README_COMMANDS_EXECUTED.
+# Zero matches is not an error here: callers iterate multiple README
+# files per pattern, and a file legitimately matching nothing must not
+# abort the pass. Callers that require matches check the counter.
 function run_readme_commands() {
     local readme_file="$1"
     local grep_pattern="$2"
     local cmd_timeout="${3:-0}"
     local grep_exclude="${4:-}"
+
+    README_COMMANDS_EXECUTED=0
 
     if [ ! -f "${readme_file}" ]; then
         return
@@ -326,6 +331,7 @@ function run_readme_commands() {
         if [ -z "${command}" ]; then
             continue
         fi
+        ((README_COMMANDS_EXECUTED += 1))
 
         if declare -f TRANSFORM_COMMAND >/dev/null 2>&1; then
             command=$(TRANSFORM_COMMAND "${command}")
