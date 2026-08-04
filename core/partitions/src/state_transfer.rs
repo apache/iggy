@@ -1339,8 +1339,9 @@ where
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         // Sweep staging strays a dead earlier attempt left behind, keeping
         // only what THIS install is about to rename. Bounded disk hygiene;
-        // the reuse-scan sweeps too, but an abandoned-to-repair transfer
-        // that never re-arms would otherwise leak a partition copy forever.
+        // the reuse-scan sweeps too, and boot sweeps ALL of `.staging`
+        // (`segment_recovery::sweep_staging_files`), so a transfer abandoned
+        // for good leaks at most until the next restart.
         let keep: Vec<&PathBuf> = staged
             .iter()
             .flat_map(|meta| [&meta.log_staging, &meta.index_staging])
@@ -1359,13 +1360,7 @@ where
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
         let namespace_raw = self.consensus().namespace();
-        let segment_count = self.log.segments().len();
-        for _ in 0..segment_count {
-            self.log.segments_mut().remove(0);
-            let mut storage = self.log.storages_mut().remove(0);
-            self.log.indexes_mut().remove(0);
-            self.log.messages_writers_mut().remove(0);
-            self.log.index_writers_mut().remove(0);
+        while let Some((_, mut storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
             drop(storage);
@@ -1719,13 +1714,7 @@ where
         config: &PartitionsConfig,
         minted_next_offset: u64,
     ) -> Result<(), iggy_common::IggyError> {
-        let segment_count = self.log.segments().len();
-        for _ in 0..segment_count {
-            self.log.segments_mut().remove(0);
-            let mut storage = self.log.storages_mut().remove(0);
-            self.log.indexes_mut().remove(0);
-            self.log.messages_writers_mut().remove(0);
-            self.log.index_writers_mut().remove(0);
+        while let Some((_, mut storage)) = self.log.retire_front() {
             let _ = storage.shutdown();
         }
         self.log.journal().inner.clear_all();
