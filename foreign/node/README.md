@@ -57,11 +57,7 @@ from the SDK command table use `Operation::NonReplicated` and carry the command
 code in the request header's reserved field. The server remains authoritative
 for classifying or rejecting extension commands.
 
-The same npm package supports both framing modes. VSR currently supports TCP
-only and restricts `Client` to one pooled connection because authentication,
-request sequencing, and consumer-group assignments belong to one consensus
-session. Configurations requesting VSR over TLS or more than one pooled
-connection fail before a socket is opened.
+The same npm package supports both framing modes over TCP and TLS. VSR restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 
 VSR authentication translates the existing password and personal-access-token
 login APIs into the register handshake required by the consensus protocol. A
