@@ -1212,15 +1212,29 @@ impl Streams {
     /// byte-identical namespace. That difference is the only thing separating
     /// the two incarnations, so callers can use it to tell a materialised
     /// partition apart from the committed one it is impersonating.
+    /// This sits on the per-request incarnation fence
+    /// (`IggyShard::serves_committed_incarnation`) and on the park stamp, so it
+    /// runs once per partition request rather than once per reconciler pass. A
+    /// plain scan of `partitions` would therefore cost ~N element visits per
+    /// request on an N-partition topic. Partitions are pushed in dense id order by
+    /// `CreateTopicWithAssignments` / `CreatePartitionsWithAssignments`, so the
+    /// direct index hits in one step; the scan stays as the fallback because
+    /// nothing in the type enforces that density.
     #[must_use]
     pub fn created_revision_for_namespace(&self, namespace: IggyNamespace) -> Option<u64> {
         self.inner.read(|inner| {
             let stream = inner.items.get(namespace.stream_id())?;
             let topic = stream.topics.get(namespace.topic_id())?;
+            let partition_id = namespace.partition_id();
+            if let Some(partition) = topic.partitions.get(partition_id)
+                && partition.id == partition_id
+            {
+                return Some(partition.created_revision);
+            }
             topic
                 .partitions
                 .iter()
-                .find(|partition| partition.id == namespace.partition_id())
+                .find(|partition| partition.id == partition_id)
                 .map(|partition| partition.created_revision)
         })
     }

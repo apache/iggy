@@ -26,6 +26,7 @@ mod http_config_provider;
 mod iceberg;
 mod influxdb;
 mod jdbc;
+mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
