@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex};
+use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use bytes::Buf;
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
@@ -54,7 +54,11 @@ impl IggyIndexReader {
 
     /// Number of whole 24-byte entries in the file. A trailing partial entry
     /// (torn write) is truncated by the integer division and ignored.
-    async fn entry_count(&self) -> Result<u64, IggyError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file metadata cannot be read.
+    pub async fn entry_count(&self) -> Result<u64, IggyError> {
         let size = self
             .file
             .metadata()
@@ -113,5 +117,177 @@ impl IggyIndexReader {
             self.read_entry_at((count - 1) * IGGY_INDEX_SIZE as u64)
                 .await?,
         ))
+    }
+
+    /// Load every whole entry into an [`IggyIndexCache`] for offset / timestamp
+    /// lower-bound lookups in one read. Density is one sparse entry per flushed
+    /// chunk, so an aggressive flush cadence (`messages_required_to_save = 1`)
+    /// makes the file track every message: callers that cannot afford an
+    /// unbounded read must gate on [`Self::entry_count`] and fall back to the
+    /// on-file lower-bound lookups. A trailing partial entry (torn write) is
+    /// ignored (see [`Self::entry_count`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file metadata or bytes cannot be read.
+    pub async fn load_all(&self) -> Result<IggyIndexCache, IggyError> {
+        let count = usize::try_from(self.entry_count().await?)
+            .map_err(|_| IggyError::CannotReadFileMetadata)?;
+        if count == 0 {
+            return Ok(IggyIndexCache::empty());
+        }
+
+        // `with_capacity` (len 0): `read_exact_at` fills the spare capacity in
+        // place and advances the length (see `read_entry_at`).
+        let buffer = Vec::with_capacity(count * IGGY_INDEX_SIZE);
+        let (result, buffer): (std::io::Result<()>, Vec<u8>) =
+            self.file.read_exact_at(buffer, 0).await.into();
+        result.map_err(|_| IggyError::CannotReadFile)?;
+
+        let mut cache = IggyIndexCache::with_capacity(count);
+        let mut view = buffer.as_slice();
+        for _ in 0..count {
+            let offset = view.get_u64_le();
+            let timestamp = view.get_u64_le();
+            let position = view.get_u64_le();
+            cache.insert(offset, timestamp, position);
+        }
+        Ok(cache)
+    }
+
+    /// Last entry with `offset` at or below the target, binary-searching the
+    /// file with single-entry preads instead of materializing it, for indexes
+    /// too large to load whole. `None` when every entry sits above the target;
+    /// semantics match [`IggyIndexCache::offset_lower_bound`]. `entry_count`
+    /// comes from [`Self::entry_count`]; entries are written in ascending
+    /// offset and timestamp order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any probed entry cannot be read.
+    pub async fn offset_lower_bound(
+        &self,
+        entry_count: u64,
+        offset: u64,
+    ) -> Result<Option<IggyIndex>, IggyError> {
+        self.lower_bound_by(entry_count, |entry| entry.offset, offset)
+            .await
+    }
+
+    /// Last entry with `timestamp` at or below the target; `None` semantics
+    /// match [`Self::offset_lower_bound`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any probed entry cannot be read.
+    pub async fn timestamp_lower_bound(
+        &self,
+        entry_count: u64,
+        timestamp: u64,
+    ) -> Result<Option<IggyIndex>, IggyError> {
+        self.lower_bound_by(entry_count, |entry| entry.timestamp, timestamp)
+            .await
+    }
+
+    async fn lower_bound_by(
+        &self,
+        entry_count: u64,
+        key: impl Fn(&IggyIndex) -> u64,
+        target: u64,
+    ) -> Result<Option<IggyIndex>, IggyError> {
+        let mut low = 0u64;
+        let mut high = entry_count;
+        let mut result = None;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = self.read_entry_at(middle * IGGY_INDEX_SIZE as u64).await?;
+            if key(&entry) <= target {
+                result = Some(entry);
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use compio::io::AsyncWriteAtExt;
+
+    async fn write_index_file(entries: &[IggyIndex]) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-index-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+        let path = dir.join("test.index").to_string_lossy().into_owned();
+        let mut bytes = Vec::with_capacity(entries.len() * IGGY_INDEX_SIZE);
+        for entry in entries {
+            bytes.extend_from_slice(&IggyIndexCache::serialize(entry));
+        }
+        let mut file = compio::fs::File::create(&path)
+            .await
+            .expect("create index file");
+        let (written, _) = file.write_all_at(bytes, 0).await.into();
+        written.expect("write index entries");
+        file.sync_all().await.expect("flush index file");
+        (dir, path)
+    }
+
+    fn entries() -> Vec<IggyIndex> {
+        vec![
+            IggyIndex::new(10, 100, 1),
+            IggyIndex::new(20, 200, 2),
+            IggyIndex::new(30, 300, 3),
+        ]
+    }
+
+    #[compio::test]
+    async fn offset_lower_bound_on_file_returns_predecessor() {
+        let (dir, path) = write_index_file(&entries()).await;
+        let reader = IggyIndexReader::new(&path).await.expect("open index");
+        let count = reader.entry_count().await.expect("entry count");
+        assert_eq!(count, 3);
+
+        let at_or_below = |result: Option<IggyIndex>| result.map(|entry| entry.offset);
+        let lookup = reader.offset_lower_bound(count, 25).await.expect("lookup");
+        assert_eq!(at_or_below(lookup), Some(20));
+        let exact = reader.offset_lower_bound(count, 20).await.expect("lookup");
+        assert_eq!(at_or_below(exact), Some(20));
+        let below_range = reader.offset_lower_bound(count, 5).await.expect("lookup");
+        assert!(below_range.is_none());
+        let above_range = reader.offset_lower_bound(count, 35).await.expect("lookup");
+        assert_eq!(at_or_below(above_range), Some(30));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn timestamp_lower_bound_on_file_returns_predecessor() {
+        let (dir, path) = write_index_file(&entries()).await;
+        let reader = IggyIndexReader::new(&path).await.expect("open index");
+        let count = reader.entry_count().await.expect("entry count");
+
+        let lookup = reader
+            .timestamp_lower_bound(count, 250)
+            .await
+            .expect("lookup");
+        assert_eq!(lookup.map(|entry| entry.timestamp), Some(200));
+        let below_range = reader
+            .timestamp_lower_bound(count, 50)
+            .await
+            .expect("lookup");
+        assert!(below_range.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
