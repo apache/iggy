@@ -104,6 +104,7 @@ jobs:
             - `iggy_connector_elasticsearch_sink`
             - `iggy_connector_elasticsearch_source`
             - `iggy_connector_iceberg_sink`
+            - `iggy_connector_jdbc_source`
             - `iggy_connector_postgres_sink`
             - `iggy_connector_postgres_source`
             - `iggy_connector_quickwit_sink`

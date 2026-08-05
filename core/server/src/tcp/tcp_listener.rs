@@ -73,11 +73,11 @@ pub async fn start(
         // Store bound address locally
         shard.tcp_bound_address.set(Some(actual_addr));
 
-        if addr.port() == 0 {
-            // Notify config writer on shard 0
-            let _ = shard.config_writer_notify.try_send(());
+        // Always notify config writer so it can write the current_config.toml
+        let _ = shard.config_writer_notify.try_send(());
 
-            // Broadcast to other shards for SO_REUSEPORT binding
+        if addr.port() == 0 {
+            // Broadcast to other shards for SO_REUSEPORT binding (only needed for dynamic ports)
             let event = ShardEvent::AddressBound {
                 protocol: TransportProtocol::Tcp,
                 address: actual_addr,

@@ -48,6 +48,18 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
+# JDBC tests each start their own iggy-server plus a Postgres testcontainer and
+# an embedded JVM, and they share a JDBC driver JAR downloaded to a single path
+# on first run. nextest runs each test in its own process, so the in-source
+# `#[serial]` guard does not serialize them here; `max-threads = 1` does, which
+# avoids resource contention and a race to download the same driver JAR.
+[test-groups.jdbc]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/connectors::jdbc::/)'
+test-group = "jdbc"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
