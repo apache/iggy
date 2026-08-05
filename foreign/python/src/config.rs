@@ -131,13 +131,14 @@ impl TcpReconnectionConfig {
     ///         successful connection. Defaults to 5 seconds.
     ///
     /// Raises:
-    ///     ValueError: If a duration is negative, or if `interval` is zero while
+    ///     ValueError: If a duration is negative, if `max_retries` is outside the
+    ///         range of an unsigned 32-bit integer, or if `interval` is zero while
     ///         reconnection is enabled and `max_retries` is unlimited.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
         #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enabled: Option<bool>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_retries: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_retries: Option<i64>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
@@ -145,6 +146,16 @@ impl TcpReconnectionConfig {
     ) -> PyResult<Self> {
         let defaults = RustTcpClientReconnectionConfig::default();
         let enabled = enabled.unwrap_or(defaults.enabled);
+        let max_retries = max_retries
+            .map(|max_retries| {
+                u32::try_from(max_retries).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "'max_retries' must be between 0 and {}",
+                        u32::MAX
+                    ))
+                })
+            })
+            .transpose()?;
         let interval = interval
             .as_ref()
             .map(py_delta_to_iggy_duration)

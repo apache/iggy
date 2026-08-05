@@ -127,6 +127,16 @@ class TestTcpReconnectionConfig:
         with pytest.raises(ValueError, match="negative"):
             construct(negative)
 
+    @pytest.mark.parametrize("out_of_range", [-1, 2**32])
+    def test_out_of_range_max_retries_is_rejected(self, out_of_range: int):
+        """Test that a retry count outside the wire range names the argument.
+
+        The conversion pyo3 does on its own raises OverflowError, which is not a
+        ValueError and so escapes the handler a caller wraps construction in.
+        """
+        with pytest.raises(ValueError, match="max_retries"):
+            TcpReconnectionConfig(max_retries=out_of_range)
+
     def test_zero_reestablish_after_is_allowed(self):
         """Test that a zero cooldown is legal and readable back."""
         reconnection = TcpReconnectionConfig(reestablish_after=timedelta(0))
