@@ -46,6 +46,28 @@ where
         None
     }
 
+    /// Remove every entry at or above `from_op`, returning how many went, and
+    /// leave the snapshot watermark where it is.
+    ///
+    /// Not `drain` with a different range: `drain` advances the watermark past what
+    /// it removed, which would mark the removed ops evictable when a suffix
+    /// truncation needs them refillable.
+    ///
+    /// Defaults to `Unsupported` rather than a silent zero: "removed nothing" and
+    /// "cannot remove anything" demand different responses from the caller.
+    ///
+    /// # Errors
+    /// I/O error if the rewrite fails, or `Unsupported` if the implementation cannot
+    /// truncate.
+    fn truncate_from(&self, _from_op: u64) -> impl Future<Output = io::Result<usize>> {
+        async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this journal cannot truncate a suffix",
+            ))
+        }
+    }
+
     /// Remove entries with ops in `ops` from the journal,
     /// returning the removed entries sorted by op.
     ///

@@ -19,21 +19,95 @@ use compio::{
     fs::{OpenOptions, create_dir_all, remove_file},
     io::{AsyncReadAtExt, AsyncWriteAtExt},
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyError, calculate_checksum};
 use std::path::Path;
 use tracing::warn;
 
 const OFFSET_SIZE: usize = core::mem::size_of::<u64>();
+const CHECKSUM_SIZE: usize = core::mem::size_of::<u64>();
+
+/// Bytes a consumer-offset file holds: the offset, then a checksum over it.
+///
+/// The offset is a consumer cursor reloaded unchanged on every restart, so a
+/// flipped bit silently rewinds the consumer into redelivery or skips it forward.
+pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 
 /// Per-partition file recording the purge generation this replica last applied
-/// locally, in the partition dir beside the segments it fences. Two LE u64s:
-/// the applied generation, then the `created_revision` of the partition
-/// incarnation it was applied for.
+/// locally, in the partition dir beside the segments it fences.
+///
+/// Two LE u64s: the applied generation, then the `created_revision` of the
+/// partition incarnation it was applied for.
 pub const PURGE_GENERATION_FILE: &str = "purge.gen";
 
 /// `[generation][created_revision]`, both LE u64.
 const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
 
+/// What a consumer-offset file was found to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetRecord {
+    /// A usable offset. `checksummed` is false for a bare offset predating the
+    /// checksum, read as-is and upgraded by the next write.
+    Value { offset: u64, checksummed: bool },
+    /// Shorter than the value: a crash between `persist_offset`'s truncate and write.
+    Torn,
+    /// The checksum does not describe the value stored beside it.
+    Corrupt {
+        offset: u64,
+        expected: u64,
+        found: u64,
+    },
+}
+
+/// Encode a consumer offset for persistence.
+#[must_use]
+pub fn encode_offset_record(offset: u64) -> [u8; OFFSET_RECORD_SIZE] {
+    let mut record = [0u8; OFFSET_RECORD_SIZE];
+    record[..OFFSET_SIZE].copy_from_slice(&offset.to_le_bytes());
+    let checksum = calculate_checksum(&record[..OFFSET_SIZE]);
+    record[OFFSET_SIZE..].copy_from_slice(&checksum.to_le_bytes());
+    record
+}
+
+/// Decode whatever a consumer-offset file contained.
+///
+/// A file of exactly one offset predates the checksum and is accepted. A partly
+/// written checksum region reads as the bare offset for the same reason: the record
+/// is written in one call, so the low bytes are the complete new value.
+#[must_use]
+pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
+    let Some(value) = bytes.first_chunk::<OFFSET_SIZE>() else {
+        return OffsetRecord::Torn;
+    };
+    let offset = u64::from_le_bytes(*value);
+    let Some(stored) = bytes
+        .get(OFFSET_SIZE..)
+        .and_then(<[u8]>::first_chunk::<CHECKSUM_SIZE>)
+    else {
+        return OffsetRecord::Value {
+            offset,
+            checksummed: false,
+        };
+    };
+    let found = u64::from_le_bytes(*stored);
+    let expected = calculate_checksum(value);
+    if found == expected {
+        OffsetRecord::Value {
+            offset,
+            checksummed: true,
+        }
+    } else {
+        OffsetRecord::Corrupt {
+            offset,
+            expected,
+            found,
+        }
+    }
+}
+
+/// Overwrite a consumer-offset file with `offset` and a checksum over it.
+///
+/// # Errors
+/// [`IggyError`] when the directory, file, or write cannot be created or completed.
 pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
     // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
     // in front of every write, which serialises a batched fan-out on stats
@@ -52,8 +126,7 @@ pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Res
         .open(path)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    let buf = offset.to_le_bytes();
-    file.write_all_at(buf, 0)
+    file.write_all_at(encode_offset_record(offset), 0)
         .await
         .0
         .map_err(|_| IggyError::CannotWriteToFile)?;
@@ -67,19 +140,23 @@ pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Res
     Ok(())
 }
 
-/// Monotone counterpart of [`persist_offset`] for a server auto-commit op:
-/// folds `max(current_on_disk, offset)` and returns the value now on disk,
-/// skipping the write when the file already holds it. Disk-tier polls
-/// replicate their auto-committed offsets in IO-completion order, so a
-/// committed op can carry a lower offset than an earlier one; a plain
-/// overwrite would leave the file rewound and a restart would reload the
-/// stale value and re-deliver. The on-disk value is committed-only (this path
-/// never writes the eager serving map), so the fold is identical on every
-/// replica applying the same op order.
+/// Monotone counterpart of [`persist_offset`] for a server auto-commit op.
 ///
-/// The read makes this the cold-key path only: once the caller's
-/// persisted-offset tracker knows the file's value, warm commits persist with
-/// a blind [`persist_offset`] and skip covered offsets without any file read.
+/// Folds `max(current_on_disk, offset)` and returns the value now on disk, skipping
+/// the write when the file already holds it. Disk-tier polls replicate their
+/// auto-committed offsets in IO-completion order, so a committed op can carry a lower
+/// offset than an earlier one, and a plain overwrite would leave the file rewound for
+/// a restart to reload and re-deliver. The on-disk value is committed-only, so the
+/// fold is identical on every replica applying the same op order.
+///
+/// The read makes this the cold-key path only: once the caller's persisted-offset
+/// tracker knows the file's value, warm commits persist with a blind
+/// [`persist_offset`] and skip covered offsets without reading.
+///
+/// # Errors
+/// [`IggyError`] when the file cannot be read or written, or when the value on disk
+/// fails its checksum: folding against a cursor provably not the one written could
+/// rewind or skip the consumer.
 pub async fn persist_offset_max(
     path: &str,
     offset: u64,
@@ -94,10 +171,11 @@ pub async fn persist_offset_max(
 }
 
 /// Durably record the purge generation a partition has locally applied, keyed
-/// to the incarnation (`created_revision`) it was applied for. Truncate+write
-/// like [`persist_offset`] but ALWAYS data-synced, regardless of the
-/// consumer-offset fsync knob: purges are rare, the record is 16 bytes, and a
-/// generation lost from the page cache in a crash makes the reconciler
+/// to the incarnation (`created_revision`) it was applied for.
+///
+/// Truncate+write like [`persist_offset`] but ALWAYS data-synced, regardless of
+/// the consumer-offset fsync knob: purges are rare, the record is 16 bytes, and
+/// a generation lost from the page cache in a crash makes the reconciler
 /// re-purge on restart, wiping messages appended after the purge. A failure
 /// leaves the previous record on disk so the caller keeps its in-memory
 /// applied generation old and retries.
@@ -202,6 +280,10 @@ pub async fn read_purge_generation(path: &str, created_revision: u64) -> Result<
 /// files, so the commit-path reader must agree or a torn file turns every
 /// later commit-apply into an error. Real I/O errors still propagate: mapping
 /// them to `None` would silently rewind a valid higher offset.
+///
+/// A checksum mismatch is an error, not `None`. `None` means "no offset recorded",
+/// which the caller folds as `max(absent, incoming)` and overwrites; doing that to a
+/// failed-checksum file discards a cursor that may have been far ahead.
 async fn read_persisted_offset(path: &str) -> Result<Option<u64>, IggyError> {
     if !Path::new(path).exists() {
         return Ok(None);
@@ -211,17 +293,43 @@ async fn read_persisted_offset(path: &str) -> Result<Option<u64>, IggyError> {
         .open(path)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    let buf = vec![0u8; OFFSET_SIZE];
-    let compio::BufResult(read, buf) = file.read_exact_at(buf, 0).await;
-    match read {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+    // Read the whole record, falling back to a bare offset: a pre-checksum file is
+    // exactly `OFFSET_SIZE` long, so the first read reports EOF rather than failing.
+    let compio::BufResult(read, buf) = file.read_exact_at(vec![0u8; OFFSET_RECORD_SIZE], 0).await;
+    let bytes = match read {
+        Ok(()) => buf,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            let compio::BufResult(read, legacy) =
+                file.read_exact_at(vec![0u8; OFFSET_SIZE], 0).await;
+            match read {
+                Ok(()) => legacy,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(None);
+                }
+                Err(_) => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
+            }
+        }
         Err(_) => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
+    };
+    match decode_offset_record(&bytes) {
+        OffsetRecord::Value { offset, .. } => Ok(Some(offset)),
+        OffsetRecord::Torn => Ok(None),
+        OffsetRecord::Corrupt {
+            offset,
+            expected,
+            found,
+        } => {
+            tracing::error!(
+                path,
+                offset,
+                expected,
+                found,
+                "consumer offset file failed its checksum; refusing to fold a value that may \
+                 rewind or skip the consumer"
+            );
+            Err(IggyError::CannotReadConsumerOffsets(path.to_owned()))
+        }
     }
-    let bytes: [u8; OFFSET_SIZE] = buf
-        .try_into()
-        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
-    Ok(Some(u64::from_le_bytes(bytes)))
 }
 
 /// Unlink a persisted consumer-offset file. A no-op if the file is absent.
@@ -254,6 +362,96 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn offset_record_round_trips() {
+        let record = encode_offset_record(114);
+        assert_eq!(record.len(), OFFSET_RECORD_SIZE);
+        assert_eq!(
+            decode_offset_record(&record),
+            OffsetRecord::Value {
+                offset: 114,
+                checksummed: true
+            }
+        );
+    }
+
+    #[test]
+    fn offset_record_accepts_a_bare_value_written_before_the_checksum() {
+        assert_eq!(
+            decode_offset_record(&114u64.to_le_bytes()),
+            OffsetRecord::Value {
+                offset: 114,
+                checksummed: false
+            }
+        );
+    }
+
+    #[test]
+    fn offset_record_rejects_either_half_flipped() {
+        // The point of the checksum: a flipped bit rewinds a consumer into redelivery
+        // or skips it forward, and nothing ever notices.
+        let mut value_flipped = encode_offset_record(114);
+        value_flipped[0] ^= 0x01;
+        assert!(matches!(
+            decode_offset_record(&value_flipped),
+            OffsetRecord::Corrupt { offset: 115, .. }
+        ));
+
+        let mut checksum_flipped = encode_offset_record(114);
+        checksum_flipped[OFFSET_SIZE] ^= 0x01;
+        assert!(matches!(
+            decode_offset_record(&checksum_flipped),
+            OffsetRecord::Corrupt { offset: 114, .. }
+        ));
+    }
+
+    #[test]
+    fn offset_record_partly_written_is_torn_below_the_value_and_bare_above_it() {
+        assert_eq!(decode_offset_record(&[]), OffsetRecord::Torn);
+        assert_eq!(decode_offset_record(&[0xAB; 7]), OffsetRecord::Torn);
+
+        // One `write_all_at` writes the whole record, so a torn tail keeps the value.
+        let record = encode_offset_record(114);
+        assert_eq!(
+            decode_offset_record(&record[..OFFSET_SIZE + 3]),
+            OffsetRecord::Value {
+                offset: 114,
+                checksummed: false
+            }
+        );
+    }
+
+    #[compio::test]
+    async fn read_persisted_offset_rejects_a_corrupt_file() {
+        let dir = unique_temp_dir();
+        let path = dir.join("42").to_string_lossy().into_owned();
+
+        persist_offset(&path, 114, false).await.expect("persist");
+        let mut bytes = std::fs::read(&path).expect("offset file exists");
+        bytes[0] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("corrupt the file");
+
+        let result = read_persisted_offset(&path).await;
+        assert!(
+            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+            "a corrupt cursor must not fold as absent, got {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn read_persisted_offset_reads_a_legacy_bare_value() {
+        let dir = unique_temp_dir();
+        let path = dir.join("42").to_string_lossy().into_owned();
+        std::fs::write(&path, 114u64.to_le_bytes()).expect("write legacy file");
+
+        let read = read_persisted_offset(&path).await.expect("legacy file");
+        assert_eq!(read, Some(114));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[compio::test]

@@ -1677,6 +1677,7 @@ async fn build_shard_for_thread(
                 .partition
                 .size_of_messages_required_to_save,
             enforce_fsync: config.system.partition.enforce_fsync,
+            validate_checksum: config.system.partition.validate_checksum,
             segment_size: config.system.segment.size,
             encryptor,
         },
@@ -1960,6 +1961,22 @@ const _: () = assert!(
     configs::ng_cluster::STATE_CHUNK_HEADER_LEN
         == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
 );
+// Both prepare-queue ceilings are pinned by the view-change wire, not by memory: a
+// `DoViewChange` carries the sender's suffix spanning `commit..=op` with one nack
+// bit and one present bit per entry, each bitset a single `u128`. The depth bounds
+// `op - commit`, so a depth at or above `DVC_HEADERS_MAX` produces entries the new
+// primary can neither adopt nor prove dead. Strictly less than, because the head op
+// needs the reserved slot.
+const _: () =
+    assert!(configs::ng_metadata::MAX_METADATA_PREPARE_QUEUE_DEPTH < consensus::DVC_HEADERS_MAX);
+const _: () =
+    assert!(configs::ng_partition::MAX_PARTITION_PREPARE_QUEUE_DEPTH < consensus::DVC_HEADERS_MAX);
+// `DVC_HEADERS_MAX` is a bare literal in both the wire crate, which sizes the
+// bitsets, and the consensus crate, which cannot depend on it the other way around.
+// Same u128, so a drift lets one side address entries the other cannot.
+const _: () =
+    assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
+const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {

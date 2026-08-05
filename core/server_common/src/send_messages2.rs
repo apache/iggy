@@ -678,6 +678,24 @@ fn transcode_legacy_request(
 /// chunk and steps by `batch_length`. Callers whose buffer is meant to BE the
 /// batch must reject the surplus themselves - see [`convert_request_message`].
 pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
+    decode_batch_slice_verified(body, true)
+}
+
+/// [`decode_batch_slice`] with the checksum check made optional.
+///
+/// `verify_checksum` exists for the disk-poll path, whose operator knob decides
+/// whether a read pays for a full re-hash of every batch. The layout checks are not
+/// optional either way: a short or self-inconsistent record is rejected regardless,
+/// because the caller would otherwise index past it.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a short or inconsistent record, and
+/// [`IggyError::InvalidBatchChecksum`] when verification is on and the batch does not
+/// match. Callers that must tell corruption from a partial tail need both.
+pub fn decode_batch_slice_verified(
+    body: &[u8],
+    verify_checksum: bool,
+) -> Result<SendMessages2Ref<'_>, IggyError> {
     if body.len() < COMMAND_HEADER_SIZE {
         return Err(IggyError::InvalidCommand);
     }
@@ -690,13 +708,17 @@ pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError
 
     let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
     let batch = SendMessages2Ref { header, blob };
-    let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
-    if header.batch_checksum != expected_checksum {
-        return Err(IggyError::InvalidBatchChecksum(
-            header.batch_checksum,
-            expected_checksum,
-            header.base_offset,
-        ));
+    if verify_checksum {
+        let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
+        if header.batch_checksum != expected_checksum {
+            return Err(IggyError::InvalidBatchChecksum(
+                header.batch_checksum,
+                expected_checksum,
+                header.base_offset,
+            ));
+        }
+    } else {
+        validate_batch_layout(&batch)?;
     }
 
     Ok(batch)
@@ -998,6 +1020,24 @@ fn verify_and_recompute_batch_checksum(batch: &SendMessages2Ref<'_>) -> Result<u
         return Err(IggyError::InvalidCommand);
     }
     Ok(hasher.finish())
+}
+
+/// The layout half of [`verify_and_recompute_batch_checksum`], without the hashing.
+///
+/// A caller that opts out of checksum verification still must not be handed a batch
+/// whose framing disagrees with its header, since it indexes by `batch_length` and
+/// would step into the next record. Walking the frames costs no hashing.
+fn validate_batch_layout(batch: &SendMessages2Ref<'_>) -> Result<(), IggyError> {
+    let mut framed = 0u32;
+    let mut covered = 0usize;
+    for message in batch.iter_with_offsets() {
+        framed += 1;
+        covered = message.end;
+    }
+    if framed != batch.message_count() || covered != batch.blob().len() {
+        return Err(IggyError::InvalidCommand);
+    }
+    Ok(())
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IggyError> {

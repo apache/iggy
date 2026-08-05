@@ -29,6 +29,15 @@ pub enum ConsensusError {
     #[error("invalid checksum")]
     InvalidChecksum,
 
+    #[error(
+        "{command:?}: header checksum {found:#034x} does not cover the frame (expected {expected:#034x})"
+    )]
+    FrameChecksumMismatch {
+        command: Command2,
+        expected: u128,
+        found: u128,
+    },
+
     #[error("invalid cluster ID")]
     InvalidCluster,
 

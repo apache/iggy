@@ -60,10 +60,15 @@ pub const DEFAULT_METADATA_JOURNAL_SLOTS: usize = 1024;
 /// margin is `max(this, prepare_queue_depth)`.
 pub const METADATA_CHECKPOINT_MARGIN_FLOOR: usize = 64;
 
-/// Upper bound on `prepare_queue_depth`. Every queued prepare pins a
-/// full message buffer; four thousand in-flight metadata ops is far past
-/// any sane deployment and a likely unit typo.
-pub const MAX_METADATA_PREPARE_QUEUE_DEPTH: usize = 4096;
+/// Upper bound on `prepare_queue_depth`.
+///
+/// Pinned by the view-change wire format, not by memory: a `DoViewChange` carries
+/// the sender's uncommitted suffix plus one nack bit and one present bit per entry,
+/// each bitset a single `u128` (`consensus::DVC_HEADERS_MAX` = 128). The suffix
+/// spans `commit_max..=op`, which this depth bounds, so a deeper queue produces
+/// entries the new primary can neither adopt nor prove dead. The reserved head slot
+/// leaves room for the head op.
+pub const MAX_METADATA_PREPARE_QUEUE_DEPTH: usize = 127;
 
 /// Upper bound on `journal_slots`. Each slot costs index memory and every
 /// checkpoint rewrites the live WAL suffix; a million slots is the sanity
@@ -187,31 +192,50 @@ mod tests {
     #[test]
     fn margin_tracks_deep_prepare_queue() {
         let config = MetadataConfig {
-            prepare_queue_depth: 256,
+            prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: 4096,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
         };
         assert!(config.validate().is_ok());
-        assert_eq!(config.checkpoint_margin(), 256);
+        assert_eq!(config.checkpoint_margin(), MAX_METADATA_PREPARE_QUEUE_DEPTH);
     }
 
     #[test]
     fn journal_must_outsize_margin() {
-        // Deep queue, journal kept at the old default: margin becomes 256,
-        // 4 * 256 = 1024 == journal_slots, boundary accepted...
+        // Deepest permitted queue: margin becomes the depth, and the journal
+        // must hold 4x that. At exactly 4x the boundary is accepted...
+        let min_slots = 4 * MAX_METADATA_PREPARE_QUEUE_DEPTH;
         let boundary = MetadataConfig {
-            prepare_queue_depth: 256,
-            journal_slots: 1024,
+            prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH,
+            journal_slots: min_slots,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
         };
         assert!(boundary.validate().is_ok());
         // ...one slot fewer is refused.
         let starved = MetadataConfig {
-            prepare_queue_depth: 256,
-            journal_slots: 1023,
+            prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH,
+            journal_slots: min_slots - 1,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
         };
         assert!(starved.validate().is_err());
+    }
+
+    #[test]
+    fn prepare_queue_depth_capped_by_view_change_bitset_width() {
+        // Not a memory guard: it keeps every uncommitted suffix entry addressable by
+        // a `u128` bitset in a `DoViewChange`. One past it must be refused, or a view
+        // change meets an entry it can neither adopt nor prove dead.
+        let over = MetadataConfig {
+            prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH + 1,
+            journal_slots: MAX_METADATA_JOURNAL_SLOTS,
+            clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+        };
+        assert!(over.validate().is_err());
+        assert_eq!(
+            MAX_METADATA_PREPARE_QUEUE_DEPTH + 1,
+            128,
+            "cap must leave the head op a slot inside the 128-bit bitset"
+        );
     }
 
     #[test]

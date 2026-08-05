@@ -917,6 +917,9 @@ key_file = "core/certs/iggy_key.pem"
 # Depth of the metadata prepare queue: how many uncommitted metadata ops
 # may be in flight at once. Submits beyond it are rejected with the
 # transient "metadata prepare queue is full" and retried by the SDK.
+# Capped at 127 by the view-change wire format: a DoViewChange describes the
+# uncommitted suffix with one nack bit and one present bit per entry in a u128 each,
+# so a deeper queue produces entries a view change can neither adopt nor prove dead.
 prepare_queue_depth = 32
 
 # Size of the metadata WAL's in-memory index, in slots (one committed but
@@ -940,7 +943,9 @@ clients_table_max = 8192
 # consumer-offset ops may be in flight at once for that partition. Submits past
 # it spill into a request queue of twice this depth; once both are full the
 # server drops the request without a reply and the client retries on its own
-# request timeout. Must be > 0 and <= 256.
+# request timeout. Must be > 0 and <= 127: the ceiling is the view-change wire, not
+# memory. A DoViewChange describes the uncommitted suffix with one bit per op in a
+# u128 bitset, and this depth bounds that suffix.
 prepare_queue_depth = 32
 
 # Entries the evicted ring retains per multi-replica partition for journal

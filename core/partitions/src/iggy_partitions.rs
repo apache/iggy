@@ -412,8 +412,10 @@ where
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
         // inside), so no sibling task can realloc the partitions vec under it.
+        // Read the knob first: the `&mut` borrow below covers `self.config` too.
+        let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
-        Some(partition.build_poll_plan(consumer, args))
+        Some(partition.build_poll_plan(consumer, args, validate_checksum))
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully

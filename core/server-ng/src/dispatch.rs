@@ -3250,12 +3250,13 @@ mod tests {
                 client,
                 request,
                 user_id: 0,
-                checksum: 42,
                 namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
                 ..Default::default()
             };
         }
-        message
+        // A real identity, not a placeholder: `on_replicate` recomputes it before the
+        // prepare reaches the WAL, so an arbitrary value reads as transit corruption.
+        consensus::seal_prepare_checksum(message)
     }
 
     /// Regression test for the production failure chain "CLI stream
@@ -3319,6 +3320,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },
@@ -3437,6 +3439,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },
@@ -3560,6 +3563,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },
@@ -3622,6 +3626,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },

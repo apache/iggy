@@ -34,6 +34,7 @@ use consensus::{
     is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
     pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
     request_preflight, send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
+    verify_prepare_integrity,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1037,6 +1038,26 @@ where
         };
 
         let header = *message.header();
+
+        // Before anything trusts `checksum` as an identity token, and before the WAL
+        // takes the bytes. Every live prepare travels this path: unverified, a frame
+        // corrupted between primary and backup is journaled as-is and re-served to
+        // peers, which the interior-corruption boot refusal turns into an unbootable
+        // node on the next restart.
+        if let Err(reason) = verify_prepare_integrity(
+            &header,
+            &message.as_slice()[std::mem::size_of::<PrepareHeader>()..],
+        ) {
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                "discarding prepare: {reason}"
+            );
+            return;
+        }
 
         let current_op = match replicate_preflight(consensus, &header) {
             Ok(current_op) => current_op,
@@ -3752,7 +3773,12 @@ where
         ..Default::default()
     };
 
-    prepare
+    // Last, because the identity checksum covers every other field. Same contract as
+    // the wire path in `Project::project`; skipping it would leave the rewritten
+    // prepares (CreateTopic/CreatePartitions assignments, the UpdateTopic default-size
+    // rewrite, the PAT-cleaner delete) as the only ops the merge cannot tell apart
+    // from a competing prepare.
+    consensus::seal_prepare_checksum(prepare)
 }
 
 /// Eviction reason for a request `prepare_request` rejected as structurally

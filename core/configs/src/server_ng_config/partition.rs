@@ -27,11 +27,11 @@
 //!   (the per-partition journal-repair retention ring's dual ceilings)
 //!
 //! Distinct from `[metadata]` (a single, shard-0-global VSR plane) because
-//! partition pipelines exist PER PARTITION. The default mirrors the runtime
-//! constant so a default deployment is byte-identical; the ceiling is far
-//! below metadata's because the request queue (`depth * 2` slots) pins full
-//! inbound produce batches, so pinned memory scales with the partition count
-//! (see [`MAX_PARTITION_PREPARE_QUEUE_DEPTH`]).
+//! partition pipelines exist PER PARTITION: the request queue (`depth * 2` slots)
+//! pins full inbound produce batches, so pinned memory scales with the partition
+//! count. The default mirrors the runtime constant; the ceiling matches metadata's,
+//! since both planes ship the same `DoViewChange` suffix over the same bitsets (see
+//! [`MAX_PARTITION_PREPARE_QUEUE_DEPTH`]).
 //!
 //! The default is a duplicated literal rather than an import so
 //! `core/configs` does not grow a build-time edge onto `core/consensus`
@@ -47,13 +47,19 @@ use serde::{Deserialize, Serialize};
 /// Mirrors `consensus::PIPELINE_PREPARE_QUEUE_MAX`.
 pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
 
-/// Upper bound on `prepare_queue_depth`. Unlike the single metadata pipeline,
-/// a pipeline exists per partition, and each queued request pins a full
-/// inbound produce batch (a 4 KiB floor up to megabytes). Worst-case pinned
-/// memory therefore scales as `depth * 2 * partition_count * batch_size`, so
-/// this ceiling sits far below metadata's 4096: it is a typo guard, not a
-/// sizing endorsement.
-pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 256;
+/// Upper bound on `prepare_queue_depth`.
+///
+/// Pinned by the view-change wire format, and equal to
+/// [`super::metadata::MAX_METADATA_PREPARE_QUEUE_DEPTH`] for that reason: a
+/// `DoViewChange` carries the sender's uncommitted suffix spanning `commit..=op`
+/// with one nack bit and one present bit per entry, each bitset a single `u128`
+/// (`consensus::DVC_HEADERS_MAX` = 128). This depth bounds `op - commit`, so a
+/// deeper queue produces entries the new primary can neither adopt nor prove dead.
+/// The reserved head slot leaves room for the head op.
+///
+/// The memory bound (`depth * 2 * partition_count * batch_size` of pinned produce
+/// batches) still holds and is looser, so the wire is what decides.
+pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 127;
 
 /// Mirrors the free const `shard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment
 /// ceiling plus the one whole batch a segment may close past it).
