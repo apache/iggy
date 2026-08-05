@@ -119,8 +119,8 @@ const CONNECTOR_NAME: &str = "JDBC source";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Parse the configured `poll_interval` humantime string into a `Duration`,
-/// falling back to [`DEFAULT_POLL_INTERVAL`] when unset, empty, or unparseable.
-/// `validate_config` separately rejects a set-but-unparseable value so a typo
+/// falling back to [`DEFAULT_POLL_INTERVAL`] when unset, empty, or unparsable.
+/// `validate_config` separately rejects a set-but-unparsable value so a typo
 /// surfaces at `open()` rather than silently defaulting.
 fn parse_poll_interval(poll_interval: Option<&str>) -> Duration {
     poll_interval
@@ -1315,7 +1315,7 @@ impl JdbcSource {
             )));
         }
 
-        // A set poll_interval must be a valid humantime string; an unparseable
+        // A set poll_interval must be a valid humantime string; an unparsable
         // value would otherwise silently fall back to the default.
         if let Some(value) = self.config.poll_interval.as_deref()
             && !value.trim().is_empty()
@@ -1956,7 +1956,7 @@ mod tests {
     fn test_parse_poll_interval() {
         assert_eq!(parse_poll_interval(Some("30s")), Duration::from_secs(30));
         assert_eq!(parse_poll_interval(Some("5m")), Duration::from_secs(300));
-        // Unset, empty, and unparseable all fall back to the default.
+        // Unset, empty, and unparsable all fall back to the default.
         assert_eq!(parse_poll_interval(None), DEFAULT_POLL_INTERVAL);
         assert_eq!(parse_poll_interval(Some("  ")), DEFAULT_POLL_INTERVAL);
         assert_eq!(

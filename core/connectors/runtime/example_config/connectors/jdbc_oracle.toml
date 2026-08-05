@@ -70,7 +70,6 @@ snake_case_columns = true
 # Include metadata wrapper in output messages
 include_metadata = true
 
-
 # Custom JVM options (optional)
 jvm_options = ["-Xmx512m", "-Xms256m"]
 
