@@ -1600,7 +1600,13 @@ fn build_cluster_roster(
     ClusterRoster {
         enabled: config.cluster.enabled,
         name: config.cluster.name.clone(),
-        nodes: config.cluster.nodes.clone(),
+        nodes: config
+            .cluster
+            .nodes
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
         self_ip: topology.client_listen_addr.ip().to_string(),
         self_ports: configs::ng_cluster::TransportPorts {
             tcp: Some(topology.client_listen_addr.port()),
@@ -4055,6 +4061,7 @@ mod tests {
             name: "node".to_owned(),
             ip: ip.to_owned(),
             advertised_address: None,
+            advertised_addresses: Vec::new(),
             replica_id: 0,
             ports: configs::ng_cluster::TransportPorts {
                 tcp,

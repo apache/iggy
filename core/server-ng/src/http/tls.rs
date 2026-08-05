@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use axum::Router;
+use axum::extract::ConnectInfo;
 use compio::net::{TcpListener, TcpStream};
 use compio::runtime::JoinHandle;
 use compio::tls::{TlsAcceptor, TlsStream};
@@ -54,8 +55,10 @@ use message_bus::ShutdownToken;
 use message_bus::transports::tls::{
     TlsServerCredentials, install_default_crypto_provider, load_pem,
 };
+use tower_http::add_extension::AddExtension;
 use tracing::{debug, error};
 
+use crate::http::ClientAddr;
 use crate::server_error::ServerNgError;
 
 /// hyper's auto-builder serves whichever protocol the client selects via
@@ -143,8 +146,16 @@ async fn serve_connection(
     let io = HyperStream::new_tls(tls);
     // `Router<()>` already maps the incoming body to axum's `Body` in its own
     // `Service` impl, so it serves hyper's `Request<Incoming>` directly - no
-    // `map_request` shim. `with_state(())` finalizes the routes eagerly.
-    let service = TowerToHyperService::new(router.with_state(()));
+    // `map_request` shim.
+    //
+    // This hand-rolled loop bypasses axum's connect-info make-service (the
+    // plain listener's source of the peer address), so stamp the identical
+    // `ConnectInfo<ClientAddr>` extension on every request of this connection
+    // here - the extractors cannot tell the two paths apart. `AddExtension`
+    // wraps the shared router as one thin per-request insert; `Router::layer`
+    // would rebuild every route's boxed service on each connection.
+    let service =
+        TowerToHyperService::new(AddExtension::new(router, ConnectInfo(ClientAddr(peer))));
     let builder = Builder::new(LocalExecutor);
     // `serve_connection_with_upgrades` borrows `builder`, so it must outlive
     // `conn`; keep it bound rather than inlined.

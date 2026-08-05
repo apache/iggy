@@ -106,6 +106,7 @@ use shard::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -772,7 +773,10 @@ async fn handle_client_request<B, MJ, S, SB>(
     if header.operation == Operation::NonReplicated {
         // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
         // legitimately pre-auth (liveness probe + connection bootstrap
-        // metadata). Every other non-replicated code (`GET_STREAM*`,
+        // metadata). Pre-auth metadata is a narrow topology oracle: it leaks
+        // only the advertised-address mapping for networks the caller can
+        // already send packets from, and the HTTP mirror of the same read
+        // sits behind `Identity`. Every other non-replicated code (`GET_STREAM*`,
         // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
         // MUST go through Register first, which binds the acting user the
         // per-op authz gates resolve.
@@ -1252,10 +1256,11 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    // Acting user for the read gates below, resolved once. `None` only on the
-    // pre-auth path (PING / GET_CLUSTER_METADATA), which serves ungated codes;
-    // the gated arms fail closed on it.
-    let user_id = sessions.borrow().get_user_id(transport_client_id);
+    // Acting user and peer address for the read gates below, resolved in one
+    // connection lookup. `user_id` is `None` only on the pre-auth path
+    // (PING / GET_CLUSTER_METADATA), which serves ungated codes; the gated
+    // arms fail closed on it.
+    let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -1369,6 +1374,14 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         _ => {
             let roster = sessions.borrow().cluster_roster();
+            let client_ip = client_address.map(|address| address.ip());
+            if client_ip.is_none() {
+                debug!(
+                    transport_client_id,
+                    code,
+                    "no peer address recorded; advertised-address resolution degrades to the catch-all"
+                );
+            }
             handle_default_non_replicated(
                 shard,
                 transport_client_id,
@@ -1376,13 +1389,14 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
                 &request,
                 user_id,
                 &roster,
+                client_ip,
             )
             .await;
         }
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn handle_default_non_replicated<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
@@ -1390,6 +1404,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
     roster: &ClusterRoster,
+    client_ip: Option<IpAddr>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1404,7 +1419,14 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
-    match build_non_replicated_response(shard, code, request_body(request), user_id, roster) {
+    match build_non_replicated_response(
+        shard,
+        code,
+        request_body(request),
+        user_id,
+        roster,
+        client_ip,
+    ) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(

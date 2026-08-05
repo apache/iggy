@@ -87,10 +87,7 @@ default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
-# forward iggy/vsr: the SDK gates its VsrSessionControl impls on its own
-# feature while the trait surface follows iggy_common/vsr; without the
-# forward a bare `-p server-ng --features vsr` build breaks in the SDK
-vsr = ["iggy_common/vsr", "iggy/vsr"]
+vsr = ["iggy_common/vsr"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -183,7 +180,6 @@ vergen-git2 = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
-iggy = { workspace = true }
 # Reconciler unit tests assert on `ShardMetrics` snapshots and
 # `IggyShard::parked_frame_count`, gated to test/simulator so they cannot grow
 # production callers. `shard`'s own `cfg(test)` is false when compiled as our

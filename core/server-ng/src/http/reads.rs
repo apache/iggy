@@ -65,7 +65,7 @@ pub(in crate::http) fn authorize_read(
         .authorize(|permissioner| rule(permissioner, identity.user_id))
         .map_err(ReadError::Rejected)?;
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
-        return Err(state.not_primary_read_error(&identity.path_and_query));
+        return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));
     }
     Ok(())
 }
@@ -98,6 +98,7 @@ pub(in crate::http) async fn read_local(
         body,
         Some(identity.user_id),
         &state.roster,
+        identity.client_ip,
     )
     .map_err(ReadError::Rejected)?
     {
