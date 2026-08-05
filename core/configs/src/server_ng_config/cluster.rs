@@ -1238,7 +1238,7 @@ struct EffectiveClients {
     ranges: Vec<ClientAddressRange>,
     /// The catch-all also wins clients whose peer address the transport
     /// could not produce ([`ResolvedClusterNode::advertised_for`] with no
-    /// client IP), so two catch-alls overlap even when selectors cover both
+    /// client IP), so two catch-all overlap even when selectors cover both
     /// address families.
     serves_unknown_peers: bool,
 }
@@ -2419,7 +2419,7 @@ mod cluster_validate_tests {
     #[test]
     fn validate_rejects_duplicate_catch_all_even_when_fully_shadowed() {
         // A client whose peer address the transport cannot produce always
-        // falls to the catch-all, so duplicate catch-alls conflict even when
+        // falls to the catch-all, so duplicate catch-all conflict even when
         // selectors cover every known network.
         let mut n1 = node("n1", 0);
         n1.ip = "10.0.0.1".to_owned();
