@@ -83,7 +83,7 @@ async def main():
             heartbeat_interval=timedelta(seconds=5),
             # tls_enabled=True,
             # tls_domain="localhost",
-            # tls_ca_file="core/certs/iggy_ca_cert.pem",
+            # tls_ca_file="../../core/certs/iggy_ca_cert.pem",
             # tls_validate_certificate=True,
             # nodelay=True,
         )
