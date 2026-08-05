@@ -3046,7 +3046,11 @@ where
         // never re-stamped (`restamp_prepare_view` patches only `view`), so this
         // survives view-change retransmits. The header `checksum` and its `parent`
         // chain stay `0`: activating them needs the retransmit path to re-seal a
-        // re-stamped header, a separate change.
+        // re-stamped header, a separate change. Whoever activates it must also
+        // audit every `set_last_prepare_checksum` caller for cross-plane carry --
+        // the repair router in `shard` drops metadata-plane frames it cannot
+        // journal precisely so one cannot stamp a PARTITION consensus, which is
+        // inert only while these values are structurally zero.
         //
         // Metadata plane only. A partition produce prepare already carries a verified
         // `batch_checksum` over the same bytes, so a second full-payload pass is pure

@@ -682,7 +682,13 @@ where
     pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
         let headers = unsafe { &*self.headers.get() };
         let expected = to_op.saturating_sub(floor);
-        let mut present: HashSet<u64> = HashSet::with_capacity(headers.len());
+        // At most one entry per in-window op can land, so the window bounds the
+        // hint: sizing it for every resident header allocated (and memset) about
+        // a megabyte of table per repair round on the floor-refusal path, where
+        // the header vec grows with the live tail.
+        #[allow(clippy::cast_possible_truncation)]
+        let capacity = expected.min(headers.len() as u64) as usize;
+        let mut present: HashSet<u64> = HashSet::with_capacity(capacity);
         let mut holds_messages = false;
         for header in headers
             .iter()

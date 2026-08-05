@@ -20,8 +20,7 @@ use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     process::{Command, Stdio},
     thread::{self, panicking},
     time::{Duration, Instant},
@@ -127,35 +126,12 @@ pub fn run_bench_and_wait_for_finish(
         }
     };
 
-    // Only for a child that exited on its own: a killed-and-reaped one has no
-    // output left to collect, and `wait_with_output` on it would just fail.
-    if !timed_out {
-        let output = child
-            .wait_with_output()
-            .expect("failed to get output from iggy-bench");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(stderr_file_path) = &stderr_file_path {
-            OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(stderr_file_path)
-                .unwrap()
-                .write_all(stderr.as_bytes())
-                .unwrap();
-        }
-
-        if let Some(stdout_file_path) = &stdout_file_path {
-            OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(stdout_file_path)
-                .unwrap()
-                .write_all(stdout.as_bytes())
-                .unwrap();
-        }
-    }
-
+    // Nothing to drain, by construction: both branches above redirect the
+    // child's stdout and stderr -- to files, or inherited under
+    // `IGGY_TEST_VERBOSE` -- so no pipe exists for the poll loop to deadlock
+    // against. The old `wait_with_output` capture here could only ever return
+    // empty buffers for the same reason; the captures the failure path prints
+    // are the redirect FILES.
     let failed = timed_out || status.is_none_or(|status| !status.success());
     if failed || panicking() {
         for (stream, path) in [("stdout", &stdout_file_path), ("stderr", &stderr_file_path)] {

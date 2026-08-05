@@ -985,15 +985,21 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     await_segment_layout(&partition_path, &[0]).await;
 
     // --- Verify consumer offsets cleared (memory + disk) ---
-    // POLLED, not asserted instantly: in the restart cells the kill can land
-    // mid-purge, and boot then plants the [0] layout itself (fencing a torn
-    // chain, or recovering an already-drained directory) with the offset files
-    // still present -- the layout gate above is satisfied BEFORE the
-    // reconciler's re-purge (the applied generation is not persisted, so a
-    // restart re-purges) clears them. The purge contract is that the offsets
-    // GO AWAY, not that they are gone in the same frame as a boot-planted
-    // layout, so converge on the cleared state.
-    let offsets_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Polled ONLY in the restart cells: there the kill can land mid-purge, and
+    // boot then plants the [0] layout itself (fencing a torn chain, or
+    // recovering an already-drained directory) with the offset files still
+    // present -- the layout gate above is satisfied BEFORE the reconciler's
+    // re-purge (the applied generation is not persisted, so a restart
+    // re-purges) clears them. Without a restart the pump clears offsets and
+    // files in the SAME frame that plants the layout, so the instant assert is
+    // correct there and strictly stronger; a poll would hide a regression that
+    // clears them one frame late.
+    let offsets_deadline = std::time::Instant::now()
+        + if restart_server {
+            std::time::Duration::from_secs(10)
+        } else {
+            std::time::Duration::ZERO
+        };
     loop {
         let consumer_offset = client
             .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))

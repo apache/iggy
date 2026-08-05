@@ -3435,6 +3435,19 @@ where
         for path in consumer_paths.into_iter().chain(group_paths) {
             let _ = delete_persisted_offset(&path).await;
         }
+        // Directory fsync so those unlinks stick, mirroring the install path: a
+        // crash right after the purge otherwise resurrects the offset files at
+        // boot, and while recovery clamps a resurrected offset down to the
+        // rebuilt head, "consumed through 0" is not the intended "no entry at
+        // all" -- that consumer skips the first post-purge message.
+        for dir in self
+            .consumer_offsets_path
+            .clone()
+            .into_iter()
+            .chain(self.consumer_group_offsets_path.clone())
+        {
+            let _ = crate::state_transfer::fsync_dir(&dir).await;
+        }
         // The persisted-offset tracker mirrors the files unlinked above; a
         // stale entry would make a post-purge auto-commit skip its write and
         // lose the offset on restart.
@@ -5360,6 +5373,157 @@ mod tests {
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_some());
+    }
+    /// Temp partition directory for the state-transfer fence specs below.
+    async fn transfer_fence_dir(label: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-transfer-fence-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn armed_transfer(peer: u8) -> crate::state_transfer::PartitionTransferSession {
+        crate::state_transfer::PartitionTransferSession {
+            nonce: 7,
+            peer,
+            commit_op: 12,
+            artifacts: Vec::new(),
+            target_accepted: true,
+            idle_ticks: 0,
+        }
+    }
+
+    /// A purge must not leave a transfer running: its staged segments hold
+    /// PRE-purge data, and completing the install renames it back in durably
+    /// (the install takes `max(offer generation, applied)`, and this purge
+    /// already stamped the newer one, so the reconciler's purge gate never
+    /// re-fires).
+    #[compio::test]
+    async fn given_armed_transfer_when_purged_should_abandon_session_and_rearm() {
+        let partition_dir = transfer_fence_dir("purge-abandons").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.transfer = Some(armed_transfer(1));
+        partition.transfer_rearm = Some(crate::state_transfer::PendingTransferRearm {
+            peer: 2,
+            after_ticks: 5,
+        });
+        partition.consensus().begin_state_transfer_await();
+
+        partition
+            .purge(&repair_config(), 3)
+            .await
+            .expect("purge partition");
+
+        assert!(
+            partition.transfer.is_none(),
+            "purge must drop the in-flight transfer session"
+        );
+        assert!(
+            partition.transfer_rearm.is_none(),
+            "purge must cancel the scheduled re-arm"
+        );
+        assert_eq!(
+            partition.consensus().state_transfer_stage(),
+            consensus::StateTransferStage::Idle,
+            "purge must release the transfer stage so a later trigger can arm"
+        );
+
+        let _ = std::fs::remove_dir_all(&partition_dir);
+    }
+
+    /// An offer whose frontier sits below this replica's own offset counter is
+    /// refused: installing it would rewind the counter, and the next replicated
+    /// prepare is re-stamped from it, so this replica would persist different
+    /// bytes (and a different `batch_checksum`) than the rest of the group.
+    #[compio::test]
+    async fn given_offer_below_local_counter_when_installed_should_refuse_rewind() {
+        let partition_dir = transfer_fence_dir("rewind-refused").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.should_increment_offset = true;
+        partition.offset.store(99, Ordering::Release);
+
+        let behind = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 0,
+            next_offset: 50,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+        };
+        let refused = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(
+                    crate::state_transfer::PartitionInstallError::OfferRewindsDurableData {
+                        offer_next_offset: 50,
+                        local_next_offset: 100,
+                    }
+                )
+            ),
+            "expected a rewind refusal, got {refused:?}"
+        );
+
+        // A purge at the origin is the one legitimate rewind, and the artifact
+        // carries the generation that proves it: the same offer passes the fence
+        // once its generation advances.
+        let purged = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 1,
+            next_offset: 0,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+        };
+        let accepted = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &purged.encode())
+            .await;
+        assert!(
+            !matches!(
+                accepted,
+                Err(crate::state_transfer::PartitionInstallError::OfferRewindsDurableData { .. })
+            ),
+            "a purge-advancing offer must pass the rewind fence, got {accepted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&partition_dir);
+    }
+
+    /// Primary-by-index at view 0 with nothing committed refuses to serve: an
+    /// empty group is trivially "caught up", so this gate is the only thing
+    /// separating a real primary from a phantom whose directory vanished, whose
+    /// zero-segment offer at frontier 0 would make a data-holding receiver
+    /// unlink its chain.
+    #[compio::test]
+    async fn given_nothing_committed_when_offer_requested_should_refuse() {
+        let partition_dir = transfer_fence_dir("nothing-committed").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+        assert_eq!(partition.consensus().commit_max(), 0);
+
+        let refused = partition.state_transfer_offer(&repair_config()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(crate::state_transfer::PartitionTransferUnavailable::NothingCommitted)
+            ),
+            "expected a NothingCommitted refusal, got {refused:?}"
+        );
+        assert!(
+            refused.is_err_and(|reason| reason.transient()),
+            "the refusal must be transient: the requester rotates rather than \
+             charging its failure count"
+        );
+
+        let _ = std::fs::remove_dir_all(&partition_dir);
     }
 }
 

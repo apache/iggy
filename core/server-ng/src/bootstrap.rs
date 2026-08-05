@@ -2328,7 +2328,19 @@ async fn load_partition(
     let current_offset = sized_end.or_else(|| empty_frontier.map(|start| start - 1));
     partition.created_at = partition_metadata.created_at;
     partition.recovered_durable_offset = sized_end;
-    partition.installed_frontier = empty_frontier;
+    // The OFFSET COUNTER is restored from that file name (above), but the
+    // `installed_frontier` CLAIM deliberately is not: the claim says "everything
+    // below me is represented here", and `converge_to_empty_after_failed_install`
+    // refuses to make it when staged segments were dropped -- yet a converge
+    // plants exactly the same empty `{frontier:020}.log` a legitimate empty
+    // install does, so boot provably cannot tell them apart. Re-deriving it here
+    // would hand the refused claim back: the repair floor stand-in would accept a
+    // commit floor over ops this replica holds zero bytes for, and the replica
+    // would pass the serve gate and offer that emptiness onward, making a peer
+    // unlink its own chain. Leaving it `None` costs one spurious full
+    // re-transfer on the legitimate empty-install restart; a false caught-up
+    // claim is not recoverable. A durable home for the frontier (the partition
+    // superblock already reserves a field) is what would settle it properly.
     let counter = current_offset.unwrap_or(0);
     partition.offset.store(counter, Ordering::Release);
     partition.dirty_offset.store(counter, Ordering::Relaxed);

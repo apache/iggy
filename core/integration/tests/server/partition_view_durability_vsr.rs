@@ -165,6 +165,19 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
     // fires, so re-reading it here would return the pre-restart record even if
     // recovery were broken and node 2 came back at view 0. Node 2's boot line
     // reports the view it actually restored, so it must name the recorded one.
+    //
+    // Skipped when the harness inherits the node's stdout instead of capturing
+    // it (`IGGY_TEST_VERBOSE`): the log file is then empty, and asserting on it
+    // would fail spuriously in exactly the mode someone debugging this would
+    // use. The serve check above still ran.
+    let log_captured = !harness.node(2).stdout_plain().is_empty();
+    if !log_captured {
+        eprintln!(
+            "IGGY_TEST_VERBOSE inherits node stdout, so the restored-view oracle is \
+             unavailable; skipping it"
+        );
+        return;
+    }
     let restored = restored_partition_view(harness, 2)
         .expect("node 2 must log the partition view it restored from its superblock");
     assert!(

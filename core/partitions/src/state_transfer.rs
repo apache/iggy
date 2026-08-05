@@ -140,14 +140,6 @@ impl TransferArtifact {
             Self::Staged(_) => None,
         }
     }
-
-    #[must_use]
-    pub const fn complete(&self) -> bool {
-        match self {
-            Self::Pending(progress) => progress.complete(),
-            Self::Staged(_) => true,
-        }
-    }
 }
 
 impl consensus::ChunkProgress for TransferArtifact {
@@ -184,6 +176,9 @@ impl consensus::ChunkProgress for TransferArtifact {
 pub struct StagedSegmentMeta {
     pub start_offset: u64,
     pub end_offset: u64,
+    /// Byte length of the locally rebuilt sparse index sidecar, recorded at
+    /// the walk so the install does not re-stat the renamed file.
+    pub index_size: u64,
     /// Payload byte length == the manifest entry's `len` == the final `.log`
     /// file size.
     pub size: u64,
@@ -681,9 +676,6 @@ pub(crate) fn walk_segment_payload(
     base_offset: u64,
     bytes: &[u8],
 ) -> Result<(SegmentWalkStats, Vec<u8>), SegmentWalkError> {
-    if bytes.is_empty() {
-        return Err(SegmentWalkError::Empty);
-    }
     let mut position = 0usize;
     let mut next_offset = base_offset;
     let mut stats: Option<SegmentWalkStats> = None;
@@ -940,12 +932,14 @@ pub enum PartitionInstallError {
         commit_op: u64,
         commit_min: u64,
     },
-    /// The offer's offset frontier is at or below the offsets this replica
-    /// already holds durably, so installing it would unlink data the offer
-    /// does not carry (and, at frontier 0, fork the offset space).
+    /// The offer's offset frontier is below this replica's own offset
+    /// counter, so installing it would rewind the offset space: the next
+    /// replicated prepare would be re-stamped from the rewound counter and
+    /// persist different bytes (and a different `batch_checksum`) here than
+    /// on the rest of the group.
     OfferRewindsDurableData {
         offer_next_offset: u64,
-        durable_end: u64,
+        local_next_offset: u64,
     },
     Offsets(ConsumerOffsetsWireError),
     /// Duplicate base offset in the staged set.
@@ -995,11 +989,11 @@ impl fmt::Display for PartitionInstallError {
             ),
             Self::OfferRewindsDurableData {
                 offer_next_offset,
-                durable_end,
+                local_next_offset,
             } => write!(
                 f,
-                "offer frontier {offer_next_offset} is at or below the recovered durable end \
-                 {durable_end}; installing it would drop offsets this replica already holds"
+                "offer frontier {offer_next_offset} is below this replica's own next offset \
+                 {local_next_offset}; installing it would rewind the offset space"
             ),
             Self::Offsets(source) => write!(f, "consumer-offsets artifact rejected: {source}"),
             Self::DuplicateSegment { start_offset } => {
@@ -1101,7 +1095,16 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
         };
         compio::fs::rename(&path, &PathBuf::from(&target).join(name)).await?;
     }
+    // All three touched directories: the target (its new dirents), the source
+    // (the removals), and the source's parent (the target directory itself is a
+    // new dirent there). Without the target-side syncs a crash can leave the
+    // moved files linked in neither directory -- only forensics are at stake,
+    // but forensics are the whole point of the copies.
+    fsync_dir(&target).await?;
     fsync_dir(partition_dir).await?;
+    if let Some(parent) = Path::new(partition_dir).parent().and_then(Path::to_str) {
+        fsync_dir(parent).await?;
+    }
     Ok(target)
 }
 
@@ -1153,7 +1156,7 @@ struct PlannedOffsetWrite {
 /// fsync the partition directory so a rename made durable stays durable.
 /// Async so the wait parks the task instead of the whole shard reactor;
 /// every other future on the pump keeps running through it.
-async fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
+pub(crate) async fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
     compio::fs::File::open(partition_dir)
         .await?
         .sync_all()
@@ -1199,8 +1202,17 @@ where
         // `consensus.init()`, comes up Normal at view 0, and an empty group is
         // trivially "caught up". Its offer would be zero segments at frontier
         // 0, which makes a receiver holding real data unlink its own chain.
-        // Nothing committed also means nothing worth serving, so refuse and
-        // let the requester rotate to a replica that has state.
+        //
+        // A RESTARTED replica holding a full chain matches this shape too
+        // (`commit_max == 0` because the partition journal is memory-only,
+        // `installed_frontier == None` for a recovered non-empty chain). That
+        // is the load-bearing reason this refusal is safe rather than a
+        // wedge: every transfer-arm site presupposes a peer that already
+        // reported commit > 0 (repair floor refusals, StartView adoption), so
+        // nobody ever asks a cluster where everything still reports 0.
+        // Extending the gate with `recovered_durable_offset.is_some()` would
+        // be WRONG: such an offer carries `commit_op = 0`, so the receiver's
+        // floor becomes a no-op while its counter jumps to the frontier.
         if self.consensus().commit_max() == 0 && self.installed_frontier.is_none() {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
@@ -1370,7 +1382,7 @@ where
                 SegmentChecksumMemo::new()
             }
         };
-        hash_segment_range(log_path, memo.hashed_len, size, &mut memo.hasher)
+        hash_segment_range(log_path, memo.hashed_len, size, &mut memo.hasher, None)
             .await
             .map_err(|source| PartitionTransferUnavailable::SegmentUnreadable {
                 start_offset,
@@ -1385,27 +1397,10 @@ where
         Ok(checksum)
     }
 
-    /// Move this partition's SEGMENT files aside into `<dir>.fenced.<n>/`, for
-    /// the shard's `ConvergeFailed` fence: the converge already failed to sweep
-    /// them, so whatever they hold (partial chains, undeletable strays) must not
-    /// feed the reconciler's rebuild or resurrect at boot. Picks the first free
-    /// suffix rather than a timestamp so repeated fences of the same group
-    /// cannot collide, and returns the directory it used so the fence site can
-    /// name it.
-    ///
-    /// The partition directory itself STAYS, and so do its two superblock
-    /// slots: they hold this group's only durable `(view, log_view)`, and moving
-    /// them would make the rebuild read an empty directory -- no
-    /// `restore_partition_view`, `consensus.init()` instead of
-    /// `init_as_backup()`, no replica-identity guard -- so the group would
-    /// re-enter view 0 after acting in view N and could answer a retransmitted
-    /// DVC with `(0, 0)`, letting a quorum adopt a log shorter than the
-    /// committed prefix.
-    ///
-    /// Nothing reclaims the fenced copies: they are evidence for an operator,
-    /// bounded to 1000 per partition by the suffix search and never read again
-    /// (boot recovery keys on `.log` files inside the partition directory, and
-    /// the fenced subdirectory is not one).
+    /// [`quarantine_segment_files`] over this partition's directory, for the
+    /// shard's `ConvergeFailed` fence -- the safety argument (segment files
+    /// move, superblock slots STAY, copies are unreclaimed operator evidence)
+    /// lives on the free function. `None` for an in-memory partition.
     ///
     /// # Errors
     /// The underlying `std::io::Error`; the caller logs and lets the rebuild
@@ -1506,6 +1501,7 @@ where
         let (stats, index_bytes) =
             walk_segment_payload(entry.frontier, &bytes).map_err(SpillError::Walk)?;
         let (log_staging, index_staging) = staging_paths(&partition_dir, entry.frontier);
+        let index_size = index_bytes.len() as u64;
         // Two writes, not a loop: each moves its buffer into compio's
         // owned-buffer API, so a segment-sized payload is never copied.
         write_staging_file(&log_staging, bytes)
@@ -1530,6 +1526,7 @@ where
             start_offset: entry.frontier,
             end_offset: stats.end_offset,
             size: entry.len,
+            index_size,
             start_timestamp: stats.start_timestamp,
             end_timestamp: stats.end_timestamp,
             max_timestamp: stats.max_timestamp,
@@ -1546,6 +1543,9 @@ where
     /// time) is exactly the work reuse exists to skip. The index write
     /// stays: the scan never checks `.index.staging`, and a missing sidecar
     /// would hand the install a missing rename source.
+    ///
+    /// No directory fsync here: every sidecar lands in the same directory, so
+    /// the caller fsyncs ONCE after its loop instead of once per adoption.
     async fn adopt_staged_segment(
         &self,
         entry: &consensus::StateArtifact,
@@ -1557,22 +1557,18 @@ where
         let (stats, index_bytes) =
             walk_segment_payload(entry.frontier, bytes).map_err(SpillError::Walk)?;
         let (log_staging, index_staging) = staging_paths(&partition_dir, entry.frontier);
+        let index_size = index_bytes.len() as u64;
         write_staging_file(&index_staging, index_bytes)
             .await
             .map_err(|source| SpillError::StagingIo {
                 path: index_staging.clone(),
                 source,
             })?;
-        fsync_dir(&partition_dir)
-            .await
-            .map_err(|source| SpillError::StagingIo {
-                path: PathBuf::from(&partition_dir),
-                source,
-            })?;
         Ok(StagedSegmentMeta {
             start_offset: entry.frontier,
             end_offset: stats.end_offset,
             size: entry.len,
+            index_size,
             start_timestamp: stats.start_timestamp,
             end_timestamp: stats.end_timestamp,
             max_timestamp: stats.max_timestamp,
@@ -1655,6 +1651,15 @@ where
                 adopted.push((index as u32, meta));
             }
         }
+        // Every rebuilt sidecar landed in the same directory, so one fsync
+        // covers them all. Its failure discards EVERY adoption: the per-adopt
+        // filter above no longer sees a durability failure, and an undurable
+        // sidecar handed to the install is a missing rename source after a
+        // crash.
+        if !adopted.is_empty() && fsync_dir(&partition_dir).await.is_err() {
+            adopted.clear();
+            matched_paths.clear();
+        }
         // Sweep strays: anything staged that no adopted meta claims.
         let keep: Vec<&Path> = matched_paths.iter().map(PathBuf::as_path).collect();
         sweep_staging_except(&partition_dir, &keep).await;
@@ -1702,24 +1707,33 @@ where
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
-        // Anti-rewind against LOCAL DURABLE BYTES, not just the commit
+        // Anti-rewind against the LOCAL OFFSET COUNTER, not the commit
         // frontier: the partition journal is memory-only and
         // `restore_partition_view` restores view/log_view alone, so `commit_min`
         // is 0 after every restart however much data sits on disk -- the
         // `StaleTransfer` refusal above is inert on exactly the canonical
-        // rejoin. An offer whose frontier is at or below the recovered durable
-        // end would unlink a chain that already covers those offsets, and at
-        // frontier 0 restart the offset space, forking every future batch stamp
-        // from the rest of the group. A purge is the one legitimate rewind, and
-        // the artifact carries the generation that proves one happened.
+        // rejoin. The counter is the one signal that is `Some`-equivalent in
+        // EVERY state the offset space has advanced through (recovered bytes,
+        // an installed frontier, a converge after a failed install --
+        // `recovered_durable_offset` is `None` in the last two), and it is
+        // precisely what a rewind corrupts: received prepares are pre-stamp,
+        // `stamp_prepare_for_persistence` overwrites `base_offset` from this
+        // counter and recomputes `batch_checksum` over it, so a rewound
+        // counter persists different bytes and a different checksum on this
+        // replica than on the rest of the group. A purge is the one
+        // legitimate rewind, and the artifact carries the generation that
+        // proves one happened.
         let purge_advances = offsets_wire.purge_generation > self.applied_purge_generation;
-        if !purge_advances
-            && let Some(durable_end) = self.recovered_durable_offset
-            && offsets_wire.next_offset <= durable_end
+        let local_next_offset = if self.should_increment_offset {
+            self.offset.load(Ordering::Acquire) + 1
+        } else {
+            0
+        };
+        if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
         {
             return Err(PartitionInstallError::OfferRewindsDurableData {
                 offer_next_offset: offsets_wire.next_offset,
-                durable_end,
+                local_next_offset,
             });
         }
         staged.sort_unstable_by_key(|meta| meta.start_offset);
@@ -1789,7 +1803,7 @@ where
         // Sweep staging strays a dead earlier attempt left behind, keeping
         // only what THIS install is about to rename. Bounded disk hygiene;
         // the reuse-scan sweeps too, and boot sweeps ALL of `.staging`
-        // (`segment_recovery::sweep_staging_files`), so a transfer abandoned
+        // (`segment_recovery::sweep_scratch_files`), so a transfer abandoned
         // for good leaks at most until the next restart.
         let keep: Vec<&Path> = staged
             .iter()
@@ -1857,6 +1871,19 @@ where
         // contiguous partition and re-triggers transfer for the rest. Not
         // fewer fsyncs than this: one-per-pair would lean on intra-directory
         // rename ordering POSIX does not grant.
+        //
+        // KNOWN WINDOW, above and here: the old chain's unlinks are already
+        // durable and no staged log has landed yet, and nothing durable names
+        // the offset frontier in between -- a crash there boots to zero
+        // segments and counter 0. Bounded, not silent: the gap check drops
+        // live prepares at sequencer 0 and the repair floor refuses a `None`
+        // stand-in against a nonzero first batch, so the replica takes a clean
+        // full re-transfer instead of serving a hole. One narrow door stays
+        // open until the frontier gets a durable home (the partition
+        // superblock already reserves a field for it):
+        // `repaired_window_is_offsets_only` can accept a complete
+        // offsets-only window with the counter still at 0, after which the
+        // next live append stamps `base_offset` 0 against the group's N.
         for meta in &staged {
             let (_, index_final) = final_paths(partition_dir, meta.start_offset);
             compio::fs::rename(&meta.index_staging, &index_final)
@@ -1894,23 +1921,32 @@ where
         // hydrate pattern; earlier segments are sealed and never written).
         for meta in &staged {
             let (log_final, index_final) = final_paths(partition_dir, meta.start_offset);
-            let index_len = compio::fs::metadata(&index_final)
-                .await
-                .map_or(0, |metadata| metadata.len());
-            let storage = SegmentStorage::new(
-                &log_final,
-                &index_final,
-                meta.size,
-                index_len,
-                config.enforce_fsync,
-                config.enforce_fsync,
-                true,
-            )
-            .await
-            .map_err(|source| PartitionInstallError::SegmentOpen {
-                path: log_final.clone(),
-                source,
-            })?;
+            // Retried once: by this point every rename already landed, so a
+            // failed open converges away a chain that is COMPLETE AND DURABLE
+            // on disk and the re-pull transfers the whole thing again. The
+            // sweep itself is right (a chain the live state does not know
+            // about would resurrect at boot), so one retry against a
+            // transient open failure is the only cheap save available.
+            let open = || {
+                SegmentStorage::new(
+                    &log_final,
+                    &index_final,
+                    meta.size,
+                    meta.index_size,
+                    config.enforce_fsync,
+                    config.enforce_fsync,
+                    true,
+                )
+            };
+            let storage = match open().await {
+                Ok(storage) => storage,
+                Err(_) => open()
+                    .await
+                    .map_err(|source| PartitionInstallError::SegmentOpen {
+                        path: log_final.clone(),
+                        source,
+                    })?,
+            };
             let mut segment = Segment::new(meta.start_offset, config.segment_size);
             segment.sealed = true;
             segment.start_timestamp = meta.start_timestamp;
@@ -2032,7 +2068,12 @@ where
         self.pending_consumer_offset_commits.clear();
         self.last_polled_offsets.pin().clear();
 
-        let clamp = |offset: u64| offset.min(next_offset.saturating_sub(1));
+        // `None` when the group's offset space is empty (`next_offset == 0`,
+        // a purged origin): clamping every transferred offset to 0 would tell
+        // each consumer it consumed offset 0 on a partition that never minted
+        // one, so a `Next` poll skips the first message. Dropping the entries
+        // is what "no offsets yet" means.
+        let clamp = |offset: u64| next_offset.checked_sub(1).map(|last| offset.min(last));
         if self.consumer_offsets_path.is_none() || self.consumer_group_offsets_path.is_none() {
             // Nothing to write the transferred table into: unreachable via
             // the server boot paths (they always configure storage), but if
@@ -2048,7 +2089,9 @@ where
             Vec::with_capacity(offsets_wire.consumers.len() + offsets_wire.groups.len());
         if let Some(dir) = self.consumer_offsets_path.clone() {
             for (id, offset) in &offsets_wire.consumers {
-                let value = clamp(*offset);
+                let Some(value) = clamp(*offset) else {
+                    continue;
+                };
                 let entry = ConsumerOffset::default_for_consumer(*id, &dir);
                 entry.offset.store(value, Ordering::Release);
                 let path = entry.path.clone();
@@ -2063,7 +2106,9 @@ where
         }
         if let Some(dir) = self.consumer_group_offsets_path.clone() {
             for (id, offset) in &offsets_wire.groups {
-                let value = clamp(*offset);
+                let Some(value) = clamp(*offset) else {
+                    continue;
+                };
                 let group_id = ConsumerGroupId(*id as usize);
                 let entry = ConsumerOffset::default_for_consumer_group(group_id, &dir);
                 entry.offset.store(value, Ordering::Release);
@@ -2131,7 +2176,13 @@ where
         // durable bytes on disk. Deliberately NOT `recovered_durable_offset`:
         // that field also gates repaired-batch persistence, and overstating
         // it would silently drop the `(commit_op, commit_max]` replay window.
-        self.installed_frontier = Some(next_offset);
+        // `Some(0)` is filtered out: it reads as a real claim in the
+        // `NothingCommitted` serve gate (`installed_frontier.is_none()`), so a
+        // replica holding zero bytes at frontier 0 would start serving empty
+        // offers -- the phantom shape that gate exists to stop. Behavior is
+        // otherwise unchanged: the repair floor stand-in already treats
+        // `Some(0)` and `None` identically.
+        self.installed_frontier = (next_offset > 0).then_some(next_offset);
         self.stats.zero_out_all();
         #[allow(clippy::cast_possible_truncation)]
         self.stats
@@ -2156,9 +2207,21 @@ where
         if commit_op > consensus.commit_min() {
             consensus.set_commit_floor(commit_op);
         }
-        if commit_op > consensus.sequencer().current_sequence() {
-            consensus.sequencer().set_sequence(commit_op);
-        }
+        // The sequencer is SET, not raised: the install cleared the whole
+        // journal, so ops in `(commit_op, old_sequencer]` -- journaled and
+        // PrepareOk'd before the transfer armed, since a transferring replica
+        // withholds acks -- are ops consensus still claims and the journal can
+        // no longer serve. The primary's retransmit dies in the backup gap
+        // check and repair will not arm (the install leaves
+        // `commit_min == commit_max`), so a DVC from here would advertise an op
+        // this replica cannot walk. The pipeline is cleared in the same breath:
+        // its entries are backed by the same erased journal, and
+        // `LocalPipeline::push` asserts op sequentiality in release, so a bare
+        // rewind would turn the silent desync into a shard panic on a replica
+        // promoted mid-transfer. (`last_prepare_checksum` needs nothing: it is
+        // only read as a `parent:` stamp when building a prepare.)
+        consensus.sequencer().set_sequence(commit_op);
+        consensus.pipeline().borrow_mut().clear();
         consensus.advance_commit_max(commit_op);
         self.observed_view = self.consensus().view();
         self.repair = None;
@@ -2169,14 +2232,7 @@ where
             offsets_written,
         })
     }
-}
 
-/// See `install_state_transfer`'s failure arm.
-impl<B, SB> IggyPartition<B, SB>
-where
-    B: MessageBus,
-    SB: SuperblockStore,
-{
     /// Converge the live partition AND its directory to an empty,
     /// honestly-lagging shape after a failed install: no segment files at
     /// all (the failure can land anywhere from "old chain unlinked" to
@@ -2220,7 +2276,7 @@ where
                     .map(|entry| entry.path())
                     .filter(|path| {
                         path.to_str().is_some_and(|path| {
-                            [".log", ".index", ".staging"]
+                            [".log", ".index", STAGING_SUFFIX]
                                 .iter()
                                 .any(|extension| path.ends_with(extension))
                         })
@@ -2275,7 +2331,8 @@ where
         // segments staged and the install failed, this replica holds zero bytes
         // of a range it would otherwise declare whole, and `set_commit_floor`
         // would lift `commit_min` over ops it cannot serve.
-        self.installed_frontier = staged_was_empty.then_some(minted_next_offset);
+        self.installed_frontier =
+            (staged_was_empty && minted_next_offset > 0).then_some(minted_next_offset);
         self.stats.zero_out_all();
         self.stats.increment_segments_count(1);
         self.repair = None;
@@ -2325,14 +2382,19 @@ impl std::error::Error for SpillError {}
 const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
 
 /// Feed bytes `[from, to)` of `path` into `hasher`, read in
-/// [`OFFER_HASH_CHUNK_LEN`] chunks with one reactor yield per chunk. Errors
-/// on a file shorter than `to`: the segment accounts bytes the disk does
-/// not hold.
+/// [`OFFER_HASH_CHUNK_LEN`] chunks with one reactor yield per chunk, appending
+/// each chunk to `sink` when one is given.
+///
+/// The single chunked reader for both passes over a segment file: the offer
+/// build's checksum extension (no sink) and the serving side's load + re-verify
+/// (sink collects the artifact). Errors on a file shorter than `to`: the segment
+/// accounts bytes the disk does not hold.
 async fn hash_segment_range(
     path: &str,
     from: u64,
     to: u64,
     hasher: &mut consensus::state_manifest::StateArtifactHasher,
+    mut sink: Option<&mut Vec<u8>>,
 ) -> std::io::Result<()> {
     if from >= to {
         return Ok(());
@@ -2360,13 +2422,16 @@ async fn hash_segment_range(
             ))
         })?;
         hasher.update(&buf);
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.extend_from_slice(&buf);
+        }
         position += want as u64;
     }
     Ok(())
 }
 
 /// Read the first `entry.len` bytes of a served segment file and re-verify them
-/// against the manifest entry, in [`OFFER_HASH_CHUNK_LEN`] chunks with one
+/// against the manifest entry, chunked through [`hash_segment_range`] with one
 /// reactor yield per chunk.
 ///
 /// The serving side runs this on the pump to answer a single chunk request, so
@@ -2383,23 +2448,12 @@ pub async fn load_verified_segment_artifact(
     log_path: &str,
     entry: &consensus::StateArtifact,
 ) -> Option<Vec<u8>> {
-    let file = compio::fs::File::open(log_path).await.ok()?;
-    if file.metadata().await.ok()?.len() < entry.len {
-        return None;
-    }
     let mut hasher = consensus::state_manifest::StateArtifactHasher::new();
     #[allow(clippy::cast_possible_truncation)]
     let mut bytes = Vec::with_capacity(entry.len as usize);
-    let mut position = 0u64;
-    while position < entry.len {
-        #[allow(clippy::cast_possible_truncation)]
-        let want = OFFER_HASH_CHUNK_LEN.min((entry.len - position) as usize);
-        let compio::BufResult(read, chunk) = file.read_exact_at(vec![0u8; want], position).await;
-        read.ok()?;
-        hasher.update(&chunk);
-        bytes.extend_from_slice(&chunk);
-        position += want as u64;
-    }
+    hash_segment_range(log_path, 0, entry.len, &mut hasher, Some(&mut bytes))
+        .await
+        .ok()?;
     (hasher.finish() == entry.checksum).then_some(bytes)
 }
 

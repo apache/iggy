@@ -1413,6 +1413,25 @@ pub struct StateTransferTargetHeader {
     /// Serving primary's applied frontier (`commit_min`) when the descriptor
     /// was built. The receiver's tail repair targets past this.
     pub commit_op: u64,
+    pub namespace: u64,
+    pub available: u8,
+    /// Set on an `available == 0` refusal that means "not right now" rather than
+    /// "this node is broken": the requester then re-arms on a flat interval
+    /// instead of charging its consecutive-failure count, whose exponential
+    /// backoff climbs to 1024x the retry interval and is reset only by a
+    /// completed install. A serving primary momentarily behind its own frontier
+    /// is the common case under produce load.
+    ///
+    /// This and `commit_max` below claim the HEAD of what used to be the
+    /// reserved tail, so every pre-existing field keeps its published offset:
+    /// this header ships in the `iggy_binary_protocol` crate, the size assert
+    /// cannot catch an equal-size reshuffle, and nothing on the link carries a
+    /// version signal -- a mid-struct insertion is silent non-interop between
+    /// mixed builds.
+    pub unavailable_transient: u8,
+    /// Explicit padding so `commit_max` sits 8-aligned without the implicit
+    /// padding `NoUninit` forbids.
+    pub reserved_alignment: [u8; 6],
     /// Serving replica's `commit_max` when the descriptor was built.
     ///
     /// A receiver refuses an offer from a replica that knows LESS than it does:
@@ -1422,16 +1441,7 @@ pub struct StateTransferTargetHeader {
     /// and an empty log is trivially caught up) could hand a data-holding
     /// rejoiner an empty offer that unlinks its chain.
     pub commit_max: u64,
-    pub namespace: u64,
-    pub available: u8,
-    /// Set on an `available == 0` refusal that means "not right now" rather than
-    /// "this node is broken": the requester then re-arms on a flat interval
-    /// instead of charging its consecutive-failure count, whose exponential
-    /// backoff climbs to 1024x the retry interval and is reset only by a
-    /// completed install. A serving primary momentarily behind its own frontier
-    /// is the common case under produce load.
-    pub unavailable_transient: u8,
-    pub reserved: [u8; 86],
+    pub reserved: [u8; 80],
 }
 const _: () = {
     assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
@@ -1439,7 +1449,14 @@ const _: () = {
         offset_of!(StateTransferTargetHeader, nonce)
             == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 86]>() == HEADER_SIZE);
+    // The pre-existing published offsets. New fields grow into the reserved
+    // tail only; a change that moves one of these is a wire break.
+    assert!(offset_of!(StateTransferTargetHeader, commit_op) == 144);
+    assert!(offset_of!(StateTransferTargetHeader, namespace) == 152);
+    assert!(offset_of!(StateTransferTargetHeader, available) == 160);
+    assert!(offset_of!(StateTransferTargetHeader, unavailable_transient) == 161);
+    assert!(offset_of!(StateTransferTargetHeader, commit_max) == 168);
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {

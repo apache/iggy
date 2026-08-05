@@ -133,16 +133,22 @@ pub fn next_pending_chunk<T: ChunkProgress>(
 /// Append one received chunk; `true` only when bytes actually landed, which
 /// is the caller's cue to reset its liveness counters and re-drive progress.
 ///
-/// Everything else is dropped without side effects: an out-of-range artifact
-/// index, a non-sequential offset (chunks are pulled lockstep, so anything
-/// else is a duplicate or reorder -- the stall retry re-requests from the
-/// current frontier), an overrun past the declared length, and a zero-byte
-/// payload. A zero-byte payload is not progress: it extends nothing and the
-/// same offset is re-requested immediately, and resetting liveness counters
-/// on one is what turned a short rebuilt offer into an unbounded empty-frame
-/// ping-pong on the metadata plane. The serving side refuses to produce
-/// these now; the guard stays because a peer running an older build still
-/// can.
+/// Everything else is dropped without side effects: an artifact that is not
+/// the FIRST incomplete one, a non-sequential offset (chunks are pulled
+/// lockstep, so anything else is a duplicate or reorder -- the stall retry
+/// re-requests from the current frontier), an overrun past the declared
+/// length, and a zero-byte payload. The first-incomplete restriction mirrors
+/// what [`next_pending_chunk`] would have requested: without it a peer that
+/// pushes one byte into EVERY manifest entry makes each artifact's
+/// first-chunk `reserve_exact` fire, committing address space for the sum of
+/// all declared lengths at once -- the whole-manifest reservation the
+/// receiver deliberately refuses to make up front, and a failed `Vec`
+/// reservation aborts the process rather than erroring. A zero-byte payload
+/// is not progress: it extends nothing and the same offset is re-requested
+/// immediately, and resetting liveness counters on one is what turned a
+/// short rebuilt offer into an unbounded empty-frame ping-pong on the
+/// metadata plane. The serving side refuses to produce these now; the guard
+/// stays because a peer running an older build still can.
 #[must_use]
 pub fn append_chunk<T: ChunkProgress>(
     artifacts: &mut [T],
@@ -150,6 +156,10 @@ pub fn append_chunk<T: ChunkProgress>(
     offset: u64,
     payload: &[u8],
 ) -> bool {
+    let first_incomplete = artifacts.iter().position(|artifact| !artifact.complete());
+    if first_incomplete != Some(artifact_index as usize) {
+        return false;
+    }
     let Some(artifact) = artifacts.get_mut(artifact_index as usize) else {
         return false;
     };
