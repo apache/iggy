@@ -17,7 +17,7 @@
 
 use crate::Identifier;
 use crate::utils::topic_size::MaxTopicSize;
-use crate::{IggyMessage, utils::byte_size::IggyByteSize};
+use crate::{IggyMessage, SendMessagesConfirmationResponse, utils::byte_size::IggyByteSize};
 use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
@@ -416,6 +416,9 @@ pub enum IggyError {
     ProducerSendFailed {
         cause: Box<IggyError>,
         failed: Arc<Vec<IggyMessage>>,
+        /// Confirmations of the chunks that committed before `cause`; the
+        /// durable prefix of a send that was split into several requests.
+        committed: Arc<Vec<SendMessagesConfirmationResponse>>,
         stream_name: String,
         topic_name: String,
     } = 4056,

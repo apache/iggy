@@ -1104,9 +1104,10 @@ async fn handle_get_me<B, MJ, S, SB>(
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
-/// dispatch replies (empty for an unresolvable namespace, a nonzero status
-/// for denials and the exhausted routable wait) so the client fails fast
-/// instead of wedging on a silent drop.
+/// dispatch replies with a nonzero status -- unresolvable namespace,
+/// authorization denial, exhausted routable wait -- so the client fails fast
+/// instead of wedging on a silent drop or reading a status-0 frame as a
+/// committed write.
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
@@ -1134,17 +1135,26 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
-            // A partition op against a stream/topic that no longer
-            // resolves (e.g. a consumer's trailing auto-commit racing a
-            // `delete_stream`). A silent drop wedges the SDK connection
-            // forever; reply empty so the client fails fast instead.
+            // A partition op against a stream/topic that no longer resolves
+            // (e.g. a consumer's trailing auto-commit racing a `delete_stream`,
+            // or an explicit partition id that skipped the client-side
+            // resolve). The op never reached the partition plane, so a status-0
+            // reply would read as a committed ack for work that never happened.
+            // A silent drop is no better: the SDK connection processes replies
+            // in lockstep and would wedge forever.
             warn!(
                 transport_client_id,
                 error = %error,
                 operation = ?header.operation,
-                "partition request with unresolved namespace; replying empty"
+                "partition request with unresolved namespace; replying denied"
             );
-            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            send_partition_deny_reply(
+                shard,
+                transport_client_id,
+                &header,
+                IggyError::ResourceNotFound(String::new()).as_code(),
+            )
+            .await;
             return;
         }
     };
@@ -1964,10 +1974,10 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
     .await;
 }
 
-/// Ack a partition op whose namespace does not resolve (deleted stream /
-/// topic or unknown consumer group) with an empty Reply. The SDK connection
-/// processes replies in lockstep, so a silent drop wedges every
-/// subsequent request on that connection.
+/// Ack a consumer-offset op whose body could not be rewritten for the
+/// partition plane with an empty Reply. The SDK connection processes replies
+/// in lockstep, so a silent drop wedges every subsequent request on that
+/// connection.
 #[allow(clippy::future_not_send)]
 async fn send_empty_partition_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,

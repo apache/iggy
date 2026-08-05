@@ -98,8 +98,8 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, Stats, Stream, StreamDetails, TokenInfo,
-    Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
+    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -121,7 +121,7 @@ use crate::http::reads::{
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
-    decode_topic_details, decode_user_details, login_error_to_iggy,
+    decode_topic_details, decode_user_details, login_error_to_iggy, send_confirmations,
 };
 use crate::http::state::{HttpInner, HttpState};
 use crate::http::submit::{
@@ -1127,8 +1127,13 @@ pub(in crate::http) async fn get_consumer_offset(
 /// on one credential are legal), and the committed reply comes back through
 /// the session's in-process reply slot rather than a submit return value.
 /// The default answers 201 + `Iggy-Durability: replicated-memory` only
-/// after the quorum commit; `?ack=none` answers 202 + `Iggy-Durability:
-/// none` immediately after dispatch.
+/// after the quorum commit, with the commit's per-partition confirmations as
+/// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
+/// after dispatch and can carry no confirmation, having awaited none.
+///
+/// Every 201 carries a `confirmations` list, empty when the commit reported no
+/// offsets. One shape for one meaning: a caller that had to tell "no body"
+/// apart from "empty list" would be reading the same outcome two ways.
 pub(in crate::http) async fn send_messages(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1155,21 +1160,23 @@ pub(in crate::http) async fn send_messages(
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
-            SendWrapper::new(partition_write_replicated(
+            let (reply, header) = SendWrapper::new(partition_write_replicated(
                 &state,
                 &identity.session,
                 Operation::SendMessages,
                 &body,
             ))
             .await?;
-            Ok((
-                StatusCode::CREATED,
-                [(
-                    DURABILITY_HEADER,
-                    HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
-                )],
-            )
-                .into_response())
+            let durability = [(
+                DURABILITY_HEADER,
+                HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
+            )];
+            // An unreadable confirmation still answers 201: the batch committed,
+            // only its offsets did not survive the reply.
+            let confirmations = send_confirmations(&reply, &header)
+                .map(SendMessagesConfirmations::from)
+                .unwrap_or_default();
+            Ok((StatusCode::CREATED, durability, Json(confirmations)).into_response())
         }
         ProduceAck::None => {
             SendWrapper::new(produce_unacked(&state, &identity.session, &body)).await?;
@@ -1579,4 +1586,47 @@ fn issue_identity(inner: &HttpInner, user_id: u32) -> Result<Json<IdentityInfo>,
             expiry: generated.access_token_expiry,
         }),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use iggy_binary_protocol::responses::messages::{
+        SendMessagesConfirmationResponse, SendMessagesResponse,
+    };
+
+    /// Pins the produce response contract the SDKs decode: `snake_case` field
+    /// names and a numeric `base_offset`.
+    #[test]
+    fn confirmation_renders_the_pinned_json_shape() {
+        let response = SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 5,
+                partition_id: 7,
+                base_offset: 41,
+            }],
+        };
+        let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
+            .expect("confirmations serialize");
+        assert_eq!(
+            json,
+            r#"{"confirmations":[{"stream_id":3,"topic_id":5,"partition_id":7,"base_offset":41}]}"#
+        );
+    }
+
+    /// A commit that reports no offsets renders the envelope with an empty
+    /// list. Together with [`send_messages`] answering `Json` on every acked
+    /// produce - the unreadable-confirmation path included - that is what makes
+    /// `confirmations` present on every 201 body.
+    #[test]
+    fn empty_confirmations_render_an_empty_list() {
+        let response = SendMessagesResponse {
+            confirmations: Vec::new(),
+        };
+        let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
+            .expect("confirmations serialize");
+        assert_eq!(json, r#"{"confirmations":[]}"#);
+    }
 }

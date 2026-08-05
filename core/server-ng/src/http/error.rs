@@ -254,10 +254,10 @@ impl IntoResponse for WriteError {
 /// the `PUT`/`DELETE .../consumer-offsets` writes).
 ///
 /// Split differently from [`WriteError`] because the partition plane replies
-/// carry no committed error code: a pre-dispatch gate failure is an empty
-/// reply distinguishable only by header (see [`classify_partition_reply`]),
-/// and an unanswered write is a distinct outcome the caller must treat as
-/// unknown rather than failed.
+/// carry no committed error code: a pre-dispatch gate failure is an
+/// empty-bodied reply that names itself only in the header (see
+/// [`classify_partition_reply`]), and an unanswered write is a distinct
+/// outcome the caller must treat as unknown rather than failed.
 #[derive(Debug)]
 pub(in crate::http) enum PartitionWriteError {
     /// Caller-side rejection (bad identifier, oversized batch, an authorization
@@ -265,9 +265,12 @@ pub(in crate::http) enum PartitionWriteError {
     /// (`ReplyHeader.status`), or a malformed reply frame, rendered through the
     /// legacy `IggyError -> status` map for SDK-identical bodies.
     Rejected(IggyError),
-    /// The dispatch gates could not route the write: the stream, topic, or
-    /// partition does not resolve (or never materialised within the routable
-    /// budget). Rendered as the legacy 404 body.
+    /// Backstop for a status-0 reply carrying `op` 0: an ack with no commit
+    /// number behind it, for a write that never reached the partition plane.
+    /// Routing failures name themselves through `ReplyHeader.status`, so this
+    /// shape is left to a peer that still answers a non-committing op this
+    /// way. Rendered as the legacy 404 body: the alternative is grading a
+    /// write that never happened as a success.
     NotFound,
     /// The in-process reply slot could not be installed. Transient server
     /// condition -> the shared 503, retryable.
