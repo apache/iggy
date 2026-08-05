@@ -157,7 +157,7 @@ class TestTcpReconnectionConfig:
         assert reconnection.interval == timedelta(days=30_000)
 
     def test_maximum_interval_round_trips(self):
-        """Test that the largest timedelta survives the u64-microsecond boundary."""
+        """Test that the largest timedelta survives the day conversion."""
         reconnection = TcpReconnectionConfig(interval=timedelta(days=999_999_999))
 
         assert reconnection.interval == timedelta(days=999_999_999)
@@ -401,8 +401,13 @@ class TestAutoLoginAgainstServer:
             await client.create_stream(unique_name())
 
     @pytest.mark.asyncio
-    async def test_config_and_connection_string_are_equivalent(self, unique_name):
-        """Test that TcpConfig and a connection string reach the same behavior."""
+    async def test_config_and_connection_string_both_authenticate(self, unique_name):
+        """Test that either form of configuring credentials logs the client in.
+
+        The reconnection policy is set on both sides to mirror the connection
+        string, but the client exposes no getter for it, so this asserts only
+        what is observable: both clients reach an authenticated session.
+        """
         host, port = get_server_config()
         wait_for_server(host, port)
 
