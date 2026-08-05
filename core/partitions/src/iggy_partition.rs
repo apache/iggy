@@ -43,8 +43,11 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
+use iggy_binary_protocol::responses::messages::{
+    SendMessagesConfirmationResponse, SendMessagesResponse,
+};
 use iggy_binary_protocol::{
-    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireIdentifier,
+    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier,
 };
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
@@ -57,7 +60,8 @@ use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
     send_messages2::{
-        convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
+        ChecksumMode, convert_request_message, decode_prepare_slice, decode_prepare_slice_trusted,
+        stamp_prepare_for_persistence, verify_received_send_messages,
     },
     sharding::IggyNamespace,
 };
@@ -723,8 +727,9 @@ where
     /// can run the disk read + offset persist off the partition borrow. The
     /// in-memory journal tier is read here directly (mem reads never yield);
     /// the disk tier is captured as owned descriptors in [`DiskReadPlan`].
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn build_poll_plan(
-        &self,
+        &mut self,
         consumer: PollingConsumer,
         args: &PollingArgs,
     ) -> PollPlan {
@@ -815,13 +820,22 @@ where
         }
 
         let (start_segment, start_position) = self.disk_poll_start(&query);
+        // Cap resident sealed read handles: touch this poll's start segment so
+        // the LRU keeps the hot set and drops the least-recently-used fd +
+        // index (a no-op for the active segment, whose handle never caches).
+        self.log.touch_sealed_read_state(start_segment);
         // Snapshot only the segments the disk walk visits (`start_segment..`),
-        // so `start_position` applies to the first snapshotted segment.
+        // so `start_position` applies to the first snapshotted segment. A sealed
+        // segment carries its shared read-state handle (fd + sparse index) so
+        // the off-borrow read reuses (or fills) it; the active segment opens
+        // fresh and resolves from its resident index.
         let segments = self.log.segments()[start_segment..]
             .iter()
-            .map(|segment| DiskSegment {
+            .zip(self.log.sealed_read_state()[start_segment..].iter())
+            .map(|(segment, read_state)| DiskSegment {
                 start_offset: segment.start_offset,
                 persisted: segment.size.as_bytes_u64(),
+                read_state: segment.sealed.then(|| Rc::clone(read_state)),
             })
             .collect();
         let disk = DiskReadPlan {
@@ -1139,7 +1153,13 @@ where
             );
 
             let message = if message.header().operation == Operation::SendMessages {
-                match convert_request_message(namespace, message) {
+                // Skip the batch-checksum pass: on the partition ingest path
+                // nothing reads it before `stamp_prepare_for_persistence`
+                // recomputes it over the stamped header. An already-canonical
+                // batch (native v2, or the plane's pre-encrypt convert output)
+                // returns early above, so Skip only affects the legacy
+                // transcode, whose output goes straight to project/stamp.
+                match convert_request_message(namespace, message, ChecksumMode::Skip) {
                     Ok(message) => message,
                     Err(error) => {
                         emit_partition_diag(
@@ -1482,9 +1502,16 @@ where
             // very different risk:
             // - below the sequencer: a duplicate delivery (parked-frame
             //   redispatch, retransmit echo) of an op this primary already
-            //   sequenced. Apply is keyed by `header.op` and the primary
-            //   never advances its sequencer post-apply, so proceeding is
-            //   idempotent-safe; log loudly for diagnosis.
+            //   sequenced. Proceeding is safe only because the two gates above
+            //   already returned for every copy this replica can still see:
+            //   `fence_old_prepare_by_commit` drops the executed ops and
+            //   `journal_holds_op` the resident ones, so reaching here means
+            //   the journal lacks this op and has to be given it. Apply is not
+            //   idempotent on its own for a produce: `append_messages`
+            //   re-stamps from the local dirty counter and the journal's op
+            //   index is last-write-wins, so appending an op the journal
+            //   already holds would mint a second copy at fresh offsets and
+            //   orphan the first. Log loudly for diagnosis.
             // - above the sequencer: journaling an op the sequencer has not
             //   assigned yet means the next local assignment would collide
             //   with it. Unreachable today (view fences run first, one
@@ -1522,6 +1549,32 @@ where
                 );
             }
         }
+        // First blob-integrity check on the replicated path. The consensus
+        // layer never validates the body (PrepareHeader integrity fields are
+        // inert zeros) and the batch checksum is recomputed locally at stamp,
+        // so a follower must verify each message's stamp-invariant per-message
+        // checksum before journaling transit bytes. Follower-only: the primary
+        // (and single-node self-replicate) produced these bytes and already
+        // checked the client batch at ingest, so they must not pay this pass.
+        // Fail closed on mismatch - drop without journaling, forwarding, or
+        // acking; the primary retransmits on prepare-timeout.
+        if is_backup
+            && header.operation == Operation::SendMessages
+            && let Err(error) = verify_received_send_messages(message.as_slice())
+        {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "rejecting replicated send_messages: per-message checksum mismatch",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op)
+                .with_error(error.to_string()),
+            );
+            return;
+        }
+
         // Durability-before-ack: clone for chain-replicate, forward only
         // AFTER apply_replicated_operation persists. Forward-first would
         // give downstream an op whose WAL entry we never wrote, that violates
@@ -1931,11 +1984,15 @@ where
                         }
                         continue;
                     }
-                    // A resident committed SendMessages entry decoded once at append
-                    // (the offset index) with its checksum stamped over these exact
-                    // bytes, so it must decode again here. Guard the invariant for a
-                    // future disk read-back path that could make decode fallible.
-                    let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
+                    // Resident committed SendMessages entry: this node stamped it
+                    // in `append_messages` (recomputing the batch checksum over these
+                    // exact bytes), so a validating re-decode would only re-hash ~1
+                    // MiB to confirm our own write. Trust the structural decode; the
+                    // batch-checksum recompute belongs at network ingress (repair
+                    // validation + the follower receive gate), not on locally-stamped
+                    // bytes. Guard the invariant for a future disk read-back path that
+                    // could make decode fallible.
+                    let Ok(batch) = decode_prepare_slice_trusted(entry.as_slice()) else {
                         tracing::error!(
                             target: "iggy.partitions.diag",
                             namespace_raw = self.namespace().inner(),
@@ -2121,16 +2178,21 @@ where
         }
 
         let mut failed_commit = false;
-        let committed_visible_offsets = self.resolve_committed_visible_offsets(&drained).await;
+        // Must run BEFORE the commit loop: `commit_messages` evicts the
+        // committed prefix, after which an entry survives only in the bounded
+        // repair ring - and not even there on a single replica, which keeps no
+        // ring at all. A miss degrades to a successful send carrying no
+        // confirmation, a legal answer no client can tell from a real one.
+        let committed_batch_stats = self.resolve_committed_visible_offsets(&drained);
         let mut messages_committed = false;
 
-        for entry in drained {
+        for (entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
             let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
                     prepare_header,
                     &mut messages_committed,
-                    &committed_visible_offsets,
+                    batch_stats,
                     &mut failed_commit,
                     config,
                 )
@@ -2181,10 +2243,13 @@ where
             // reply. Emitting it would push an unrequested frame onto a real
             // client's lockstep reply stream if the sentinel ever routed there.
             if send_client_replies && !is_auto_commit_client(prepare_header.client) {
-                let reply = build_reply_message(
-                    &prepare_header,
-                    &committed_reply_body(prepare_header.operation),
-                );
+                let body = match prepare_header.operation {
+                    Operation::SendMessages => {
+                        send_messages_reply_body(prepare_header.namespace, batch_stats)
+                    }
+                    operation => committed_reply_body(operation),
+                };
+                let reply = build_reply_message(&prepare_header, &body);
                 let reply_buffers = reply.into_generic().into_frozen();
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
@@ -2222,45 +2287,47 @@ where
         self.drain_request_queue_into_prepares(drained_count).await;
     }
 
-    async fn resolve_committed_visible_offsets(
+    /// Batch stats for each drained entry, positionally parallel to `drained`.
+    /// Every entry contributes exactly one slot (`None` for the operations that
+    /// carry no batch), which is what makes the pairing correct by
+    /// construction; keying on `op` instead would let a lookup miss attribute
+    /// one batch's offsets to another entry's reply.
+    fn resolve_committed_visible_offsets(
         &self,
         drained: &[PipelineEntry],
-    ) -> HashMap<u64, CommittedBatchStats> {
-        let mut committed_visible_offsets = HashMap::new();
-
-        for entry in drained {
-            if entry.header.operation != Operation::SendMessages {
-                continue;
-            }
-
-            match self.committed_batch_stats_for_prepare(&entry.header).await {
-                Ok(Some(batch_stats)) => {
-                    committed_visible_offsets.insert(entry.header.op, batch_stats);
+    ) -> Vec<Option<CommittedBatchStats>> {
+        drained
+            .iter()
+            .map(|entry| {
+                if entry.header.operation != Operation::SendMessages {
+                    return None;
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(
-                        target: "iggy.partitions.diag",
-                        plane = "partitions",
-                        replica_id = self.consensus.replica(),
-                        namespace_raw = self.namespace().inner(),
-                        op = entry.header.op,
-                        operation = ?entry.header.operation,
-                        %error,
-                        "failed to resolve committed visible offset for partition entry"
-                    );
-                }
-            }
-        }
 
-        committed_visible_offsets
+                match self.committed_batch_stats_for_prepare(&entry.header) {
+                    Ok(batch_stats) => batch_stats,
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            replica_id = self.consensus.replica(),
+                            namespace_raw = self.namespace().inner(),
+                            op = entry.header.op,
+                            operation = ?entry.header.operation,
+                            %error,
+                            "failed to resolve committed visible offset for partition entry"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     async fn commit_partition_entry(
         &mut self,
         prepare_header: PrepareHeader,
         messages_committed: &mut bool,
-        committed_visible_offsets: &HashMap<u64, CommittedBatchStats>,
+        batch_stats: Option<CommittedBatchStats>,
         failed_commit: &mut bool,
         config: &PartitionsConfig,
     ) -> bool {
@@ -2284,17 +2351,18 @@ where
                     *messages_committed = true;
                 }
 
-                if let Some(batch_stats) = committed_visible_offsets.get(&prepare_header.op) {
+                if let Some(batch_stats) = batch_stats {
+                    let end_offset = batch_stats.end_offset();
                     // A repaired batch at or below the boot-time recovered
                     // durable offset was already counted (and persisted)
                     // before the restart; skip it. Live traffic always sits
                     // above the (immutable) line.
                     if self
                         .recovered_durable_offset
-                        .is_none_or(|durable| batch_stats.end_offset > durable)
+                        .is_none_or(|durable| end_offset > durable)
                     {
-                        self.offset.store(batch_stats.end_offset, Ordering::Release);
-                        self.stats.set_current_offset(batch_stats.end_offset);
+                        self.offset.store(end_offset, Ordering::Release);
+                        self.stats.set_current_offset(end_offset);
                         // Advance the aggregate stats with the visible offset. Disk
                         // persistence is threshold-gated in `commit_messages`, which
                         // must not also touch these counters or committed messages
@@ -2328,22 +2396,48 @@ where
         }
     }
 
-    async fn committed_batch_stats_for_prepare(
+    /// Read the committed batch's own stamps back out of the journal.
+    ///
+    /// INVARIANT: two replicas can never report a different `base_offset` for
+    /// the same batch. Backups do re-stamp from their own `dirty_offset` in
+    /// `append_messages`, so the guarantee is not "the bytes are replicated";
+    /// it rests on three mechanisms. The backup gap check drops any prepare
+    /// that is not `current_op + 1`, so every replica stamps a partition's
+    /// batches in the primary's order off the same counter.
+    /// `append_repaired_send_messages` journals a repaired prepare with its
+    /// embedded stamps instead of re-stamping, so filling a hole out of live
+    /// order cannot re-mint offsets. And that same path advances the counter
+    /// with `dirty.max(last_offset)`, so a repaired window below the recovered
+    /// durable end cannot rewind it and hand the next live batch offsets that
+    /// were already issued.
+    ///
+    /// `repair_entry` is deliberate: it never awaits, and it falls back to the
+    /// evicted ring, which the resident-only lookup does not.
+    fn committed_batch_stats_for_prepare(
         &self,
         prepare_header: &PrepareHeader,
     ) -> Result<Option<CommittedBatchStats>, IggyError> {
-        let Some(entry) = self.log.journal().inner.entry(prepare_header).await else {
-            return Err(IggyError::InvalidCommand);
-        };
-        let batch =
-            decode_prepare_slice(entry.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
+        let entry = self
+            .log
+            .journal()
+            .inner
+            .repair_entry(prepare_header.op)
+            // A resident slot can read back empty, which the caller must treat
+            // as a miss and not as a zero-message batch.
+            .filter(|entry| !entry.is_empty())
+            .ok_or(IggyError::InvalidCommand)?;
+        // Trusted (no batch-hash): the entry was read back from this replica's
+        // own journal, where it was stamped/validated at append; only header
+        // stats are needed, so re-hashing the ~1 MiB blob is redundant.
+        let batch = decode_prepare_slice_trusted(entry.as_slice())
+            .map_err(|_| IggyError::InvalidCommand)?;
         let message_count = batch.message_count();
         if message_count == 0 {
             return Ok(None);
         }
 
         Ok(Some(CommittedBatchStats {
-            end_offset: batch.header.base_offset + u64::from(message_count) - 1,
+            base_offset: batch.header.base_offset,
             message_count,
             size_bytes: batch.header.total_size() as u64,
         }))
@@ -2808,12 +2902,10 @@ where
         let mut deleted_messages = 0u64;
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
-            // victim is index 0 once the previous one is gone.
-            let segment = self.log.segments_mut().remove(0);
-            let mut storage = self.log.storages_mut().remove(0);
-            self.log.indexes_mut().remove(0);
-            self.log.messages_writers_mut().remove(0);
-            self.log.index_writers_mut().remove(0);
+            // victim is the front once the previous one is gone.
+            let Some((segment, mut storage)) = self.log.retire_front() else {
+                break;
+            };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -2964,14 +3056,19 @@ where
 
         let namespace = self.namespace();
 
+        // The purge recreates segment files at the paths it unlinks below, so
+        // an in-flight poll's cached read fd would keep serving the unlinked
+        // pre-purge inodes as live data. Wipe the shared read-state slots
+        // first: the clones held by suspended walks observe the wipe and their
+        // next segment resolve re-opens by path, seeing the fresh empty files.
+        self.log.invalidate_sealed_read_state();
+
         // Drain every segment (including the active one) and unlink its files.
         let segment_count = self.log.segments().len();
         for _ in 0..segment_count {
-            self.log.segments_mut().remove(0);
-            let mut storage = self.log.storages_mut().remove(0);
-            self.log.indexes_mut().remove(0);
-            self.log.messages_writers_mut().remove(0);
-            self.log.index_writers_mut().remove(0);
+            let Some((_, mut storage)) = self.log.retire_front() else {
+                break;
+            };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -3344,11 +3441,14 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
     .operation
 }
 
-/// Success reply body for a committed partition op. Result-framed ops
-/// (`Operation::is_result_framed`; on this plane the consumer-offset ops,
-/// whose rejections ship typed errors) must carry an explicit empty result
-/// section (`[count = 0]`) so the SDK's framed decode does not misread the
-/// payload; every other partition op replies with an empty body.
+/// Success reply body for a committed partition op other than `SendMessages`
+/// (which confirms its offsets through [`send_messages_reply_body`]).
+///
+/// Result-framed ops (`Operation::is_result_framed`; on this plane the
+/// consumer-offset ops, whose rejections ship typed errors) must carry an
+/// explicit empty result section (`[count = 0]`) so the SDK's framed decode
+/// does not misread the payload; every other partition op replies with an
+/// empty body.
 const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
     if operation.is_result_framed() {
         bytes::Bytes::from_static(&[0, 0, 0, 0])
@@ -3357,14 +3457,61 @@ const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
     }
 }
 
+// The confirmation payload below ships raw, with no result section ahead of it.
+// If `SendMessages` ever became result-framed, a batch with confirmations would
+// misdecode into a spurious typed error, which is loud; a batch without them
+// would decode as a clean success, which is silent.
+const _: () = assert!(!Operation::SendMessages.is_result_framed());
+
+/// One confirmation for the committed batch, or `count = 0` when its offsets
+/// could not be resolved (missing or undecodable journal entry, or an empty
+/// batch).
+///
+/// `count = 0` is a first-class answer meaning "committed, no offsets to
+/// report", not a decode problem: the SDK reads it as an empty list, exactly as
+/// it reads the legacy server's empty body. That is also why absence must stay
+/// absent - a placeholder entry would carry a valid stream/topic/partition/
+/// offset tuple and be indistinguishable from a real commit at offset 0.
+#[allow(clippy::cast_possible_truncation)]
+fn send_messages_reply_body(
+    namespace: u64,
+    batch_stats: Option<CommittedBatchStats>,
+) -> bytes::Bytes {
+    let Some(stats) = batch_stats else {
+        return bytes::Bytes::from_static(&[0, 0, 0, 0]);
+    };
+    let namespace = IggyNamespace::from_raw(namespace);
+    SendMessagesResponse {
+        confirmations: vec![SendMessagesConfirmationResponse {
+            // `IggyNamespace` packs the ids into 12/12/20 bits, so each
+            // component fits a `u32` by construction.
+            stream_id: namespace.stream_id() as u32,
+            topic_id: namespace.topic_id() as u32,
+            partition_id: namespace.partition_id() as u32,
+            base_offset: stats.base_offset,
+        }],
+    }
+    .to_bytes()
+}
+
 /// Committed-batch accounting surfaced at commit time so the aggregate stats
 /// (`messages_count`, `size_bytes`) advance with the visible offset rather than
-/// waiting on the threshold-gated disk persist.
+/// waiting on the threshold-gated disk persist, and so the `SendMessages` reply
+/// can confirm where the batch landed.
 #[derive(Clone, Copy)]
 struct CommittedBatchStats {
-    end_offset: u64,
+    base_offset: u64,
     message_count: u32,
     size_bytes: u64,
+}
+
+impl CommittedBatchStats {
+    /// Offset of the batch's last message. The batch carries a contiguous
+    /// offset run, and the sole constructor rejects an empty one, so the
+    /// subtraction cannot underflow.
+    fn end_offset(self) -> u64 {
+        self.base_offset + u64::from(self.message_count) - 1
+    }
 }
 
 /// Fold one `SendMessages` batch's accounting into a running `JournalInfo`,
@@ -3453,7 +3600,7 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poll_plan::DiskReadOutcome;
+    use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
@@ -3909,10 +4056,12 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: 512,
+                    read_state: None,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
+                    read_state: None,
                 },
             ],
             start_position: 0,
@@ -3992,10 +4141,12 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: corrupt_len,
+                    read_state: None,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
+                    read_state: None,
                 },
             ],
             start_position: 0,
@@ -4028,6 +4179,7 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
+                read_state: None,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -4057,6 +4209,7 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
+                read_state: None,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -4074,6 +4227,465 @@ mod tests {
             matches!(outcome, DiskReadOutcome::Faulted),
             "unresolvable dir over file-backed data must fault-close, not serve the journal",
         );
+    }
+
+    /// A sealed-segment poll opens the file once and caches the read fd; a later
+    /// poll of the same segment reuses the cached descriptor. Proven by
+    /// unlinking the file after the first read: a fresh open-by-path would now
+    /// fail, so a successful second read can only come from the cached fd (which
+    /// reads the still-open, unlinked inode).
+    #[compio::test]
+    async fn read_disk_caches_and_reuses_sealed_segment_fd() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-fdcache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        let path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&path)
+                .await
+                .expect("create segment file");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment file");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        // The pump touches the poll's start segment before cloning its handle
+        // into the plan, so a cache-eligible handle is always tracked.
+        handle.tracked.set(true);
+        assert!(handle.fd.borrow().is_none(), "fd cache slot starts empty");
+
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let first = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(first, DiskReadOutcome::Matched { .. }),
+            "first sealed poll must match the batch",
+        );
+        assert!(
+            handle.fd.borrow().is_some(),
+            "first sealed poll must populate the read-fd cache slot",
+        );
+
+        // Unlink the file: a fresh open-by-path would fail now, so the second
+        // read succeeding proves the cached fd was reused.
+        std::fs::remove_file(&path).expect("unlink segment file");
+
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let second = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(second, DiskReadOutcome::Matched { .. }),
+            "cached fd must serve the read after the segment path is unlinked",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An untracked handle (a sealed segment the walk crosses without being the
+    /// poll's start segment, or a slot evicted mid-poll) opens its file
+    /// transiently: the read succeeds but no fd is retained, so the sealed LRU
+    /// cap stays a true bound on resident descriptors.
+    #[compio::test]
+    async fn read_disk_does_not_retain_fd_for_untracked_handle() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-untracked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        let path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&path)
+                .await
+                .expect("create segment file");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment file");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "the transient open must still serve the read",
+        );
+        assert!(
+            handle.fd.borrow().is_none(),
+            "an untracked handle must not retain the fd",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sealed-segment poll reloads the dropped sparse index from the `.index`
+    /// file and resolves the start byte from it, skipping the full-segment scan.
+    /// Proven by prefixing the `.log` with bytes a scan from position 0 would
+    /// fault on: only an index that jumps straight to the batch reads it.
+    #[compio::test]
+    async fn read_disk_reloads_sealed_index_to_skip_scan() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-idxreload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        // `.log`: an undecodable prefix (a scan from byte 0 faults on it) then a
+        // valid batch at offset 5. `.index`: one sparse entry mapping offset 5
+        // to the batch's byte position, so the poll jumps past the prefix.
+        let prefix = vec![0xABu8; 512];
+        let prefix_len = prefix.len() as u64;
+        let batch = build_segment_record(namespace, 5);
+        let mut log_bytes = prefix;
+        log_bytes.extend_from_slice(&batch);
+        let log_len = log_bytes.len() as u64;
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&log_path)
+                .await
+                .expect("create segment log");
+            let (written, _) = file.write_all_at(log_bytes, 0).await.into();
+            written.expect("write segment log");
+            file.sync_all().await.expect("flush segment log");
+        }
+
+        let index_bytes = crate::iggy_index::IggyIndexCache::serialize(
+            &crate::iggy_index::IggyIndex::new(5, 0, prefix_len),
+        );
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        {
+            let mut file = compio::fs::File::create(&index_path)
+                .await
+                .expect("create segment index");
+            let (written, _) = file.write_all_at(index_bytes, 0).await.into();
+            written.expect("write segment index");
+            file.sync_all().await.expect("flush segment index");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: log_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            // Byte 0, exactly what disk_poll_start returns for a sealed segment
+            // whose resident index was dropped.
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 5,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "the reloaded sparse index must skip the prefix; a scan from byte 0 would fault",
+        );
+        assert!(
+            handle.index.borrow().is_some(),
+            "the sealed poll must cache the reloaded sparse index",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sparse index past `SEALED_INDEX_RESIDENT_MAX_BYTES` (a dense flush
+    /// cadence can make it track every message, hundreds of MB per segment) is
+    /// binary-searched on file instead of materialized: the poll still resolves
+    /// the exact start byte (proven by the poison prefix a byte-0 scan would
+    /// fault on) while the handle's index slot stays empty.
+    #[compio::test]
+    async fn read_disk_resolves_oversized_index_without_materializing() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-bigidx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let index_size = crate::iggy_index::IGGY_INDEX_SIZE as u64;
+        let entry_count = crate::poll_plan::SEALED_INDEX_RESIDENT_MAX_BYTES / index_size + 1;
+        let target_offset = entry_count - 1;
+
+        let prefix = vec![0xABu8; 512];
+        let prefix_len = prefix.len() as u64;
+        let batch = build_segment_record(namespace, target_offset);
+        let mut log_bytes = prefix;
+        log_bytes.extend_from_slice(&batch);
+        let log_len = log_bytes.len() as u64;
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&log_path)
+                .await
+                .expect("create segment log");
+            let (written, _) = file.write_all_at(log_bytes, 0).await.into();
+            written.expect("write segment log");
+            file.sync_all().await.expect("flush segment log");
+        }
+
+        // Every entry below the target points at byte 0 (the poison prefix),
+        // so only an exact lower-bound hit on the last entry reads the batch.
+        let mut index_bytes =
+            Vec::with_capacity(usize::try_from(entry_count * index_size).expect("fits in usize"));
+        for entry in 0..entry_count {
+            index_bytes.extend_from_slice(&entry.to_le_bytes());
+            index_bytes.extend_from_slice(&entry.to_le_bytes());
+            let position = if entry == target_offset {
+                prefix_len
+            } else {
+                0
+            };
+            index_bytes.extend_from_slice(&position.to_le_bytes());
+        }
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        {
+            let mut file = compio::fs::File::create(&index_path)
+                .await
+                .expect("create segment index");
+            let (written, _) = file.write_all_at(index_bytes, 0).await.into();
+            written.expect("write segment index");
+            file.sync_all().await.expect("flush segment index");
+        }
+
+        let handle = SealedSegmentHandle::default();
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: log_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: target_offset,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "the on-file lower bound must resolve past the poison prefix",
+        );
+        assert!(
+            handle.index.borrow().is_none(),
+            "an index past the resident cap must never be materialized",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Purge unlinks every segment and recreates the same paths, so a poll
+    /// suspended across the purge must not keep serving the old inodes through
+    /// its cached read state. The wipe reaches the in-flight clone through the
+    /// shared handle: the resumed walk re-opens by path and fails closed on
+    /// the recreated empty segment instead of serving purged messages.
+    #[compio::test]
+    async fn purge_invalidates_sealed_read_state_held_by_in_flight_poll() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-purge-readstate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+
+        // Seal the boot segment and back it with real files so the purge
+        // unlinks and recreates them at the same paths.
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        partition.log.segments_mut()[0].sealed = true;
+        partition.log.storages_mut()[0] =
+            SegmentStorage::new(&log_path, &index_path, 0, 0, false, false, false)
+                .await
+                .expect("create segment storage");
+
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        {
+            let mut file = compio::fs::File::create(&log_path)
+                .await
+                .expect("open segment log");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment log");
+        }
+
+        partition.log.touch_sealed_read_state(0);
+        let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let before_purge = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            matches!(before_purge, DiskReadOutcome::Matched { .. }),
+            "the sealed poll must match before the purge",
+        );
+        assert!(
+            handle.fd.borrow().is_some(),
+            "the sealed poll must populate the fd cache slot",
+        );
+
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+
+        assert!(
+            handle.fd.borrow().is_none(),
+            "purge must clear the cached fd inside the shared state",
+        );
+        assert!(
+            handle.index.borrow().is_none(),
+            "purge must clear the cached index inside the shared state",
+        );
+        assert!(
+            !handle.tracked.get(),
+            "purge must untrack the handle so a resumed walk cannot re-cache",
+        );
+
+        // A walk resumed after the purge resolves through the same handle: it
+        // must re-open by path and hit the recreated empty segment, never the
+        // unlinked pre-purge inode.
+        let resumed = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Some(Rc::clone(&handle)),
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let after_purge = resumed
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 1,
+                ceiling: u64::MAX,
+            })
+            .await;
+        assert!(
+            !matches!(after_purge, DiskReadOutcome::Matched { .. }),
+            "a resumed walk must not serve purged messages through a stale fd",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn repair_config() -> PartitionsConfig {
@@ -4192,6 +4804,64 @@ mod tests {
         partition.complete_repair(&repair_config()).await;
 
         assert_eq!(partition.consensus().commit_min(), 0);
+    }
+
+    fn batch_stats(base_offset: u64, message_count: u32) -> CommittedBatchStats {
+        CommittedBatchStats {
+            base_offset,
+            message_count,
+            size_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn given_send_messages_when_offsets_resolved_should_confirm_base_offset() {
+        let namespace = IggyNamespace::new(3, 7, 5);
+        let stats = batch_stats(42, 3);
+
+        let body = send_messages_reply_body(namespace.inner(), Some(stats));
+        let (response, consumed) = SendMessagesResponse::decode(&body).unwrap();
+
+        assert_eq!(consumed, body.len());
+        assert_eq!(
+            response.confirmations,
+            vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 7,
+                partition_id: 5,
+                base_offset: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn given_send_messages_when_offsets_unavailable_should_reply_zero_confirmations() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let body = send_messages_reply_body(namespace.inner(), None);
+
+        assert_eq!(&body[..], &[0, 0, 0, 0]);
+        let (response, _) = SendMessagesResponse::decode(&body).unwrap();
+        assert!(response.confirmations.is_empty());
+    }
+
+    #[test]
+    fn given_batch_stats_when_end_offset_derived_should_span_the_message_run() {
+        assert_eq!(batch_stats(9, 1).end_offset(), 9);
+        assert_eq!(batch_stats(9, 4).end_offset(), 12);
+    }
+
+    #[test]
+    fn given_result_framed_operation_when_committed_should_reply_empty_result_section() {
+        assert_eq!(
+            &committed_reply_body(Operation::StoreConsumerOffset2)[..],
+            &[0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn given_unframed_operation_when_committed_should_reply_empty_body() {
+        assert!(committed_reply_body(Operation::DeleteSegments).is_empty());
     }
 }
 

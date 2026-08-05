@@ -30,7 +30,13 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import AutoLogin, IggyClient, TcpConfig, TcpReconnectionConfig
+from apache_iggy import (
+    AutoLogin,
+    IggyClient,
+    IggyExpiry,
+    TcpConfig,
+    TcpReconnectionConfig,
+)
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -239,7 +245,7 @@ class TestClientConstruction:
                 stream="stream",
                 name="topic",
                 partitions_count=1,
-                message_expiry=timedelta(seconds=-1),
+                message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
             )
 
 

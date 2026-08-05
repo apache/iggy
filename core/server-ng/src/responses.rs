@@ -87,6 +87,7 @@ use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -463,13 +464,17 @@ where
 
 /// `user_id` is the authenticated caller, used only by the identity-scoped
 /// reads (currently the PAT list); every other arm ignores it. Authorization
-/// stays with the per-transport gates that run before this builder.
+/// stays with the per-transport gates that run before this builder. `client_ip`
+/// is the caller's transport-level peer address, used only by the
+/// cluster-metadata read to pick each node's advertised address; `None`
+/// degrades to the catch-all address.
 pub(crate) fn build_non_replicated_response<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     code: u32,
     body: &[u8],
     user_id: Option<u32>,
     roster: &ClusterRoster,
+    client_ip: Option<IpAddr>,
 ) -> Result<NonReplicatedResponse, IggyError>
 where
     B: ShellBus,
@@ -479,7 +484,7 @@ where
 {
     match code {
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_cluster_metadata_response(roster, shard).to_bytes(),
+            build_cluster_metadata_response(roster, shard, client_ip).to_bytes(),
         )),
         GET_STATS_CODE => Ok(NonReplicatedResponse::Bytes(
             build_stats_response(shard)?.to_bytes(),
@@ -597,6 +602,7 @@ where
 fn build_cluster_metadata_response<B, MJ, S>(
     roster: &ClusterRoster,
     shard: &Rc<ShellShard<B, MJ, S>>,
+    client_ip: Option<IpAddr>,
 ) -> ClusterMetadataResponse
 where
     B: ShellBus,
@@ -621,7 +627,7 @@ where
                 .then_some(primary_index)
         })
         .or_else(|| roster.current_primary_index());
-    let metadata = roster.cluster_metadata(primary_index);
+    let metadata = roster.cluster_metadata(primary_index, client_ip);
     ClusterMetadataResponse {
         name: metadata.name,
         nodes: metadata
@@ -1437,7 +1443,7 @@ where
 /// Size of the in-storage (`IggyMessage2`) per-message header inside a
 /// `SendMessages2` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
 /// + `timestamp_delta`(4) + `user_headers_length`(4) + `payload_length`(4)
-/// + reserved(8). See `server_common::send_messages2::from_legacy_request`.
+/// + reserved(8). See `server_common::send_messages2::SendMessages2Owned::from_messages`.
 const STORED_MESSAGE_HEADER_SIZE: usize = 48;
 
 /// Build the `PolledMessages` reply body from the owning shard's poll

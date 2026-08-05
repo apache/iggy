@@ -18,9 +18,11 @@
 
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import type { AddressInfo, Socket } from 'node:net';
 import { createServer, type Server } from 'node:net';
 import { describe, it } from 'node:test';
+import { createServer as createTlsServer } from 'node:tls';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { ResponseError } from '../wire/error.utils.js';
 import {
@@ -37,6 +39,15 @@ import { CommandResponseStream } from './client.socket.js';
 import type { ClientConfig } from './client.type.js';
 
 const TEST_SESSION = 42n;
+const TLS_CERTIFICATE = readFileSync(
+  new URL('../../../../core/certs/iggy_cert.pem', import.meta.url)
+);
+const TLS_KEY = readFileSync(
+  new URL('../../../../core/certs/iggy_key.pem', import.meta.url)
+);
+const TLS_CA_CERTIFICATE = readFileSync(
+  new URL('../../../../core/certs/iggy_ca_cert.pem', import.meta.url)
+);
 
 type FrameHandler = (frame: Buffer, socket: Socket) => void;
 
@@ -48,10 +59,11 @@ type VsrTestServer = {
 
 /** Loopback server speaking just enough VSR framing for the client tests. */
 const startVsrServer = async (
-  handler: FrameHandler
+  handler: FrameHandler,
+  transport: 'TCP' | 'TLS' = 'TCP'
 ): Promise<VsrTestServer> => {
   const frames: Buffer[] = [];
-  const server: Server = createServer((socket) => {
+  const handleConnection = (socket: Socket) => {
     let pending = Buffer.alloc(0);
     socket.on('data', (data: Buffer) => {
       pending = Buffer.concat([pending, data]);
@@ -65,7 +77,13 @@ const startVsrServer = async (
       }
     });
     socket.on('error', () => {});
-  });
+  };
+  const server: Server = transport === 'TLS'
+    ? createTlsServer(
+      { cert: TLS_CERTIFICATE, key: TLS_KEY },
+      handleConnection
+    )
+    : createServer(handleConnection);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
@@ -193,6 +211,32 @@ const vsrConfig = (port: number): ClientConfig => ({
 });
 
 describe('VSR client socket', () => {
+  it('exchanges VSR frames over TLS', async () => {
+    const server = await startVsrServer(
+      (frame, socket) => singleNodeHandler(server.port)(frame, socket),
+      'TLS'
+    );
+    const client = new CommandResponseStream({
+      ...vsrConfig(server.port),
+      transport: 'TLS',
+      options: {
+        host: '127.0.0.1',
+        port: server.port,
+        servername: 'localhost',
+        ca: TLS_CA_CERTIFICATE
+      }
+    });
+    try {
+      const response = await client.sendCommand(60_015, Buffer.from('tls'));
+
+      assert.equal(response.status, 0);
+      assert.equal(server.frames.length, 3);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
   it('registers one session before the first authenticated command', async () => {
     const server = await startVsrServer(
       (frame, socket) => singleNodeHandler(server.port)(frame, socket)

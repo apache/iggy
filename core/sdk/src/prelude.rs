@@ -58,10 +58,11 @@ pub use iggy_common::{
     IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner, Partitioning,
     Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages, PollingKind,
     PollingStrategy, QuicClientConfig, QuicClientConfigBuilder, QuicClientReconnectionConfig,
-    SendMessages, Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
-    SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
-    Topic, TopicDetails, TopicPermissions, TransportEndpoints, TransportProtocol, UserId, UserInfo,
-    UserInfoDetails, UserStatus, Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
+    SendMessages, SendMessagesConfirmationResponse, SendMessagesResponse, Sizeable,
+    SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions, SystemSnapshotType,
+    TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicDetails,
+    TopicPermissions, TransportEndpoints, TransportProtocol, UserId, UserInfo, UserInfoDetails,
+    UserStatus, Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
     WebSocketClientReconnectionConfig, defaults, locking,
 };
 pub use iggy_common::{
