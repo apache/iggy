@@ -40,6 +40,19 @@ pub fn iggy_duration_to_py_delta(
     duration.get_duration().into_pyobject(py)
 }
 
+/// Renders a duration the way it would be written in Python, so that a `__repr__`
+/// built from it can be pasted back into a constructor.
+pub fn duration_repr(duration: IggyDuration) -> String {
+    // Read the std duration, whose micros are u128: `IggyDuration::as_micros()`
+    // truncates to u64, which a timedelta near the Python maximum overflows.
+    let micros = duration.get_duration().as_micros();
+    if micros.is_multiple_of(1_000_000) {
+        format!("datetime.timedelta(seconds={})", micros / 1_000_000)
+    } else {
+        format!("datetime.timedelta(microseconds={micros})")
+    }
+}
+
 /// Rejects a zero duration for parameters where zero means an unthrottled loop
 /// rather than "disabled".
 pub fn reject_zero(duration: IggyDuration, parameter: &str) -> PyResult<IggyDuration> {

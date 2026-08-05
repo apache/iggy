@@ -25,6 +25,7 @@ proves the point of the configuration: with `auto_login` set, credentials are
 replayed on connect and no manual `login_user()` is needed.
 """
 
+import ast
 from collections.abc import Callable
 from datetime import timedelta
 
@@ -215,6 +216,30 @@ class TestTcpConfig:
         config = TcpConfig(auto_login=AutoLogin.username_password("iggy", "secret"))
 
         assert "secret" not in repr(config)
+
+    def test_repr_shows_every_field_as_python(self):
+        """Test that repr covers the TLS fields and parses as Python.
+
+        The TLS fields are the ones a handshake is debugged with, and a repr is
+        only worth printing if it can be pasted back into a constructor.
+        """
+        config = TcpConfig(
+            heartbeat_interval=timedelta(seconds=15),
+            tls_enabled=True,
+            tls_domain="localhost",
+            tls_ca_file="ca.pem",
+            tls_validate_certificate=False,
+            nodelay=True,
+        )
+
+        printed = repr(config)
+
+        assert 'tls_domain="localhost"' in printed
+        assert 'tls_ca_file="ca.pem"' in printed
+        assert "tls_validate_certificate=False" in printed
+        assert "nodelay=True" in printed
+        assert "heartbeat_interval=datetime.timedelta(seconds=15)" in printed
+        ast.parse(printed)
 
     @pytest.mark.parametrize(
         "invalid_address",

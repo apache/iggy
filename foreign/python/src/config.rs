@@ -28,7 +28,9 @@ use pyo3_stub_gen::impl_stub_type;
 use secrecy::SecretString;
 use std::sync::Arc;
 
-use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration, reject_zero};
+use crate::duration::{
+    duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration, reject_zero,
+};
 
 /// The credentials replayed by the client every time it (re)connects.
 ///
@@ -200,9 +202,9 @@ impl TcpReconnectionConfig {
         };
         format!(
             "TcpReconnectionConfig(enabled={}, max_retries={max_retries}, interval={}, reestablish_after={})",
-            if self.inner.enabled { "True" } else { "False" },
-            self.inner.interval.as_human_time_string(),
-            self.inner.reestablish_after.as_human_time_string(),
+            python_bool(self.inner.enabled),
+            duration_repr(self.inner.interval),
+            duration_repr(self.inner.reestablish_after),
         )
     }
 }
@@ -377,19 +379,26 @@ impl TcpConfig {
     }
 
     fn __repr__(&self) -> String {
+        let tls_ca_file = match &self.inner.tls_ca_file {
+            Some(tls_ca_file) => format!("{tls_ca_file:?}"),
+            None => "None".to_owned(),
+        };
         format!(
-            "TcpConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, tls_enabled={})",
+            "TcpConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={}, nodelay={})",
             self.inner.server_address,
             self.auto_login().__repr__(),
             self.reconnection().__repr__(),
-            self.inner.heartbeat_interval.as_human_time_string(),
-            if self.inner.tls_enabled {
-                "True"
-            } else {
-                "False"
-            },
+            duration_repr(self.inner.heartbeat_interval),
+            python_bool(self.inner.tls_enabled),
+            self.inner.tls_domain,
+            python_bool(self.inner.tls_validate_certificate),
+            python_bool(self.inner.nodelay),
         )
     }
+}
+
+fn python_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
 }
 
 /// What `IggyClient(...)` accepts: a bare `host:port` or a full `TcpConfig`.

@@ -117,7 +117,11 @@ def build_config(args: ArgNamespace) -> TcpConfig:
 
 async def main():
     args: ArgNamespace = parse_args()
-    config = build_config(args)
+    try:
+        config = build_config(args)
+    except ValueError as error:
+        logger.error(f"Invalid client configuration: {error}")
+        return
     logger.info(f"Connecting to {args.tcp_server_address} (TLS: {args.tls})")
 
     client = IggyClient(config)
