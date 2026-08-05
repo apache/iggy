@@ -28,14 +28,15 @@ use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, RequestStartViewHeader, StartViewChangeHeader, StartViewHeader,
+    ReplyHeader, RequestStartViewHeader, RoutedRequestHeader, StartViewChangeHeader,
+    StartViewHeader,
 };
 use iggy_common::IggyTimestamp;
 use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -242,7 +243,7 @@ impl PipelineEntry {
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
-    pub message: Message<RequestHeader>,
+    pub message: Message<RoutedRequestHeader>,
     // TODO: populate from monotonic clock at push, promote to `pub` for
     // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
     #[allow(dead_code)]
@@ -256,7 +257,7 @@ pub struct RequestEntry {
 
 impl RequestEntry {
     #[must_use]
-    pub const fn new(message: Message<RequestHeader>) -> Self {
+    pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
         Self {
             message,
             received_at: 0,
@@ -271,7 +272,7 @@ impl RequestEntry {
     /// instead of being bounced with a transient error.
     #[must_use]
     pub fn with_subscriber(
-        message: Message<RequestHeader>,
+        message: Message<RoutedRequestHeader>,
     ) -> (Self, Receiver<Message<ReplyHeader>>) {
         let (sender, receiver) = oneshot::channel();
         let entry = Self {
@@ -723,7 +724,7 @@ pub enum CommitOutcome {
 #[derive(Debug, Clone)]
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
-    SendStartViewChange { view: u32, namespace: u64 },
+    SendStartViewChange { view: u32, group: u64 },
     /// Send `DoViewChange` to primary.
     SendDoViewChange {
         view: u32,
@@ -731,13 +732,13 @@ pub enum VsrAction {
         log_view: u32,
         op: u64,
         commit: u64,
-        namespace: u64,
+        group: u64,
     },
     /// Broadcast a `RequestStartView` probe (recovering replica asking for
     /// the current view's `StartView`; only that view's primary answers).
     /// Stamped with the prober's view so peers can fence stale duplicates
     /// out of the probed-primary election path.
-    SendRequestStartView { view: u32, namespace: u64 },
+    SendRequestStartView { view: u32, group: u64 },
     /// Send `StartView`, as the view's primary.
     ///
     /// `incarnation` echoes the requester's nonce when this answers a
@@ -754,7 +755,7 @@ pub enum VsrAction {
         commit: u64,
         incarnation: u128,
         target: Option<u8>,
-        namespace: u64,
+        group: u64,
     },
     /// Send `PrepareOK` for each op in `[from_op, to_op]` that is present in the WAL.
     ///
@@ -766,7 +767,7 @@ pub enum VsrAction {
         from_op: u64,
         to_op: u64,
         target: u8,
-        namespace: u64,
+        group: u64,
     },
     /// Retransmit uncommitted prepares from the WAL to replicas that haven't acked.
     ///
@@ -793,7 +794,7 @@ pub enum VsrAction {
     SendCommit {
         view: u32,
         commit: u64,
-        namespace: u64,
+        group: u64,
         timestamp_monotonic: u64,
     },
 }
@@ -829,7 +830,7 @@ where
     cluster: u128,
     replica: u8,
     replica_count: u8,
-    namespace: u64,
+    group: u64,
 
     view: Cell<u32>,
 
@@ -952,7 +953,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         cluster: u128,
         replica: u8,
         replica_count: u8,
-        namespace: u64,
+        group: u64,
         message_bus: B,
         pipeline: P,
     ) -> Self {
@@ -960,7 +961,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             cluster,
             replica,
             replica_count,
-            namespace,
+            group,
             message_bus,
             pipeline,
             ConsensusClock::system(),
@@ -977,7 +978,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         cluster: u128,
         replica: u8,
         replica_count: u8,
-        namespace: u64,
+        group: u64,
         message_bus: B,
         pipeline: P,
         clock: ConsensusClock,
@@ -988,25 +989,25 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         assert!(replica_count >= 1, "need at least 1 replica");
         // Consensus-control routing distinguishes metadata frames from
-        // partition frames by namespace value: metadata uses the sentinel,
+        // partition frames by the group id: metadata uses the sentinel,
         // partitions use `IggyNamespace::inner()` which lives strictly
-        // inside the packed range. A namespace outside both ranges would
+        // inside the packed range. A group outside both ranges would
         // route to neither and silently warn-drop on every receiving peer.
         debug_assert!(
-            namespace == METADATA_CONSENSUS_NAMESPACE || IggyNamespace::is_packable(namespace),
-            "VsrConsensus namespace must be METADATA_CONSENSUS_NAMESPACE or a packable \
-             IggyNamespace; got {namespace:#x}"
+            group == METADATA_GROUP || IggyNamespace::is_packable(group),
+            "VsrConsensus group must be METADATA_GROUP or a packable \
+             IggyNamespace; got {group:#x}"
         );
         // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
         // across groups. Consider using a proper hash (e.g., Murmur3) of
-        // (replica_id, namespace) for production.
-        let timeout_seed = u128::from(replica) ^ u128::from(namespace);
+        // (replica_id, group) for production.
+        let timeout_seed = u128::from(replica) ^ u128::from(group);
         let prepare_queue_max = pipeline.prepare_queue_max();
         Self {
             cluster,
             replica,
             replica_count,
-            namespace,
+            group,
             view: Cell::new(0),
             log_view: Cell::new(0),
             view_durable: Cell::new(0),
@@ -1431,8 +1432,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     #[must_use]
-    pub const fn namespace(&self) -> u64 {
-        self.namespace
+    pub const fn group(&self) -> u64 {
+        self.group
     }
 
     #[must_use]
@@ -1693,7 +1694,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                         if self.state_transfer_stage.get() != StateTransferStage::Idle {
                             tracing::info!(
                                 replica = self.replica,
-                                namespace_raw = self.namespace,
+                                namespace_raw = self.group,
                                 "view probe exhausted; abandoning state transfer (cluster bootstrap)"
                             );
                             self.set_state_transfer_stage(StateTransferStage::Idle);
@@ -1708,7 +1709,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                             .reset(TimeoutKind::RequestStartViewMessage);
                         actions.push(VsrAction::SendRequestStartView {
                             view: self.view.get(),
-                            namespace: self.namespace,
+                            group: self.group,
                         });
                     }
                 }
@@ -1718,7 +1719,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                         .reset(TimeoutKind::RequestStartViewMessage);
                     actions.push(VsrAction::SendRequestStartView {
                         view: self.view.get(),
-                        namespace: self.namespace,
+                        group: self.group,
                     });
                 }
                 _ => {
@@ -1782,7 +1783,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if self.observed_newer_view.get() > self.view.get() {
             tracing::info!(
                 replica = self.replica,
-                namespace_raw = self.namespace,
+                namespace_raw = self.group,
                 view = self.view.get(),
                 observed_newer_view = self.observed_newer_view.get(),
                 "heartbeat timed out behind a newer view; probing to catch up"
@@ -1827,7 +1828,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let action = VsrAction::SendStartViewChange {
             view: new_view,
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -1851,7 +1852,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let action = VsrAction::SendStartViewChange {
             view: self.view.get(),
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -1890,7 +1891,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             op: current_op,
             // commit_max clamped to op: see `handle_start_view_change`.
             commit: self.commit_max.get().min(current_op),
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -1935,7 +1936,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let action = VsrAction::SendStartViewChange {
             view: next_view,
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -2044,7 +2045,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if self.observed_newer_view.get() > self.view.get() {
             tracing::info!(
                 replica = self.replica,
-                namespace_raw = self.namespace,
+                namespace_raw = self.group,
                 view = self.view.get(),
                 observed_newer_view = self.observed_newer_view.get(),
                 "stale primary-by-index behind a newer view; probing to catch up"
@@ -2065,7 +2066,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![VsrAction::SendCommit {
             view: self.view.get(),
             commit: self.commit_min.get(),
-            namespace: self.namespace,
+            group: self.group,
             timestamp_monotonic: ts,
         }]
     }
@@ -2083,10 +2084,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         plane: PlaneKind,
         header: &StartViewChangeHeader,
     ) -> Vec<VsrAction> {
-        assert_eq!(
-            header.namespace, self.namespace,
-            "SVC routed to wrong group"
-        );
+        assert_eq!(header.group, self.group, "SVC routed to wrong group");
         // A recovering replica is quorum-invisible: it lost (or cannot trust)
         // its durable state, so it must not vote history into existence. The
         // election proceeds among the peers; its conclusion reaches this
@@ -2137,7 +2135,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // Send our own SVC
             let action = VsrAction::SendStartViewChange {
                 view: msg_view,
-                namespace: self.namespace,
+                group: self.group,
             };
             emit_sim_event(
                 SimEventKind::ControlMessageScheduled,
@@ -2191,7 +2189,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 log_view: self.log_view.get(),
                 op: current_op,
                 commit,
-                namespace: self.namespace,
+                group: self.group,
             };
             emit_sim_event(
                 SimEventKind::ControlMessageScheduled,
@@ -2239,10 +2237,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         plane: PlaneKind,
         header: &DoViewChangeHeader,
     ) -> Vec<VsrAction> {
-        assert_eq!(
-            header.namespace, self.namespace,
-            "DVC routed to wrong group"
-        );
+        assert_eq!(header.group, self.group, "DVC routed to wrong group");
         // Quorum-invisible while recovering (see handle_start_view_change):
         // a recovering replica must not collect DVCs and crown itself.
         if self.status.get() == Status::Recovering {
@@ -2294,7 +2289,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // Send our own SVC
             let action = VsrAction::SendStartViewChange {
                 view: msg_view,
-                namespace: self.namespace,
+                group: self.group,
             };
             emit_sim_event(
                 SimEventKind::ControlMessageScheduled,
@@ -2370,7 +2365,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn begin_view_probe(&self) {
         tracing::info!(
             replica = self.replica,
-            namespace_raw = self.namespace,
+            namespace_raw = self.group,
             "beginning view probe"
         );
         self.status.set(Status::Recovering);
@@ -2420,7 +2415,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         tracing::info!(
             replica = self.replica,
-            namespace_raw = self.namespace,
+            namespace_raw = self.group,
             ?from,
             ?to,
             "state transfer stage"
@@ -2446,7 +2441,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         header: &RequestStartViewHeader,
     ) -> Vec<VsrAction> {
         assert_eq!(
-            header.namespace, self.namespace,
+            header.group, self.group,
             "RequestStartView routed to wrong group"
         );
         if self.status.get() != Status::Normal {
@@ -2487,7 +2482,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             commit: self.commit_max.get(),
             incarnation: header.incarnation,
             target: Some(header.replica),
-            namespace: self.namespace,
+            group: self.group,
         }]
     }
 
@@ -2535,7 +2530,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Gap: if a backup never received a prepare (lost message),
     /// `commit_journal` stops at the gap. Requires message repair.
     pub fn handle_start_view(&self, plane: PlaneKind, header: &StartViewHeader) -> Vec<VsrAction> {
-        assert_eq!(header.namespace, self.namespace, "SV routed to wrong group");
+        assert_eq!(header.group, self.group, "SV routed to wrong group");
         let from_replica = header.replica;
         let msg_view = header.view;
         let msg_op = header.op;
@@ -2673,7 +2668,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 from_op: msg_commit + 1,
                 to_op: msg_op,
                 target: from_replica,
-                namespace: self.namespace,
+                group: self.group,
             };
             emit_sim_event(
                 SimEventKind::ControlMessageScheduled,
@@ -2699,10 +2694,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
     pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> CommitOutcome {
-        assert_eq!(
-            header.namespace, self.namespace,
-            "Commit routed to wrong group"
-        );
+        assert_eq!(header.group, self.group, "Commit routed to wrong group");
 
         if self.is_primary() {
             // A heartbeat from the primary of an OLDER view means that
@@ -2843,7 +2835,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             commit: max_commit,
             incarnation: 0,
             target: None,
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -3022,7 +3014,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 }
 
-impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RequestHeader>
+impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RoutedRequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
@@ -3055,7 +3047,7 @@ where
         // sealed region before the entry is journaled. Leaving those prepares at `0`
         // is the designed "nothing to verify" sentinel, so a future durable partition
         // journal skips verification instead of failing every entry as corrupt.
-        let checksum_body = if consensus.namespace == METADATA_CONSENSUS_NAMESPACE {
+        let checksum_body = if consensus.group == METADATA_GROUP {
             u128::from(calculate_checksum(
                 &self.as_slice()[size_of::<PrepareHeader>()..],
             ))
@@ -3080,11 +3072,11 @@ where
                 timestamp,
                 operation: old.operation,
                 // The GROUP's namespace, never the request's: a client
-                // RequestHeader carries namespace 0, and journaling that
+                // RoutedRequestHeader carries namespace 0, and journaling that
                 // would make the stored prepare route to the wrong plane
                 // when repair later ships it verbatim (live replication
                 // masked this; repair replay is what broke).
-                namespace: consensus.namespace,
+                group: consensus.group,
                 checksum_body,
                 // Copied verbatim: carries the stamped acting user for client
                 // ops (and the authenticated user on Register), so the in-apply
@@ -3119,7 +3111,7 @@ where
                 commit: consensus.commit_max.get(),
                 timestamp: old.timestamp,
                 operation: old.operation,
-                namespace: old.namespace,
+                group: old.group,
                 // PrepareOk is header-only; the frame is exactly the header, so
                 // `size` is the header size.
                 size: std::mem::size_of::<PrepareOkHeader>() as u32,
@@ -3137,7 +3129,7 @@ where
     type MessageBus = B;
     #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
     type Message<H> = Message<H> where H: ConsensusHeader;
-    type RequestHeader = RequestHeader;
+    type RoutedRequestHeader = RoutedRequestHeader;
     type ReplicateHeader = PrepareHeader;
     type AckHeader = PrepareOkHeader;
 
@@ -3175,20 +3167,20 @@ mod request_queue_tests {
     use super::*;
     use iggy_binary_protocol::{Command2, Operation};
 
-    fn make_request(client: u128, request_num: u64) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
-        let mut msg = Message::<RequestHeader>::new(header_size);
-        let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+    fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let mut msg = Message::<RoutedRequestHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
             &mut msg.as_mut_slice()[..header_size],
         )
         .expect("zeroed bytes are valid");
-        *header = RequestHeader {
+        *header = RoutedRequestHeader {
             command: Command2::Request,
             client,
             session: 1,
             request: request_num,
             operation: Operation::SendMessages,
-            ..RequestHeader::default()
+            ..RoutedRequestHeader::default()
         };
         msg
     }
@@ -3493,7 +3485,7 @@ mod timestamp_clamp_tests {
             1,
             0,
             1,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
             lagging_clock,
@@ -3525,7 +3517,7 @@ mod timestamp_clamp_tests {
             1,
             0,
             1,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
             leading_clock,
@@ -3558,7 +3550,7 @@ mod timestamp_clamp_tests {
         header.commit = op;
         header.replica = replica;
         header.incarnation = incarnation;
-        header.namespace = METADATA_CONSENSUS_NAMESPACE;
+        header.group = METADATA_GROUP;
         header.size = size as u32;
         msg
     }
@@ -3579,7 +3571,7 @@ mod timestamp_clamp_tests {
             1,
             0,
             3,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
             ConsensusClock::system(),
@@ -3645,14 +3637,14 @@ mod timestamp_clamp_tests {
                 LocalPipeline::new(),
                 ConsensusClock::new(Rc::new(FixedClock(100_000))),
             );
-            let header_size = size_of::<RequestHeader>();
+            let header_size = size_of::<RoutedRequestHeader>();
             let body = b"produce payload";
-            let mut msg = Message::<RequestHeader>::new(header_size + body.len());
+            let mut msg = Message::<RoutedRequestHeader>::new(header_size + body.len());
             msg.as_mut_slice()[header_size..].copy_from_slice(body);
-            let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+            let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
                 &mut msg.as_mut_slice()[..header_size],
             )
-            .expect("zeroed bytes are a valid RequestHeader");
+            .expect("zeroed bytes are a valid RoutedRequestHeader");
             header.command = Command2::Request;
             header.client = 1;
             header.request = 1;
@@ -3662,7 +3654,7 @@ mod timestamp_clamp_tests {
         };
 
         assert_ne!(
-            seal(METADATA_CONSENSUS_NAMESPACE),
+            seal(METADATA_GROUP),
             0,
             "a metadata prepare must be sealed: the WAL scan verifies it after a crash"
         );
@@ -3691,7 +3683,7 @@ mod timestamp_clamp_tests {
             1,
             0,
             3,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
             ConsensusClock::system(),
@@ -3739,14 +3731,8 @@ mod timestamp_clamp_tests {
     /// pins the predicate the dispatch sites and the debug tripwire both read.
     #[test]
     fn given_view_change_when_needs_superblock_persist_should_track_durability() {
-        let mut consensus = VsrConsensus::new(
-            1,
-            0,
-            3,
-            METADATA_CONSENSUS_NAMESPACE,
-            NoopBus,
-            LocalPipeline::new(),
-        );
+        let mut consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
         assert!(
             !consensus.needs_superblock_persist(),
             "fresh replica: view == view_durable == 0"

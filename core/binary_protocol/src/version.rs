@@ -63,7 +63,7 @@
 //! `ClientVersionInfo` is the leading bytes of the login-register request
 //! *body*, which itself rides inside a 256-byte VSR `RequestHeader` (see
 //! `consensus::header`): `command` = `Command2::Request`, `operation` =
-//! `Operation::Register`, `namespace` = `METADATA_CONSENSUS_NAMESPACE`,
+//! `Operation::Register`, `namespace` = `METADATA_GROUP`,
 //! client id in `RequestHeader.client`. A foreign SDK emits that header,
 //! then the body starting with this prefix, to reach the gate.
 //!

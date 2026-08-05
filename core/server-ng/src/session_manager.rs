@@ -50,8 +50,8 @@ pub enum ConnectionState {
     Authenticated { user_id: u32 },
     /// Register committed through consensus. Connection is bound to a
     /// `(client_id, session)` pair. Requests on this connection use
-    /// these values to populate `RequestHeader.client` and
-    /// `RequestHeader.session`.
+    /// these values to populate `RoutedRequestHeader.client` and
+    /// `RoutedRequestHeader.session`.
     Bound {
         user_id: u32,
         client_id: u128,

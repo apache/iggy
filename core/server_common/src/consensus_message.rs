@@ -19,9 +19,9 @@ use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
     Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader,
 };
 use smallvec::SmallVec;
 use std::{marker::PhantomData, mem::size_of};
@@ -495,7 +495,7 @@ where
 
 #[derive(Debug)]
 pub enum MessageBag {
-    Request(Message<RequestHeader>),
+    Request(Message<RoutedRequestHeader>),
     Prepare(Message<PrepareHeader>),
     PrepareOk(Message<PrepareOkHeader>),
     StartViewChange(Message<StartViewChangeHeader>),
@@ -600,7 +600,9 @@ where
 
         match command {
             Command2::Prepare => Ok(Self::Prepare(value.try_into_typed::<PrepareHeader>()?)),
-            Command2::Request => Ok(Self::Request(value.try_into_typed::<RequestHeader>()?)),
+            Command2::Request => Ok(Self::Request(
+                value.try_into_typed::<RoutedRequestHeader>()?,
+            )),
             Command2::PrepareOk => Ok(Self::PrepareOk(value.try_into_typed::<PrepareOkHeader>()?)),
             Command2::StartViewChange => Ok(Self::StartViewChange(
                 value.try_into_typed::<StartViewChangeHeader>()?,
@@ -659,12 +661,12 @@ mod tests {
 
     // Field offsets via `offset_of!`: a field reorder fails to compile here
     // rather than silently corrupting test bytes.
-    const SIZE_OFF: usize = std::mem::offset_of!(RequestHeader, size);
-    const COMMAND_OFF: usize = std::mem::offset_of!(RequestHeader, command);
-    const REQUEST_CLIENT_OFF: usize = std::mem::offset_of!(RequestHeader, client);
-    const REQUEST_OPERATION_OFF: usize = std::mem::offset_of!(RequestHeader, operation);
-    const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RequestHeader, session);
-    const REQUEST_REQUEST_OFF: usize = std::mem::offset_of!(RequestHeader, request);
+    const SIZE_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, size);
+    const COMMAND_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, command);
+    const REQUEST_CLIENT_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, client);
+    const REQUEST_OPERATION_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, operation);
+    const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, session);
+    const REQUEST_REQUEST_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, request);
 
     fn header_bytes(command: Command2, size: u32) -> Owned<MESSAGE_ALIGN> {
         header_bytes_sized(command, size, 256)
@@ -737,7 +739,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "size must be at least header size")]
     fn message_new_smaller_than_header_panics() {
-        let _ = Message::<RequestHeader>::new(100);
+        let _ = Message::<RoutedRequestHeader>::new(100);
     }
 
     // try_from(Owned): validation gates the unsafe construction
@@ -745,7 +747,7 @@ mod tests {
     #[test]
     fn try_from_owned_too_short_returns_err() {
         let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
-        let result = Message::<RequestHeader>::try_from(owned);
+        let result = Message::<RoutedRequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
 
@@ -753,13 +755,13 @@ mod tests {
     fn try_from_owned_invalid_bit_pattern_returns_err() {
         let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(256);
         owned.as_mut_slice()[COMMAND_OFF] = 99; // outside Command2's discriminant range
-        let result = Message::<RequestHeader>::try_from(owned);
+        let result = Message::<RoutedRequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidBitPattern)));
     }
 
     #[test]
     fn try_from_owned_buffer_shorter_than_claimed_size_returns_err() {
-        // Header parses cleanly (RequestHeader::validate doesn't gate on
+        // Header parses cleanly (RoutedRequestHeader::validate doesn't gate on
         // size), but the encoded `size` field claims more bytes than the
         // backing buffer holds. The buffer-bounds check at the bottom of
         // `Message::try_from` must reject. (Both this case and the
@@ -769,7 +771,7 @@ mod tests {
         let owned = header_bytes(Command2::Request, 999);
         // header_bytes already produces a 256-byte buffer; size=999 > 256,
         // so try_from rejects via `bytes.len() < header.size()`.
-        let result = Message::<RequestHeader>::try_from(owned);
+        let result = Message::<RoutedRequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
 
@@ -779,8 +781,11 @@ mod tests {
         // so only the construction-time `size` floor rejects it (the
         // buffer-length check passes). Guards the `[size_of::<H>()..size]`
         // underflow at every downstream call site.
-        let owned = header_bytes(Command2::Request, size_of::<RequestHeader>() as u32 - 1);
-        let result = Message::<RequestHeader>::try_from(owned);
+        let owned = header_bytes(
+            Command2::Request,
+            size_of::<RoutedRequestHeader>() as u32 - 1,
+        );
+        let result = Message::<RoutedRequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
 
@@ -789,7 +794,7 @@ mod tests {
     #[test]
     fn as_generic_view_reads_command_byte() {
         let owned = header_bytes(Command2::Request, 256);
-        let typed = Message::<RequestHeader>::try_from(owned).expect("valid");
+        let typed = Message::<RoutedRequestHeader>::try_from(owned).expect("valid");
         let generic = typed.as_generic();
         assert_eq!(generic.header().command, Command2::Request);
         assert_eq!(generic.total_len(), 256);
@@ -799,11 +804,11 @@ mod tests {
 
     #[test]
     fn try_as_typed_command_mismatch_returns_err_without_unsafe_cast() {
-        // bytes are a valid Prepare; asking for RequestHeader must fail
+        // bytes are a valid Prepare; asking for RoutedRequestHeader must fail
         // *before* the unsafe ptr-cast inside try_as_typed.
         let owned = header_bytes(Command2::Prepare, 256);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid");
-        let result = generic.try_as_typed::<RequestHeader>();
+        let result = generic.try_as_typed::<RoutedRequestHeader>();
         assert!(matches!(
             result,
             Err(ConsensusError::InvalidCommand {
@@ -815,7 +820,7 @@ mod tests {
 
     #[test]
     fn try_as_typed_invalid_validation_returns_err() {
-        // RequestHeader::validate rejects operation=Register with non-zero session.
+        // RoutedRequestHeader::validate rejects operation=Register with non-zero session.
         let mut owned = header_bytes(Command2::Request, 256);
         {
             let buf = owned.as_mut_slice();
@@ -823,7 +828,7 @@ mod tests {
             buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8].copy_from_slice(&5u64.to_le_bytes());
         }
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
-        let result = generic.try_as_typed::<RequestHeader>();
+        let result = generic.try_as_typed::<RoutedRequestHeader>();
         assert!(matches!(result, Err(ConsensusError::InvalidField(_))));
     }
 
@@ -833,7 +838,7 @@ mod tests {
     fn try_into_typed_command_mismatch_returns_err() {
         let owned = header_bytes(Command2::Prepare, 256);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid");
-        let result = generic.try_into_typed::<RequestHeader>();
+        let result = generic.try_into_typed::<RoutedRequestHeader>();
         assert!(matches!(
             result,
             Err(ConsensusError::InvalidCommand {
@@ -898,7 +903,7 @@ mod tests {
 
     #[test]
     fn messagebag_dispatch_request_with_invalid_register_session_returns_err() {
-        // `RequestHeader::validate` rejects Register with non-zero session.
+        // `RoutedRequestHeader::validate` rejects Register with non-zero session.
         let mut owned = header_bytes(Command2::Request, 256);
         {
             let buf = owned.as_mut_slice();
@@ -912,7 +917,7 @@ mod tests {
 
     // Ingress validation runs on every client frame at the network boundary,
     // reached through `MessageBag::try_from` -> `try_into_typed` ->
-    // `RequestHeader::validate`. Several dedup and authz conclusions rest on
+    // `RoutedRequestHeader::validate`. Several dedup and authz conclusions rest on
     // it running, so pin the field rules rather than the plumbing: whatever
     // `request_preflight` and the operation gate see downstream has already
     // passed these.
@@ -978,7 +983,7 @@ mod tests {
     #[test]
     fn request_message_deep_copy_independent() {
         let owned = header_bytes(Command2::Request, 256);
-        let mut msg = Message::<RequestHeader>::try_from(owned).expect("valid");
+        let mut msg = Message::<RoutedRequestHeader>::try_from(owned).expect("valid");
         let copy = msg.deep_copy();
         // Mutate the original's bytes; the deep copy must be untouched.
         msg.as_mut_slice()[200] = 0xab;
@@ -991,7 +996,7 @@ mod tests {
     #[test]
     fn transmute_header_request_to_prepare() {
         let owned = header_bytes(Command2::Request, 256);
-        let msg = Message::<RequestHeader>::try_from(owned).expect("valid");
+        let msg = Message::<RoutedRequestHeader>::try_from(owned).expect("valid");
         let prepared: Message<PrepareHeader> =
             msg.transmute_header::<PrepareHeader>(|_old, new| {
                 new.command = Command2::Prepare;

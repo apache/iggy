@@ -76,7 +76,7 @@ use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
-    RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
+    RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::{EncryptorKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use journal::superblock::SuperblockStore;
@@ -1236,7 +1236,7 @@ pub(crate) enum NonReplicatedResponse {
 impl NonReplicatedResponse {
     pub(crate) fn into_reply(
         self,
-        request_header: &RequestHeader,
+        request_header: &RoutedRequestHeader,
         client_id: u128,
         session: u64,
         commit: u64,
@@ -1251,7 +1251,7 @@ impl NonReplicatedResponse {
 }
 
 pub(crate) fn build_empty_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
@@ -1267,7 +1267,7 @@ pub(crate) fn build_empty_reply(
 /// reply, and only the partition primary's pre-pipeline deny pins it to 0,
 /// stamped through `consensus::build_deny_reply_from_request`.
 pub(crate) fn build_deny_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
@@ -1287,7 +1287,7 @@ pub(crate) fn build_deny_reply(
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) fn build_login_register_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
@@ -1318,7 +1318,7 @@ pub(crate) fn build_login_register_reply(
 }
 
 pub(crate) fn build_reply_from_bytes(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
@@ -1341,7 +1341,7 @@ pub(crate) fn build_reply_from_bytes(
 /// (no token, a committed business rejection, or an eviction frame) the
 /// committed reply passes through unchanged.
 pub(crate) fn build_raw_pat_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     committed: Message<GenericHeader>,
     raw_token: Option<String>,
 ) -> Result<Message<GenericHeader>, IggyError> {
@@ -1402,7 +1402,7 @@ pub(crate) fn build_raw_pat_reply(
 }
 
 pub(crate) fn build_reply_with_body(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
@@ -1431,7 +1431,6 @@ pub(crate) fn build_reply_with_body(
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     write_body(&mut reply.as_mut_slice()[header_len..total_size]);
@@ -1623,10 +1622,10 @@ pub(crate) fn build_consumer_offset_body(
 mod tests {
     use super::*;
 
-    fn pat_request_header() -> RequestHeader {
-        let zeroed = [0u8; std::mem::size_of::<RequestHeader>()];
-        let mut header = *bytemuck::checked::try_from_bytes::<RequestHeader>(&zeroed)
-            .expect("zeroed bytes form a valid RequestHeader");
+    fn pat_request_header() -> RoutedRequestHeader {
+        let zeroed = [0u8; std::mem::size_of::<RoutedRequestHeader>()];
+        let mut header = *bytemuck::checked::try_from_bytes::<RoutedRequestHeader>(&zeroed)
+            .expect("zeroed bytes form a valid RoutedRequestHeader");
         header.command = Command2::Request;
         header.operation = Operation::CreatePersonalAccessToken;
         header.client = 42;

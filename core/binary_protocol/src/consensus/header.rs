@@ -162,7 +162,6 @@ pub struct RequestHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
     /// Session fence epoch: the commit op of the latest committed `Register`
     /// for this `client`. Handed to the client by that register's reply and
     /// echoed on every subsequent request.
@@ -183,7 +182,7 @@ pub struct RequestHeader {
     /// The submitter's wire value is never trusted. Zero for `Logout`,
     /// partition-plane, and server-internal ops.
     pub user_id: u32,
-    pub reserved: [u8; 52],
+    pub reserved: [u8; 60],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -194,8 +193,87 @@ const _: () = {
     assert!(
         offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 52]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 60]>() == HEADER_SIZE);
 };
+
+/// A [`RequestHeader`] AFTER the receiving node resolved its target.
+///
+/// The server-internal shape a client request travels in between shards
+/// (and follower to primary), never on the client wire. `group` carries the
+/// resolved consensus group so the owner shard can route, park, and fence
+/// WITHOUT re-decoding the payload -- clients no longer send any namespace
+/// (it is derived: plane from `operation`, partition group from the body),
+/// so this is where the derivation result lives for the internal hop.
+///
+/// Layout: identical to [`RequestHeader`] with `group` claiming the first
+/// eight reserved bytes, so the in-place `transmute_header` rewrite stays a
+/// same-size copy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct RoutedRequestHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub client: u128,
+    pub request_checksum: u128,
+    pub timestamp: u64,
+    pub request: u64,
+    pub operation: Operation,
+    pub operation_padding: [u8; 7],
+    pub session: u64,
+    pub user_id: u32,
+    /// Same offset and meaning as the leading 52 bytes of
+    /// `RequestHeader::reserved` -- this region CARRIES DATA (the
+    /// non-replicated op code range), so `group` must not displace it.
+    pub reserved: [u8; 52],
+    /// The resolved consensus group id (see `binary_protocol::namespace`),
+    /// claiming the TAIL of the client header's reserved area.
+    pub group: u64,
+}
+const _: () = {
+    assert!(size_of::<RoutedRequestHeader>() == HEADER_SIZE);
+    // Every field shared with `RequestHeader` sits at the same offset --
+    // including the data-bearing prefix of `reserved` (the non-replicated
+    // code range) -- so promotion preserves everything a client sent.
+    assert!(offset_of!(RoutedRequestHeader, client) == offset_of!(RequestHeader, client));
+    assert!(offset_of!(RoutedRequestHeader, session) == offset_of!(RequestHeader, session));
+    assert!(offset_of!(RoutedRequestHeader, user_id) == offset_of!(RequestHeader, user_id));
+    assert!(offset_of!(RoutedRequestHeader, reserved) == offset_of!(RequestHeader, reserved));
+    assert!(offset_of!(RoutedRequestHeader, group) + size_of::<u64>() == HEADER_SIZE);
+};
+
+impl Default for RoutedRequestHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Command2::Request,
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: 0,
+            request_checksum: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Operation::Reserved,
+            operation_padding: [0; 7],
+            session: 0,
+            user_id: 0,
+            reserved: [0; 52],
+            group: 0,
+        }
+    }
+}
 
 impl Default for RequestHeader {
     fn default() -> Self {
@@ -215,11 +293,73 @@ impl Default for RequestHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
             session: 0,
             user_id: 0,
-            reserved: [0; 52],
+            reserved: [0; 60],
         }
+    }
+}
+
+impl RoutedRequestHeader {
+    /// Promote a client-wire [`RequestHeader`] to the server-internal routed
+    /// shape, stamping the resolved consensus `group`. Every shared field is
+    /// copied verbatim; this is the ONLY sanctioned crossing between the two
+    /// layouts (transmute-based reads across them would alias `group` with
+    /// reserved bytes).
+    #[must_use]
+    pub const fn from_request(header: &RequestHeader, group: u64) -> Self {
+        Self {
+            checksum: header.checksum,
+            checksum_body: header.checksum_body,
+            cluster: header.cluster,
+            size: header.size,
+            view: header.view,
+            release: header.release,
+            command: header.command,
+            replica: header.replica,
+            reserved_frame: header.reserved_frame,
+            client: header.client,
+            request_checksum: header.request_checksum,
+            timestamp: header.timestamp,
+            request: header.request,
+            operation: header.operation,
+            operation_padding: header.operation_padding,
+            session: header.session,
+            user_id: header.user_id,
+            reserved: {
+                let mut reserved = [0u8; 52];
+                let mut i = 0;
+                while i < 52 {
+                    reserved[i] = header.reserved[i];
+                    i += 1;
+                }
+                reserved
+            },
+            group,
+        }
+    }
+}
+
+impl ConsensusHeader for RoutedRequestHeader {
+    const COMMAND: Command2 = Command2::Request;
+    fn operation(&self) -> Operation {
+        self.operation
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::Request {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::Request,
+                found: self.command,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -318,7 +458,6 @@ pub struct ReplyHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
     /// Request-level status: 0 = ok; nonzero = the `IggyError` code for a
     /// failure decided before commit (e.g. a dispatch-time authorization
     /// denial, or the partition primary rejecting a consumer-offset op).
@@ -332,7 +471,7 @@ pub struct ReplyHeader {
     /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
     /// moves and `validate` does not inspect it.
     pub status: u32,
-    pub reserved: [u8; 28],
+    pub reserved: [u8; 36],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -340,10 +479,7 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(
-        offset_of!(ReplyHeader, status) == offset_of!(ReplyHeader, namespace) + size_of::<u64>()
-    );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -367,9 +503,8 @@ impl Default for ReplyHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
             status: 0,
-            reserved: [0; 28],
+            reserved: [0; 36],
         }
     }
 }
@@ -655,7 +790,12 @@ pub struct PrepareHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
+    /// Consensus group id: which of the node's multiplexed VSR groups this
+    /// frame belongs to. `METADATA_GROUP` (top bit) for the metadata plane,
+    /// otherwise the partition's packed stream-topic-partition key. The
+    /// demux and repair-replay routing key; see `binary_protocol::namespace`
+    /// for the value-space contract.
+    pub group: u64,
     /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
     /// that field for the stamping contract.
     pub user_id: u32,
@@ -668,8 +808,7 @@ const _: () = {
             == offset_of!(PrepareHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     assert!(
-        offset_of!(PrepareHeader, user_id)
-            == offset_of!(PrepareHeader, namespace) + size_of::<u64>()
+        offset_of!(PrepareHeader, user_id) == offset_of!(PrepareHeader, group) + size_of::<u64>()
     );
     assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
@@ -695,7 +834,7 @@ impl Default for PrepareHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
+            group: 0,
             user_id: 0,
             reserved: [0; 28],
         }
@@ -785,7 +924,7 @@ pub struct PrepareOkHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 48],
 }
 const _: () = {
@@ -817,7 +956,7 @@ impl Default for PrepareOkHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
+            group: 0,
             reserved: [0; 48],
         }
     }
@@ -866,7 +1005,7 @@ pub struct CommitHeader {
     pub timestamp_monotonic: u64,
     pub commit: u64,
     pub checkpoint_op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 80],
 }
 const _: () = {
@@ -917,13 +1056,13 @@ pub struct StartViewChangeHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 120],
 }
 const _: () = {
     assert!(size_of::<StartViewChangeHeader>() == HEADER_SIZE);
     assert!(
-        offset_of!(StartViewChangeHeader, namespace)
+        offset_of!(StartViewChangeHeader, group)
             == offset_of!(StartViewChangeHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     assert!(offset_of!(StartViewChangeHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
@@ -975,7 +1114,7 @@ pub struct DoViewChangeHeader {
     pub op: u64,
     /// Highest committed op.
     pub commit: u64,
-    pub namespace: u64,
+    pub group: u64,
     /// View when status was last normal (key for log selection).
     pub log_view: u32,
     pub reserved: [u8; 100],
@@ -1047,7 +1186,7 @@ pub struct StartViewHeader {
     pub op: u64,
     /// max(commit) from all DVCs.
     pub commit: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 88],
     /// Sender's incarnation, echoed from the `RequestStartView` this answers so a
     /// recovering replica can prove the reply post-dates its restart (see
@@ -1055,7 +1194,7 @@ pub struct StartViewHeader {
     /// (a normal view-change completion), which carries no freshness claim.
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
-    /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
+    /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`group`.
     /// A peer that predates it sends zeros, decoding as `incarnation == 0`, which
     /// the `handle_start_view` guard treats as no claim rather than as a foreign
     /// one, so a mixed-version rolling upgrade is wire-compatible: the pre-upgrade
@@ -1064,7 +1203,7 @@ pub struct StartViewHeader {
 }
 const _: () = {
     assert!(size_of::<StartViewHeader>() == HEADER_SIZE);
-    // op/commit/namespace keep their pre-incarnation offsets.
+    // op/commit/group keep their pre-incarnation offsets.
     assert!(
         offset_of!(StartViewHeader, op)
             == offset_of!(StartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
@@ -1130,22 +1269,22 @@ pub struct RequestStartViewHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 104],
     /// The requester's per-boot incarnation, echoed back in the answering
     /// `StartView` so a reply from a previous incarnation is detectable.
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
-    /// lands 16-aligned with no padding WITHOUT moving `namespace`. A peer that
+    /// lands 16-aligned with no padding WITHOUT moving `group`. A peer that
     /// predates it sends zeros, decoding as `incarnation == 0`, so a mixed-version
     /// rolling upgrade is wire-compatible.
     pub incarnation: u128,
 }
 const _: () = {
     assert!(size_of::<RequestStartViewHeader>() == HEADER_SIZE);
-    // namespace keeps its pre-incarnation offset.
+    // group keeps its pre-incarnation offset.
     assert!(
-        offset_of!(RequestStartViewHeader, namespace)
+        offset_of!(RequestStartViewHeader, group)
             == offset_of!(RequestStartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     // `incarnation` is last and 16-aligned, so the struct has no padding.
@@ -1186,7 +1325,7 @@ impl ConsensusHeader for RequestStartViewHeader {
 /// Recovering/holed replica -> a Normal peer: request a repair stream.
 ///
 /// Sent to the primary first. Asks for the journaled prepares in
-/// `[from_op, to_op]` for `namespace`. Header-only. The peer answers with
+/// `[from_op, to_op]` for `group`. Header-only. The peer answers with
 /// `RepairPrepare` frames in op order, terminated by `RepairDone` or
 /// `RangeEvicted`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
@@ -1205,7 +1344,7 @@ pub struct RequestPreparesHeader {
     pub nonce: u128,
     pub from_op: u64,
     pub to_op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 88],
 }
 const _: () = {
@@ -1268,7 +1407,7 @@ pub struct RepairRangeReplyHeader {
     pub nonce: u128,
     /// `RepairDone`: last op served. `RangeEvicted`: oldest retained op.
     pub op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 96],
 }
 const _: () = {
@@ -1338,7 +1477,7 @@ pub struct RequestStateTransferHeader {
     pub reserved_frame: [u8; 66],
 
     pub nonce: u128,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 104],
 }
 const _: () = {
@@ -1413,7 +1552,7 @@ pub struct StateTransferTargetHeader {
     /// Serving primary's applied frontier (`commit_min`) when the descriptor
     /// was built. The receiver's tail repair targets past this.
     pub commit_op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub available: u8,
     pub reserved: [u8; 95],
 }
@@ -1487,7 +1626,7 @@ pub struct RequestStateChunkHeader {
 
     pub nonce: u128,
     pub offset: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub len: u32,
     /// Index into the offered state manifest. Range-checked by the serving
     /// handler against the cached offer (the header cannot know the count).
@@ -1562,7 +1701,7 @@ pub struct StateChunkHeader {
 
     pub nonce: u128,
     pub offset: u64,
-    pub namespace: u64,
+    pub group: u64,
     /// Index into the offered state manifest. Range-checked by the receiving
     /// handler against its accepted manifest.
     pub artifact: u32,
@@ -1760,11 +1899,7 @@ mod tests {
         use std::mem::offset_of;
         assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
         assert_eq!(
-            offset_of!(ReplyHeader, status),
-            offset_of!(ReplyHeader, namespace) + size_of::<u64>()
-        );
-        assert_eq!(
-            offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>(),
+            offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>(),
             HEADER_SIZE
         );
     }

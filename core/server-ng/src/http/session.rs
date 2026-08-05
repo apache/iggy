@@ -85,10 +85,10 @@ pub(in crate::http) struct HttpSession {
     pub(in crate::http) key: String,
     /// Shard-0 client id minted for this credential; its top 16 bits are 0, so
     /// it shares the shard-0 id space with TCP virtual clients without
-    /// colliding. Fills `RequestHeader.client` on every write.
+    /// colliding. Fills `RoutedRequestHeader.client` on every write.
     pub(in crate::http) client_id: u128,
     /// Cluster session number returned by the VSR `Register` commit. Fills
-    /// `RequestHeader.session` on every write.
+    /// `RoutedRequestHeader.session` on every write.
     pub(in crate::http) session: u64,
     /// User the credential authenticated as. Consumed by the write path for
     /// authorization.

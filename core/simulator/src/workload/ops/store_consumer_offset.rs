@@ -18,7 +18,7 @@
 //! `StoreConsumerOffset` op. Pre-`AckLevel` manual encoding. Live
 //! namespace via shadow, fabricated consumer kind/id. Samples Success.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -73,7 +73,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.store_consumer_offset(
         input.ns,
         input.consumer_kind,

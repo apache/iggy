@@ -27,7 +27,7 @@ use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHea
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
-use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
 
 /// How often the shard pump drives `VsrConsensus::tick`.
@@ -46,63 +46,63 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
     match bag {
         MessageBag::Request(r) => {
             let h = *r.header();
-            (h.operation, h.namespace, r.into_generic())
+            (h.operation, h.group, r.into_generic())
         }
         MessageBag::Prepare(p) => {
             let h = *p.header();
-            (h.operation, h.namespace, p.into_generic())
+            (h.operation, h.group, p.into_generic())
         }
         MessageBag::PrepareOk(p) => {
             let h = *p.header();
-            (h.operation, h.namespace, p.into_generic())
+            (h.operation, h.group, p.into_generic())
         }
         MessageBag::StartViewChange(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::DoViewChange(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::StartView(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::Commit(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestStartView(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestPrepares(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RepairPrepare(m) => {
             let h = *m.header();
-            (h.0.operation, h.0.namespace, m.into_generic())
+            (h.0.operation, h.0.group, m.into_generic())
         }
         MessageBag::RepairRangeReply(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestStateTransfer(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::StateTransferTarget(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestStateChunk(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::StateChunk(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
     }
 }
@@ -185,7 +185,7 @@ where
     ///    frame (`StartViewChange`, `DoViewChange`, `StartView`, `Commit`)
     ///    or a client `Register` request. The owning consensus group is
     ///    identified by `namespace_u64`:
-    ///    - `METADATA_CONSENSUS_NAMESPACE` -> shard 0.
+    ///    - `METADATA_GROUP` -> shard 0.
     ///    - packable `IggyNamespace::inner()` -> the shard owning that
     ///      partition's consensus group.
     fn route_typed(
@@ -232,7 +232,7 @@ where
             "route_typed: operation {operation:?} fell through unclassified; \
              expected is_metadata / is_partition / is_vsr_reserved"
         );
-        if namespace_u64 == METADATA_CONSENSUS_NAMESPACE {
+        if namespace_u64 == METADATA_GROUP {
             self.try_send_to_target(0, generic, operation);
             return;
         }

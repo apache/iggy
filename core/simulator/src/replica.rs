@@ -29,7 +29,7 @@ use metadata::stm::user::{Users, UsersInner};
 use metadata::{IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionsConfig};
 use server_common::crypto;
-use server_common::sharding::{METADATA_CONSENSUS_NAMESPACE, ShardId};
+use server_common::sharding::{METADATA_GROUP, ShardId};
 use server_ng::bootstrap::{ShellHandlers, ShellShardHandle, wire_shell_handlers};
 use shard::shards_table::PapayaShardsTable;
 use std::cell::RefCell;
@@ -182,7 +182,7 @@ pub fn new_shard(
             CLUSTER_ID,
             replica_id,
             replica_count,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             SharedSimOutbox(Rc::clone(bus)),
             LocalPipeline::new(),
             clock.clone(),

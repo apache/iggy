@@ -40,7 +40,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RequestHeader, WireIdentifier};
+use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireIdentifier};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -63,8 +63,8 @@ use std::rc::Rc;
 /// join. Every other operation passes through.
 pub(crate) async fn maybe_rewrite_consumer_group_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: Message<RequestHeader>,
-) -> Result<Message<RequestHeader>, IggyError>
+    request: Message<RoutedRequestHeader>,
+) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -208,8 +208,8 @@ where
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: Message<RequestHeader>,
-) -> Result<Message<RequestHeader>, IggyError>
+    request: Message<RoutedRequestHeader>,
+) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,

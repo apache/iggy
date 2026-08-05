@@ -21,7 +21,7 @@
 //! or `TopicNotFound` (a live stream with a fabricated topic). Partition counts
 //! are not tracked in the shadow, so every outcome predicts `Effect::None`.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -82,7 +82,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.delete_partitions(&input.stream, &input.topic, input.partitions_count)
 }
 

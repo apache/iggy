@@ -29,7 +29,7 @@ use crate::responses::{build_login_register_reply, current_metadata_commit};
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use consensus::{MetadataHandle, build_result_rejection_reply};
 use iggy_binary_protocol::PrepareHeader;
-use iggy_binary_protocol::{ClientVersionInfo, EvictionReason, RequestHeader};
+use iggy_binary_protocol::{ClientVersionInfo, EvictionReason, RoutedRequestHeader};
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
@@ -183,7 +183,7 @@ pub(crate) async fn complete_login_register<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     vsr_client_id: u128,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     user_id: u32,
     client_version: &ClientVersionInfo,
 ) -> Result<(), LoginRegisterError>
@@ -291,7 +291,7 @@ where
 pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     error: &LoginRegisterError,
 ) where
     B: ShellBus,
@@ -326,7 +326,7 @@ pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
 async fn send_login_transient_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,

@@ -1455,7 +1455,7 @@ where
         // Unlink the old segment chain oldest-first (a crash mid-loop leaves
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
-        let namespace_raw = self.consensus().namespace();
+        let namespace_raw = self.consensus().group();
         while let Some((_, mut storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -1847,7 +1847,7 @@ where
                     tracing::error!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
-                        namespace_raw = self.consensus().namespace(),
+                        namespace_raw = self.consensus().group(),
                         partition_dir,
                         %error,
                         "converge sweep cannot list the partition directory"
@@ -1861,7 +1861,7 @@ where
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         warn_unlink(
-                            self.consensus().namespace(),
+                            self.consensus().group(),
                             &path.display().to_string(),
                             &error,
                         );

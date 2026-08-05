@@ -1990,7 +1990,7 @@ fn restore_metadata_consensus(
         topology.cluster_id,
         topology.self_replica_id,
         replica_count,
-        server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+        server_common::sharding::METADATA_GROUP,
         bus,
         // Request queue keeps the stock 2x ratio over the prepare queue
         // (32 -> 64 at defaults): buffered requests are cheap relative to

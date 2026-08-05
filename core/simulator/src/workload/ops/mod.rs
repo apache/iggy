@@ -55,7 +55,7 @@ pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -130,7 +130,7 @@ macro_rules! op_dispatch {
         }
 
         #[must_use]
-        pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RequestHeader> {
+        pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RoutedRequestHeader> {
             match input {
                 $( InFlightInput::$variant(i) => $module::build_message(client, i), )*
             }

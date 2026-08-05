@@ -19,7 +19,7 @@ use crate::consensus_message::{MESSAGE_ALIGN, Message};
 use crate::iobuf::Owned;
 use crate::sharding::IggyNamespace;
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::{PrepareHeader, RequestHeader};
+use iggy_binary_protocol::{PrepareHeader, RoutedRequestHeader};
 use iggy_common::{EncryptorKind, INDEX_SIZE, IggyError, random_id};
 use std::hash::Hasher;
 use twox_hash::XxHash3_64;
@@ -196,20 +196,20 @@ impl SendMessages2Owned {
 
     pub fn encode_request(
         self,
-        mut request_header: RequestHeader,
-    ) -> Result<Message<RequestHeader>, IggyError> {
-        let total_size = std::mem::size_of::<RequestHeader>() + self.header.total_size();
+        mut request_header: RoutedRequestHeader,
+    ) -> Result<Message<RoutedRequestHeader>, IggyError> {
+        let total_size = std::mem::size_of::<RoutedRequestHeader>() + self.header.total_size();
         // The converted body differs in size from the legacy wire body the
         // header described; a stale `size` truncates the rebuilt blob for
         // every downstream slice (stamping, journal reads).
         request_header.size = u32::try_from(total_size).map_err(|_| IggyError::InvalidCommand)?;
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total_size);
         let bytes = buffer.as_mut_slice();
-        bytes[0..std::mem::size_of::<RequestHeader>()]
+        bytes[0..std::mem::size_of::<RoutedRequestHeader>()]
             .copy_from_slice(bytemuck::bytes_of(&request_header));
         self.header.encode_into(
-            &mut bytes[std::mem::size_of::<RequestHeader>()
-                ..std::mem::size_of::<RequestHeader>() + COMMAND_HEADER_SIZE],
+            &mut bytes[std::mem::size_of::<RoutedRequestHeader>()
+                ..std::mem::size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE],
         );
         bytes[PREPARE_SPLIT_POINT..PREPARE_SPLIT_POINT + self.blob.len()]
             .copy_from_slice(&self.blob);
@@ -473,12 +473,12 @@ pub(crate) type FrozenBatchHeader = crate::iobuf::Frozen<MESSAGE_ALIGN>;
 /// [`IggyError::InvalidCommand`] on an undecodable batch; encryption errors
 /// propagate from the encryptor.
 pub fn encrypt_batch_request(
-    message: Message<RequestHeader>,
+    message: Message<RoutedRequestHeader>,
     encryptor: &EncryptorKind,
-) -> Result<Message<RequestHeader>, IggyError> {
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let request_header = *message.header();
     let total_size = request_header.size as usize;
-    let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
+    let body = &message.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..total_size];
     let batch = decode_batch_slice(body)?;
 
     let mut blob = BytesMut::with_capacity(batch.blob().len() * 2);
@@ -537,12 +537,12 @@ pub enum ChecksumMode {
 
 pub fn convert_request_message(
     namespace: IggyNamespace,
-    message: Message<RequestHeader>,
+    message: Message<RoutedRequestHeader>,
     checksum: ChecksumMode,
-) -> Result<Message<RequestHeader>, IggyError> {
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let request_header = *message.header();
     let total_size = request_header.size as usize;
-    let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
+    let body = &message.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..total_size];
     // A canonical body enters the pipeline verbatim, so it must end exactly at
     // `batch_length`: `size` and `batch_length` are independent client-supplied
     // fields and `decode_batch_slice` only lower-bounds the frame. A suffix past
@@ -556,7 +556,7 @@ pub fn convert_request_message(
 }
 
 /// Transcode a legacy `SendMessages` request body directly into the canonical
-/// `[RequestHeader][256B SendMessages2Header][blob]` form, writing each message
+/// `[RoutedRequestHeader][256B SendMessages2Header][blob]` form, writing each message
 /// record straight into the final aligned buffer.
 ///
 /// Fused replacement for the `from_legacy_request(..).encode_request(..)`
@@ -571,9 +571,9 @@ pub fn convert_request_message(
 fn transcode_legacy_request(
     namespace: IggyNamespace,
     body: &[u8],
-    mut request_header: RequestHeader,
+    mut request_header: RoutedRequestHeader,
     checksum: ChecksumMode,
-) -> Result<Message<RequestHeader>, IggyError> {
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let (message_count, messages) = legacy_messages_slice(body)?;
     let mut parsed = Vec::with_capacity(message_count as usize);
     let mut origin_timestamp = u64::MAX;
@@ -598,7 +598,7 @@ fn transcode_legacy_request(
         origin_timestamp = 0;
     }
 
-    let header_size = std::mem::size_of::<RequestHeader>();
+    let header_size = std::mem::size_of::<RoutedRequestHeader>();
     let batch_length = COMMAND_HEADER_SIZE
         .checked_add(blob_len)
         .ok_or(IggyError::InvalidCommand)?;
@@ -1381,14 +1381,14 @@ mod tests {
         body
     }
 
-    fn legacy_request_message(body: &[u8]) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
+    fn legacy_request_message(body: &[u8]) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total = header_size + body.len();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
         {
-            let header: &mut RequestHeader =
+            let header: &mut RoutedRequestHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid RequestHeader");
+                    .expect("zeroed bytes form a valid RoutedRequestHeader");
             header.command = Command2::Request;
             header.operation = Operation::SendMessages;
             header.client = 1;
@@ -1420,7 +1420,7 @@ mod tests {
         let legacy = legacy_request_message(&legacy_send_messages_body(&messages));
         let converted = convert_request_message(namespace, legacy, ChecksumMode::Compute)
             .expect("legacy body transcodes");
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let actual_body = &converted.as_slice()[header_size..converted.header().size as usize];
 
         assert_eq!(
@@ -1447,7 +1447,7 @@ mod tests {
         let namespace = IggyNamespace::new(1, 1, 3);
         let messages = sample_messages();
         let body = legacy_send_messages_body(&messages);
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
 
         let computed = convert_request_message(
             namespace,
@@ -1490,7 +1490,7 @@ mod tests {
         // batch and returns it unchanged. Every decode must succeed.
         let namespace = IggyNamespace::new(1, 1, 3);
         let messages = sample_messages();
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
 
         let legacy = legacy_request_message(&legacy_send_messages_body(&messages));
         let canonical = convert_request_message(namespace, legacy, ChecksumMode::Compute)
@@ -1523,19 +1523,19 @@ mod tests {
     const TRAILING_JUNK_CASES: [&[u8]; 2] = [&[0xAA], &[0xFF; 64]];
 
     /// Canonical `SendMessages` request carrying `junk` past `batch_length`, with
-    /// `RequestHeader.size` inflated to cover it. `size` and `batch_length` are
+    /// `RoutedRequestHeader.size` inflated to cover it. `size` and `batch_length` are
     /// independent wire fields, so a non-conforming client can emit this.
-    fn canonical_request_with_trailing_bytes(junk: &[u8]) -> Message<RequestHeader> {
+    fn canonical_request_with_trailing_bytes(junk: &[u8]) -> Message<RoutedRequestHeader> {
         let namespace = IggyNamespace::new(1, 1, 3);
         let owned =
             SendMessages2Owned::from_messages(namespace, &sample_messages()).expect("build batch");
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total = header_size + owned.header.total_size() + junk.len();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
         {
-            let header: &mut RequestHeader =
+            let header: &mut RoutedRequestHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid RequestHeader");
+                    .expect("zeroed bytes form a valid RoutedRequestHeader");
             header.command = Command2::Request;
             header.operation = Operation::SendMessages;
             header.client = 1;

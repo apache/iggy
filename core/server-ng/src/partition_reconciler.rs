@@ -1133,7 +1133,7 @@ mod tests {
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command2, GenericHeader, Operation, PrepareHeader, ReplyHeader, RequestHeader,
+        Command2, GenericHeader, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader,
         WireIdentifier,
     };
     use message_bus::IggyMessageBus;
@@ -1219,7 +1219,7 @@ mod tests {
         header.command = Command2::Prepare;
         header.size = u32::try_from(header_size).expect("prepare size fits u32");
         header.operation = Operation::SendMessages;
-        header.namespace = namespace.inner();
+        header.group = namespace.inner();
         header.op = op;
         msg.into_generic()
     }
@@ -1251,17 +1251,17 @@ mod tests {
         namespace: IggyNamespace,
         body_len: usize,
     ) -> Message<GenericHeader> {
-        let header_size = size_of::<RequestHeader>();
+        let header_size = size_of::<RoutedRequestHeader>();
         let total_size = header_size + body_len;
-        let mut msg = Message::<RequestHeader>::new(total_size);
-        let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+        let mut msg = Message::<RoutedRequestHeader>::new(total_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
             &mut msg.as_mut_slice()[..header_size],
         )
-        .expect("zeroed bytes form a valid RequestHeader");
+        .expect("zeroed bytes form a valid RoutedRequestHeader");
         header.command = Command2::Request;
         header.size = u32::try_from(total_size).expect("request size fits u32");
         header.operation = Operation::SendMessages;
-        header.namespace = namespace.inner();
+        header.group = namespace.inner();
         // Header validation rejects a zero session / request on a non-register
         // op, and the park path runs after that validation.
         header.session = 1;
