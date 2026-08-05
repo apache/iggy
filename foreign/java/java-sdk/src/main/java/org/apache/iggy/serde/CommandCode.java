@@ -30,6 +30,7 @@ public interface CommandCode {
     enum System implements CommandCode {
         PING(1),
         GET_STATS(10),
+        GET_CLUSTER_METADATA(12),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
