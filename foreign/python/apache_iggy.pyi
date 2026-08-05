@@ -1861,8 +1861,8 @@ class TcpConfig:
                 leaving it on.
 
         Raises:
-            ValueError: If `server_address` is not a valid `host:port` pair, or
-                if a duration is negative.
+            ValueError: If `server_address` is not a valid `host:port` pair, if a
+                duration is negative, or if `heartbeat_interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -1898,7 +1898,8 @@ class TcpReconnectionConfig:
                 successful connection. Defaults to 5 seconds.
 
         Raises:
-            ValueError: If a duration is negative.
+            ValueError: If a duration is negative, or if `interval` is zero while
+                reconnection is enabled and `max_retries` is unlimited.
         """
     def __repr__(self) -> builtins.str: ...
 

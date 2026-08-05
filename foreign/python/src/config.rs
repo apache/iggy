@@ -20,6 +20,7 @@ use iggy::prelude::{
     TcpClientConfig as RustTcpClientConfig, TcpClientConfigBuilder,
     TcpClientReconnectionConfig as RustTcpClientReconnectionConfig,
 };
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -27,7 +28,7 @@ use pyo3_stub_gen::impl_stub_type;
 use secrecy::SecretString;
 use std::sync::Arc;
 
-use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
+use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration, reject_zero};
 
 /// The credentials replayed by the client every time it (re)connects.
 ///
@@ -103,16 +104,10 @@ impl AutoLogin {
     }
 }
 
-impl Default for AutoLogin {
-    fn default() -> Self {
-        Self::disabled()
-    }
-}
-
 /// How the TCP client reconnects after the connection to the server is lost.
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TcpReconnectionConfig {
     pub(crate) inner: RustTcpClientReconnectionConfig,
 }
@@ -130,7 +125,8 @@ impl TcpReconnectionConfig {
     ///         successful connection. Defaults to 5 seconds.
     ///
     /// Raises:
-    ///     ValueError: If a duration is negative.
+    ///     ValueError: If a duration is negative, or if `interval` is zero while
+    ///         reconnection is enabled and `max_retries` is unlimited.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -142,15 +138,25 @@ impl TcpReconnectionConfig {
         reestablish_after: Option<Py<PyDelta>>,
     ) -> PyResult<Self> {
         let defaults = RustTcpClientReconnectionConfig::default();
+        let enabled = enabled.unwrap_or(defaults.enabled);
+        let interval = interval
+            .as_ref()
+            .map(py_delta_to_iggy_duration)
+            .transpose()?
+            .unwrap_or(defaults.interval);
+        // Unlimited retries at a zero interval reconnect in a continuous loop;
+        // a zero interval with a retry cap is a legitimate fast-retry policy, and
+        // with reconnection off the interval is never read at all.
+        if enabled && interval.is_zero() && max_retries.is_none() {
+            return Err(PyValueError::new_err(
+                "'interval' must not be zero unless 'max_retries' is set",
+            ));
+        }
         Ok(Self {
             inner: RustTcpClientReconnectionConfig {
-                enabled: enabled.unwrap_or(defaults.enabled),
+                enabled,
                 max_retries,
-                interval: interval
-                    .as_ref()
-                    .map(py_delta_to_iggy_duration)
-                    .transpose()?
-                    .unwrap_or(defaults.interval),
+                interval,
                 reestablish_after: reestablish_after
                     .as_ref()
                     .map(py_delta_to_iggy_duration)
@@ -204,8 +210,6 @@ impl TcpReconnectionConfig {
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct TcpConfig {
-    auto_login: AutoLogin,
-    reconnection: TcpReconnectionConfig,
     inner: Arc<RustTcpClientConfig>,
 }
 
@@ -238,8 +242,8 @@ impl TcpConfig {
     ///         leaving it on.
     ///
     /// Raises:
-    ///     ValueError: If `server_address` is not a valid `host:port` pair, or
-    ///         if a duration is negative.
+    ///     ValueError: If `server_address` is not a valid `host:port` pair, if a
+    ///         duration is negative, or if `heartbeat_interval` is zero.
     #[new]
     #[pyo3(signature = (
         *,
@@ -271,35 +275,44 @@ impl TcpConfig {
         tls_validate_certificate: Option<bool>,
         #[gen_stub(override_type(type_repr = "builtins.bool | None"))] nodelay: Option<bool>,
     ) -> PyResult<Self> {
-        let defaults = RustTcpClientConfig::default();
-        let auto_login = auto_login.unwrap_or_default();
-        let reconnection = reconnection.unwrap_or_default();
-
-        // The builder is only used to validate and trim the server address; the
-        // remaining fields are assigned directly so every unset argument falls
-        // back to the Rust `TcpClientConfig::default()` value instead of a
-        // literal duplicated here.
-        let mut inner = TcpClientConfigBuilder::new()
-            .with_server_address(server_address.unwrap_or(defaults.server_address))
+        // The builder starts from `TcpClientConfig::default()`, and its `build()`
+        // trims and validates the address whether or not one was set here.
+        let mut builder = TcpClientConfigBuilder::new();
+        if let Some(server_address) = server_address {
+            builder = builder.with_server_address(server_address);
+        }
+        let mut inner = builder
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-        inner.auto_login = auto_login.inner.clone();
-        inner.reconnection = reconnection.inner.clone();
-        inner.heartbeat_interval = heartbeat_interval
-            .as_ref()
-            .map(py_delta_to_iggy_duration)
-            .transpose()?
-            .unwrap_or(defaults.heartbeat_interval);
-        inner.tls_enabled = tls_enabled.unwrap_or(defaults.tls_enabled);
-        inner.tls_domain = tls_domain.unwrap_or(defaults.tls_domain);
-        inner.tls_ca_file = tls_ca_file.or(defaults.tls_ca_file);
-        inner.tls_validate_certificate =
-            tls_validate_certificate.unwrap_or(defaults.tls_validate_certificate);
-        inner.nodelay = nodelay.unwrap_or(defaults.nodelay);
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(auto_login) = auto_login {
+            inner.auto_login = auto_login.inner;
+        }
+        if let Some(reconnection) = reconnection {
+            inner.reconnection = reconnection.inner;
+        }
+        if let Some(heartbeat_interval) = heartbeat_interval {
+            inner.heartbeat_interval = reject_zero(
+                py_delta_to_iggy_duration(&heartbeat_interval)?,
+                "heartbeat_interval",
+            )?;
+        }
+        if let Some(tls_enabled) = tls_enabled {
+            inner.tls_enabled = tls_enabled;
+        }
+        if let Some(tls_domain) = tls_domain {
+            inner.tls_domain = tls_domain;
+        }
+        if tls_ca_file.is_some() {
+            inner.tls_ca_file = tls_ca_file;
+        }
+        if let Some(tls_validate_certificate) = tls_validate_certificate {
+            inner.tls_validate_certificate = tls_validate_certificate;
+        }
+        if let Some(nodelay) = nodelay {
+            inner.nodelay = nodelay;
+        }
 
         Ok(Self {
-            auto_login,
-            reconnection,
             inner: Arc::new(inner),
         })
     }
@@ -311,12 +324,16 @@ impl TcpConfig {
 
     #[getter]
     fn auto_login(&self) -> AutoLogin {
-        self.auto_login.clone()
+        AutoLogin {
+            inner: self.inner.auto_login.clone(),
+        }
     }
 
     #[getter]
     fn reconnection(&self) -> TcpReconnectionConfig {
-        self.reconnection.clone()
+        TcpReconnectionConfig {
+            inner: self.inner.reconnection.clone(),
+        }
     }
 
     #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
@@ -355,8 +372,8 @@ impl TcpConfig {
         format!(
             "TcpConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, tls_enabled={})",
             self.inner.server_address,
-            self.auto_login.__repr__(),
-            self.reconnection.__repr__(),
+            self.auto_login().__repr__(),
+            self.reconnection().__repr__(),
             self.inner.heartbeat_interval.as_human_time_string(),
             if self.inner.tls_enabled {
                 "True"

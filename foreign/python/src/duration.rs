@@ -16,23 +16,20 @@
 // under the License.
 
 use iggy::prelude::IggyDuration;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDelta, PyDeltaAccess};
+use pyo3::types::PyDelta;
 use std::time::Duration;
 
 pub fn py_delta_to_iggy_duration(delta: &Py<PyDelta>) -> PyResult<IggyDuration> {
     Python::attach(|py| {
-        let delta = delta.bind(py);
-        // Python normalizes a negative timedelta to negative days plus
-        // non-negative seconds/microseconds, so the sign lives in the sum.
-        let seconds = i64::from(delta.get_days()) * 60 * 60 * 24 + i64::from(delta.get_seconds());
-        if seconds < 0 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "duration must not be negative",
-            ));
-        }
-        let nanos = (delta.get_microseconds() * 1_000) as u32;
-        Ok(IggyDuration::new(Duration::new(seconds as u64, nanos)))
+        // The value is already a timedelta, so a negative one is the only failure
+        // left to map, and the Python surface must not name Rust types.
+        delta
+            .bind(py)
+            .extract::<Duration>()
+            .map(IggyDuration::from)
+            .map_err(|_| PyValueError::new_err("duration must not be negative"))
     })
 }
 
@@ -40,16 +37,16 @@ pub fn iggy_duration_to_py_delta(
     py: Python<'_>,
     duration: IggyDuration,
 ) -> PyResult<Bound<'_, PyDelta>> {
-    // IggyDuration::as_micros() truncates to u64; read the std Duration to keep
-    // the full u128 so oversized values fail the i32 conversion below instead of
-    // wrapping.
-    let micros = duration.get_duration().as_micros();
-    let total_seconds = micros / 1_000_000;
-    let days = i32::try_from(total_seconds / 86_400).map_err(|_| {
-        PyErr::new::<pyo3::exceptions::PyOverflowError, _>(
-            "duration does not fit into a datetime.timedelta",
-        )
-    })?;
-    let seconds = (total_seconds % 86_400) as i32;
-    PyDelta::new(py, days, seconds, (micros % 1_000_000) as i32, true)
+    duration.get_duration().into_pyobject(py)
+}
+
+/// Rejects a zero duration for parameters where zero means an unthrottled loop
+/// rather than "disabled".
+pub fn reject_zero(duration: IggyDuration, parameter: &str) -> PyResult<IggyDuration> {
+    if duration.is_zero() {
+        return Err(PyValueError::new_err(format!(
+            "'{parameter}' must not be zero"
+        )));
+    }
+    Ok(duration)
 }

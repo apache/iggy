@@ -35,7 +35,7 @@ use crate::consumer::{
     AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
     IggyConsumer,
 };
-use crate::duration::py_delta_to_iggy_duration;
+use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
@@ -117,12 +117,8 @@ impl IggyClient {
         };
         let tcp_client = TcpClient::create(config)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let client = IggyClientBuilder::new()
-            .with_client(ClientWrapper::Tcp(tcp_client))
-            .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(IggyClient {
-            inner: Arc::new(client),
+            inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
         })
     }
 
@@ -1084,8 +1080,10 @@ impl IggyClient {
             builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
-            builder =
-                builder.polling_retry_interval(py_delta_to_iggy_duration(&polling_retry_interval)?)
+            builder = builder.polling_retry_interval(reject_zero(
+                py_delta_to_iggy_duration(&polling_retry_interval)?,
+                "polling_retry_interval",
+            )?)
         }
         if init_retries.is_some() && init_retry_interval.is_none() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -1101,7 +1099,10 @@ impl IggyClient {
         {
             builder = builder.init_retries(
                 init_retries,
-                py_delta_to_iggy_duration(&init_retry_interval)?,
+                reject_zero(
+                    py_delta_to_iggy_duration(&init_retry_interval)?,
+                    "init_retry_interval",
+                )?,
             );
         }
         if allow_replay {

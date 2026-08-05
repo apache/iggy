@@ -31,6 +31,9 @@ from datetime import timedelta
 import pytest
 
 from apache_iggy import (
+    AutoCommit,
+    AutoCommitAfter,
+    AutoCommitWhen,
     AutoLogin,
     IggyClient,
     IggyExpiry,
@@ -123,11 +126,28 @@ class TestTcpReconnectionConfig:
         with pytest.raises(ValueError, match="negative"):
             construct(negative)
 
-    def test_zero_interval_is_allowed(self):
-        """Test that a zero interval is legal and readable back."""
-        reconnection = TcpReconnectionConfig(interval=timedelta(0))
+    def test_zero_reestablish_after_is_allowed(self):
+        """Test that a zero cooldown is legal and readable back."""
+        reconnection = TcpReconnectionConfig(reestablish_after=timedelta(0))
+
+        assert reconnection.reestablish_after == timedelta(0)
+
+    def test_zero_interval_is_allowed_with_bounded_retries(self):
+        """Test that a zero interval is legal as a bounded fast-retry policy."""
+        reconnection = TcpReconnectionConfig(interval=timedelta(0), max_retries=5)
 
         assert reconnection.interval == timedelta(0)
+
+    def test_zero_interval_is_allowed_when_reconnection_is_disabled(self):
+        """Test that a zero interval is legal when nothing ever reads it."""
+        reconnection = TcpReconnectionConfig(enabled=False, interval=timedelta(0))
+
+        assert reconnection.interval == timedelta(0)
+
+    def test_zero_interval_with_unlimited_retries_is_rejected(self):
+        """Test that the combination that reconnects in a continuous loop fails."""
+        with pytest.raises(ValueError, match="zero"):
+            TcpReconnectionConfig(interval=timedelta(0))
 
     def test_very_long_interval_round_trips(self):
         """Test that an interval beyond 68 years survives the i32 boundary."""
@@ -210,6 +230,15 @@ class TestTcpConfig:
         with pytest.raises(ValueError, match="negative"):
             TcpConfig(heartbeat_interval=timedelta(seconds=-3))
 
+    def test_zero_heartbeat_interval_is_rejected(self):
+        """Test that a zero heartbeat interval fails at construction.
+
+        Nothing downstream reads zero as "disabled"; it heartbeats in a
+        continuous loop for as long as the client lives.
+        """
+        with pytest.raises(ValueError, match="zero"):
+            TcpConfig(heartbeat_interval=timedelta(0))
+
 
 @pytest.mark.unit
 class TestClientConstruction:
@@ -233,10 +262,9 @@ class TestClientConstruction:
             IggyClient("nonsense")
 
     def test_negative_message_expiry_is_rejected(self):
-        """Test that the negative-duration rule reaches the pre-existing surface.
+        """Test that the negative-duration rule reaches create_topic.
 
-        create_topic accepted a negative message_expiry before durations were
-        validated; it now fails at the call, before any I/O.
+        The check runs at the call, before any I/O.
         """
         client = IggyClient()
 
@@ -246,6 +274,66 @@ class TestClientConstruction:
                 name="topic",
                 partitions_count=1,
                 message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
+            )
+
+    @pytest.mark.parametrize(
+        "interval_kwargs",
+        [
+            {"polling_retry_interval": timedelta(0)},
+            {"init_retries": 3, "init_retry_interval": timedelta(0)},
+            {"auto_commit": AutoCommit.Interval(timedelta(0))},
+            {
+                "auto_commit": AutoCommit.IntervalOrWhen(
+                    timedelta(0), AutoCommitWhen.PollingMessages()
+                )
+            },
+            {
+                "auto_commit": AutoCommit.IntervalOrAfter(
+                    timedelta(0), AutoCommitAfter.ConsumingEachMessage()
+                )
+            },
+        ],
+        ids=[
+            "polling_retry_interval",
+            "init_retry_interval",
+            "auto_commit_interval",
+            "auto_commit_interval_or_when",
+            "auto_commit_interval_or_after",
+        ],
+    )
+    def test_zero_consumer_interval_is_rejected(self, interval_kwargs: dict):
+        """Test that a zero consumer interval fails at the call.
+
+        Zero spins the retry loop, floods the server with offset stores, or
+        panics inside the runtime timer, and none of those name the argument
+        that caused it.
+        """
+        client = IggyClient()
+
+        with pytest.raises(ValueError, match="zero"):
+            client.consumer_group(
+                name="group",
+                stream="stream",
+                topic="topic",
+                **interval_kwargs,
+            )
+
+    def test_zero_poll_interval_is_allowed(self):
+        """Test that a zero poll interval passes validation.
+
+        Zero there means "do not wait before polling" and is short-circuited
+        before the sleep, unlike the retry intervals. Reaching the awaitable is
+        what proves it: building one without a running loop is the next failure,
+        and a rejected value would have raised ValueError first.
+        """
+        client = IggyClient()
+
+        with pytest.raises(RuntimeError):
+            client.consumer_group(
+                name="group",
+                stream="stream",
+                topic="topic",
+                poll_interval=timedelta(0),
             )
 
 
