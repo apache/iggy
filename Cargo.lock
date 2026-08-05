@@ -11933,7 +11933,6 @@ dependencies = [
  "hwlocality",
  "hyper",
  "hyper-util",
- "iggy",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",
