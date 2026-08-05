@@ -52,38 +52,69 @@ async fn setup_postgres_container()
     Ok((postgres, jdbc_url, postgres_jar))
 }
 
-/// Get PostgreSQL JDBC driver, downloading if necessary
+/// A file that starts with the ZIP local-file-header magic (`PK\x03\x04`) and is
+/// at least this large is treated as a real driver JAR. A truncated download or
+/// an HTML error page fails this check, so it is never cached or handed to the
+/// JVM (where it would only surface later as a `ClassNotFoundException` on
+/// `Class.forName`, with the bad file silently reused by every later test).
+const MIN_DRIVER_JAR_BYTES: usize = 500_000;
+
+fn looks_like_jar(bytes: &[u8]) -> bool {
+    bytes.len() >= MIN_DRIVER_JAR_BYTES && bytes.starts_with(b"PK\x03\x04")
+}
+
+/// Get the PostgreSQL JDBC driver, downloading and integrity-checking it if a
+/// valid copy is not already cached. Downloads from Maven Central, verifies the
+/// bytes are a real JAR before persisting, and writes via a temp file + atomic
+/// rename so a partial or corrupt download can never be cached and reused.
 async fn get_postgres_driver_jar() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
-    let jdbc_test_dir = format!("{}/test-jdbc-drivers", target_dir);
-    let jar_path = format!("{}/postgresql-42.7.1.jar", jdbc_test_dir);
+    let jdbc_test_dir = format!("{target_dir}/test-jdbc-drivers");
+    let jar_path = format!("{jdbc_test_dir}/postgresql-42.7.1.jar");
 
     std::fs::create_dir_all(&jdbc_test_dir)?;
 
+    // Reuse the cached jar only if it is actually a valid JAR; a previously
+    // cached bad download must self-heal rather than fail every run.
     if std::path::Path::new(&jar_path).exists() {
-        info!("PostgreSQL JDBC driver found at {}", jar_path);
-        let absolute_path = std::fs::canonicalize(&jar_path)?
-            .to_string_lossy()
-            .to_string();
-        return Ok(absolute_path);
+        match std::fs::read(&jar_path) {
+            Ok(bytes) if looks_like_jar(&bytes) => {
+                info!("PostgreSQL JDBC driver found at {jar_path}");
+                return Ok(std::fs::canonicalize(&jar_path)?.to_string_lossy().to_string());
+            }
+            _ => {
+                info!("Cached JDBC driver at {jar_path} is invalid; re-downloading");
+                let _ = std::fs::remove_file(&jar_path);
+            }
+        }
     }
 
     info!("Downloading PostgreSQL JDBC driver...");
-    let download_url = "https://jdbc.postgresql.org/download/postgresql-42.7.1.jar";
-
+    let download_url =
+        "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar";
     let response = reqwest::get(download_url).await?;
     if !response.status().is_success() {
         return Err(format!("Failed to download driver: HTTP {}", response.status()).into());
     }
-
     let bytes = response.bytes().await?;
-    std::fs::write(&jar_path, bytes)?;
+    if !looks_like_jar(&bytes) {
+        return Err(format!(
+            "Downloaded JDBC driver is not a valid JAR ({} bytes, magic {:02x?}); \
+             the download endpoint may have returned an error page",
+            bytes.len(),
+            bytes.get(..4).unwrap_or(&[])
+        )
+        .into());
+    }
 
-    info!("PostgreSQL JDBC driver downloaded to {}", jar_path);
-    let absolute_path = std::fs::canonicalize(&jar_path)?
-        .to_string_lossy()
-        .to_string();
-    Ok(absolute_path)
+    // Write to a unique temp file, then atomically rename, so a crash or a
+    // concurrent test never observes a half-written jar at `jar_path`.
+    let tmp_path = format!("{jar_path}.{}.tmp", std::process::id());
+    std::fs::write(&tmp_path, &bytes)?;
+    std::fs::rename(&tmp_path, &jar_path)?;
+
+    info!("PostgreSQL JDBC driver downloaded to {jar_path}");
+    Ok(std::fs::canonicalize(&jar_path)?.to_string_lossy().to_string())
 }
 
 /// Build the environment variables for a JDBC Postgres source connector.
