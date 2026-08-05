@@ -39,10 +39,14 @@ pub const STATE_TRANSFER_MAX_STALL_RETRIES: u32 = 5;
 /// Decode-failure rounds a receiver spends on ONE offered generation
 /// before refusing to pull it again.
 ///
-/// Metadata keys on `snapshot_seq`, partitions on the offered `commit_op`. A peer whose generation advances resets the
-/// budget -- new bytes are worth full retries -- while a generation this
-/// build cannot decode ends up costing one refused descriptor per repair
-/// round instead of a full pull.
+/// METADATA plane only, keyed on `snapshot_seq`: a peer whose snapshot
+/// generation advances resets the budget (new bytes are worth full
+/// retries), while a generation this build cannot decode costs one refused
+/// descriptor per repair round instead of a full pull. The partition plane
+/// deliberately does NOT use a generation-keyed budget -- a committing
+/// origin advances `commit_op` every round, which pinned such a count at
+/// 1 forever; it counts consecutive failures on the partition and backs
+/// its re-arm off instead.
 pub const STATE_TRANSFER_MAX_DECODE_RETRIES: u32 = 5;
 
 /// One artifact of an accepted transfer target: its manifest entry plus

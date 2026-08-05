@@ -27,20 +27,21 @@
 //! protocol from `core/consensus`; everything in this module is the
 //! partition-specific payload handling on either end.
 
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use consensus::le_cursor::{LeCursor, Truncated, split_verified_trailer};
 use consensus::{ArtifactProgress, state_artifact_checksum};
 use std::fmt;
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Framing marker for the consumer-offsets wire artifact, "ICO1".
 pub const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
 
 /// Version byte following the magic.
 ///
-/// Bump when the layout changes shape in a way appending fields cannot
-/// express; a decoder rejects versions it does not know instead of
-/// misreading trailing bytes as `Truncated`.
+/// Any layout change bumps this, INCLUDING appended fields: the decoder
+/// deliberately fails closed on unknown versions and on trailing bytes,
+/// because a v2 field can change the meaning of fields v1 already read.
 pub const CONSUMER_OFFSETS_VERSION: u8 = 1;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
@@ -57,8 +58,14 @@ pub const CONSUMER_OFFSETS_ENTRIES_MAX: u32 = 1 << 20;
 /// they finish (bounding receiver memory to one in-flight artifact), and the
 /// walk metadata recorded here is what the install consumes. NO retry budget
 /// lives in here -- three of four metadata arming sites re-minted the
-/// session, so a per-session counter bounded nothing; the budget is
-/// [`crate::IggyPartition::transfer_attempts`], reset only on real progress.
+/// session, so a per-session counter bounded nothing. The partition plane's
+/// budgets live on the partition: the stall budget
+/// (`transfer_attempts`, reset on received chunks) and the consecutive
+/// failure count driving the re-arm backoff (reset only by a completed
+/// install; deliberately NOT generation-keyed -- a committing origin
+/// advances its generation every round). A deterministically undecodable
+/// artifact therefore re-pulls once per backed-off round, capped at 1024x
+/// the base interval, rather than being refused outright.
 #[derive(Debug)]
 pub struct PartitionTransferSession {
     pub nonce: u128,
@@ -271,7 +278,12 @@ impl ConsumerOffsetsWire {
         let consumers = Self::decode_section(&mut cursor, "consumers", consumer_count)?;
         let groups = Self::decode_section(&mut cursor, "groups", group_count)?;
         if !cursor.remaining().is_empty() {
-            return Err(ConsumerOffsetsWireError::Truncated);
+            // Distinct from `Truncated`: extra bytes point at a NEWER
+            // encoder, and telling the operator the artifact is short would
+            // send them the wrong way.
+            return Err(ConsumerOffsetsWireError::TrailingBytes {
+                extra: cursor.remaining().len(),
+            });
         }
         Ok(Self {
             purge_generation,
@@ -322,6 +334,10 @@ pub enum ConsumerOffsetsWireError {
     UnsupportedVersion {
         version: u8,
     },
+    /// Bytes remained after this version's field set: a newer encoder.
+    TrailingBytes {
+        extra: usize,
+    },
     ChecksumMismatch {
         expected: u64,
         actual: u64,
@@ -348,6 +364,11 @@ impl fmt::Display for ConsumerOffsetsWireError {
         match self {
             Self::Truncated => write!(f, "consumer-offsets artifact is truncated"),
             Self::BadMagic => write!(f, "consumer-offsets artifact carries a foreign magic"),
+            Self::TrailingBytes { extra } => write!(
+                f,
+                "consumer-offsets artifact carries {extra} trailing bytes past this \
+                 version's field set (a newer encoder?)"
+            ),
             Self::UnsupportedVersion { version } => write!(
                 f,
                 "consumer-offsets artifact version {version} is not understood \
@@ -524,7 +545,7 @@ mod tests {
         padded.extend_from_slice(&trailer.to_le_bytes());
         assert_eq!(
             ConsumerOffsetsWire::decode(&padded),
-            Err(ConsumerOffsetsWireError::Truncated),
+            Err(ConsumerOffsetsWireError::TrailingBytes { extra: 1 }),
             "bytes past the last section must fail closed"
         );
     }
@@ -1000,17 +1021,34 @@ where
             };
             // Checksum pass over exactly `segment.size` bytes: the file can
             // be LONGER after a failed-index-save rewind, and the size
-            // counter is what readers bound by. Chunked, with an await per
-            // chunk: this runs on the pump task, and a whole-file read +
-            // hash of a large segment would stall every consensus tick on
-            // this core long enough to trip view-change timers. Resident
-            // footprint is one chunk; only the manifest entry is retained.
-            let checksum = hash_segment_prefix(&log_path, size)
-                .await
-                .map_err(|source| PartitionTransferUnavailable::SegmentUnreadable {
-                    start_offset: segment.start_offset,
-                    source,
-                })?;
+            // counter is what readers bound by. Memoized by
+            // `(start_offset, size)` -- sealed segments are immutable and
+            // the active one re-keys as it grows -- so repeat builds (every
+            // committed round moves `commit_op` and misses the offer cache)
+            // hash only new bytes. A miss hashes chunked, one await per
+            // chunk, resident footprint one chunk; still on the pump, so
+            // the memo is what keeps a large retained history from stalling
+            // this core's consensus ticks on every rejoin round.
+            let memo_key = (segment.start_offset, size);
+            let memoized = self.segment_checksum_cache.borrow().get(&memo_key).copied();
+            let checksum = if let Some(checksum) = memoized {
+                checksum
+            } else {
+                {
+                    let checksum =
+                        hash_segment_prefix(&log_path, size)
+                            .await
+                            .map_err(|source| PartitionTransferUnavailable::SegmentUnreadable {
+                                start_offset: segment.start_offset,
+                                source,
+                            })?;
+                    self.segment_checksum_cache
+                        .borrow_mut()
+                        .insert(memo_key, checksum);
+                    checksum
+                }
+            };
+
             segments.push(SegmentArtifactSource {
                 entry: consensus::StateArtifact {
                     kind: artifact_kind::SEGMENT_LOG,
@@ -1020,6 +1058,20 @@ where
                 },
                 log_path: log_path.clone(),
             });
+        }
+
+        // Sweep memo entries whose segment left the chain (GC) or whose
+        // active-size key was superseded, so the map tracks the live chain.
+        {
+            let live: std::collections::HashSet<(u64, u64)> = self
+                .log
+                .segments()
+                .iter()
+                .map(|segment| (segment.start_offset, segment.size.as_bytes_u64()))
+                .collect();
+            self.segment_checksum_cache
+                .borrow_mut()
+                .retain(|key, _| live.contains(key));
         }
 
         let offsets_wire = self.offsets_wire_snapshot();
@@ -1036,6 +1088,32 @@ where
         });
         *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
         Ok(offer)
+    }
+
+    /// Move this partition's directory aside as `<dir>.fenced.<n>`, for the
+    /// shard's `ConvergeFailed` fence: the converge already failed to sweep
+    /// it, so whatever it holds (partial chains, undeletable strays) must
+    /// not feed the reconciler's rebuild or resurrect at boot. Picks the
+    /// first free suffix rather than a timestamp so repeated fences of the
+    /// same group cannot collide.
+    ///
+    /// # Errors
+    /// The underlying rename's `std::io::Error`; the caller logs and lets
+    /// the rebuild re-hydrate the directory in place.
+    pub async fn quarantine_partition_dir(&self) -> std::io::Result<()> {
+        let Some(dir) = self.partition_dir.clone() else {
+            return Ok(());
+        };
+        for attempt in 0..1000 {
+            let target = format!("{dir}.fenced.{attempt}");
+            if compio::fs::metadata(&target).await.is_ok() {
+                continue;
+            }
+            return compio::fs::rename(&dir, &target).await;
+        }
+        Err(std::io::Error::other(
+            "a thousand fenced copies of this partition already exist",
+        ))
     }
 
     /// Release the cached offer once no requester holds one (the shard's
@@ -1218,6 +1296,14 @@ where
                 continue;
             }
             let (log_staging, _) = staging_paths(&partition_dir, entry.frontier);
+            // Length short-circuit BEFORE reading: length is the first
+            // conjunct of the artifact check anyway, and the common retry
+            // case is precisely an active-segment length mismatch -- no
+            // point reading up to 2 GiB just to discard it.
+            match compio::fs::metadata(&log_staging).await {
+                Ok(metadata) if metadata.len() == entry.len => {}
+                _ => continue,
+            }
             let Ok(bytes) = compio::fs::read(&log_staging).await else {
                 continue;
             };
@@ -1237,7 +1323,7 @@ where
                 let path = dir_entry.path();
                 let is_staging = path.to_str().is_some_and(|path| path.ends_with(".staging"));
                 if is_staging && !matched_paths.contains(&path) {
-                    let _ = std::fs::remove_file(&path);
+                    let _ = compio::fs::remove_file(&path).await;
                 }
             }
         }
@@ -1351,10 +1437,20 @@ where
                 let path = entry.path();
                 let is_staging = path.to_str().is_some_and(|path| path.ends_with(".staging"));
                 if is_staging && !keep.iter().any(|kept| **kept == path) {
-                    let _ = std::fs::remove_file(&path);
+                    let _ = compio::fs::remove_file(&path).await;
                 }
             }
         }
+
+        // The install recreates segment files at paths it unlinks (the staged
+        // chain can reuse the same base offsets), so an in-flight poll's
+        // cached read fd would keep serving the unlinked pre-install inodes
+        // as live data -- worst case, purged messages returning checksum-clean
+        // on a receiver that missed the purge. Same hazard and same fix as
+        // `purge`: wipe the shared read-state slots first, so suspended walks
+        // re-resolve by path and see the fresh files.
+        self.log.invalidate_sealed_read_state();
+        self.segment_checksum_cache.borrow_mut().clear();
 
         // Unlink the old segment chain oldest-first (a crash mid-loop leaves
         // the NEWEST suffix, which is contiguous) and drop the in-memory
@@ -1526,9 +1622,15 @@ where
 
         // Consumer offsets: replace both maps through the SAME Arcs (the
         // data plane holds clones), unlink the old files, install the
-        // transferred entries with locally minted paths, clamped to the
-        // installed end like boot recovery clamps.
+        // transferred entries with locally minted paths, clamped like boot
+        // recovery clamps. The clamp anchors on the GROUP FRONTIER, not the
+        // staged end: an empty staged set (everything GC'd at the origin)
+        // must not rewind every transferred offset to 0 -- a durable,
+        // client-visible rewind the replicas would then disagree on.
         let installed_end = staged.last().map(|meta| meta.end_offset);
+        let next_offset = offsets_wire
+            .next_offset
+            .max(installed_end.map_or(0, |end| end + 1));
         let mut offsets_written = true;
         // A key that fails the u32 narrowing would strand its old offset
         // file's delete, which boot can then resurrect: unreachable while
@@ -1571,7 +1673,7 @@ where
         self.pending_consumer_offset_commits.clear();
         self.last_polled_offsets.pin().clear();
 
-        let clamp = |offset: u64| installed_end.map_or(0, |end| offset.min(end));
+        let clamp = |offset: u64| offset.min(next_offset.saturating_sub(1));
         if self.consumer_offsets_path.is_none() || self.consumer_group_offsets_path.is_none() {
             // Nothing to write the transferred table into: unreachable via
             // the server boot paths (they always configure storage), but if
@@ -1642,14 +1744,18 @@ where
         // max defensively. The stats mutate through the EXISTING Arc:
         // partition counters are never snapshotted, and the data plane's
         // registered handle must keep reading the same cells.
-        let next_offset = offsets_wire
-            .next_offset
-            .max(installed_end.map_or(0, |end| end + 1));
         let end = next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
         self.should_increment_offset = next_offset > 0;
         self.recovered_durable_offset = installed_end;
+        // Where the group's offset space starts on this replica: everything
+        // below is represented by this install, so the repair floor check
+        // can connect windows that begin at (or below) it even with no
+        // durable bytes on disk. Deliberately NOT `recovered_durable_offset`:
+        // that field also gates repaired-batch persistence, and overstating
+        // it would silently drop the `(commit_op, commit_max]` replay window.
+        self.installed_frontier = Some(next_offset);
         self.stats.zero_out_all();
         #[allow(clippy::cast_possible_truncation)]
         self.stats
@@ -1779,6 +1885,7 @@ where
         self.dirty_offset.store(end, Ordering::Relaxed);
         self.should_increment_offset = minted_next_offset > 0;
         self.recovered_durable_offset = None;
+        self.installed_frontier = Some(minted_next_offset);
         self.stats.zero_out_all();
         self.stats.increment_segments_count(1);
         self.repair = None;
@@ -1832,17 +1939,27 @@ const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
 /// on a file shorter than `len`: the segment accounts bytes the disk does
 /// not hold.
 async fn hash_segment_prefix(path: &str, len: u64) -> std::io::Result<u64> {
-    use compio::io::AsyncReadAtExt;
     let file = compio::fs::File::open(path).await?;
     let mut hasher = consensus::state_manifest::StateArtifactHasher::new();
     let mut position = 0u64;
+    // One buffer for the whole pass; `BufResult` hands it back per read
+    // precisely so the alloc + memset are not paid per chunk. Re-allocated
+    // (not resized) when the tail chunk is shorter: compio reads into a
+    // Vec's CAPACITY, and a shrunken `len` over the old 1 MiB capacity made
+    // `read_exact_at` demand a full megabyte at EOF.
+    #[allow(clippy::cast_possible_truncation)]
+    let mut buf = vec![0u8; OFFER_HASH_CHUNK_LEN.min(len as usize)];
     while position < len {
         #[allow(clippy::cast_possible_truncation)]
         let want = OFFER_HASH_CHUNK_LEN.min((len - position) as usize);
-        let compio::BufResult(read, buf) = file.read_exact_at(vec![0u8; want], position).await;
-        read.map_err(|_| {
+        if buf.len() != want {
+            buf = vec![0u8; want];
+        }
+        let compio::BufResult(read, returned) = file.read_exact_at(buf, position).await;
+        buf = returned;
+        read.map_err(|source| {
             std::io::Error::other(format!(
-                "file ends at {position}+, segment accounts {len} bytes"
+                "reading segment bytes at {position} of {len} failed: {source}"
             ))
         })?;
         hasher.update(&buf);
@@ -1851,8 +1968,7 @@ async fn hash_segment_prefix(path: &str, len: u64) -> std::io::Result<u64> {
     Ok(hasher.finish())
 }
 
-async fn write_staging_file(path: &PathBuf, payload: Vec<u8>) -> std::io::Result<()> {
-    use compio::io::AsyncWriteAtExt;
+async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()> {
     let mut file = compio::fs::File::create(path).await?;
     let (result, _) = file.write_all_at(payload, 0).await.into();
     result?;

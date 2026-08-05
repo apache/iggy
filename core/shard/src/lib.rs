@@ -860,6 +860,9 @@ struct ServedSegmentCache {
     entries: HashMap<(u64, u64), CachedSegmentPayload>,
     resident_bytes: u64,
     use_seq: u64,
+    /// `use_seq` as of the previous idle sweep; entries at or below it have
+    /// served nothing for a full sweep interval.
+    last_sweep_seq: u64,
 }
 
 /// One resident payload plus its last-use sequence (the LRU key).
@@ -869,8 +872,33 @@ struct CachedSegmentPayload {
 }
 
 impl ServedSegmentCache {
-    /// Byte budget across all resident segment payloads on one shard.
-    const RESIDENT_BYTES_MAX: u64 = 4 << 30;
+    /// Byte budget across all resident segment payloads on ONE shard (the
+    /// process-wide bound is this times the shard count). LRU pressure from
+    /// new inserts plus the idle sweep below reclaim it; a config knob can
+    /// follow if operators need to trade it against page cache.
+    const RESIDENT_BYTES_MAX: u64 = 1 << 30;
+
+    /// Drop every payload not touched since the previous idle sweep. Runs
+    /// from the same place offers expire: without it, one rejoin leaves a
+    /// permanent high-water of resident bytes (nothing else releases the
+    /// cache once the pulls stop).
+    fn expire_idle(&mut self) {
+        let floor = self.last_sweep_seq;
+        self.last_sweep_seq = self.use_seq;
+        let stale: Vec<(u64, u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, cached)| cached.last_use <= floor)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in stale {
+            if let Some(evicted) = self.entries.remove(&key) {
+                self.resident_bytes = self
+                    .resident_bytes
+                    .saturating_sub(evicted.payload.len() as u64);
+            }
+        }
+    }
 
     fn get(&mut self, namespace: u64, checksum: u64) -> Option<Rc<Vec<u8>>> {
         self.use_seq += 1;
@@ -2023,8 +2051,16 @@ where
                             let planes = self.plane.inner();
                             let config = planes.1.0.config();
                             let namespace = IggyNamespace::from_raw(routing.1);
+                            // Same transfer gate as the view-change walks: a
+                            // walk during a transfer can advance commit_min
+                            // past the incoming frontier and trip the
+                            // install's StaleTransfer refusal after the full
+                            // pull. This is the highest-frequency walk (one
+                            // per replicated prepare), so it needs the gate
+                            // most.
                             if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
                                 && partition.consensus().is_follower()
+                                && !partition.consensus().is_transferring()
                             {
                                 partition.commit_journal(config).await;
                             }
@@ -2971,7 +3007,9 @@ where
         let consensus = partition.consensus();
         let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
         let (local_actions, wire_actions) = split_local_actions(actions);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &local_actions).await;
+        // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
+        // executes there (`dispatch_vsr_actions` bails on `journal: None`)
+        // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         if partition.persist_superblock_if_needed().await {
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
@@ -3028,7 +3066,9 @@ where
         let consensus = partition.consensus();
         let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
         let (local_actions, wire_actions) = split_local_actions(actions);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &local_actions).await;
+        // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
+        // executes there (`dispatch_vsr_actions` bails on `journal: None`)
+        // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         if partition.persist_superblock_if_needed().await {
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
@@ -3140,6 +3180,9 @@ where
         }
 
         let config = planes.1.0.config();
+        // Counted BEFORE the `&mut partition` below exists: the scan takes
+        // shared borrows of every partition (see `arm_partition_transfer`).
+        let transfers_inflight = self.partition_transfers_inflight();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
             header.namespace,
@@ -3153,7 +3196,9 @@ where
         let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
         let adopted = !actions.is_empty();
         let (local_actions, wire_actions) = split_local_actions(actions);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &local_actions).await;
+        // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
+        // executes there (`dispatch_vsr_actions` bails on `journal: None`)
+        // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         if partition.persist_superblock_if_needed().await {
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
@@ -3172,7 +3217,8 @@ where
                 peer = header.replica,
                 "adopted a live view while awaiting transfer; requesting partition state transfer"
             );
-            self.arm_partition_transfer(partition, header.replica).await;
+            self.arm_partition_transfer(partition, header.replica, transfers_inflight)
+                .await;
             return;
         }
         // A commit walk during Fetching can advance commit_min past the
@@ -3362,10 +3408,17 @@ where
         let consensus = partition.consensus();
         let actions = consensus.handle_request_start_view(PlaneKind::Partitions, &header);
         let (local_actions, wire_actions) = split_local_actions(actions);
-        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &local_actions).await;
+        // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
+        // executes there (`dispatch_vsr_actions` bails on `journal: None`)
+        // and `CommitJournal` is a no-op in both.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
+        // Wire to BOTH, like every other partition site: the journal
+        // dispatcher owns SendPrepareOk and the debug durable-before-send
+        // tripwire, and skipping it would drop both silently the day this
+        // handler emits one.
         if partition.persist_superblock_if_needed().await {
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
         }
     }
 
@@ -3574,8 +3627,16 @@ where
         });
         let header = *msg.header();
         let planes = self.plane.inner();
+        // `header.namespace == 0`: pre-upgrade metadata WAL entries were
+        // journaled before prepares stamped `consensus.namespace()`, and
+        // repair ships stored bytes verbatim -- without this acceptance a
+        // mixed-version metadata repair re-ships the same 0-stamped entries
+        // forever. Safe to claim for the metadata plane: partition ops never
+        // reach this arm with a metadata operation code, and namespace 0's
+        // partition-side gates journal nothing for foreign operations.
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && (consensus.namespace() == header.namespace
+                || (header.namespace == 0 && !header.operation.is_partition()))
         {
             let session = *self.metadata_repair.borrow();
             let Some(session) = session else {
@@ -3734,6 +3795,9 @@ where
             }
             return;
         }
+        // Counted BEFORE the `&mut partition` below exists: the scan takes
+        // shared borrows of every partition (see `arm_partition_transfer`).
+        let transfers_inflight = self.partition_transfers_inflight();
         let config = planes.1.0.config().clone();
         let Some(partition) = planes
             .1
@@ -3783,11 +3847,12 @@ where
                             floor,
                             to_op,
                             peer = header.replica,
-                            attempts = partition.transfer_attempts,
+                            attempts = partition.transfer_attempts(),
                             "partition repair floor unreachable; converting to state transfer"
                         );
                         partition.consensus().begin_state_transfer_await();
-                        self.arm_partition_transfer(partition, header.replica).await;
+                        self.arm_partition_transfer(partition, header.replica, transfers_inflight)
+                            .await;
                     } else {
                         // The refusal cleared the repair session, so falling
                         // through would log "repair complete" right after
@@ -4982,8 +5047,16 @@ where
                 }
             })
             .collect();
-        if !pending_persists.is_empty() {
-            futures::future::join_all(pending_persists).await;
+        // Capped fan-out: each persist is a create + write + 2 fsyncs, and a
+        // node-wide view change over many partitions must not dump an
+        // unbounded fd/fsync burst onto the reactor in one tick.
+        let mut pending_persists = pending_persists.into_iter();
+        loop {
+            let chunk: Vec<_> = pending_persists.by_ref().take(16).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            futures::future::join_all(chunk).await;
         }
 
         for namespace in namespaces {
@@ -4997,7 +5070,8 @@ where
             // retransmits), so it persists first like every dispatch site;
             // it is also what retries a persist an earlier site withheld on.
             let (local_actions, wire_actions) = split_local_actions(actions);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &local_actions).await;
+            // Locals to the partition dispatcher only; see the view-change
+            // sites for the rationale.
             dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
             if partition.persist_superblock_if_needed().await {
                 dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
@@ -5086,14 +5160,13 @@ where
                         shard = self.id,
                         namespace_raw = namespace.inner(),
                         peer,
-                        "partition state transfer stalled past its retry budget; \
-                         abandoning with a backed-off re-arm"
+                        "partition state transfer stalled past its retry budget; abandoning with a backed-off re-arm"
                     );
                     // Staging files are KEPT: a later attempt adopts every
                     // segment whose manifest entry still matches. The shared
                     // path charges the failure, rotates the peer, schedules
                     // the re-arm, and re-arms journal repair meanwhile.
-                    self.abandon_or_rearm_partition_transfer(partition, 0, peer)
+                    self.abandon_or_rearm_partition_transfer(partition, peer)
                         .await;
                 } else if target_accepted {
                     self.request_pending_partition_chunk(namespace.inner())
@@ -5133,11 +5206,13 @@ where
                 }
             };
             if let Some(peer) = rearm_peer {
+                let transfers_inflight = self.partition_transfers_inflight();
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
                 partition.consensus().begin_state_transfer_await();
-                self.arm_partition_transfer(partition, peer).await;
+                self.arm_partition_transfer(partition, peer, transfers_inflight)
+                    .await;
             }
         }
     }
@@ -5520,12 +5595,21 @@ where
     /// shortage is not the peer's fault) and the stage returns to Idle so
     /// journal repair keeps the gap visible meanwhile.
     #[allow(clippy::future_not_send)]
-    async fn arm_partition_transfer(&self, partition: &mut IggyPartition<B, SB>, peer: u8)
-    where
+    /// `transfers_inflight` is computed by the caller BEFORE it formed its
+    /// `&mut partition`: the counting scan takes shared borrows of every
+    /// partition, and deriving a sibling `&` to the element the caller's
+    /// protected `&mut` points at is UB under both stacked and tree borrows,
+    /// however innocuous the generated code is today.
+    async fn arm_partition_transfer(
+        &self,
+        partition: &mut IggyPartition<B, SB>,
+        peer: u8,
+        transfers_inflight: usize,
+    ) where
         B: MessageBus,
     {
         if partition.transfer.is_none()
-            && self.partition_transfers_inflight() >= Self::PARTITION_TRANSFERS_INFLIGHT_MAX
+            && transfers_inflight >= Self::PARTITION_TRANSFERS_INFLIGHT_MAX
         {
             tracing::info!(
                 shard = self.id,
@@ -5637,7 +5721,7 @@ where
                 peer = header.replica,
                 "partition transfer peer cannot serve; backing off before re-arming"
             );
-            self.abandon_or_rearm_partition_transfer(partition, header.commit_op, header.replica)
+            self.abandon_or_rearm_partition_transfer(partition, header.replica)
                 .await;
             return;
         }
@@ -5707,10 +5791,13 @@ where
         session.artifacts = entries
             .iter()
             .map(|&entry| {
-                TransferArtifact::Pending(consensus::ArtifactProgress {
-                    entry,
-                    buf: Vec::new(),
-                })
+                // Exact reservation: `entry.len` already passed the per-kind
+                // caps, and geometric growth to gigabyte sizes would copy
+                // roughly twice the bytes with a ~1.5x transient peak.
+                let mut buf = Vec::new();
+                #[allow(clippy::cast_possible_truncation)]
+                buf.reserve_exact(entry.len as usize);
+                TransferArtifact::Pending(consensus::ArtifactProgress { entry, buf })
             })
             .collect();
         session.idle_ticks = 0;
@@ -5819,7 +5906,7 @@ where
                     .then_some(index)
             });
         if let Some(index) = spill_candidate {
-            let (entry, bytes, generation, peer) = {
+            let (entry, bytes, peer, nonce) = {
                 let Some(session) = partition.transfer.as_mut() else {
                     return;
                 };
@@ -5827,11 +5914,19 @@ where
                     return;
                 };
                 let bytes = std::mem::take(&mut progress.buf);
-                (progress.entry, bytes, session.commit_op, session.peer)
+                (progress.entry, bytes, session.peer, session.nonce)
             };
             match partition.spill_transfer_segment(&entry, bytes).await {
                 Ok(meta) => {
-                    if let Some(session) = partition.transfer.as_mut() {
+                    // Nonce re-check across the spill await: a session
+                    // re-minted underneath it has a fresh (possibly empty)
+                    // artifact vec, and the stale index would panic. Pump-
+                    // serial today, but nothing enforces that.
+                    if let Some(session) = partition
+                        .transfer
+                        .as_mut()
+                        .filter(|session| session.nonce == nonce)
+                    {
                         session.artifacts[index] = TransferArtifact::Staged(meta);
                     }
                 }
@@ -5843,7 +5938,7 @@ where
                         %reason,
                         "partition transfer segment failed validation at spill"
                     );
-                    self.abandon_or_rearm_partition_transfer(partition, generation, peer)
+                    self.abandon_or_rearm_partition_transfer(partition, peer)
                         .await;
                     return;
                 }
@@ -5901,7 +5996,7 @@ where
                 namespace_raw = namespace,
                 "partition transfer artifacts failed verification; refusing install"
             );
-            self.abandon_or_rearm_partition_transfer(partition, generation, peer)
+            self.abandon_or_rearm_partition_transfer(partition, peer)
                 .await;
             return;
         };
@@ -5946,19 +6041,38 @@ where
             ) => {
                 // The partition holds no serviceable segment chain and its
                 // next append or poll would panic the shard. Fence exactly
-                // this group: drop it from the plane and the routing row so
-                // frames park (row miss reads as "not seeded yet"), then
-                // wake the reconciler, which re-materialises it from
-                // committed metadata + whatever disk state survived.
+                // this group: quarantine the directory (a failed converge
+                // sweep can leave strays that `build_partition_fresh` would
+                // never clear and the boot contiguity guard would then trip
+                // on), then retire the in-memory partition through the
+                // reconcile queue -- `IggyPartitions` mandates external
+                // removals go through `ConfirmRemove`, and a direct
+                // `remove()` here would invalidate the very `&mut` this
+                // frame still holds. The reconciler then re-materialises a
+                // fresh partition from committed metadata; its first repair
+                // floor refusal re-arms a transfer, which re-seeds the
+                // offset frontier from the offsets artifact.
                 tracing::error!(
                     shard = self.id,
                     namespace_raw = namespace,
                     %error,
-                    "partition unserviceable after failed install; fencing it for rebuild"
+                    "partition unserviceable after failed install; \
+                     quarantining its directory and fencing it for rebuild"
                 );
+                let quarantined = partition.quarantine_partition_dir().await;
+                if let Err(quarantine_error) = quarantined {
+                    // The directory survives in place; the rebuild below
+                    // re-hydrates whatever it holds, and the boot guard
+                    // refuses a holed chain rather than serving it.
+                    tracing::error!(
+                        shard = self.id,
+                        namespace_raw = namespace,
+                        error = %quarantine_error,
+                        "failed to quarantine the fenced partition directory"
+                    );
+                }
                 let target = IggyNamespace::from_raw(namespace);
-                self.plane.partitions().remove(&target);
-                self.shards_table.remove(&target);
+                self.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace: target });
                 self.signal_reconcile_wake();
             }
             Err(error) => {
@@ -5968,7 +6082,7 @@ where
                     %error,
                     "partition state transfer install failed; falling back to journal repair"
                 );
-                self.abandon_or_rearm_partition_transfer(partition, generation, peer)
+                self.abandon_or_rearm_partition_transfer(partition, peer)
                     .await;
             }
         }
@@ -5986,7 +6100,6 @@ where
     async fn abandon_or_rearm_partition_transfer(
         &self,
         partition: &mut IggyPartition<B, SB>,
-        _generation: u64,
         peer: u8,
     ) where
         B: MessageBus,
@@ -6060,6 +6173,7 @@ where
     }
 
     fn expire_idle_state_transfer_offers(&self) {
+        self.served_segment_cache.borrow_mut().expire_idle();
         // `max(1)`: the retry interval is operator-configurable, and a zero would
         // make the expiry zero, dropping every offer on the tick after it was
         // built and breaking transfers outright.
@@ -6194,8 +6308,7 @@ where
                     shard = self.id,
                     peer,
                     attempts,
-                    "metadata state transfer stalled past its retry budget; \
-                     abandoning and falling back to journal repair"
+                    "metadata state transfer stalled past its retry budget; abandoning and falling back to journal repair"
                 );
                 *self.metadata_transfer.borrow_mut() = None;
                 if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {

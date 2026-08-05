@@ -211,9 +211,15 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
     server(
         system.sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64",
-        system.partition.messages_required_to_save = "1"
+        system.partition.messages_required_to_save = "1",
+        system.segment.size = "8MiB"
     )
 )]
+// The 8 MiB segment cap makes the 64 MiB bulky seed span ~8 sealed
+// segments, so this spec also exercises the multi-artifact manifest, the
+// per-artifact spill, and the staged-segment reuse scan when the transfer
+// re-arms against the surviving primary -- the other specs are all
+// single-segment under the default 1 GiB cap.
 async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partition(
     harness: &mut TestHarness,
 ) {
@@ -236,11 +242,17 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
     harness
         .restart_node_from_clean_slate(2)
         .expect("clean-slate restart of node 2");
+    // Kill node 0 the moment node 2 CONVERTED: the transfer is then armed
+    // at node 0 but the 64 MiB pull cannot possibly finish inside the kill
+    // latency, so node 2 deterministically ends up stalling against a dead
+    // peer -- whether the descriptor made it out or not, both funnels land
+    // in the stall budget. (Gating on the serving marker instead raced the
+    // pull itself: a release-build pull finishes in a few hundred ms.)
     let deadline = Instant::now() + TRANSFER_BUDGET;
-    while !harness.node(0).stdout_contains(SERVING_MARKER) {
+    while !harness.node(2).stdout_contains(CONVERSION_MARKER) {
         assert!(
             Instant::now() < deadline,
-            "node 0 never started serving the partition transfer"
+            "node 2 never converted its refused repair floor to a transfer"
         );
         sleep(KILL_GATE_POLL).await;
     }

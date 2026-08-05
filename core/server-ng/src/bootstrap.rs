@@ -2241,33 +2241,35 @@ async fn load_partition(
     )
     .await?;
 
-    let current_offset = partition
+    let sized_end = partition
         .log
         .segments()
         .iter()
         .filter(|segment| segment.size > IggyByteSize::default())
         .map(|segment| segment.end_offset)
+        .max();
+    // An empty chain whose segment is named for a nonzero offset is the
+    // shape a state-transfer install (or its converge) plants at the group
+    // frontier after the origin GC'd everything: the file name carries the
+    // frontier, and re-minting offsets from 0 here would fork this
+    // replica's batch stamps from the rest of the group after a restart.
+    let empty_frontier = partition
+        .log
+        .segments()
+        .iter()
+        .map(|segment| segment.start_offset)
         .max()
-        .unwrap_or(0);
+        .filter(|&start| sized_end.is_none() && start > 0);
+    let current_offset = sized_end.or_else(|| empty_frontier.map(|start| start - 1));
     partition.created_at = partition_metadata.created_at;
-    if partition
-        .log
-        .segments()
-        .iter()
-        .any(|segment| segment.size > IggyByteSize::default())
-    {
-        partition.recovered_durable_offset = Some(current_offset);
-    }
-    partition.offset.store(current_offset, Ordering::Release);
-    partition
-        .dirty_offset
-        .store(current_offset, Ordering::Relaxed);
-    partition.should_increment_offset = partition
-        .log
-        .segments()
-        .iter()
-        .any(|segment| segment.size > IggyByteSize::default());
-    partition.stats.set_current_offset(current_offset);
+    partition.recovered_durable_offset = sized_end;
+    partition.installed_frontier = empty_frontier;
+    let counter = current_offset.unwrap_or(0);
+    partition.offset.store(counter, Ordering::Release);
+    partition.dirty_offset.store(counter, Ordering::Relaxed);
+    partition.should_increment_offset = current_offset.is_some();
+    partition.stats.set_current_offset(counter);
+    let current_offset = counter;
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;

@@ -131,11 +131,12 @@ pub enum ServerNgError {
     },
     #[error(
         "partition superblock at {dir} belongs to a different {field}: expected \
-         {expected}, found {found}; a copied or misplaced data directory"
+         {expected}, found {found}; a copied or misplaced data directory, or the \
+         cluster was resized without reconfiguration"
     )]
     PartitionSuperblockIdentityMismatch {
         dir: PathBuf,
-        field: &'static str,
+        field: metadata::impls::recovery::IdentityField,
         expected: u128,
         found: u128,
     },

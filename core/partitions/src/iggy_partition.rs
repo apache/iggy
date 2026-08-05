@@ -126,6 +126,15 @@ where
     /// re-persisting / re-counting them. Immutable after boot, so live
     /// traffic (always above it) is never affected.
     pub recovered_durable_offset: Option<u64>,
+    /// Where the group's offset space STARTS on this replica: everything
+    /// below it is represented by a completed state-transfer install (or by
+    /// the empty segment such an install planted at the frontier). Consulted
+    /// only by the repair floor-connect check, so an install with zero
+    /// staged segments does not force one wasted transfer round per rejoin.
+    /// Deliberately separate from [`Self::recovered_durable_offset`], which
+    /// also gates repaired-batch persistence -- overstating THAT field would
+    /// silently drop the `(commit_op, commit_max]` replay window.
+    pub installed_frontier: Option<u64>,
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Committed-only mirror of each consumer's persisted offset file: the
     /// last value this replica durably wrote per (kind, consumer id). Fed
@@ -177,7 +186,7 @@ where
     /// so a per-session counter bounded nothing and a permanent failure
     /// cycled abandon -> repair -> refusal -> re-arm at zero forever. Reset
     /// only by [`Self::note_transfer_progress`].
-    pub transfer_attempts: u32,
+    transfer_attempts: u32,
     /// CONSECUTIVE transfer failures of any class (decode, spill, install,
     /// peer-unavailable, stall exhaustion). Deliberately NOT keyed on the
     /// offered generation: a committing primary advances its generation
@@ -185,7 +194,7 @@ where
     /// deterministic local failure (ENOSPC, an undecodable artifact) looped
     /// at network round-trip rate. Reset only by
     /// [`Self::note_transfer_installed`]; drives the re-arm backoff.
-    pub transfer_failures: u32,
+    transfer_failures: u32,
     /// A scheduled transfer re-arm: try `peer` again once `after_ticks`
     /// consensus ticks elapse. Owned by the shard tick sweep; while one is
     /// pending, the repair-refusal trigger must not arm concurrently.
@@ -194,6 +203,15 @@ where
     /// simultaneous rejoiners share one manifest instead of re-reading every
     /// segment per requester. Invalidated by `purge` (same commit frontier,
     /// different bytes) and released by the shard's offer-expiry sweep.
+    /// Memoized segment-payload checksums keyed by `(start_offset, size)`.
+    /// Sealed segments are immutable, so their stamp never changes; the
+    /// active segment's growth changes `size` and thus the key. Without
+    /// this, EVERY offer build re-reads and re-hashes all retained bytes on
+    /// the pump -- and a committing primary advances `commit_op` each round,
+    /// so the offer cache alone never saves the pass. Swept against the
+    /// live chain at build time; cleared wherever segment files are
+    /// unlinked-and-recreated (purge, install, converge).
+    pub(crate) segment_checksum_cache: RefCell<std::collections::HashMap<(u64, u64), u64>>,
     pub(crate) transfer_offer_cache:
         RefCell<Option<Rc<crate::state_transfer::PartitionStateTransferOffer>>>,
 }
@@ -324,6 +342,7 @@ where
             consumer_offset_enforce_fsync: false,
             repair: None,
             recovered_durable_offset: None,
+            installed_frontier: None,
             pending_consumer_offset_commits: HashMap::new(),
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
@@ -336,6 +355,7 @@ where
             transfer_attempts: 0,
             transfer_failures: 0,
             transfer_rearm: None,
+            segment_checksum_cache: RefCell::new(std::collections::HashMap::new()),
             transfer_offer_cache: RefCell::new(None),
         };
         if single_replica {
@@ -464,10 +484,12 @@ where
     /// THIS partition's group is fenced; the rest of the node keeps serving.
     #[allow(clippy::future_not_send)]
     async fn write_superblock(&self, superblock: &SB) -> bool {
-        // No partition checkpoint exists yet, so the pairing fields stay
-        // `(0, 0)` until partition-plane state transfer introduces one.
-        // `commit_max` rides along as the recovery lower bound that state
-        // transfer will read.
+        // The pairing fields stay `(0, 0)` and `commit_max` is a dead write
+        // on this plane: nothing reads either back (`restore_partition_view`
+        // restores view/log_view only), because recovery re-derives the
+        // install floor from the installed segments at boot -- a crash after
+        // an install does not re-run the transfer. Written anyway so the
+        // record shape matches the metadata plane's.
         let state = self.consensus.vsr_state(0, 0);
         match superblock.write(&state.to_bytes()).await {
             Ok(()) => {
@@ -539,6 +561,15 @@ where
     /// consecutive-failure count.
     pub const fn note_transfer_installed(&mut self) {
         self.transfer_failures = 0;
+    }
+
+    /// Read-only view of the stall budget, for diagnostics. The counters
+    /// themselves are private: they are the anti-livelock argument, and the
+    /// docs promise exactly one resetter each -- a `pub` field would let any
+    /// future call site break that silently.
+    #[must_use]
+    pub const fn transfer_attempts(&self) -> u32 {
+        self.transfer_attempts
     }
 
     pub fn configure_consumer_offset_storage(
@@ -3312,7 +3343,11 @@ where
         // re-persisted, but the purge just deleted those bytes and offsets
         // restart at 0. Keeping it would make every post-purge batch at or
         // below the old line evict silently without ever reaching a segment.
+        // The installed frontier goes with it: the offset space genuinely
+        // restarts, so nothing "stands in" below any floor anymore.
         self.recovered_durable_offset = None;
+        self.installed_frontier = None;
+        self.segment_checksum_cache.borrow_mut().clear();
 
         // Clear consumer + consumer-group offsets (memory + disk). Collect the
         // file paths before deleting so the map guard is not held across an
@@ -3472,8 +3507,15 @@ where
             // would silently serve a holed log. Refuse and stay gap-stopped:
             // a visible stall beats invisible loss.
             let durable_end = self.recovered_durable_offset;
-            let connected = match (session.first_batch_offset, durable_end) {
-                (Some(first), Some(durable)) => first <= durable.saturating_add(1),
+            // Recovered bytes and an installed frontier both "stand in"
+            // below the floor; a window connecting to either is whole.
+            let stand_in = match (durable_end, self.installed_frontier) {
+                (Some(durable), Some(frontier)) => Some(durable.saturating_add(1).max(frontier)),
+                (Some(durable), None) => Some(durable.saturating_add(1)),
+                (None, frontier) => frontier,
+            };
+            let connected = match (session.first_batch_offset, stand_in) {
+                (Some(first), Some(bound)) => first <= bound,
                 (Some(first), None) => first == 0,
                 // No repaired batch arrived, so there is no offset anchor to
                 // verify the floor's continuum claim against. `None` is only

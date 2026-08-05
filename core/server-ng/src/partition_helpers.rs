@@ -32,8 +32,9 @@ use consensus::{LocalPipeline, VsrConsensus, VsrState};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats,
 };
-use journal::superblock::{PingPongSuperblock, SuperblockContents, SuperblockStore};
+use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
+use metadata::impls::recovery::IdentityField;
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
@@ -460,10 +461,10 @@ pub(crate) async fn open_partition_superblock(
     // materialized on this replica (a committed create it missed); the
     // superblock lives inside that directory either way.
     create_dir_all(partition_dir).await.map_err(io_error)?;
-    let superblock = PingPongSuperblock::open(partition_dir)
+    let (superblock, latest) = PingPongSuperblock::open_with_latest(partition_dir)
         .await
         .map_err(io_error)?;
-    let recovered_state = match superblock.read_latest().await.map_err(io_error)? {
+    let recovered_state = match latest {
         SuperblockContents::Present(bytes) => {
             Some(VsrState::try_from(bytes.as_slice()).map_err(|source| {
                 ServerNgError::PartitionSuperblockUndecodable {
@@ -490,18 +491,18 @@ pub(crate) async fn open_partition_superblock(
             })
         };
         if state.cluster != cluster_id {
-            return mismatch("cluster", cluster_id, state.cluster);
+            return mismatch(IdentityField::Cluster, cluster_id, state.cluster);
         }
         if state.replica_id != self_replica_id {
             return mismatch(
-                "replica_id",
+                IdentityField::ReplicaId,
                 self_replica_id.into(),
                 state.replica_id.into(),
             );
         }
         if state.replica_count != replica_count {
             return mismatch(
-                "replica_count",
+                IdentityField::ReplicaCount,
                 replica_count.into(),
                 state.replica_count.into(),
             );
@@ -720,6 +721,7 @@ pub async fn delete_partitions_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use journal::superblock::SuperblockStore;
 
     const CLUSTER: u128 = 7;
     const REPLICA: u8 = 1;
@@ -805,7 +807,7 @@ mod tests {
 
         match refused {
             Err(ServerNgError::PartitionSuperblockIdentityMismatch { field, .. }) => {
-                assert_eq!(field, "cluster");
+                assert_eq!(field, IdentityField::Cluster);
             }
             Err(other) => panic!("expected an identity mismatch, got {other}"),
             Ok(_) => panic!("a copied or misplaced partition directory must refuse boot"),

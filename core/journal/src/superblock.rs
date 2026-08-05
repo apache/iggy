@@ -195,6 +195,19 @@ impl PingPongSuperblock {
     /// # Errors
     /// I/O error if a slot file exists but cannot be read.
     pub async fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        Ok(Self::open_with_latest(dir).await?.0)
+    }
+
+    /// [`Self::open`] plus the latest recorded contents, from the SAME slot
+    /// reads `open` already performs -- boot paths that would otherwise call
+    /// `read_latest` right after `open` pay four slot reads per group
+    /// instead of two.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`]: any slot read failing at the io layer.
+    pub async fn open_with_latest(
+        dir: impl Into<PathBuf>,
+    ) -> io::Result<(Self, SuperblockContents)> {
         let dir = dir.into();
         let slot_a = read_slot(&dir.join(FILE_A)).await?;
         let slot_b = read_slot(&dir.join(FILE_B)).await?;
@@ -216,14 +229,15 @@ impl PingPongSuperblock {
         };
         let next_slot = if a_is_newest { Slot::B } else { Slot::A };
 
-        Ok(Self {
+        let store = Self {
             dir,
             next_sequence: Cell::new(latest + 1),
             next_slot: Cell::new(next_slot),
             degraded: has_unreadable_sequence(&slot_a) || has_unreadable_sequence(&slot_b),
             #[cfg(debug_assertions)]
             writing: Cell::new(false),
-        })
+        };
+        Ok((store, combine_slots(slot_a, slot_b)))
     }
 }
 

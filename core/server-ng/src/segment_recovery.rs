@@ -190,11 +190,21 @@ fn ensure_contiguous_chain(
     for pair in recovered.windows(2) {
         let previous = &pair[0].segment;
         let next = &pair[1].segment;
-        // A torn-tail segment recovered as empty has `end_offset ==
-        // start_offset` with zero size; only sized segments carry a real
-        // end to check against.
+        // A NON-tail empty segment can only be an orphan pairing: the torn-
+        // tail leniency (an index-less crash tail recovered as empty) only
+        // ever applies to the LAST element, and a size-0 segment followed by
+        // more chain is exactly what a failed converge rebuild leaves behind.
+        // Skipping it here was the guard's blind spot.
         if previous.size == IggyByteSize::default() {
-            continue;
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                empty_start = previous.start_offset,
+                next_start = next.start_offset,
+                "recovered chain holds an empty non-tail segment; refusing to serve past it"
+            );
+            return Err(IggyError::CannotReadPartitions.into());
         }
         if next.start_offset != previous.end_offset + 1 {
             error!(
