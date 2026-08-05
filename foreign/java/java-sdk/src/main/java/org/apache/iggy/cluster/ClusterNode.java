@@ -17,26 +17,16 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.cluster;
 
-import org.apache.iggy.cluster.ClusterMetadata;
-import org.apache.iggy.system.ClientInfo;
-import org.apache.iggy.system.ClientInfoDetails;
-import org.apache.iggy.system.Stats;
-
-import java.util.List;
-
-public interface SystemClient {
-
-    Stats getStats();
-
-    ClusterMetadata getClusterMetadata();
-
-    ClientInfoDetails getMe();
-
-    ClientInfoDetails getClient(Long clientId);
-
-    List<ClientInfo> getClients();
-
-    String ping();
-}
+/**
+ * A single node in the cluster roster.
+ *
+ * @param name      the node name
+ * @param ip        the node IP address or hostname
+ * @param endpoints the per-transport ports of the node
+ * @param role      the node role
+ * @param status    the node status
+ */
+public record ClusterNode(
+        String name, String ip, TransportEndpoints endpoints, ClusterNodeRole role, ClusterNodeStatus status) {}
