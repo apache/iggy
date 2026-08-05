@@ -24,6 +24,7 @@ Apache Iggy is the persistent message streaming platform written in Rust, suppor
 
 ```bash
 # Using uv
+uv venv # if not already created
 uv add apache-iggy
 
 # Using pip
@@ -38,25 +39,91 @@ pip install apache-iggy
 
 ### Local Development
 
-```bash
-# Start server for testing using docker
-docker compose -f docker-compose.test.yml up --build
+1. Build a project for development
 
-# Or use cargo
-cargo run --bin iggy-server -- --with-default-root-credentials --fresh
+   With `uv`:
 
-# Using uv:
-uv sync --all-extras
-uv run maturin develop
-uv run pytest tests/ -v # Run tests (requires iggy-server running)
+   > Create a venv:
+   >
+   > ```bash
+   > uv venv
+   > ```
+   >
+   > Sync the environment without updating it:
+   >
+   > ```bash
+   > uv sync --frozen --all-extras --no-install-project
+   > ```
+   >
+   > Build the project - this runs cargo build and performs an editable install:
+   >
+   > ```bash
+   > uv run maturin develop
+   > ```
 
-# Using pip:
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[all]"
-maturin develop
-pytest tests/ -v # Run tests (requires iggy-server running)
-```
+   With `pip`:
+
+   > Create a venv:
+   >
+   > ```bash
+   > python3 -m venv .venv
+   > ```
+   >
+   > Activate the venv:
+   >
+   > ```bash
+   > source .venv/bin/activate
+   > ```
+   >
+   > Install the dependencies with `pip`:
+   >
+   > ```bash
+   > pip install -e ".[all]"
+   > ```
+
+2. Run the server to be able to run the tests
+
+   ```bash
+   cargo run --bin iggy-server -- --with-default-root-credentials --fresh
+   ```
+
+3. Run the tests
+
+   `uv`:
+
+   ```bash
+   uv run --no-sync pytest tests/ -v
+   ```
+
+   `pip`:
+
+   ```bash
+   pytest tests/ -v # make sure iggy-server is running and the venv is activated
+   ```
+
+4. To update the stubs, use
+
+   ```bash
+   cargo run --bin stub_gen
+   ```
+
+5. Before making a commit, make sure you've ran these commands in `foreign/python`, otherwise the precommit / pre-push hooks will fail these checks:
+
+   ```bash
+   ruff format .
+   ```
+
+   ```bash
+   ruff check --fix .
+   ```
+
+   ```bash
+   cargo fmt --all
+   ```
+
+   ```bash
+   cargo clippy --all-targets --all-features -- -D warnings
+   ```
 
 ## Examples
 
@@ -64,7 +131,7 @@ Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examp
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/foreign/python/CONTRIBUTING.md) for development setup and guidelines.
+See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
