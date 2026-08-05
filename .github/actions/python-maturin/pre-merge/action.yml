@@ -82,6 +82,9 @@ runs:
         echo "Running cargo fmt for Python extension..."
         cargo fmt --manifest-path Cargo.toml -- --check
 
+        echo "Running cargo clippy for Python extension..."
+        cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+
         echo "Running pyrefly on SDK..."
         uv run pyrefly check "$DIR_SDK"
         echo "pyrefly version: $(uv run pyrefly --version)"

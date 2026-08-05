@@ -265,6 +265,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                         &mut msgs,
                     )
                     .await
+                    .map(|_| ())
             }
             POLL_MESSAGES_CODE => client
                 .poll_messages(

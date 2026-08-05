@@ -745,6 +745,7 @@ mod tests {
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,
+            advertised_addresses: Vec::new(),
             replica_id,
             ports: TransportPorts {
                 tcp: Some(8090 + u16::from(replica_id)),

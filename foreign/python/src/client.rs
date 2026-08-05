@@ -37,7 +37,7 @@ use crate::consumer::{
 use crate::identifier::PyIdentifier;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
@@ -898,8 +898,11 @@ impl IggyClient {
     }
 
     /// Sends a list of messages to the specified topic.
-    /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    /// Returns a SendMessagesResponse carrying the per-partition commit
+    /// confirmations, or a PyRuntimeError on failure. The confirmation list is
+    /// empty when the server reports no offsets, and the legacy server never
+    /// reports any.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
         py: Python<'a>,
@@ -926,11 +929,11 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
+            let response = inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(())
+            Ok(PySendMessagesResponse::from(response))
         })
     }
 

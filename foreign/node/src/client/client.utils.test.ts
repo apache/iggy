@@ -18,10 +18,9 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleResponse, deserializeVoidResponse, deserializeStatusResponse } from './client.utils.js';
+import { handleResponse, deserializeVoidResponse } from './client.utils.js';
 
 const SUCCESS = 0;
-const ERROR = 1;
 
 describe('handleResponse', () => {
 
@@ -45,26 +44,6 @@ describe('handleResponse', () => {
 
     const r = handleResponse(buf);
     assert.equal(deserializeVoidResponse(r), true);
-  });
-
-});
-
-describe('deserializeStatusResponse', () => {
-
-  it('returns true when status is SUCCESS and data is empty', () => {
-    const r = { status: SUCCESS, length: 0, data: Buffer.alloc(0) };
-    assert.equal(deserializeStatusResponse(r), true);
-  });
-
-  it('returns true when status is SUCCESS and data is non-empty (e.g. SendMessages server payload)', () => {
-    // Key difference from deserializeVoidResponse: non-empty data is accepted.
-    const r = { status: SUCCESS, length: 4, data: Buffer.from([1, 2, 3, 4]) };
-    assert.equal(deserializeStatusResponse(r), true);
-  });
-
-  it('returns false when status is an error code', () => {
-    const r = { status: ERROR, length: 0, data: Buffer.alloc(0) };
-    assert.equal(deserializeStatusResponse(r), false);
   });
 
 });

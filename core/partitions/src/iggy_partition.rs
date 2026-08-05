@@ -43,8 +43,11 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
+use iggy_binary_protocol::responses::messages::{
+    SendMessagesConfirmationResponse, SendMessagesResponse,
+};
 use iggy_binary_protocol::{
-    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireIdentifier,
+    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier,
 };
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
@@ -1499,9 +1502,16 @@ where
             // very different risk:
             // - below the sequencer: a duplicate delivery (parked-frame
             //   redispatch, retransmit echo) of an op this primary already
-            //   sequenced. Apply is keyed by `header.op` and the primary
-            //   never advances its sequencer post-apply, so proceeding is
-            //   idempotent-safe; log loudly for diagnosis.
+            //   sequenced. Proceeding is safe only because the two gates above
+            //   already returned for every copy this replica can still see:
+            //   `fence_old_prepare_by_commit` drops the executed ops and
+            //   `journal_holds_op` the resident ones, so reaching here means
+            //   the journal lacks this op and has to be given it. Apply is not
+            //   idempotent on its own for a produce: `append_messages`
+            //   re-stamps from the local dirty counter and the journal's op
+            //   index is last-write-wins, so appending an op the journal
+            //   already holds would mint a second copy at fresh offsets and
+            //   orphan the first. Log loudly for diagnosis.
             // - above the sequencer: journaling an op the sequencer has not
             //   assigned yet means the next local assignment would collide
             //   with it. Unreachable today (view fences run first, one
@@ -2168,16 +2178,21 @@ where
         }
 
         let mut failed_commit = false;
-        let committed_visible_offsets = self.resolve_committed_visible_offsets(&drained).await;
+        // Must run BEFORE the commit loop: `commit_messages` evicts the
+        // committed prefix, after which an entry survives only in the bounded
+        // repair ring - and not even there on a single replica, which keeps no
+        // ring at all. A miss degrades to a successful send carrying no
+        // confirmation, a legal answer no client can tell from a real one.
+        let committed_batch_stats = self.resolve_committed_visible_offsets(&drained);
         let mut messages_committed = false;
 
-        for entry in drained {
+        for (entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
             let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
                     prepare_header,
                     &mut messages_committed,
-                    &committed_visible_offsets,
+                    batch_stats,
                     &mut failed_commit,
                     config,
                 )
@@ -2228,10 +2243,13 @@ where
             // reply. Emitting it would push an unrequested frame onto a real
             // client's lockstep reply stream if the sentinel ever routed there.
             if send_client_replies && !is_auto_commit_client(prepare_header.client) {
-                let reply = build_reply_message(
-                    &prepare_header,
-                    &committed_reply_body(prepare_header.operation),
-                );
+                let body = match prepare_header.operation {
+                    Operation::SendMessages => {
+                        send_messages_reply_body(prepare_header.namespace, batch_stats)
+                    }
+                    operation => committed_reply_body(operation),
+                };
+                let reply = build_reply_message(&prepare_header, &body);
                 let reply_buffers = reply.into_generic().into_frozen();
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
@@ -2269,45 +2287,47 @@ where
         self.drain_request_queue_into_prepares(drained_count).await;
     }
 
-    async fn resolve_committed_visible_offsets(
+    /// Batch stats for each drained entry, positionally parallel to `drained`.
+    /// Every entry contributes exactly one slot (`None` for the operations that
+    /// carry no batch), which is what makes the pairing correct by
+    /// construction; keying on `op` instead would let a lookup miss attribute
+    /// one batch's offsets to another entry's reply.
+    fn resolve_committed_visible_offsets(
         &self,
         drained: &[PipelineEntry],
-    ) -> HashMap<u64, CommittedBatchStats> {
-        let mut committed_visible_offsets = HashMap::new();
-
-        for entry in drained {
-            if entry.header.operation != Operation::SendMessages {
-                continue;
-            }
-
-            match self.committed_batch_stats_for_prepare(&entry.header).await {
-                Ok(Some(batch_stats)) => {
-                    committed_visible_offsets.insert(entry.header.op, batch_stats);
+    ) -> Vec<Option<CommittedBatchStats>> {
+        drained
+            .iter()
+            .map(|entry| {
+                if entry.header.operation != Operation::SendMessages {
+                    return None;
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(
-                        target: "iggy.partitions.diag",
-                        plane = "partitions",
-                        replica_id = self.consensus.replica(),
-                        namespace_raw = self.namespace().inner(),
-                        op = entry.header.op,
-                        operation = ?entry.header.operation,
-                        %error,
-                        "failed to resolve committed visible offset for partition entry"
-                    );
-                }
-            }
-        }
 
-        committed_visible_offsets
+                match self.committed_batch_stats_for_prepare(&entry.header) {
+                    Ok(batch_stats) => batch_stats,
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            replica_id = self.consensus.replica(),
+                            namespace_raw = self.namespace().inner(),
+                            op = entry.header.op,
+                            operation = ?entry.header.operation,
+                            %error,
+                            "failed to resolve committed visible offset for partition entry"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     async fn commit_partition_entry(
         &mut self,
         prepare_header: PrepareHeader,
         messages_committed: &mut bool,
-        committed_visible_offsets: &HashMap<u64, CommittedBatchStats>,
+        batch_stats: Option<CommittedBatchStats>,
         failed_commit: &mut bool,
         config: &PartitionsConfig,
     ) -> bool {
@@ -2331,17 +2351,18 @@ where
                     *messages_committed = true;
                 }
 
-                if let Some(batch_stats) = committed_visible_offsets.get(&prepare_header.op) {
+                if let Some(batch_stats) = batch_stats {
+                    let end_offset = batch_stats.end_offset();
                     // A repaired batch at or below the boot-time recovered
                     // durable offset was already counted (and persisted)
                     // before the restart; skip it. Live traffic always sits
                     // above the (immutable) line.
                     if self
                         .recovered_durable_offset
-                        .is_none_or(|durable| batch_stats.end_offset > durable)
+                        .is_none_or(|durable| end_offset > durable)
                     {
-                        self.offset.store(batch_stats.end_offset, Ordering::Release);
-                        self.stats.set_current_offset(batch_stats.end_offset);
+                        self.offset.store(end_offset, Ordering::Release);
+                        self.stats.set_current_offset(end_offset);
                         // Advance the aggregate stats with the visible offset. Disk
                         // persistence is threshold-gated in `commit_messages`, which
                         // must not also touch these counters or committed messages
@@ -2375,13 +2396,36 @@ where
         }
     }
 
-    async fn committed_batch_stats_for_prepare(
+    /// Read the committed batch's own stamps back out of the journal.
+    ///
+    /// INVARIANT: two replicas can never report a different `base_offset` for
+    /// the same batch. Backups do re-stamp from their own `dirty_offset` in
+    /// `append_messages`, so the guarantee is not "the bytes are replicated";
+    /// it rests on three mechanisms. The backup gap check drops any prepare
+    /// that is not `current_op + 1`, so every replica stamps a partition's
+    /// batches in the primary's order off the same counter.
+    /// `append_repaired_send_messages` journals a repaired prepare with its
+    /// embedded stamps instead of re-stamping, so filling a hole out of live
+    /// order cannot re-mint offsets. And that same path advances the counter
+    /// with `dirty.max(last_offset)`, so a repaired window below the recovered
+    /// durable end cannot rewind it and hand the next live batch offsets that
+    /// were already issued.
+    ///
+    /// `repair_entry` is deliberate: it never awaits, and it falls back to the
+    /// evicted ring, which the resident-only lookup does not.
+    fn committed_batch_stats_for_prepare(
         &self,
         prepare_header: &PrepareHeader,
     ) -> Result<Option<CommittedBatchStats>, IggyError> {
-        let Some(entry) = self.log.journal().inner.entry(prepare_header).await else {
-            return Err(IggyError::InvalidCommand);
-        };
+        let entry = self
+            .log
+            .journal()
+            .inner
+            .repair_entry(prepare_header.op)
+            // A resident slot can read back empty, which the caller must treat
+            // as a miss and not as a zero-message batch.
+            .filter(|entry| !entry.is_empty())
+            .ok_or(IggyError::InvalidCommand)?;
         // Trusted (no batch-hash): the entry was read back from this replica's
         // own journal, where it was stamped/validated at append; only header
         // stats are needed, so re-hashing the ~1 MiB blob is redundant.
@@ -2393,7 +2437,7 @@ where
         }
 
         Ok(Some(CommittedBatchStats {
-            end_offset: batch.header.base_offset + u64::from(message_count) - 1,
+            base_offset: batch.header.base_offset,
             message_count,
             size_bytes: batch.header.total_size() as u64,
         }))
@@ -3397,11 +3441,14 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
     .operation
 }
 
-/// Success reply body for a committed partition op. Result-framed ops
-/// (`Operation::is_result_framed`; on this plane the consumer-offset ops,
-/// whose rejections ship typed errors) must carry an explicit empty result
-/// section (`[count = 0]`) so the SDK's framed decode does not misread the
-/// payload; every other partition op replies with an empty body.
+/// Success reply body for a committed partition op other than `SendMessages`
+/// (which confirms its offsets through [`send_messages_reply_body`]).
+///
+/// Result-framed ops (`Operation::is_result_framed`; on this plane the
+/// consumer-offset ops, whose rejections ship typed errors) must carry an
+/// explicit empty result section (`[count = 0]`) so the SDK's framed decode
+/// does not misread the payload; every other partition op replies with an
+/// empty body.
 const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
     if operation.is_result_framed() {
         bytes::Bytes::from_static(&[0, 0, 0, 0])
@@ -3410,14 +3457,61 @@ const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
     }
 }
 
+// The confirmation payload below ships raw, with no result section ahead of it.
+// If `SendMessages` ever became result-framed, a batch with confirmations would
+// misdecode into a spurious typed error, which is loud; a batch without them
+// would decode as a clean success, which is silent.
+const _: () = assert!(!Operation::SendMessages.is_result_framed());
+
+/// One confirmation for the committed batch, or `count = 0` when its offsets
+/// could not be resolved (missing or undecodable journal entry, or an empty
+/// batch).
+///
+/// `count = 0` is a first-class answer meaning "committed, no offsets to
+/// report", not a decode problem: the SDK reads it as an empty list, exactly as
+/// it reads the legacy server's empty body. That is also why absence must stay
+/// absent - a placeholder entry would carry a valid stream/topic/partition/
+/// offset tuple and be indistinguishable from a real commit at offset 0.
+#[allow(clippy::cast_possible_truncation)]
+fn send_messages_reply_body(
+    namespace: u64,
+    batch_stats: Option<CommittedBatchStats>,
+) -> bytes::Bytes {
+    let Some(stats) = batch_stats else {
+        return bytes::Bytes::from_static(&[0, 0, 0, 0]);
+    };
+    let namespace = IggyNamespace::from_raw(namespace);
+    SendMessagesResponse {
+        confirmations: vec![SendMessagesConfirmationResponse {
+            // `IggyNamespace` packs the ids into 12/12/20 bits, so each
+            // component fits a `u32` by construction.
+            stream_id: namespace.stream_id() as u32,
+            topic_id: namespace.topic_id() as u32,
+            partition_id: namespace.partition_id() as u32,
+            base_offset: stats.base_offset,
+        }],
+    }
+    .to_bytes()
+}
+
 /// Committed-batch accounting surfaced at commit time so the aggregate stats
 /// (`messages_count`, `size_bytes`) advance with the visible offset rather than
-/// waiting on the threshold-gated disk persist.
+/// waiting on the threshold-gated disk persist, and so the `SendMessages` reply
+/// can confirm where the batch landed.
 #[derive(Clone, Copy)]
 struct CommittedBatchStats {
-    end_offset: u64,
+    base_offset: u64,
     message_count: u32,
     size_bytes: u64,
+}
+
+impl CommittedBatchStats {
+    /// Offset of the batch's last message. The batch carries a contiguous
+    /// offset run, and the sole constructor rejects an empty one, so the
+    /// subtraction cannot underflow.
+    fn end_offset(self) -> u64 {
+        self.base_offset + u64::from(self.message_count) - 1
+    }
 }
 
 /// Fold one `SendMessages` batch's accounting into a running `JournalInfo`,
@@ -4710,6 +4804,64 @@ mod tests {
         partition.complete_repair(&repair_config()).await;
 
         assert_eq!(partition.consensus().commit_min(), 0);
+    }
+
+    fn batch_stats(base_offset: u64, message_count: u32) -> CommittedBatchStats {
+        CommittedBatchStats {
+            base_offset,
+            message_count,
+            size_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn given_send_messages_when_offsets_resolved_should_confirm_base_offset() {
+        let namespace = IggyNamespace::new(3, 7, 5);
+        let stats = batch_stats(42, 3);
+
+        let body = send_messages_reply_body(namespace.inner(), Some(stats));
+        let (response, consumed) = SendMessagesResponse::decode(&body).unwrap();
+
+        assert_eq!(consumed, body.len());
+        assert_eq!(
+            response.confirmations,
+            vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 7,
+                partition_id: 5,
+                base_offset: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn given_send_messages_when_offsets_unavailable_should_reply_zero_confirmations() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let body = send_messages_reply_body(namespace.inner(), None);
+
+        assert_eq!(&body[..], &[0, 0, 0, 0]);
+        let (response, _) = SendMessagesResponse::decode(&body).unwrap();
+        assert!(response.confirmations.is_empty());
+    }
+
+    #[test]
+    fn given_batch_stats_when_end_offset_derived_should_span_the_message_run() {
+        assert_eq!(batch_stats(9, 1).end_offset(), 9);
+        assert_eq!(batch_stats(9, 4).end_offset(), 12);
+    }
+
+    #[test]
+    fn given_result_framed_operation_when_committed_should_reply_empty_result_section() {
+        assert_eq!(
+            &committed_reply_body(Operation::StoreConsumerOffset2)[..],
+            &[0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn given_unframed_operation_when_committed_should_reply_empty_body() {
+        assert!(committed_reply_body(Operation::DeleteSegments).is_empty());
     }
 }
 
