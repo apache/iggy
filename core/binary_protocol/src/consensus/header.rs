@@ -1413,9 +1413,25 @@ pub struct StateTransferTargetHeader {
     /// Serving primary's applied frontier (`commit_min`) when the descriptor
     /// was built. The receiver's tail repair targets past this.
     pub commit_op: u64,
+    /// Serving replica's `commit_max` when the descriptor was built.
+    ///
+    /// A receiver refuses an offer from a replica that knows LESS than it does:
+    /// without this the descriptor carried no proof of the sender's own
+    /// progress, and a phantom view-0 primary (a group whose directory vanished
+    /// boots `init()` rather than `init_as_backup()`, comes up Normal at view 0,
+    /// and an empty log is trivially caught up) could hand a data-holding
+    /// rejoiner an empty offer that unlinks its chain.
+    pub commit_max: u64,
     pub namespace: u64,
     pub available: u8,
-    pub reserved: [u8; 95],
+    /// Set on an `available == 0` refusal that means "not right now" rather than
+    /// "this node is broken": the requester then re-arms on a flat interval
+    /// instead of charging its consecutive-failure count, whose exponential
+    /// backoff climbs to 1024x the retry interval and is reset only by a
+    /// completed install. A serving primary momentarily behind its own frontier
+    /// is the common case under produce load.
+    pub unavailable_transient: u8,
+    pub reserved: [u8; 86],
 }
 const _: () = {
     assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
@@ -1423,7 +1439,7 @@ const _: () = {
         offset_of!(StateTransferTargetHeader, nonce)
             == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 86]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {
@@ -1448,6 +1464,11 @@ impl ConsensusHeader for StateTransferTargetHeader {
         if self.available > 1 {
             return Err(ConsensusError::InvalidField(
                 "available must be 0 or 1".to_string(),
+            ));
+        }
+        if self.unavailable_transient > 1 {
+            return Err(ConsensusError::InvalidField(
+                "unavailable_transient must be 0 or 1".to_string(),
             ));
         }
         // Unavailable is a bare refusal; a manifest body on it would be

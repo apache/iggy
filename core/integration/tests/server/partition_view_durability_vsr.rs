@@ -52,6 +52,9 @@ const MESSAGES_COUNT: u32 = 10;
 /// then the restarted node's probe and repair), and CI runners are slow. 60s bounds
 /// the worst case without hanging the suite.
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Boot line reporting the `(view, log_view)` a partition group restored from its
+/// superblock: the recovered replica's own account of what it read back.
+const RESTORED_VIEW_MARKER: &str = "restored partition view from its superblock";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
@@ -152,18 +155,52 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
         .start()
         .expect("restart the survivor (node 2)");
 
-    // The reformed cluster must serve the pre-crash batch again, proving the
-    // partition group is live under its recovered view.
-    wait_until_partition_serves(harness, &[0, 1, 2]).await;
+    // NODE 2 specifically must serve the pre-crash batch: the helper returns on
+    // the first node that answers, and nodes 0 and 1 were not restarted, so
+    // asking the whole set would never contact the node under test.
+    wait_until_partition_serves(harness, &[2]).await;
 
-    // The advanced view survived the survivor's own restart: re-read its partition
-    // superblock once resettled and confirm it did not regress toward a fresh 0.
-    let view_after = wait_for_advanced_partition_view(harness, 2).await;
+    // The recovered replica's own BEHAVIOR, not the file's contents: the
+    // superblock is read only at boot and written only when the persist gate
+    // fires, so re-reading it here would return the pre-restart record even if
+    // recovery were broken and node 2 came back at view 0. Node 2's boot line
+    // reports the view it actually restored, so it must name the recorded one.
+    let restored = restored_partition_view(harness, 2)
+        .expect("node 2 must log the partition view it restored from its superblock");
     assert!(
-        view_after.view >= view_before.view && view_after.log_view >= view_before.log_view,
-        "the durable partition view must survive node 2's restart without regressing: \
-         before={view_before:?}, after={view_after:?}"
+        restored.0 >= view_before.view && restored.1 >= view_before.log_view,
+        "node 2 restored (view {}, log_view {}) but its superblock recorded {view_before:?}; \
+         a replica that resumes below its recorded view can re-enter a view it already acted in",
+        restored.0,
+        restored.1
     );
+}
+
+/// `(view, log_view)` the node reports restoring at boot, parsed out of the
+/// structured fields of its restore line. `None` while the line is absent.
+///
+/// The stdout log is truncated per process start, so a value read after a
+/// restart was logged by the new process.
+fn restored_partition_view(harness: &TestHarness, node: usize) -> Option<(u32, u32)> {
+    let log = harness.node(node).stdout_plain();
+    log.lines()
+        .filter(|line| line.contains(RESTORED_VIEW_MARKER))
+        .filter_map(|line| {
+            // Leading space so the `view` key cannot match inside `log_view`.
+            let view = field(line, " view=")?;
+            let log_view = field(line, " log_view=")?;
+            Some((view, log_view))
+        })
+        .max()
+}
+
+/// Value of a space-prefixed `key=<u32>` tracing field.
+fn field(line: &str, key: &str) -> Option<u32> {
+    let start = line.find(key)? + key.len();
+    line[start..]
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
 }
 
 /// Connect a root-authenticated TCP client to a specific node.

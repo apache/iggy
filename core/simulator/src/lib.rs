@@ -47,7 +47,8 @@ use server_common::Message;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::CONSENSUS_TICK_INTERVAL;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 
@@ -85,6 +86,14 @@ pub struct SimReplica {
     /// yet the run stays byte-identical on replay. See
     /// `VsrConsensus::set_incarnation`.
     pub metadata_incarnation: u128,
+    /// One durable superblock per partition group this replica has materialised,
+    /// harness-owned for the same reason as the metadata one: the bytes survive
+    /// the shards being dropped and rebuilt, so a re-materialised group recovers
+    /// the `(view, log_view)` it recorded instead of re-entering view 0. Without
+    /// a store the persist gate marks every view durable without writing, which
+    /// leaves the gate, its write-failure fence, and view recovery all
+    /// unexercised.
+    pub partition_superblocks: RefCell<HashMap<IggyNamespace, Rc<SimSuperblock>>>,
     /// Keeps each pump's stop channel alive; dropping one would end that
     /// pump gracefully, which is reserved for future shutdown/restart
     /// tests (crash uses `DetExecutor::abort` instead).
@@ -325,6 +334,7 @@ impl Simulator {
                 superblock,
                 metadata_journal,
                 metadata_incarnation,
+                partition_superblocks: RefCell::new(HashMap::new()),
                 _stop_txs: stop_txs,
                 pump_tasks,
             });
@@ -364,7 +374,23 @@ impl Simulator {
             }
             let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
             let owner = calculate_shard_assignment(&namespace, shard_count);
-            replica.shards[usize::from(owner)].init_partition(namespace);
+            // One store per group, minted on first materialisation and reused on
+            // every later one, so the recorded view survives a replica restart.
+            let superblock = Rc::clone(
+                replica
+                    .partition_superblocks
+                    .borrow_mut()
+                    .entry(namespace)
+                    .or_default(),
+            );
+            let recovered_state = superblock
+                .read_latest_sync()
+                .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
+            replica.shards[usize::from(owner)].init_partition(
+                namespace,
+                Some(superblock),
+                recovered_state,
+            );
             // Commit the namespace before stamping the rows: a partition the
             // metadata plane never heard of is a shape production cannot
             // produce, and the shard refuses to serve client traffic whose
@@ -749,6 +775,11 @@ impl Simulator {
         // incarnation and still in flight is ignored. Deterministic, so replay stays
         // byte-identical.
         let metadata_incarnation = self.replicas[idx].metadata_incarnation + 1;
+        // Partition superblocks carry forward too: a group re-materialised after
+        // the restart must recover its recorded view from the same store, exactly
+        // as a rebooted server-ng partition reads the record in its directory.
+        let partition_superblocks =
+            std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
 
         // Recover the durable VSR state from the retained superblock before the
         // rebuild, as production reads it in restore_metadata_consensus.
@@ -811,6 +842,7 @@ impl Simulator {
             superblock,
             metadata_journal,
             metadata_incarnation,
+            partition_superblocks: RefCell::new(partition_superblocks),
             _stop_txs: stop_txs,
             pump_tasks,
         };

@@ -94,6 +94,16 @@ impl ChunkProgress for ArtifactProgress {
     }
 
     fn extend_from_chunk(&mut self, payload: &[u8]) {
+        // Reserved on the FIRST chunk of this artifact, not when the manifest is
+        // accepted: reserving every artifact up front is an eager address-space
+        // commit of the whole manifest, and a receiver only ever pulls one
+        // artifact at a time. Exact rather than geometric -- `entry.len` already
+        // passed the caller's per-kind caps, and doubling to gigabyte sizes would
+        // copy roughly twice the bytes at a ~1.5x transient peak.
+        if self.buf.is_empty() {
+            #[allow(clippy::cast_possible_truncation)]
+            self.buf.reserve_exact(self.entry.len as usize);
+        }
         self.buf.extend_from_slice(payload);
     }
 }

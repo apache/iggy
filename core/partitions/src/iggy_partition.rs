@@ -181,11 +181,13 @@ where
     /// refused); tail repair takes over at install. See
     /// [`PartitionTransferSession`].
     pub transfer: Option<PartitionTransferSession>,
-    /// Consecutive transfer stall rounds, across session re-mints. NOT in the
-    /// session: three of four metadata arming sites re-minted their session,
-    /// so a per-session counter bounded nothing and a permanent failure
-    /// cycled abandon -> repair -> refusal -> re-arm at zero forever. Reset
-    /// only by [`Self::note_transfer_progress`].
+    /// Consecutive transfer stall rounds WITHIN one recovery attempt. NOT in the
+    /// session: three of four metadata arming sites re-minted their session, so
+    /// a per-session counter bounded nothing and a permanent failure cycled
+    /// abandon -> repair -> refusal -> re-arm at zero forever. Reset by
+    /// [`Self::note_transfer_progress`] and by
+    /// [`Self::note_transfer_rearm_scheduled`]; livelock across attempts is
+    /// bounded by [`Self::transfer_failures`] and its exponential backoff.
     transfer_attempts: u32,
     /// CONSECUTIVE transfer failures of any class (decode, spill, install,
     /// peer-unavailable, stall exhaustion). Deliberately NOT keyed on the
@@ -199,19 +201,24 @@ where
     /// consensus ticks elapse. Owned by the shard tick sweep; while one is
     /// pending, the repair-refusal trigger must not arm concurrently.
     pub transfer_rearm: Option<PendingTransferRearm>,
+    /// Memoized segment-payload checksum state, keyed by segment base offset.
+    /// Sealed segments are immutable, so their stamp never changes; the active
+    /// segment extends its own hasher over the bytes it gained. Without this,
+    /// EVERY offer build re-reads and re-hashes all retained bytes on the pump
+    /// -- and a committing primary advances `commit_op` each round, so the offer
+    /// cache alone never saves the pass. Swept against the live chain at build
+    /// time; cleared wherever segment files are unlinked-and-recreated (purge,
+    /// install, converge).
+    pub(crate) segment_checksum_cache:
+        RefCell<std::collections::HashMap<u64, crate::state_transfer::SegmentChecksumMemo>>,
+    /// Receiving-side memo of the last staged-segment reuse scan, so a peer
+    /// rotation against the same segment set does not re-read and re-walk every
+    /// staged file. See [`crate::state_transfer::ReuseScanMemo`].
+    pub(crate) reuse_scan_memo: RefCell<Option<crate::state_transfer::ReuseScanMemo>>,
     /// Serving-side offer cache, keyed by the `commit_op` it was built at, so
     /// simultaneous rejoiners share one manifest instead of re-reading every
     /// segment per requester. Invalidated by `purge` (same commit frontier,
     /// different bytes) and released by the shard's offer-expiry sweep.
-    /// Memoized segment-payload checksums keyed by `(start_offset, size)`.
-    /// Sealed segments are immutable, so their stamp never changes; the
-    /// active segment's growth changes `size` and thus the key. Without
-    /// this, EVERY offer build re-reads and re-hashes all retained bytes on
-    /// the pump -- and a committing primary advances `commit_op` each round,
-    /// so the offer cache alone never saves the pass. Swept against the
-    /// live chain at build time; cleared wherever segment files are
-    /// unlinked-and-recreated (purge, install, converge).
-    pub(crate) segment_checksum_cache: RefCell<std::collections::HashMap<(u64, u64), u64>>,
     pub(crate) transfer_offer_cache:
         RefCell<Option<Rc<crate::state_transfer::PartitionStateTransferOffer>>>,
 }
@@ -356,6 +363,7 @@ where
             transfer_failures: 0,
             transfer_rearm: None,
             segment_checksum_cache: RefCell::new(std::collections::HashMap::new()),
+            reuse_scan_memo: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
         };
         if single_replica {
@@ -561,6 +569,19 @@ where
     /// consecutive-failure count.
     pub const fn note_transfer_installed(&mut self) {
         self.transfer_failures = 0;
+    }
+
+    /// A fresh re-arm is scheduled: the stall budget starts over for it.
+    ///
+    /// Carrying an exhausted budget into the next attempt left every later
+    /// session with a single retry-interval window to land its first response --
+    /// against a re-arm backoff climbing to 1024x, and a serving side that
+    /// hashes retained bytes before it can answer, so a slow first response is
+    /// ordinary rather than a stall. The budget bounds consecutive stalls within
+    /// one attempt; `transfer_failures` and its backoff are what bound livelock
+    /// across attempts.
+    pub const fn note_transfer_rearm_scheduled(&mut self) {
+        self.transfer_attempts = 0;
     }
 
     /// Read-only view of the stall budget, for diagnostics. The counters
@@ -3199,6 +3220,15 @@ where
     /// (see `rotate_segment`); falls back to the config-derived path for
     /// in-memory partitions with no directory.
     ///
+    /// Both files are opened through `SegmentStorage::new` with
+    /// `file_exists = false`, which TRUNCATES them. That is load-bearing, not
+    /// incidental: this offset may already have an `.index` on disk (a crash
+    /// between the state-transfer install's index-rename and log-rename loops
+    /// leaves final-name indexes with no logs, and the boot sweep only reaches
+    /// the ones still orphaned at startup). The `partitions`-side writers with
+    /// the same names do NOT truncate, so a recreate path that opened them
+    /// directly would read index entries from a previous generation.
+    ///
     /// # Errors
     /// If the segment's log / index file cannot be created.
     pub(crate) async fn install_empty_segment(
@@ -3284,7 +3314,12 @@ where
     /// `PurgeTopic` advances the committed generation and triggers a fresh pass).
     ///
     /// # Errors
-    /// If the replacement segment's log / index file cannot be created.
+    /// If the replacement segment's log / index file cannot be created. Every
+    /// segment is already drained by then, so an `Err` leaves a partition with
+    /// no serviceable chain: the caller must FENCE it (quarantine + retire for
+    /// the reconciler to rebuild), exactly as the state-transfer install's
+    /// `ConvergeFailed` arm does, or the next append panics on
+    /// `active_segment()`.
     pub async fn purge(
         &mut self,
         config: &PartitionsConfig,
@@ -3329,6 +3364,25 @@ where
                     }
                 }
             }
+        }
+
+        // An in-flight state transfer was pulling the PRE-purge state: its
+        // staged segments hold data this purge just deleted, and letting the
+        // session complete renames it back in -- durably, because the install
+        // takes `max(offer generation, applied)` and this purge already stamped
+        // the newer generation, so the reconciler's purge gate never re-fires
+        // and the resurrected data outlives the process. Drop the session,
+        // cancel the scheduled re-arm, release the transfer stage so the
+        // ordinary triggers can arm a fresh one, and sweep the staged bytes.
+        self.transfer = None;
+        self.transfer_rearm = None;
+        let consensus = self.consensus();
+        if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
+            consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        }
+        self.reuse_scan_memo.borrow_mut().take();
+        if let Some(partition_dir) = self.partition_dir.clone() {
+            crate::state_transfer::sweep_staging_except(&partition_dir, &[]).await;
         }
 
         // Recreate a fresh empty segment at offset 0 with real writers.
@@ -3508,12 +3562,12 @@ where
             // a visible stall beats invisible loss.
             let durable_end = self.recovered_durable_offset;
             // Recovered bytes and an installed frontier both "stand in"
-            // below the floor; a window connecting to either is whole.
-            let stand_in = match (durable_end, self.installed_frontier) {
-                (Some(durable), Some(frontier)) => Some(durable.saturating_add(1).max(frontier)),
-                (Some(durable), None) => Some(durable.saturating_add(1)),
-                (None, frontier) => frontier,
-            };
+            // below the floor; a window connecting to either is whole. `None`
+            // orders below every `Some`, so the join covers all four
+            // combinations.
+            let stand_in = durable_end
+                .map(|durable| durable.saturating_add(1))
+                .max(self.installed_frontier);
             let connected = match (session.first_batch_offset, stand_in) {
                 (Some(first), Some(bound)) => first <= bound,
                 (Some(first), None) => first == 0,
@@ -3599,7 +3653,11 @@ where
     /// (`floor >= to_op`) counts as complete: there is nothing left that
     /// could arrive and change the floor verdict.
     fn repaired_window_is_complete(&self, floor: u64, to_op: u64) -> bool {
-        ((floor + 1)..=to_op).all(|op| self.log.journal().inner.header_by_op(op).is_some())
+        self.log
+            .journal()
+            .inner
+            .repaired_window_shape(floor, to_op)
+            .complete
     }
 
     /// Whether the served repair window `(floor, to_op]` arrived complete and
@@ -3612,13 +3670,8 @@ where
         if floor >= to_op {
             return false;
         }
-        ((floor + 1)..=to_op).all(|op| {
-            self.log
-                .journal()
-                .inner
-                .header_by_op(op)
-                .is_some_and(|header| header.operation != Operation::SendMessages)
-        })
+        let shape = self.log.journal().inner.repaired_window_shape(floor, to_op);
+        shape.complete && !shape.holds_messages
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded

@@ -984,45 +984,50 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     #[cfg(feature = "vsr")]
     await_segment_layout(&partition_path, &[0]).await;
 
-    // --- Verify consumer offsets cleared ---
-    let consumer_offset = client
-        .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
-        .await
-        .unwrap();
-    assert!(
-        consumer_offset.is_none(),
-        "Consumer offset must be cleared after purge"
-    );
-
-    let group_offset = client
-        .get_consumer_offset(
-            &group_consumer_ref,
-            &stream_ident,
-            &topic_ident,
-            Some(PARTITION_ID),
-        )
-        .await
-        .unwrap();
-    assert!(
-        group_offset.is_none(),
-        "Consumer group offset must be cleared after purge"
-    );
-
-    // --- Verify offset files deleted from disk ---
-    let consumer_files: Vec<_> = read_dir(&consumers_dir)
-        .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
-        .unwrap_or_default();
-    let group_files: Vec<_> = read_dir(&groups_dir)
-        .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
-        .unwrap_or_default();
-    assert!(
-        consumer_files.is_empty(),
-        "Consumer offset files must be deleted after purge, found: {consumer_files:?}"
-    );
-    assert!(
-        group_files.is_empty(),
-        "Consumer group offset files must be deleted after purge, found: {group_files:?}"
-    );
+    // --- Verify consumer offsets cleared (memory + disk) ---
+    // POLLED, not asserted instantly: in the restart cells the kill can land
+    // mid-purge, and boot then plants the [0] layout itself (fencing a torn
+    // chain, or recovering an already-drained directory) with the offset files
+    // still present -- the layout gate above is satisfied BEFORE the
+    // reconciler's re-purge (the applied generation is not persisted, so a
+    // restart re-purges) clears them. The purge contract is that the offsets
+    // GO AWAY, not that they are gone in the same frame as a boot-planted
+    // layout, so converge on the cleared state.
+    let offsets_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let consumer_offset = client
+            .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
+            .await
+            .unwrap();
+        let group_offset = client
+            .get_consumer_offset(
+                &group_consumer_ref,
+                &stream_ident,
+                &topic_ident,
+                Some(PARTITION_ID),
+            )
+            .await
+            .unwrap();
+        let consumer_files: Vec<_> = read_dir(&consumers_dir)
+            .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+            .unwrap_or_default();
+        let group_files: Vec<_> = read_dir(&groups_dir)
+            .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+            .unwrap_or_default();
+        if consumer_offset.is_none()
+            && group_offset.is_none()
+            && consumer_files.is_empty()
+            && group_files.is_empty()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < offsets_deadline,
+            "consumer offsets must be cleared after purge: consumer={consumer_offset:?} \
+             group={group_offset:?} consumer_files={consumer_files:?} group_files={group_files:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     // --- Verify partition reset: single empty segment at offset 0 ---
     assert_fresh_empty_partition(&partition_path);

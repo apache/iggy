@@ -9546,6 +9546,7 @@ dependencies = [
  "bytes",
  "compio",
  "consensus",
+ "futures",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",

@@ -109,30 +109,30 @@ pub fn run_bench_and_wait_for_finish(
 
     let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + BENCH_WAIT_TIMEOUT;
-    let result = loop {
+    // A timeout does NOT panic here: doing so jumped over the capture dump and
+    // the temp-file cleanup below, so every timed-out run leaked both files and
+    // printed only stderr -- while iggy-bench writes its progress to stdout,
+    // the one capture that explains a hang. The verdict is the assert at the end.
+    let mut timed_out = false;
+    let status = loop {
         match child.try_wait().unwrap() {
-            Some(status) => break status,
+            Some(status) => break Some(status),
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(stderr_file_path) = &stderr_file_path {
-                    eprintln!(
-                        "Iggy bench stderr:\n{}",
-                        fs::read_to_string(stderr_file_path).unwrap_or_default()
-                    );
-                }
-                panic!(
-                    "iggy-bench did not finish within {BENCH_WAIT_TIMEOUT:?}; if the server \
-                     runs in vsr mode, make sure iggy-bench was built with --features vsr \
-                     (the SDK framing is chosen at compile time)"
-                );
+                timed_out = true;
+                break None;
             }
             None => thread::sleep(Duration::from_millis(200)),
         }
     };
 
-    // Cleanup
-    if let Ok(output) = child.wait_with_output() {
+    // Only for a child that exited on its own: a killed-and-reaped one has no
+    // output left to collect, and `wait_with_output` on it would just fail.
+    if !timed_out {
+        let output = child
+            .wait_with_output()
+            .expect("failed to get output from iggy-bench");
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(stderr_file_path) = &stderr_file_path {
@@ -154,23 +154,17 @@ pub fn run_bench_and_wait_for_finish(
                 .write_all(stdout.as_bytes())
                 .unwrap();
         }
-    } else {
-        panic!("Failed to get output from iggy-bench");
     }
 
-    if panicking() {
-        if let Some(stdout_file_path) = &stdout_file_path {
-            eprintln!(
-                "Iggy bench stdout:\n{}",
-                fs::read_to_string(stdout_file_path).unwrap()
-            );
-        }
-
-        if let Some(stderr_file_path) = &stderr_file_path {
-            eprintln!(
-                "Iggy bench stderr:\n{}",
-                fs::read_to_string(stderr_file_path).unwrap()
-            );
+    let failed = timed_out || status.is_none_or(|status| !status.success());
+    if failed || panicking() {
+        for (stream, path) in [("stdout", &stdout_file_path), ("stderr", &stderr_file_path)] {
+            if let Some(path) = path {
+                eprintln!(
+                    "Iggy bench {stream}:\n{}",
+                    fs::read_to_string(path).unwrap_or_default()
+                );
+            }
         }
     }
 
@@ -181,7 +175,13 @@ pub fn run_bench_and_wait_for_finish(
         fs::remove_file(stderr_file_path).unwrap();
     }
 
-    assert!(result.success());
+    assert!(
+        !timed_out,
+        "iggy-bench did not finish within {BENCH_WAIT_TIMEOUT:?}; if the server \
+         runs in vsr mode, make sure iggy-bench was built with --features vsr \
+         (the SDK framing is chosen at compile time)"
+    );
+    assert!(status.is_some_and(|status| status.success()));
 }
 
 pub fn get_random_path() -> String {

@@ -27,17 +27,20 @@
 //! recovery panic). This module is the server-ng-owned loader, reading the same
 //! 24-byte format its writer emits.
 
-use crate::server_error::ServerNgError;
+use crate::server_error::{PartitionChainRefusal, ServerNgError};
 use configs::server_ng::ServerNgConfig;
 use iggy_common::{IggyByteSize, IggyError, PartitionStats};
+use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndexReader, Segment};
 use server_common::SegmentStorage;
 use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use std::fs;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use tracing::{error, warn};
 
 const LOG_EXTENSION: &str = "log";
+const INDEX_EXTENSION: &str = "index";
 
 /// A persisted segment recovered from disk: its metadata plus the storage
 /// handles (readers/writers) opened over its `.log` / `.index` files.
@@ -67,7 +70,7 @@ pub async fn load_persisted_segments(
     let partition_path = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
-    sweep_staging_files(&partition_path);
+    sweep_scratch_files(&partition_path);
     let mut start_offsets = collect_segment_start_offsets(&partition_path)?;
     start_offsets.sort_unstable();
 
@@ -171,7 +174,13 @@ pub async fn load_persisted_segments(
         last.segment.sealed = false;
     }
 
-    ensure_contiguous_chain(&recovered, stream_id, topic_id, partition_id)?;
+    ensure_contiguous_chain(
+        &recovered,
+        &partition_path,
+        stream_id,
+        topic_id,
+        partition_id,
+    )?;
 
     Ok(recovered)
 }
@@ -181,12 +190,27 @@ pub async fn load_persisted_segments(
 /// an operator copy) would otherwise splice a hole or an overlap into the
 /// chain and push `current_offset` past data this replica does not hold.
 /// Refuse loudly instead of serving a holed log.
+///
+/// The refusal names the partition and its directory so the caller can fence
+/// THAT group rather than abort the node's boot: the shapes it rejects are
+/// exactly what a failed quarantine leaves behind, and one damaged local chain
+/// must not take the whole node down.
 fn ensure_contiguous_chain(
     recovered: &[RecoveredSegment],
+    partition_path: &str,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
 ) -> Result<(), ServerNgError> {
+    let refused = |reason| {
+        Err(ServerNgError::PartitionChainRefused {
+            dir: PathBuf::from(partition_path),
+            stream_id,
+            topic_id,
+            partition_id,
+            reason,
+        })
+    };
     for pair in recovered.windows(2) {
         let previous = &pair[0].segment;
         let next = &pair[1].segment;
@@ -196,51 +220,80 @@ fn ensure_contiguous_chain(
         // more chain is exactly what a failed converge rebuild leaves behind.
         // Skipping it here was the guard's blind spot.
         if previous.size == IggyByteSize::default() {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                empty_start = previous.start_offset,
-                next_start = next.start_offset,
-                "recovered chain holds an empty non-tail segment; refusing to serve past it"
-            );
-            return Err(IggyError::CannotReadPartitions.into());
+            return refused(PartitionChainRefusal::EmptyNonTailSegment {
+                empty_start: previous.start_offset,
+                next_start: next.start_offset,
+            });
         }
         if next.start_offset != previous.end_offset + 1 {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                previous_start = previous.start_offset,
-                previous_end = previous.end_offset,
-                next_start = next.start_offset,
-                "recovered segment chain is not contiguous; refusing to serve a holed log"
-            );
-            return Err(IggyError::CannotReadPartitions.into());
+            return refused(PartitionChainRefusal::Hole {
+                previous_start: previous.start_offset,
+                previous_end: previous.end_offset,
+                next_start: next.start_offset,
+            });
         }
     }
     Ok(())
 }
 
-/// Unlink every `*.staging` spill file in the partition directory. Boot is
-/// the one sweep that always runs: the install-time and reuse-time sweeps
-/// only fire on the NEXT transfer attempt, so a transfer abandoned for good
-/// would otherwise leak a full partition copy across restarts. Staging files
-/// are pure scratch (never a rename source until an install owns them), so
-/// unlinking is always safe here.
-fn sweep_staging_files(partition_path: &str) {
+/// Unlink the partition directory's scratch leftovers: every `*.staging` spill
+/// file, and every `.index` with no `.log` beside it.
+///
+/// Boot is the one sweep that always runs. The install-time and reuse-time
+/// staging sweeps only fire on the NEXT transfer attempt, so a transfer
+/// abandoned for good would otherwise leak a full partition copy across
+/// restarts; staging files are pure scratch (never a rename source until an
+/// install owns them), so unlinking is always safe.
+///
+/// Orphaned indexes come from the state-transfer install, which renames ALL
+/// indexes to their final names, fsyncs the directory, and only then renames the
+/// logs -- a crash in that window is GUARANTEED to leave final-name `.index`
+/// files with no `.log`. Recovery keys on `.log` stems, so nothing else ever
+/// looks at them again: they are invisible to it and to the size stats, and
+/// without this they are a permanent leak at offsets the partition may never
+/// revisit. Unlinking rather than keeping them is safe because every path that
+/// recreates a segment at a given base offset opens its index through
+/// `SegmentStorage::new(.., file_exists = false)` first, which TRUNCATES: the
+/// stale entries are never read, only overwritten.
+fn sweep_scratch_files(partition_path: &str) {
     let Ok(entries) = fs::read_dir(partition_path) else {
         return;
     };
+    let mut swept = Vec::new();
+    let mut orphan_candidates = Vec::new();
+    let mut log_stems = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_staging = path.to_str().is_some_and(|path| path.ends_with(".staging"));
-        if is_staging && let Err(error) = fs::remove_file(&path) {
+        let Some(as_str) = path.to_str() else {
+            continue;
+        };
+        if as_str.ends_with(STAGING_SUFFIX) {
+            swept.push(path);
+            continue;
+        }
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(LOG_EXTENSION) => {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    log_stems.insert(stem.to_owned());
+                }
+            }
+            Some(INDEX_EXTENSION) => orphan_candidates.push(path),
+            _ => {}
+        }
+    }
+    swept.extend(orphan_candidates.into_iter().filter(|path| {
+        !path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| log_stems.contains(stem))
+    }));
+    for path in swept {
+        if let Err(error) = fs::remove_file(&path) {
             warn!(
                 partition_path,
                 path = %path.display(),
                 %error,
-                "failed to sweep a stale staging file at boot"
+                "failed to sweep a stale scratch file at boot"
             );
         }
     }

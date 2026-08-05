@@ -62,7 +62,10 @@ const KILL_GATE_POLL: Duration = Duration::from_millis(10);
 
 const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting to state transfer";
 const INSTALL_MARKER: &str = "partition state transfer installed";
-const SERVING_MARKER: &str = "serving partition state transfer";
+/// Logged once per transfer, at the last byte of the last artifact. The
+/// descriptor-time "serving" line only proves a request ARRIVED; this proves the
+/// pull ran.
+const FULLY_SERVED_MARKER: &str = "partition state transfer fully served";
 const ABANDON_MARKER: &str =
     "partition state transfer stalled past its retry budget; abandoning with a backed-off re-arm";
 
@@ -197,13 +200,10 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
     await_marker(harness, 2, CONVERSION_MARKER).await;
     await_marker(harness, 2, INSTALL_MARKER).await;
     // The serving side proves the pull actually ran (not a vacuous install).
-    let served_somewhere = [0, 1]
-        .iter()
-        .any(|&node| harness.node(node).stdout_contains(SERVING_MARKER));
-    assert!(
-        served_somewhere,
-        "some survivor must have served the partition transfer"
-    );
+    // Retried like every other marker check here: stdout goes through the
+    // buffered non-blocking appender, so a survivor's line can trail node 2's
+    // install by more than one poll.
+    await_marker_any(harness, &[0, 1], FULLY_SERVED_MARKER).await;
 }
 
 #[iggy_harness(
@@ -215,11 +215,13 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
         system.segment.size = "8MiB"
     )
 )]
-// The 8 MiB segment cap makes the 64 MiB bulky seed span ~8 sealed
-// segments, so this spec also exercises the multi-artifact manifest, the
-// per-artifact spill, and the staged-segment reuse scan when the transfer
-// re-arms against the surviving primary -- the other specs are all
-// single-segment under the default 1 GiB cap.
+// The 8 MiB segment cap makes the 64 MiB bulky seed span several sealed
+// segments, so unlike the other specs (single-segment under the default 1 GiB
+// cap) this one installs from a MULTI-ARTIFACT manifest, one spill per artifact.
+// The installed segment count at the end is what asserts that. The re-armed
+// pull also runs the staged-segment reuse scan, but how much it can adopt
+// depends on how many artifacts completed before the kill, so nothing here
+// asserts on reuse.
 async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partition(
     harness: &mut TestHarness,
 ) {
@@ -267,14 +269,23 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
     // Recovery: the scheduled re-arm targets the surviving primary. No
     // follow-up commit is asserted -- the cluster is quorum-marginal with
     // one node down, and an unanswered read mid-election is not a verdict.
+    await_marker(harness, 2, INSTALL_MARKER).await;
+    await_marker_any(harness, &[1], FULLY_SERVED_MARKER).await;
+
+    // The manifest the install consumed carried one artifact per sealed
+    // segment, and each was spilled and renamed separately: the seeded 64 MiB
+    // over an 8 MiB segment cap cannot land as one file.
+    let data_path = harness.node(2).data_path();
     let deadline = Instant::now() + TRANSFER_BUDGET;
     loop {
-        if harness.node(2).stdout_contains(INSTALL_MARKER) {
+        let installed = segment_log_count(&data_path);
+        if installed > 1 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "node 2 never installed a partition transfer with node 0 dead"
+            "node 2 installed {installed} segment file(s); a 64 MiB transfer under an \
+             8 MiB segment cap must arrive as a multi-artifact manifest"
         );
         sleep(MARKER_POLL).await;
     }
@@ -384,6 +395,21 @@ async fn poll_count(client: &IggyClient, count: u32) -> Result<u32, IggyError> {
     Ok(polled.messages.len() as u32)
 }
 
+/// [`await_marker`] over a set of nodes: satisfied by the first one to log it.
+async fn await_marker_any(harness: &TestHarness, nodes: &[usize], marker: &str) {
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    while !nodes
+        .iter()
+        .any(|&node| harness.node(node).stdout_contains(marker))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "none of {nodes:?} logged {marker:?} within {TRANSFER_BUDGET:?}"
+        );
+        sleep(MARKER_POLL).await;
+    }
+}
+
 async fn await_marker(harness: &TestHarness, node: usize, marker: &str) {
     let deadline = Instant::now() + TRANSFER_BUDGET;
     while !harness.node(node).stdout_contains(marker) {
@@ -395,13 +421,19 @@ async fn await_marker(harness: &TestHarness, node: usize, marker: &str) {
     }
 }
 
-/// Total `.log` bytes outside the metadata directory: transferred segment
-/// payload. Walked rather than path-derived so the test does not hard-code
-/// the `streams/<s>/topics/<t>/partitions/<p>` layout.
+/// Total transferred segment payload under `root`. Walked rather than
+/// path-derived so the test does not hard-code the
+/// `streams/<s>/topics/<t>/partitions/<p>` layout.
+///
+/// Matches the segment file NAME shape, not the `.log` extension alone: the
+/// server's own text log sits under the same data root (~15 KiB on a local run,
+/// about a third of the floor this feeds), and the child inherits `RUST_LOG`, so
+/// an extension-only sum let a debug run satisfy the caller with zero
+/// transferred segment bytes.
 fn total_partition_log_bytes(root: &Path) -> u64 {
     let mut total = 0;
     let _ = walk(root, &mut |path| {
-        if path.extension().is_some_and(|extension| extension == "log")
+        if is_segment_log(path)
             && let Ok(metadata) = std::fs::metadata(path)
         {
             total += metadata.len();
@@ -409,6 +441,29 @@ fn total_partition_log_bytes(root: &Path) -> u64 {
         false
     });
     total
+}
+
+/// Number of segment files under `root`; more than one proves the install came
+/// from a multi-artifact manifest, each artifact spilled and renamed in turn.
+fn segment_log_count(root: &Path) -> usize {
+    let mut count = 0;
+    let _ = walk(root, &mut |path| {
+        if is_segment_log(path) {
+            count += 1;
+        }
+        false
+    });
+    count
+}
+
+/// A segment `.log`, named for its 20-digit zero-padded base offset (see
+/// `partitions::state_transfer`'s path builders).
+fn is_segment_log(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "log")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.len() == 20 && stem.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn find_consumer_offset_file(root: &Path) -> Option<PathBuf> {

@@ -675,13 +675,22 @@ where
                             generation,
                             "purge-partition reset partition to empty"
                         ),
-                        Err(error) => tracing::error!(
-                            shard = self.id,
-                            namespace_raw = namespace.inner(),
-                            generation,
-                            %error,
-                            "purge-partition failed to reset partition"
-                        ),
+                        Err(error) => {
+                            // The purge drained every segment before its first
+                            // fallible step, so a failure leaves the partition
+                            // with no serviceable chain and the next append
+                            // panics on `active_segment()`. Fence this one group
+                            // for rebuild, exactly as a failed state-transfer
+                            // convergence does.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition failed to reset partition; fencing it for rebuild"
+                            );
+                            self.fence_partition_for_rebuild(namespace, partition).await;
+                        }
                     }
                 }
             }

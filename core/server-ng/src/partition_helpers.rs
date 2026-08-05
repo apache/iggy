@@ -34,7 +34,7 @@ use iggy_common::{
 };
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
-use metadata::impls::recovery::IdentityField;
+use metadata::impls::recovery::{IdentityField, ReplicaIdentity};
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Validate that a namespace fits within the static caps declared in
 /// `config.extra.namespace`.
@@ -347,6 +347,11 @@ pub async fn ensure_initial_segment(
         .system
         .get_index_path(stream_id, topic_id, partition_id, 0);
     let enforce_fsync = config.system.partition.enforce_fsync;
+    // `file_exists = false` TRUNCATES both files, which is load-bearing here: a
+    // fenced-and-rebuilt partition (or one whose quarantine failed) can reach
+    // this with a stale `.index` at offset 0 on disk. The `partitions`-side
+    // writers with the same names do NOT truncate, so opening them directly
+    // instead would read index entries from a previous generation.
     let storage = SegmentStorage::new(
         &messages_path,
         &index_path,
@@ -449,9 +454,7 @@ pub async fn ensure_initial_segment(
 /// variants when a record exists but cannot be trusted.
 pub(crate) async fn open_partition_superblock(
     partition_dir: &str,
-    cluster_id: u128,
-    self_replica_id: u8,
-    replica_count: u8,
+    identity: ReplicaIdentity,
 ) -> Result<(Rc<PingPongSuperblock>, Option<VsrState>), ServerNgError> {
     let io_error = |source| ServerNgError::PartitionSuperblockIo {
         dir: PathBuf::from(partition_dir),
@@ -490,20 +493,20 @@ pub(crate) async fn open_partition_superblock(
                 found,
             })
         };
-        if state.cluster != cluster_id {
-            return mismatch(IdentityField::Cluster, cluster_id, state.cluster);
+        if state.cluster != identity.cluster {
+            return mismatch(IdentityField::Cluster, identity.cluster, state.cluster);
         }
-        if state.replica_id != self_replica_id {
+        if state.replica_id != identity.replica_id {
             return mismatch(
                 IdentityField::ReplicaId,
-                self_replica_id.into(),
+                identity.replica_id.into(),
                 state.replica_id.into(),
             );
         }
-        if state.replica_count != replica_count {
+        if state.replica_count != identity.replica_count {
             return mismatch(
                 IdentityField::ReplicaCount,
-                replica_count.into(),
+                identity.replica_count.into(),
                 state.replica_count.into(),
             );
         }
@@ -519,6 +522,16 @@ pub(crate) fn restore_partition_view(
     consensus: &mut VsrConsensus<Rc<IggyMessageBus>>,
     state: &VsrState,
 ) {
+    // The one line proving the durable record was READ BACK, not merely written:
+    // the group's whole anti-regression guarantee rests on this call running, and
+    // a replica that came back at view 0 is otherwise indistinguishable from one
+    // that resumed correctly until it votes.
+    info!(
+        namespace_raw = consensus.namespace(),
+        view = state.view,
+        log_view = state.log_view,
+        "restored partition view from its superblock"
+    );
     consensus.set_view(state.view);
     consensus.set_log_view(state.log_view);
     consensus.mark_superblock_durable(state.view, state.log_view);
@@ -612,9 +625,15 @@ pub async fn build_partition_fresh(
     let partition_dir = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
-    let (superblock, recovered_state) =
-        open_partition_superblock(&partition_dir, cluster_id, self_replica_id, replica_count)
-            .await?;
+    let (superblock, recovered_state) = open_partition_superblock(
+        &partition_dir,
+        ReplicaIdentity {
+            cluster: cluster_id,
+            replica_id: self_replica_id,
+            replica_count,
+        },
+    )
+    .await?;
     if let Some(state) = recovered_state.as_ref() {
         restore_partition_view(&mut consensus, state);
     }
@@ -744,16 +763,23 @@ mod tests {
         root.path().join("partition").to_string_lossy().into_owned()
     }
 
+    const fn test_identity() -> ReplicaIdentity {
+        ReplicaIdentity {
+            cluster: CLUSTER,
+            replica_id: REPLICA,
+            replica_count: REPLICAS,
+        }
+    }
+
     #[compio::test]
     async fn given_fresh_partition_dir_when_superblock_opened_should_yield_no_state() {
         let root = tempfile::tempdir().expect("tempdir");
         // A not-yet-materialized directory must open as fresh, not error: the
         // helper creates it, since a follower can reach load before its first
         // segment write.
-        let (_store, recovered) =
-            open_partition_superblock(&partition_dir(&root), CLUSTER, REPLICA, REPLICAS)
-                .await
-                .expect("open a fresh partition superblock");
+        let (_store, recovered) = open_partition_superblock(&partition_dir(&root), test_identity())
+            .await
+            .expect("open a fresh partition superblock");
         assert!(
             recovered.is_none(),
             "an empty superblock is a fresh group, never an error"
@@ -764,7 +790,7 @@ mod tests {
     async fn given_recorded_view_when_superblock_reopened_should_recover_state() {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = partition_dir(&root);
-        let (store, recovered) = open_partition_superblock(&dir, CLUSTER, REPLICA, REPLICAS)
+        let (store, recovered) = open_partition_superblock(&dir, test_identity())
             .await
             .expect("first open");
         assert!(recovered.is_none());
@@ -775,7 +801,7 @@ mod tests {
             .expect("record the advanced view");
         drop(store);
 
-        let (_store, recovered) = open_partition_superblock(&dir, CLUSTER, REPLICA, REPLICAS)
+        let (_store, recovered) = open_partition_superblock(&dir, test_identity())
             .await
             .expect("reopen after a restart");
 
@@ -790,7 +816,7 @@ mod tests {
     async fn given_foreign_cluster_record_when_superblock_opened_should_refuse_boot() {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = partition_dir(&root);
-        let (store, _) = open_partition_superblock(&dir, CLUSTER, REPLICA, REPLICAS)
+        let (store, _) = open_partition_superblock(&dir, test_identity())
             .await
             .expect("first open");
         let foreign = VsrState {
@@ -803,7 +829,7 @@ mod tests {
             .expect("record a foreign identity");
         drop(store);
 
-        let refused = open_partition_superblock(&dir, CLUSTER, REPLICA, REPLICAS).await;
+        let refused = open_partition_superblock(&dir, test_identity()).await;
 
         match refused {
             Err(ServerNgError::PartitionSuperblockIdentityMismatch { field, .. }) => {

@@ -25,8 +25,8 @@ use crate::dispatch::{
 };
 use crate::http;
 use crate::partition_helpers::{
-    configure_consumer_offsets, ensure_initial_segment, open_partition_superblock,
-    restore_partition_view, validate_namespace_bounds,
+    build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
+    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
@@ -1721,17 +1721,70 @@ async fn build_shard_for_thread(
     for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
         validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let partition = load_partition(
+        let partition = match load_partition(
             config,
             namespace,
-            partition_stats,
+            Arc::clone(&partition_stats),
             &partition_metadata,
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
             Rc::clone(&bus),
         )
-        .await?;
+        .await
+        {
+            Ok(partition) => partition,
+            // ONE damaged local chain must not take the node down. The shapes
+            // this refuses are exactly what a failed state-transfer quarantine
+            // leaves behind, so fence that group the same way the runtime path
+            // does -- move its segment files aside, keeping the superblock so it
+            // cannot re-enter view 0 -- and materialise it fresh. The ordinary
+            // rejoin path (repair, then state transfer on a refused floor)
+            // recovers its data from a peer.
+            Err(ServerNgError::PartitionChainRefused { dir, reason, .. }) => {
+                let partition_dir = dir.to_string_lossy().into_owned();
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    partition_dir,
+                    %reason,
+                    "refusing the recovered segment chain; fencing this partition and \
+                     rebuilding it empty for the rejoin path"
+                );
+                match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
+                    Ok(fenced_dir) => error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        fenced_dir,
+                        "quarantined the refused segment files; they are kept for inspection"
+                    ),
+                    Err(error) => error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        partition_dir,
+                        %error,
+                        "failed to quarantine the refused segment files; the rebuild will \
+                         re-read them and refuse again"
+                    ),
+                }
+                // The refused load already folded its segment counts in.
+                partition_stats.zero_out_all();
+                build_partition_fresh(
+                    config,
+                    namespace,
+                    partition_stats,
+                    topology.cluster_id,
+                    topology.self_replica_id,
+                    topology.replica_count,
+                    Rc::clone(&bus),
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        };
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -2175,9 +2228,15 @@ async fn load_partition(
     let partition_dir = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
-    let (superblock, recovered_state) =
-        open_partition_superblock(&partition_dir, cluster_id, self_replica_id, replica_count)
-            .await?;
+    let (superblock, recovered_state) = open_partition_superblock(
+        &partition_dir,
+        ReplicaIdentity {
+            cluster: cluster_id,
+            replica_id: self_replica_id,
+            replica_count,
+        },
+    )
+    .await?;
     if let Some(state) = recovered_state.as_ref() {
         restore_partition_view(&mut consensus, state);
     }

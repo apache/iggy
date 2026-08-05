@@ -24,7 +24,7 @@ use server_common::{
 use std::io;
 use std::{
     cell::{Cell, UnsafeCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
 };
 use tracing::warn;
 
@@ -45,6 +45,16 @@ pub struct RetainedBatchMeta {
     pub base_timestamp: u64,
     pub total_size: u64,
     pub message_count: u32,
+}
+
+/// What one pass over the journal headers found for a repair window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairedWindowShape {
+    /// Every op in the window is resident. An EMPTY window is complete: nothing
+    /// left can arrive and change the floor verdict.
+    pub complete: bool,
+    /// At least one resident op in the window is a `SendMessages`.
+    pub holds_messages: bool,
 }
 
 /// Lookup key for querying messages from the journal.
@@ -653,6 +663,41 @@ where
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().find(|header| header.op == op).copied()
+    }
+
+    /// Presence and message-carrying shape of the repair window `(floor, to_op]`
+    /// in ONE pass over the header vec.
+    ///
+    /// [`Self::header_by_op`] is a linear scan with no index, so asking it
+    /// op-by-op over a window is O(window x headers): on the floor-refusal path
+    /// the replica is gap-stopped, so nothing evicts and the header vec grows
+    /// with the live tail, and the default 4096-op window over ~100k resident
+    /// headers is on the order of 4e8 comparisons -- synchronous, on the shard
+    /// pump, per repair round. Long enough to miss heartbeat and view-change
+    /// deadlines for every group on the core and turn one rejoin into an
+    /// election storm.
+    ///
+    /// The evicted ring is deliberately NOT consulted, matching the op-by-op
+    /// form: consulting it would change the floor-refusal verdict.
+    pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
+        let headers = unsafe { &*self.headers.get() };
+        let expected = to_op.saturating_sub(floor);
+        let mut present: HashSet<u64> = HashSet::with_capacity(headers.len());
+        let mut holds_messages = false;
+        for header in headers
+            .iter()
+            .filter(|header| header.op > floor && header.op <= to_op)
+        {
+            if header.operation == Operation::SendMessages {
+                holds_messages = true;
+            }
+            present.insert(header.op);
+        }
+        RepairedWindowShape {
+            // In-window ops only, deduplicated, so a count match IS coverage.
+            complete: present.len() as u64 == expected,
+            holds_messages,
+        }
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
