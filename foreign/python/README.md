@@ -107,7 +107,15 @@ pip install apache-iggy
    cargo run --bin stub_gen
    ```
 
-5. Before making a commit, make sure you've ran these commands in `foreign/python`, otherwise the precommit / pre-push hooks will fail these checks:
+5. Before committing, test the pre-commit and pre-push hooks. `prek` only inspects staged content, so stage your work first:
+
+   ```bash
+   git add -A
+   prek run # runs pre-commit hooks
+   prek run --hook-stage pre-push
+   ```
+
+   These are some of the essential commands prek is running, so it's recommended to run them manually before  running prek / committing / pushing. This list is not exhaustive and other hook failures are possible.
 
    ```bash
    ruff format .
@@ -123,6 +131,10 @@ pip install apache-iggy
 
    ```bash
    cargo clippy --all-targets --all-features -- -D warnings
+   ```
+
+   ```bash
+   ./scripts/ci/markdownlint.sh --fix # read the diff after applying this, sometimes it gives unwanted results, e.g. messing up enumerations
    ```
 
 ## Examples
