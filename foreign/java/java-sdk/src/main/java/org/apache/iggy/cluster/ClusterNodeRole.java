@@ -17,26 +17,36 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.cluster;
 
-import org.apache.iggy.cluster.ClusterMetadata;
-import org.apache.iggy.system.ClientInfo;
-import org.apache.iggy.system.ClientInfoDetails;
-import org.apache.iggy.system.Stats;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.iggy.exception.IggyMalformedResponseException;
 
-import java.util.List;
+/**
+ * Role of a node in the cluster.
+ */
+public enum ClusterNodeRole {
+    @JsonProperty("leader")
+    Leader(0),
+    @JsonProperty("follower")
+    Follower(1);
 
-public interface SystemClient {
+    private final int code;
 
-    Stats getStats();
+    ClusterNodeRole(int code) {
+        this.code = code;
+    }
 
-    ClusterMetadata getClusterMetadata();
+    public static ClusterNodeRole fromCode(int code) {
+        for (ClusterNodeRole role : ClusterNodeRole.values()) {
+            if (role.code == code) {
+                return role;
+            }
+        }
+        throw new IggyMalformedResponseException("Invalid cluster node role: " + code);
+    }
 
-    ClientInfoDetails getMe();
-
-    ClientInfoDetails getClient(Long clientId);
-
-    List<ClientInfo> getClients();
-
-    String ping();
+    public int asCode() {
+        return code;
+    }
 }
