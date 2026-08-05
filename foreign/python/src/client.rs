@@ -91,11 +91,14 @@ impl IggyClient {
     /// Args:
     ///     conn: Either a `host:port` address, or a `TcpConfig` carrying the full
     ///         transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-    ///         disabled.
+    ///         disabled. A malformed address is reported differently by the two
+    ///         forms: the string form raises `RuntimeError` here, while `TcpConfig`
+    ///         raises `ValueError` when it is constructed, before it ever reaches
+    ///         this call. Neither exception is a subclass of the other.
     ///
     /// Raises:
-    ///     RuntimeError: If the address is not a valid `host:port` pair, or if the
-    ///         client cannot be built.
+    ///     RuntimeError: If the address passed as a string is not a valid
+    ///         `host:port` pair.
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
@@ -436,7 +439,8 @@ impl IggyClient {
     }
 
     /// Gets stream by id.
-    /// Returns Option of stream details or a RuntimeError on failure.
+    /// Returns the stream details, or `None` if the stream does not exist.
+    /// Raises `RuntimeError` on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails | None]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
@@ -520,7 +524,8 @@ impl IggyClient {
     }
 
     /// Gets topic by stream and id.
-    /// Returns Option of topic details or a RuntimeError on failure.
+    /// Returns the topic details, or `None` if the topic does not exist.
+    /// Raises `RuntimeError` on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails | None]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
@@ -1004,7 +1009,10 @@ impl IggyClient {
     }
 
     /// Creates a new consumer group consumer.
-    /// Returns the consumer or a RuntimeError on failure.
+    /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
+    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
+    /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
+    /// is zero.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,

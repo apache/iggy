@@ -821,11 +821,14 @@ class IggyClient:
         Args:
             conn: Either a `host:port` address, or a `TcpConfig` carrying the full
                 transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-                disabled.
+                disabled. A malformed address is reported differently by the two
+                forms: the string form raises `RuntimeError` here, while `TcpConfig`
+                raises `ValueError` when it is constructed, before it ever reaches
+                this call. Neither exception is a subclass of the other.
 
         Raises:
-            RuntimeError: If the address is not a valid `host:port` pair, or if the
-                client cannot be built.
+            RuntimeError: If the address passed as a string is not a valid
+                `host:port` pair.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
@@ -997,7 +1000,8 @@ class IggyClient:
     ) -> collections.abc.Awaitable[StreamDetails | None]:
         r"""
         Gets stream by id.
-        Returns Option of stream details or a RuntimeError on failure.
+        Returns the stream details, or `None` if the stream does not exist.
+        Raises `RuntimeError` on failure.
         """
     def create_topic(
         self,
@@ -1035,7 +1039,8 @@ class IggyClient:
     ) -> collections.abc.Awaitable[TopicDetails | None]:
         r"""
         Gets topic by stream and id.
-        Returns Option of topic details or a RuntimeError on failure.
+        Returns the topic details, or `None` if the topic does not exist.
+        Raises `RuntimeError` on failure.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
@@ -1299,7 +1304,10 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
-        Returns the consumer or a RuntimeError on failure.
+        Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
+        `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
+        `AutoCommit` interval is negative, or if any of those except `poll_interval`
+        is zero.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -1852,11 +1860,15 @@ class TcpConfig:
             tls_enabled: Whether to connect over TLS. Defaults to disabled.
             tls_domain: Domain to validate the certificate against. Empty means it is
                 taken from `server_address`.
-            tls_ca_file: Path to the CA file for TLS.
+            tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
+                and `tls_validate_certificate` are both on; with either one off it
+                is kept but never consulted, so pairing it with
+                `tls_validate_certificate=False` pins nothing.
             tls_validate_certificate: Whether to validate the server certificate.
                 Defaults to validating. Disabling this accepts any certificate the
-                server presents, including self-signed and mismatched ones; intended
-                for local development only.
+                server presents, including self-signed and mismatched ones, and
+                takes precedence over `tls_ca_file`; intended for local development
+                only.
             nodelay: Disable the Nagle algorithm for the TCP socket. Defaults to
                 leaving it on.
 
@@ -1893,6 +1905,10 @@ class TcpReconnectionConfig:
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
             max_retries: Attempts before giving up, or `None` for unlimited.
+                Defaults to unlimited, which means a call awaited while the server
+                is down never returns: `connect()`, `send_messages()` and
+                `poll_messages()` all wait inside the retry loop. Set a finite
+                number for request/reply style usage, so a call fails instead.
             interval: Delay between attempts. Defaults to 1 second.
             reestablish_after: Cooldown before reconnecting after a previously
                 successful connection. Defaults to 5 seconds.

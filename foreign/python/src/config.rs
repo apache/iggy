@@ -120,6 +120,10 @@ impl TcpReconnectionConfig {
     /// Args:
     ///     enabled: Whether to reconnect at all. Defaults to enabled.
     ///     max_retries: Attempts before giving up, or `None` for unlimited.
+    ///         Defaults to unlimited, which means a call awaited while the server
+    ///         is down never returns: `connect()`, `send_messages()` and
+    ///         `poll_messages()` all wait inside the retry loop. Set a finite
+    ///         number for request/reply style usage, so a call fails instead.
     ///     interval: Delay between attempts. Defaults to 1 second.
     ///     reestablish_after: Cooldown before reconnecting after a previously
     ///         successful connection. Defaults to 5 seconds.
@@ -233,11 +237,15 @@ impl TcpConfig {
     ///     tls_enabled: Whether to connect over TLS. Defaults to disabled.
     ///     tls_domain: Domain to validate the certificate against. Empty means it is
     ///         taken from `server_address`.
-    ///     tls_ca_file: Path to the CA file for TLS.
+    ///     tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
+    ///         and `tls_validate_certificate` are both on; with either one off it
+    ///         is kept but never consulted, so pairing it with
+    ///         `tls_validate_certificate=False` pins nothing.
     ///     tls_validate_certificate: Whether to validate the server certificate.
     ///         Defaults to validating. Disabling this accepts any certificate the
-    ///         server presents, including self-signed and mismatched ones; intended
-    ///         for local development only.
+    ///         server presents, including self-signed and mismatched ones, and
+    ///         takes precedence over `tls_ca_file`; intended for local development
+    ///         only.
     ///     nodelay: Disable the Nagle algorithm for the TCP socket. Defaults to
     ///         leaving it on.
     ///
