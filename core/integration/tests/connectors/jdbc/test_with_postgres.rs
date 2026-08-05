@@ -80,7 +80,9 @@ async fn get_postgres_driver_jar() -> Result<String, Box<dyn std::error::Error +
         match std::fs::read(&jar_path) {
             Ok(bytes) if looks_like_jar(&bytes) => {
                 info!("PostgreSQL JDBC driver found at {jar_path}");
-                return Ok(std::fs::canonicalize(&jar_path)?.to_string_lossy().to_string());
+                return Ok(std::fs::canonicalize(&jar_path)?
+                    .to_string_lossy()
+                    .to_string());
             }
             _ => {
                 info!("Cached JDBC driver at {jar_path} is invalid; re-downloading");
@@ -114,7 +116,9 @@ async fn get_postgres_driver_jar() -> Result<String, Box<dyn std::error::Error +
     std::fs::rename(&tmp_path, &jar_path)?;
 
     info!("PostgreSQL JDBC driver downloaded to {jar_path}");
-    Ok(std::fs::canonicalize(&jar_path)?.to_string_lossy().to_string())
+    Ok(std::fs::canonicalize(&jar_path)?
+        .to_string_lossy()
+        .to_string())
 }
 
 /// Build the environment variables for a JDBC Postgres source connector.
