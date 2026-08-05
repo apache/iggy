@@ -6657,7 +6657,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.5.1-edge.1"
+version = "0.6.0-edge.1"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -6714,7 +6714,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.13.1-edge.1"
+version = "0.14.0-edge.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
