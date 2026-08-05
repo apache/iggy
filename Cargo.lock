@@ -7072,7 +7072,6 @@ dependencies = [
  "chrono",
  "dashmap",
  "humantime",
- "iggy_common",
  "iggy_connector_sdk",
  "jni 0.21.1",
  "regex",

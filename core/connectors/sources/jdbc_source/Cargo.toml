@@ -46,9 +46,6 @@ dashmap = { workspace = true }
 # For parsing duration strings (poll_interval)
 humantime = { workspace = true }
 
-# Shared serde helpers (SecretString serialization)
-iggy_common = { workspace = true }
-
 # Connector SDK
 iggy_connector_sdk = { workspace = true }
 

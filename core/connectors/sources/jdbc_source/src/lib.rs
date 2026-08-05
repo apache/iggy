@@ -17,7 +17,6 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use iggy_common::serde_secret;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
@@ -146,12 +145,16 @@ pub enum Mode {
     Incremental,
 }
 
-/// Configuration for JDBC source connector
-#[derive(Clone, Deserialize, Serialize)]
+/// Configuration for JDBC source connector.
+///
+/// Deliberately does NOT derive `Serialize`: the runtime only ever deserializes
+/// this from config, and serializing it would risk writing `jdbc_url`/`password`
+/// (both `SecretString`) to logs or state in plaintext. Redacted logging goes
+/// through the manual `Debug` impl below.
+#[derive(Clone, Deserialize)]
 pub struct JdbcSourceConfig {
     /// JDBC connection URL (e.g., "jdbc:mysql://localhost:3306/mydb")
     /// Can include credentials: "jdbc:mysql://localhost:3306/mydb?user=root&password=secret"
-    #[serde(serialize_with = "serde_secret::serialize_secret")]
     pub jdbc_url: SecretString,
 
     /// JDBC driver class name (e.g., "com.mysql.cj.jdbc.Driver")
@@ -165,7 +168,7 @@ pub struct JdbcSourceConfig {
     pub username: Option<String>,
 
     /// Database password (optional if included in jdbc_url)
-    #[serde(default, serialize_with = "serde_secret::serialize_optional_secret")]
+    #[serde(default)]
     pub password: Option<SecretString>,
 
     /// SQL query to execute for fetching data
@@ -813,7 +816,7 @@ impl JdbcSource {
         // negative i32 would sign-extend to an enormous usize and abort on alloc.
         let mut columns = Vec::with_capacity((column_count.max(0) as usize).min(8192));
         for i in 1..=column_count {
-            let col_name = self.get_column_name(env, &metadata, i)?;
+            let col_name = self.get_column_label(env, &metadata, i)?;
             let col_type = self.get_column_type(env, &metadata, i)?;
             columns.push((col_name, col_type));
         }
@@ -1042,8 +1045,12 @@ impl JdbcSource {
         finalize_query(query)
     }
 
-    /// Get column name from ResultSetMetaData
-    fn get_column_name(
+    /// Get the column label from ResultSetMetaData. Uses `getColumnLabel` (not
+    /// `getColumnName`) so a `SELECT expr AS alias` yields the alias the caller
+    /// asked for; `getColumnName` returns the underlying base-table column (or
+    /// empty for computed columns), which would not match a configured
+    /// `tracking_column` alias and can be blank.
+    fn get_column_label(
         &self,
         env: &mut JNIEnv,
         metadata: &JObject,
@@ -1053,12 +1060,12 @@ impl JdbcSource {
             env,
             env.call_method(
                 metadata,
-                "getColumnName",
+                "getColumnLabel",
                 "(I)Ljava/lang/String;",
                 &[JValue::Int(column_index)],
             )
             .and_then(|v| v.l()),
-            "Failed to get column name"
+            "Failed to get column label"
         );
 
         let col_name: String = jni!(
@@ -1707,12 +1714,33 @@ fn outer_order_by(query: &str) -> Option<&str> {
     let mut depth: u32 = 0;
     let mut in_quote = false;
     let mut last_end = None;
-    for i in 0..bytes.len() {
+    let mut i = 0;
+    while i < bytes.len() {
         let byte = bytes[i];
         if in_quote {
             if byte == b'\'' {
                 in_quote = false;
             }
+            i += 1;
+            continue;
+        }
+        // Skip SQL comments entirely: an `ORDER BY` (or a stray paren/quote)
+        // inside a comment must not be mistaken for the outer ordering, which
+        // would let a query with no real ordering pass validation and then skip
+        // rows at runtime.
+        if byte == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i += 2; // consume the closing `*/`
             continue;
         }
         match byte {
@@ -1730,6 +1758,7 @@ fn outer_order_by(query: &str) -> Option<&str> {
             }
             _ => {}
         }
+        i += 1;
     }
     last_end.map(|end| query[end..].trim_start())
 }
@@ -1823,20 +1852,34 @@ fn take_pending_sql_exception(env: &mut JNIEnv) -> (Option<String>, String) {
 }
 
 /// Call a no-arg `String`-returning method on a throwable; None on JNI error/null.
+/// Any pending exception raised by the call itself is cleared before returning,
+/// so a later JNI call on this thread is not aborted for running with an
+/// exception pending (JNI forbids that).
 fn throwable_string_method(
     env: &mut JNIEnv,
     throwable: &JThrowable,
     method: &str,
 ) -> Option<String> {
-    let obj = env
+    let obj = match env
         .call_method(throwable, method, "()Ljava/lang/String;", &[])
-        .ok()?
-        .l()
-        .ok()?;
+        .and_then(|v| v.l())
+    {
+        Ok(obj) => obj,
+        Err(_) => {
+            clear_pending_exception(env);
+            return None;
+        }
+    };
     if obj.is_null() {
         return None;
     }
-    env.get_string(&JString::from(obj)).ok().map(|s| s.into())
+    match env.get_string(&JString::from(obj)) {
+        Ok(s) => Some(s.into()),
+        Err(_) => {
+            clear_pending_exception(env);
+            None
+        }
+    }
 }
 
 /// JDBC SQL Types constants
@@ -2200,6 +2243,29 @@ mod tests {
         // the real outer ORDER BY.
         assert!(query_orders_by_tracking_column(
             "SELECT * FROM t WHERE note = 'a (b' ORDER BY id",
+            "id",
+            false
+        ));
+        // An ORDER BY inside a SQL comment must NOT satisfy the requirement: the
+        // real query has no ordering, so accepting it would skip rows at runtime.
+        assert!(!query_orders_by_tracking_column(
+            "SELECT * FROM t -- ORDER BY id\n",
+            "id",
+            false
+        ));
+        assert!(!query_orders_by_tracking_column(
+            "SELECT * FROM t /* ORDER BY id */",
+            "id",
+            false
+        ));
+        // A comment before the genuine outer ORDER BY must not hide it.
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t /* pick a key */ ORDER BY id",
+            "id",
+            false
+        ));
+        assert!(query_orders_by_tracking_column(
+            "SELECT * FROM t -- note\n ORDER BY id",
             "id",
             false
         ));

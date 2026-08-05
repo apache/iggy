@@ -219,10 +219,7 @@ async fn setup_jdbc_postgres_source(
 async fn bulk_query_produces_message_to_iggy() {
     let (_postgres_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     let query = "SELECT 1 as id, 'test' as name";
@@ -271,10 +268,7 @@ async fn bulk_query_produces_message_to_iggy() {
 async fn bulk_query_produces_multiple_rows_to_iggy() {
     let (postgres_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     // Use a multi-row SELECT to simulate table data without needing DDL
@@ -331,10 +325,7 @@ async fn bulk_query_produces_multiple_rows_to_iggy() {
 async fn source_includes_metadata_fields_when_enabled() {
     let (_postgres_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     let query = "SELECT 42 as value";
@@ -395,10 +386,7 @@ fn collect_ids(messages: &[serde_json::Value]) -> Vec<i64> {
 async fn incremental_mode_advances_offset_across_polls() {
     let (_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {e}");
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     // Seed a real table BEFORE the source starts polling.
@@ -454,10 +442,7 @@ async fn incremental_mode_advances_offset_across_polls() {
 async fn large_result_set_streams_without_crashing() {
     let (_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {e}");
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     let pool = PgPoolOptions::new()
@@ -524,10 +509,7 @@ async fn large_result_set_streams_without_crashing() {
 async fn source_recovers_after_repeated_query_errors() {
     let (_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {e}");
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     // Start the source against a table that does not exist yet: every poll
@@ -574,10 +556,7 @@ async fn source_recovers_after_repeated_query_errors() {
 async fn bulk_result_larger_than_batch_size_fails_closed() {
     let (_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
         Ok(result) => result,
-        Err(e) => {
-            eprintln!("Skipping test: Failed to setup Postgres: {e}");
-            return;
-        }
+        Err(e) => panic!("Failed to set up Postgres container: {e}"),
     };
 
     let pool = PgPoolOptions::new()

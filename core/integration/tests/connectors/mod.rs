@@ -244,11 +244,4 @@ impl ConnectorsRuntime {
             .await
             .expect("Failed to create root TCP client")
     }
-
-    pub fn connectors_api_address(&self) -> Option<String> {
-        self.harness
-            .server()
-            .connectors_runtime()
-            .map(|cr| cr.http_address().to_string())
-    }
 }
