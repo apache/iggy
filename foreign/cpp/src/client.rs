@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::{RUNTIME, ffi};
+use bytes::Bytes;
 use iggy::prelude::{
     Client as IggyConnectionClient, ClusterClient,
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
@@ -239,7 +240,7 @@ impl Client {
         partitioning_kind: String,
         partitioning_value: Vec<u8>,
         messages: Vec<ffi::IggyMessageToSend>,
-    ) -> Result<(), String> {
+    ) -> Result<ffi::SendMessagesResponse, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not send messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -284,7 +285,8 @@ impl Client {
             .collect::<Result<Vec<_>, _>>()?;
 
         RUNTIME.block_on(async {
-            self.inner
+            let response = self
+                .inner
                 .send_messages(
                     &rust_stream_id,
                     &rust_topic_id,
@@ -293,7 +295,7 @@ impl Client {
                 )
                 .await
                 .map_err(|error| format!("Could not send messages: {error}"))?;
-            Ok(())
+            Ok(ffi::SendMessagesResponse::from(response))
         })
     }
 
@@ -1127,6 +1129,19 @@ impl Client {
                     format!("Could not change password for user '{rust_user_id}': {error}")
                 })?;
             Ok(())
+        })
+    }
+
+    /// Sends a command code and payload and returns the raw response bytes.
+    /// Session-control codes return an invalid-command error.
+    pub fn send_binary_request(&self, code: u32, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        RUNTIME.block_on(async {
+            let response = self
+                .inner
+                .send_binary_request(code, Bytes::from(payload))
+                .await
+                .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
+            Ok(Vec::from(response))
         })
     }
 }

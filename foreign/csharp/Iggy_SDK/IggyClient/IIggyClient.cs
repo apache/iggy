@@ -58,4 +58,17 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// </summary>
     /// <returns>The current address of the client.</returns>
     string GetCurrentAddress();
+
+    /// <summary>
+    ///     Sends a command code with a payload and returns the raw response bytes.
+    /// </summary>
+    /// <remarks>
+    ///     Session-control codes are rejected with an invalid-command error.
+    ///     HTTP clients report that this operation is unavailable.
+    /// </remarks>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The request payload.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
+    Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
 }

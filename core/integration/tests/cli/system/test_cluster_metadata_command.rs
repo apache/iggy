@@ -167,7 +167,7 @@ pub async fn should_cluster_help_match() {
 {USAGE_PREFIX} cluster <COMMAND>
 
 Commands:
-  metadata  Get cluster metadata [aliases: m]
+  metadata  Get cluster metadata [alias: m]
   help      Print this message or the help of the given subcommand(s)
 
 Options:

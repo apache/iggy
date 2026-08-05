@@ -28,5 +28,5 @@ bazel build //:iggy-cpp
 bazel test //:unit
 
 // Low level integration tests (requires running server)
-bazel test //:low-level-e2e
+bazel test //:e2e
 ```

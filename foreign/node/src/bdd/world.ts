@@ -26,5 +26,7 @@ export interface TestWorld {
   stream: Stream,
   topic: Topic,
   sendMessages: CreateMessage[],
-  polledMessages: Message[]
+  polledMessages: Message[],
+  rawResponse?: Buffer,
+  rawError?: Error
 };

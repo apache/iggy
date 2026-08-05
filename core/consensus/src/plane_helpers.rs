@@ -40,7 +40,10 @@ pub async fn pipeline_prepare_common<C, F>(
 {
     assert!(!consensus.is_follower(), "on_request: primary only");
     assert!(consensus.is_normal(), "on_request: status must be normal");
-    assert!(!consensus.is_syncing(), "on_request: must not be syncing");
+    assert!(
+        !consensus.is_transferring(),
+        "on_request: must not be transferring state"
+    );
 
     consensus.verify_pipeline();
     consensus.pipeline_message(plane, &prepare);
@@ -131,8 +134,8 @@ where
 {
     assert_eq!(header.command, Command2::Prepare);
 
-    if consensus.is_syncing() {
-        return Err(IgnoreReason::Syncing);
+    if consensus.is_transferring() {
+        return Err(IgnoreReason::StateTransfer);
     }
 
     let current_op = consensus.sequencer().current_sequence();
@@ -142,6 +145,10 @@ where
     }
 
     if header.view > consensus.view() {
+        // Dropped, but recorded: a newer-view prepare is proof the cluster
+        // moved past this replica, so the heartbeat-timeout handler probes to
+        // catch up rather than starting a futile election.
+        consensus.observe_newer_view(header.view);
         return Err(IgnoreReason::NewerView);
     }
 
@@ -253,6 +260,28 @@ where
     }
 
     drained
+}
+
+/// Header of the pipeline head, iff its op is covered by the commit frontier.
+///
+/// Peek-only counterpart of [`drain_committable_prefix`] for commit paths that
+/// must survive their driving future being canceled between "committable" and
+/// "applied" (see `IggyMetadata::on_ack`): the caller peeks here, performs its
+/// awaits with the entry still in the pipeline, then — in a sync region —
+/// revalidates that the head is still this exact entry before popping and
+/// applying it. A driver dropped at an await strands nothing; a sibling driver
+/// that committed the op first fails the caller's revalidation and re-peeks.
+pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let commit = consensus.commit_max();
+    let pipeline = consensus.pipeline().borrow();
+    pipeline
+        .head()
+        .map(|entry| entry.header)
+        .filter(|header| header.op <= commit)
 }
 
 /// Build reply for a committed prepare.
@@ -481,6 +510,48 @@ where
     reply
 }
 
+/// [`build_deny_reply_from_request`] for layers that hold no consensus group
+/// for the request's namespace (a shard fencing a frame aimed at a torn-down
+/// or never-materialised partition).
+///
+/// Replica-stamped fields (`cluster`, `view`, `replica`) echo the request
+/// instead, the same convention as [`build_result_rejection_reply`];
+/// `commit` stays 0 because no commit position exists here and deny frames
+/// are never cached in the `ClientTable`.
+///
+/// # Panics
+/// If the constructed message buffer is not a valid reply message.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_deny_reply_from_request_header(
+    request_header: &RequestHeader,
+    status: u32,
+) -> Message<ReplyHeader> {
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let mut buffer = bytes::BytesMut::zeroed(header_size);
+
+    let header = ReplyHeader {
+        cluster: request_header.cluster,
+        size: header_size as u32,
+        view: request_header.view,
+        release: request_header.release,
+        command: Command2::Reply,
+        replica: request_header.replica,
+        request_checksum: request_header.request_checksum,
+        client: request_header.client,
+        status,
+        timestamp: request_header.timestamp,
+        request: request_header.request,
+        operation: request_header.operation,
+        namespace: request_header.namespace,
+        ..Default::default()
+    };
+    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
+        .expect("deny reply buffer must contain a valid reply message")
+}
+
 /// Verify hash chain would not break if we add this header.
 ///
 /// # Panics
@@ -518,7 +589,7 @@ pub async fn send_prepare_ok<B, P>(
         return;
     }
 
-    if consensus.is_syncing() {
+    if consensus.is_transferring() {
         return;
     }
 
@@ -661,9 +732,9 @@ mod tests {
         consensus.init();
 
         // Diverge the frontiers: applied (commit_min=5) lags known-committed
-        // (commit_max=13) by more than PIPELINE_PREPARE_QUEUE_MAX (8). op is at
-        // 13 (>= commit_max), so the op clamp on the DVC commit is a no-op here
-        // and the carried value is commit_max. The clamp itself is covered by
+        // (commit_max=13). op is at 13 (>= commit_max), so the op clamp on the
+        // DVC commit is a no-op here and the carried value is commit_max. The
+        // clamp itself is covered by
         // `do_view_change_commit_clamped_to_op_when_commit_max_exceeds_op`.
         consensus.advance_commit_max(13);
         consensus.sequencer().set_sequence(13);
@@ -886,6 +957,74 @@ mod tests {
         assert!(
             buf.is_empty(),
             "loopback queue must be empty after view change completion"
+        );
+    }
+
+    /// A DVC winner may claim an uncommitted range up to the *configured*
+    /// prepare depth. With a pipeline deeper than the default const, the new
+    /// primary schedules the rebuild rather than panicking on the old
+    /// `PIPELINE_PREPARE_QUEUE_MAX` bound.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn given_view_change_range_above_default_when_complete_as_primary_should_rebuild() {
+        use iggy_binary_protocol::{DoViewChangeHeader, StartViewChangeHeader};
+
+        let depth = crate::PIPELINE_PREPARE_QUEUE_MAX * 2;
+        // Strictly above the default const, still within the configured depth.
+        let winner_op = (crate::PIPELINE_PREPARE_QUEUE_MAX + 8) as u64;
+
+        // 3 replicas, replica 0 is primary for view 3 (3 % 3 = 0).
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            0,
+            NoopBus,
+            LocalPipeline::with_capacities(depth, depth * 2),
+        );
+        consensus.init();
+
+        // SVC from replica 1 moves replica 0 into view 3 and records its own DVC.
+        let svc = StartViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 3,
+            release: 0,
+            command: Command2::StartViewChange,
+            replica: 1,
+            reserved_frame: [0; 66],
+            namespace: 0,
+            reserved: [0; 120],
+        };
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc);
+
+        // DVC from replica 2 claims a log head far past commit, forming quorum.
+        let dvc = DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 3,
+            release: 0,
+            command: Command2::DoViewChange,
+            replica: 2,
+            reserved_frame: [0; 66],
+            op: winner_op,
+            commit: 0,
+            namespace: 0,
+            log_view: 0,
+            reserved: [0; 100],
+        };
+        let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc);
+
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                VsrAction::RebuildPipeline { from_op: 1, to_op } if *to_op == winner_op
+            )),
+            "expected RebuildPipeline over the full uncommitted range"
         );
     }
 

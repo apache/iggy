@@ -21,6 +21,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -28,8 +29,10 @@ use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use configs::server_ng::NgSystemConfig;
 use consensus::{MetadataHandle, VsrConsensus};
+use futures::channel::oneshot;
 use iggy_common::{ClusterMetadata, IggyTimestamp};
 use message_bus::InstanceToken;
+use metadata::MetadataSubmitError;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -38,17 +41,21 @@ use crate::bootstrap::ServerNgShard;
 use crate::cluster_meta::ClusterRoster;
 use crate::dispatch::submit_register_on_owner;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
+use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
+use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
-    BarrierEntry, FIRST_REQUEST_ID, HttpSession, MAX_HTTP_SESSIONS, RegistrationBarrier,
+    BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
     forget_if_same, live_entry, sweep_expired,
 };
 
 /// Response header carrying the current VSR view number. Stamped by
 /// `insert_view_header` on success and redirect responses only (never on
 /// errors, and the router suppresses it on `/ping`) while this node has live
-/// consensus.
-const VIEW_HEADER: HeaderName = HeaderName::from_static("x-iggy-view");
+/// consensus. Fill-if-absent: a response relayed from the primary already
+/// carries the SERVING node's view, which must win over the relaying
+/// follower's possibly-stale one.
+pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("iggy-view");
 
 /// Axum router state: shard-0's [`HttpInner`] behind an `Rc`, `!Send` yet
 /// bridged into axum's `Send + Sync` requirement by `SendWrapper`. Sound
@@ -77,10 +84,25 @@ pub(in crate::http) struct HttpInner {
     /// requests for one credential from each running its own `Register`.
     pub(in crate::http) registrations: RegistrationBarrier,
     pub(in crate::http) roster: ClusterRoster,
+    /// Cap on live per-credential sessions: half the configured `[metadata]
+    /// clients_table_max`, so HTTP sessions cannot crowd the TCP/QUIC/WS virtual
+    /// clients out of the shared VSR client table. Read by `resolve_session`
+    /// when admitting a fresh session.
+    pub(in crate::http) max_http_sessions: usize,
+    /// Configured `[personal_access_token] max_tokens_per_user`, enforced
+    /// pre-consensus by the PAT rewrite inside the write submit (the cap is
+    /// config-derived, so it must never branch inside the replicated apply).
+    pub(in crate::http) max_tokens_per_user: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
     pub(in crate::http) in_flight_writes: Cell<u32>,
+    /// Follower-to-primary forwarding context: outbound client, scheme, body
+    /// bound, and its own in-flight budget (see `http::forward`).
+    pub(in crate::http) forward: ForwardState,
+    /// Legacy-parity metric registry served by the scrape route; the router's
+    /// counting layer holds a clone of its request counter.
+    pub(in crate::http) metrics: HttpMetrics,
 }
 
 impl HttpInner {
@@ -103,8 +125,15 @@ impl HttpInner {
     /// current VSR primary's HTTP address when it resolves from the roster, else
     /// fail closed to the 503. The target is the roster node whose `replica_id`
     /// equals `primary_index(view)`; an absent consensus, an unmatched id, or a
-    /// port-less node all fall back to [`ReadError::NotPrimary`].
-    pub(in crate::http) fn not_primary_read_error(&self, path_and_query: &str) -> ReadError {
+    /// port-less node all fall back to [`ReadError::NotPrimary`]. `client_ip`
+    /// picks the primary's advertised address from its per-client-network
+    /// selectors, so the redirected client lands on the address for its own
+    /// network.
+    pub(in crate::http) fn not_primary_read_error(
+        &self,
+        path_and_query: &str,
+        client_ip: Option<IpAddr>,
+    ) -> ReadError {
         let location = self
             .shard
             .plane
@@ -113,7 +142,13 @@ impl HttpInner {
             .as_ref()
             .and_then(|consensus| {
                 let primary_index = consensus.primary_index(consensus.view());
-                primary_redirect_location(&self.roster, primary_index, path_and_query)
+                primary_redirect_location(
+                    &self.roster,
+                    primary_index,
+                    self.forward.scheme,
+                    path_and_query,
+                    client_ip,
+                )
             });
         location.map_or(ReadError::NotPrimary, ReadError::RedirectToPrimary)
     }
@@ -157,7 +192,7 @@ impl HttpInner {
                     let (admitted, torn) = {
                         let mut table = self.sessions.borrow_mut();
                         let torn = sweep_expired(&mut table, now);
-                        if table.len() >= MAX_HTTP_SESSIONS {
+                        if table.len() >= self.max_http_sessions {
                             // Still full after dropping expired entries: too many
                             // genuinely live sessions. Refuse rather than evict a
                             // live one (its `fresh` client id is orphaned on the
@@ -181,9 +216,58 @@ impl HttpInner {
         live_entry(&self.sessions.borrow(), key, now_secs)
     }
 
-    /// Mint a shard-0 client id and run the VSR `Register` for a fresh session.
-    /// Holds no table borrow; the caller inserts the result under `key`.
+    /// Mint a shard-0 client id and run the VSR `Register` for a fresh session,
+    /// retrying on a fresh id if the minted one turns out to be taken.
+    ///
+    /// The minter is a per-process counter reseeded from the client table at
+    /// boot, so a fresh mint normally lands on a free id. Two situations break
+    /// that, and neither is predictable from here: a promoted primary mints
+    /// from a counter with no relationship to the ids its predecessor
+    /// committed, and in a cluster every node counts independently. Landing on
+    /// an occupied entry is therefore reactive to detect and cheap to fix --
+    /// mint again. Bounded, because a run of collisions means the counter is
+    /// wrong rather than unlucky, and looping would hide that.
+    ///
+    /// The two collision signals are asymmetric. A different owner is refused
+    /// terminally by the register ownership gate. The SAME user is not refused
+    /// at all -- it rebinds, silently inheriting a watermark written by another
+    /// of that user's sessions, which would make this session's first writes
+    /// read as duplicates and answer them from the other session's cache. A
+    /// non-zero watermark on what should be a brand-new session is exactly that
+    /// tell.
     async fn register_session(
+        &self,
+        key: String,
+        user_id: u32,
+        expiry: u64,
+    ) -> Result<Rc<HttpSession>, AuthError> {
+        /// Enough to ride out a promotion-era counter overlap; beyond this the
+        /// minter is misconfigured and the 503 is the honest answer.
+        const MINT_ATTEMPTS: u8 = 3;
+
+        for attempt in 1..=MINT_ATTEMPTS {
+            match self
+                .register_session_once(key.clone(), user_id, expiry)
+                .await
+            {
+                Ok(session) => return Ok(session),
+                Err(AuthError::SessionIdOwnedByAnotherUser | AuthError::SessionIdTaken)
+                    if attempt < MINT_ATTEMPTS =>
+                {
+                    warn!(
+                        attempt,
+                        "server-ng HTTP: minted client id was already registered; re-minting"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AuthError::SessionUnavailable)
+    }
+
+    /// One mint-and-Register attempt. `SessionIdTaken` means the id was live
+    /// under this same user, so the caller should mint a different one.
+    async fn register_session_once(
         &self,
         key: String,
         user_id: u32,
@@ -193,6 +277,21 @@ impl HttpInner {
             .shard
             .coordinator()
             .ok_or(AuthError::SessionUnavailable)?;
+        // Refold the client table into the minter if this is the first mint of
+        // the current view. Cheap and skipped within a view, and it is what
+        // stops a PROMOTED primary from minting against ids its predecessor
+        // committed from an unrelated counter -- the table is replicated, the
+        // counter is per process. Boot does the same call (`bootstrap`); this
+        // one covers every later view.
+        {
+            let metadata = self.shard.plane.metadata();
+            if let Some(consensus) = metadata.consensus.as_ref() {
+                coordinator.seed_client_sequence(
+                    consensus.view(),
+                    metadata.client_table.borrow().client_ids(),
+                );
+            }
+        }
         // Reuse the TCP accept path's minter: it draws from the same shard-0
         // `client_seq`, so an HTTP session id can never collide with a TCP
         // virtual client's and the shard-0 tag (top 16 bits == 0) is preserved.
@@ -205,16 +304,71 @@ impl HttpInner {
         }
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
-        let session = submit_register_on_owner(&self.shard, client_id, user_id)
+        //
+        // Detached so a client disconnect cannot cancel the Register
+        // mid-flight: the in-process submit drives shared consensus machinery
+        // (pipeline push, WAL append, the `on_ack` commit loop), and hyper
+        // drops this handler future the moment the HTTP peer disconnects.
+        // A canceled submit used to strand consensus state mid-await; now the
+        // detached task always drives it to completion and a disconnect only
+        // drops the receiver half (same discipline as `submit_committed`).
+        let (result_slot, committed) = oneshot::channel();
+        let shard = Rc::clone(&self.shard);
+        compio::runtime::spawn(async move {
+            let result = submit_register_on_owner(&shard, client_id, user_id).await;
+            // A failed send means the handler died mid-await; the Register
+            // itself has already committed, which is what matters.
+            let _ = result_slot.send(result);
+        })
+        .detach();
+        let bound = committed
             .await
+            .map_err(|_| AuthError::SessionUnavailable)?
             .map_err(|error| {
                 warn!(?error, "server-ng HTTP: VSR Register submit failed");
-                AuthError::SessionUnavailable
+                match error {
+                    // The Register never entered the pipeline, so re-issuing
+                    // it anywhere is safe; the transient-not-accepted body
+                    // tells a forwarding peer to retry against the current
+                    // primary. `Canceled` / `InProgress` mean a prepare may
+                    // still commit cluster-wide, so they stay the plain
+                    // unavailable 503.
+                    MetadataSubmitError::NotPrimary
+                    | MetadataSubmitError::NotCaughtUp
+                    | MetadataSubmitError::PipelineFull => AuthError::SessionNotAccepted,
+                    // Terminal, and the only variant here that is: retrying
+                    // anywhere cannot make the id free. Kept off the 503 path
+                    // so the caller's HTTP stack does not auto-retry forever.
+                    MetadataSubmitError::ClientIdOwnedByAnotherUser => {
+                        AuthError::SessionIdOwnedByAnotherUser
+                    }
+                    // `InProgress` / `Canceled` mean a prepare may still
+                    // commit cluster-wide, so the outcome is unknown rather
+                    // than terminal. A future variant lands here too: 503 is
+                    // the safe default, since it never asserts a refusal the
+                    // server did not make.
+                    MetadataSubmitError::InProgress | MetadataSubmitError::Canceled | _ => {
+                        AuthError::SessionUnavailable
+                    }
+                }
             })?;
+        // A fresh mint must land on a fresh entry, so a watermark it did not
+        // write means the id was already registered to this same user (see
+        // `register_session`). Rebinding onto it would inherit that session's
+        // dedup history; hand the id back instead and let the caller re-mint.
+        if bound.watermark != FRESH_ENTRY_WATERMARK {
+            warn!(
+                client_id,
+                user_id,
+                watermark = bound.watermark,
+                "server-ng HTTP: minted client id already had a committed session for this user"
+            );
+            return Err(AuthError::SessionIdTaken);
+        }
         Ok(Rc::new(HttpSession {
             key,
             client_id,
-            session,
+            session: bound.epoch,
             user_id,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
@@ -252,7 +406,12 @@ impl HttpInner {
     /// shared [`ClusterRoster`] assembly. The leader marking comes from this
     /// shard's consensus view; the HTTP listener is shard-0-only, so consensus is
     /// always present and every roster read carries real leader/follower roles.
-    pub(in crate::http) fn build_cluster_metadata(&self) -> ClusterMetadata {
+    /// `client_ip` picks each node's advertised address from its
+    /// per-client-network selectors.
+    pub(in crate::http) fn build_cluster_metadata(
+        &self,
+        client_ip: Option<IpAddr>,
+    ) -> ClusterMetadata {
         let primary_index = self
             .shard
             .plane
@@ -260,7 +419,7 @@ impl HttpInner {
             .consensus
             .as_ref()
             .map(|consensus| consensus.primary_index(consensus.view()));
-        self.roster.cluster_metadata(primary_index)
+        self.roster.cluster_metadata(primary_index, client_ip)
     }
 }
 
@@ -275,9 +434,12 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
         return response;
     }
     if let Some(consensus) = state.shard.plane.metadata().consensus.as_ref() {
+        // Fill-if-absent: a relayed response already carries the serving
+        // primary's view, which must not be overwritten with this follower's.
         response
             .headers_mut()
-            .insert(VIEW_HEADER, HeaderValue::from(consensus.view()));
+            .entry(VIEW_HEADER)
+            .or_insert(HeaderValue::from(consensus.view()));
     }
     response
 }

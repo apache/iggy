@@ -27,17 +27,19 @@ use crate::stm::result::{
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-// Only `seed_single_partition` (below, sim/test-gated) uses this at module
-// scope; keep the import under the same gate so a production build does not
-// see it as unused. The test module re-imports it independently.
+// Only `seed_namespace` (below, sim/test-gated) uses these at module scope;
+// keep the imports under the same gate so a production build does not see them
+// as unused. The test module re-imports them independently.
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
+#[cfg(any(test, feature = "simulator"))]
+use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
@@ -179,10 +181,11 @@ pub struct Topic {
     /// key (keyed by group id) can't be inherited by a recreated group.
     ///
     /// Ceiling: the partition-plane offset key is `u32`, so a group id must stay
-    /// within `u32::MAX` (the wire rewrite in `server-ng` truncates to u32 and
-    /// `expect`s this). ~4 billion group creates on a single topic is
-    /// unreachable in practice, but the cap is real -- past it the wire id would
-    /// wrap and could collide with a live group's offset key.
+    /// within `u32::MAX` (the wire rewrite in `server-ng` clamps past-ceiling
+    /// ids to `u32::MAX` rather than panic). ~4 billion group creates on a
+    /// single topic is unreachable in practice, but the cap is real -- past it
+    /// clamped wire ids all collide on `u32::MAX`, including with a live
+    /// group's offset key.
     pub next_consumer_group_id: u64,
 }
 
@@ -201,7 +204,7 @@ impl Default for Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         }
     }
 }
@@ -229,7 +232,7 @@ impl Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         }
     }
 
@@ -458,6 +461,43 @@ impl StatsRegistry {
                 !(*sid == stream_id && *tid == topic_id && *pid >= first_removed)
             });
     }
+
+    /// Drop every entry the snapshot does not describe, keeping the rest.
+    ///
+    /// Used by the in-place restore (state transfer), which replaces the whole
+    /// stream tree but must not replace the registry: partition counters live
+    /// only here (never snapshotted), so survivors have to keep their `Arc`s
+    /// or every already-materialized partition reads (0,0,0,0) forever. Slab
+    /// keys are recycled, so anything the snapshot dropped has to go with it.
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    fn retain_from_snapshot(&self, snapshot: &StreamsSnapshot) {
+        let mut live_streams: AHashSet<usize> = AHashSet::new();
+        let mut live_topics: AHashSet<(usize, usize)> = AHashSet::new();
+        let mut live_partitions: AHashSet<(usize, usize, usize)> = AHashSet::new();
+        for (stream_key, stream) in &snapshot.items {
+            live_streams.insert(*stream_key);
+            for (topic_key, topic) in &stream.topics {
+                live_topics.insert((*stream_key, *topic_key));
+                for partition in &topic.partitions {
+                    live_partitions.insert((*stream_key, *topic_key, partition.id));
+                }
+            }
+        }
+        self.streams
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|id, _| live_streams.contains(id));
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|key, _| live_topics.contains(key));
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|key, _| live_partitions.contains(key));
+    }
 }
 
 define_state! {
@@ -548,9 +588,9 @@ impl StateHandler for TruncatePartitionRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         // The committed form of a client `DeleteSegments`: an unresolvable
-        // target commits as a rejection, keeping the client's request
-        // sequence contiguous (`request == committed + 1`) while surfacing
-        // the typed error an empty ack would swallow.
+        // target commits as a rejection, so the outcome is recorded against
+        // the client's request id (its retry dedups) while surfacing the
+        // typed error an empty ack would swallow.
         {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
@@ -1163,53 +1203,196 @@ impl Streams {
         })
     }
 
-    /// Seed the first stream / topic / partition straight into the STM so a
-    /// simulator or test namespace resolves without driving the metadata
-    /// consensus + reconciler chain (which the simulator does not wire).
+    /// Committed [`Partition::created_revision`] for the exact partition the
+    /// `namespace` tuple denotes, or `None` if any level of the tuple is not
+    /// committed.
     ///
-    /// Creates stream slab 0, topic slab 0, and one partition `partition_id`
-    /// bound to `consensus_group_id`, so `namespace_from_partition(numeric 0,
-    /// numeric 0, partition_id)` resolves to `IggyNamespace::new(0, 0,
-    /// partition_id)`. Mirrors [`Users::ensure_root_user`]: a seed helper
-    /// that bypasses consensus, never a production runtime path. No-op if a
-    /// stream already occupies slab 0.
+    /// Resolves by slab index rather than by name, so a delete + recreate that
+    /// recycled the freed keys reports the NEW incarnation's revision under the
+    /// byte-identical namespace. That difference is the only thing separating
+    /// the two incarnations, so callers can use it to tell a materialised
+    /// partition apart from the committed one it is impersonating.
+    /// This sits on the per-request incarnation fence
+    /// (`IggyShard::serves_committed_incarnation`) and on the park stamp, so it
+    /// runs once per partition request rather than once per reconciler pass. A
+    /// plain scan of `partitions` would therefore cost ~N element visits per
+    /// request on an N-partition topic. Partitions are pushed in dense id order by
+    /// `CreateTopicWithAssignments` / `CreatePartitionsWithAssignments`, so the
+    /// direct index hits in one step; the scan stays as the fallback because
+    /// nothing in the type enforces that density.
+    #[must_use]
+    pub fn created_revision_for_namespace(&self, namespace: IggyNamespace) -> Option<u64> {
+        self.inner.read(|inner| {
+            let stream = inner.items.get(namespace.stream_id())?;
+            let topic = stream.topics.get(namespace.topic_id())?;
+            let partition_id = namespace.partition_id();
+            if let Some(partition) = topic.partitions.get(partition_id)
+                && partition.id == partition_id
+            {
+                return Some(partition.created_revision);
+            }
+            topic
+                .partitions
+                .iter()
+                .find(|partition| partition.id == partition_id)
+                .map(|partition| partition.created_revision)
+        })
+    }
+
+    /// Create stream slabs `0..=stream_slab`, skipping those already present.
+    #[cfg(any(test, feature = "simulator"))]
+    fn seed_stream_slabs(&self, stream_slab: usize) {
+        for slab in 0..=stream_slab {
+            if self.read(|inner| inner.items.contains(slab)) {
+                continue;
+            }
+            self.inner
+                .try_apply(StreamsCommand::CreateStream(
+                    CreateStreamRequest {
+                        name: WireName::new(format!("sim-stream-{slab}"))
+                            .expect("sim stream name is valid"),
+                    },
+                    IggyTimestamp::from(1),
+                ))
+                .expect("sim stream seed applies on the metadata writer");
+        }
+    }
+
+    /// Create topic slabs `0..=topic_slab` under `stream_slab`, skipping those
+    /// already present. Only the last slab receives `target_partitions`.
+    #[cfg(any(test, feature = "simulator"))]
+    fn seed_topic_slabs(
+        &self,
+        stream_slab: usize,
+        topic_slab: usize,
+        target_partitions: &[CreatedPartitionAssignment],
+    ) {
+        let stream_wire =
+            WireIdentifier::numeric(u32::try_from(stream_slab).expect("sim stream slab fits u32"));
+        for slab in 0..=topic_slab {
+            let present = self.read(|inner| {
+                inner
+                    .items
+                    .get(stream_slab)
+                    .is_some_and(|stream| stream.topics.contains(slab))
+            });
+            if present {
+                continue;
+            }
+            let partitions = if slab == topic_slab {
+                target_partitions.to_vec()
+            } else {
+                Vec::new()
+            };
+            self.inner
+                .try_apply(StreamsCommand::CreateTopicWithAssignments(
+                    CreateTopicWithAssignmentsRequest {
+                        request: CreateTopicRequest {
+                            stream_id: stream_wire.clone(),
+                            partitions_count: u32::try_from(partitions.len())
+                                .expect("sim partition count fits u32"),
+                            compression_algorithm: 0,
+                            message_expiry: 0,
+                            max_topic_size: 0,
+                            replication_factor: 1,
+                            name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
+                                .expect("sim topic name is valid"),
+                        },
+                        partitions,
+                    },
+                    IggyTimestamp::from(1),
+                ))
+                .expect("sim topic seed applies on the metadata writer");
+        }
+    }
+
+    /// Seed the stream / topic / partition that `namespace` denotes straight
+    /// into the STM so a simulator or test namespace resolves without driving
+    /// the metadata consensus + reconciler chain (which the simulator does not
+    /// wire).
+    ///
+    /// Slab keys are handed out in creation order, so landing on stream slab
+    /// `s` / topic slab `t` means creating every slab below it too; those
+    /// fillers carry no partitions and are inert. Each level is skipped when
+    /// already present, so seeding sibling partitions of one topic adds only
+    /// the missing partition. Mirrors [`Users::ensure_root_user`]: a seed
+    /// helper that bypasses consensus, never a production runtime path.
     ///
     /// # Panics
     /// Panics if the apply is attempted on a reader handle rather than the
-    /// writer (never for the simulator's writer-backed STM).
+    /// writer (never for the simulator's writer-backed STM), or if a slab id
+    /// exceeds the `u32` wire identifier space.
     #[cfg(any(test, feature = "simulator"))]
-    pub fn seed_single_partition(&self, partition_id: u32, consensus_group_id: u64) {
-        if self.read(|inner| inner.items.contains(0)) {
+    pub fn seed_namespace(&self, namespace: IggyNamespace, consensus_group_id: u64) {
+        let stream_slab = namespace.stream_id();
+        let topic_slab = namespace.topic_id();
+        let partition_id =
+            u32::try_from(namespace.partition_id()).expect("sim partition id fits u32");
+        let stream_wire = || {
+            WireIdentifier::numeric(u32::try_from(stream_slab).expect("sim stream slab fits u32"))
+        };
+        let topic_wire =
+            || WireIdentifier::numeric(u32::try_from(topic_slab).expect("sim topic slab fits u32"));
+        // Filler partitions created to keep the id range dense get the group id
+        // their own namespace would carry, so the addressed one keeps the
+        // caller's value.
+        let sibling_group_id = |id: u32| {
+            if id == partition_id {
+                consensus_group_id
+            } else {
+                IggyNamespace::new(stream_slab, topic_slab, id as usize).inner()
+            }
+        };
+
+        // Only the addressed topic carries partitions; the fillers below it
+        // exist purely to advance the slab counter. Ids are absolute on the
+        // topic-create command, but the additive path below can only append
+        // above the current maximum, so seed the whole dense range up front and
+        // leave no gap for a later sibling to fall into.
+        let target_partitions: Vec<_> = (0..=partition_id)
+            .map(|id| CreatedPartitionAssignment {
+                partition_id: id,
+                consensus_group_id: sibling_group_id(id),
+            })
+            .collect();
+        self.seed_stream_slabs(stream_slab);
+        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions);
+
+        if self.created_revision_for_namespace(namespace).is_some() {
             return;
         }
+        // Sibling partition of a topic seeded by an earlier call. Ids on this
+        // command are relative to `max(existing) + 1`, so append the whole run
+        // up to the addressed id rather than the single id itself.
+        let base = self.read(|inner| {
+            inner
+                .items
+                .get(stream_slab)
+                .and_then(|stream| stream.topics.get(topic_slab))
+                .and_then(|topic| topic.partitions.iter().map(|partition| partition.id).max())
+                .map_or(0, |highest| highest + 1)
+        });
+        let base = u32::try_from(base).expect("sim partition base fits u32");
+        let partitions = (base..=partition_id)
+            .map(|id| CreatedPartitionAssignment {
+                partition_id: id - base,
+                consensus_group_id: sibling_group_id(id),
+            })
+            .collect::<Vec<_>>();
         self.inner
-            .try_apply(StreamsCommand::CreateStream(
-                CreateStreamRequest {
-                    name: WireName::new("sim-stream").expect("sim stream name is valid"),
-                },
-                IggyTimestamp::from(1),
-            ))
-            .expect("sim stream seed applies on the metadata writer");
-        self.inner
-            .try_apply(StreamsCommand::CreateTopicWithAssignments(
-                CreateTopicWithAssignmentsRequest {
-                    request: CreateTopicRequest {
-                        stream_id: WireIdentifier::numeric(0),
-                        partitions_count: 1,
-                        compression_algorithm: 0,
-                        message_expiry: 0,
-                        max_topic_size: 0,
-                        replication_factor: 1,
-                        name: WireName::new("sim-topic").expect("sim topic name is valid"),
+            .try_apply(StreamsCommand::CreatePartitionsWithAssignments(
+                CreatePartitionsWithAssignmentsRequest {
+                    request: CreatePartitionsRequest {
+                        stream_id: stream_wire(),
+                        topic_id: topic_wire(),
+                        partitions_count: u32::try_from(partitions.len())
+                            .expect("sim partition count fits u32"),
                     },
-                    partitions: vec![CreatedPartitionAssignment {
-                        partition_id,
-                        consensus_group_id,
-                    }],
+                    partitions,
                 },
                 IggyTimestamp::from(1),
             ))
-            .expect("sim topic seed applies on the metadata writer");
+            .expect("sim partition seed applies on the metadata writer");
     }
 
     #[must_use]
@@ -1416,7 +1599,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -1718,6 +1901,12 @@ impl StateHandler for DeletePartitionsRequest {
 }
 
 /// Snapshot representation for the Streams state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items` and the nested `topics` / `consumer_groups` / `partitions` stay ordered
+/// `Vec`s even though the runtime holds them in `AHashMap`s and a `Slab`. Swapping
+/// any back to an unordered map reorders on a decode and re-encode, breaking the
+/// checkpoint checksum cross-check recovery relies on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsSnapshot {
     pub items: Vec<(usize, StreamSnapshot)>,
@@ -1807,12 +1996,43 @@ impl Snapshotable for Streams {
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        // Boot: no live registry exists yet, so mint one. Safe because
+        // `new_from_empty` clones this single inner onto the other left-right
+        // buffer rather than building a second one.
+        Ok(StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default())).into())
+    }
+}
+
+impl StreamsInner {
+    /// Rebuild from a snapshot section IN PLACE, keeping the live stats
+    /// registry.
+    ///
+    /// The restore command is absorbed on BOTH left-right buffers, so minting
+    /// a registry here would hand the two buffers different `Arc`s and split
+    /// every direct partition-plane counter increment by publish parity --
+    /// exactly what [`StatsRegistry`] exists to prevent. Carrying the registry
+    /// across also preserves the `Arc<PartitionStats>` the data plane
+    /// registered at bootstrap and reconcile, which nothing in a snapshot can
+    /// reconstruct (partition counters are not snapshotted).
+    pub(crate) fn restore_in_place(&mut self, snapshot: StreamsSnapshot) {
+        let registry = Arc::clone(&self.stats_registry);
+        // Slab keys are recycled, so an entry left over from a stream the
+        // snapshot does not have would hand its counters to whatever lands in
+        // that slot next.
+        registry.retain_from_snapshot(&snapshot);
+        *self = Self::inner_from_snapshot(snapshot, registry);
+    }
+
+    /// Build a complete `StreamsInner` from a snapshot section against
+    /// `stats_registry`. Shared by wrapper construction
+    /// ([`Snapshotable::from_snapshot`]) and the in-place restore command
+    /// (state transfer), which absorbs it on both left-right buffers.
+    pub(crate) fn inner_from_snapshot(
+        snapshot: StreamsSnapshot,
+        stats_registry: Arc<StatsRegistry>,
+    ) -> Self {
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
         let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
-        // Register restored stats in the shared registry so both left-right
-        // buffers (and any post-restore op) reference one `Arc` per
-        // stream/topic (see `StatsRegistry`).
-        let stats_registry = Arc::new(StatsRegistry::default());
 
         for (slab_key, stream_snap) in snapshot.items {
             let stream_stats = stats_registry.stream(slab_key);
@@ -1862,17 +2082,14 @@ impl Snapshotable for Streams {
                         .iter()
                         .map(|(_, group_snap)| (Arc::from(group_snap.name.as_str()), group_snap.id))
                         .collect(),
-                    next_consumer_group_id: topic_snap
-                        .next_consumer_group_id
-                        .max(
-                            topic_snap
-                                .consumer_groups
-                                .iter()
-                                .map(|(id, _)| id + 1)
-                                .max()
-                                .unwrap_or(1),
-                        )
-                        .max(1),
+                    next_consumer_group_id: topic_snap.next_consumer_group_id.max(
+                        topic_snap
+                            .consumer_groups
+                            .iter()
+                            .map(|(id, _)| id + 1)
+                            .max()
+                            .unwrap_or(0),
+                    ),
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()
@@ -1900,7 +2117,7 @@ impl Snapshotable for Streams {
         }
 
         let items: Slab<Stream> = stream_entries.into_iter().collect();
-        let mut inner = StreamsInner {
+        let mut inner = Self {
             index,
             items,
             revision: snapshot.revision,
@@ -1910,7 +2127,7 @@ impl Snapshotable for Streams {
             stats_registry,
         };
         inner.recompute_pending_revocations_count();
-        Ok(inner.into())
+        inner
     }
 }
 
@@ -1919,6 +2136,7 @@ impl_fill_restore!(Streams, streams);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::snapshot::MetadataSnapshot;
     use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::codec::WireDecode;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1969,6 +2187,85 @@ mod tests {
             replication_factor: 1,
             name: WireName::new(name).unwrap(),
         }
+    }
+
+    /// Regression guard for the [`StreamsSnapshot`] serialized-form invariant: a
+    /// populated snapshot must re-encode byte-identically after a decode, or the
+    /// checkpoint checksum cross-check (`recovery::verify_checkpoint_pairing`) would
+    /// diverge and refuse boot on a healthy node. Populates the three map-derived
+    /// `Vec`s (`items`, `topics`, `consumer_groups`) with two entries each, since one
+    /// entry cannot reorder and only >= 2 makes a regression observable.
+    #[test]
+    fn populated_streams_snapshot_reencode_is_byte_stable() {
+        let mut inner = StreamsInner::new();
+        for name in ["alpha", "beta"] {
+            create_stream(&mut inner, name);
+        }
+        // Streams are assigned ids 0, 1 in creation order; two topics per stream,
+        // two consumer groups per topic.
+        for stream_id in 0..2u32 {
+            for topic_name in ["logs", "events"] {
+                let create_topic = CreateTopicWithAssignmentsRequest {
+                    request: make_topic_request(stream_id, 2, topic_name),
+                    partitions: vec![
+                        CreatedPartitionAssignment {
+                            partition_id: 0,
+                            consensus_group_id: 1,
+                        },
+                        CreatedPartitionAssignment {
+                            partition_id: 1,
+                            consensus_group_id: 2,
+                        },
+                    ],
+                };
+                let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+            }
+        }
+        for stream_id in 0..2u32 {
+            for topic_id in 0..2u32 {
+                for group_name in ["cg-a", "cg-b"] {
+                    let request = CreateConsumerGroupRequest {
+                        stream_id: WireIdentifier::numeric(stream_id),
+                        topic_id: WireIdentifier::numeric(topic_id),
+                        name: WireName::new(group_name).unwrap(),
+                    };
+                    let _ = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+                }
+            }
+        }
+        let streams: Streams = inner.into();
+
+        let mut snapshot = MetadataSnapshot::new(7);
+        snapshot.streams = Some(streams.to_snapshot());
+
+        // The tree really is populated, else a byte-stable empty snapshot would pass
+        // vacuously.
+        let streams_snapshot = snapshot.streams.as_ref().unwrap();
+        assert_eq!(streams_snapshot.items.len(), 2, "two streams");
+        let (_, first_stream) = &streams_snapshot.items[0];
+        assert_eq!(
+            first_stream.topics.len(),
+            2,
+            "two topics in the first stream"
+        );
+        let (_, first_topic) = &first_stream.topics[0];
+        assert_eq!(
+            first_topic.consumer_groups.len(),
+            2,
+            "two consumer groups in the first topic"
+        );
+
+        let encoded = snapshot.encode().unwrap();
+        let reencoded = MetadataSnapshot::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(
+            encoded, reencoded,
+            "a populated snapshot must re-encode byte-identically after a decode; an \
+             unordered collection would reorder and break the checkpoint checksum \
+             cross-check, refusing boot on a healthy node"
+        );
     }
 
     #[test]
@@ -2243,5 +2540,89 @@ mod tests {
         }
         buffer.as_mut_slice()[header_size..].copy_from_slice(&body);
         Message::try_from(buffer).unwrap()
+    }
+
+    /// One stream, one topic, one partition, materialized in the registry the
+    /// way the data plane does at bootstrap.
+    fn inner_with_registered_partition() -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "alpha");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "logs"),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let topic_stats = inner.items[0].topics[0].stats.clone();
+        inner.stats_registry.partition(0, 0, 0, topic_stats);
+        inner
+    }
+
+    // The restore command is absorbed on BOTH left-right buffers. Minting a
+    // registry per call would hand the two buffers different `Arc`s, so a
+    // direct partition-plane increment would land on one buffer and vanish on
+    // the next publish -- the `messages_count_inconsistent` failure the
+    // registry exists to prevent.
+    #[test]
+    fn in_place_restore_keeps_one_registry_across_both_buffers() {
+        let mut first = inner_with_registered_partition();
+        let snapshot = Streams::from(first.clone()).to_snapshot();
+        let mut second = first.clone();
+
+        first.restore_in_place(snapshot.clone());
+        second.restore_in_place(snapshot);
+
+        assert!(
+            Arc::ptr_eq(&first.stats_registry, &second.stats_registry),
+            "both buffers must keep the one shared registry"
+        );
+        let from_first = first
+            .stats_registry
+            .partition_get(0, 0, 0)
+            .expect("survivor keeps its partition stats");
+        let from_second = second
+            .stats_registry
+            .partition_get(0, 0, 0)
+            .expect("survivor keeps its partition stats");
+        assert!(Arc::ptr_eq(&from_first, &from_second));
+    }
+
+    // Partition counters live only in the registry (never snapshotted), so an
+    // install that dropped them would leave every already-materialized
+    // partition reading zeroes with no way to recover them.
+    #[test]
+    fn in_place_restore_keeps_survivor_partition_stats() {
+        let mut inner = inner_with_registered_partition();
+        let stats = inner.stats_registry.partition_get(0, 0, 0).expect("stats");
+        stats.increment_messages_count(42);
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+
+        inner.restore_in_place(snapshot);
+
+        let after = inner
+            .stats_registry
+            .partition_get(0, 0, 0)
+            .expect("partition survived the restore, so its stats must too");
+        assert!(Arc::ptr_eq(&stats, &after));
+        assert_eq!(after.messages_count_inconsistent(), 42);
+    }
+
+    // Slab keys are recycled: an entry left behind by a stream the snapshot
+    // does not carry would hand its counters to whatever lands in that slot.
+    #[test]
+    fn in_place_restore_prunes_entries_the_snapshot_dropped() {
+        let mut inner = inner_with_registered_partition();
+        // A second stream that the snapshot below will not contain.
+        let empty = Streams::from(StreamsInner::new()).to_snapshot();
+        assert!(inner.stats_registry.partition_get(0, 0, 0).is_some());
+
+        inner.restore_in_place(empty);
+
+        assert!(
+            inner.stats_registry.partition_get(0, 0, 0).is_none(),
+            "a partition the snapshot dropped must not keep its registry entry"
+        );
     }
 }

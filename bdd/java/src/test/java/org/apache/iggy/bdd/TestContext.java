@@ -32,4 +32,6 @@ class TestContext {
     Long lastTopicPartitions;
     PolledMessages lastPolledMessages;
     String lastSentMessage;
+    byte[] lastRawResponse;
+    RuntimeException lastRawError;
 }

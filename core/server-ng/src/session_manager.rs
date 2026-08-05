@@ -291,6 +291,34 @@ impl SessionManager {
         }
     }
 
+    /// The transport-level peer address a connection arrived from, recorded by
+    /// [`Self::ensure_connection`] for every transport. The non-replicated
+    /// read path uses it to pick the advertised address a client is told
+    /// about; `None` (unknown connection) degrades to the catch-all address.
+    #[must_use]
+    pub fn connection_address(&self, connection_id: u128) -> Option<SocketAddr> {
+        self.connections
+            .get(&connection_id)
+            .map(|conn| conn.address)
+    }
+
+    /// Acting user and transport peer address for a connection, in one map
+    /// lookup: the non-replicated dispatch path needs both, and the separate
+    /// accessors would walk the connection map twice per request.
+    #[must_use]
+    pub fn read_context(&self, connection_id: u128) -> (Option<u32>, Option<SocketAddr>) {
+        let Some(conn) = self.connections.get(&connection_id) else {
+            return (None, None);
+        };
+        let user_id = match conn.state {
+            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
+                Some(user_id)
+            }
+            ConnectionState::Connected => None,
+        };
+        (user_id, Some(conn.address))
+    }
+
     /// Look up the authenticated user id for a connection.
     #[must_use]
     pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {
@@ -547,5 +575,31 @@ mod tests {
         assert_eq!(mgr.remove_connection(c1), Some((100, 10)));
         assert!(mgr.get_session(c1).is_none());
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
+    }
+    // Every disconnect releases its consensus session, group member or not.
+    // Holding the slot open for a resume window instead leaked it: the sweep
+    // that would have collected it rides the heartbeat verifier, which only
+    // runs when `heartbeat.enabled` is set, and that ships false -- so the
+    // slot survived for the process lifetime and pushed the client table
+    // toward capacity eviction, which silently erases dedup watermarks.
+    #[test]
+    fn disconnect_releases_the_bound_session_for_logout() {
+        let mut mgr = SessionManager::new();
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5100), ClientTransportKind::Tcp);
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 7).unwrap();
+
+        assert_eq!(
+            mgr.remove_connection(conn),
+            Some((100, 7)),
+            "the disconnect must hand back (client_id, epoch) so the caller can log it out"
+        );
+        assert!(mgr.get_session(conn).is_none());
+        assert_eq!(
+            mgr.remove_connection(conn),
+            None,
+            "a second disconnect has nothing left to release"
+        );
     }
 }

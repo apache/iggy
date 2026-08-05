@@ -106,6 +106,13 @@ run_language_examples() {
             report_result "${EXAMPLES_EXIT_CODE}"
             return "${EXAMPLES_EXIT_CODE}"
         fi
+        # The pre-flight leaves streams behind, and examples with
+        # hardcoded IDs assume a fresh server; restart with clean state.
+        stop_server
+        cleanup_server_state
+        # shellcheck disable=SC2086
+        start_plain_server ${server_extra_args}
+        wait_for_server_ready "${lang}"
     fi
 
     if [ "${workdir}" != "." ]; then
@@ -175,17 +182,25 @@ run_rust_examples() {
     resolve_server_binary "${TARGET}"
     resolve_cli_binary "${TARGET}"
 
+    # The README documents credentials as <iggy_username>/<iggy_password>
+    # placeholders; the test server starts with iggy/iggy.
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|cargo r |cargo r --target ${TARGET} |g" | sed "s|cargo run |cargo run --target ${TARGET} |g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
         }
     else
-        unset -f TRANSFORM_COMMAND 2>/dev/null || true
+        TRANSFORM_COMMAND() {
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
+        }
     fi
 
     # Pre-flight: run CLI commands from root README
     _rust_preflight() {
-        run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
+        run_readme_commands "README.md" '^[`]cargo run --bin iggy -- '
+        if [ "${README_COMMANDS_EXECUTED}" -eq 0 ]; then
+            echo -e "\e[31mNo CLI commands extracted from README.md; the preflight pattern is stale.\e[0m"
+            EXAMPLES_EXIT_CODE=1
+        fi
     }
 
     run_language_examples \
@@ -345,21 +360,15 @@ run_csharp_examples() {
     resolve_server_binary "${TARGET}"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
-    # Pre-flight: run CLI commands from root README
-    _csharp_preflight() {
-        run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
-    }
-
     run_language_examples \
         "C#" \
         "." \
-        "README.md examples/csharp/README.md" \
+        "examples/csharp/README.md" \
         "^dotnet run --project" \
         "TcpTls" \
         "^dotnet run --project.*TcpTls" \
         0 \
-        "" \
-        "_csharp_preflight"
+        ""
 }
 
 # ---------------------------------------------------------------------------

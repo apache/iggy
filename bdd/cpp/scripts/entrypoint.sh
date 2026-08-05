@@ -54,10 +54,16 @@ fi
 
 cd /workspace/bdd/cpp || exit 1
 
+tags=()
+case "${BDD_FEATURE:-all}" in
+    basic_messaging) tags=(--tags @basic-messaging) ;;
+    raw_command) tags=(--tags @raw-command) ;;
+esac
+
 # --strict fails the run on undefined steps; without it a feature step with no matching C++
 # definition would be reported and still exit 0.
 set +e
-bundle exec cucumber --strict
+bundle exec cucumber --strict "${tags[@]}"
 status=$?
 set -e
 

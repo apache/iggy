@@ -17,6 +17,7 @@
 
 use crate::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
+    SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -26,6 +27,8 @@ pub trait MessageClient {
     /// Poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
+    ///
+    /// Under the `vsr` feature, polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,
@@ -41,13 +44,25 @@ pub trait MessageClient {
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to send the messages.
+    ///
+    /// Returns the per-partition commit confirmations, which may be empty: the
+    /// legacy server reports none, and a server that does report them can still
+    /// commit a batch it has no offsets to describe. Callers must handle an
+    /// empty list rather than assume a confirmation per send.
+    ///
+    /// A reported `base_offset` is where the batch's first message landed, with
+    /// two limits. Delivery is at-least-once, so an earlier retry may already
+    /// have committed the same batch at a lower offset and the value never
+    /// implies uniqueness. A batch is confirmed once it is committed in memory,
+    /// not once it is fsynced, so a crash-restart can stamp a later batch with
+    /// an offset a client has already recorded.
     async fn send_messages(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError>;
+    ) -> Result<SendMessagesResponse, IggyError>;
 
     /// Force flush of the `unsaved_messages` buffer to disk, optionally fsyncing the data.
     #[allow(clippy::too_many_arguments)]

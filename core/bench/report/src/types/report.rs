@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::cluster::BenchmarkClusterInfo;
 use super::server_stats::BenchmarkServerStats;
 use crate::group_metrics::BenchmarkGroupMetrics;
 use crate::individual_metrics::BenchmarkIndividualMetrics;
@@ -41,6 +42,10 @@ pub struct BenchmarkReport {
     /// Benchmark parameters
     pub params: BenchmarkParams,
 
+    /// Cluster topology, present only for cluster benchmarks (None = single node)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<BenchmarkClusterInfo>,
+
     /// Benchmark metrics for all actors of same type (all producers, all consumers or all actors)
     pub group_metrics: Vec<BenchmarkGroupMetrics>,
 
@@ -56,5 +61,49 @@ impl BenchmarkReport {
         let report_path = Path::new(output_dir).join("report.json");
         let report_json = serde_json::to_string(self).unwrap();
         std::fs::write(report_path, report_json).expect("Failed to write report to file");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::BenchmarkClusterNode;
+
+    #[test]
+    fn test_single_node_report_omits_cluster_and_deserializes_to_none() {
+        let report = BenchmarkReport::default();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("\"cluster\""));
+
+        let decoded: BenchmarkReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.cluster, None);
+    }
+
+    #[test]
+    fn test_cluster_report_round_trip_preserves_data() {
+        let report = BenchmarkReport {
+            cluster: Some(BenchmarkClusterInfo {
+                name: "vsr".to_string(),
+                nodes: vec![
+                    BenchmarkClusterNode {
+                        name: "node-1".to_string(),
+                        role: "leader".to_string(),
+                        status: "healthy".to_string(),
+                    },
+                    BenchmarkClusterNode {
+                        name: "node-2".to_string(),
+                        role: "follower".to_string(),
+                        status: "healthy".to_string(),
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"cluster\""));
+
+        let decoded: BenchmarkReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, report);
     }
 }

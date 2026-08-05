@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-ARG RUST_VERSION=1.96
+ARG RUST_VERSION=1.97.1
 ARG ALPINE_VERSION=3.23
 # ── from-source path ─────────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine${ALPINE_VERSION} AS chef

@@ -33,8 +33,11 @@ bytemuck = { workspace = true }
 compio = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 server_common = { workspace = true }
+tracing = { workspace = true }
+twox-hash = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

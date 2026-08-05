@@ -64,26 +64,13 @@ pub fn bind(
     addr: SocketAddr,
     server_config: ServerConfig,
 ) -> Result<(Endpoint, SocketAddr), IggyError> {
-    // QUIC remains shard-0 terminal; this only enables coexistence with the
-    // harness's placeholder UDP socket during process startup.
-    //
-    // TODO: remove `SO_REUSEPORT` again once the integration harness stops
-    // holding placeholder reservation sockets open across child startup.
+    // QUIC remains shard-0 terminal, so nothing here needs the load balancing
+    // `SO_REUSEPORT` exists for. No reuse flag is set at all: UDP has no
+    // TIME_WAIT to rebind over, and on Linux `SO_REUSEADDR` alone lets a
+    // second unicast UDP socket bind the same port and silently steal inbound
+    // datagrams. A stale process holding the port must be a loud
+    // `EADDRINUSE` instead.
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|e| IggyError::IoError(e.to_string()))?;
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| IggyError::IoError(e.to_string()))?;
-    // Match the gate in `core/message_bus/src/socket_opts.rs`: `set_reuse_port`
-    // is absent on illumos/solaris/cygwin, so the cfg must exclude them or
-    // QUIC bind fails to compile on those targets while TCP intentionally
-    // skips.
-    #[cfg(all(
-        unix,
-        not(any(target_os = "illumos", target_os = "solaris", target_os = "cygwin"))
-    ))]
-    socket
-        .set_reuse_port(true)
         .map_err(|e| IggyError::IoError(e.to_string()))?;
     socket
         .bind(&addr.into())

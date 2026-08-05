@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::analytics::report_builder::BenchmarkReportBuilder;
+use crate::analytics::report_builder::{BenchmarkReportBuilder, cluster_suffix};
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::plot::{ChartType, plot_chart};
@@ -93,6 +93,9 @@ impl BenchmarkRunner {
             // Generate the full output path using the directory name generator
             let mut dir_name = benchmark.args().generate_dir_name();
             append_cpu_name_lowercase(&mut dir_name);
+            // Cluster runs share params (and thus the dir name) with single-node
+            // runs; suffix keeps them from overwriting each other's results.
+            dir_name.push_str(&cluster_suffix(report.cluster.as_ref()));
             let full_output_path = Path::new(&output_dir)
                 .join(dir_name.clone())
                 .to_string_lossy()

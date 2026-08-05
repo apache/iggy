@@ -22,7 +22,7 @@ use crate::wire_conversions::{
 };
 use crate::{
     Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
-    PollingStrategy,
+    PollingStrategy, SendMessagesResponse,
 };
 #[cfg(feature = "vsr")]
 use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
@@ -59,7 +59,7 @@ fn topic_cache_key(stream_id: &Identifier, topic_id: &Identifier) -> String {
 }
 
 /// Sync the requesting member's assignment from the coordinator into the
-/// transport cache. An empty reply means the member holds no partitions.
+/// transport cache. An empty reply means the client is not a member.
 #[cfg(feature = "vsr")]
 async fn sync_group_assignment<B: BinaryClient>(
     client: &B,
@@ -77,14 +77,15 @@ async fn sync_group_assignment<B: BinaryClient>(
         .await?;
     let key = group_cache_key(stream_id, topic_id, group_id);
     if response.is_empty() {
-        // Empty reply = the client is not a member of this group (or holds no
-        // partitions). Record the empty assignment but do NOT `register_group`:
-        // registering would make the heartbeat re-sync it for the connection's
-        // lifetime and leak a `joined_groups` entry per distinct non-member
-        // group ever polled. Only a real membership (non-empty reply) registers.
-        client
-            .consumer_group_state()
-            .set_assignment(key, 0, Vec::new());
+        // Empty reply = not a member: the coordinator sends an assignment
+        // header for any member, including one holding zero partitions.
+        // Registering only on a non-empty reply keeps a non-member group from
+        // leaking a `joined_groups` entry, and the deregister is the only thing
+        // that observes a server-side removal (group deleted, member evicted):
+        // without it `is_registered` latches true and every later poll returns
+        // empty instead of surfacing 5006.
+        client.consumer_group_state().invalidate_assignment(&key);
+        client.consumer_group_state().deregister_group(&key);
         return Ok(());
     }
     let (assignment, _) =
@@ -195,7 +196,18 @@ async fn poll_group_messages<B: BinaryClient>(
     }
     for _ in 0..GROUP_POLL_MAX_ATTEMPTS {
         let Some(partition_id) = client.consumer_group_state().next_group_partition(&key) else {
-            // Synced but holds no partitions: not a member, or none assigned.
+            // Nothing to poll, but the two causes need opposite handling and
+            // only membership tells them apart: a real member can legitimately
+            // hold zero partitions, while a non-member must surface 5006 or
+            // `IggyConsumer` polls an empty assignment forever instead of
+            // rejoining. The client id is not known client-side.
+            if !client.consumer_group_state().is_registered(&key) {
+                return Err(IggyError::ConsumerGroupMemberNotFound(
+                    0,
+                    consumer.id.clone(),
+                    topic_id.clone(),
+                ));
+            }
             return Ok(PolledMessages::empty());
         };
         let request = PollMessagesRequest {
@@ -239,6 +251,38 @@ async fn poll_group_messages<B: BinaryClient>(
     // ids are fabricated and a normal rebalance must not look like a hard error
     // to a CG app that doesn't special-case 5009. The caller just re-polls.
     Ok(PolledMessages::empty())
+}
+
+/// Map a raw `SendMessages` reply body to its confirmation payload. An empty
+/// body means the batch was accepted but no offsets were reported: the legacy
+/// server answers that way, so absence must never surface as a decode failure.
+///
+/// Absence is reported as an empty list, never as a zeroed entry. Every field
+/// of a confirmation has 0 as a legitimate value (ids are 0-based slab keys,
+/// the first batch of a partition commits at offset 0), so a synthetic entry
+/// would be indistinguishable from a real one and a caller checkpointing
+/// `base_offset` would record a commit that never happened.
+pub fn decode_send_confirmations(response: &[u8]) -> Result<SendMessagesResponse, IggyError> {
+    if response.is_empty() {
+        return Ok(SendMessagesResponse {
+            confirmations: Vec::new(),
+        });
+    }
+    super::decode_response::<SendMessagesResponse>(response)
+}
+
+/// Confirmations for a batch the server has already committed.
+///
+/// An unreadable body degrades to no confirmations instead of an error. The
+/// producer retry loop filters nothing and resends on any `Err`, so failing
+/// here would turn one committed write into as many copies as the retry budget
+/// allows, on a plane that keeps no reply cache to deduplicate them. Reporting
+/// a zeroed entry instead would be no better: the caller cannot tell it from a
+/// genuine commit at offset 0 and would checkpoint the shape mismatch.
+fn committed_send_confirmations(response: &[u8]) -> SendMessagesResponse {
+    decode_send_confirmations(response).unwrap_or_else(|_| SendMessagesResponse {
+        confirmations: Vec::new(),
+    })
 }
 
 #[async_trait::async_trait]
@@ -291,7 +335,7 @@ impl<B: BinaryClient> MessageClient for B {
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         fail_if_not_authenticated(self).await?;
         // VSR: resolve Balanced/MessagesKey to an explicit partition client-side.
         // An explicit `PartitionId` needs no resolution, so borrow the input
@@ -332,9 +376,10 @@ impl<B: BinaryClient> MessageClient for B {
             &wire_partitioning,
             &raw_messages,
         );
-        self.send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
+        let response = self
+            .send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
             .await?;
-        Ok(())
+        Ok(committed_send_confirmations(&response))
     }
 
     async fn flush_unsaved_buffer(
@@ -354,5 +399,101 @@ impl<B: BinaryClient> MessageClient for B {
         self.send_raw_with_response(FLUSH_UNSAVED_BUFFER_CODE, req.to_bytes())
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{committed_send_confirmations, decode_send_confirmations};
+    use crate::{IggyError, SendMessagesConfirmationResponse, SendMessagesResponse};
+    use iggy_binary_protocol::codec::WireEncode;
+
+    fn response() -> SendMessagesResponse {
+        SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 1,
+                topic_id: 2,
+                partition_id: 3,
+                base_offset: 42,
+            }],
+        }
+    }
+
+    /// The legacy server reports nothing at all, and nothing is what the caller
+    /// must see: no error to retry on, and no entry that reads as a commit at
+    /// offset 0.
+    #[test]
+    fn empty_body_is_no_confirmations() {
+        let decoded = decode_send_confirmations(&[]).expect("empty body must not fail");
+        assert!(decoded.confirmations.is_empty());
+    }
+
+    #[test]
+    fn populated_body_decodes() {
+        let expected = response();
+        let bytes = expected.to_bytes();
+        let decoded = decode_send_confirmations(&bytes).expect("valid payload must decode");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn zero_count_body_decodes_to_empty_list() {
+        let bytes = SendMessagesResponse {
+            confirmations: vec![],
+        }
+        .to_bytes();
+        let decoded = decode_send_confirmations(&bytes).expect("zero-count payload must decode");
+        assert!(decoded.confirmations.is_empty());
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = response().to_bytes().to_vec();
+        bytes.push(0xFF);
+        assert!(matches!(
+            decode_send_confirmations(&bytes),
+            Err(IggyError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn truncated_body_is_rejected() {
+        let bytes = response().to_bytes();
+        for length in 1..bytes.len() {
+            assert!(
+                matches!(
+                    decode_send_confirmations(&bytes[..length]),
+                    Err(IggyError::InvalidFormat)
+                ),
+                "expected error for truncation at byte {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_body_keeps_reported_confirmations() {
+        let expected = response();
+        assert_eq!(committed_send_confirmations(&expected.to_bytes()), expected);
+    }
+
+    /// The write is already durable once the reply arrives, so an unreadable
+    /// body degrades to no confirmations. Anything else either resends a
+    /// committed batch or hands the caller a fabricated offset.
+    #[test]
+    fn committed_malformed_body_is_no_confirmations() {
+        let valid = response().to_bytes();
+
+        let mut with_tail = valid.to_vec();
+        with_tail.push(0xFF);
+        let degraded = committed_send_confirmations(&with_tail);
+        assert!(degraded.confirmations.is_empty());
+
+        for length in 1..valid.len() {
+            let degraded = committed_send_confirmations(&valid[..length]);
+            assert!(
+                degraded.confirmations.is_empty(),
+                "expected no confirmations for truncation at byte {length}"
+            );
+        }
     }
 }

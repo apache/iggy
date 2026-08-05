@@ -24,7 +24,7 @@ import { deserializeMetadata, type ClusterMetadata } from './cluster.utils.js';
 
 export const GET_CLUSTER_METADATA = {
   code: COMMAND_CODE.GetClusterMetadata,
-  
+
   serialize: () => {
     return Buffer.alloc(0);
   },

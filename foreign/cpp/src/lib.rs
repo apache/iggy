@@ -145,6 +145,31 @@ mod ffi {
         messages: Vec<IggyMessagePolled>,
     }
 
+    /// Commit confirmation for one partition written by `send_messages`.
+    struct SendMessagesConfirmation {
+        stream_id: u32,
+        topic_id: u32,
+        partition_id: u32,
+        /// Offset assigned to the first message of the batch in this partition.
+        ///
+        /// Sends are at-least-once: an earlier retry may already have committed
+        /// the same batch at a lower offset, so this never identifies a batch
+        /// uniquely.
+        ///
+        /// A batch is confirmed once it is committed in memory, not once it is
+        /// fsynced. A crash-restart can stamp a later batch with an offset a
+        /// client has already recorded.
+        base_offset: u64,
+    }
+
+    /// Reply to `send_messages`.
+    struct SendMessagesResponse {
+        /// One entry per partition the batch was written to. Empty whenever the
+        /// server reports no offsets, which is every send against the legacy
+        /// server, so call `empty()` before indexing.
+        confirmations: Vec<SendMessagesConfirmation>,
+    }
+
     struct StreamDetails {
         id: u32,
         created_at: u64,
@@ -461,7 +486,7 @@ mod ffi {
             partitioning_kind: String,
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
-        ) -> Result<()>;
+        ) -> Result<SendMessagesResponse>;
         fn flush_unsaved_buffer(
             self: &Client,
             stream_id: Identifier,
@@ -480,6 +505,7 @@ mod ffi {
             snapshot_compression: String,
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
+        fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
 
         // Future functions
         fn disconnect(self: &Client) -> Result<()>;

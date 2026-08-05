@@ -17,7 +17,8 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ext_php_rs::{exception::PhpResult, php_class, php_impl};
+use bytes::Bytes;
+use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl};
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
@@ -30,7 +31,7 @@ use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
 
@@ -183,14 +184,16 @@ impl IggyClient {
         })
     }
 
-    /// Sends messages to a topic.
+    /// Sends messages to a topic and returns the commit confirmations.
+    ///
+    /// The list is empty against the legacy server, which reports no offsets.
     pub fn send_messages(
         &self,
         stream: PhpIdentifier,
         topic: PhpIdentifier,
         partition_id: u32,
         messages: Vec<&SendMessage>,
-    ) -> PhpResult {
+    ) -> PhpResult<SendMessagesResponse> {
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
         let partitioning = Partitioning::partition_id(partition_id);
@@ -204,6 +207,7 @@ impl IggyClient {
             inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
+                .map(SendMessagesResponse::from)
                 .map_err(to_php_exception)
         })
     }
@@ -374,6 +378,20 @@ impl IggyClient {
                 stream,
                 topic,
             })
+        })
+    }
+
+    /// Sends a command code with a payload and returns the raw response bytes.
+    /// Session-control codes return an invalid-command exception.
+    pub fn send_binary_request(&self, code: u32, payload: Binary<u8>) -> PhpResult<Binary<u8>> {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .send_binary_request(code, Bytes::from(Vec::<u8>::from(payload)))
+                .await
+                .map(|response| Binary::new(Vec::from(response)))
+                .map_err(to_php_exception)
         })
     }
 }

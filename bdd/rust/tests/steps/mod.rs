@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod leader_redirection;
 pub mod messages;
+pub mod raw_command;
 pub mod server;
 pub mod streams;
 pub mod topics;

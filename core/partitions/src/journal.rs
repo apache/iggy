@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice},
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -177,6 +177,14 @@ where
     evicted_ring: UnsafeCell<VecDeque<(u64, JournalBuffer)>>,
     /// Running byte total of the buffers held by `evicted_ring`.
     evicted_ring_bytes: Cell<u64>,
+    /// Entry-count ceiling for `evicted_ring`. Defaults to
+    /// [`EVICTED_RING_CAPACITY`]; server-ng overrides it from config at
+    /// partition build.
+    evicted_ring_capacity: Cell<usize>,
+    /// Byte ceiling for `evicted_ring`. Defaults to
+    /// [`EVICTED_RING_BYTES_MAX`]; server-ng overrides it from config at
+    /// partition build.
+    evicted_ring_bytes_max: Cell<u64>,
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
@@ -207,6 +215,8 @@ where
             }),
             evicted_ring: UnsafeCell::new(VecDeque::new()),
             evicted_ring_bytes: Cell::new(0),
+            evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
+            evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
         }
     }
@@ -284,6 +294,15 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             ring.clear();
             self.evicted_ring_bytes.set(0);
         }
+    }
+
+    /// Override the evicted-ring ceilings from configuration. Called once at
+    /// partition build, before any eviction, so the caps govern the first
+    /// flush onward. Leaves `repair_retention` untouched: the single-replica
+    /// disable path stands on its own.
+    pub fn set_ring_caps(&self, capacity: usize, bytes_max: u64) {
+        self.evicted_ring_capacity.set(capacity);
+        self.evicted_ring_bytes_max.set(bytes_max);
     }
 
     /// Resident (un-evicted) entry count; diagnostics only.
@@ -466,8 +485,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 };
                 ring_bytes += entry.len() as u64;
                 ring.push_back((op, entry));
-                while ring.len() > EVICTED_RING_CAPACITY
-                    || (ring_bytes > EVICTED_RING_BYTES_MAX && ring.len() > 1)
+                while ring.len() > self.evicted_ring_capacity.get()
+                    || (ring_bytes > self.evicted_ring_bytes_max.get() && ring.len() > 1)
                 {
                     if let Some((_, dropped)) = ring.pop_front() {
                         ring_bytes -= dropped.len() as u64;
@@ -519,8 +538,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         // One decode feeds both the offset/timestamp index (keyed on
         // `origin_timestamp`) and the surfaced accounting meta (`base_timestamp`,
         // size, count); the two timestamps are distinct fields, do not conflate.
+        // Trusted (no batch-hash): every entry reaching append was just stamped
+        // by `stamp_prepare_for_persistence` (its checksum recomputed over this
+        // exact blob) or re-appended from an already-validated resident entry,
+        // so re-hashing the ~1 MiB blob here only to read the header is waste.
         let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
-            match decode_prepare_slice(entry.as_slice()) {
+            match decode_prepare_slice_trusted(entry.as_slice()) {
                 Ok(batch) if batch.message_count() != 0 => {
                     let message_count = batch.message_count();
                     let meta = RetainedBatchMeta {
@@ -597,6 +620,8 @@ where
             inner: UnsafeCell::new(JournalInner { storage }),
             evicted_ring: UnsafeCell::new(VecDeque::new()),
             evicted_ring_bytes: Cell::new(0),
+            evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
+            evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
         }
     }
@@ -697,6 +722,16 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
     type Entry = JournalBuffer;
     #[rustfmt::skip]
     type HeaderRef<'a> = &'a Self::Header;
+
+    /// No snapshot bookkeeping: the partition plane has no checkpoint of its
+    /// own yet, so nothing supersedes journaled entries. Answered explicitly
+    /// (the trait has no default) so partition-plane state transfer has to
+    /// decide this deliberately rather than inherit it.
+    fn snapshot_op(&self) -> u64 {
+        0
+    }
+
+    fn set_snapshot_op(&self, _op: u64) {}
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = unsafe { &mut *self.headers.get() };
@@ -854,7 +889,10 @@ fn try_push_resident_entry(
     if header.operation != Operation::SendMessages {
         return;
     }
-    let Ok(batch) = decode_prepare_slice(prepare.as_slice()) else {
+    // Resident entries were locally stamped in `append_messages` or validated
+    // at repair ingress, so a validating re-decode would only re-hash our own
+    // write. See the invariant note at the committed-prefix flush walk.
+    let Ok(batch) = decode_prepare_slice_trusted(prepare.as_slice()) else {
         return;
     };
     let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {

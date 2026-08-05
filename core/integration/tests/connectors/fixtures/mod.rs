@@ -24,6 +24,7 @@ mod elasticsearch;
 mod http;
 mod iceberg;
 mod influxdb;
+mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
@@ -68,14 +69,16 @@ pub use influxdb::{
     InfluxDbSinkNoMetadataFixture, InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
     InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
 };
+pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
+    PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceDeleteFixture,
+    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceOps,
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};

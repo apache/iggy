@@ -31,6 +31,79 @@ pub const ASYNCIFY_POOL_DISABLED_PANIC_MSG: &str =
 #[cfg(target_os = "linux")]
 const DISCORD_SUPPORT_URL: &str = "https://discord.gg/apache-iggy";
 
+/// Classify a failed shard-executor creation and fold the matching
+/// remediation into the error itself.
+///
+/// The verbose remediation block (current limits, per-environment fix
+/// steps) is printed to stderr once per process; the returned error
+/// carries a one-line summary of the cause and the primary fix, so every
+/// propagated copy - the shard-join failure list, a panic message, a log
+/// line hours later in a collector - documents the remediation instead
+/// of only the stderr captured at the moment of failure.
+///
+/// Errors of a kind this module has no diagnosis for pass through
+/// unchanged.
+#[cfg(target_os = "linux")]
+pub fn enrich_runtime_create_error(error: std::io::Error) -> std::io::Error {
+    static RUNTIME_CREATE_DIAGNOSTIC: std::sync::Once = std::sync::Once::new();
+
+    let kind = error.kind();
+    let hint = match kind {
+        std::io::ErrorKind::OutOfMemory => {
+            RUNTIME_CREATE_DIAGNOSTIC.call_once(print_locked_memory_limit_info);
+            locked_memory_limit_hint()
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            RUNTIME_CREATE_DIAGNOSTIC.call_once(print_io_uring_permission_info);
+            "io_uring syscalls are blocked, typically by a container seccomp \
+             profile: allow io_uring_setup/io_uring_enter/io_uring_register, \
+             or run with `--security-opt seccomp=unconfined` (Docker) / \
+             `seccompProfile: {type: Unconfined}` (Kubernetes)"
+                .to_owned()
+        }
+        std::io::ErrorKind::InvalidInput => {
+            RUNTIME_CREATE_DIAGNOSTIC.call_once(print_invalid_io_uring_args_info);
+            format!(
+                "the kernel rejected io_uring setup flags shard executors require \
+                 (IORING_SETUP_COOP_TASKRUN + IORING_SETUP_TASKRUN_FLAG need Linux \
+                 >= {MIN_KERNEL_MAJOR}.{MIN_KERNEL_MINOR} with full io_uring support; \
+                 WSL2 kernels are often incomplete)"
+            )
+        }
+        _ => return error,
+    };
+    std::io::Error::new(kind, format!("{error}: {hint}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn enrich_runtime_create_error(error: std::io::Error) -> std::io::Error {
+    error
+}
+
+/// One-line remediation for an io_uring ring allocation denied by
+/// `RLIMIT_MEMLOCK`, with the live limits baked in so a log line is
+/// self-sufficient evidence of the misconfiguration.
+#[cfg(target_os = "linux")]
+fn locked_memory_limit_hint() -> String {
+    use nix::sys::resource::{Resource, getrlimit};
+
+    let limits = getrlimit(Resource::RLIMIT_MEMLOCK).map_or_else(
+        |_| "RLIMIT_MEMLOCK could not be read".to_owned(),
+        |(soft, hard)| {
+            format!(
+                "RLIMIT_MEMLOCK soft={}, hard={}",
+                format_limit(soft),
+                format_limit(hard)
+            )
+        },
+    );
+    format!(
+        "io_uring was denied locked memory for its rings ({limits}): raise the \
+         limit with `ulimit -l unlimited` (shell), `LimitMEMLOCK=infinity` \
+         (systemd), or `--ulimit memlock=-1:-1` (Docker)"
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn print_discord_link() {
     eprintln!("  Need help? Join our Discord: {DISCORD_SUPPORT_URL}");
@@ -359,7 +432,40 @@ pub const fn print_incomplete_io_uring_ops_info() {}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{format_limit, parse_kernel_version};
+    use super::{enrich_runtime_create_error, format_limit, parse_kernel_version};
+
+    #[test]
+    fn enrich_folds_memlock_remediation_into_the_error() {
+        let raw = std::io::Error::new(std::io::ErrorKind::OutOfMemory, "io_uring setup: ENOMEM");
+        let enriched = enrich_runtime_create_error(raw);
+        let message = enriched.to_string();
+        assert_eq!(enriched.kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(message.contains("io_uring setup: ENOMEM"), "{message}");
+        assert!(message.contains("ulimit -l unlimited"), "{message}");
+        assert!(message.contains("RLIMIT_MEMLOCK"), "{message}");
+    }
+
+    #[test]
+    fn enrich_folds_seccomp_remediation_into_the_error() {
+        let raw = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EPERM");
+        let message = enrich_runtime_create_error(raw).to_string();
+        assert!(message.contains("seccomp"), "{message}");
+    }
+
+    #[test]
+    fn enrich_folds_kernel_flag_remediation_into_the_error() {
+        let raw = std::io::Error::new(std::io::ErrorKind::InvalidInput, "EINVAL");
+        let message = enrich_runtime_create_error(raw).to_string();
+        assert!(message.contains("IORING_SETUP_COOP_TASKRUN"), "{message}");
+    }
+
+    #[test]
+    fn enrich_passes_undiagnosed_kinds_through_unchanged() {
+        let raw = std::io::Error::new(std::io::ErrorKind::Interrupted, "EINTR");
+        let enriched = enrich_runtime_create_error(raw);
+        assert_eq!(enriched.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(enriched.to_string(), "EINTR");
+    }
 
     #[test]
     fn parse_kernel_version_standard() {

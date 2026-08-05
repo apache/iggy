@@ -88,7 +88,7 @@ impl ViewChangeReason {
 pub enum IgnoreReason {
     NotPrimary,
     NotNormal,
-    Syncing,
+    StateTransfer,
     NewerView,
     OlderView,
     OldPrepare,
@@ -106,7 +106,7 @@ impl IgnoreReason {
         match self {
             Self::NotPrimary => "not_primary",
             Self::NotNormal => "not_normal",
-            Self::Syncing => "syncing",
+            Self::StateTransfer => "state_transfer",
             Self::NewerView => "newer_view",
             Self::OlderView => "older_view",
             Self::OldPrepare => "old_prepare",

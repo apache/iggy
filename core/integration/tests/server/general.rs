@@ -18,9 +18,9 @@
 #[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::bench_scenario;
 use crate::server::scenarios::{
-    authentication_scenario, consumer_timestamp_polling_scenario, create_message_payload,
-    invalid_consumer_offset_scenario, message_headers_scenario, permissions_scenario,
-    snapshot_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
+    authentication_scenario, consumer_timestamp_polling_scenario, invalid_consumer_offset_scenario,
+    message_headers_scenario, permissions_scenario, snapshot_scenario,
+    stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use integration::iggy_harness;
 
@@ -88,19 +88,6 @@ async fn permissions(harness: &TestHarness) {
 )]
 async fn message_headers(harness: &TestHarness) {
     message_headers_scenario::run(harness).await;
-}
-
-#[iggy_harness(
-    test_client_transport = [Tcp, Http, Quic, WebSocket],
-    server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
-        quic.max_idle_timeout = "500s",
-        quic.keep_alive_interval = "15s"
-    )
-)]
-async fn create_message_payload_scenario(harness: &TestHarness) {
-    create_message_payload::run(harness).await;
 }
 
 #[iggy_harness(

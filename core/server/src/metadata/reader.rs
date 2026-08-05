@@ -598,7 +598,7 @@ impl Metadata {
     ) -> Option<PersonalAccessToken> {
         let token_hash_arc: Arc<str> = Arc::from(token_hash);
         let metadata = self.load();
-        for (_, user_pats) in metadata.personal_access_tokens.iter() {
+        for user_pats in metadata.personal_access_tokens.values() {
             if let Some(pat) = user_pats.get(&token_hash_arc) {
                 return Some(pat.clone());
             }

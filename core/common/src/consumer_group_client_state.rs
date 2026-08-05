@@ -164,6 +164,17 @@ impl ConsumerGroupClientState {
             .remove(key);
     }
 
+    /// True if the last assignment sync observed this client as a member. A
+    /// member mid-rebalance or holding zero partitions is still registered, so
+    /// this is a different question than [`Self::has_assignment`].
+    #[must_use]
+    pub fn is_registered(&self, key: &str) -> bool {
+        self.joined_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(key)
+    }
+
     /// Identifiers of every group the client has joined on this transport.
     #[must_use]
     pub fn registered_groups(&self) -> Vec<(Identifier, Identifier, Identifier)> {
@@ -215,5 +226,20 @@ mod tests {
         let state = ConsumerGroupClientState::new();
         assert!(!state.has_assignment("s|t|g"));
         assert_eq!(state.next_group_partition("s|t|g"), None);
+    }
+
+    #[test]
+    fn member_holding_no_partitions_stays_registered() {
+        let state = ConsumerGroupClientState::new();
+        let id = Identifier::named("g").unwrap();
+        state.register_group("s|t|g".to_owned(), id.clone(), id.clone(), id);
+        state.set_assignment("s|t|g".to_owned(), 1, Vec::new());
+        // A poll distinguishes "member, nothing assigned" from "not a member"
+        // by membership alone, so the two must not track each other.
+        assert!(!state.has_assignment("s|t|g"));
+        assert!(state.is_registered("s|t|g"));
+
+        state.deregister_group("s|t|g");
+        assert!(!state.is_registered("s|t|g"));
     }
 }

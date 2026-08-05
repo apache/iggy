@@ -22,9 +22,9 @@ use crate::IggyByteSize;
 use crate::Sizeable;
 use crate::error::IggyError;
 use crate::utils::checksum;
-use crate::wire_conversions::user_headers_from_wire;
+use crate::wire_conversions::user_headers_from_validated_slice;
 use crate::{HeaderKey, IggyMessageHeaderView};
-use iggy_binary_protocol::WireUserHeaders;
+use iggy_binary_protocol::validate_user_headers;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
@@ -87,17 +87,14 @@ impl<'a> IggyMessageView<'a> {
     /// Return instantiated user headers map
     pub fn user_headers_map(&self) -> Result<Option<BTreeMap<HeaderKey, HeaderValue>>, IggyError> {
         if let Some(headers) = self.user_headers() {
-            let wire = match WireUserHeaders::from_slice(headers) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse user headers: {e}, header_length={}",
-                        self.header().user_headers_length()
-                    );
-                    return Ok(None);
-                }
-            };
-            let map = user_headers_from_wire(&wire)?;
+            if let Err(e) = validate_user_headers(headers) {
+                tracing::warn!(
+                    "Failed to parse user headers: {e}, header_length={}",
+                    self.header().user_headers_length()
+                );
+                return Ok(None);
+            }
+            let map = user_headers_from_validated_slice(headers)?;
             Ok(Some(map))
         } else {
             Ok(None)
@@ -207,6 +204,7 @@ mod tests {
     use super::*;
     use crate::IggyMessage;
     use bytes::Bytes;
+    use std::str::FromStr;
 
     fn build_batch() -> crate::IggyMessagesBatch {
         let messages = vec![
@@ -248,5 +246,59 @@ mod tests {
         let batch = build_batch();
         let last = IggyMessageViewIterator::new(batch.buffer()).last().unwrap();
         assert_eq!(last.payload(), b"three");
+    }
+
+    #[test]
+    fn given_structurally_invalid_user_headers_when_mapped_should_return_none() {
+        // A TLV entry claiming a 4-byte key but carrying only 2 bytes.
+        let mut headers = Vec::new();
+        headers.push(6u8);
+        headers.extend_from_slice(&4u32.to_le_bytes());
+        headers.extend_from_slice(b"ab");
+
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"payload"))
+            .build()
+            .unwrap();
+        let mut buffer = message.to_bytes().to_vec();
+        // Splice the malformed blob in and declare it in the fixed header.
+        let len = headers.len() as u32;
+        buffer[IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE].copy_from_slice(&len.to_le_bytes());
+        buffer.extend_from_slice(&headers);
+
+        let view = IggyMessageView::new(&buffer).unwrap();
+        assert!(view.user_headers_map().unwrap().is_none());
+    }
+
+    #[test]
+    fn given_valid_user_headers_when_mapped_should_recover_every_entry() {
+        let user_headers = BTreeMap::from([
+            (
+                HeaderKey::from_str("content-type").unwrap(),
+                HeaderValue::from_str("text/plain").unwrap(),
+            ),
+            (HeaderKey::from_str("attempt").unwrap(), 3u32.into()),
+        ]);
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"payload"))
+            .user_headers(user_headers.clone())
+            .build()
+            .unwrap();
+        let buffer = message.to_bytes().to_vec();
+
+        let view = IggyMessageView::new(&buffer).unwrap();
+        assert_eq!(view.user_headers_map().unwrap().unwrap(), user_headers);
+    }
+
+    #[test]
+    fn given_message_without_user_headers_when_mapped_should_return_none() {
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"payload"))
+            .build()
+            .unwrap();
+        let buffer = message.to_bytes().to_vec();
+
+        let view = IggyMessageView::new(&buffer).unwrap();
+        assert!(view.user_headers_map().unwrap().is_none());
     }
 }

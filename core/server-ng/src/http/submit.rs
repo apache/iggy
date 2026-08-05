@@ -23,10 +23,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command2;
-use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader};
+use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RequestHeader};
 use iggy_common::IggyError;
+use message_bus::BusMessage;
+use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use tracing::warn;
 
@@ -38,7 +41,7 @@ use crate::dispatch::{
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{
-    classify_partition_reply, committed_payload, eviction_error, is_transient_not_committed,
+    classify_partition_reply, committed_payload, eviction_error, transient_code,
 };
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
@@ -80,12 +83,16 @@ const TRANSIENT_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 /// runs no pre-submit gate; it drives the gate-locked submit
 /// ([`submit_gated`]) on a detached shard-0 task and awaits its outcome over a
 /// oneshot. Axum drops this handler future the moment the HTTP client
-/// disconnects; were the gate held here, that drop could land between the
-/// pump-driven consensus commit and the id advance, leaving the committed op's
-/// reply cached under an id the session still considers unused - the next
-/// write would collide into `Duplicate` and silently receive the prior op's
-/// reply. Detaching moves the whole critical section out of the cancellable
-/// future; a disconnect now only drops the receiver half.
+/// disconnects, and detaching keeps the whole gate-held critical section off
+/// that cancellable future -- the submit always runs to completion and a
+/// disconnect only drops the receiver half.
+///
+/// The collide-into-`Duplicate` hazard this originally guarded (a drop landing
+/// between the consensus commit and the id advance, leaving a committed op's
+/// reply cached under an id the session still thought unused) is now closed at
+/// the source: [`submit_gated`] burns the id at stamp time, so no exit -- or
+/// cancellation -- can leave it reusable. Detaching remains correct for the
+/// other reason above.
 pub(in crate::http) async fn submit_committed(
     state: &HttpInner,
     session: &Rc<HttpSession>,
@@ -102,12 +109,14 @@ pub(in crate::http) async fn submit_committed(
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
     let body = body.to_vec();
-    // Detached so a client disconnect cannot split a commit from its id
-    // advance; both happen inside the task regardless of handler liveness.
+    let max_tokens_per_user = state.max_tokens_per_user;
+    // Detached so a client disconnect cannot abandon the gate mid-submit;
+    // the write runs to completion regardless of handler liveness.
     compio::runtime::spawn(async move {
-        let result = submit_gated(&shard, &task_session, operation, &body).await;
-        // A failed send means the handler died mid-await. The id advance
-        // already happened above, which is the invariant that matters.
+        let result =
+            submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
+        // A failed send means the handler died mid-await; the submit itself
+        // already completed, which is the invariant that matters.
         let _ = result_slot.send(result);
     })
     .detach();
@@ -125,17 +134,36 @@ pub(in crate::http) async fn submit_committed(
 /// Gate-locked core of [`submit_committed`], run on a task the HTTP client
 /// cannot cancel: serializes this session's writes behind its gate and holds
 /// it across the submit so request ids reach the primary strictly in order.
-/// The gate advances only on a genuine committed `Reply`: an unanswered
-/// submit, a `TransientNotCommitted` frame, or an eviction leaves the id
-/// free, which the depth-1 dedup requires (the next accepted request must be
-/// `committed + 1`, so a consumed-but-uncommitted id would wedge the session
-/// on `RequestGap`). A transient frame is replayed in place with the same id
-/// on the binary SDKs' cadence (see [`TRANSIENT_RETRY_INTERVAL`]). An
-/// eviction means the session is dead: mapped to 401, and [`submit_committed`]
-/// then forgets the entry so the caller's retry re-registers cleanly.
+///
+/// The id is BURNED as soon as it is stamped into a request: it advances once,
+/// up front, and no exit path can hand it to a later operation. A transient
+/// frame is still replayed in place under that same id (see
+/// [`TRANSIENT_RETRY_INTERVAL`]) -- replaying the identical request is what
+/// dedup exists for -- but once this call returns, the id is spent.
+///
+/// It used to advance only on a genuine committed `Reply`, leaving the id free
+/// after an unanswered submit, a `TransientNotCommitted` frame, or an
+/// eviction. Under the old depth-1 contiguity rule that reuse was mandatory:
+/// the next accepted request had to be `committed + 1`, so a
+/// consumed-but-uncommitted id wedged the session on `RequestGap`. The client
+/// table now dedups on a watermark instead -- `request > watermark` is New, so
+/// gaps are free and `RequestGap` no longer exists -- which inverts the
+/// requirement. Reusing the id became a wrong-answer hazard: the frame that
+/// released it may still have committed (a view-change-canceled prepare can
+/// reach quorum and be inherited by the new primary, which is exactly why the
+/// budget-exhausted arm reports `TransientNotCommitted`), and then the reused
+/// id sits at or below the watermark, so the caller's NEXT and DIFFERENT
+/// operation is answered from the dedup cache with the previous operation's
+/// reply -- under a 2xx, since the create endpoints return 204 and never
+/// inspect the payload.
+///
+/// An eviction still means the session is dead: mapped to 401, and
+/// [`submit_committed`] then forgets the entry so the caller's retry
+/// re-registers cleanly.
 ///
 /// Both shard-0 request rewrites run here before consensus, mirroring the TCP
-/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
+/// dispatch path: the PAT rewrite enforces the per-user token cap, then mints
+/// a raw token and replicates only its hash
 /// (`CreatePersonalAccessToken`), and the user-password rewrite hashes the new
 /// password and, for `ChangePassword`, strips the current one and verifies it
 /// against the stored hash (`CreateUser` / `ChangePassword`). Both are no-ops
@@ -143,35 +171,56 @@ pub(in crate::http) async fn submit_committed(
 /// write. A third resolution handles `DeleteSegments`, which is not itself a
 /// consensus op: it is rewritten to the metadata `TruncatePartition` that commits
 /// the trim (see [`resolve_delete_segments_truncate`]), so the truncate rides
-/// this session's gate id. On a rejection (a malformed body or an unresolved
-/// delete-segments namespace) the gate is released without advancing, leaving
-/// the id free. A failed current-password check is not a rejection here: the op
-/// still commits with an emptied new-password sentinel that the replicated
-/// apply grades to `InvalidCredentials`, so the id advances on the committed
-/// reply (see `verify_and_rewrite_change_password`).
+/// this session's gate id. A rejection (a malformed body, a caller at the
+/// personal-access-token cap, or an unresolved delete-segments namespace) still
+/// spends the id like any other exit. A failed current-password check is not a
+/// rejection here: the op still commits with an emptied new-password sentinel
+/// that the replicated apply grades to `InvalidCredentials` (see
+/// `verify_and_rewrite_change_password`).
 async fn submit_gated(
     shard: &Rc<ServerNgShard>,
     session: &HttpSession,
     operation: Operation,
+    max_tokens_per_user: u32,
     body: &[u8],
 ) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
+    // Burn the id at stamp time: every exit below (rewrite rejection,
+    // unresolved delete-segments, unanswered submit, exhausted transient
+    // budget, eviction) then leaves it spent rather than handing it to a
+    // later, different operation. See the doc block for why reuse was
+    // mandatory under contiguity and is a wrong-answer hazard under the
+    // watermark.
+    let request_id = *next_request_id;
+    *next_request_id += 1;
     let message = build_request_message(
         operation,
         session.client_id,
         session.session,
-        *next_request_id,
+        request_id,
         body,
     );
-    let (message, raw_token) =
-        rewrite_pat_request_for_user(session.user_id, message).map_err(WriteError::Rejected)?;
+    let (message, raw_token) = rewrite_pat_request_for_user(
+        session.user_id,
+        max_tokens_per_user,
+        |user_id| {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| users.pat_count_of(user_id))
+        },
+        message,
+    )
+    .map_err(WriteError::Rejected)?;
     let message =
         maybe_rewrite_user_password_request(shard, message).map_err(WriteError::Rejected)?;
     // `DeleteSegments` is not itself a consensus op: resolve it to the metadata
     // `TruncatePartition` that commits the trim before it reaches consensus,
-    // mirroring the TCP dispatch. The truncate rides this session's gate id, so
-    // the metadata request sequence stays contiguous; an unresolved namespace
-    // releases the gate without advancing, like a rejected rewrite.
+    // mirroring the TCP dispatch. The truncate rides this session's burned
+    // gate id; an unresolved namespace releases the gate with the id already
+    // spent, like a rejected rewrite.
     let message = if message.header().operation == Operation::DeleteSegments {
         let template = *message.header();
         resolve_delete_segments_truncate(
@@ -189,6 +238,7 @@ async fn submit_gated(
     let request_header = *message.header();
     let deadline = Instant::now() + TRANSIENT_RETRY_DEADLINE;
     let mut request = message;
+    let mut saw_not_committed = false;
     let reply = loop {
         // The submit consumes the request; keep a byte-identical copy for a
         // possible replay. Re-running the rewrites instead would mint a fresh
@@ -197,22 +247,36 @@ async fn submit_gated(
         let Some(reply) = submit_client_request_on_owner(shard, request).await else {
             return Err(WriteError::Unavailable);
         };
-        if reply.header().command != Command2::Reply || !is_transient_not_committed(&reply) {
+        let transient = (reply.header().command == Command2::Reply)
+            .then(|| transient_code(&reply))
+            .flatten();
+        let Some(transient) = transient else {
             break reply;
-        }
-        // Pre-consensus `TransientNotCommitted`: replay the SAME request id,
-        // mirroring the binary SDKs' in-client loop. Safe to replay - the
-        // dominant emissions never entered the pipeline, and the view-change
-        // cancel is dedup-idempotent (the client table serves the cached
-        // reply). The gate stays held across the replay on purpose: the
-        // request keeps its serialization turn, and a queued same-session
-        // write would only hit the same transient.
+        };
+        saw_not_committed |= matches!(transient, IggyError::TransientNotCommitted);
+        // Pre-consensus transient frame: replay the SAME request id, mirroring
+        // the binary SDKs' in-client loop. Safe to replay - the dominant
+        // emissions never entered the pipeline, and the view-change cancel is
+        // dedup-idempotent (the client table serves the cached reply). The
+        // gate stays held across the replay on purpose: the request keeps its
+        // serialization turn, and a queued same-session write would only hit
+        // the same transient.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Budget exhausted with the op still not committed: surface the
-            // transient code, which renders as a retryable 503, never the
-            // catch-all 400.
-            return Err(WriteError::Rejected(IggyError::TransientNotCommitted));
+            // Budget exhausted: surface a retryable 503 (never the catch-all
+            // 400), with the code sticky across frames. Once ANY frame was
+            // `TransientNotCommitted` the op may still commit cluster-wide (a
+            // view-change-canceled prepare can reach quorum and be inherited
+            // by the new primary), so a later `TransientNotAccepted` frame -
+            // this node losing the primary role mid-replay - must not
+            // downgrade it: `TransientNotAccepted` licenses a forwarding
+            // follower to re-issue at the new primary under a fresh session,
+            // which would double-apply the possibly-committed op.
+            return Err(WriteError::Rejected(if saw_not_committed {
+                IggyError::TransientNotCommitted
+            } else {
+                transient
+            }));
         }
         compio::time::sleep(TRANSIENT_RETRY_INTERVAL.min(remaining)).await;
         request = retry_request;
@@ -220,7 +284,8 @@ async fn submit_gated(
 
     match reply.header().command {
         Command2::Reply => {
-            *next_request_id += 1;
+            // Already burned at stamp time; release the gate so the next
+            // write on this session can take its turn.
             drop(next_request_id);
             Ok((request_header, reply, raw_token))
         }
@@ -257,21 +322,32 @@ pub(in crate::http) async fn submit_write(
 /// credential; a caller that re-presents it just re-registers a fresh session.
 pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<HttpSession>) {
     // Synthetic request id: the logout apply keys on (client, session) only and
-    // is terminal for this session, so it needs no gate-issued contiguous id
+    // is terminal for this session, so it needs no gate-issued id at all
     // (mirrors the disconnect path's `u64::MAX`).
     const LOGOUT_REQUEST_ID: u64 = u64::MAX;
-    if let Err(error) = submit_logout_on_owner(
-        &state.shard,
-        session.client_id,
-        session.session,
-        LOGOUT_REQUEST_ID,
-    )
-    .await
-    {
-        warn!(
+    // Detached for the same reason as `submit_committed`: the submit drives
+    // shared consensus machinery, and axum drops this handler future on
+    // client disconnect. A cancel mid-await used to strand consensus state;
+    // the detached task always drives the Logout to completion.
+    let (result_slot, done) = oneshot::channel();
+    let shard = Rc::clone(&state.shard);
+    let vsr_client_id = session.client_id;
+    let vsr_session = session.session;
+    compio::runtime::spawn(async move {
+        let result =
+            submit_logout_on_owner(&shard, vsr_client_id, vsr_session, LOGOUT_REQUEST_ID).await;
+        let _ = result_slot.send(result);
+    })
+    .detach();
+    match done.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(
             ?error,
             "server-ng HTTP: VSR Logout submit failed; slot lingers until eviction"
-        );
+        ),
+        Err(_canceled) => warn!(
+            "server-ng HTTP: VSR Logout task dropped before replying; slot lingers until eviction"
+        ),
     }
     state.forget_session(session);
 }
@@ -285,12 +361,16 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
 /// which fires an installed slot, so one slot catches every exit. The slot
 /// guard borrows the registry, which is why this whole future runs inside
 /// the caller's `SendWrapper` on shard 0.
+///
+/// Hands back the graded reply frame and the header grading read, so a caller
+/// that renders a committed payload can bound the body without parsing the
+/// header again; the offset writes answer 204 and drop both.
 pub(in crate::http) async fn partition_write_replicated(
     state: &HttpInner,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
-) -> Result<(), PartitionWriteError> {
+) -> Result<(BusMessage, ReplyHeader), PartitionWriteError> {
     // Admission sits here rather than before body decode: axum's extractors
     // already buffered and deserialized the body (bounded by the router-wide
     // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
@@ -334,7 +414,7 @@ pub(in crate::http) async fn partition_write_replicated(
     // reply after a timeout sheds at the bus instead of leaking a waiter.
     drop(guard);
     match outcome {
-        Ok(Ok(reply)) => classify_partition_reply(&reply),
+        Ok(Ok(reply)) => classify_partition_reply(&reply).map(|header| (reply, header)),
         // Cancelled (reply target torn down by session eviction mid-wait) or
         // elapsed: same caller contract either way - outcome unknown, 504.
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),

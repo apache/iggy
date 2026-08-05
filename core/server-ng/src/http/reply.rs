@@ -23,6 +23,7 @@ use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, HEADER_SIZE, result_code, result_section_len,
 };
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
+use iggy_binary_protocol::responses::messages::SendMessagesResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
@@ -34,24 +35,33 @@ use iggy_common::{
 };
 use message_bus::BusMessage;
 use server_common::Message;
+use tracing::warn;
 
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::login_register::LoginRegisterError;
 
 /// Discriminate a partition write reply. Partition replies carry no result
-/// section (success and denial are both empty-bodied), so the discriminators
-/// live in the header. `status` is read first: a nonzero value is the typed
-/// pre-commit denial (the partition primary's delete-of-missing-offset
-/// rejection, or a dispatch-time authorization denial) and renders through
-/// the legacy `IggyError -> status` map. With status 0, the reply's `op`
-/// splits the rest: a committed reply is built from its prepare header, whose
-/// op (the partition group's commit number) is always >= 1, while the
-/// pre-dispatch gate failures reply through `build_empty_reply` with 0 in
-/// that field. The gate reply cannot name which entity was missing, hence the
-/// generic legacy 404 body.
+/// section - a denial is empty-bodied and a committed body, where there is one,
+/// is the bare typed payload - so the discriminators live in the header.
+/// `status` is read first, and that order is load-bearing: every pre-commit
+/// denial names itself there (a namespace that does not resolve or is not
+/// routable, a dispatch-time authorization denial, the partition primary's
+/// delete-of-missing-offset rejection), and each renders through the legacy
+/// `IggyError -> status` map, which is what keeps an unresolvable namespace a
+/// 404. Only with status 0 does `op` split the rest: a committed reply is
+/// built from its prepare header, whose op (the partition group's commit
+/// number) is always >= 1, so a 0 there is an ack with nothing committed
+/// behind it and must not grade as success.
+///
+/// Grading only, and it hands the graded header back: the committed body is
+/// read separately (see [`send_confirmations`]) because it is
+/// operation-specific - consumer-offset writes commit empty, a produce commits
+/// its confirmations - and reading it needs the header's `size`. Returning it
+/// keeps that a single parse whose failure mode is already decided here, rather
+/// than a second one whose fallback would have to invent a body.
 pub(in crate::http) fn classify_partition_reply(
     reply: &BusMessage,
-) -> Result<(), PartitionWriteError> {
+) -> Result<ReplyHeader, PartitionWriteError> {
     let header = reply
         .as_slice()
         .get(..HEADER_SIZE)
@@ -68,7 +78,48 @@ pub(in crate::http) fn classify_partition_reply(
     if header.op == 0 {
         return Err(PartitionWriteError::NotFound);
     }
-    Ok(())
+    Ok(*header)
+}
+
+/// The per-partition commit confirmations carried by a graded `SendMessages`
+/// reply, or `None` when the reply has no readable confirmation.
+///
+/// `None` is a normal outcome, never a failure: a peer whose partition plane
+/// does not stamp the payload commits with an empty body, and a body this build
+/// cannot decode is a shape mismatch. Neither unmakes the commit, so both fall
+/// back to an empty confirmation list rather than failing a write that already
+/// landed.
+///
+/// `header` is the one [`classify_partition_reply`] graded, so this reads the
+/// body without re-deriving its extent.
+pub(in crate::http) fn send_confirmations(
+    reply: &BusMessage,
+    header: &ReplyHeader,
+) -> Option<SendMessagesResponse> {
+    let body = partition_reply_body(reply, header);
+    if body.is_empty() {
+        return None;
+    }
+    match SendMessagesResponse::decode_from(body) {
+        Ok(confirmations) => Some(confirmations),
+        Err(error) => {
+            warn!(
+                ?error,
+                "server-ng HTTP: undecodable send_messages commit confirmation"
+            );
+            None
+        }
+    }
+}
+
+/// A partition reply's body past the header, bounded by the header's `size`
+/// rather than by the buffer length: `size` is the frame's authoritative
+/// extent, and the typed decoders reject trailing bytes.
+fn partition_reply_body<'a>(reply: &'a BusMessage, header: &ReplyHeader) -> &'a [u8] {
+    reply
+        .as_slice()
+        .get(HEADER_SIZE..header.size as usize)
+        .unwrap_or_default()
 }
 
 /// Classify a committed reply's leading result section and return the typed
@@ -96,18 +147,25 @@ pub(in crate::http) fn committed_payload(
     }
 }
 
-/// True when a reply-shaped frame is the primary's pre-consensus
-/// `TransientNotCommitted` rejection (`[count=1][index=0][57]`, see
-/// `build_result_rejection_reply`): the op did not commit, so the write path
-/// must replay the same request id rather than grade it as a committed
-/// result or advance the session gate.
-pub(in crate::http) fn is_transient_not_committed(reply: &Message<GenericHeader>) -> bool {
-    matches!(
-        result_code(reply_body(reply)),
-        Some(code)
-            if code == IggyError::TransientNotCommitted.as_code()
-                || code == IggyError::TransientNotAccepted.as_code()
-    )
+/// The transient variant of a reply-shaped pre-consensus rejection frame
+/// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
+/// for a committed outcome. Either transient means the op did not commit, so
+/// the write path must replay the same request id rather than grade it as a
+/// committed result or advance the session gate. The two codes are kept
+/// distinct because they exhaust differently: `TransientNotAccepted` never
+/// entered the pipeline and is safe to re-issue anywhere, while
+/// `TransientNotCommitted` may still commit and only a same-session same-id
+/// replay is safe.
+pub(in crate::http) fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
+    match result_code(reply_body(reply)) {
+        Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
+            Some(IggyError::TransientNotCommitted)
+        }
+        Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
+            Some(IggyError::TransientNotAccepted)
+        }
+        _ => None,
+    }
 }
 
 /// The reply body past the generic header, bounded by the header's `size`.
@@ -209,6 +267,8 @@ mod tests {
     use bytes::Bytes;
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::PrepareHeader;
+    use iggy_binary_protocol::WireEncode;
+    use iggy_binary_protocol::responses::messages::SendMessagesConfirmationResponse;
 
     use crate::responses::{
         NonReplicatedResponse, build_deny_reply, build_empty_reply, build_reply_from_bytes,
@@ -336,8 +396,12 @@ mod tests {
         assert!(classify_partition_reply(&reply).is_ok());
     }
 
+    /// An ack with no commit number behind it: status 0 and `op` 0. A routing
+    /// failure names itself in `status`, so whatever emits this shape never
+    /// reached the partition plane, and grading it as success would report a
+    /// write that never happened.
     #[test]
-    fn gate_failure_empty_reply_classifies_as_not_found() {
+    fn status_zero_op_zero_ack_classifies_as_not_found() {
         let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
         let reply = frozen(build_empty_reply(request.header(), 42, 0, 9));
         assert!(matches!(
@@ -368,11 +432,25 @@ mod tests {
             IggyError::TransientNotCommitted.as_code(),
         )
         .into_generic();
-        assert!(is_transient_not_committed(&reply));
+        assert_eq!(
+            transient_code(&reply),
+            Some(IggyError::TransientNotCommitted)
+        );
         assert!(matches!(
             committed_payload(&reply),
             Err(WriteError::Rejected(IggyError::TransientNotCommitted))
         ));
+
+        let not_accepted = consensus::build_result_rejection_reply(
+            request.header(),
+            9,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .into_generic();
+        assert_eq!(
+            transient_code(&not_accepted),
+            Some(IggyError::TransientNotAccepted)
+        );
     }
 
     /// Genuine committed outcomes must advance the gate, so neither a success
@@ -389,7 +467,7 @@ mod tests {
         body.extend_from_slice(b"payload");
         let success =
             build_reply_from_bytes(request.header(), 42, 7, 9, &Bytes::from(body)).into_generic();
-        assert!(!is_transient_not_committed(&success));
+        assert_eq!(transient_code(&success), None);
         let Ok(payload) = committed_payload(&success) else {
             panic!("success section must grade ok");
         };
@@ -401,11 +479,74 @@ mod tests {
             IggyError::UserAlreadyExists.as_code(),
         )
         .into_generic();
-        assert!(!is_transient_not_committed(&rejected));
+        assert_eq!(transient_code(&rejected), None);
         assert!(matches!(
             committed_payload(&rejected),
             Err(WriteError::Rejected(IggyError::UserAlreadyExists))
         ));
+    }
+
+    fn send_reply(body: &Bytes) -> BusMessage {
+        let prepare = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::SendMessages,
+            client: 42,
+            op: 1,
+            request: 1,
+            ..Default::default()
+        };
+        frozen(consensus::build_reply_message(&prepare, body))
+    }
+
+    /// Walks the same order the write path does: grade first, then read the
+    /// body with the header that grading returned.
+    fn graded_send_confirmations(body: &Bytes) -> Option<SendMessagesResponse> {
+        let reply = send_reply(body);
+        let header = classify_partition_reply(&reply).expect("committed send reply grades ok");
+        send_confirmations(&reply, &header)
+    }
+
+    #[test]
+    fn committed_send_reply_yields_its_confirmations() {
+        let response = SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 5,
+                partition_id: 7,
+                base_offset: 41,
+            }],
+        };
+        assert_eq!(
+            graded_send_confirmations(&response.to_bytes()),
+            Some(response)
+        );
+    }
+
+    /// A zero-count body is a committed batch that reports no offsets, which is
+    /// distinct from the empty body below: it decodes, so the response carries
+    /// an empty confirmation list rather than falling back to no body at all.
+    #[test]
+    fn zero_count_commit_body_yields_empty_confirmations() {
+        let empty = SendMessagesResponse {
+            confirmations: Vec::new(),
+        };
+        assert_eq!(graded_send_confirmations(&empty.to_bytes()), Some(empty));
+    }
+
+    /// A peer whose partition plane does not stamp the payload commits with an
+    /// empty body. The write still landed, so this is `None`, not an error, and
+    /// the handler answers 201 with an empty confirmation list.
+    #[test]
+    fn empty_commit_body_yields_no_confirmations() {
+        assert_eq!(graded_send_confirmations(&Bytes::new()), None);
+    }
+
+    /// Same fallback for a body this build cannot read: a shape mismatch must
+    /// not fail a produce that already committed.
+    #[test]
+    fn undecodable_commit_body_yields_no_confirmations() {
+        let truncated = Bytes::from_static(&[1, 0, 0, 0, 9]);
+        assert_eq!(graded_send_confirmations(&truncated), None);
     }
 
     /// The partition primary's typed pre-commit deny (delete of a missing

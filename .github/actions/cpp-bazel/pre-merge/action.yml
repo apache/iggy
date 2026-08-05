@@ -31,7 +31,6 @@ runs:
       uses: ./.github/actions/utils/setup-cpp-with-cache
 
     - name: Setup Rust with cache
-      if: inputs.task != 'lint'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Install clang-format
@@ -60,6 +59,13 @@ runs:
 
         printf '%s\n' "${files[@]}" | xargs clang-format-18 --style=file --dry-run --Werror
 
+    - name: Lint (clippy)
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/cpp
+        cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+
     - name: Build
       if: inputs.task == 'build'
       shell: bash
@@ -83,7 +89,7 @@ runs:
       shell: bash
       run: |
         cd foreign/cpp
-        bazel test --config=ci //:low-level-e2e
+        bazel test --config=ci //:e2e
 
     - name: Stop server after e2e tests
       if: always() && inputs.task == 'e2e'
