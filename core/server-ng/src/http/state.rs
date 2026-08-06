@@ -21,6 +21,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use crate::dispatch::submit_register_on_owner;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
+use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
     forget_if_same, live_entry, sweep_expired,
@@ -87,6 +89,10 @@ pub(in crate::http) struct HttpInner {
     /// clients out of the shared VSR client table. Read by `resolve_session`
     /// when admitting a fresh session.
     pub(in crate::http) max_http_sessions: usize,
+    /// Configured `[personal_access_token] max_tokens_per_user`, enforced
+    /// pre-consensus by the PAT rewrite inside the write submit (the cap is
+    /// config-derived, so it must never branch inside the replicated apply).
+    pub(in crate::http) max_tokens_per_user: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
@@ -94,6 +100,9 @@ pub(in crate::http) struct HttpInner {
     /// Follower-to-primary forwarding context: outbound client, scheme, body
     /// bound, and its own in-flight budget (see `http::forward`).
     pub(in crate::http) forward: ForwardState,
+    /// Legacy-parity metric registry served by the scrape route; the router's
+    /// counting layer holds a clone of its request counter.
+    pub(in crate::http) metrics: HttpMetrics,
 }
 
 impl HttpInner {
@@ -116,8 +125,15 @@ impl HttpInner {
     /// current VSR primary's HTTP address when it resolves from the roster, else
     /// fail closed to the 503. The target is the roster node whose `replica_id`
     /// equals `primary_index(view)`; an absent consensus, an unmatched id, or a
-    /// port-less node all fall back to [`ReadError::NotPrimary`].
-    pub(in crate::http) fn not_primary_read_error(&self, path_and_query: &str) -> ReadError {
+    /// port-less node all fall back to [`ReadError::NotPrimary`]. `client_ip`
+    /// picks the primary's advertised address from its per-client-network
+    /// selectors, so the redirected client lands on the address for its own
+    /// network.
+    pub(in crate::http) fn not_primary_read_error(
+        &self,
+        path_and_query: &str,
+        client_ip: Option<IpAddr>,
+    ) -> ReadError {
         let location = self
             .shard
             .plane
@@ -131,6 +147,7 @@ impl HttpInner {
                     primary_index,
                     self.forward.scheme,
                     path_and_query,
+                    client_ip,
                 )
             });
         location.map_or(ReadError::NotPrimary, ReadError::RedirectToPrimary)
@@ -389,7 +406,12 @@ impl HttpInner {
     /// shared [`ClusterRoster`] assembly. The leader marking comes from this
     /// shard's consensus view; the HTTP listener is shard-0-only, so consensus is
     /// always present and every roster read carries real leader/follower roles.
-    pub(in crate::http) fn build_cluster_metadata(&self) -> ClusterMetadata {
+    /// `client_ip` picks each node's advertised address from its
+    /// per-client-network selectors.
+    pub(in crate::http) fn build_cluster_metadata(
+        &self,
+        client_ip: Option<IpAddr>,
+    ) -> ClusterMetadata {
         let primary_index = self
             .shard
             .plane
@@ -397,7 +419,7 @@ impl HttpInner {
             .consensus
             .as_ref()
             .map(|consensus| consensus.primary_index(consensus.view()));
-        self.roster.cluster_metadata(primary_index)
+        self.roster.cluster_metadata(primary_index, client_ip)
     }
 }
 

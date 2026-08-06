@@ -23,10 +23,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command2;
-use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader};
+use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RequestHeader};
 use iggy_common::IggyError;
+use message_bus::BusMessage;
+use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use tracing::warn;
 
@@ -106,10 +109,12 @@ pub(in crate::http) async fn submit_committed(
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
     let body = body.to_vec();
+    let max_tokens_per_user = state.max_tokens_per_user;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
     // the write runs to completion regardless of handler liveness.
     compio::runtime::spawn(async move {
-        let result = submit_gated(&shard, &task_session, operation, &body).await;
+        let result =
+            submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
         // A failed send means the handler died mid-await; the submit itself
         // already completed, which is the invariant that matters.
         let _ = result_slot.send(result);
@@ -157,7 +162,8 @@ pub(in crate::http) async fn submit_committed(
 /// re-registers cleanly.
 ///
 /// Both shard-0 request rewrites run here before consensus, mirroring the TCP
-/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
+/// dispatch path: the PAT rewrite enforces the per-user token cap, then mints
+/// a raw token and replicates only its hash
 /// (`CreatePersonalAccessToken`), and the user-password rewrite hashes the new
 /// password and, for `ChangePassword`, strips the current one and verifies it
 /// against the stored hash (`CreateUser` / `ChangePassword`). Both are no-ops
@@ -165,15 +171,17 @@ pub(in crate::http) async fn submit_committed(
 /// write. A third resolution handles `DeleteSegments`, which is not itself a
 /// consensus op: it is rewritten to the metadata `TruncatePartition` that commits
 /// the trim (see [`resolve_delete_segments_truncate`]), so the truncate rides
-/// this session's gate id. A rejection (a malformed body or an unresolved
-/// delete-segments namespace) still spends the id like any other exit. A
-/// failed current-password check is not a rejection here: the op still commits
-/// with an emptied new-password sentinel that the replicated apply grades to
-/// `InvalidCredentials` (see `verify_and_rewrite_change_password`).
+/// this session's gate id. A rejection (a malformed body, a caller at the
+/// personal-access-token cap, or an unresolved delete-segments namespace) still
+/// spends the id like any other exit. A failed current-password check is not a
+/// rejection here: the op still commits with an emptied new-password sentinel
+/// that the replicated apply grades to `InvalidCredentials` (see
+/// `verify_and_rewrite_change_password`).
 async fn submit_gated(
     shard: &Rc<ServerNgShard>,
     session: &HttpSession,
     operation: Operation,
+    max_tokens_per_user: u32,
     body: &[u8],
 ) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
@@ -192,8 +200,20 @@ async fn submit_gated(
         request_id,
         body,
     );
-    let (message, raw_token) =
-        rewrite_pat_request_for_user(session.user_id, message).map_err(WriteError::Rejected)?;
+    let (message, raw_token) = rewrite_pat_request_for_user(
+        session.user_id,
+        max_tokens_per_user,
+        |user_id| {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| users.pat_count_of(user_id))
+        },
+        message,
+    )
+    .map_err(WriteError::Rejected)?;
     let message =
         maybe_rewrite_user_password_request(shard, message).map_err(WriteError::Rejected)?;
     // `DeleteSegments` is not itself a consensus op: resolve it to the metadata
@@ -341,12 +361,16 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
 /// which fires an installed slot, so one slot catches every exit. The slot
 /// guard borrows the registry, which is why this whole future runs inside
 /// the caller's `SendWrapper` on shard 0.
+///
+/// Hands back the graded reply frame and the header grading read, so a caller
+/// that renders a committed payload can bound the body without parsing the
+/// header again; the offset writes answer 204 and drop both.
 pub(in crate::http) async fn partition_write_replicated(
     state: &HttpInner,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
-) -> Result<(), PartitionWriteError> {
+) -> Result<(BusMessage, ReplyHeader), PartitionWriteError> {
     // Admission sits here rather than before body decode: axum's extractors
     // already buffered and deserialized the body (bounded by the router-wide
     // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
@@ -390,7 +414,7 @@ pub(in crate::http) async fn partition_write_replicated(
     // reply after a timeout sheds at the bus instead of leaking a waiter.
     drop(guard);
     match outcome {
-        Ok(Ok(reply)) => classify_partition_reply(&reply),
+        Ok(Ok(reply)) => classify_partition_reply(&reply).map(|header| (reply, header)),
         // Cancelled (reply target torn down by session eviction mid-wait) or
         // elapsed: same caller contract either way - outcome unknown, 504.
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),

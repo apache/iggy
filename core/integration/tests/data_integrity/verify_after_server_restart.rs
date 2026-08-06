@@ -40,10 +40,34 @@ fn build_server_config(cache_setting: &str) -> TestServerConfig {
         "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
         cache_setting.to_string(),
     );
+    // server-ng flushes on the journal thresholds (no flush primitive), so
+    // force every committed batch straight to disk: the restart asserts
+    // below need everything durable, and the explicit flush calls are
+    // cfg'd out under vsr (`flush_unsaved_buffer` answers
+    // FeatureUnavailable there and is slated for removal). Legacy keeps its
+    // shipped buffered defaults; the flush loops below are its barrier.
+    #[cfg(feature = "vsr")]
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
+        "1".to_string(),
+    );
+    #[cfg(feature = "vsr")]
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
+        "true".to_string(),
+    );
     TestServerConfig::builder().extra_envs(extra_envs).build()
 }
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
+//
+// Under vsr this runs against a 3-node cluster and needs two adaptations:
+// the durability barrier is the eager-flush envs in `build_server_config`
+// (`flush_unsaved_buffer` answers FeatureUnavailable there, so the explicit
+// flush loops are cfg'd out), and `iggy-bench` must be built with
+// `--features vsr` because the SDK framing is chosen at compile time. A
+// default-features bench binary never completes a frame against server-ng
+// and the run trips the bench timeout in `run_bench_and_wait_for_finish`.
 #[test_matrix(
     [cache_all(), cache_open_segment(), cache_none()]
 )]
@@ -80,6 +104,9 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let client = harness.tcp_root_client().await.unwrap();
 
     let topic_id = Identifier::numeric(0).unwrap();
+    // Durability barrier on the legacy server only; server-ng persists
+    // eagerly via the config envs and answers FeatureUnavailable here.
+    #[cfg(not(feature = "vsr"))]
     for i in 0..7 {
         let stream_id = Identifier::numeric(i).unwrap();
         client
@@ -193,14 +220,17 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // Connect and login to server
     let client = harness.tcp_root_client().await.unwrap();
 
-    // Flush unsaved buffer
-    let topic_id = Identifier::numeric(0).unwrap();
-    for i in 0..7 {
-        let stream_id = Identifier::numeric(i).unwrap();
-        client
-            .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
-            .await
-            .unwrap();
+    // Durability barrier on the legacy server only (see the first loop).
+    #[cfg(not(feature = "vsr"))]
+    {
+        let topic_id = Identifier::numeric(0).unwrap();
+        for i in 0..7 {
+            let stream_id = Identifier::numeric(i).unwrap();
+            client
+                .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
+                .await
+                .unwrap();
+        }
     }
 
     // Save stats from the second server (should have double the data)

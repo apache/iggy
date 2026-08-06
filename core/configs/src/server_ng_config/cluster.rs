@@ -27,8 +27,10 @@ use crate::ConfigurationError;
 use crate::http::HttpJwtConfig;
 use configs::ConfigEnv;
 use iggy_common::{IggyDuration, Validatable};
+use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
+use std::cmp::Reverse;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -71,10 +73,23 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
 
+/// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
+/// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server-ng`'s bootstrap static-asserts it
+/// against the real header. Used to reject a `[message_bus] max_message_size`
+/// too small to carry a single state-transfer chunk.
+pub const STATE_CHUNK_HEADER_LEN: u64 = 256;
+
 /// Upper bound on `repair_chunk_max`. A chunk rides the per-peer bus queue, so
 /// the load-bearing rule is `repair_chunk_max < message_bus.peer_queue_capacity`
 /// (enforced at the top level); this standalone ceiling is a typo guard.
 const MAX_REPAIR_CHUNK_MAX: usize = 1024;
+
+/// Upper bound on per-node `advertised_addresses` selectors. Must mirror the
+/// `#[config_env(max_elements = 16)]` cap on the field: env overrides above
+/// the cap do not exist, so a TOML roster exceeding it could never be
+/// replicated through the env path. Also bounds the cross-node conflict scan
+/// (quadratic in pooled entries) and the per-request longest-prefix walk.
+const MAX_ADVERTISED_SELECTORS: usize = 16;
 
 /// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
 /// is KDF-derived from these bytes at use-site, so any encoding clearing this
@@ -361,12 +376,172 @@ pub struct ClusterNodeConfig {
     /// to use [`Self::ip`].
     #[serde(default)]
     pub advertised_address: Option<String>,
+    /// Client-network-scoped overrides of [`Self::advertised_address`],
+    /// resolved by longest-prefix match over the client's IP (see
+    /// [`AdvertisedAddressSelector`]). Empty by default, so existing configs
+    /// keep the single catch-all address. At most `MAX_ADVERTISED_SELECTORS`
+    /// per node (validated), matching the env-override cap below.
+    #[serde(default)]
+    #[config_env(max_elements = 16)]
+    pub advertised_addresses: Vec<AdvertisedAddressSelector>,
     /// Numeric replica ID for VSR consensus (0-based).
     ///
     /// Must be unique across [`ClusterConfig::nodes`] and strictly less than
     /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
     pub replica_id: u8,
     pub ports: TransportPorts,
+}
+
+/// One client-network-scoped advertised address: clients whose IP falls
+/// inside `client_cidr` are told `address` instead of the node's catch-all
+/// [`ClusterNodeConfig::advertised_address`].
+///
+/// Typical split-network case: the roster `ip` is VPC-private and
+/// `advertised_address` is public; a selector with the VPC CIDR keeps
+/// in-VPC clients on the private address while everyone else stays on the
+/// public one. Selection is longest-prefix match across a node's selectors.
+/// Selection sees the transport-level peer address, so clients arriving
+/// through a proxy or load balancer match the proxy's network, not their
+/// own.
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
+pub struct AdvertisedAddressSelector {
+    /// Client network this selector matches, in CIDR notation
+    /// (`10.0.0.0/16`, `2001:db8::/32`). Must parse at boot; duplicate
+    /// networks within one node are rejected. A v4-mapped v6 network
+    /// (`::ffff:10.0.0.0/104`) canonicalizes to its v4 form (`10.0.0.0/8`),
+    /// matching how client IPs canonicalize before matching.
+    pub client_cidr: String,
+    /// Address advertised to matching clients: a literal IP or a DNS
+    /// hostname, validated as [`AdvertisedAddress`] at boot (no port; ports
+    /// come from [`ClusterNodeConfig::ports`]).
+    pub address: String,
+}
+
+/// A roster node with its advertised-address selectors and catch-all parsed
+/// once, built wherever a roster is assembled for serving clients
+/// (listener/shard start). Per-request resolution never re-parses config
+/// strings: everything is snapshotted here, so mutating the source config
+/// after conversion has no effect on what clients are told. Entries that do
+/// not parse are dropped at build time; validation already rejects them
+/// whenever the cluster is enabled, and a disabled cluster never consults
+/// the roster.
+#[derive(Debug, Clone)]
+pub struct ResolvedClusterNode {
+    config: ClusterNodeConfig,
+    /// Truncated, canonicalized selector networks with their parsed
+    /// addresses, in declaration order.
+    selectors: Vec<(IpNet, AdvertisedAddress)>,
+    /// Parsed catch-all: [`ClusterNodeConfig::advertised_address`], else the
+    /// roster [`ClusterNodeConfig::ip`]. `None` when the configured value
+    /// does not parse - a set `advertised_address` never falls through to
+    /// the private roster ip.
+    catch_all: Option<AdvertisedAddress>,
+    /// Parsed roster [`ClusterNodeConfig::ip`], the replica-plane dial
+    /// address. `None` when the roster ip is not a literal IP (boot only
+    /// requires it non-empty); internal forwarding then has no dial target.
+    replica_ip: Option<IpAddr>,
+}
+
+impl From<ClusterNodeConfig> for ResolvedClusterNode {
+    fn from(config: ClusterNodeConfig) -> Self {
+        let selectors = config
+            .advertised_addresses
+            .iter()
+            .filter_map(|selector| {
+                let network = selector.client_cidr.parse::<IpNet>().ok()?;
+                let address = selector.address.parse::<AdvertisedAddress>().ok()?;
+                Some((canonical_ip_net(network.trunc()), address))
+            })
+            .collect();
+        let catch_all = match config.advertised_address.as_deref() {
+            Some(advertised_address) => advertised_address.parse().ok(),
+            None => config.ip.parse().ok(),
+        };
+        let replica_ip = config.ip.parse().ok();
+        Self {
+            config,
+            selectors,
+            catch_all,
+            replica_ip,
+        }
+    }
+}
+
+impl ResolvedClusterNode {
+    /// The roster entry this node was built from. Read-only: resolution runs
+    /// on the boot-parsed snapshot, never on the config strings.
+    #[must_use]
+    pub fn config(&self) -> &ClusterNodeConfig {
+        &self.config
+    }
+
+    /// The roster `ip` as a dialable address for the replica plane and
+    /// internal request forwarding. Never routed through the advertised
+    /// ladder: this is what servers dial, not what clients are told.
+    #[must_use]
+    pub fn replica_ip(&self) -> Option<IpAddr> {
+        self.replica_ip
+    }
+
+    /// The client-facing address for a client connecting from `client_ip`:
+    /// longest-prefix match over the selector networks, then the parsed
+    /// catch-all. `None` when no selector matches and the catch-all did not
+    /// parse; callers choose whether to fail closed (redirect URLs) or to
+    /// publish [`Self::raw_advertised_fallback`] verbatim (cluster metadata).
+    #[must_use]
+    pub fn advertised_for(&self, client_ip: Option<IpAddr>) -> Option<&AdvertisedAddress> {
+        client_ip
+            .and_then(|client_ip| self.selector_address(client_ip))
+            .or(self.catch_all.as_ref())
+    }
+
+    /// The catch-all ladder ([`ClusterNodeConfig::advertised_address`], else
+    /// the roster [`ClusterNodeConfig::ip`]) as configured, unparsed. Cluster
+    /// metadata publishes this verbatim when [`Self::advertised_for`] finds
+    /// nothing: the roster `ip` is only validated non-empty, and Docker
+    /// service names with underscores exist in the wild.
+    #[must_use]
+    pub fn raw_advertised_fallback(&self) -> &str {
+        self.config
+            .advertised_address
+            .as_deref()
+            .unwrap_or(&self.config.ip)
+    }
+
+    /// Longest-prefix match over the boot-parsed selector networks. The
+    /// client IP is canonicalized first so a v4-mapped v6 peer
+    /// (`::ffff:10.0.0.7`, the shape a dual-stack listener reports) matches
+    /// v4 networks. `min_by_key` keeps the first of equal-length matches, so
+    /// resolution stays declaration-order deterministic even though a
+    /// validated config cannot produce two matching networks of equal length
+    /// (equal-length distinct networks are disjoint, duplicates are
+    /// rejected).
+    fn selector_address(&self, client_ip: IpAddr) -> Option<&AdvertisedAddress> {
+        let client_ip = client_ip.to_canonical();
+        self.selectors
+            .iter()
+            .filter(|(network, _)| network.contains(&client_ip))
+            .min_by_key(|(network, _)| Reverse(network.prefix_len()))
+            .map(|(_, address)| address)
+    }
+}
+
+/// Network-side mirror of the `IpAddr::to_canonical` applied to client IPs
+/// before matching: a selector network written in v4-mapped v6 form
+/// (`::ffff:10.0.0.0/104`) becomes its v4 equivalent (`10.0.0.0/8`), since a
+/// canonicalized client could never match the v6 spelling. Prefixes shorter
+/// than 96 bits cannot drop the `::ffff:` mapping and stay v6 (they match
+/// native v6 clients only).
+fn canonical_ip_net(network: IpNet) -> IpNet {
+    if let IpNet::V6(v6_network) = network
+        && v6_network.prefix_len() >= 96
+        && let IpAddr::V4(v4_address) = v6_network.addr().to_canonical()
+        && let Ok(v4_network) = Ipv4Net::new(v4_address, v6_network.prefix_len() - 96)
+    {
+        return IpNet::V4(v4_network);
+    }
+    network
 }
 
 /// Per-node listener ports advertised in the cluster roster. In cluster mode
@@ -740,8 +915,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
         let mut used_endpoints = std::collections::HashSet::new();
-        let mut used_advertised_endpoints = std::collections::HashSet::new();
-        let mut used_raw_advertised_endpoints = std::collections::HashSet::new();
+        let mut advertised_endpoints: Vec<AdvertisedEndpoint> = Vec::new();
 
         for node in &self.nodes {
             if node.name.trim().is_empty() {
@@ -832,25 +1006,113 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 None => node.ip.parse::<AdvertisedAddress>().ok(),
             };
 
-            for (name, port) in &client_ports {
-                if let Some(port) = port {
-                    let (endpoint, inserted) = match &client_address {
-                        Some(address) => (
-                            address.authority(*port),
-                            used_advertised_endpoints.insert((address.clone(), *port)),
-                        ),
-                        None => {
-                            let endpoint = format!("{}:{port}", node.ip);
-                            let inserted = used_raw_advertised_endpoints.insert(endpoint.clone());
-                            (endpoint, inserted)
-                        }
-                    };
-                    if !inserted {
+            if node.advertised_addresses.len() > MAX_ADVERTISED_SELECTORS {
+                eprintln!(
+                    "Invalid cluster configuration: node '{}' declares {} advertised_addresses \
+                     selectors, exceeding the maximum ({MAX_ADVERTISED_SELECTORS})",
+                    node.name,
+                    node.advertised_addresses.len()
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
+            // Selector CIDRs and addresses feed clients the same way the
+            // catch-all advertised address does, so they get the same strict
+            // parse. Networks are compared truncated (`10.0.1.0/16` ==
+            // `10.0.0.0/16`) and canonicalized (`::ffff:10.0.0.0/104` ==
+            // `10.0.0.0/8`) since matching truncates and canonicalizes too.
+            // Parsed before the catch-all enters the conflict pool because
+            // every entry's effective client set depends on the node's full
+            // selector list.
+            let mut selectors = Vec::with_capacity(node.advertised_addresses.len());
+            let mut seen_selector_cidrs = std::collections::HashSet::new();
+            for selector in &node.advertised_addresses {
+                let client_cidr = match selector.client_cidr.parse::<IpNet>() {
+                    Ok(client_cidr) => canonical_ip_net(client_cidr.trunc()),
+                    Err(error) => {
                         eprintln!(
-                            "Invalid cluster configuration: advertised client endpoint conflict - {endpoint} is already used (node '{}', transport {name})",
-                            node.name
+                            "Invalid cluster configuration: advertised_addresses client_cidr '{}' for node '{}': {error}",
+                            selector.client_cidr, node.name
                         );
                         return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                };
+                if !seen_selector_cidrs.insert(client_cidr) {
+                    eprintln!(
+                        "Invalid cluster configuration: duplicate advertised_addresses client_cidr '{}' for node '{}'",
+                        selector.client_cidr, node.name
+                    );
+                    return Err(ConfigurationError::InvalidConfigurationValue);
+                }
+                let address = match selector.address.parse::<AdvertisedAddress>() {
+                    Ok(address) => address,
+                    Err(error) => {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_addresses address '{}' for node '{}': {error}",
+                            selector.address, node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                };
+                selectors.push((client_cidr, address));
+            }
+            let selector_ranges: Vec<ClientAddressRange> = selectors
+                .iter()
+                .map(|(network, _)| ClientAddressRange::from(network))
+                .collect();
+
+            // Endpoint conflicts are checked across every node's selectors
+            // and catch-all on effective client sets - the clients an entry
+            // actually wins after this node's longest-prefix match. Two
+            // nodes may reuse one host:port as long as the winning sets stay
+            // disjoint (that is the feature, and it includes a per-subnet
+            // override shadowing the same node's wider selector); a conflict
+            // means some client wins both entries and would resolve both
+            // nodes to one endpoint. The catch-all is an implicit
+            // match-everything-else selector, so it pools the same way. A
+            // roster ip that fails the strict parse skips the pool: it can
+            // never equal a parsed host, and two raw ips sharing host:port
+            // are already rejected by the bind-endpoint check above.
+            if let Some(address) = &client_address {
+                let catch_all_clients = EffectiveClients::for_catch_all(&selector_ranges);
+                for (name, port) in &client_ports {
+                    if let Some(port) = port {
+                        insert_advertised_endpoint(
+                            &mut advertised_endpoints,
+                            AdvertisedEndpoint {
+                                node_name: &node.name,
+                                transport: name,
+                                network: None,
+                                clients: catch_all_clients.clone(),
+                                host: address.clone(),
+                                port: *port,
+                            },
+                        )?;
+                    }
+                }
+            }
+
+            for (selector_index, (client_cidr, address)) in selectors.iter().enumerate() {
+                let sibling_ranges: Vec<ClientAddressRange> = selector_ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_index, _)| *other_index != selector_index)
+                    .map(|(_, range)| *range)
+                    .collect();
+                let clients = EffectiveClients::for_selector(client_cidr, &sibling_ranges);
+                for (name, port) in &client_ports {
+                    if let Some(port) = port {
+                        insert_advertised_endpoint(
+                            &mut advertised_endpoints,
+                            AdvertisedEndpoint {
+                                node_name: &node.name,
+                                transport: name,
+                                network: Some(*client_cidr),
+                                clients: clients.clone(),
+                                host: address.clone(),
+                                port: *port,
+                            },
+                        )?;
                     }
                 }
             }
@@ -927,6 +1189,204 @@ impl Validatable<ConfigurationError> for ClusterConfig {
     }
 }
 
+/// One advertised client endpoint and the clients it wins, pooled by
+/// [`ClusterConfig::validate`] so selectors and catch-all conflict-check
+/// against each other. `network: None` is the catch-all (`advertised_address`,
+/// or the roster `ip` as fallback); `clients` is the entry's effective set
+/// after its node's longest-prefix shadowing.
+struct AdvertisedEndpoint<'roster> {
+    node_name: &'roster str,
+    transport: &'static str,
+    network: Option<IpNet>,
+    clients: EffectiveClients,
+    host: AdvertisedAddress,
+    port: u16,
+}
+
+impl AdvertisedEndpoint<'_> {
+    /// True when some client would resolve both entries to one host:port on
+    /// two different nodes. Effective client sets already encode each node's
+    /// longest-prefix shadowing, so nested networks conflict only where the
+    /// wider entry still wins some client that the other node's entry also
+    /// wins. Entries of one node never conflict: their effective sets are
+    /// disjoint by construction.
+    fn conflicts_with(&self, other: &Self) -> bool {
+        self.node_name != other.node_name
+            && self.port == other.port
+            && self.host == other.host
+            && self.clients.overlaps(&other.clients)
+    }
+
+    fn authority(&self) -> String {
+        self.host.authority(self.port)
+    }
+
+    fn network_description(&self) -> String {
+        match self.network {
+            Some(network) => format!("client_cidr {network}"),
+            None => "every client network (catch-all)".to_owned(),
+        }
+    }
+}
+
+/// The clients an advertised entry actually wins under its node's
+/// longest-prefix match, built by [`ClusterConfig::validate`] for the
+/// cross-node conflict scan.
+#[derive(Clone)]
+struct EffectiveClients {
+    /// Sorted disjoint ranges of winning client addresses.
+    ranges: Vec<ClientAddressRange>,
+    /// The catch-all also wins clients whose peer address the transport
+    /// could not produce ([`ResolvedClusterNode::advertised_for`] with no
+    /// client IP), so two catch-all overlap even when selectors cover both
+    /// address families.
+    serves_unknown_peers: bool,
+}
+
+impl EffectiveClients {
+    /// A selector wins its network minus the sibling networks nested inside
+    /// it (longer prefixes take the node's LPM). `sibling_ranges` must
+    /// exclude the selector's own network.
+    fn for_selector(network: &IpNet, sibling_ranges: &[ClientAddressRange]) -> Self {
+        Self {
+            ranges: ClientAddressRange::from(network).subtract_nested(sibling_ranges),
+            serves_unknown_peers: false,
+        }
+    }
+
+    /// The catch-all wins every client no selector matches, in both address
+    /// families, plus unknown-peer clients.
+    fn for_catch_all(selector_ranges: &[ClientAddressRange]) -> Self {
+        let mut ranges = ClientAddressRange::FULL_IPV4.subtract_nested(selector_ranges);
+        ranges.extend(ClientAddressRange::FULL_IPV6.subtract_nested(selector_ranges));
+        Self {
+            ranges,
+            serves_unknown_peers: true,
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        if self.serves_unknown_peers && other.serves_unknown_peers {
+            return true;
+        }
+        self.ranges.iter().any(|range| {
+            other.ranges.iter().any(|other_range| {
+                range.is_ipv4 == other_range.is_ipv4
+                    && range.first <= other_range.last
+                    && other_range.first <= range.last
+            })
+        })
+    }
+}
+
+/// Inclusive range of client addresses within one family. Client IPs
+/// canonicalize to v4 before matching, so v4 and v6 networks match disjoint
+/// client populations and a range never spans families.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClientAddressRange {
+    is_ipv4: bool,
+    first: u128,
+    last: u128,
+}
+
+impl ClientAddressRange {
+    const FULL_IPV4: Self = Self {
+        is_ipv4: true,
+        first: 0,
+        last: u32::MAX as u128,
+    };
+    const FULL_IPV6: Self = Self {
+        is_ipv4: false,
+        first: 0,
+        last: u128::MAX,
+    };
+
+    /// `self` minus every range nested inside it, as sorted disjoint
+    /// leftovers. CIDR networks are nested or disjoint, never partially
+    /// overlapping, so a range outside `self` is either disjoint from it
+    /// (subtracts nothing) or contains it (a shorter prefix, which loses
+    /// LPM and also subtracts nothing).
+    fn subtract_nested(self, ranges: &[Self]) -> Vec<Self> {
+        let mut nested: Vec<Self> = ranges
+            .iter()
+            .filter(|range| {
+                range.is_ipv4 == self.is_ipv4
+                    && range.first >= self.first
+                    && range.last <= self.last
+            })
+            .copied()
+            .collect();
+        nested.sort_unstable();
+        let mut remaining = Vec::new();
+        let mut cursor = Some(self.first);
+        for nested_range in nested {
+            let Some(next_free) = cursor else { break };
+            if nested_range.first > next_free {
+                remaining.push(Self {
+                    is_ipv4: self.is_ipv4,
+                    first: next_free,
+                    last: nested_range.first - 1,
+                });
+            }
+            cursor = nested_range
+                .last
+                .checked_add(1)
+                .map(|after| after.max(next_free));
+        }
+        if let Some(next_free) = cursor
+            && next_free <= self.last
+        {
+            remaining.push(Self {
+                is_ipv4: self.is_ipv4,
+                first: next_free,
+                last: self.last,
+            });
+        }
+        remaining
+    }
+}
+
+impl From<&IpNet> for ClientAddressRange {
+    fn from(network: &IpNet) -> Self {
+        match network {
+            IpNet::V4(network) => Self {
+                is_ipv4: true,
+                first: u128::from(u32::from(network.network())),
+                last: u128::from(u32::from(network.broadcast())),
+            },
+            IpNet::V6(network) => Self {
+                is_ipv4: false,
+                first: u128::from(network.network()),
+                last: u128::from(network.broadcast()),
+            },
+        }
+    }
+}
+
+fn insert_advertised_endpoint<'roster>(
+    advertised_endpoints: &mut Vec<AdvertisedEndpoint<'roster>>,
+    endpoint: AdvertisedEndpoint<'roster>,
+) -> Result<(), ConfigurationError> {
+    if let Some(existing) = advertised_endpoints
+        .iter()
+        .find(|existing| existing.conflicts_with(&endpoint))
+    {
+        eprintln!(
+            "Invalid cluster configuration: advertised client endpoint conflict - {} is advertised for {} (node '{}', transport {}) and for {} (node '{}', transport {}); their effective client sets overlap after longest-prefix shadowing, so a client in the overlap would resolve both nodes to one endpoint",
+            endpoint.authority(),
+            endpoint.network_description(),
+            endpoint.node_name,
+            endpoint.transport,
+            existing.network_description(),
+            existing.node_name,
+            existing.transport,
+        );
+        return Err(ConfigurationError::InvalidConfigurationValue);
+    }
+    advertised_endpoints.push(endpoint);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1448,26 @@ mod tests {
                 .to_string()
                 .contains("unknown field `advertise_address`"),
             "unexpected deserialization error: {error}"
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_env_expansion_is_capped() {
+        // The selectors Vec nests inside the nodes Vec, so the derive's
+        // index ceilings multiply; without the field's max_elements cap the
+        // default of 256x256 adds ~131k leaked mappings to every boot.
+        let mappings = <ClusterConfig as configs::ConfigEnvMappings>::env_mappings();
+        assert!(
+            mappings
+                .iter()
+                .any(|mapping| mapping.env_name.contains("ADVERTISED_ADDRESSES_15_")),
+            "selector index 15 must stay reachable by env override"
+        );
+        assert!(
+            !mappings
+                .iter()
+                .any(|mapping| mapping.env_name.contains("ADVERTISED_ADDRESSES_16_")),
+            "selector env expansion must stop at max_elements = 16"
         );
     }
 }
@@ -1070,6 +1550,167 @@ mod advertised_address_tests {
 }
 
 #[cfg(test)]
+mod advertised_for_tests {
+    use super::*;
+
+    fn node_with_selectors(selectors: Vec<AdvertisedAddressSelector>) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: "node-0".to_owned(),
+            ip: "10.0.1.5".to_owned(),
+            advertised_address: Some("203.0.113.10".to_owned()),
+            advertised_addresses: selectors,
+            replica_id: 0,
+            ports: TransportPorts::default(),
+        }
+    }
+
+    fn selector(client_cidr: &str, address: &str) -> AdvertisedAddressSelector {
+        AdvertisedAddressSelector {
+            client_cidr: client_cidr.to_owned(),
+            address: address.to_owned(),
+        }
+    }
+
+    fn resolved(node: ClusterNodeConfig) -> ResolvedClusterNode {
+        node.into()
+    }
+
+    fn ip(address: &str) -> IpAddr {
+        address.parse().unwrap()
+    }
+
+    #[test]
+    fn falls_back_to_advertised_address_without_selectors() {
+        let node = node_with_selectors(Vec::new());
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("10.0.0.7"))),
+            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_roster_ip_without_advertised_address() {
+        let mut node = node_with_selectors(Vec::new());
+        node.advertised_address = None;
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("10.0.0.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+        );
+    }
+
+    #[test]
+    fn is_none_when_no_fallback_parses() {
+        let mut node = node_with_selectors(Vec::new());
+        node.advertised_address = None;
+        node.ip = "iggy_node".to_owned();
+        assert_eq!(resolved(node).advertised_for(Some(ip("10.0.0.7"))), None);
+    }
+
+    #[test]
+    fn matching_selector_beats_advertised_address() {
+        let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("10.0.200.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+        );
+    }
+
+    #[test]
+    fn unmatched_client_falls_back_to_advertised_address() {
+        let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("192.168.0.7"))),
+            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+        );
+    }
+
+    #[test]
+    fn unknown_client_ip_falls_back_to_advertised_address() {
+        let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
+        assert_eq!(
+            resolved(node).advertised_for(None),
+            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+        );
+    }
+
+    #[test]
+    fn longest_prefix_wins_regardless_of_declaration_order() {
+        let node = resolved(node_with_selectors(vec![
+            selector("10.0.0.0/8", "10.255.255.1"),
+            selector("10.0.0.0/16", "10.0.1.5"),
+        ]));
+        assert_eq!(
+            node.advertised_for(Some(ip("10.0.200.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.0.1.5"))),
+            "the /16 must win over the /8 even though it is declared second"
+        );
+        assert_eq!(
+            node.advertised_for(Some(ip("10.9.0.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.255.255.1"))),
+            "a client outside the /16 but inside the /8 must match the /8"
+        );
+    }
+
+    #[test]
+    fn equal_prefix_matches_resolve_deterministically_to_first_declared() {
+        // No validated config reaches this state: these networks truncate to
+        // one /16, which validation rejects as a duplicate. Pinned anyway so
+        // a future relaxation of that rule cannot make resolution
+        // order-dependent.
+        let node = node_with_selectors(vec![
+            selector("10.0.1.0/16", "10.0.1.5"),
+            selector("10.0.2.0/16", "10.0.2.5"),
+        ]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("10.0.200.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+        );
+    }
+
+    #[test]
+    fn v4_mapped_v6_client_matches_v4_cidr() {
+        // A dual-stack listener reports v4 peers as `::ffff:a.b.c.d`.
+        let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("::ffff:10.0.0.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+        );
+    }
+
+    #[test]
+    fn v4_mapped_v6_selector_cidr_matches_v4_client() {
+        // The mirror case: the CIDR side canonicalizes at build, so
+        // `::ffff:10.0.0.0/104` matches like `10.0.0.0/8` instead of being
+        // a silently dead selector.
+        let node = node_with_selectors(vec![selector("::ffff:10.0.0.0/104", "10.0.1.5")]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("10.0.0.7"))),
+            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+        );
+    }
+
+    #[test]
+    fn v6_selector_matches_v6_client() {
+        let node = node_with_selectors(vec![selector("2001:db8::/32", "2001:db8::1")]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("2001:db8::7"))),
+            Some(&AdvertisedAddress::Ip(ip("2001:db8::1")))
+        );
+    }
+
+    #[test]
+    fn selector_address_may_be_a_hostname() {
+        let node = node_with_selectors(vec![selector("10.0.0.0/16", "Broker.Internal.Example")]);
+        assert_eq!(
+            resolved(node).advertised_for(Some(ip("10.0.0.7"))),
+            Some(&AdvertisedAddress::Hostname(
+                "broker.internal.example".to_owned()
+            ))
+        );
+    }
+}
+
+#[cfg(test)]
 mod cluster_validate_tests {
     use super::*;
 
@@ -1078,8 +1719,16 @@ mod cluster_validate_tests {
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,
+            advertised_addresses: Vec::new(),
             replica_id: id,
             ports: TransportPorts::default(),
+        }
+    }
+
+    fn selector(client_cidr: &str, address: &str) -> AdvertisedAddressSelector {
+        AdvertisedAddressSelector {
+            client_cidr: client_cidr.to_owned(),
+            address: address.to_owned(),
         }
     }
 
@@ -1496,6 +2145,314 @@ mod cluster_validate_tests {
         n2.ip = "10.0.0.2".to_owned();
         n2.advertised_address = Some("broker-2.example.com".to_owned());
         n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_selectors_with_distinct_cidrs() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("203.0.113.1".to_owned());
+        n1.advertised_addresses = vec![
+            selector("10.0.0.0/16", "10.0.0.1"),
+            selector("10.0.0.0/8", "broker-1.internal.example"),
+        ];
+        n1.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_selector_cidr() {
+        for client_cidr in ["10.0.0.0", "10.0.0.0/33", "not-a-cidr", ""] {
+            let mut n1 = node("n1", 0);
+            n1.advertised_addresses = vec![selector(client_cidr, "10.0.0.1")];
+
+            assert!(
+                cfg(vec![n1, node("n2", 1)]).validate().is_err(),
+                "client_cidr '{client_cidr}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_selector_address() {
+        for address in ["", "10.0.0.1:8090", "10.0.0.256", "iggy_node"] {
+            let mut n1 = node("n1", 0);
+            n1.advertised_addresses = vec![selector("10.0.0.0/16", address)];
+
+            assert!(
+                cfg(vec![n1, node("n2", 1)]).validate().is_err(),
+                "selector address '{address}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_selector_cidr_within_a_node() {
+        // `10.0.1.0/16` truncates to `10.0.0.0/16`: the two selectors match
+        // the identical client set, so the second could never win LPM.
+        let mut n1 = node("n1", 0);
+        n1.advertised_addresses = vec![
+            selector("10.0.0.0/16", "10.0.0.1"),
+            selector("10.0.1.0/16", "10.0.0.2"),
+        ];
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_selector_count_at_the_cap() {
+        let mut n1 = node("n1", 0);
+        n1.advertised_addresses = (0..MAX_ADVERTISED_SELECTORS)
+            .map(|index| selector(&format!("10.{index}.0.0/16"), &format!("192.0.2.{index}")))
+            .collect();
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_selector_count_above_the_cap() {
+        // The env-override path stops expanding selector indices at the same
+        // ceiling, so a TOML roster exceeding it could never be replicated
+        // byte-identically through env vars.
+        let mut n1 = node("n1", 0);
+        n1.advertised_addresses = (0..=MAX_ADVERTISED_SELECTORS)
+            .map(|index| selector(&format!("10.{index}.0.0/16"), &format!("192.0.2.{index}")))
+            .collect();
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_selector_endpoint_conflict_within_one_cidr() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![selector("10.0.0.0/16", "10.0.7.7")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.0.0.0/16", "10.0.7.7")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_identical_selector_endpoint_across_different_cidrs() {
+        // Reusing one host:port across DIFFERENT client networks is the
+        // feature (e.g. each network NATs the address to its local node).
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![selector("10.1.0.0/16", "192.0.2.10")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.2.0.0/16", "192.0.2.10")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_v4_mapped_v6_selector_cidr_duplicating_its_v4_form() {
+        // `::ffff:10.0.0.0/104` canonicalizes to `10.0.0.0/8` (matching how
+        // client IPs canonicalize before LPM), so these two selectors match
+        // the identical client set.
+        let mut n1 = node("n1", 0);
+        n1.advertised_addresses = vec![
+            selector("10.0.0.0/8", "10.0.0.1"),
+            selector("::ffff:10.0.0.0/104", "10.0.0.2"),
+        ];
+
+        assert!(cfg(vec![n1, node("n2", 1)]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_selector_endpoint_clashing_with_another_nodes_catch_all() {
+        // The catch-all matches every client, so a 10.0.0.0/16 client would
+        // resolve both nodes to 192.0.2.10:8090.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.10")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("192.0.2.10".to_owned());
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_selector_endpoint_clashing_with_another_nodes_roster_ip() {
+        // Without an advertised_address the roster ip backs the catch-all,
+        // so the same cross-set conflict applies to it.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![selector("10.0.0.0/16", "10.0.0.2")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_identical_selector_endpoint_across_nested_cidrs() {
+        // LPM runs per node, not cluster-wide: n1 has no longer prefix of
+        // its own shadowing the /16 overlap, so a 10.0.0.0/16 client wins
+        // n1's /8 and n2's /16, resolving both to 192.0.2.10:8090.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![selector("10.0.0.0/8", "192.0.2.10")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.10")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_nested_cidr_reuse_shadowed_by_same_node_longer_prefix() {
+        // n1's /16 selector shadows its /8 within 10.0.0.0/16, so n1's /8
+        // entry wins only 10.0.0.0/8 minus 10.0.0.0/16 - disjoint from n2's
+        // /16. No client resolves both nodes to 192.0.2.10:8090.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![
+            selector("10.0.0.0/8", "192.0.2.10"),
+            selector("10.0.0.0/16", "192.0.2.20"),
+        ];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.10")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_partially_shadowed_nested_cidr_reuse() {
+        // n1's /24 shadow carves only part of the /16 overlap: a client in
+        // 10.0.0.0/16 outside 10.0.0.0/24 still wins n1's /8 entry and n2's
+        // /16 entry, resolving both nodes to 192.0.2.10:8090.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![
+            selector("10.0.0.0/8", "192.0.2.10"),
+            selector("10.0.0.0/24", "192.0.2.20"),
+        ];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.10")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_catch_all_reuse_shadowed_by_same_node_selector() {
+        // n1's /16 selector shadows its catch-all within 10.0.0.0/16, so
+        // the catch-all never wins a client inside n2's /24. Without the
+        // shadow the same pair conflicts (see
+        // validate_rejects_selector_endpoint_clashing_with_another_nodes_catch_all).
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("192.0.2.10".to_owned());
+        n1.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.20")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.0.0.0/24", "192.0.2.10")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_selector_reusing_a_fully_shadowed_catch_all_address() {
+        // n1's selectors cover both address families, so its catch-all wins
+        // known peers nowhere; only unknown-peer clients reach it, and they
+        // never match n2's selector.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("192.0.2.10".to_owned());
+        n1.advertised_addresses = vec![
+            selector("0.0.0.0/0", "192.0.2.20"),
+            selector("::/0", "192.0.2.30"),
+        ];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.10")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_catch_all_spelling_another_nodes_selector_address_when_self_shadowed() {
+        // Split-network NAT roster: n2's catch-all spells n1's 10/8 selector
+        // address, but n2's own 10/8 selector shadows its catch-all inside
+        // 10/8 (outside it n1 serves its own catch-all), so no client
+        // resolves both nodes to 192.0.2.10:8090.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_addresses = vec![selector("10.0.0.0/8", "192.0.2.10")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("192.0.2.10".to_owned());
+        n2.advertised_addresses = vec![selector("10.0.0.0/8", "192.0.2.20")];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_catch_all_even_when_fully_shadowed() {
+        // A client whose peer address the transport cannot produce always
+        // falls to the catch-all, so duplicate catch-all conflict even when
+        // selectors cover every known network.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("192.0.2.10".to_owned());
+        n1.advertised_addresses = vec![
+            selector("0.0.0.0/0", "192.0.2.20"),
+            selector("::/0", "192.0.2.30"),
+        ];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.advertised_address = Some("192.0.2.10".to_owned());
+        n2.advertised_addresses = vec![
+            selector("0.0.0.0/0", "192.0.2.40"),
+            selector("::/0", "192.0.2.50"),
+        ];
+        n2.ports.tcp = Some(8090);
+
+        assert!(cfg(vec![n1, n2]).validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_selector_reusing_its_own_nodes_catch_all_address() {
+        // Redundant but harmless: within one node the selector and the
+        // catch-all cannot resolve a client to two different nodes.
+        let mut n1 = node("n1", 0);
+        n1.ip = "10.0.0.1".to_owned();
+        n1.advertised_address = Some("192.0.2.10".to_owned());
+        n1.advertised_addresses = vec![selector("10.0.0.0/16", "192.0.2.10")];
+        n1.ports.tcp = Some(8090);
+        let mut n2 = node("n2", 1);
+        n2.ip = "10.0.0.2".to_owned();
+        n2.ports.tcp = Some(8091);
 
         assert!(cfg(vec![n1, n2]).validate().is_ok());
     }

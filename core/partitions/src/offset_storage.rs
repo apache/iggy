@@ -25,9 +25,11 @@ use std::path::Path;
 const OFFSET_SIZE: usize = core::mem::size_of::<u64>();
 
 pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.exists()
-    {
+    // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
+    // in front of every write, which serialises a batched fan-out on stats
+    // before it can submit any I/O. `create_dir_all` is already a no-op on an
+    // existing directory.
+    if let Some(parent) = Path::new(path).parent() {
         create_dir_all(parent).await.map_err(|_| {
             IggyError::CannotCreateConsumerOffsetsDirectory(parent.display().to_string())
         })?;
@@ -114,13 +116,14 @@ async fn read_persisted_offset(path: &str) -> Result<Option<u64>, IggyError> {
 /// # Errors
 /// Returns [`IggyError::CannotDeleteConsumerOffsetFile`] if the unlink fails.
 pub async fn delete_persisted_offset(path: &str) -> Result<(), IggyError> {
-    if !Path::new(path).exists() {
-        return Ok(());
+    // NotFound is tolerated on the result instead of probed for: the probe was
+    // a blocking stat on the pump before every unlink, and "already gone" is
+    // exactly the outcome this wants anyway.
+    match remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(IggyError::CannotDeleteConsumerOffsetFile(path.to_owned())),
     }
-
-    remove_file(path)
-        .await
-        .map_err(|_| IggyError::CannotDeleteConsumerOffsetFile(path.to_owned()))
 }
 
 #[cfg(test)]
