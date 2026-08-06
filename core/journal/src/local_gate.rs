@@ -102,3 +102,100 @@ impl Drop for LocalGateGuard<'_> {
         }
     }
 }
+
+// NOT behind `cfg(debug_assertions)`: release is exactly the build where this
+// gate is the only enforcement of the superblock single-writer contract (the
+// `WritingGuard` tripwire is debug-only, `write` takes `&self`, and two
+// overlapping writers collide on one fixed `.tmp` path and tear a slot while
+// both return `Ok`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+    use futures::future::join;
+    use std::rc::Rc;
+
+    /// Two writers queued on the same gate run one after the other, never
+    /// interleaved -- the property a torn superblock slot depends on.
+    #[compio::test]
+    async fn given_two_waiters_when_acquiring_should_serialize() {
+        let gate = LocalGate::new();
+        let gate = &gate;
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let first = {
+            let log = Rc::clone(&log);
+            async move {
+                let guard = gate.acquire().await;
+                log.borrow_mut().push("first:enter");
+                // A yield inside the critical section: without exclusion the
+                // second writer would slot in right here.
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                log.borrow_mut().push("first:exit");
+                drop(guard);
+            }
+        };
+        let second = {
+            let log = Rc::clone(&log);
+            async move {
+                let guard = gate.acquire().await;
+                log.borrow_mut().push("second:enter");
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                log.borrow_mut().push("second:exit");
+                drop(guard);
+            }
+        };
+        join(first, second).await;
+
+        let log = log.borrow();
+        assert_eq!(log.len(), 4, "both sections ran: {log:?}");
+        let first_exit = log.iter().position(|entry| *entry == "first:exit").unwrap();
+        let second_enter = log
+            .iter()
+            .position(|entry| *entry == "second:enter")
+            .unwrap();
+        assert!(
+            first_exit < second_enter,
+            "sections must not interleave: {log:?}"
+        );
+    }
+
+    /// Dropping the guard wakes a queued waiter, so the gate does not wedge
+    /// once contended.
+    #[compio::test]
+    async fn given_queued_waiter_when_guard_drops_should_wake_it() {
+        let gate = LocalGate::new();
+        let held = gate.acquire().await;
+
+        let mut waiter = Box::pin(gate.acquire());
+        assert!(
+            waiter.as_mut().now_or_never().is_none(),
+            "the gate is held, so the waiter must park"
+        );
+
+        drop(held);
+        assert!(
+            waiter.now_or_never().is_some(),
+            "dropping the guard must wake the queued waiter"
+        );
+    }
+
+    /// A waiter that goes away leaves only a stale waker behind: the next
+    /// acquirer still gets the gate. Cancel safety is load-bearing here, since
+    /// every acquire site sits in a future a shard can drop.
+    #[compio::test]
+    async fn given_dropped_waiter_when_guard_releases_should_not_wedge() {
+        let gate = LocalGate::new();
+        let held = gate.acquire().await;
+
+        let mut abandoned = Box::pin(gate.acquire());
+        assert!(abandoned.as_mut().now_or_never().is_none());
+        drop(abandoned);
+
+        drop(held);
+        assert!(
+            gate.acquire().now_or_never().is_some(),
+            "a dropped waiter must not keep the gate busy"
+        );
+    }
+}

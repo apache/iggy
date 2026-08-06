@@ -34,7 +34,7 @@ use iggy_common::{
 };
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
-use metadata::impls::recovery::{IdentityField, ReplicaIdentity};
+use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
@@ -537,6 +537,46 @@ pub(crate) fn restore_partition_view(
     consensus.mark_superblock_durable(state.view, state.log_view);
 }
 
+/// Re-seed a partition's offset counter from the durable frontier, taking the
+/// MAX of what the record holds and what the recovered segments already proved.
+///
+/// The record is a lower bound, never a completeness claim: it exists because
+/// three paths leave a replica whose counter would otherwise restart at 0 while
+/// the group is at N (a transfer install of an all-GC'd origin, a crash inside
+/// the install's swap window, and the fence-and-rebuild path, which needs no
+/// crash at all). Restarting the counter is not a lag -- replicas re-stamp
+/// `base_offset` from it and recompute `batch_checksum` over the result, so the
+/// next replicated prepare would persist different bytes here than on every
+/// peer, silently.
+pub(crate) fn restore_offset_frontier(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    recovered: Option<&VsrState>,
+) {
+    let Some(frontier) = recovered
+        .map(|state| state.offset_frontier)
+        .filter(|&f| f > 0)
+    else {
+        return;
+    };
+    let recovered_end = frontier - 1;
+    if partition.should_increment_offset
+        && partition.offset.load(Ordering::Acquire) >= recovered_end
+    {
+        return;
+    }
+    info!(
+        namespace_raw = partition.consensus().namespace(),
+        offset_frontier = frontier,
+        "restored partition offset frontier from its superblock"
+    );
+    partition.offset.store(recovered_end, Ordering::Release);
+    partition
+        .dirty_offset
+        .store(recovered_end, Ordering::Relaxed);
+    partition.should_increment_offset = true;
+    partition.stats.set_current_offset(recovered_end);
+}
+
 /// Materialise a brand-new [`IggyPartition`] for a namespace that has no on-disk state yet.
 ///
 /// Counterpart to bootstrap's `load_partition`, which hydrates from
@@ -675,7 +715,14 @@ pub async fn build_partition_fresh(
         "fresh partition must not carry recovered segments"
     );
 
-    configure_consumer_offsets(&mut partition, config, namespace, 0)?;
+    // A "fresh" build is also how a FENCED partition comes back (the shard
+    // tombstones it and the reconciler rebuilds through here), and the fence
+    // deliberately leaves the superblock in place, so the recorded frontier is
+    // what stops the rebuild from re-minting offsets the group already used.
+    restore_offset_frontier(&mut partition, recovered_state.as_ref());
+    let current_offset = partition.offset.load(Ordering::Acquire);
+
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     Ok(partition)
@@ -756,6 +803,7 @@ mod tests {
             commit_max: 42,
             checkpoint_op: 0,
             checkpoint_checksum: 0,
+            offset_frontier: 0,
         }
     }
 

@@ -26,7 +26,8 @@ use crate::dispatch::{
 use crate::http;
 use crate::partition_helpers::{
     build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
-    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
+    open_partition_superblock, restore_offset_frontier, restore_partition_view,
+    validate_namespace_bounds,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
@@ -72,8 +73,9 @@ use message_bus::{
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
+use metadata::ReplicaIdentity;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
-use metadata::impls::recovery::{ReplicaIdentity, recover};
+use metadata::impls::recovery::recover;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -1766,15 +1768,32 @@ async fn build_shard_for_thread(
                         fenced_dir,
                         "quarantined the refused segment files; they are kept for inspection"
                     ),
-                    Err(error) => error!(
-                        stream_id,
-                        topic_id,
-                        partition_id = partition_metadata.id,
-                        partition_dir,
-                        %error,
-                        "failed to quarantine the refused segment files; the rebuild will \
-                         re-read them and refuse again"
-                    ),
+                    Err(error) => {
+                        // NOT rebuilt: `build_partition_fresh` reaches
+                        // `ensure_initial_segment`, which opens segment 0 with
+                        // `file_exists = false` and TRUNCATES whatever the
+                        // failed quarantine left behind. The likeliest failures
+                        // (suffix cap exhausted, `create_dir_all`) move zero
+                        // files, so rebuilding would destroy the oldest segment
+                        // on the first attempt while the higher-offset survivors
+                        // keep refusing every boot -- a loop that never
+                        // terminates and eats the chain one segment at a time.
+                        // Tombstone instead: the namespace stays unmaterialised
+                        // and unrouted, the reconciler backs off, and an
+                        // operator still has every byte.
+                        error!(
+                            stream_id,
+                            topic_id,
+                            partition_id = partition_metadata.id,
+                            partition_dir,
+                            %error,
+                            "failed to quarantine the refused segment files; leaving this \
+                             partition tombstoned rather than rebuilding over them"
+                        );
+                        partition_stats.zero_out_all();
+                        partitions.tombstone(namespace);
+                        continue;
+                    }
                 }
                 // The refused load already folded its segment counts in.
                 partition_stats.zero_out_all();
@@ -1852,6 +1871,15 @@ async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_served_segment_cache_bytes_max(
+        config
+            .partition
+            .transfer_served_cache_bytes_max
+            .as_bytes_u64(),
+    );
+    shard.set_partition_artifact_len_max(
+        config.partition.transfer_artifact_bytes_max.as_bytes_u64(),
+    );
     shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
     // Bounds a served state-transfer chunk. A frame above the bus ceiling is
     // rejected by the RECEIVING transport, which tears the replica connection
@@ -2346,7 +2374,12 @@ async fn load_partition(
     partition.dirty_offset.store(counter, Ordering::Relaxed);
     partition.should_increment_offset = current_offset.is_some();
     partition.stats.set_current_offset(counter);
-    let current_offset = counter;
+    // The durable frontier is a LOWER BOUND on top of what the segments proved:
+    // it is the only carrier left when the segments that named the frontier are
+    // gone (an all-GC'd origin's install, a crash inside the swap window), and
+    // taking the max means real recovered data always wins.
+    restore_offset_frontier(&mut partition, recovered_state.as_ref());
+    let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;

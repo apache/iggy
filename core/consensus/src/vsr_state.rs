@@ -31,8 +31,8 @@ use std::fmt;
 /// Number of bytes [`VsrState::to_bytes`] produces and [`VsrState::try_from`]
 /// expects: `cluster`(16) + `replica_id`(1) + `replica_count`(1) + `view`(4)
 /// + `log_view`(4) + `commit_max`(8) + `checkpoint_op`(8)
-/// + `checkpoint_checksum`(16).
-pub const ENCODED_LEN: usize = 58;
+/// + `checkpoint_checksum`(16) + `offset_frontier`(8).
+pub const ENCODED_LEN: usize = 66;
 
 /// The durable consensus state of one replica for one consensus group.
 ///
@@ -69,6 +69,22 @@ pub struct VsrState {
     /// Integrity tag of the paired checkpoint, detecting a torn
     /// snapshot/superblock pairing across a crash.
     pub checkpoint_checksum: u128,
+    /// PARTITION plane: the next message offset this replica will mint, or `0`
+    /// for a group whose offset space is still empty.
+    ///
+    /// A durable LOWER BOUND, not a completeness claim: boot takes the max of
+    /// this and whatever the recovered segments prove. It exists because
+    /// nothing else durably names the frontier once the segments that carried
+    /// it are gone -- a state-transfer install of an all-GC'd origin, a crash
+    /// inside the install's swap window, and the fence-and-rebuild path all
+    /// leave a replica whose counter would otherwise restart at 0 while the
+    /// group is at N. That is not a lag: replicas re-stamp `base_offset` from
+    /// this counter and recompute `batch_checksum` over it, so the next
+    /// replicated prepare would persist different bytes here than on every
+    /// peer, silently.
+    ///
+    /// Always `0` on the metadata plane, which mints no message offsets.
+    pub offset_frontier: u64,
 }
 
 impl VsrState {
@@ -84,6 +100,7 @@ impl VsrState {
         out[26..34].copy_from_slice(&self.commit_max.to_le_bytes());
         out[34..42].copy_from_slice(&self.checkpoint_op.to_le_bytes());
         out[42..58].copy_from_slice(&self.checkpoint_checksum.to_le_bytes());
+        out[58..66].copy_from_slice(&self.offset_frontier.to_le_bytes());
         out
     }
 }
@@ -108,6 +125,7 @@ impl TryFrom<&[u8]> for VsrState {
             commit_max: u64::from_le_bytes(field(bytes, 26)),
             checkpoint_op: u64::from_le_bytes(field(bytes, 34)),
             checkpoint_checksum: u128::from_le_bytes(field(bytes, 42)),
+            offset_frontier: u64::from_le_bytes(field(bytes, 58)),
         };
         // A record violating `log_view <= view` decodes into a replica that looks
         // healthy locally while `DoViewChangeHeader::validate` makes every peer drop
@@ -178,6 +196,7 @@ mod tests {
             commit_max: 6,
             checkpoint_op: 7,
             checkpoint_checksum: 8,
+            offset_frontier: 0,
         };
         let bytes = state.to_bytes();
         assert_eq!(bytes.len(), ENCODED_LEN);
@@ -209,6 +228,7 @@ mod tests {
             commit_max: 0,
             checkpoint_op: 0,
             checkpoint_checksum: 0,
+            offset_frontier: 0,
         }
         .to_bytes();
         bytes[22] = 5; // log_view = 5, view stays 4

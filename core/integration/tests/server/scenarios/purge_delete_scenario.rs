@@ -994,12 +994,18 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     // files in the SAME frame that plants the layout, so the instant assert is
     // correct there and strictly stronger; a poll would hide a regression that
     // clears them one frame late.
-    let offsets_deadline = std::time::Instant::now()
-        + if restart_server {
-            std::time::Duration::from_secs(10)
-        } else {
-            std::time::Duration::ZERO
-        };
+    // vsr-only, and only for the restart cells: the legacy flavor purges
+    // synchronously, and without a restart the pump clears offsets and files in
+    // the SAME frame that plants the layout, so the instant assert is correct
+    // and strictly stronger there. Kept short -- a client-visible stale offset
+    // after purge-then-restart is a real (bounded) window, not something to
+    // paper over with a long tolerance.
+    let poll_window = if cfg!(feature = "vsr") && restart_server {
+        std::time::Duration::from_secs(2)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let offsets_deadline = std::time::Instant::now() + poll_window;
     loop {
         let consumer_offset = client
             .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))

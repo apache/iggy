@@ -1416,11 +1416,14 @@ pub struct StateTransferTargetHeader {
     pub namespace: u64,
     pub available: u8,
     /// Set on an `available == 0` refusal that means "not right now" rather than
-    /// "this node is broken": the requester then re-arms on a flat interval
-    /// instead of charging its consecutive-failure count, whose exponential
-    /// backoff climbs to 1024x the retry interval and is reset only by a
-    /// completed install. A serving primary momentarily behind its own frontier
-    /// is the common case under produce load.
+    /// "this node is broken".
+    ///
+    /// PARTITION arm only: it is the only side with a consecutive-failure count
+    /// to charge. The requester then re-arms on a flat interval instead of
+    /// charging that count, whose exponential backoff climbs to 1024x the retry
+    /// interval and is reset only by a completed install. A serving primary
+    /// momentarily behind its own frontier is the common case under produce
+    /// load.
     ///
     /// This and `commit_max` below claim the HEAD of what used to be the
     /// reserved tail, so every pre-existing field keeps its published offset:
@@ -1434,7 +1437,11 @@ pub struct StateTransferTargetHeader {
     pub reserved_alignment: [u8; 6],
     /// Serving replica's `commit_max` when the descriptor was built.
     ///
-    /// A receiver refuses an offer from a replica that knows LESS than it does:
+    /// Read by the PARTITION receiver only; the metadata arm branches on
+    /// `available` and falls back to journal repair without a refusal.
+    ///
+    /// A partition receiver refuses an offer from a replica that knows LESS
+    /// than it does:
     /// without this the descriptor carried no proof of the sender's own
     /// progress, and a phantom view-0 primary (a group whose directory vanished
     /// boots `init()` rather than `init_as_backup()`, comes up Normal at view 0,

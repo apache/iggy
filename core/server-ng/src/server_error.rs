@@ -136,7 +136,7 @@ pub enum ServerNgError {
     )]
     PartitionSuperblockIdentityMismatch {
         dir: PathBuf,
-        field: metadata::impls::recovery::IdentityField,
+        field: metadata::IdentityField,
         expected: u128,
         found: u128,
     },

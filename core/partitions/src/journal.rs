@@ -24,7 +24,7 @@ use server_common::{
 use std::io;
 use std::{
     cell::{Cell, UnsafeCell},
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
 };
 use tracing::warn;
 
@@ -682,13 +682,26 @@ where
     pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
         let headers = unsafe { &*self.headers.get() };
         let expected = to_op.saturating_sub(floor);
-        // At most one entry per in-window op can land, so the window bounds the
-        // hint: sizing it for every resident header allocated (and memset) about
-        // a megabyte of table per repair round on the floor-refusal path, where
-        // the header vec grows with the live tail.
+        // More in-window ops than resident headers can never be covered, and
+        // `expected` is unbounded here (`to_op` rides the local `commit_max`),
+        // so this is both the early answer and what keeps the bitset below from
+        // being sized off an arbitrary number.
+        if expected > headers.len() as u64 {
+            return RepairedWindowShape {
+                complete: false,
+                holds_messages: headers.iter().any(|header| {
+                    header.op > floor
+                        && header.op <= to_op
+                        && header.operation == Operation::SendMessages
+                }),
+            };
+        }
+        // Dense window, so a bitset beats a `HashSet`: no hashing per op and one
+        // allocation of `expected / 8` bytes.
         #[allow(clippy::cast_possible_truncation)]
-        let capacity = expected.min(headers.len() as u64) as usize;
-        let mut present: HashSet<u64> = HashSet::with_capacity(capacity);
+        let expected_len = expected as usize;
+        let mut present = vec![false; expected_len];
+        let mut covered = 0usize;
         let mut holds_messages = false;
         for header in headers
             .iter()
@@ -697,11 +710,16 @@ where
             if header.operation == Operation::SendMessages {
                 holds_messages = true;
             }
-            present.insert(header.op);
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (header.op - floor - 1) as usize;
+            if !present[slot] {
+                present[slot] = true;
+                covered += 1;
+            }
         }
         RepairedWindowShape {
             // In-window ops only, deduplicated, so a count match IS coverage.
-            complete: present.len() as u64 == expected,
+            complete: covered == expected_len,
             holds_messages,
         }
     }

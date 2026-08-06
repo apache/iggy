@@ -669,12 +669,23 @@ where
                     && partition.applied_purge_generation() < generation
                 {
                     match partition.purge(&config, generation).await {
-                        Ok(()) => tracing::debug!(
-                            shard = self.id,
-                            namespace_raw = namespace.inner(),
-                            generation,
-                            "purge-partition reset partition to empty"
-                        ),
+                        Ok(()) => {
+                            // The purge unlinked the very bytes this shard is
+                            // serving: the cached offer still advertises the
+                            // pre-purge manifest and the payload cache can
+                            // answer chunk requests for it without touching
+                            // disk, so a puller would install purged data. Both
+                            // are keyed on pre-purge content, so neither can
+                            // notice on its own.
+                            partition.clear_state_transfer_offer_cache();
+                            self.drop_served_state_for(namespace.inner());
+                            tracing::debug!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                "purge-partition reset partition to empty"
+                            );
+                        }
                         Err(error) => {
                             // The purge drained every segment before its first
                             // fallible step, so a failure leaves the partition

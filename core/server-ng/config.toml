@@ -955,12 +955,26 @@ evicted_ring_capacity = 4096
 # large batches can pin. Must be > 0 and <= "256 MiB".
 evicted_ring_bytes_max = "16 MiB"
 
+# Byte budget for segment payloads a SERVING shard keeps resident to answer
+# state-transfer chunk requests, per shard (process-wide is this times the shard
+# count). Sized for concurrent pulls: at exactly one maximum segment a single
+# rejoining node thrashes the cache by itself, and every miss re-reads and
+# re-hashes a whole segment to serve one 256 KiB chunk. Must be > 0.
+transfer_served_cache_bytes_max = "4 GB"
+
+# Alloc ceiling for ONE received state-transfer artifact, per shard. The
+# receiver holds it resident through verify, walk and staging write, and up to
+# four transfers run at once. Keep it above the largest legal segment
+# (segment.size plus one max batch) or legal segments are rejected. Must be > 0.
+transfer_artifact_bytes_max = "1088 MB"
+
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
 # consensus traffic between replicas and SDK-client traffic between
 # shards. These knobs are consensus-liveness-critical (max_batch gates
 # throughput under backpressure). Defaults match
 # core::message_bus::config::MessageBusConfig::default().
+
 [message_bus]
 # Maximum number of BusMessage entries coalesced into a single writev(2)
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.

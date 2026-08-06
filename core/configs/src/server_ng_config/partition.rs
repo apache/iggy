@@ -95,6 +95,27 @@ pub struct PartitionConfig {
     /// [`MAX_EVICTED_RING_BYTES`].
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
+
+    /// Byte budget for segment payloads a SERVING shard keeps resident to
+    /// answer state-transfer chunk requests, per shard (so the process-wide
+    /// bound is this times the shard count).
+    ///
+    /// Sized for concurrent pulls, not one: at exactly one maximum segment a
+    /// single receiver arming several transfers thrashes the cache by itself,
+    /// and every miss re-reads and re-hashes a whole segment to serve one
+    /// chunk. Must be > 0.
+    #[config_env(leaf)]
+    pub transfer_served_cache_bytes_max: IggyByteSize,
+
+    /// Alloc ceiling for ONE received state-transfer artifact, per shard.
+    ///
+    /// A receiver holds the whole artifact resident through verify, walk and
+    /// staging write, so the in-flight cap multiplies this. It must stay above
+    /// the largest legal segment (`segment.size` plus the one batch a segment
+    /// may overshoot it by) or legal segments are rejected deterministically.
+    /// Must be > 0.
+    #[config_env(leaf)]
+    pub transfer_artifact_bytes_max: IggyByteSize,
 }
 
 impl Validatable<ConfigurationError> for PartitionConfig {
@@ -119,6 +140,14 @@ impl Validatable<ConfigurationError> for PartitionConfig {
                 "{COMPONENT_NG} partition.evicted_ring_capacity ({}) exceeds the maximum ({MAX_EVICTED_RING_CAPACITY})",
                 self.evicted_ring_capacity
             );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.transfer_served_cache_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT_NG} partition.transfer_served_cache_bytes_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.transfer_artifact_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT_NG} partition.transfer_artifact_bytes_max must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         let ring_bytes = self.evicted_ring_bytes_max.as_bytes_u64();

@@ -200,6 +200,10 @@ where
     /// at network round-trip rate. Reset only by
     /// [`Self::note_transfer_installed`]; drives the re-arm backoff.
     transfer_failures: u32,
+    /// CONSECUTIVE transient refusals (a peer that cannot serve right now).
+    /// Drives log escalation only -- never the backoff. See
+    /// [`Self::record_transfer_refusal`].
+    transfer_refusals: u32,
     /// A scheduled transfer re-arm: try `peer` again once `after_ticks`
     /// consensus ticks elapse. Owned by the shard tick sweep; while one is
     /// pending, the repair-refusal trigger must not arm concurrently.
@@ -364,6 +368,7 @@ where
             transfer: None,
             transfer_attempts: 0,
             transfer_failures: 0,
+            transfer_refusals: 0,
             transfer_rearm: None,
             segment_checksum_cache: RefCell::new(std::collections::HashMap::new()),
             reuse_scan_memo: RefCell::new(None),
@@ -476,7 +481,8 @@ where
         if !self.consensus.needs_superblock_persist() {
             return true;
         }
-        self.write_superblock(superblock.as_ref()).await
+        self.write_superblock(superblock.as_ref(), self.offset_frontier())
+            .await
     }
 
     /// Write the current VSR state under [`Self::superblock_lock`].
@@ -494,14 +500,23 @@ where
     /// send for this group, goes quiet, and its peers elect around it. Only
     /// THIS partition's group is fenced; the rest of the node keeps serving.
     #[allow(clippy::future_not_send)]
-    async fn write_superblock(&self, superblock: &SB) -> bool {
+    async fn write_superblock(&self, superblock: &SB, offset_frontier: u64) -> bool {
         // The pairing fields stay `(0, 0)` and `commit_max` is a dead write
         // on this plane: nothing reads either back (`restore_partition_view`
         // restores view/log_view only), because recovery re-derives the
         // install floor from the installed segments at boot -- a crash after
         // an install does not re-run the transfer. Written anyway so the
         // record shape matches the metadata plane's.
-        let state = self.consensus.vsr_state(0, 0);
+        //
+        // `offset_frontier` is NOT dead: it is the only durable carrier of the
+        // group's offset space once the segments that named it are gone. Every
+        // write stamps the current counter, so whichever write lands last (a
+        // view change, or the explicit persist an install issues) leaves a
+        // lower bound boot can re-seed from.
+        let mut state = self.consensus.vsr_state(0, 0);
+        // Never regresses: a caller recording an incoming frontier passes a
+        // larger value, and the ordinary gate passes the live counter.
+        state.offset_frontier = offset_frontier.max(self.offset_frontier());
         match superblock.write(&state.to_bytes()).await {
             Ok(()) => {
                 self.consensus
@@ -541,6 +556,53 @@ where
         }
     }
 
+    /// The next message offset this replica will mint, `0` while the offset
+    /// space is still empty. The value stamped into the durable record.
+    #[must_use]
+    pub fn offset_frontier(&self) -> u64 {
+        if self.should_increment_offset {
+            self.offset.load(Ordering::Acquire).saturating_add(1)
+        } else {
+            0
+        }
+    }
+
+    /// Force the durable record to catch up with the current offset frontier,
+    /// outside the view-change gate.
+    ///
+    /// [`Self::persist_superblock_if_needed`] fires on `(view, log_view)`
+    /// changes only, which is the right trigger for the split-brain fence and
+    /// the wrong one for the frontier: an install can move the counter by
+    /// millions without touching the view. Called where the frontier changes
+    /// with nothing else durable naming it -- after a state-transfer install
+    /// and after the convergence that follows a failed one. Returns whether the
+    /// record now holds it; a failure is logged by the writer and left to the
+    /// ordinary retry, since the install itself already succeeded.
+    #[allow(clippy::future_not_send)]
+    pub async fn persist_offset_frontier(&self) -> bool {
+        self.persist_offset_frontier_at(self.offset_frontier())
+            .await
+    }
+
+    /// [`Self::persist_offset_frontier`] for a frontier this replica has not
+    /// reached yet.
+    ///
+    /// Used to record an INCOMING frontier before a destructive swap: the
+    /// install unlinks the old chain and fsyncs that before the first staged
+    /// rename lands, and boot sweeps `.log.staging` unconditionally, so a crash
+    /// in that window otherwise leaves no copy of the frontier anywhere. Writing
+    /// the claim first makes it a durable lower bound the whole way through, and
+    /// over-claiming is harmless: the convergence that follows a failed install
+    /// seeds the counter from the same artifact frontier.
+    #[allow(clippy::future_not_send)]
+    pub async fn persist_offset_frontier_at(&self, frontier: u64) -> bool {
+        let Some(superblock) = self.superblock.as_ref().map(Rc::clone) else {
+            return true;
+        };
+        let _superblock_guard = self.superblock_lock.acquire().await;
+        self.write_superblock(superblock.as_ref(), frontier).await
+    }
+
     /// Burn one transfer stall round; `true` once the budget is exhausted.
     /// Lives on the partition, not the session, so a re-minted session
     /// cannot reset it (see [`Self::transfer_attempts`]).
@@ -572,6 +634,19 @@ where
     /// consecutive-failure count.
     pub const fn note_transfer_installed(&mut self) {
         self.transfer_failures = 0;
+        self.transfer_refusals = 0;
+    }
+
+    /// Charge one TRANSIENT refusal and return the consecutive count.
+    ///
+    /// Separate from [`Self::record_transfer_failure`] on purpose: a transient
+    /// refusal must not touch the exponential backoff (the flat retry interval
+    /// is the point), but a partition refused for hours still has to be
+    /// visible, so the count exists only to escalate logging and feed a metric.
+    /// Reset by [`Self::note_transfer_installed`] alongside the failure count.
+    pub const fn record_transfer_refusal(&mut self) -> u32 {
+        self.transfer_refusals = self.transfer_refusals.saturating_add(1);
+        self.transfer_refusals
     }
 
     /// A fresh re-arm is scheduled: the stall budget starts over for it.
@@ -3432,6 +3507,12 @@ where
         // Recreate a fresh empty segment at offset 0 with real writers.
         let start_offset = 0u64;
         self.install_empty_segment(config, start_offset).await?;
+        // Make the unlinks AND the replanted dirent durable together: without
+        // this a crash can resurrect pre-purge segments until the boot re-purge
+        // fires. Bounded and self-healing, but the fsync is one call.
+        if let Some(partition_dir) = self.partition_dir.clone() {
+            let _ = crate::state_transfer::fsync_dir(&partition_dir).await;
+        }
 
         // Reset the offset counters so new messages start at offset 0.
         self.offset.store(start_offset, Ordering::Release);

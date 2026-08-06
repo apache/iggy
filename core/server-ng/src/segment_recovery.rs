@@ -102,13 +102,15 @@ pub async fn load_persisted_segments(
         )
         .await?;
 
-        // An index without a single whole entry means any log bytes were torn
-        // off mid-write (the crash landed between the message write and the
-        // index write). Recover the segment as EMPTY: counting the bytes with
-        // `end_offset == start_offset` would fabricate one phantom message for
-        // the bootstrap non-empty filters, and appending after the torn bytes
-        // would strand undecodable garbage inside the readable range. Zeroed
-        // sizes make the next append overwrite the torn bytes instead.
+        // `bounds == None` now means the log holds no whole BATCH either (the
+        // index-less path above already tried walking the log), so there is
+        // nothing to recover: zeroed sizes make the next append overwrite the
+        // torn bytes, where counting them with `end_offset == start_offset`
+        // would fabricate one phantom message for the bootstrap non-empty
+        // filters and strand undecodable garbage inside the readable range.
+        // Note this is NOT tail-only -- a torn index is reachable mid-chain on
+        // the shipped `enforce_fsync = false`, which is why the walk above
+        // exists rather than refusing the partition.
         let (start_timestamp, end_timestamp, end_offset, effective_messages_size) =
             if let Some((start_timestamp, end_timestamp, end_offset, walked_size)) = bounds {
                 (start_timestamp, end_timestamp, end_offset, walked_size)
@@ -345,6 +347,7 @@ fn file_len(path: &str) -> u64 {
 /// `enforce_fsync` there is no ordering barrier between the message write and
 /// the index write, and a tail torn mid-flush would otherwise pass while
 /// `end_offset` claims offsets whose bytes are incomplete.
+#[allow(clippy::too_many_lines)]
 async fn recover_segment_bounds(
     index_path: &str,
     messages_path: &str,
@@ -431,6 +434,60 @@ async fn recover_segment_bounds(
                 });
             }
             Ok(Some((first.timestamp, end_timestamp, end_offset, position)))
+        }
+        // No whole index entry, but the log holds bytes: recover the bounds by
+        // WALKING the log from byte 0 instead of declaring the segment empty.
+        //
+        // The index is not the only self-describing copy -- batch headers carry
+        // their own offsets, timestamps and lengths -- and with the shipped
+        // `enforce_fsync = false` there is no write ordering between a log and
+        // its index, so a torn index is reachable on default config for a
+        // MID-CHAIN segment too, not just the tail. Recovering that as empty
+        // then trips the contiguity guard and refuses the whole partition:
+        // total serve loss (and offset reuse from 0) for a chain whose bytes
+        // are all present. The walk stops at the first header that does not
+        // decode or does not fit, which keeps the torn-tail truncation the
+        // indexed path performs.
+        _ if messages_size > 0 => {
+            let mut position = 0u64;
+            let mut start_timestamp = None;
+            let mut end_offset = start_offset;
+            let mut end_timestamp = 0;
+            while position < messages_size {
+                let Some(header) = read_batch_header(messages_path, position, messages_size) else {
+                    break;
+                };
+                let extent = position.saturating_add(header.total_size() as u64);
+                if extent > messages_size {
+                    break;
+                }
+                if header.message_count > 0 {
+                    end_offset = header
+                        .base_offset
+                        .saturating_add(u64::from(header.message_count) - 1);
+                    end_timestamp = header.base_timestamp;
+                    start_timestamp.get_or_insert(header.base_timestamp);
+                }
+                position = extent;
+            }
+            let Some(start_timestamp) = start_timestamp else {
+                // Not one whole batch either: the bytes really are unusable, so
+                // the caller's empty recovery is right after all.
+                return Ok(None);
+            };
+            warn!(
+                stream_id,
+                topic_id,
+                partition_id,
+                start_offset,
+                messages_size,
+                walked_size = position,
+                "sparse index holds no whole entry; recovered segment bounds by \
+                 walking the log instead of discarding it (the index repopulates \
+                 on the next flush, and polls take the index-less fallback until \
+                 then)"
+            );
+            Ok(Some((start_timestamp, end_timestamp, end_offset, position)))
         }
         _ => Ok(None),
     }
