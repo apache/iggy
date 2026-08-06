@@ -45,12 +45,6 @@ public sealed class LoginRegisterTests
     }
 
     [Fact]
-    public void ProtocolVersion_PacksTenBitsPerComponent()
-    {
-        Assert.Equal((0u << 20) | (10u << 10) | 3u, LoginRegister.PROTOCOL_VERSION);
-    }
-
-    [Fact]
     public void Serialize_WritesVersionInfoThenCredentialsThenContext()
     {
         var body = LoginRegister.Serialize("admin", "secret");

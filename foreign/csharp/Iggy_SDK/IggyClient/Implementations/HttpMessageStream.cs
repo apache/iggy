@@ -256,8 +256,8 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
-        IList<Message> messages,
+    public async Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId,
+        Partitioning partitioning, IList<Message> messages,
         CancellationToken token = default)
     {
         if (MessageEncryptor is not null)
@@ -294,41 +294,9 @@ public class HttpMessageStream : IIggyClient
         {
             await HandleResponseAsync(response);
         }
-    }
 
-    /// <summary>
-    ///     Resolves balanced and message-key partitioning to an explicit partition id, mirroring the TCP client.
-    ///     Server-side balanced resolution races partition-count changes (a send right after CreatePartitions can
-    ///     land on a stale round-robin cycle), so the client picks the partition and sends it explicitly.
-    /// </summary>
-    private async ValueTask<Partitioning> ResolvePartitioningAsync(Identifier streamId, Identifier topicId,
-        Partitioning partitioning, CancellationToken token)
-    {
-        var key = new TopicKey(streamId, topicId);
-        var partitionCount = _groupState.PartitionCount(key);
-        if (partitionCount is null)
-        {
-            var topic = await GetTopicByIdAsync(streamId, topicId, token)
-                        ?? throw new IggyInvalidStatusCodeException((int)HttpStatusCode.NotFound,
-                            $"Topic {topicId} was not found in stream {streamId}.", true);
-            _groupState.SetPartitionCount(key, topic.PartitionsCount);
-            partitionCount = topic.PartitionsCount;
-        }
-
-        if (partitionCount == 0)
-        {
-            throw new IggyInvalidStatusCodeException((int)HttpStatusCode.NotFound,
-                $"Topic {topicId} in stream {streamId} has no partitions to resolve the message to.", true);
-        }
-
-        var partition = partitioning.Kind switch
-        {
-            Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(key, partitionCount.Value),
-            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Value) % partitionCount.Value,
-            _ => throw new FeatureUnavailableException()
-        };
-
-        return Partitioning.PartitionId((int)partition);
+        return await response.Content.ReadFromJsonAsync<SendMessagesResponse>(_jsonSerializerOptions, token)
+               ?? throw new InvalidResponseException("Send messages reply carried no confirmation body.");
     }
 
     /// <summary>
@@ -928,6 +896,41 @@ public class HttpMessageStream : IIggyClient
     public string GetCurrentAddress()
     {
         return _httpClient.BaseAddress?.ToString() ?? string.Empty;
+    }
+
+    /// <summary>
+    ///     Resolves balanced and message-key partitioning to an explicit partition id, mirroring the TCP client.
+    ///     Server-side balanced resolution races partition-count changes (a send right after CreatePartitions can
+    ///     land on a stale round-robin cycle), so the client picks the partition and sends it explicitly.
+    /// </summary>
+    private async ValueTask<Partitioning> ResolvePartitioningAsync(Identifier streamId, Identifier topicId,
+        Partitioning partitioning, CancellationToken token)
+    {
+        var key = new TopicKey(streamId, topicId);
+        var partitionCount = _groupState.PartitionCount(key);
+        if (partitionCount is null)
+        {
+            var topic = await GetTopicByIdAsync(streamId, topicId, token)
+                        ?? throw new IggyInvalidStatusCodeException((int)HttpStatusCode.NotFound,
+                            $"Topic {topicId} was not found in stream {streamId}.", true);
+            _groupState.SetPartitionCount(key, topic.PartitionsCount);
+            partitionCount = topic.PartitionsCount;
+        }
+
+        if (partitionCount == 0)
+        {
+            throw new IggyInvalidStatusCodeException((int)HttpStatusCode.NotFound,
+                $"Topic {topicId} in stream {streamId} has no partitions to resolve the message to.", true);
+        }
+
+        var partition = partitioning.Kind switch
+        {
+            Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(key, partitionCount.Value),
+            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Value) % partitionCount.Value,
+            _ => throw new FeatureUnavailableException()
+        };
+
+        return Partitioning.PartitionId((int)partition);
     }
 
     private void DecryptMessages(IReadOnlyList<MessageResponse> messages, uint partitionId)

@@ -230,12 +230,12 @@ internal static class BinaryMapper
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
 
         return (new UserResponse
-        {
-            Id = id,
-            CreatedAt = createdAt,
-            Status = userStatus,
-            Username = username
-        },
+            {
+                Id = id,
+                CreatedAt = createdAt,
+                Status = userStatus,
+                Username = username
+            },
             readBytes);
     }
 
@@ -604,8 +604,16 @@ internal static class BinaryMapper
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
 
-            headers[new HeaderKey { Kind = keyKind, Value = keyValue }] =
-                new HeaderValue { Kind = valueKind, Value = value.ToArray() };
+            headers[new HeaderKey
+                {
+                    Kind = keyKind,
+                    Value = keyValue
+                }] =
+                new HeaderValue
+                {
+                    Kind = valueKind,
+                    Value = value.ToArray()
+                };
         }
 
         return headers;
@@ -682,8 +690,16 @@ internal static class BinaryMapper
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
 
-            headers[new HeaderKey { Kind = keyKind, Value = keyValue }] =
-                new HeaderValue { Kind = valueKind, Value = value.ToArray() };
+            headers[new HeaderKey
+                {
+                    Kind = keyKind,
+                    Value = keyValue
+                }] =
+                new HeaderValue
+                {
+                    Kind = valueKind,
+                    Value = value.ToArray()
+                };
         }
 
         return headers;
@@ -738,6 +754,47 @@ internal static class BinaryMapper
         }
 
         return streams.AsReadOnly();
+    }
+
+    /// <summary>
+    ///     Maps a send messages reply: <c>[count:4][stream_id:4][topic_id:4][partition_id:4][base_offset:8]*</c>.
+    /// </summary>
+    /// <remarks>
+    ///     Strict: the payload is the whole reply body, so any length that does not match the count
+    ///     is a shape this build cannot read, not a prefix of a larger value. Entries are read at a
+    ///     fixed 20-byte stride, so tolerating a tail would return garbage as a successful decode.
+    /// </remarks>
+    internal static SendMessagesResponse MapSendMessages(ReadOnlySpan<byte> payload)
+    {
+        const int confirmationSize = 4 + 4 + 4 + 8;
+
+        if (payload.Length < 4)
+        {
+            throw new InvalidResponseException("Send messages reply is shorter than the confirmation count prefix.");
+        }
+
+        var count = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
+        if (payload.Length - 4 != count * (long)confirmationSize)
+        {
+            throw new InvalidResponseException(
+                $"Send messages reply length {payload.Length} does not match {count} confirmations.");
+        }
+
+        var confirmations = new SendMessagesConfirmation[count];
+        var position = 4;
+        for (var i = 0; i < confirmations.Length; i++)
+        {
+            confirmations[i] = new SendMessagesConfirmation
+            {
+                StreamId = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]),
+                TopicId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]),
+                PartitionId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 8)..(position + 12)]),
+                BaseOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 12)..(position + 20)])
+            };
+            position += confirmationSize;
+        }
+
+        return new SendMessagesResponse { Confirmations = confirmations };
     }
 
     internal static StreamResponse MapStream(ReadOnlySpan<byte> payload)
@@ -1041,11 +1098,11 @@ internal static class BinaryMapper
         }
 
         return (new ConsumerGroupMember
-        {
-            Id = id,
-            PartitionsCount = partitionsCount,
-            Partitions = partitions
-        },
+            {
+                Id = id,
+                PartitionsCount = partitionsCount,
+                Partitions = partitions
+            },
             8 + partitionsCount * 4);
     }
 

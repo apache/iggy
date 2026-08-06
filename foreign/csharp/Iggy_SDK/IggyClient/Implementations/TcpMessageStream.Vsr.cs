@@ -127,7 +127,7 @@ public sealed partial class TcpMessageStream
     /// </remarks>
     private async Task<AuthResponse?> LoginRegisterAsync(int code, byte[] message, CancellationToken token)
     {
-        for (var redirects = 0; ; redirects++)
+        for (var redirects = 0;; redirects++)
         {
             if (_consensusSession.IsBound)
             {
@@ -204,12 +204,12 @@ public sealed partial class TcpMessageStream
         return partitioning.Kind != Enums.Partitioning.PartitionId;
     }
 
-    private async Task SendMessagesResolvedAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
-        IList<Message> messages, CancellationToken token)
+    private async Task<SendMessagesResponse> SendMessagesResolvedAsync(Identifier streamId, Identifier topicId,
+        Partitioning partitioning, IList<Message> messages, CancellationToken token)
     {
         var resolved = await ResolvePartitioningAsync(streamId, topicId, partitioning, token);
 
-        await SendMessagesCoreAsync(streamId, topicId, resolved, AsSpan(messages), token);
+        return await SendMessagesCoreAsync(streamId, topicId, resolved, AsSpan(messages), token);
     }
 
     /// <summary>
@@ -229,8 +229,8 @@ public sealed partial class TcpMessageStream
 
         var partition = partitioning.Kind switch
         {
-            Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(
-                new TopicKey(streamId, topicId), partitionCount),
+            Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(new TopicKey(streamId, topicId),
+                partitionCount),
             Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Value) % partitionCount,
             _ => throw VsrError.Exception(VsrError.FEATURE_UNAVAILABLE,
                 $"Partitioning kind {partitioning.Kind} cannot be resolved to a partition id.")
@@ -293,10 +293,10 @@ public sealed partial class TcpMessageStream
                     pollingStrategy, count, autoCommit, token);
             }
             catch (IggyInvalidStatusCodeException e) when (e is
-            {
-                StatusCode: VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED,
-                FromServer: true
-            })
+                                                           {
+                                                               StatusCode: VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED,
+                                                               FromServer: true
+                                                           })
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
                 // re-sync below.
@@ -458,7 +458,10 @@ public sealed partial class TcpMessageStream
             }
         }
         // todo: change after error refactoring, error code 5 is for feature not supported
-        catch (IggyInvalidStatusCodeException e) when (e is { StatusCode: VsrError.FEATURE_UNAVAILABLE, FromServer: true })
+        catch (IggyInvalidStatusCodeException e) when (e is
+                                                       {
+                                                           StatusCode: VsrError.FEATURE_UNAVAILABLE, FromServer: true
+                                                       })
         {
             return null;
         }
@@ -521,7 +524,9 @@ public sealed partial class TcpMessageStream
                 }
 
                 if (attempt.Error is IggyInvalidStatusCodeException
-                    { StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED, FromServer: true }
+                    {
+                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED, FromServer: true
+                    }
                     && !isLoginRegister
                     && Environment.TickCount64 < overallDeadline)
                 {
@@ -598,7 +603,7 @@ public sealed partial class TcpMessageStream
         // Read the stream once for the whole attempt. Nothing may swap the field without the sending lock this
         // call holds, so the frame and its reply cannot be split across two sockets, and a teardown after the
         // lock is gone can tell this connection from a replacement a reconnect installed since.
-        TcpConnectionStream stream = _stream;
+        var stream = _stream;
         try
         {
             // A small request goes out as one write. Two writes cost two syscalls and, with Nagle disabled, two
@@ -787,7 +792,8 @@ public sealed partial class TcpMessageStream
         }
     }
 
-    private async ValueTask ReadExactVsrAsync(TcpConnectionStream stream, Memory<byte> buffer, CancellationToken readToken,
+    private async ValueTask ReadExactVsrAsync(TcpConnectionStream stream, Memory<byte> buffer,
+        CancellationToken readToken,
         CancellationToken token)
     {
         var totalRead = 0;

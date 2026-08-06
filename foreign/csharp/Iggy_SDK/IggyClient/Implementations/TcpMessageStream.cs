@@ -22,7 +22,6 @@ using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.ConnectionStream;
 using Apache.Iggy.Contracts;
@@ -59,8 +58,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     ];
 
     private readonly IggyClientConfigurator _configuration;
-    private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
     private readonly SemaphoreSlim _connectGate = new(1, 1);
+    private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
     private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _sendingSemaphore;
@@ -304,8 +303,8 @@ public sealed partial class TcpMessageStream : IIggyClient
 
 
     /// <inheritdoc />
-    public Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
-        IList<Message> messages, CancellationToken token = default)
+    public Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId,
+        Partitioning partitioning, IList<Message> messages, CancellationToken token = default)
     {
         if (NeedsClientSidePartitioning(partitioning))
         {
@@ -316,8 +315,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
-        Message message, CancellationToken token = default)
+    public Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId,
+        Partitioning partitioning, Message message, CancellationToken token = default)
     {
         if (NeedsClientSidePartitioning(partitioning))
         {
@@ -636,47 +635,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         return ConnectAsync(true, token);
     }
 
-    /// <summary>
-    ///     Connects, optionally without the configured auto login. A caller that authenticates itself right
-    ///     after the connect passes <c>false</c>, so the connect does not spend a round trip on credentials the
-    ///     caller is about to replace.
-    /// </summary>
-    private async Task ConnectAsync(bool autoLogin, CancellationToken token)
-    {
-        if (_state is ConnectionState.Connected
-            or ConnectionState.Authenticating
-            or ConnectionState.Authenticated)
-        {
-            _logger.LogWarning("Connection is already connected");
-            return;
-        }
-
-        await _connectGate.WaitAsync(token);
-        Interlocked.Exchange(ref _isConnecting, 1);
-        try
-        {
-            if (_state is ConnectionState.Connected
-                or ConnectionState.Authenticating
-                or ConnectionState.Authenticated)
-            {
-                return;
-            }
-
-            if (_lastConnectionTime != DateTimeOffset.MinValue)
-            {
-                await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
-            }
-
-            SetConnectionStateAsync(ConnectionState.Connecting);
-            await TryEstablishConnectionAsync(autoLogin, token);
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _isConnecting, 0);
-            _connectGate.Release();
-        }
-    }
-
     /// <inheritdoc />
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
@@ -893,6 +851,47 @@ public sealed partial class TcpMessageStream : IIggyClient
             LoginRegister.SerializeWithPersonalAccessToken(token), ct);
     }
 
+    /// <summary>
+    ///     Connects, optionally without the configured auto login. A caller that authenticates itself right
+    ///     after the connect passes <c>false</c>, so the connect does not spend a round trip on credentials the
+    ///     caller is about to replace.
+    /// </summary>
+    private async Task ConnectAsync(bool autoLogin, CancellationToken token)
+    {
+        if (_state is ConnectionState.Connected
+            or ConnectionState.Authenticating
+            or ConnectionState.Authenticated)
+        {
+            _logger.LogWarning("Connection is already connected");
+            return;
+        }
+
+        await _connectGate.WaitAsync(token);
+        Interlocked.Exchange(ref _isConnecting, 1);
+        try
+        {
+            if (_state is ConnectionState.Connected
+                or ConnectionState.Authenticating
+                or ConnectionState.Authenticated)
+            {
+                return;
+            }
+
+            if (_lastConnectionTime != DateTimeOffset.MinValue)
+            {
+                await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
+            }
+
+            SetConnectionStateAsync(ConnectionState.Connecting);
+            await TryEstablishConnectionAsync(autoLogin, token);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _isConnecting, 0);
+            _connectGate.Release();
+        }
+    }
+
     private async Task<PolledMessagesRental> PollPartitionMessagesRentedAsync(Identifier streamId, Identifier topicId,
         uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
         CancellationToken token)
@@ -942,8 +941,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
     }
 
-    private Task SendMessagesCoreAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
-        ReadOnlySpan<Message> messages, CancellationToken token)
+    private Task<SendMessagesResponse> SendMessagesCoreAsync(Identifier streamId, Identifier topicId,
+        Partitioning partitioning, ReadOnlySpan<Message> messages, CancellationToken token)
     {
         var encryptor = _configuration.MessageEncryptor;
 
@@ -969,15 +968,17 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw;
         }
 
-        return SendAckAndDisposeAsync(payloadBuffer, payloadBufferSize, token);
+        return SendConfirmedAndDisposeAsync(payloadBuffer, payloadBufferSize, token);
     }
 
-    private async Task SendAckAndDisposeAsync(IMemoryOwner<byte> payloadBuffer, int payloadBufferSize,
-        CancellationToken token)
+    private async Task<SendMessagesResponse> SendConfirmedAndDisposeAsync(IMemoryOwner<byte> payloadBuffer,
+        int payloadBufferSize, CancellationToken token)
     {
         try
         {
-            await SendAckAsync(payloadBuffer.Memory[..payloadBufferSize], token);
+            using IMemoryOwner<byte> responseBuffer =
+                await SendWithResponseAsync(payloadBuffer.Memory[..payloadBufferSize], token);
+            return BinaryMapper.MapSendMessages(responseBuffer.Memory.Span);
         }
         finally
         {
@@ -1055,7 +1056,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
 
-                TcpConnectionStream connectionStream = _configuration.TlsSettings.Enabled switch
+                var connectionStream = _configuration.TlsSettings.Enabled switch
                 {
                     true => await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
                     false => new TcpConnectionStream(new NetworkStream(socket, true))
