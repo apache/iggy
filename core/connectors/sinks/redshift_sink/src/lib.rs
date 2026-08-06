@@ -17,24 +17,25 @@
 
 mod config;
 
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
 use arrow::{
-    array::{
-        ArrayRef, BinaryArray, Decimal256Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray,
-    },
-    datatypes::{DataType, Field, Schema, TimeUnit},
+    array::{ArrayRef, BinaryBuilder, Int64Array, RecordBatch, StringArray, StringBuilder},
+    datatypes::{DataType, Field, Schema},
 };
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
-use parquet::arrow::ArrowWriter;
+use parquet::{
+    arrow::ArrowWriter,
+    basic::{Compression, ZstdLevel},
+    file::properties::WriterProperties,
+};
 use s3::{Bucket, Region, creds::Credentials};
 use secrecy::ExposeSecret;
-use sqlx::{AssertSqlSafe, Pool, Postgres, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, Pool, Postgres, Row, postgres::PgPoolOptions};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -66,7 +67,10 @@ impl Sink for RedshiftSink {
         );
 
         self.connect().await?;
-        self.ensure_table_exists().await?;
+        // Ensuring tables exist
+        self.ensure_tables_exist().await?;
+        // Checking for schema drift
+        self.ensure_schema_match().await?;
         Ok(())
     }
 
@@ -149,8 +153,14 @@ impl RedshiftSink {
         let region = self.build_region()?;
 
         let credentials = Credentials::new(
-            Some(self.config.aws_access_key_id.expose_secret()),
-            Some(self.config.aws_secret_access_key.expose_secret()),
+            self.config
+                .aws_access_key_id
+                .as_ref()
+                .map(|v| v.expose_secret()),
+            self.config
+                .aws_secret_access_key
+                .as_ref()
+                .map(|v| v.expose_secret()),
             None,
             None,
             None,
@@ -188,27 +198,170 @@ impl RedshiftSink {
         }
     }
 
-    async fn ensure_table_exists(&self) -> Result<(), Error> {
+    async fn ensure_tables_exist(&self) -> Result<(), Error> {
         let pool = self.get_pool()?;
 
-        let table_name = &self.config.target_table;
+        let target_table = quote_identifier(&self.config.target_table)?;
+        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+
         let payload_type = self.payload_format().sql_type();
 
-        let (query, _) = self.build_create_table_sql()?;
+        let target_query = self.build_create_table_sql(&target_table)?;
 
-        tracing::debug!("ensuring target table exists");
+        let staging_query = self.build_create_table_sql(&staging_table)?;
 
-        sqlx::query(AssertSqlSafe(query))
+        tracing::debug!("ensuring staging and target tables exist");
+
+        sqlx::query(AssertSqlSafe(staging_query))
             .execute(pool)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e);
-                Error::InitError(format!("Failed to create table '{table_name}': {e}"))
+                Error::InitError(format!("Failed to create table '{staging_table}': {e}"))
             })?;
 
-        tracing::info!(table = %table_name, payload_type, "target table ready");
+        tracing::debug!("Staging table created");
+
+        sqlx::query(AssertSqlSafe(target_query))
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e);
+                Error::InitError(format!("Failed to create table '{target_table}': {e}"))
+            })?;
+
+        tracing::info!(
+            staging_table = staging_table,
+            target_table = target_table,
+            payload_type,
+            "staging and target tables ready"
+        );
 
         Ok(())
+    }
+
+    // This method ensures that the target table schema matches the expected schema.
+    // it also verifies there is a created_at column
+    async fn ensure_schema_match(&self) -> Result<(), Error> {
+        let include_metadata = self.config.include_metadata.unwrap_or(true);
+        let include_checksum = self.config.include_checksum.unwrap_or(true);
+        let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
+        let target_table = quote_identifier(&self.config.target_table)?;
+        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let payload_type = self.payload_format().sql_type();
+        let pool = self.get_pool()?;
+
+        let mut expected_cols: BTreeMap<&str, &str> = BTreeMap::new();
+        expected_cols.insert("id", "VARCHAR");
+        if include_metadata {
+            expected_cols.insert("iggy_offset", "VARCHAR");
+            expected_cols.insert("iggy_timestamp", "VARCHAR");
+            expected_cols.insert("iggy_stream", "TEXT");
+            expected_cols.insert("iggy_topic", "TEXT");
+            expected_cols.insert("iggy_partition_id", "BIGINT");
+        }
+        if include_checksum {
+            expected_cols.insert("iggy_checksum", "VARCHAR");
+        }
+        if include_origin_timestamp {
+            expected_cols.insert("iggy_origin_timestamp", "VARCHAR");
+        }
+        expected_cols.insert("payload", payload_type);
+        expected_cols.insert("created_at", "TIMESTAMPTZ");
+
+        let target_cols = Self::load_columns(pool, &target_table).await?;
+        let staging_cols = Self::load_columns(pool, &staging_table).await?;
+
+        let mut mismatches = Self::diff_schema(&target_table, &target_cols, &expected_cols);
+        mismatches.extend(Self::diff_schema(
+            &staging_table,
+            &staging_cols,
+            &expected_cols,
+        ));
+
+        tracing::info!("Mismatches: {:?}", mismatches);
+
+        if !mismatches.is_empty() {
+            return Err(Error::InitError(format!(
+                "Schema mismatch detected:\n{}",
+                mismatches.join("\n")
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn diff_schema(
+        table_name: &str,
+        actual_cols: &BTreeMap<String, String>,
+        expected_cols: &BTreeMap<&str, &str>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        for (col_name, expected_type) in expected_cols {
+            match actual_cols.get(*col_name) {
+                None => errors.push(format!(
+                    "{table_name}: missing column '{col_name}' (expected {expected_type})"
+                )),
+                Some(actual_type) if !Self::type_matches(actual_type, expected_type) => errors.push(format!(
+                    "{table_name}: column '{col_name}' type mismatch — expected {expected_type}, found {actual_type}"
+                )),
+                _ => {}
+            }
+        }
+        errors
+    }
+
+    fn type_matches(actual: &str, expected: &str) -> bool {
+        Self::normalize_type(actual) == Self::normalize_type(expected)
+    }
+
+    async fn load_columns(
+        pool: &sqlx::PgPool,
+        table: &str,
+    ) -> Result<BTreeMap<String, String>, Error> {
+        let query = format!(
+            "SELECT \"column\", type FROM pg_table_def WHERE tablename = '{}'",
+            table.replace('"', "")
+        );
+
+        let rows = sqlx::query(AssertSqlSafe(query))
+            .fetch_all(pool)
+            .await
+            .map_err(|e| Error::InitError(format!("Failed to read schema for '{table}': {e}")))?;
+
+        if rows.is_empty() {
+            return Err(Error::InitError(format!(
+                "Table '{table}' was not found or has no visible columns"
+            )));
+        }
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("column")
+                        .map_err(|e| Error::InitError(e.to_string()))?,
+                    Self::normalize_type(
+                        &row.try_get::<String, _>("type")
+                            .map_err(|e| Error::InitError(e.to_string()))?,
+                    )
+                    .to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn normalize_type(t: &str) -> &'static str {
+        match t.to_ascii_uppercase().as_str() {
+            "INTEGER" | "INT" | "INT4" => "INTEGER",
+            "INT8" | "BIGINT" => "BIGINT",
+            "VARCHAR" | "CHARACTER VARYING" => "VARCHAR",
+            // Having bytea because of the Postgres Test
+            "BYTEA" | "VARBYTE" | "VARBINARY" | "BINARY VARYING" => "VARBYTE",
+            "TEXT" => "TEXT",
+            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => "TIMESTAMPTZ",
+            _ => "UNKNOWN",
+        }
     }
 
     async fn process_messages(
@@ -224,12 +377,28 @@ impl RedshiftSink {
                 .insert_batch(batch, topic_metadata, messages_metadata)
                 .await
             {
-                Ok(()) => {
-                    self.state.lock().await.batches_loaded += 1;
+                Ok(path) => {
+                    // Messages were received and ingested to Redshift
+                    if let Some(s3_path) = path {
+                        // Truncate the staging table
+                        if let Err(e) = self.staging_cleanup().await {
+                            tracing::warn!(error = %e, "failed to cleanup staging table");
+                        }
+
+                        // Handle archiving
+                        if let Err(e) = self.archive_parquet(&s3_path).await {
+                            tracing::warn!(error = %e, "failed to archive parquet file: {}", s3_path);
+                        }
+
+                        self.state.lock().await.batches_loaded += 1
+                    } else {
+                        tracing::info!("Zero messages found for processing");
+                    }
                 }
                 Err(e) => {
                     self.state.lock().await.insertion_errors += batch.len() as u64;
                     tracing::error!(error = %e, batch_size = batch.len(), "failed to insert batch");
+                    return Err(e);
                 }
             }
         }
@@ -258,14 +427,21 @@ impl RedshiftSink {
         Ok(())
     }
 
+    // This function builds a parquet from messages and metadata
+    // It uploads the parquet to S3 and returns the path
+    // It then copies the parquet to Redshift target table via
+    // a staging table by means of a MERGE statement
+    // This function treats parquet-generation, uploading to s3,
+    // copying to staging and merging to target as atomic
+    // process of focus for this sink connector
     async fn insert_batch(
         &self,
         messages: &[ConsumedMessage],
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         if messages.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let include_metadata = self.config.include_metadata.unwrap_or(true);
@@ -292,24 +468,51 @@ impl RedshiftSink {
         );
 
         let s3_path = self.upload_parquet(&content).await?;
-        self.copy_parquet(&s3_path).await?;
-        self.archive_parquet(&s3_path).await?;
+
+        let schema = record_batch.schema();
+        let cols = schema
+            .fields
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+
+        // Copy the parquet file to Redshift staging
+        // Cleanup
+        tracing::info!("copying parquet to Redshift staging");
+        if let Err(e) = self.copy_parquet(&s3_path, &cols).await {
+            let key = s3_path
+                .strip_prefix(&format!("s3://{}/", self.config.s3_bucket))
+                .ok_or(Error::InvalidConfigValue("Missing Cleanup S3 path".into()))?;
+
+            self.delete_object(key).await?;
+
+            Err(e)?
+        }
+
+        tracing::info!("Redshift stging COPY completed");
+
+        // Do a merge into Redshift target table
+        self.merge_into_target(&cols).await?;
+
+        tracing::info!("Redshift target table merge completed");
 
         tracing::info!(count = messages.len(), path = %s3_path, "batch inserted into Redshift");
 
-        Ok(())
+        Ok(Some(s3_path))
     }
 
-    async fn copy_parquet(&self, s3_path: &str) -> Result<(), Error> {
+    async fn copy_parquet(&self, s3_path: &str, cols: &[&str]) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
         let retry_delay = self.get_retry_delay();
-        let sql = self.build_copy_sql(s3_path);
+        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+
+        let sql = self.build_copy_sql(&staging_table, s3_path, &cols.join(", "))?;
         let pool = self.get_pool()?;
 
         tracing::debug!(table = %self.config.target_table, s3_path, "issuing Redshift COPY");
 
         retry_with_backoff(
-            "redshift COPY",
+            "Redshift COPY",
             max_retries,
             retry_delay,
             is_transient_error,
@@ -322,60 +525,129 @@ impl RedshiftSink {
         )
         .await?;
 
-        tracing::debug!(table = %self.config.target_table, "Redshift COPY completed");
+        tracing::debug!(staging_table = staging_table, "Redshift COPY completed");
 
         Ok(())
     }
 
-    fn build_create_table_sql(&self) -> Result<(String, u32), Error> {
-        let table_name = &self.config.target_table;
-        let quoted_table = quote_identifier(table_name)?;
+    async fn merge_into_target(&self, cols: &[&str]) -> Result<(), Error> {
+        let max_retries = self.get_max_retries();
+        let retry_delay = self.get_retry_delay();
+        let target_table = quote_identifier(&self.config.target_table)?;
+        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let sql = self.build_merge_sql(cols, &staging_table, &target_table);
+        let pool = self.get_pool()?;
 
+        tracing::debug!(table = %self.config.target_table, "issuing Redshift MERGE");
+
+        retry_with_backoff(
+            "Redshift MERGE",
+            max_retries,
+            retry_delay,
+            is_transient_error,
+            || async {
+                sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .execute(pool)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await?;
+
+        tracing::debug!(staging_table = %staging_table, target_table = %target_table, "Redshift MERGE completed");
+
+        Ok(())
+    }
+
+    async fn staging_cleanup(&self) -> Result<(), Error> {
+        let max_retries = self.get_max_retries();
+        let retry_delay = self.get_retry_delay();
+        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let sql = self.build_truncate_sql(&staging_table);
+        let pool = self.get_pool()?;
+
+        tracing::debug!(table = %self.config.target_table, "issuing Redshift TRUNCATE");
+
+        retry_with_backoff(
+            "Redshift TRUNCATE",
+            max_retries,
+            retry_delay,
+            is_transient_error,
+            || async {
+                sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .execute(pool)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await?;
+
+        tracing::debug!(table = %self.config.target_table, "Redshift TRUNCATE completed");
+
+        Ok(())
+    }
+
+    fn build_create_table_sql(&self, table_name: &str) -> Result<String, Error> {
         let include_metadata = self.config.include_metadata.unwrap_or(true);
         let include_checksum = self.config.include_checksum.unwrap_or(true);
         let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
         let payload_type = self.payload_format().sql_type();
 
-        let mut params_per_row: u32 = 1; // id
-
-        let mut query =
-            format!("CREATE TABLE IF NOT EXISTS {quoted_table} (id DECIMAL(39, 0) PRIMARY KEY");
+        let mut query = format!("CREATE TABLE IF NOT EXISTS {table_name} (id VARCHAR(40)");
 
         if include_metadata {
-            query.push_str(", iggy_offset BIGINT, iggy_timestamp TIMESTAMPTZ, iggy_stream TEXT, iggy_topic TEXT, iggy_partition_id INTEGER");
-            params_per_row += 5;
+            query.push_str(", iggy_offset VARCHAR(20), iggy_timestamp VARCHAR(20), iggy_stream TEXT, iggy_topic TEXT, iggy_partition_id BIGINT");
         }
 
         if include_checksum {
             query.push_str(", iggy_checksum VARCHAR");
-            params_per_row += 1;
         }
 
         if include_origin_timestamp {
-            query.push_str(", iggy_origin_timestamp TIMESTAMPTZ");
-            params_per_row += 1;
+            query.push_str(", iggy_origin_timestamp VARCHAR(20)");
         }
 
         query.push_str(&format!(", payload {payload_type}"));
         query.push_str(", created_at TIMESTAMPTZ DEFAULT GETDATE());");
-        params_per_row += 2;
 
-        Ok((query, params_per_row))
+        Ok(query)
     }
 
-    fn build_copy_sql(&self, s3_path: &str) -> String {
-        // Built via format! (not sqlx binds) because the Redshift/Pgwire endpoint here
-        // uses a Simple Query Handler that doesn't support prepared statements with binds.
-        let credentials = format!(
-            "CREDENTIALS 'ACCESS_KEY_ID={};SECRET_ACCESS_KEY={}'",
-            self.config.aws_access_key_id.expose_secret(),
-            self.config.aws_secret_access_key.expose_secret()
-        );
+    fn build_copy_sql(
+        &self,
+        staging_table: &str,
+        s3_path: &str,
+        cols: &str,
+    ) -> Result<String, Error> {
+        // Redshift allows this from the docs
+        // https://docs.aws.amazon.com/redshift/latest/dg/r_COPY_command_examples.html
+        let iam_role = quote_identifier(&self.config.aws_iam_role)?;
+
+        let region = quote_identifier(&self.config.aws_region)?;
+
+        Ok(format!(
+            "COPY {} ({}) FROM '{}' CREDENTIALS 'AWS_IAM_ROLE={}' FORMAT AS PARQUET REGION '{}';",
+            staging_table, cols, s3_path, iam_role, region
+        ))
+    }
+
+    fn build_merge_sql(&self, cols: &[&str], staging: &str, target: &str) -> String {
+        let t_cols = cols.join(", ");
+
+        let s_cols = cols
+            .iter()
+            .map(|v| format!("sm.{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         format!(
-            "COPY {} FROM '{}' {} FORMAT AS PARQUET REGION '{}';",
-            self.config.target_table, s3_path, credentials, self.config.aws_region
+            "MERGE INTO {} AS t USING {} AS sm ON t.id = sm.id WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});",
+            target, staging, t_cols, s_cols
         )
+    }
+
+    fn build_truncate_sql(&self, table: &str) -> String {
+        format!("TRUNCATE {};", table)
     }
 
     async fn upload_parquet(&self, content: &[u8]) -> Result<String, Error> {
@@ -411,7 +683,22 @@ impl RedshiftSink {
 
         let bucket = self.get_bucket()?;
         let prefix = self.config.s3_prefix.trim_matches('/');
-        let archived_key = old_key.replacen(prefix, DEFAULT_ARCHIVE_PREFIX.trim_matches('/'), 1);
+        let archive_prefix = DEFAULT_ARCHIVE_PREFIX.trim_matches('/');
+
+        let suffix = if prefix.is_empty() {
+            old_key
+        } else {
+            old_key
+                .strip_prefix(prefix)
+                .map(|s| s.trim_start_matches('/'))
+                .unwrap_or(old_key)
+        };
+
+        let archived_key = if archive_prefix.is_empty() {
+            suffix.to_string()
+        } else {
+            format!("{}/{}", archive_prefix, suffix)
+        };
 
         tracing::debug!(from = old_key, to = %archived_key, "archiving parquet file");
 
@@ -511,7 +798,7 @@ where
                 let transient = is_transient(&e);
 
                 if !transient || attempts >= max_retries {
-                    tracing::error!(operation, attempts, error = %e, "operation failed permanently");
+                    tracing::error!(operation = operation, attempts = attempts, error = %e, "operation failed permanently");
                     return Err(Error::CannotStoreData(format!(
                         "{operation} failed after {attempts} attempts: {e}"
                     )));
@@ -525,11 +812,16 @@ where
 }
 
 fn encode_parquet(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+
     let mut content = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut content, batch.schema(), None).map_err(|e| {
-        tracing::error!(error = %e, "failed to create parquet writer");
-        Error::WriteFailure(format!("Failed to create parquet writer: {e}"))
-    })?;
+    let mut writer =
+        ArrowWriter::try_new(&mut content, batch.schema(), Some(props)).map_err(|e| {
+            tracing::error!(error = %e, "failed to create parquet writer");
+            Error::WriteFailure(format!("Failed to create parquet writer: {e}"))
+        })?;
 
     writer.write(batch).map_err(|e| {
         tracing::error!(error = %e, "failed to write parquet batch");
@@ -575,8 +867,8 @@ fn create_record_batch(
     include_origin_timestamp: bool,
     payload_format: PayloadFormat,
 ) -> Result<RecordBatch, Error> {
-    let mut fields = vec![Field::new("id", DataType::Decimal256(39, 0), false)];
-    let mut columns: Vec<ArrayRef> = vec![id_column(messages)?];
+    let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+    let mut columns: Vec<ArrayRef> = vec![id_column(messages)];
 
     if include_metadata {
         let (mut metadata_fields, mut metadata_columns) =
@@ -591,11 +883,7 @@ fn create_record_batch(
     }
 
     if include_origin_timestamp {
-        fields.push(Field::new(
-            "iggy_origin_timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ));
+        fields.push(Field::new("iggy_origin_timestamp", DataType::Utf8, false));
         columns.push(origin_timestamp_column(messages));
     }
 
@@ -615,16 +903,10 @@ fn create_record_batch(
     Ok(batch)
 }
 
-fn id_column(messages: &[ConsumedMessage]) -> Result<ArrayRef, Error> {
-    let ids = Decimal256Array::from_iter_values(
-        messages
-            .iter()
-            .map(|v| arrow::datatypes::i256::from_parts(v.id, 0)),
-    )
-    .with_precision_and_scale(39, 0)
-    .map_err(|e| Error::CannotStoreData(e.to_string()))?;
-
-    Ok(Arc::new(ids))
+fn id_column(messages: &[ConsumedMessage]) -> ArrayRef {
+    Arc::new(StringArray::from_iter_values(
+        messages.iter().map(|v| v.id.to_string()),
+    ))
 }
 
 fn metadata_columns(
@@ -633,23 +915,19 @@ fn metadata_columns(
     messages: &[ConsumedMessage],
 ) -> (Vec<Field>, Vec<ArrayRef>) {
     let fields = vec![
-        Field::new("iggy_offset", DataType::Int64, false),
-        Field::new(
-            "iggy_timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
+        Field::new("iggy_offset", DataType::Utf8, false),
+        Field::new("iggy_timestamp", DataType::Utf8, false),
         Field::new("iggy_stream", DataType::Utf8, false),
         Field::new("iggy_topic", DataType::Utf8, false),
-        Field::new("iggy_partition_id", DataType::Int32, false),
+        Field::new("iggy_partition_id", DataType::Int64, false),
     ];
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from_iter_values(
-            messages.iter().map(|v| v.offset as i64),
+        Arc::new(StringArray::from_iter_values(
+            messages.iter().map(|v| v.offset.to_string()),
         )),
-        Arc::new(TimestampMicrosecondArray::from_iter_values(
-            messages.iter().map(|v| v.timestamp as i64),
+        Arc::new(StringArray::from_iter_values(
+            messages.iter().map(|v| v.timestamp.to_string()),
         )),
         Arc::new(StringArray::from_iter_values(
             (0..messages.len()).map(|_| topic_metadata.stream.clone()),
@@ -657,8 +935,8 @@ fn metadata_columns(
         Arc::new(StringArray::from_iter_values(
             (0..messages.len()).map(|_| topic_metadata.topic.clone()),
         )),
-        Arc::new(Int32Array::from_iter_values(
-            (0..messages.len()).map(|_| messages_metadata.partition_id as i32),
+        Arc::new(Int64Array::from_iter_values(
+            (0..messages.len()).map(|_| messages_metadata.partition_id as i64),
         )),
     ];
 
@@ -672,43 +950,33 @@ fn checksum_column(messages: &[ConsumedMessage]) -> ArrayRef {
 }
 
 fn origin_timestamp_column(messages: &[ConsumedMessage]) -> ArrayRef {
-    Arc::new(TimestampMicrosecondArray::from_iter_values(
-        messages.iter().map(|v| v.origin_timestamp as i64),
+    Arc::new(StringArray::from_iter_values(
+        messages.iter().map(|v| v.origin_timestamp.to_string()),
     ))
 }
 
 fn payload_column(messages: &[ConsumedMessage], format: PayloadFormat) -> Result<ArrayRef, Error> {
     match format {
         PayloadFormat::Varbyte => {
-            let values: Vec<Vec<u8>> = messages
-                .iter()
-                .map(|v| v.payload.clone().try_to_bytes())
-                .collect::<Result<_, _>>()?;
-            let slices: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
-            Ok(Arc::new(BinaryArray::from_vec(slices)))
+            let mut builder = BinaryBuilder::with_capacity(messages.len(), 0);
+
+            for m in messages {
+                builder.append_value(m.payload.try_to_bytes()?);
+            }
+
+            Ok(Arc::new(builder.finish()))
         }
         PayloadFormat::Text => {
-            let values: Vec<String> = messages
-                .iter()
-                .map(|v| {
-                    let bytes = v.payload.try_to_bytes()?;
-                    String::from_utf8(bytes).map_err(|_| Error::InvalidTextPayload)
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Arc::new(StringArray::from_iter_values(values.iter())))
-        }
-        PayloadFormat::Json => {
-            let values: Vec<String> = messages
-                .iter()
-                .map(|v| {
-                    let bytes = v.payload.try_to_bytes()?;
+            let mut builder = StringBuilder::with_capacity(messages.len(), 0);
 
-                    Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .map_err(|_| Error::InvalidJsonPayload)?
-                        .to_string())
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Arc::new(StringArray::from_iter_values(values.iter())))
+            for m in messages {
+                let bytes = m.payload.try_to_bytes()?;
+                let s = std::str::from_utf8(&bytes).map_err(|_| Error::InvalidTextPayload)?;
+
+                builder.append_value(s);
+            }
+
+            Ok(Arc::new(builder.finish()))
         }
     }
 }
@@ -721,11 +989,16 @@ fn redact_connection_string(conn_str: &str) -> String {
         let scheme = &conn_str[..scheme_end + 3];
         let rest = &conn_str[scheme_end + 3..];
 
+        let bound_end = rest.find([':', '@', '?', '/']).unwrap_or(rest.len());
+
         // Stop preview at the first sensitive boundary
         let safe_end = rest
-            .find([':', '@', '?', '/'])
-            .unwrap_or(rest.len())
-            .min(PREVIEW_LEN);
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(rest.len()))
+            .take_while(|&i| i <= bound_end)
+            .nth(PREVIEW_LEN)
+            .unwrap_or(bound_end);
 
         let preview = &rest[..safe_end];
         return format!("{scheme}{preview}***");
@@ -790,8 +1063,9 @@ mod tests {
             verbose_logging: None,
             max_retries: None,
             retry_delay: None,
-            aws_access_key_id: SecretString::from("admin"),
-            aws_secret_access_key: SecretString::from("password"),
+            aws_access_key_id: Some(SecretString::from("admin")),
+            aws_secret_access_key: Some(SecretString::from("password")),
+            aws_iam_role: "arn:aws:iam::123456789012:role/Iggy".into(),
             s3_bucket: "iggymessages".into(),
             s3_prefix: "iggy/messages".into(),
             s3_endpoint: None,
@@ -867,7 +1141,7 @@ mod tests {
     #[test]
     fn given_empty_aws_access_key_id_should_error() {
         let mut config = test_config(false, false, false);
-        config.aws_access_key_id = SecretString::default();
+        config.aws_access_key_id = Some(SecretString::default());
 
         assert!(config.validate().is_err());
     }
@@ -875,7 +1149,7 @@ mod tests {
     #[test]
     fn given_empty_aws_secret_access_key_should_error() {
         let mut config = test_config(false, false, false);
-        config.aws_secret_access_key = SecretString::default();
+        config.aws_secret_access_key = Some(SecretString::default());
 
         assert!(config.validate().is_err());
     }
@@ -920,7 +1194,6 @@ mod tests {
     #[test]
     fn given_payload_format_should_return_correct_sql_type() {
         assert_eq!(PayloadFormat::Varbyte.sql_type(), "VARBYTE");
-        assert_eq!(PayloadFormat::Json.sql_type(), "VARCHAR");
         assert_eq!(PayloadFormat::Text.sql_type(), "VARCHAR");
     }
 
@@ -931,10 +1204,6 @@ mod tests {
             arrow::datatypes::DataType::Binary
         );
         assert_eq!(
-            PayloadFormat::Json.arrow_type(),
-            arrow::datatypes::DataType::Utf8
-        );
-        assert_eq!(
             PayloadFormat::Text.arrow_type(),
             arrow::datatypes::DataType::Utf8
         );
@@ -943,8 +1212,12 @@ mod tests {
     #[test]
     fn given_all_options_enabled_should_build_full_create_query() {
         let sink = RedshiftSink::new(1, test_config(true, true, true));
-        let (query, param_count) = sink
-            .build_create_table_sql()
+
+        let target_table =
+            quote_identifier(&sink.config.target_table).expect("Failed to quote table identifier");
+
+        let query = sink
+            .build_create_table_sql(&target_table)
             .expect("Failed to build create query");
 
         assert!(query.contains("CREATE TABLE IF NOT EXISTS \"messages\""));
@@ -957,7 +1230,6 @@ mod tests {
         assert!(query.contains("iggy_origin_timestamp"));
         assert!(query.contains("payload"));
         assert!(query.contains("created_at"));
-        assert_eq!(param_count, 10);
     }
 
     #[test]
@@ -1000,8 +1272,11 @@ mod tests {
     #[test]
     fn given_metadata_disabled_should_build_minimal_create_query() {
         let sink = RedshiftSink::new(1, test_config(false, false, false));
-        let (query, param_count) = sink
-            .build_create_table_sql()
+
+        let target_table =
+            quote_identifier(&sink.config.target_table).expect("Failed to quote table identifier");
+        let query = sink
+            .build_create_table_sql(&target_table)
             .expect("Failed to build create query");
 
         assert!(query.contains("CREATE TABLE IF NOT EXISTS \"messages\""));
@@ -1014,7 +1289,6 @@ mod tests {
         assert!(!query.contains("iggy_origin_timestamp"));
         assert!(query.contains("payload"));
         assert!(query.contains("created_at"));
-        assert_eq!(param_count, 3);
     }
 
     #[test]
@@ -1059,12 +1333,12 @@ mod tests {
         let timestamp_col = record_batch
             .column(2)
             .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
+            .downcast_ref::<StringArray>()
             .expect("Failed to downcast to Timestamp Microsecond array");
 
         let timestamp = timestamp_col.value(0);
 
-        assert_eq!(timestamp, 1_767_225_600_000_000);
+        assert_eq!(timestamp, "1767225600000000");
     }
 
     #[test]

@@ -25,19 +25,23 @@ use testcontainers::{
     core::{IntoContainerPort, WaitFor, wait::HttpWaitStrategy},
     runners::AsyncRunner,
 };
-use testcontainers_modules::postgres;
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::connectors::fixtures::{
     self,
-    redshift::redshift_mock::handler::{RedshiftHandler, RedshiftHandlerFactory},
+    redshift::redshift_mock::{handler::RedshiftHandlerFactory, load::S3Client},
 };
 
+const POSTGRES_IMAGE: &str = "postgres";
+const POSTGRES_TAG: &str = "15-alpine";
+const POSTGRES_PORT: u16 = 5432;
+const POSTGRES_DB: &str = "postgres";
+const POSTGRES_USER: &str = "postgres";
+const POSTGRES_PASSWORD: &str = "postgres";
 const MINIO_IMAGE: &str = "docker.io/minio/minio";
 const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 const MINIO_PORT: u16 = 9000;
 const MINIO_CONSOLE_PORT: u16 = 9001;
-const POSTGRES_PORT: u16 = 5432;
 
 pub const MINIO_ACCESS_KEY: &str = "admin";
 pub const MINIO_SECRET_KEY: &str = "password";
@@ -45,12 +49,14 @@ pub const MINIO_BUCKET: &str = "iggystaging";
 pub const DEFAULT_SINK_TABLE: &str = "iggy_messages";
 pub const STAGING_REGION: &str = "us-east-1";
 pub const STAGING_PREFIX: &str = "iggy/messages";
+pub const AWS_IAM_ROLE: &str = "arn:aws:iam::0123456789012:role/iggyRole";
 
 pub const ENV_SINK_CONNECTION_STRING: &str =
     "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_CONNECTION_STRING";
 pub const ENV_SINK_TARGET_TABLE: &str = "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_TARGET_TABLE";
 pub const ENV_SINK_PAYLOAD_FORMAT: &str =
     "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_PAYLOAD_FORMAT";
+pub const ENV_SINK_AWS_IAM_ROLE: &str = "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_AWS_IAM_ROLE";
 pub const ENV_SINK_STAGING_ACCESS_KEY: &str =
     "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_AWS_ACCESS_KEY_ID";
 pub const ENV_SINK_STAGING_SECRET: &str =
@@ -130,13 +136,20 @@ impl MinioContainer {
 /// Base container management for PostgreSQL fixtures.
 pub struct PostgresContainer {
     #[allow(dead_code)]
-    container: ContainerAsync<postgres::Postgres>,
+    container: ContainerAsync<GenericImage>,
     pub connection_string: String,
 }
 
 impl PostgresContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
-        let container = postgres::Postgres::default()
+        let container = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
+            .with_exposed_port(POSTGRES_PORT.tcp())
+            .with_wait_for(WaitFor::message_on_stdout(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", POSTGRES_DB)
+            .with_env_var("POSTGRES_USER", POSTGRES_USER)
+            .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
             .with_container_name(fixtures::unique_container_name("postgres"))
             .start()
             .await
@@ -184,24 +197,22 @@ impl RedshiftContainer {
         target_connection: String,
         s3_endpoint: String,
     ) -> Result<Self, TestBinaryError> {
-        let (pg_client, connection) =
-            tokio_postgres::connect(&target_connection, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| TestBinaryError::FixtureSetup {
-                    fixture_type: "RedshiftContainer".into(),
-                    message: e.to_string(),
-                })?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                panic!("{}", e.to_string())
-            }
-        });
-
-        let redshql = RedshiftHandler::new(pg_client, s3_endpoint);
+        let s3_client = S3Client::new(
+            MINIO_BUCKET,
+            &s3_endpoint,
+            MINIO_ACCESS_KEY,
+            MINIO_SECRET_KEY,
+            STAGING_REGION,
+        )
+        .await
+        .map_err(|e| TestBinaryError::FixtureSetup {
+            fixture_type: "RedshiftContainer".to_string(),
+            message: format!("failed to create S3 client: {e}"),
+        })?;
 
         let factory = Arc::new(RedshiftHandlerFactory {
-            handler: Arc::new(redshql),
+            pg_dsn: target_connection,
+            s3_client: Arc::new(s3_client),
         });
 
         let listener =
@@ -252,7 +263,7 @@ impl RedshiftContainer {
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SinkPayloadFormat {
     #[default]
-    Bytea,
+    Varbyte,
     Text,
 }
 

@@ -15,42 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use sqlparser::{
-    parser::{Parser, ParserError},
-    tokenizer::{Token, Word},
-};
-
-pub mod copy;
-pub mod create;
+pub mod ddl;
+pub mod dml;
+pub mod dql;
 pub mod handler;
 pub mod load;
-
-pub fn expect_word(parser: &mut Parser) -> Result<String, ParserError> {
-    match parser.next_token().token {
-        Token::Word(Word { value, .. }) => Ok(value),
-        Token::SemiColon => Ok("SemiColon".into()),
-        other => Err(ParserError::ParserError(format!(
-            "expected identifier, got {other:?}"
-        ))),
-    }
-}
-
-pub fn parse_string_literal(parser: &mut Parser) -> Result<String, ParserError> {
-    match parser.next_token().token {
-        Token::SingleQuotedString(s) => Ok(s),
-        other => Err(ParserError::ParserError(format!(
-            "expected string literal, got {other:?}"
-        ))),
-    }
-}
-
-pub fn parse_number_literal(parser: &mut Parser) -> Result<u32, ParserError> {
-    match parser.next_token().token {
-        Token::Number(s, _) => s
-            .parse()
-            .map_err(|_| ParserError::ParserError(format!("bad number: {s}"))),
-        other => Err(ParserError::ParserError(format!(
-            "expected number, got {other:?}"
-        ))),
-    }
-}
+pub mod parser;
+pub mod util;

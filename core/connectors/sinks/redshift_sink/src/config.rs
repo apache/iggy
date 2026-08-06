@@ -35,10 +35,11 @@ pub struct RedshiftSinkConfig {
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
     /// aws_access_key_id and aws_secret_access_key MUST be provided
-    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
-    pub aws_access_key_id: SecretString,
-    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
-    pub aws_secret_access_key: SecretString,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
+    pub aws_access_key_id: Option<SecretString>,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
+    pub aws_secret_access_key: Option<SecretString>,
+    pub aws_iam_role: String,
     pub s3_bucket: String,
     pub s3_prefix: String,
     pub s3_endpoint: Option<String>,
@@ -69,13 +70,20 @@ impl RedshiftSinkConfig {
             errors.push_str(", aws_region is empty\n");
         }
 
-        // Validate AWS credentials: access keys must be provided
-        let has_access_key = !self.aws_access_key_id.expose_secret().is_empty();
+        if self.aws_iam_role.is_empty() {
+            errors.push_str(", aws_iam_role is empty\n");
+        }
 
-        let has_secret_key = !self.aws_secret_access_key.expose_secret().is_empty();
+        if let (Some(access), Some(secret)) = (&self.aws_access_key_id, &self.aws_secret_access_key)
+        {
+            // Validate AWS credentials: access keys must be provided
+            let has_access_key = !access.expose_secret().is_empty();
 
-        if !(has_access_key && has_secret_key) {
-            errors.push_str(", aws_access_key_id and aws_secret_access_key are empty\n");
+            let has_secret_key = !secret.expose_secret().is_empty();
+
+            if !(has_access_key && has_secret_key) {
+                errors.push_str(", aws_access_key_id and aws_secret_access_key are empty\n");
+            }
         }
 
         if !errors.is_empty() {
@@ -92,11 +100,9 @@ impl RedshiftSinkConfig {
 ///
 /// We dont have Json because we are using parquet as a means to sink ingestion
 /// As at the development of this connector there's no direct parquet type that matches JSON
-/// For JSON needs Reshshift has SUPER(VARCHAR can be parsed by JSON_PARSE)
-#[allow(unused)]
+/// For JSON needs Redshift has SUPER(VARCHAR can be parsed by JSON_PARSE)ß
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PayloadFormat {
-    Json,
     Text,
     #[default]
     Varbyte,
@@ -105,15 +111,29 @@ pub enum PayloadFormat {
 impl PayloadFormat {
     pub fn from_config(s: Option<&str>) -> Self {
         match s.map(|s| s.to_lowercase()).as_deref() {
-            Some("text") | Some("json") => PayloadFormat::Text,
-            _ => PayloadFormat::Varbyte,
+            Some("text") => PayloadFormat::Text,
+            Some("json") => {
+                tracing::warn!("Json is not supported, falling back to Text");
+                PayloadFormat::Text
+            }
+
+            other => {
+                if other.is_some() {
+                    tracing::warn!(
+                        "Unrecognized payload_format {:?}, falling back to VARBYTE",
+                        other
+                    );
+                }
+
+                PayloadFormat::Varbyte
+            }
         }
     }
 
     pub fn sql_type(&self) -> &'static str {
         match self {
             PayloadFormat::Varbyte => "VARBYTE",
-            PayloadFormat::Text | PayloadFormat::Json => "VARCHAR",
+            PayloadFormat::Text => "VARCHAR",
         }
     }
 
@@ -121,7 +141,6 @@ impl PayloadFormat {
         match self {
             PayloadFormat::Varbyte => DataType::Binary,
             PayloadFormat::Text => DataType::Utf8,
-            PayloadFormat::Json => DataType::Utf8,
         }
     }
 }

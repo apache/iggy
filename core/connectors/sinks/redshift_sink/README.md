@@ -57,15 +57,16 @@ archive = true
 | `target_table` | yes | — | Destination Redshift table that batches are copied into. |
 | `batch_size` | no | `100` | Number of messages buffered per Parquet file / `COPY` operation. |
 | `max_connections` | no | `5` | Size of the connection pool used against Redshift. |
-| `include_metadata` | no | `false` | Stores stream/topic/partition/offset/timestamp/schema fields alongside the payload. |
+| `include_metadata` | no | `true` | Stores stream/topic/partition/offset/timestamp/schema fields alongside the payload. |
 | `include_checksum` | no | `false` | Stores the Iggy message checksum. |
 | `include_origin_timestamp` | no | `false` | Stores the original Iggy origin timestamp. |
 | `payload_format` | no | `varbyte` | Encoding used for the payload column in the Parquet file. See **Payload Format** below. |
 | `verbose_logging` | no | `false` | Enables verbose logging for debugging purposes. |
 | `max_retries` | no | `3` | Maximum number of retries for failed `COPY` operations. `0` disables retries (only one attempt will be made) |
 | `retry_delay` | no | `1s` | Delay in seconds between retry attempts. |
-| `aws_access_key_id` | yes | — | AWS access key used for S3 staging. |
-| `aws_secret_access_key` | yes | — | AWS secret key used for S3 staging. |
+| `aws_iam_role` | yes | — | AWS IAM role with S3-Redshift write privileges used for S3 staging. |
+| `aws_access_key_id` | no | — | AWS access key used for S3 staging. |
+| `aws_secret_access_key` | no | — | AWS secret key used for S3 staging. |
 | `s3_bucket` | yes | — | S3 bucket that Parquet batch files are staged into before the Redshift `COPY`. |
 | `s3_prefix` | yes | — | Key prefix under which staged Parquet files are written, e.g. `iggy/messages`. |
 | `s3_endpoint` | no | — | Override endpoint for S3-compatible stores (e.g. MinIO). Omit for AWS S3 itself. |
@@ -117,3 +118,104 @@ With metadata enabled, records contain:
 
 The `messages_processed` counter reports valid records submitted to Redshift
 via `COPY`.
+
+## Test Suite Setup
+
+Six queries validate connector behavior end-to-end. Each is shown in its **production (Redshift)** form; where the pgwire-postgres test harness diverges, the substitution is noted inline.
+
+### 1. Connection check
+
+```sql
+SELECT 1
+```
+
+Confirms warehouse connectivity. No dialect differences.
+
+## 2. Staging/target table creation
+
+```sql
+CREATE TABLE IF NOT EXISTS {table_name} (
+    id VARCHAR(40),
+    iggy_offset VARCHAR(20),
+    iggy_timestamp VARCHAR(20),
+    iggy_stream TEXT,
+    iggy_topic TEXT,
+    iggy_partition_id BIGINT,
+    iggy_checksum VARCHAR,
+    iggy_origin_timestamp VARCHAR(20),
+    payload {payload_type},
+    created_at TIMESTAMPTZ DEFAULT GETDATE()
+);
+```
+
+- Staging table name = `staging_` + `{table_name}`.
+- **pgwire test substitution:** `GETDATE()` → `NOW()`.
+- **pgwire test substitution:** `VARBYTE` → `BYTEA`. This affects the `column` when we have `VARBYTE` as the type.
+- `iggy_offset`, `iggy_timestamp`, and `iggy_origin_timestamp` are u64 values in Iggy but are stored as `VARCHAR` rather than `BIGINT`. `BIGINT` is signed and tops out below `u64::MAX`, so a `VARCHAR` column sidesteps the overflow risk on the upper half of the u64 range without pulling in `DECIMAL`'s added precision/rounding handling.
+- `iggy_partition_id` is u32 in Iggy but is stored as `BIGINT` rather than `INTEGER`. `INTEGER` is signed and tops out below `u32::MAX`, so a `BIGINT` column sidesteps the overflow risk.
+
+## 3. Schema drift check
+
+**Redshift:**
+
+```sql
+SELECT "column", type
+FROM pg_table_def
+WHERE tablename = 'target_table';
+```
+
+**pgwire test equivalent:**
+
+```sql
+SELECT column_name, type
+FROM information_schema.columns
+WHERE table_name = 'target_table';
+```
+
+Substitutions: `pg_table_def` → `information_schema.columns`, `"column"` → `column_name`, `udt_name`* → `type`.
+
+## 4. S3 → staging load
+
+**Redshift:**
+
+```sql
+COPY {staging_table} ({columns})
+FROM '{s3_path}'
+CREDENTIALS 'AWS_IAM_ROLE={iam_role}'
+FORMAT AS PARQUET
+REGION '{region}';
+```
+
+**pgwire test equivalent:**
+
+```sql
+COPY {staging_table} ({columns})
+FROM STDIN BINARY
+```
+
+The `s3_path` is parsed and used to fetch the object from the MinIO instance backing the mock container, with access key and secret key supplied to the container via environment variables rather than an IAM role. Instead of Redshift pulling directly from S3, the connector reads the object itself and streams it into the mock over `COPY ... FROM STDIN BINARY`, so the `CREDENTIALS`, `FORMAT AS PARQUET`, and `REGION` clauses have no equivalent here.
+
+## 5. Staging → target merge (idempotent upsert)
+
+```sql
+MERGE INTO "target_table" AS t
+USING staging_target_table AS sm
+ON t.id = sm.id
+WHEN NOT MATCHED THEN INSERT (
+    id, iggy_offset, iggy_timestamp, iggy_stream, iggy_topic,
+    iggy_partition_id, iggy_checksum, iggy_origin_timestamp, payload, created_at
+) VALUES (
+    sm.id, sm.iggy_offset, sm.iggy_timestamp, sm.iggy_stream, sm.iggy_topic,
+    sm.iggy_partition_id, sm.iggy_checksum, sm.iggy_origin_timestamp, sm.payload, sm.created_at
+);
+```
+
+Uniqueness enforced on `id` — no update branch by design (insert-only merge). No dialect differences.
+
+## 6. Staging table reset
+
+```sql
+TRUNCATE staging_target_table;
+```
+
+Clears staging ahead of the next load cycle. No dialect differences.

@@ -21,6 +21,6 @@ mod sink;
 
 pub use container::{MinioContainer, PostgresContainer, RedshiftContainer};
 pub use sink::{
-    RedshiftSinkByteaFixture, RedshiftSinkFixture, RedshiftSinkJsonFixture,
-    RedshiftSinkNoArchiveFixture,
+    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
+    RedshiftSinkVarbyteFixture,
 };

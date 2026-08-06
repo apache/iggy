@@ -17,8 +17,8 @@
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::{
-    RedshiftSinkByteaFixture, RedshiftSinkFixture, RedshiftSinkJsonFixture,
-    RedshiftSinkNoArchiveFixture,
+    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
+    RedshiftSinkVarbyteFixture,
 };
 use crate::connectors::{TestMessage, create_test_messages};
 use bytes::Bytes;
@@ -33,11 +33,23 @@ use reqwest::Client;
 
 const SINK_TABLE: &str = "iggy_messages";
 const API_KEY: &str = "test-api-key";
-const ICEBERG_SINK_KEY: &str = "redshift";
+const REDSHIFT_SINK_KEY: &str = "redshift";
 
-type SinkRow = (i64, String, String, String);
-type SinkRawRow = (i64, String, String, Vec<u8>);
-type SinkJsonRow = (i64, String);
+type SinkRow = (
+    String,
+    String,
+    String,
+    String,
+    chrono::DateTime<chrono::Utc>,
+);
+type SinkRawRow = (
+    String,
+    String,
+    String,
+    Vec<u8>,
+    chrono::DateTime<chrono::Utc>,
+);
+type SinkJsonRow = (String, String, chrono::DateTime<chrono::Utc>);
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/redshift/sink.toml")),
@@ -62,7 +74,7 @@ async fn redshift_sink_initializes_and_runs(harness: &TestHarness, fixture: Reds
     let sinks: Vec<SinkInfoResponse> = response.json().await.expect("Failed to parse sinks");
 
     assert_eq!(sinks.len(), 1);
-    assert_eq!(sinks[0].key, ICEBERG_SINK_KEY);
+    assert_eq!(sinks[0].key, REDSHIFT_SINK_KEY);
     assert!(sinks[0].enabled);
 
     drop(fixture);
@@ -111,7 +123,7 @@ async fn json_messages_sink_stores_as_text(
         .expect("Failed to send messages");
 
     let query = format!(
-        "SELECT iggy_offset, iggy_stream, iggy_topic, payload FROM {SINK_TABLE} ORDER BY iggy_offset"
+        "SELECT iggy_offset, iggy_stream, iggy_topic, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
     );
     let rows: Vec<SinkRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
@@ -124,8 +136,8 @@ async fn json_messages_sink_stores_as_text(
         "Expected {TEST_MESSAGE_COUNT} rows in PostgreSQL table"
     );
 
-    for (i, (offset, stream, topic, payload)) in rows.iter().enumerate() {
-        assert_eq!(*offset, i as i64, "Offset mismatch at row {i}");
+    for (i, (offset, stream, topic, payload, _)) in rows.iter().enumerate() {
+        assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(stream, seeds::names::STREAM, "Stream mismatch at row {i}");
         assert_eq!(topic, seeds::names::TOPIC, "Topic mismatch at row {i}");
 
@@ -141,7 +153,7 @@ async fn json_messages_sink_stores_as_text(
 )]
 async fn binary_messages_sink_stores_as_bytea(
     harness: &TestHarness,
-    fixture: RedshiftSinkByteaFixture,
+    fixture: RedshiftSinkVarbyteFixture,
 ) {
     let client = harness.root_client().await.unwrap();
     let pool = fixture.target_pool().await.expect("Failed to create pool");
@@ -178,7 +190,7 @@ async fn binary_messages_sink_stores_as_bytea(
         .expect("Failed to send messages");
 
     let query = format!(
-        "SELECT iggy_offset, iggy_stream, iggy_topic, payload FROM {SINK_TABLE} ORDER BY iggy_offset"
+        "SELECT iggy_offset, iggy_stream, iggy_topic, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
     );
     let rows: Vec<SinkRawRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
@@ -191,8 +203,8 @@ async fn binary_messages_sink_stores_as_bytea(
         "Expected {TEST_MESSAGE_COUNT} rows in PostgreSQL table"
     );
 
-    for (i, (offset, _, _, payload)) in rows.iter().enumerate() {
-        assert_eq!(*offset, i as i64, "Offset mismatch at row {i}");
+    for (i, (offset, _, _, payload, _)) in rows.iter().enumerate() {
+        assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(payload, &raw_payloads[i], "Payload mismatch at row {i}");
     }
 }
@@ -240,7 +252,8 @@ async fn json_messages_sink_stores_as_json(
         .await
         .expect("Failed to send messages");
 
-    let query = format!("SELECT iggy_offset, payload FROM {SINK_TABLE} ORDER BY iggy_offset");
+    let query =
+        format!("SELECT iggy_offset, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset");
     let rows: Vec<SinkJsonRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
         .await
@@ -252,8 +265,8 @@ async fn json_messages_sink_stores_as_json(
         "Expected {TEST_MESSAGE_COUNT} rows in PostgreSQL table"
     );
 
-    for (i, (offset, payload)) in rows.iter().enumerate() {
-        assert_eq!(*offset, i as i64, "Offset mismatch at row {i}");
+    for (i, (offset, payload, _)) in rows.iter().enumerate() {
+        assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(
             payload,
             &json_payloads[i].to_string(),
@@ -268,7 +281,7 @@ async fn json_messages_sink_stores_as_json(
 )]
 async fn json_messages_sink_stores_as_bytea(
     harness: &TestHarness,
-    fixture: RedshiftSinkByteaFixture,
+    fixture: RedshiftSinkVarbyteFixture,
 ) {
     let client = harness.root_client().await.unwrap();
     let pool = fixture.target_pool().await.expect("Failed to create pool");
@@ -306,7 +319,7 @@ async fn json_messages_sink_stores_as_bytea(
         .expect("Failed to send messages");
 
     let query = format!(
-        "SELECT iggy_offset, iggy_stream, iggy_topic, payload FROM {SINK_TABLE} ORDER BY iggy_offset"
+        "SELECT iggy_offset, iggy_stream, iggy_topic, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
     );
     let rows: Vec<SinkRawRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
@@ -319,8 +332,8 @@ async fn json_messages_sink_stores_as_bytea(
         "Expected {TEST_MESSAGE_COUNT} rows in PostgreSQL table"
     );
 
-    for (i, (offset, _, _, payload)) in rows.iter().enumerate() {
-        assert_eq!(*offset, i as i64, "Offset mismatch at row {i}");
+    for (i, (offset, _, _, payload, _)) in rows.iter().enumerate() {
+        assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(payload).expect("Failed to parse bytes"),
             json_payloads[i],
@@ -372,7 +385,8 @@ async fn sink_with_no_archive_deletes_s3_artefact(
         .await
         .expect("Failed to send messages");
 
-    let query = format!("SELECT iggy_offset, payload FROM {SINK_TABLE} ORDER BY iggy_offset");
+    let query =
+        format!("SELECT iggy_offset, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset");
     let rows: Vec<SinkJsonRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
         .await
@@ -384,8 +398,8 @@ async fn sink_with_no_archive_deletes_s3_artefact(
         "Expected {TEST_MESSAGE_COUNT} rows in PostgreSQL table"
     );
 
-    for (i, (offset, payload)) in rows.iter().enumerate() {
-        assert_eq!(*offset, i as i64, "Offset mismatch at row {i}");
+    for (i, (offset, payload, _)) in rows.iter().enumerate() {
+        assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(
             payload,
             &json_payloads[i].to_string(),

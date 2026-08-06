@@ -83,8 +83,8 @@ pub use postgres::{
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 pub use redshift::{
-    RedshiftSinkByteaFixture, RedshiftSinkFixture, RedshiftSinkJsonFixture,
-    RedshiftSinkNoArchiveFixture,
+    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
+    RedshiftSinkVarbyteFixture,
 };
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use surrealdb::{

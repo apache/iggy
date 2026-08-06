@@ -43,6 +43,7 @@ base64 = { workspace = true }
 bon = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }

@@ -27,14 +27,14 @@ use crate::connectors::fixtures::{
     redshift::{
         MinioContainer, PostgresContainer, RedshiftContainer,
         container::{
-            DEFAULT_POLL_ATTEMPTS, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SINK_TABLE,
-            DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_ARCHIVE, ENV_SINK_CONNECTION_STRING,
-            ENV_SINK_PATH, ENV_SINK_PAYLOAD_FORMAT, ENV_SINK_S3_BUCKET, ENV_SINK_S3_ENDPOINT,
-            ENV_SINK_S3_PREFIX, ENV_SINK_STAGING_ACCESS_KEY, ENV_SINK_STAGING_REGION,
-            ENV_SINK_STAGING_SECRET, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
-            ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TARGET_TABLE,
-            MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_SECRET_KEY, STAGING_PREFIX, STAGING_REGION,
-            SinkPayloadFormat, SinkSchema,
+            AWS_IAM_ROLE, DEFAULT_POLL_ATTEMPTS, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SINK_TABLE,
+            DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_ARCHIVE, ENV_SINK_AWS_IAM_ROLE,
+            ENV_SINK_CONNECTION_STRING, ENV_SINK_PATH, ENV_SINK_PAYLOAD_FORMAT, ENV_SINK_S3_BUCKET,
+            ENV_SINK_S3_ENDPOINT, ENV_SINK_S3_PREFIX, ENV_SINK_STAGING_ACCESS_KEY,
+            ENV_SINK_STAGING_REGION, ENV_SINK_STAGING_SECRET, ENV_SINK_STREAMS_0_CONSUMER_GROUP,
+            ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS,
+            ENV_SINK_TARGET_TABLE, MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_SECRET_KEY,
+            STAGING_PREFIX, STAGING_REGION, SinkPayloadFormat, SinkSchema,
         },
     },
 };
@@ -135,6 +135,8 @@ impl TestFixture for RedshiftSinkFixture {
             DEFAULT_SINK_TABLE.to_string(),
         );
 
+        envs.insert(ENV_SINK_AWS_IAM_ROLE.to_string(), AWS_IAM_ROLE.to_string());
+
         envs.insert(
             ENV_SINK_STAGING_ACCESS_KEY.to_string(),
             MINIO_ACCESS_KEY.to_string(),
@@ -186,7 +188,7 @@ impl TestFixture for RedshiftSinkFixture {
         );
 
         let format_str = match self.payload_format {
-            SinkPayloadFormat::Bytea => "bytea",
+            SinkPayloadFormat::Varbyte => "varbyte",
             SinkPayloadFormat::Text => "text",
         };
         envs.insert(ENV_SINK_PAYLOAD_FORMAT.to_string(), format_str.to_string());
@@ -196,11 +198,11 @@ impl TestFixture for RedshiftSinkFixture {
 }
 
 /// redshift sink fixture for bytea payload format.
-pub struct RedshiftSinkByteaFixture {
+pub struct RedshiftSinkVarbyteFixture {
     inner: RedshiftSinkFixture,
 }
 
-impl std::ops::Deref for RedshiftSinkByteaFixture {
+impl std::ops::Deref for RedshiftSinkVarbyteFixture {
     type Target = RedshiftSinkFixture;
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -208,7 +210,7 @@ impl std::ops::Deref for RedshiftSinkByteaFixture {
 }
 
 #[async_trait]
-impl TestFixture for RedshiftSinkByteaFixture {
+impl TestFixture for RedshiftSinkVarbyteFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let postgres = PostgresContainer::start().await?;
 
@@ -231,7 +233,7 @@ impl TestFixture for RedshiftSinkByteaFixture {
                 minio,
                 redshift,
                 postgres,
-                payload_format: SinkPayloadFormat::Bytea,
+                payload_format: SinkPayloadFormat::Varbyte,
                 schema: SinkSchema::Raw,
             },
         })
@@ -352,7 +354,7 @@ impl TestFixture for RedshiftSinkNoArchiveFixture {
         envs.insert(ENV_SINK_ARCHIVE.to_string(), false.to_string());
 
         let format_str = match self.payload_format {
-            SinkPayloadFormat::Bytea => "bytea",
+            SinkPayloadFormat::Varbyte => "varbyte",
             SinkPayloadFormat::Text => "text",
         };
 
