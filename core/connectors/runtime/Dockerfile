@@ -41,6 +41,14 @@ FROM --platform=$BUILDPLATFORM chef AS toolchain
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
+# The base image tag and rust-toolchain.toml agree only while the pinned
+# channel is an x.y.z with z > 0: scripts/ci/sync-rustc-version.sh rewrites an
+# x.y.0 channel to the floating x.y tag, which then resolves to whatever patch
+# the base image publishes. Bring the pin in before rustup runs so the cross
+# targets land on the toolchain cargo selects once the sources arrive, whichever
+# of the two it turns out to be.
+COPY rust-toolchain.toml rust-toolchain.toml
+
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static && \
     cargo install cargo-zigbuild --version '=0.22.1' --locked && \
     rustup target add \
