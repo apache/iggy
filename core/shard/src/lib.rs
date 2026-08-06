@@ -6659,15 +6659,18 @@ where
             let Some(session) = partition.transfer.as_mut() else {
                 return;
             };
-            // `session.peer` too, not the nonce alone. The other three
-            // partition-transfer handlers all validate their sender; this one
+            if session.nonce != header.nonce || !session.target_accepted {
+                return;
+            }
+            // The sender too, not the nonce alone. The other three
+            // partition-transfer handlers all validate theirs; this one
             // authenticated payload bytes by a 128-bit capability only, which
             // is thin but real once a peer has seen one frame -- a rotated-away
-            // peer still holds the nonce until the session is re-minted.
-            if session.nonce != header.nonce
-                || session.peer != header.replica
-                || !session.target_accepted
-            {
+            // peer still holds the nonce until the session is re-minted. Its
+            // own `if` because folded into the condition above, clippy's
+            // `suspicious_operation_groupings` reads the operand asymmetry as a
+            // typo and proposes a `header.peer` that does not exist.
+            if session.peer != header.replica {
                 return;
             }
             let payload = &msg.as_slice()[size_of::<StateChunkHeader>()..header.size as usize];
