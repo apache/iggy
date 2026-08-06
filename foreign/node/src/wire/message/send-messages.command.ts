@@ -19,9 +19,19 @@
 import { type Id } from '../identifier.utils.js';
 import { serializeSendMessages, type CreateMessage } from './message.utils.js';
 import type { Partitioning } from './partitioning.utils.js';
-import {deserializeStatusResponse} from '../../client/client.utils.js';
+import type { CommandResponse } from '../../client/client.type.js';
+import { DeserializeError } from '../error.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+
+/** Size of the confirmation count prefixing the list. */
+const CONFIRMATIONS_COUNT_SIZE = 4;
+
+/**
+ * Size of one confirmation entry:
+ * `stream_id(4) + topic_id(4) + partition_id(4) + base_offset(8)`.
+ */
+const CONFIRMATION_SIZE = 20;
 
 /**
  * Parameters for the send messages command.
@@ -37,6 +47,67 @@ export type SendMessages = {
   partition?: Partitioning,
 };
 
+/** Commit confirmation for one partition written by a send. */
+export type SendMessagesConfirmation = {
+  /** Numeric id of the stream the batch was written to */
+  streamId: number,
+  /** Numeric id of the topic the batch was written to */
+  topicId: number,
+  /** Partition the batch was written to */
+  partitionId: number,
+  /**
+   * Offset assigned to the first message of the batch in that partition.
+   *
+   * Delivery is at-least-once, so an earlier retry of the same batch may
+   * already have committed at a lower offset: this never identifies a batch
+   * uniquely. A batch is confirmed once it is committed in memory, not once it
+   * is fsynced, so a crash-restart can stamp a later batch with an offset a
+   * client has already recorded.
+   */
+  baseOffset: bigint,
+};
+
+/**
+ * Outcome of a successful send, one confirmation per written partition. The
+ * legacy server returns an empty list: it commits without reporting offsets.
+ */
+export type SendMessagesResponse = {
+  /** Commit confirmations, one per partition the batch was written to */
+  confirmations: SendMessagesConfirmation[],
+};
+
+/**
+ * Decodes the reply body of a send: `[confirmations_count:4]` then that many
+ * `[stream_id:4 topic_id:4 partition_id:4 base_offset:8]` entries.
+ *
+ * The legacy server reports a commit by sending no body at all, so absence
+ * decodes to no confirmations instead of surfacing as a decode failure.
+ */
+const deserializeSendMessages = (data: Buffer): SendMessagesResponse => {
+  if (data.length === 0) return { confirmations: [] };
+  if (data.length < CONFIRMATIONS_COUNT_SIZE)
+    throw new DeserializeError('send messages confirmation count is truncated');
+
+  const count = data.readUInt32LE(0);
+  const expected = CONFIRMATIONS_COUNT_SIZE + count * CONFIRMATION_SIZE;
+  if (expected > data.length)
+    throw new DeserializeError('send messages confirmation list is truncated');
+  if (expected !== data.length)
+    throw new DeserializeError('send messages confirmations have trailing bytes');
+
+  const confirmations = new Array<SendMessagesConfirmation>(count);
+  for (let index = 0; index < count; index += 1) {
+    const at = CONFIRMATIONS_COUNT_SIZE + index * CONFIRMATION_SIZE;
+    confirmations[index] = {
+      streamId: data.readUInt32LE(at),
+      topicId: data.readUInt32LE(at + 4),
+      partitionId: data.readUInt32LE(at + 8),
+      baseOffset: data.readBigUInt64LE(at + 12)
+    };
+  }
+  return { confirmations };
+};
+
 /**
  * Send messages command definition.
  * Publishes messages to a topic.
@@ -48,10 +119,12 @@ export const SEND_MESSAGES = {
     return serializeSendMessages(streamId, topicId, messages, partition);
   },
 
-  deserialize: deserializeStatusResponse
+  deserialize: (r: CommandResponse) => deserializeSendMessages(r.data)
 };
 
 /**
- * Executable send messages command function.
+ * Executable send messages command function. Resolves to the commit
+ * confirmations of the written partitions, empty against the legacy server.
  */
-export const sendMessages = wrapCommand<SendMessages, boolean>(SEND_MESSAGES);
+export const sendMessages =
+  wrapCommand<SendMessages, SendMessagesResponse>(SEND_MESSAGES);

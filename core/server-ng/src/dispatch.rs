@@ -105,6 +105,7 @@ use shard::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -187,10 +188,10 @@ where
 {
     let shard_handle = Rc::clone(shard_handle);
     // Runs synchronously on the shard pump (see `process_lifecycle` ->
-    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
-    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
-    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
-    // poll replies here without spawning. See the `poll_plan` module docs.
+    // `on_partition_read`). `build_poll_snapshot` takes a pump-only `&mut`
+    // partition borrow (synchronous, so no sibling task can realloc under it) and
+    // returns an owned `PollPlan`; only owned data crosses into `spawn_poll_io`. A
+    // fully-resident poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;
@@ -761,7 +762,10 @@ async fn handle_client_request<B, MJ, S>(
     if header.operation == Operation::NonReplicated {
         // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
         // legitimately pre-auth (liveness probe + connection bootstrap
-        // metadata). Every other non-replicated code (`GET_STREAM*`,
+        // metadata). Pre-auth metadata is a narrow topology oracle: it leaks
+        // only the advertised-address mapping for networks the caller can
+        // already send packets from, and the HTTP mirror of the same read
+        // sits behind `Identity`. Every other non-replicated code (`GET_STREAM*`,
         // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
         // MUST go through Register first, which binds the acting user the
         // per-op authz gates resolve.
@@ -1087,9 +1091,10 @@ async fn handle_get_me<B, MJ, S>(
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
-/// dispatch replies (empty for an unresolvable namespace, a nonzero status
-/// for denials and the exhausted routable wait) so the client fails fast
-/// instead of wedging on a silent drop.
+/// dispatch replies with a nonzero status -- unresolvable namespace,
+/// authorization denial, exhausted routable wait -- so the client fails fast
+/// instead of wedging on a silent drop or reading a status-0 frame as a
+/// committed write.
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
@@ -1116,17 +1121,26 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
-            // A partition op against a stream/topic that no longer
-            // resolves (e.g. a consumer's trailing auto-commit racing a
-            // `delete_stream`). A silent drop wedges the SDK connection
-            // forever; reply empty so the client fails fast instead.
+            // A partition op against a stream/topic that no longer resolves
+            // (e.g. a consumer's trailing auto-commit racing a `delete_stream`,
+            // or an explicit partition id that skipped the client-side
+            // resolve). The op never reached the partition plane, so a status-0
+            // reply would read as a committed ack for work that never happened.
+            // A silent drop is no better: the SDK connection processes replies
+            // in lockstep and would wedge forever.
             warn!(
                 transport_client_id,
                 error = %error,
                 operation = ?header.operation,
-                "partition request with unresolved namespace; replying empty"
+                "partition request with unresolved namespace; replying denied"
             );
-            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            send_partition_deny_reply(
+                shard,
+                transport_client_id,
+                &header,
+                IggyError::ResourceNotFound(String::new()).as_code(),
+            )
+            .await;
             return;
         }
     };
@@ -1161,13 +1175,14 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
         send_partition_deny_reply(shard, transport_client_id, &header, status).await;
         return;
     }
-    // Convergence wait: a CreateTopic commit returns to the client
-    // before the per-shard reconcilers seed routing rows and
-    // materialise the partition (next wake/periodic tick). The SDK
-    // does not replay sends, so an immediately-following partition op
-    // would be dropped as unroutable. Absorb that window here with a
-    // bounded wait; steady-state sends (row present, partition probed
-    // once) skip it entirely.
+    // Convergence wait: a CreateTopic commit returns to the client before the
+    // per-shard reconcilers seed routing rows and materialise the partition
+    // (next wake/periodic tick). An op arriving inside that window is not lost
+    // if it skips this wait -- `router::route_typed` falls back to the hash
+    // assignment, and the owning shard parks it -- so this is an admission
+    // courtesy that keeps the steady state off that park buffer, not a
+    // correctness gate. See `wait_for_partition_routable`, which spells out why
+    // there is no owner-readiness probe here any more.
     if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
         // The op never reached the partition plane, so it is safe to re-issue
         // anywhere -- the same contract the plane itself answers for a
@@ -1236,10 +1251,11 @@ async fn handle_non_replicated_request<B, MJ, S>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    // Acting user for the read gates below, resolved once. `None` only on the
-    // pre-auth path (PING / GET_CLUSTER_METADATA), which serves ungated codes;
-    // the gated arms fail closed on it.
-    let user_id = sessions.borrow().get_user_id(transport_client_id);
+    // Acting user and peer address for the read gates below, resolved in one
+    // connection lookup. `user_id` is `None` only on the pre-auth path
+    // (PING / GET_CLUSTER_METADATA), which serves ungated codes; the gated
+    // arms fail closed on it.
+    let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -1353,6 +1369,14 @@ async fn handle_non_replicated_request<B, MJ, S>(
         }
         _ => {
             let roster = sessions.borrow().cluster_roster();
+            let client_ip = client_address.map(|address| address.ip());
+            if client_ip.is_none() {
+                debug!(
+                    transport_client_id,
+                    code,
+                    "no peer address recorded; advertised-address resolution degrades to the catch-all"
+                );
+            }
             handle_default_non_replicated(
                 shard,
                 transport_client_id,
@@ -1360,13 +1384,14 @@ async fn handle_non_replicated_request<B, MJ, S>(
                 &request,
                 user_id,
                 &roster,
+                client_ip,
             )
             .await;
         }
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn handle_default_non_replicated<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
     transport_client_id: u128,
@@ -1374,6 +1399,7 @@ async fn handle_default_non_replicated<B, MJ, S>(
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
     roster: &ClusterRoster,
+    client_ip: Option<IpAddr>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1387,7 +1413,14 @@ async fn handle_default_non_replicated<B, MJ, S>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
-    match build_non_replicated_response(shard, code, request_body(request), user_id, roster) {
+    match build_non_replicated_response(
+        shard,
+        code,
+        request_body(request),
+        user_id,
+        roster,
+        client_ip,
+    ) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
@@ -1917,10 +1950,10 @@ async fn handle_sync_consumer_group<B, MJ, S>(
     .await;
 }
 
-/// Ack a partition op whose namespace does not resolve (deleted stream /
-/// topic or unknown consumer group) with an empty Reply. The SDK connection
-/// processes replies in lockstep, so a silent drop wedges every
-/// subsequent request on that connection.
+/// Ack a consumer-offset op whose body could not be rewritten for the
+/// partition plane with an empty Reply. The SDK connection processes replies
+/// in lockstep, so a silent drop wedges every subsequent request on that
+/// connection.
 #[allow(clippy::future_not_send)]
 async fn send_empty_partition_reply<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
@@ -1948,13 +1981,26 @@ async fn send_empty_partition_reply<B, MJ, S>(
     }
 }
 
-/// Wait (bounded) until `namespace` is routable: this shard's routing row
-/// exists and the owning shard answers a probe read (partition
-/// materialised). Fast path: row already present -> no probe, no wait.
+/// Wait (bounded) until this shard holds a routing row for `namespace`. Fast
+/// path: row already present -> no wait.
 ///
-/// Covers the post-`CreateTopic` convergence window where the metadata
-/// commit has returned to the client but the per-shard reconcilers have
-/// not yet seeded routing rows / materialised partitions.
+/// Covers the post-`CreateTopic` convergence window where the metadata commit
+/// has returned to the client but the per-shard reconcilers have not yet seeded
+/// routing rows. This is an admission courtesy, not a correctness gate: the row
+/// is a cache of the deterministic hash assignment and may exist before the
+/// owner has materialised anything, so its presence proves only where the
+/// partition belongs. What makes an early arrival safe is the owning shard
+/// itself - `park_if_unmaterialised` holds the frame until its partition lands,
+/// and `serves_committed_incarnation` refuses to serve a mismatched
+/// incarnation. Waiting here simply keeps the steady state off that park
+/// buffer, whose overflow is the one path that still sheds a request without
+/// replying (`frame_drops_total{variant=partition,reason=park_overflow}`).
+///
+/// Deliberately no owner-readiness probe. One used to run here, on the theory
+/// that the table could not be trusted; it could not close the window either,
+/// because the fast path above skipped it in exactly the case it was meant to
+/// cover - a row seeded from the hash by a shard that owns nothing. Readiness
+/// belongs to the owner, which is where it is now enforced.
 #[allow(clippy::future_not_send)]
 async fn wait_for_partition_routable<B, MJ, S>(
     shard: &Rc<ShellShard<B, MJ, S>>,
@@ -1972,9 +2018,6 @@ where
     // bus sleep advances virtual time, whereas `Instant::now` would not.
     const MAX_ATTEMPTS: u32 = 60;
 
-    if shard.shards_table().shard_for(namespace).is_some() {
-        return true;
-    }
     let mut attempts = 0u32;
     while shard.shards_table().shard_for(namespace).is_none() {
         if attempts >= MAX_ATTEMPTS {
@@ -1983,30 +2026,7 @@ where
         attempts += 1;
         shard.bus.sleep(ATTEMPT_DELAY).await;
     }
-    // The local row is seeded by THIS shard's reconciler; the owner
-    // materialises the partition on its own pass. Probe with a cheap read
-    // until the owner answers, so the write below normally clears the
-    // owner's "partition not initialized" guard. Not a hard guarantee: the
-    // partition can de-materialise between this probe and the dispatch, but
-    // the park/tombstone path re-checks and the client retries.
-    while attempts < MAX_ATTEMPTS {
-        match shard
-            .partition_read(
-                namespace,
-                PartitionRead::ConsumerOffset {
-                    consumer: PollingConsumer::Consumer(0, 0),
-                },
-            )
-            .await
-        {
-            Some(PartitionReadReply::NotFound) | None => {
-                attempts += 1;
-                shard.bus.sleep(ATTEMPT_DELAY).await;
-            }
-            Some(_) => return true,
-        }
-    }
-    false
+    true
 }
 
 /// The 16-byte `PolledMessages` body with zero messages

@@ -202,10 +202,13 @@ where
             // assignment (every `InsertOwned`/`InsertRouted` row stores
             // `calculate_shard_assignment`'s result), seeded asynchronously
             // by each shard's reconciler. A miss therefore means "not seeded
-            // yet", not "unroutable": fall back to the hash so replication
-            // frames arriving during the post-commit convergence window are
-            // not dropped (the partition plane re-checks materialisation on
-            // the owning shard).
+            // yet", not "unroutable": fall back to the hash so frames arriving
+            // during the post-commit convergence window still reach the shard
+            // that will own the partition. That shard is where earliness is
+            // resolved -- it parks the frame until its partition materialises
+            // (`park_if_unmaterialised`) and fences a mismatched incarnation
+            // (`serves_committed_incarnation`) -- so neither a hit nor a miss
+            // here carries any claim about readiness.
             let target = self
                 .shards_table
                 .shard_for(partition_namespace)
@@ -236,21 +239,28 @@ where
 
     /// Send `message` into `senders[target]`. Honors the `io_uring` reactor
     /// constraint: never blocks; drops on `Full` / `Disconnected` and
-    /// records the drop in `frame_drops_total{variant=consensus}`. VSR
-    /// retransmit recovers consensus drops. A `target` past the end of
-    /// `senders` (a stored `u16` from `shard_for`, not a trusted index)
-    /// is dropped with `reason=unroutable` rather than panicking.
-    /// Metadata frames always pass `target = 0` here, since `is_metadata`
-    /// operations are owned by shard 0.
+    /// records the drop in `frame_drops_total`, under `variant=partition` for a
+    /// partition-plane operation and `variant=consensus` otherwise -- the two
+    /// have different recovery stories, so folding them into one label hides
+    /// which one is bleeding. VSR retransmit recovers consensus drops. A
+    /// `target` past the end of `senders` (a stored `u16` from `shard_for`, not
+    /// a trusted index) is dropped with `reason=unroutable` rather than
+    /// panicking. Metadata frames always pass `target = 0` here, since
+    /// `is_metadata` operations are owned by shard 0.
     fn try_send_to_target(
         &self,
         target: u16,
         message: Message<GenericHeader>,
         operation: Operation,
     ) {
+        let variant = if operation.is_partition() {
+            frame_drop_variant::PARTITION
+        } else {
+            frame_drop_variant::CONSENSUS
+        };
         let Some(sender) = self.senders.get(target as usize) else {
             self.metrics
-                .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE);
+                .record_frame_drop(variant, frame_drop_reason::UNROUTABLE);
             tracing::error!(
                 shard = self.id,
                 target,
@@ -263,7 +273,7 @@ where
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.metrics
-                    .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+                    .record_frame_drop(variant, frame_drop_reason::FULL);
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -272,10 +282,8 @@ where
                 );
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.metrics.record_frame_drop(
-                    frame_drop_variant::CONSENSUS,
-                    frame_drop_reason::DISCONNECTED,
-                );
+                self.metrics
+                    .record_frame_drop(variant, frame_drop_reason::DISCONNECTED);
                 tracing::warn!(
                     shard = self.id,
                     target,

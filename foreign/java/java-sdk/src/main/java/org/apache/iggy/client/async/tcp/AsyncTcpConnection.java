@@ -84,10 +84,8 @@ public class AsyncTcpConnection {
             int port,
             boolean enableTls,
             Optional<File> tlsCertificate,
-            TCPConnectionPoolConfig poolConfig,
+            TcpConnectionPoolConfig poolConfig,
             Optional<Duration> connectionTimeout) {
-        this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
-
         SslContext sslContext = null;
         if (enableTls) {
             try {
@@ -98,6 +96,8 @@ public class AsyncTcpConnection {
                 throw new IggyTlsException("Failed to build SSL context for AsyncTcpConnection", e);
             }
         }
+
+        this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
         var bootstrap = new Bootstrap()
                 .group(eventLoopGroup)
@@ -195,11 +195,12 @@ public class AsyncTcpConnection {
     public CompletableFuture<ByteBuf> send(int commandCode, ByteBuf payload) {
         captureLoginPayloadIfNeeded(commandCode, payload);
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
+        CompletableFuture<ByteBuf> callerFuture = new CompletableFuture<>();
 
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
             if (!f.isSuccess()) {
                 payload.release();
-                responseFuture.completeExceptionally(mapAcquireException(f.cause()));
+                callerFuture.completeExceptionally(mapAcquireException(f.cause()));
                 return;
             }
 
@@ -210,9 +211,17 @@ public class AsyncTcpConnection {
                     && commandCode != CommandCode.System.PING.getValue()
                     && commandCode != CommandCode.System.GET_STATS.getValue();
 
-            responseFuture.handle((res, ex) -> {
-                handlePostResponse(channel, commandCode, isLoginCommand, ex);
-                return null;
+            responseFuture.whenComplete((response, error) -> {
+                try {
+                    handlePostResponse(channel, commandCode, isLoginCommand, error);
+                } catch (RuntimeException bookkeepingError) {
+                    log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
+                }
+                if (error != null) {
+                    callerFuture.completeExceptionally(error);
+                } else {
+                    callerFuture.complete(response);
+                }
             });
 
             CompletableFuture<Void> authStep;
@@ -242,7 +251,7 @@ public class AsyncTcpConnection {
                     });
         });
 
-        return responseFuture;
+        return callerFuture;
     }
 
     private static Throwable mapAcquireException(Throwable cause) {
@@ -397,31 +406,45 @@ public class AsyncTcpConnection {
         }
 
         @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            failPendingRequests(new IggyConnectionException("Connection closed before a response arrived"));
+            ctx.fireChannelInactive();
+        }
+
+        @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            CompletableFuture<ByteBuf> f;
-            while ((f = responseQueue.poll()) != null) {
-                f.completeExceptionally(cause);
-            }
+            failPendingRequests(cause);
             ctx.close();
+        }
+
+        private void failPendingRequests(Throwable cause) {
+            CompletableFuture<ByteBuf> pending;
+            while ((pending = responseQueue.poll()) != null) {
+                pending.completeExceptionally(cause);
+            }
         }
     }
 
-    public static class TCPConnectionPoolConfig {
+    public static class TcpConnectionPoolConfig {
         private final int maxConnections;
         private final int maxPendingAcquires;
         private final long acquireTimeoutMillis;
 
-        public TCPConnectionPoolConfig() {
+        public TcpConnectionPoolConfig() {
             this(
-                    Builder.DEFAULT_MAX_CONNECTION,
-                    Builder.DEFAULT_MAX_PENDING_ACQUIRES,
-                    Builder.DEFAULT_ACQUIRE_TIMEOUT_MILLIS);
+                    TcpConnectionPoolConfigBuilder.DEFAULT_MAX_CONNECTION,
+                    TcpConnectionPoolConfigBuilder.DEFAULT_MAX_PENDING_ACQUIRES,
+                    TcpConnectionPoolConfigBuilder.DEFAULT_ACQUIRE_TIMEOUT_MILLIS);
         }
 
-        public TCPConnectionPoolConfig(int maxConnections, int maxPendingAcquires, long acquireTimeoutMillis) {
+        public TcpConnectionPoolConfig(int maxConnections, int maxPendingAcquires, long acquireTimeoutMillis) {
             this.maxConnections = maxConnections;
             this.maxPendingAcquires = maxPendingAcquires;
             this.acquireTimeoutMillis = acquireTimeoutMillis;
+        }
+
+        public static TcpConnectionPoolConfigBuilder builder() {
+            return new TcpConnectionPoolConfigBuilder();
         }
 
         public int getMaxConnections() {
@@ -436,7 +459,7 @@ public class AsyncTcpConnection {
             return this.acquireTimeoutMillis;
         }
 
-        public static final class Builder {
+        public static final class TcpConnectionPoolConfigBuilder {
             public static final int DEFAULT_MAX_CONNECTION = 5;
             public static final int DEFAULT_MAX_PENDING_ACQUIRES = 1000;
             public static final int DEFAULT_ACQUIRE_TIMEOUT_MILLIS = 3000;
@@ -445,9 +468,9 @@ public class AsyncTcpConnection {
             private int maxPendingAcquires;
             private long acquireTimeoutMillis;
 
-            public Builder() {}
+            public TcpConnectionPoolConfigBuilder() {}
 
-            public Builder setMaxConnections(int maxConnections) {
+            public TcpConnectionPoolConfigBuilder setMaxConnections(int maxConnections) {
                 if (maxConnections <= 0) {
                     throw new IggyInvalidArgumentException("Connection pool size cannot be 0 or negative");
                 }
@@ -455,7 +478,7 @@ public class AsyncTcpConnection {
                 return this;
             }
 
-            public Builder setMaxPendingAcquires(int maxPendingAcquires) {
+            public TcpConnectionPoolConfigBuilder setMaxPendingAcquires(int maxPendingAcquires) {
                 if (maxPendingAcquires <= 0) {
                     throw new IggyInvalidArgumentException("Max Pending Acquires cannot be 0 or negative");
                 }
@@ -463,7 +486,7 @@ public class AsyncTcpConnection {
                 return this;
             }
 
-            public Builder setAcquireTimeoutMillis(long acquireTimeoutMillis) {
+            public TcpConnectionPoolConfigBuilder setAcquireTimeoutMillis(long acquireTimeoutMillis) {
                 if (acquireTimeoutMillis <= 0) {
                     throw new IggyInvalidArgumentException("Acquire timeout cannot be 0 or negative");
                 }
@@ -471,7 +494,7 @@ public class AsyncTcpConnection {
                 return this;
             }
 
-            public TCPConnectionPoolConfig build() {
+            public TcpConnectionPoolConfig build() {
                 if (this.maxConnections == 0) {
                     this.maxConnections = DEFAULT_MAX_CONNECTION;
                 }
@@ -481,7 +504,7 @@ public class AsyncTcpConnection {
                 if (this.maxPendingAcquires == 0) {
                     this.maxPendingAcquires = DEFAULT_MAX_PENDING_ACQUIRES;
                 }
-                return new TCPConnectionPoolConfig(maxConnections, maxPendingAcquires, acquireTimeoutMillis);
+                return new TcpConnectionPoolConfig(maxConnections, maxPendingAcquires, acquireTimeoutMillis);
             }
         }
     }

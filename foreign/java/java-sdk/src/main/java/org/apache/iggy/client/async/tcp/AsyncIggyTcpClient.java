@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.client.async.MessagesClient;
@@ -30,7 +31,8 @@ import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
-import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TCPConnectionPoolConfig;
+import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
+import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -45,6 +47,9 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Async TCP client for Apache Iggy message streaming, built on Netty.
@@ -101,8 +106,6 @@ public class AsyncIggyTcpClient {
     private static final int INVALID_COMMAND_ERROR_CODE = 3;
     private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
 
-    private final String host;
-    private final int port;
     private final Optional<String> username;
     private final Optional<String> password;
     private final Optional<Duration> connectionTimeout;
@@ -112,7 +115,12 @@ public class AsyncIggyTcpClient {
     private final Optional<RetryPolicy> retryPolicy;
     private final boolean enableTls;
     private final Optional<File> tlsCertificate;
-    private AsyncTcpConnection connection;
+    private final TcpConnectionPoolConfig poolConfig;
+    private final AtomicReference<AsyncTcpConnection> connection = new AtomicReference<>();
+    private final AtomicReference<CompletableFuture<Void>> redirectChain =
+            new AtomicReference<>(CompletableFuture.completedFuture(null));
+    private volatile ConnectionInfo connectionInfo;
+    private volatile boolean closed;
     private MessagesClient messagesClient;
     private ConsumerGroupsClient consumerGroupsClient;
     private ConsumerOffsetsClient consumerOffsetsClient;
@@ -148,8 +156,7 @@ public class AsyncIggyTcpClient {
             RetryPolicy retryPolicy,
             boolean enableTls,
             Optional<File> tlsCertificate) {
-        this.host = host;
-        this.port = port;
+        this.connectionInfo = new ConnectionInfo(host, port);
         this.username = Optional.ofNullable(username);
         this.password = Optional.ofNullable(password);
         this.connectionTimeout = Optional.ofNullable(connectionTimeout);
@@ -159,6 +166,11 @@ public class AsyncIggyTcpClient {
         this.retryPolicy = Optional.ofNullable(retryPolicy);
         this.enableTls = enableTls;
         this.tlsCertificate = tlsCertificate;
+
+        var poolConfigBuilder = TcpConnectionPoolConfig.builder();
+        this.connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
+        this.acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
+        this.poolConfig = poolConfigBuilder.build();
     }
 
     /**
@@ -180,22 +192,26 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when the connection is established
      */
     public CompletableFuture<Void> connect() {
-        TCPConnectionPoolConfig.Builder poolConfigBuilder = new TCPConnectionPoolConfig.Builder();
-        connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
-        acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
-        TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
-        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig, connectionTimeout);
-        return connection.connect().thenRun(() -> {
-            log.debug("Connected to {}:{} | {}", host, port, IggyVersion.getInstance());
-            messagesClient = new MessagesTcpClient(connection);
-            consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
-            consumerOffsetsClient = new ConsumerOffsetsTcpClient(connection);
-            streamsClient = new StreamsTcpClient(connection);
-            topicsClient = new TopicsTcpClient(connection);
-            usersClient = new UsersTcpClient(connection);
-            systemClient = new SystemTcpClient(connection);
-            personalAccessTokensClient = new PersonalAccessTokensTcpClient(connection);
-            partitionsClient = new PartitionsTcpClient(connection);
+        closed = false;
+        ConnectionInfo target = connectionInfo;
+        AsyncTcpConnection newConnection = openConnection(target);
+        AsyncTcpConnection previousConnection = connection.getAndSet(newConnection);
+        if (previousConnection != null) {
+            previousConnection.close();
+        }
+        Supplier<AsyncTcpConnection> currentConnection = connection::get;
+        return newConnection.connect().thenRun(() -> {
+            log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
+            messagesClient = new MessagesTcpClient(currentConnection);
+            consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
+            consumerOffsetsClient = new ConsumerOffsetsTcpClient(currentConnection);
+            streamsClient = new StreamsTcpClient(currentConnection);
+            topicsClient = new TopicsTcpClient(currentConnection);
+            usersClient = new UsersTcpClient(currentConnection, this::checkLeaderAndRedirect);
+            systemClient = new SystemTcpClient(currentConnection);
+            personalAccessTokensClient =
+                    new PersonalAccessTokensTcpClient(currentConnection, this::checkLeaderAndRedirect);
+            partitionsClient = new PartitionsTcpClient(currentConnection);
         });
     }
 
@@ -238,11 +254,12 @@ public class AsyncIggyTcpClient {
             return CompletableFuture.failedFuture(
                     IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));
         }
-        if (connection == null) {
+        AsyncTcpConnection currentConnection = connection.get();
+        if (currentConnection == null) {
             throw new IggyNotConnectedException();
         }
 
-        return connection.send(code, Unpooled.copiedBuffer(payload)).thenApply(response -> {
+        return currentConnection.send(code, Unpooled.copiedBuffer(payload)).thenApply(response -> {
             try {
                 if (response.readableBytes() <= 1) {
                     return new byte[0];
@@ -382,9 +399,139 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when all resources are released
      */
     public CompletableFuture<Void> close() {
-        if (connection != null) {
-            return connection.close();
+        closed = true;
+        AsyncTcpConnection currentConnection = connection.get();
+        if (currentConnection != null) {
+            return currentConnection.close();
         }
+        return CompletableFuture.completedFuture(null);
+    }
+
+    /**
+     * Returns the server address this client currently targets. Leader
+     * redirection can change it after login, so it may differ from the
+     * address the client was built with.
+     *
+     * @return the current {@link ConnectionInfo}
+     */
+    public ConnectionInfo getConnectionInfo() {
+        return connectionInfo;
+    }
+
+    private AsyncTcpConnection openConnection(ConnectionInfo target) {
+        return new AsyncTcpConnection(
+                target.host(), target.port(), enableTls, tlsCertificate, poolConfig, connectionTimeout);
+    }
+
+    /**
+     * Post-login leader check, serialized across concurrent logins: fetches
+     * the cluster roster and, while a healthy leader lives elsewhere,
+     * reconnects to it and replays the login. A queued login waits for the
+     * in-flight redirection and then re-checks the roster, so it either
+     * confirms the new node or retries a redirection that failed. Every
+     * failure except the replayed login's own is non-fatal; the client then
+     * stays on the current node. Each check runs with a fresh redirection
+     * budget, so hitting the cap parks only that login, not the client.
+     */
+    private CompletableFuture<IdentityInfo> checkLeaderAndRedirect(Supplier<CompletableFuture<IdentityInfo>> reLogin) {
+        CompletableFuture<Void> gate = new CompletableFuture<>();
+        CompletableFuture<Void> previous = redirectChain.getAndSet(gate);
+        LeaderRedirectionState redirectionState = new LeaderRedirectionState();
+        return previous.thenCompose(ignored -> redirectToLeader(reLogin, null, redirectionState))
+                .whenComplete((identity, error) -> gate.complete(null));
+    }
+
+    /**
+     * One redirection hop: when the roster names a healthy leader elsewhere,
+     * reconnect to it, replay the login and re-check from the new node, since
+     * mid-election metadata can point at a node that is itself not the
+     * leader. Bounded by the per-check redirection budget.
+     */
+    private CompletableFuture<IdentityInfo> redirectToLeader(
+            Supplier<CompletableFuture<IdentityInfo>> reLogin,
+            IdentityInfo redirectedIdentity,
+            LeaderRedirectionState redirectionState) {
+        ConnectionInfo currentTarget = connectionInfo;
+        return findLeaderElsewhere(currentTarget).thenCompose(leaderTarget -> {
+            if (leaderTarget.isEmpty()) {
+                return CompletableFuture.completedFuture(redirectedIdentity);
+            }
+            if (!redirectionState.canRedirect()) {
+                log.warn(
+                        "Maximum leader redirections ({}) reached, connection will continue on server node {}",
+                        LeaderAwareness.MAX_LEADER_REDIRECTS,
+                        currentTarget.serverAddress());
+                return CompletableFuture.completedFuture(redirectedIdentity);
+            }
+            return retarget(leaderTarget.get())
+                    .handle((ignored, error) -> {
+                        if (error != null) {
+                            log.warn(
+                                    "Failed to reconnect to leader at {}: {}, connection will continue"
+                                            + " on server node {}",
+                                    leaderTarget.get().serverAddress(),
+                                    error.getMessage(),
+                                    currentTarget.serverAddress());
+                            return CompletableFuture.completedFuture(redirectedIdentity);
+                        }
+                        redirectionState.recordRedirect();
+                        return reLogin.get()
+                                .thenCompose(identity -> redirectToLeader(reLogin, identity, redirectionState));
+                    })
+                    .thenCompose(Function.identity());
+        });
+    }
+
+    /**
+     * Picks a healthy leader living elsewhere from the roster, waiting out a
+     * transiently leaderless election. Resolves to empty on any failure
+     * (metadata fetch, malformed roster) so the redirection path never fails
+     * the login that triggered it.
+     */
+    private CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(ConnectionInfo currentTarget) {
+        SystemClient currentSystemClient = systemClient;
+        if (currentSystemClient == null) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget);
+    }
+
+    private CompletableFuture<Void> retarget(ConnectionInfo newTarget) {
+        AsyncTcpConnection oldConnection = connection.get();
+        AsyncTcpConnection newConnection;
+        try {
+            newConnection = openConnection(newTarget);
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        AsyncTcpConnection openedConnection = newConnection;
+        return newConnection
+                .connect()
+                .thenCompose(ignored -> publishConnection(oldConnection, openedConnection, newTarget))
+                .whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        openedConnection.close();
+                    }
+                });
+    }
+
+    private CompletableFuture<Void> publishConnection(
+            AsyncTcpConnection oldConnection, AsyncTcpConnection newConnection, ConnectionInfo newTarget) {
+        if (!connection.compareAndSet(oldConnection, newConnection)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Connection replaced concurrently during leader redirection"));
+        }
+        if (closed) {
+            oldConnection.close();
+            return CompletableFuture.failedFuture(
+                    new IggyNotConnectedException("Client closed during leader redirection"));
+        }
+        connectionInfo = newTarget;
+        oldConnection.close().whenComplete((ignored, closeError) -> {
+            if (closeError != null) {
+                log.warn("Failed to close previous connection: {}", closeError.getMessage());
+            }
+        });
         return CompletableFuture.completedFuture(null);
     }
 

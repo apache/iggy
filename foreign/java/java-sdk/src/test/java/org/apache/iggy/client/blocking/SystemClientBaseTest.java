@@ -19,6 +19,8 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.cluster.ClusterNodeRole;
+import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -47,6 +49,22 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
         assertThat(stats.threadsCount()).isNotNull();
         assertThat(stats.freeDiskSpace()).isNotNull();
         assertThat(stats.totalDiskSpace()).isNotNull();
+    }
+
+    @Test
+    void shouldGetClusterMetadataForSingleNode() {
+        // when
+        var metadata = systemClient.getClusterMetadata();
+
+        // then
+        assertThat(metadata).isNotNull();
+        assertThat(metadata.name()).isEqualTo("single-node");
+        assertThat(metadata.nodes()).hasSize(1);
+        var node = metadata.nodes().get(0);
+        assertThat(node.name()).isEqualTo("iggy-node");
+        assertThat(node.role()).isEqualTo(ClusterNodeRole.Leader);
+        assertThat(node.status()).isEqualTo(ClusterNodeStatus.Healthy);
+        assertThat(node.endpoints().tcp()).isPositive();
     }
 
     @Test

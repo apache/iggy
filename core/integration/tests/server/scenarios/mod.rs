@@ -28,7 +28,6 @@ pub mod consumer_group_offset_cleanup_scenario;
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
 pub mod consumer_group_with_single_client_polling_messages_scenario;
 pub mod consumer_timestamp_polling_scenario;
-pub mod create_message_payload;
 // Cross-protocol PAT visibility (create via HTTP, list via TCP across shards,
 // and the reverse). Runs under vsr too: server-ng serves the PAT routes on its
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,

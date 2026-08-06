@@ -412,7 +412,10 @@ impl IggyService {
                     &partitioning,
                     &mut messages,
                 )
-                .await,
+                .await
+                // Wire responses carry no serde on purpose; the MCP reply stays
+                // the unit acknowledgement it always was.
+                .map(|_| ()),
         )
     }
 
