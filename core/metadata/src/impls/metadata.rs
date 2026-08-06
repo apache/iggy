@@ -415,17 +415,29 @@ impl<M> SnapshotCoordinator<M> {
         Ok(checksum)
     }
 
-    /// Drain the snapshotted prefix `0..=last_op` to reclaim WAL space. Runs only
-    /// after the pairing is durable (see [`Self::persist_snapshot`]).
+    /// Drain the snapshotted prefix below `last_op` to reclaim WAL space. Runs
+    /// only after the pairing is durable (see [`Self::persist_snapshot`]).
+    ///
+    /// `last_op` itself is retained, one entry the snapshot has already
+    /// superseded. It is this replica's commit point, and a `DoViewChange`
+    /// carries a header for every op from there up. Draining it inclusively
+    /// leaves that entry blank, and blank at the commit point is the one slot
+    /// the merge can neither adopt nor discard: a quorum of senders that all
+    /// checkpointed at the same op deadlocks the view change
+    /// (`dvc_merge::merge_dvc_quorum`). Reclaiming one more entry is not worth
+    /// a group that cannot elect.
     #[allow(clippy::future_not_send)]
     async fn drain<J: JournalHandle>(
         &self,
         journal: &J,
         last_op: u64,
     ) -> Result<(), SnapshotError> {
+        let Some(drain_to) = last_op.checked_sub(1) else {
+            return Ok(());
+        };
         journal
             .handle()
-            .drain(0..=last_op)
+            .drain(0..=drain_to)
             .await
             .map_err(SnapshotError::Io)?;
         Ok(())
@@ -4712,6 +4724,87 @@ mod tests {
             is_caught_up_primary(consensus),
             "gate must reopen once the prefix is fully applied"
         );
+    }
+
+    /// A checkpoint reclaims the WAL prefix the snapshot supersedes, but must
+    /// stop one op short of the checkpoint op itself.
+    ///
+    /// That op is the replica's commit point, and its `DoViewChange` suffix is
+    /// floored there. The merge scans the commit point and may not discard it,
+    /// so a sender with no header to put there is deferring to a peer; when
+    /// every sender has checkpointed at the same op the view change deadlocks
+    /// (`dvc_merge::merge_dvc_quorum`). Checkpoints fire on local journal
+    /// occupancy, which is symmetric across replicas seeing the same ops, so
+    /// "every sender" is the ordinary case, not a coincidence.
+    #[compio::test]
+    async fn checkpoint_drain_retains_the_commit_point_header() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const OPS: u64 = 5;
+        const CHECKPOINT_OP: u64 = 3;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        for op in 1..=OPS {
+            let prepare = md
+                .prepare_request(create_stream_request(CLIENT, op, &format!("s{op}")))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            md.on_replicate(prepare).await;
+        }
+
+        let journal = md.journal.as_ref().unwrap();
+        md.coordinator
+            .as_ref()
+            .expect("data_dir present arms the coordinator")
+            .drain(journal, CHECKPOINT_OP)
+            .await
+            .expect("drain the snapshotted prefix");
+
+        let header_at = |op: u64| journal.header(usize::try_from(op).expect("test ops fit usize"));
+        for op in 1..CHECKPOINT_OP {
+            assert!(
+                header_at(op).is_none(),
+                "op {op} is below the checkpoint and must be reclaimed"
+            );
+        }
+        assert!(
+            header_at(CHECKPOINT_OP).is_some(),
+            "the checkpoint op is the commit point and must stay describable in a DVC"
+        );
+        for op in CHECKPOINT_OP + 1..=OPS {
+            assert!(header_at(op).is_some(), "op {op} was never snapshotted");
+        }
     }
 
     /// Reproduces the single-node "metadata prepare queue is full" wedge

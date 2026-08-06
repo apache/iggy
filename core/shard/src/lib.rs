@@ -8111,6 +8111,10 @@ where
 /// is in-memory only, so after a restart it reads empty and this replica votes
 /// all-nack: correct, since the ops really are lost and the merge needs a peer
 /// that still holds them.
+///
+/// Read through `repair_header`, not the resident headers: the committed prefix
+/// leaves those as soon as its bytes reach a segment, which on a caught-up
+/// replica includes the commit point itself.
 fn refresh_partition_dvc_suffix<B, SB>(partition: &partitions::IggyPartition<B, SB>)
 where
     B: MessageBus,
@@ -8127,7 +8131,7 @@ where
     let suffix = build_dvc_suffix(
         commit,
         op,
-        |entry_op| journal.inner.header_by_op(entry_op),
+        |entry_op| journal.inner.repair_header(entry_op),
         pending.as_ref().map(|pending| pending.headers.as_slice()),
     );
     consensus.set_local_dvc_suffix(suffix);
@@ -8351,6 +8355,25 @@ fn build_dvc_suffix(
             headers.push(dvc_blank(entry_op));
             if entry_op > commit {
                 nack_bitset |= 1u128 << index;
+            } else {
+                // The commit point, the one slot that goes out blank AND
+                // un-nacked. The merge scans it and may not discard it, so a
+                // sender is asking the new primary to take the header from
+                // someone else; if every sender in the quorum does that, the
+                // op is undecidable and the view never starts.
+                //
+                // Every compaction path is supposed to leave this header behind
+                // (the metadata checkpoint drain stops one op short, a
+                // partition serves it from the evicted ring), so reaching here
+                // means a replica whose log genuinely starts above its own
+                // commit point: a state-transfer receiver that jumped its
+                // commit floor to a snapshot whose prepares it never held.
+                tracing::warn!(
+                    op = entry_op,
+                    commit,
+                    "no header at this replica's commit point; the DVC reports it blank and \
+                     cannot nack it, so the view change stalls unless a peer supplies it"
+                );
             }
         }
     }
@@ -9036,6 +9059,25 @@ mod dvc_suffix_window_tests {
         let suffix = build_dvc_suffix(2, 0, |_| None, Some(&view));
 
         assert_eq!(suffix.nack_bitset(), 0b010, "only the blank op nacks");
+    }
+
+    #[test]
+    fn given_no_header_at_the_commit_point_should_report_it_blank_and_undecidable() {
+        // The window's floor is the commit point, and a blank there is the one
+        // entry that goes out with neither a header nor a nack. The merge scans
+        // that op and may not discard it, so a quorum of these deadlocks the view
+        // change. Pinned here because both compaction paths are meant to keep the
+        // header alive precisely so this shape never leaves a healthy replica.
+        let suffix = build_dvc_suffix(5, 5, |_| None, None);
+
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(floor(&suffix), Some(5));
+        assert_eq!(
+            suffix.nack_bitset(),
+            0,
+            "the commit point is never nacked, whatever the journal says"
+        );
+        assert_eq!(suffix.present_bitset(), 0);
     }
 
     #[test]

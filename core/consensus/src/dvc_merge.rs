@@ -620,6 +620,51 @@ mod tests {
     }
 
     #[test]
+    fn given_blank_commit_point_from_every_sender_should_deadlock() {
+        // The commit point is scanned and may not be discarded, so a sender that
+        // reports it blank is deferring to a peer. When every sender defers there
+        // is no peer left and the view cannot start.
+        //
+        // Nothing in the merge can rescue this, which is why the senders must not
+        // produce it: a replica keeps the header at its own commit point through
+        // compaction (the metadata checkpoint drain stops one op short, a
+        // partition answers from its evicted ring).
+        let mut quorum = dvc_quorum_array_empty();
+        let blank_at_commit = DvcSuffix::new(vec![dvc_blank(5)], 0, 0);
+        for replica in 0..3 {
+            dvc_record(&mut quorum, dvc(replica, 1, 5, 5, blank_at_commit.clone()));
+        }
+
+        assert_eq!(
+            merge_dvc_quorum(&quorum, quorums_r3()),
+            MergeOutcome::Deadlocked { undecided_op: 5 },
+            "a blank commit point is neither adoptable nor discardable"
+        );
+    }
+
+    #[test]
+    fn given_blank_commit_point_from_one_sender_should_adopt_the_peer_header() {
+        // The same suffix stops being fatal the moment one sender still holds the
+        // header: that one is canonical and serves the body, and the deferring
+        // sender neither nacks it nor conflicts with it.
+        let mut quorum = dvc_quorum_array_empty();
+        dvc_record(
+            &mut quorum,
+            dvc(0, 1, 5, 5, DvcSuffix::new(vec![dvc_blank(5)], 0, 0)),
+        );
+        dvc_record(
+            &mut quorum,
+            dvc(1, 1, 5, 5, suffix_all_present(suffix_headers(5, 5, 1))),
+        );
+
+        let MergeOutcome::Ready(log) = merge_dvc_quorum(&quorum, quorums_r3()) else {
+            panic!("one surviving copy of the commit point is enough to start the view");
+        };
+        assert_eq!(log.op_head, 5);
+        assert_eq!(log.commit_max, 5);
+    }
+
+    #[test]
     fn given_header_without_a_servable_body_when_replicas_outstanding_should_await_repair() {
         // Both senders have op 4's header, neither can serve its body, and replica 2
         // has not reported. A head whose body nobody holds would wedge the view.

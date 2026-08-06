@@ -367,6 +367,31 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             .map(|(_, entry)| entry.clone())
     }
 
+    /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
+    ///
+    /// NOT [`Self::header_by_op`], which reads the resident headers alone. The
+    /// committed prefix is evicted from those the moment its bytes reach a
+    /// segment, up to and including `commit_max`, so a `DoViewChange` built off
+    /// the resident headers reports its own commit point blank. The merge scans
+    /// the commit point and cannot discard it, so a quorum of such senders is
+    /// undecidable and the view never starts (`dvc_merge::merge_dvc_quorum`).
+    /// The entry is still servable from the evicted ring, which is what makes
+    /// the blank wrong rather than merely pessimistic.
+    ///
+    /// The ring drops from the front, so the highest evicted op -- the commit
+    /// point of the last flush -- is the last thing it forgets.
+    pub fn repair_header(&self, op: u64) -> Option<PrepareHeader> {
+        if let Some(header) = self.header_by_op(op) {
+            return Some(header);
+        }
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let (_, entry) = ring.iter().find(|(ring_op, _)| *ring_op == op)?;
+        let header_bytes = entry.as_slice().get(..PREPARE_HEADER_SIZE)?;
+        bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+            .ok()
+            .copied()
+    }
+
     /// Oldest op this journal can still serve for repair (ring front, else
     /// resident head), or `None` when it holds nothing at all.
     pub fn repair_retained_from(&self) -> Option<u64> {
