@@ -55,12 +55,16 @@ pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
 /// sizing endorsement.
 pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 256;
 
-/// Mirrors `shard::IggyShard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment ceiling
-/// plus the one whole batch a segment may close past it).
+/// Mirrors the free const `shard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment
+/// ceiling plus the one whole batch a segment may close past it).
 pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 = 1024 * 1024 * 1024 + 64 * 1024 * 1024;
 
-/// Mirrors `shard::ServedSegmentCache::RESIDENT_BYTES_DEFAULT`.
-pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 = 2 * 1024 * 1024 * 1024;
+/// Mirrors the free const `shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT`: room for
+/// two concurrently served segments at the size a SEALED one actually reaches,
+/// which is the artifact ceiling above, not the configured segment target. Sized
+/// off the target instead, two admitted pulls would not both fit and would evict
+/// each other on every chunk.
+pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 = 2 * DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX;
 
 /// Upper bound on the two state-transfer byte knobs. A typo guard, not a sizing
 /// endorsement: both are PER SHARD, so a slipped digit multiplies by the core

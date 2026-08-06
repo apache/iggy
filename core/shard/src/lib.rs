@@ -886,7 +886,7 @@ pub const PARTITION_ARTIFACT_LEN_DEFAULT: u64 =
 /// (`[partition] transfer_served_cache_bytes_max`). Pinned like
 /// [`PARTITION_ARTIFACT_LEN_DEFAULT`].
 pub const SERVED_SEGMENT_CACHE_BYTES_DEFAULT: u64 =
-    SEGMENT_SIZE_CEILING_BYTES * CONCURRENT_SERVED_SEGMENTS;
+    PARTITION_ARTIFACT_LEN_DEFAULT * CONCURRENT_SERVED_SEGMENTS;
 
 /// Distinct max-size segments the served-payload budget holds at once.
 ///
@@ -962,11 +962,15 @@ impl ServedSegmentCache {
     /// once the pulls stop).
     fn expire_idle(&mut self, idle_sweeps_max: u64) {
         self.sweeps += 1;
+        // Strictly BELOW the floor: at `<=` an entry stamped on sweep 0 matches
+        // `0 <= 0` on the very first sweep and is dropped whatever the budget
+        // says, and every other entry loses one sweep of its lifetime. Harmless
+        // in production, but it makes the budget untestable at its boundary.
         let floor = self.sweeps.saturating_sub(idle_sweeps_max);
         let stale: Vec<(u64, u64)> = self
             .entries
             .iter()
-            .filter(|(_, cached)| cached.last_use_sweep <= floor)
+            .filter(|(_, cached)| cached.last_use_sweep < floor)
             .map(|(&key, _)| key)
             .collect();
         for key in stale {
@@ -1162,6 +1166,15 @@ where
     /// `(namespace, requester replica id)`. Bounded by the replica count times
     /// the groups this shard serves; replaced per fresh nonce.
     state_transfer_offers: RefCell<HashMap<(u64, u8), ServedStateTransfer>>,
+    /// Partition groups with an offer build under way but no offer yet, keyed
+    /// by namespace and carrying ticks since the last request that advanced it.
+    ///
+    /// A build spans rounds (the checksum pass is budgeted per frame body), and
+    /// during those rounds nothing in `state_transfer_offers` names the group,
+    /// so admission control cannot see it without this. Aged out on the same
+    /// clock as an idle offer, since a requester that walked away leaves
+    /// nothing else to release the slot.
+    partition_offer_builds: RefCell<HashMap<u64, u32>>,
 
     /// See [`ServedSegmentCache`].
     served_segment_cache: RefCell<ServedSegmentCache>,
@@ -1420,6 +1433,7 @@ where
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             state_transfer_offers: RefCell::new(HashMap::new()),
+            partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
@@ -1673,6 +1687,7 @@ where
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             state_transfer_offers: RefCell::new(HashMap::new()),
+            partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
@@ -1948,7 +1963,8 @@ where
 /// The serving replica's `(view, commit_max)` for a descriptor.
 ///
 /// Sampled per branch, always AFTER any offer build: the build force-flushes and
-/// hashes every un-memoized segment (seconds on a first multi-GiB serve) while
+/// hashes a budgeted slice of the un-memoized segments (a first multi-GiB
+/// serve takes several rounds to complete an offer at all) while
 /// reading its `commit_op` post-flush, so a pre-build sample could advertise a
 /// `commit_max` below the descriptor's own `commit_op`. Harmless on the receiver
 /// (the values are only compared against its own locals) but it makes its gate
@@ -3158,7 +3174,7 @@ where
         );
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
-        if let Some(state) = recovered_state {
+        if let Some(state) = recovered_state.as_ref() {
             consensus.set_view(state.view);
             consensus.set_log_view(state.log_view);
             consensus.mark_superblock_durable(state.view, state.log_view);
@@ -3173,8 +3189,14 @@ where
             partitions.config().enforce_fsync,
         );
         if let Some(superblock) = superblock {
-            partition.set_superblock(superblock);
+            partition.set_superblock(superblock, recovered_state.as_ref());
         }
+        // The SAME call the boot paths make, not a copy of it: this restore is
+        // a max against what the segments already proved, and a harness running
+        // a divergent copy of that rule cannot catch a violation of it. Without
+        // the restore at all, a simulator replica rebuilt against a retained
+        // store resumes minting at 0 while its group is at N.
+        partition.restore_offset_frontier(recovered_state.as_ref());
         partitions.insert(namespace, partition);
     }
 
@@ -5372,6 +5394,11 @@ where
             })
             .map(|namespace| async move {
                 if let Some(partition) = partitions.get_by_ns(&namespace) {
+                    // The only dropped durability verdict in the tree: this pre-pass
+                    // exists to coalesce the writes, and the per-group loop below re-runs
+                    // the same gate on its lock-free fast path and withholds every
+                    // view-scoped send when it fails, so the verdict here is redundant
+                    // rather than ignored.
                     let _ = partition.persist_superblock_if_needed().await;
                 }
             })
@@ -5603,16 +5630,51 @@ where
     /// segments must be resident at once. A group already being served always
     /// passes, so admission cannot revoke a transfer midway.
     ///
-    /// The cap tracks the configured budget rather than a constant, so an
-    /// operator who raises `transfer_served_cache_bytes_max` gets the
-    /// concurrency it pays for; at least one is always admitted, since refusing
-    /// every rejoin is worse than re-reading for a single one.
+    /// BOTH inputs are the configured ones. Dividing by the compile-time
+    /// segment ceiling instead of the deployed `system.segment.size` would make
+    /// the numerator the only thing an operator controls: on a 64 MiB-segment
+    /// deployment the same budget holds sixteen times as many payloads as a cap
+    /// derived from the 1 GiB ceiling would admit, and rejoins serialise for no
+    /// reason.
+    ///
+    /// The divisor is the size a SEALED segment actually reaches, not the
+    /// configured target: rotation fires after the append that crosses it, so a
+    /// sealed segment runs up to one maximum batch past `segment.size`. Dividing
+    /// by the bare target says two payloads fit a two-target budget when they do
+    /// not, and `ServedSegmentCache::insert` then evicts one per chunk -- the
+    /// thrash this cap exists to prevent, reintroduced through the arithmetic.
+    ///
+    /// That size is `partition_artifact_len_max`, which the config validator
+    /// floors at `segment.size` plus the CONFIGURED `message_bus.max_message_size`.
+    /// The compile-time [`SEGMENT_SIZE_OVERSHOOT_BYTES`] only tracks the shipped
+    /// bus cap, so using it would restore the same thrash on any deployment that
+    /// raised that knob: the sealed segment grows with the bus cap while the
+    /// divisor would not. It is kept as a floor for the case where an operator
+    /// sets the artifact ceiling below what a segment can reach.
+    ///
+    /// At least one is always admitted, since refusing every rejoin is worse
+    /// than re-reading for a single one; the quotient rather than the divisor
+    /// carries that clamp, so a zero segment size fails CLOSED at one slot
+    /// instead of disabling admission control.
     fn partition_transfer_admission_cap(&self) -> usize {
-        let slots = self.served_segment_cache_bytes_max.get() / SEGMENT_SIZE_CEILING_BYTES;
+        let segment_size = self.plane.partitions().config().segment_size.as_bytes_u64();
+        let resident_len = self
+            .partition_artifact_len_max
+            .get()
+            .max(segment_size.saturating_add(SEGMENT_SIZE_OVERSHOOT_BYTES));
+        let slots = self
+            .served_segment_cache_bytes_max
+            .get()
+            .checked_div(resident_len)
+            .unwrap_or(1);
         usize::try_from(slots).unwrap_or(usize::MAX).max(1)
     }
 
     fn may_serve_another_partition_transfer(&self, namespace: u64) -> bool {
+        let builds = self.partition_offer_builds.borrow();
+        if builds.contains_key(&namespace) {
+            return true;
+        }
         let offers = self.state_transfer_offers.borrow();
         let mut served: Vec<u64> = offers
             .iter()
@@ -5622,6 +5684,12 @@ where
         if served.contains(&namespace) {
             return true;
         }
+        // Builds count too. A multi-round checksum pass holds no offer yet, so
+        // counting only completed offers admitted every requester's whole
+        // in-flight set at once and let each run its own pass: the frame bodies
+        // stay bounded, but the pump carries N budgets per round-cycle and
+        // every other frame, produce included, queues behind them.
+        served.extend(builds.keys().copied());
         served.sort_unstable();
         served.dedup();
         served.len() < self.partition_transfer_admission_cap()
@@ -5714,63 +5782,88 @@ where
                 .await;
                 return;
             }
-            None => match partition.state_transfer_offer(&config).await {
-                Ok(offer) => {
-                    tracing::info!(
-                        shard = self.id,
-                        namespace_raw = header.namespace,
-                        requester = header.replica,
-                        commit_op = offer.commit_op,
-                        artifacts = offer.artifact_count(),
-                        total_len = offer.total_len(),
-                        "serving partition state transfer"
+            None => {
+                // Claim the admission slot for the whole build, not just for a
+                // completed offer: the checksum pass runs over several rounds
+                // and holds nothing in the offers map meanwhile.
+                self.partition_offer_builds
+                    .borrow_mut()
+                    .insert(header.namespace, 0);
+                match partition.state_transfer_offer(&config).await {
+                    Ok(offer) => {
+                        self.partition_offer_builds
+                            .borrow_mut()
+                            .remove(&header.namespace);
+                        tracing::info!(
+                            shard = self.id,
+                            namespace_raw = header.namespace,
+                            requester = header.replica,
+                            commit_op = offer.commit_op,
+                            artifacts = offer.artifact_count(),
+                            total_len = offer.total_len(),
+                            "serving partition state transfer"
+                        );
+                        self.state_transfer_offers.borrow_mut().insert(
+                            (header.namespace, header.replica),
+                            ServedStateTransfer {
+                                nonce: header.nonce,
+                                offer: ServedOffer::Partition(Rc::clone(&offer)),
+                                idle_ticks: 0,
+                                fully_served: false,
+                            },
+                        );
+                        Some(offer)
+                    }
+                    Err(reason) => {
+                        // The ACTUAL reason: "not the caught-up primary" is routine
+                        // (the requester re-targets), an unreadable segment is an
+                        // operator-visible fault on THIS node. The requester cannot
+                        // see the reason, only whether it was transient, which is
+                        // what keeps a routine refusal from charging its failure
+                        // count.
+                        //
+                        // The slot survives ONLY a budget-exhausted round, which is
+                        // a build that will resume; every other refusal abandons
+                        // the build and must not keep the group admitted.
+                        let building = matches!(
+                        reason,
+                        partitions::state_transfer::PartitionTransferUnavailable::OfferBuildInProgress { .. }
                     );
-                    self.state_transfer_offers.borrow_mut().insert(
-                        (header.namespace, header.replica),
-                        ServedStateTransfer {
-                            nonce: header.nonce,
-                            offer: ServedOffer::Partition(Rc::clone(&offer)),
-                            idle_ticks: 0,
-                            fully_served: false,
-                        },
-                    );
-                    Some(offer)
+                        if !building {
+                            self.partition_offer_builds
+                                .borrow_mut()
+                                .remove(&header.namespace);
+                        }
+                        let transient = reason.transient();
+                        tracing::info!(
+                            shard = self.id,
+                            namespace_raw = header.namespace,
+                            requester = header.replica,
+                            transient,
+                            %reason,
+                            "cannot serve partition state transfer; requester falls back"
+                        );
+                        let (view, commit_max) = serving_progress(partition);
+                        self.send_state_transfer_target(
+                            cluster,
+                            self_id,
+                            header.replica,
+                            header.nonce,
+                            header.namespace,
+                            TransferDescriptor::unavailable(transient, view, commit_max),
+                        )
+                        .await;
+                        return;
+                    }
                 }
-                Err(reason) => {
-                    // The ACTUAL reason: "not the caught-up primary" is routine
-                    // (the requester re-targets), an unreadable segment is an
-                    // operator-visible fault on THIS node. The requester cannot
-                    // see the reason, only whether it was transient, which is
-                    // what keeps a routine refusal from charging its failure
-                    // count.
-                    let transient = reason.transient();
-                    tracing::info!(
-                        shard = self.id,
-                        namespace_raw = header.namespace,
-                        requester = header.replica,
-                        transient,
-                        %reason,
-                        "cannot serve partition state transfer; requester falls back"
-                    );
-                    let (view, commit_max) = serving_progress(partition);
-                    self.send_state_transfer_target(
-                        cluster,
-                        self_id,
-                        header.replica,
-                        header.nonce,
-                        header.namespace,
-                        TransferDescriptor::unavailable(transient, view, commit_max),
-                    )
-                    .await;
-                    return;
-                }
-            },
+            }
         };
         let Some(offer) = offer else {
             return;
         };
-        // Sampled AFTER any build: that build force-flushes and hashes every
-        // un-memoized segment (seconds on a first multi-GiB serve) while reading
+        // Sampled AFTER any build: that build force-flushes and hashes a
+        // budgeted slice of the un-memoized segments (a first multi-GiB serve
+        // spans several rounds before an offer exists) while reading
         // `commit_op` post-flush, so a pre-build sample could advertise a
         // `commit_max` below the descriptor's own `commit_op` -- which only
         // makes the receiver's gate refuse, and refusals feed a backoff.
@@ -6094,6 +6187,10 @@ where
     }
 
     fn drop_served_state_for(&self, namespace: u64) {
+        // Including the build slot: the bytes a partial checksum pass covered are
+        // gone with the chain, so the slot behind it is no longer resumable
+        // work and must stop counting against other namespaces' admission.
+        self.partition_offer_builds.borrow_mut().remove(&namespace);
         self.state_transfer_offers
             .borrow_mut()
             .retain(|(served_namespace, _), _| *served_namespace != namespace);
@@ -6140,20 +6237,42 @@ where
     /// but the tombstone and the routing row drop SYNCHRONOUSLY here, because
     /// the tombstone is the only gate in `get_mut_by_ns` and the queue does not
     /// drain until the end of the pump iteration.
+    ///
+    /// `intended_frontier` is the offset frontier the caller knows the group is
+    /// at, for the paths where the LIVE counter is not it. A failed install
+    /// under an advancing purge generation leaves the counter at the pre-purge
+    /// value while the group restarted its offset space lower, and the
+    /// advancing write would stamp that stale counter over the reset the
+    /// install just made, then quarantine the segments that would have
+    /// contradicted it. `None` where the counter is authoritative.
     #[allow(clippy::future_not_send)]
     async fn fence_partition_for_rebuild(
         &self,
         namespace: IggyNamespace,
         partition: &IggyPartition<B, SB>,
+        intended_frontier: Option<u64>,
     ) where
         B: MessageBus + 'static,
         T: ShardsTable,
     {
         // BEFORE the quarantine: it moves away the segments that are this
         // partition's only other witness to the offset frontier, and the
-        // rebuild's sole anchor is then the durable record. Advancing form --
-        // the live counter is what the rebuild must not fall below.
-        partition.persist_offset_frontier().await;
+        // rebuild's sole anchor is then the durable record.
+        // Ungated by the write backoff on purpose: this is a one-shot write
+        // ahead of an irreversible quarantine, not a retry loop, so a skipped
+        // attempt is the last chance gone rather than deferred work.
+        let recorded = partition
+            .record_frontier_before_quarantine(intended_frontier)
+            .await;
+        if !recorded {
+            tracing::error!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                intended_frontier,
+                "could not record the fenced partition's offset frontier before quarantining \
+                 its segments; the rebuild will re-seed from whatever the record still holds"
+            );
+        }
         match partition.quarantine_partition_dir().await {
             Ok(Some(fenced_dir)) => tracing::error!(
                 shard = self.id,
@@ -6344,8 +6463,22 @@ where
                 "partition transfer peer cannot serve; backing off before re-arming"
             );
             if transient {
-                self.rearm_partition_transfer_after_refusal(partition, header.replica)
-                    .await;
+                // The peer that refused is the node that would otherwise serve,
+                // and on the partition arm only a caught-up primary can. Keep
+                // asking it unless it is not the primary this replica knows: a
+                // rotation spends the next round on a backup that can only
+                // refuse, and the serving side's partial offer-build progress
+                // is memoized per node, so that round advances no hashing.
+                let primary = {
+                    let consensus = partition.consensus();
+                    consensus.primary_index(consensus.view())
+                };
+                self.rearm_partition_transfer_after_refusal(
+                    partition,
+                    header.replica,
+                    header.replica != primary,
+                )
+                .await;
             } else {
                 self.abandon_or_rearm_partition_transfer(partition, header.replica)
                     .await;
@@ -6360,6 +6493,27 @@ where
         // holds; nonce match alone cannot tell the two apart.
         let local_view = partition.consensus().view();
         let local_commit_max = partition.consensus().commit_max();
+        // `commit_op` past the sender's OWN `commit_max` is self-contradictory:
+        // the offer cannot be built past the frontier its builder had. Nothing
+        // downstream bounds it above -- the install only refuses values BELOW
+        // the local floor, and the offsets-artifact cross-check compares two
+        // numbers the same peer chose -- so without this a peer offering
+        // `commit_op = u64::MAX` drives this replica's commit floor, sequencer
+        // and `commit_max` there and it reports itself fully committed.
+        if header.commit_op > header.commit_max {
+            tracing::warn!(
+                shard = self.id,
+                namespace_raw = header.namespace,
+                peer = header.replica,
+                serving_commit_op = header.commit_op,
+                serving_commit_max = header.commit_max,
+                "refusing a partition transfer offer whose commit_op exceeds the sender's \
+                 own commit frontier"
+            );
+            self.abandon_or_rearm_partition_transfer(partition, header.replica)
+                .await;
+            return;
+        }
         if header.view < local_view || header.commit_max < local_commit_max {
             tracing::warn!(
                 shard = self.id,
@@ -6371,7 +6525,9 @@ where
                 local_commit_max,
                 "refusing a partition transfer offer from a replica behind this one"
             );
-            self.rearm_partition_transfer_after_refusal(partition, header.replica)
+            // ALWAYS rotate: this refusal is evidence about the peer, not about
+            // its timing, so re-asking it is the one thing that cannot help.
+            self.rearm_partition_transfer_after_refusal(partition, header.replica, true)
                 .await;
             return;
         }
@@ -6503,7 +6659,15 @@ where
             let Some(session) = partition.transfer.as_mut() else {
                 return;
             };
-            if session.nonce != header.nonce || !session.target_accepted {
+            // `session.peer` too, not the nonce alone. The other three
+            // partition-transfer handlers all validate their sender; this one
+            // authenticated payload bytes by a 128-bit capability only, which
+            // is thin but real once a peer has seen one frame -- a rotated-away
+            // peer still holds the nonce until the session is re-minted.
+            if session.nonce != header.nonce
+                || session.peer != header.replica
+                || !session.target_accepted
+            {
                 return;
             }
             let payload = &msg.as_slice()[size_of::<StateChunkHeader>()..header.size as usize];
@@ -6667,7 +6831,7 @@ where
         // descriptor's `commit_op` and the offsets artifact's frontier from ONE
         // binding, and `commit_op` goes on to drive `set_commit_floor`,
         // `set_sequence`, `advance_commit_max` and the reported
-        // `applied_frontier`, while nothing else ever reads that frontier back.
+        // `applied_commit_op`, while nothing else ever reads that frontier back.
         if let Some(frontier) = offsets_frontier
             && frontier != commit_op
         {
@@ -6728,7 +6892,13 @@ where
             .consensus()
             .set_state_transfer_stage(consensus::StateTransferStage::Installing);
         let outcome = partition
-            .install_state_transfer(&config, commit_op, staged, &offsets_bytes)
+            .install_state_transfer(
+                &config,
+                commit_op,
+                staged,
+                &offsets_bytes,
+                committed_purge_generation,
+            )
             .await;
         partition
             .consensus()
@@ -6742,7 +6912,7 @@ where
                     tracing::info!(
                         shard = self.id,
                         namespace_raw = namespace,
-                        applied_frontier = outcome.applied_frontier,
+                        applied_commit_op = outcome.applied_commit_op,
                         "partition state transfer installed; handing tail to journal repair"
                     );
                 } else {
@@ -6752,7 +6922,7 @@ where
                     tracing::warn!(
                         shard = self.id,
                         namespace_raw = namespace,
-                        applied_frontier = outcome.applied_frontier,
+                        applied_commit_op = outcome.applied_commit_op,
                         "partition state transfer landed WITHOUT fully written consumer \
                          offsets; the next offset commit rewrites the files"
                     );
@@ -6761,7 +6931,10 @@ where
                 self.maybe_request_partition_repair(partition, peer).await;
             }
             Err(
-                error @ partitions::state_transfer::PartitionInstallError::ConvergeFailed { .. },
+                error @ partitions::state_transfer::PartitionInstallError::ConvergeFailed {
+                    frontier,
+                    ..
+                },
             ) => {
                 // The partition holds no serviceable segment chain and its
                 // next append or poll would panic the shard. Fence exactly
@@ -6777,8 +6950,17 @@ where
                     %error,
                     "partition unserviceable after failed install; fencing it for rebuild"
                 );
-                self.fence_partition_for_rebuild(IggyNamespace::from_raw(namespace), partition)
-                    .await;
+                // Served state first, as the purge fence does: the quarantine
+                // below moves the chain those offers and cached payloads
+                // describe into `.fenced.N`, and a requester holding one would
+                // otherwise pull bytes that no longer exist.
+                self.drop_partition_transfer_state(IggyNamespace::from_raw(namespace), partition);
+                self.fence_partition_for_rebuild(
+                    IggyNamespace::from_raw(namespace),
+                    partition,
+                    Some(frontier),
+                )
+                .await;
             }
             Err(error) => {
                 tracing::error!(
@@ -6811,7 +6993,7 @@ where
     {
         let failures = partition.record_transfer_failure();
         let after_ticks = transfer_rearm_backoff(self.repair_retry_ticks.get(), failures);
-        self.schedule_partition_transfer_rearm(partition, peer, failures, after_ticks)
+        self.schedule_partition_transfer_rearm(partition, peer, failures, after_ticks, true)
             .await;
     }
 
@@ -6824,11 +7006,21 @@ where
     /// ceilings: nothing else recovers the partition meanwhile, since repair
     /// keeps hitting the refused floor and will not arm while a re-arm is
     /// pending.
+    ///
+    /// `rotate` belongs to the CALLER because the two refusal sites mean
+    /// opposite things by it. A peer saying "not right now" is the node that
+    /// would otherwise serve, so staying on it is right. This replica refusing
+    /// a descriptor from a peer that knows LESS than it does is the one case
+    /// where the peer is provably the wrong one, and rotating is the whole
+    /// remedy: a restarted primary comes back at `commit_max = 0` (the
+    /// partition journal is memory-only), so a rejoining backup would otherwise
+    /// pin itself to it at a flat interval until the group's next election.
     #[allow(clippy::future_not_send)]
     async fn rearm_partition_transfer_after_refusal(
         &self,
         partition: &mut IggyPartition<B, SB>,
         peer: u8,
+        rotate: bool,
     ) where
         B: MessageBus,
     {
@@ -6845,20 +7037,33 @@ where
         if refusals >= TRANSFER_REFUSALS_BEFORE_ESCALATION
             && refusals.is_multiple_of(TRANSFER_REFUSALS_BEFORE_ESCALATION)
         {
-            tracing::error!(
+            // Deliberately not phrased as "not rejoining": a serving primary
+            // building a large offer refuses one round per budget slice, so a
+            // healthy multi-GiB rejoin reaches this count while progressing
+            // normally. The descriptor carries no reason code, so this side
+            // cannot tell the two apart; the serving node's own logs can.
+            tracing::warn!(
                 shard = self.id,
                 namespace_raw = partition.consensus().namespace(),
                 peer,
                 refusals,
-                "partition state transfer has been refused {refusals} times in a row;                  this partition is not rejoining"
+                "partition state transfer has been refused {refusals} times in a row; the peer \
+                 may be building a large offer or rate-limiting concurrent transfers, or it may \
+                 be unable to serve at all -- check its logs before intervening"
             );
         }
-        self.schedule_partition_transfer_rearm(partition, peer, 0, after_ticks)
+        self.schedule_partition_transfer_rearm(partition, peer, 0, after_ticks, rotate)
             .await;
     }
 
-    /// Drop the session, rotate the peer, and schedule the re-arm; shared by the
-    /// charged and uncharged paths.
+    /// Drop the session, pick the next peer, and schedule the re-arm; shared by
+    /// the charged and uncharged paths.
+    ///
+    /// `rotate` is false where the refusing peer is the only one that could
+    /// have served: only a caught-up primary passes `is_caught_up_primary`, so
+    /// rotating off it asks a backup that can answer nothing but another
+    /// refusal, and the serving side's partial offer-build progress is memoized
+    /// PER NODE, so the round spent on the backup also advances no hashing.
     #[allow(clippy::future_not_send)]
     async fn schedule_partition_transfer_rearm(
         &self,
@@ -6866,6 +7071,7 @@ where
         peer: u8,
         failures: u32,
         after_ticks: u32,
+        rotate: bool,
     ) where
         B: MessageBus,
     {
@@ -6874,12 +7080,16 @@ where
         if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
         }
-        let next_peer = next_transfer_peer(
-            consensus.replica(),
-            peer,
-            consensus.replica_count(),
-            consensus.primary_index(consensus.view()),
-        );
+        let next_peer = if rotate {
+            next_transfer_peer(
+                consensus.replica(),
+                peer,
+                consensus.replica_count(),
+                consensus.primary_index(consensus.view()),
+            )
+        } else {
+            peer
+        };
         tracing::info!(
             shard = self.id,
             namespace_raw = partition.consensus().namespace(),
@@ -6979,6 +7189,23 @@ where
         let retry_ticks = self.repair_retry_ticks.get().max(1);
         let idle_expiry_ticks = retry_ticks.saturating_mul(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE);
         let served_expiry_ticks = retry_ticks.saturating_mul(STATE_TRANSFER_SERVED_EXPIRY_MULTIPLE);
+        // A build slot is released by the round that completes the offer, so a
+        // requester that walked away mid-build would otherwise hold admission
+        // forever. Same idle window as an abandoned offer.
+        self.partition_offer_builds
+            .borrow_mut()
+            .retain(|namespace, idle_ticks| {
+                *idle_ticks += 1;
+                let live = *idle_ticks < idle_expiry_ticks;
+                if !live {
+                    tracing::debug!(
+                        shard = self.id,
+                        namespace_raw = namespace,
+                        "dropping an abandoned partition offer build slot"
+                    );
+                }
+                live
+            });
         let mut offers = self.state_transfer_offers.borrow_mut();
         let namespaces_before: Vec<u64> = offers.keys().map(|(namespace, _)| *namespace).collect();
         offers.retain(|(namespace, requester), served| {

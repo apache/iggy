@@ -552,53 +552,6 @@ pub(crate) fn restore_partition_view(
     consensus.mark_superblock_durable(state.view, state.log_view);
 }
 
-/// Re-seed a partition's offset counter from the durable frontier, taking the
-/// MAX of what the record holds and what the recovered segments already proved.
-///
-/// The record is a lower bound, never a completeness claim: it exists because
-/// three paths leave a replica whose counter would otherwise restart at 0 while
-/// the group is at N (a transfer install of an all-GC'd origin, a crash inside
-/// the install's swap window, and the fence-and-rebuild path, which needs no
-/// crash at all). Restarting the counter is not a lag -- replicas re-stamp
-/// `base_offset` from it and recompute `batch_checksum` over the result, so the
-/// next replicated prepare would persist different bytes here than on every
-/// peer, silently.
-pub(crate) fn restore_offset_frontier(
-    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    recovered: Option<&VsrState>,
-) {
-    // Seeded even when the rest of this function returns early: the advance
-    // direction maxes against the last-written value, and leaving it at zero
-    // would let the first write after a fence lower the record below what boot
-    // just read off disk.
-    if let Some(state) = recovered {
-        partition.seed_durable_offset_frontier(state.offset_frontier);
-    }
-    let Some(frontier) = recovered
-        .map(|state| state.offset_frontier)
-        .filter(|&f| f > 0)
-    else {
-        return;
-    };
-    let recovered_end = frontier - 1;
-    if partition.should_increment_offset
-        && partition.offset.load(Ordering::Acquire) >= recovered_end
-    {
-        return;
-    }
-    info!(
-        namespace_raw = partition.consensus().namespace(),
-        offset_frontier = frontier,
-        "restored partition offset frontier from its superblock"
-    );
-    partition.offset.store(recovered_end, Ordering::Release);
-    partition
-        .dirty_offset
-        .store(recovered_end, Ordering::Relaxed);
-    partition.should_increment_offset = true;
-    partition.stats.set_current_offset(recovered_end);
-}
-
 /// Materialise a brand-new [`IggyPartition`] for a namespace that has no on-disk state yet.
 ///
 /// Counterpart to bootstrap's `load_partition`, which hydrates from
@@ -717,7 +670,7 @@ pub async fn build_partition_fresh(
     }
 
     let mut partition = IggyPartition::new(stats, consensus);
-    partition.set_superblock(superblock);
+    partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
     // IggyPartition::new has already disabled retention for single-replica
     // groups (nobody to serve), so this only sizes the multi-replica ring; the
@@ -751,7 +704,7 @@ pub async fn build_partition_fresh(
     // source of truth. Closing it needs the runtime fence to persist the
     // frontier before quarantining, and the boot-path chain refusal to carry
     // the refused chain's max `end_offset` on its error.
-    restore_offset_frontier(&mut partition, recovered_state.as_ref());
+    partition.restore_offset_frontier(recovered_state.as_ref());
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;

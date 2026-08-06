@@ -696,8 +696,11 @@ where
                 }),
             };
         }
-        // Dense window, so a bitset beats a `HashSet`: no hashing per op and one
-        // allocation of `expected / 8` bytes.
+        // Dense window, so a flat presence vector beats a `HashSet`: no hashing
+        // per op and one contiguous allocation. One BYTE per op rather than one
+        // bit -- `expected` is bounded by `headers.len()`, so the 8x over a real
+        // bitset buys simpler indexing at a size the caller already holds in
+        // headers.
         #[allow(clippy::cast_possible_truncation)]
         let expected_len = expected as usize;
         let mut present = vec![false; expected_len];

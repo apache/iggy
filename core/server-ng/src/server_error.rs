@@ -129,7 +129,7 @@ pub enum ServerNgError {
     PartitionSuperblockUnverifiable { dir: PathBuf },
     #[error(
         "partition superblock at {dir} was checksum-clean but did not decode; \
-         refusing boot rather than infer a stale view"
+         tombstoning this partition rather than inferring a stale view"
     )]
     PartitionSuperblockUndecodable {
         dir: PathBuf,

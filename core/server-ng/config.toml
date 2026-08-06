@@ -958,12 +958,20 @@ evicted_ring_bytes_max = "16 MiB"
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core
 # count, so the process-wide high-water is this times the core count on top of
-# page cache -- keep that product in mind before raising it. The default holds
-# two maximum-size segments: below one, a single rejoining node thrashes the
-# cache by itself and every miss re-reads and re-hashes a whole segment to serve
-# one 256 KiB chunk. Running under the budget costs re-reads, not failures.
+# page cache -- keep that product in mind before raising it. The default is a
+# FIXED 2176 MiB: two sealed segments at the SHIPPED system.segment.size of
+# 1 GiB, each of which can close one whole message_bus.max_message_size past
+# its target, which is why it is not 2 GiB. It does not track your segment
+# size. How many groups this shard serves at once IS derived from yours:
+# floor(this / max(partition.transfer_artifact_bytes_max,
+# system.segment.size + 64 MiB)), minimum one. So raising either that knob or
+# system.segment.size without raising this lowers concurrency and can take it
+# to one, serialising rejoins, and nothing at boot warns about it.
+# Below one segment a single rejoining node thrashes the cache by itself and
+# every miss re-reads and re-hashes a whole segment to serve one 256 KiB chunk.
+# Running under the budget costs re-reads, not failures.
 # Must be > 0 and <= "64 GiB".
-transfer_served_cache_bytes_max = "2 GiB"
+transfer_served_cache_bytes_max = "2176 MiB"
 
 # Alloc ceiling for ONE received state-transfer artifact, per shard. The
 # receiver holds it resident through verify, walk and staging write, and up to
@@ -971,7 +979,9 @@ transfer_served_cache_bytes_max = "2 GiB"
 # message_bus.max_message_size (a segment may close one whole batch past its
 # cap): under that, a legal segment is refused, the whole manifest with it, and
 # the partition livelocks re-requesting it from every peer. Boot validates the
-# floor. Must be > 0 and <= "64 GiB".
+# floor. Raising this above the floor for headroom also DIVIDES the serving
+# concurrency derived from transfer_served_cache_bytes_max above, so raise that
+# in step. Must be > 0 and <= "64 GiB".
 transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.

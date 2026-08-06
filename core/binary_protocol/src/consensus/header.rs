@@ -1495,6 +1495,15 @@ impl ConsensusHeader for StateTransferTargetHeader {
                 "unavailable_transient must be 0 or 1".to_string(),
             ));
         }
+        // The flag qualifies a refusal, so it is meaningless on an offer. Inert
+        // today (the receiver reads it only inside the `available == 0` arm),
+        // rejected anyway because a self-contradictory descriptor says the
+        // sender is not the build this field was designed for.
+        if self.available == 1 && self.unavailable_transient == 1 {
+            return Err(ConsensusError::InvalidField(
+                "unavailable_transient must be 0 on an available offer".to_string(),
+            ));
+        }
         // Unavailable is a bare refusal; a manifest body on it would be
         // ambiguous (which offer would the chunks belong to?). An
         // `available == 1` body is left unbounded here on purpose: it carries

@@ -72,14 +72,14 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 //
@@ -180,6 +180,16 @@ where
     /// terminal policy.
     superblock_write_failures: Cell<u64>,
     superblock_retry_after_micros: Cell<u64>,
+    /// A committed purge this replica accepted but could not apply, because it
+    /// could not record the frontier reset first. Withholds `PrepareOk` until
+    /// the purge lands: the counter still names the PRE-purge offset space, so
+    /// every op acked meanwhile would be stamped from a `base_offset` the peers
+    /// that already purged do not share.
+    ///
+    /// The superblock persist gate cannot cover this on its own -- it fires on
+    /// `(view, log_view)` changes, and a replica with a stable view and a full
+    /// disk attempts no write, observes no failure, and fences nothing.
+    pub(crate) purge_deferred: bool,
     /// The `offset_frontier` the last successful superblock write recorded,
     /// seeded at boot from the record that write left behind.
     ///
@@ -274,6 +284,60 @@ enum Disposition {
         offset: Option<u64>,
     },
 }
+
+/// Why a purge did not complete, split by whether it had already mutated.
+///
+/// The two need opposite handling, and conflating them is a data-loss bug:
+/// fencing a partition whose purge failed before it touched anything
+/// quarantines a complete healthy chain while the live counter still names the
+/// pre-purge offset space, and the fence's own frontier write then stamps that
+/// stale counter as durable truth.
+#[derive(Debug)]
+pub enum PurgeError {
+    /// The frontier reset could not be recorded. NOTHING was mutated: the
+    /// segments, the counters and `applied_purge_generation` are all untouched,
+    /// so the reconciler's `committed > applied` gate re-issues this purge on
+    /// its next pass. Retry, do not fence.
+    ///
+    /// Sets [`Self::purge_deferred`], which withholds `PrepareOk` for this
+    /// group until the purge lands, so the replica goes quorum-invisible THERE
+    /// while every other partition on the node keeps serving. Without that
+    /// fence the counter would still name the pre-purge offset space and every
+    /// op this replica acked would be stamped from a `base_offset` its purged
+    /// peers do not share. The superblock persist gate does not cover it: that
+    /// fires on `(view, log_view)` changes, and a stable view attempts no write
+    /// and so observes no failure.
+    ///
+    /// Fencing the SEND rather than the whole partition is the point. The
+    /// alternative was fencing a partition whose chain is still whole, which
+    /// quarantines live data and rebuilds it at the pre-purge frontier.
+    ///
+    /// Carries no cause: the write path reports `bool`, and the underlying
+    /// `ENOSPC` / `EIO` is logged by the superblock writer on the first failure
+    /// and at every power-of-two thereafter.
+    FrontierNotRecorded,
+    /// A step after the drain failed, so the partition holds no serviceable
+    /// segment chain and its next append would panic on `active_segment()`.
+    /// The caller must fence this group for rebuild.
+    Unserviceable(IggyError),
+}
+
+impl fmt::Display for PurgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FrontierNotRecorded => write!(
+                f,
+                "could not record the purge's offset-frontier reset; nothing was mutated"
+            ),
+            Self::Unserviceable(source) => write!(
+                f,
+                "purge left the partition without a serviceable chain: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PurgeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PendingConsumerOffsetCommit {
@@ -376,6 +440,7 @@ where
             superblock_lock: LocalGate::new(),
             superblock_write_failures: Cell::new(0),
             superblock_retry_after_micros: Cell::new(0),
+            purge_deferred: false,
             durable_offset_frontier: Cell::new(0),
             transfer: None,
             transfer_attempts: 0,
@@ -431,11 +496,21 @@ where
     }
 
     /// Attach the durable superblock store the boot path opened for this
-    /// partition's group. Boot seeds consensus with the recovered
-    /// `(view, log_view)` and marks them durable before attaching; from then
-    /// on [`Self::persist_superblock_if_needed`] keeps the record current.
-    pub fn set_superblock(&mut self, superblock: Rc<SB>) {
+    /// partition's group, along with the record it read back. Boot seeds
+    /// consensus with the recovered `(view, log_view)` and marks them durable
+    /// before attaching; from then on [`Self::persist_superblock_if_needed`]
+    /// keeps the record current.
+    ///
+    /// The record is a PARAMETER rather than a follow-up seeding call because
+    /// the advance direction maxes against its frontier: an attach that left
+    /// that at zero against a record naming N would let the first write after a
+    /// fence lower it, which is the whole defect the field exists to prevent.
+    /// As a separate call it was silently optional, and one of the three attach
+    /// sites dropped it.
+    pub fn set_superblock(&mut self, superblock: Rc<SB>, recovered: Option<&consensus::VsrState>) {
         self.superblock = Some(superblock);
+        self.durable_offset_frontier
+            .set(recovered.map_or(0, |state| state.offset_frontier));
     }
 
     /// Persist this group's VSR state to its superblock when the view changed
@@ -458,6 +533,7 @@ where
     /// withhold the send. The in-memory view stays ahead of the durable one,
     /// which a crash safely rolls back, and the next tick retries.
     #[allow(clippy::future_not_send)]
+    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
     pub async fn persist_superblock_if_needed(&self) -> bool {
         let Some(superblock) = self.superblock.as_ref() else {
             // No store (in-memory / simulated partitions): nothing can be
@@ -483,7 +559,7 @@ where
         // on every 10 ms tick. Back off first, while still reporting `false`
         // so the send stays withheld: fail-closed is the point of this gate,
         // and the backoff only bounds what the retry costs.
-        if self.consensus.clock_realtime_micros() < self.superblock_retry_after_micros.get() {
+        if self.superblock_write_is_backed_off() {
             return false;
         }
         // Re-check needs-persist AFTER acquiring the lock so check and write
@@ -583,6 +659,45 @@ where
         }
     }
 
+    /// Re-seed the offset counter from a recovered superblock record, taking
+    /// the MAX of what the record holds and what the recovered segments already
+    /// proved.
+    ///
+    /// The record is a lower bound, never a completeness claim: it exists
+    /// because three paths leave a replica whose counter would otherwise
+    /// restart at 0 while the group is at N (a transfer install of an all-GC'd
+    /// origin, a crash inside the install's swap window, and the
+    /// fence-and-rebuild path, which needs no crash at all). Restarting the
+    /// counter is not a lag -- replicas re-stamp `base_offset` from it and
+    /// recompute `batch_checksum` over the result, so the next replicated
+    /// prepare would persist different bytes here than on every peer, silently.
+    ///
+    /// Lives HERE rather than in the server crate so the boot paths and the
+    /// simulator share one implementation. A copy in the harness was a copy of
+    /// the max rule that had lost the max, in the one place built to catch
+    /// violations of it.
+    pub fn restore_offset_frontier(&mut self, recovered: Option<&consensus::VsrState>) {
+        let Some(frontier) = recovered
+            .map(|state| state.offset_frontier)
+            .filter(|&f| f > 0)
+        else {
+            return;
+        };
+        let recovered_end = frontier - 1;
+        if self.should_increment_offset && self.offset.load(Ordering::Acquire) >= recovered_end {
+            return;
+        }
+        tracing::info!(
+            namespace_raw = self.consensus().namespace(),
+            offset_frontier = frontier,
+            "restored partition offset frontier from its superblock"
+        );
+        self.offset.store(recovered_end, Ordering::Release);
+        self.dirty_offset.store(recovered_end, Ordering::Relaxed);
+        self.should_increment_offset = true;
+        self.stats.set_current_offset(recovered_end);
+    }
+
     /// The next message offset this replica will mint, `0` while the offset
     /// space is still empty. The value stamped into the durable record.
     #[must_use]
@@ -606,6 +721,7 @@ where
     /// record now holds it; a failure is logged by the writer and left to the
     /// ordinary retry, since the install itself already succeeded.
     #[allow(clippy::future_not_send)]
+    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
     pub async fn persist_offset_frontier(&self) -> bool {
         self.persist_offset_frontier_at(self.offset_frontier())
             .await
@@ -621,8 +737,9 @@ where
     /// just erased, and the following append stamps `base_offset` N where every
     /// peer stamps 0.
     #[allow(clippy::future_not_send)]
+    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
     pub async fn reset_offset_frontier(&self) -> bool {
-        self.reset_offset_frontier_to(self.offset_frontier()).await
+        self.reset_offset_frontier_at(self.offset_frontier()).await
     }
 
     /// [`Self::reset_offset_frontier`] for a frontier the live counter does not
@@ -637,20 +754,61 @@ where
     /// straight back up and leave the pre-purge value on disk across the swap
     /// window.
     #[allow(clippy::future_not_send)]
-    pub async fn reset_offset_frontier_to(&self, frontier: u64) -> bool {
+    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
+    pub async fn reset_offset_frontier_at(&self, frontier: u64) -> bool {
         let Some(superblock) = self.superblock.as_ref().map(Rc::clone) else {
             return true;
         };
+        if self.superblock_write_is_backed_off() {
+            return false;
+        }
         let _superblock_guard = self.superblock_lock.acquire().await;
         self.write_superblock_inner(superblock.as_ref(), frontier)
             .await
     }
 
-    /// Seed the last-written frontier from the record boot read back, so the
-    /// first advance maxes against what is actually on disk rather than against
-    /// zero. Boot only: every later value comes from a write this replica made.
-    pub fn seed_durable_offset_frontier(&self, frontier: u64) {
-        self.durable_offset_frontier.set(frontier);
+    /// Record the frontier immediately ahead of an irreversible quarantine,
+    /// BYPASSING the retry backoff.
+    ///
+    /// The gate exists because the other writers' callers became retry loops,
+    /// and skipping a doomed write costs them nothing. This caller is the
+    /// opposite: it writes once and then moves the segments that are the
+    /// record's only corroborating witness into `.fenced.N`, so a skip here is
+    /// not deferred work, it is the last chance gone. A disk that recovered
+    /// inside the backoff window would otherwise leave the rebuild re-seeding
+    /// from a stale record with nothing left to take the max against.
+    ///
+    /// `intended` is the frontier the caller knows the group is at, written
+    /// verbatim; `None` means the live counter is authoritative and the
+    /// advancing form applies.
+    #[allow(clippy::future_not_send)]
+    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
+    pub async fn record_frontier_before_quarantine(&self, intended: Option<u64>) -> bool {
+        let Some(superblock) = self.superblock.as_ref().map(Rc::clone) else {
+            return true;
+        };
+        let _superblock_guard = self.superblock_lock.acquire().await;
+        match intended {
+            Some(frontier) => {
+                self.write_superblock_inner(superblock.as_ref(), frontier)
+                    .await
+            }
+            None => {
+                self.write_superblock(superblock.as_ref(), self.offset_frontier())
+                    .await
+            }
+        }
+    }
+
+    /// Whether a recent write failure's backoff window is still open.
+    ///
+    /// The same gate [`Self::persist_superblock_if_needed`] applies before its
+    /// own write, extended to the spelled-value writers because their callers
+    /// became retry loops: a deferred purge is re-issued by the reconciler, and
+    /// without this each pass re-runs a full `atomic_replace` against a disk
+    /// that just refused one, as fast as `ENOSPC` returns.
+    fn superblock_write_is_backed_off(&self) -> bool {
+        self.consensus.clock_realtime_micros() < self.superblock_retry_after_micros.get()
     }
 
     /// [`Self::persist_offset_frontier`] for a frontier this replica has not
@@ -664,10 +822,14 @@ where
     /// over-claiming is harmless: the convergence that follows a failed install
     /// seeds the counter from the same artifact frontier.
     #[allow(clippy::future_not_send)]
+    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
     pub async fn persist_offset_frontier_at(&self, frontier: u64) -> bool {
         let Some(superblock) = self.superblock.as_ref().map(Rc::clone) else {
             return true;
         };
+        if self.superblock_write_is_backed_off() {
+            return false;
+        }
         let _superblock_guard = self.superblock_lock.acquire().await;
         self.write_superblock(superblock.as_ref(), frontier).await
     }
@@ -675,6 +837,7 @@ where
     /// Burn one transfer stall round; `true` once the budget is exhausted.
     /// Lives on the partition, not the session, so a re-minted session
     /// cannot reset it (see [`Self::transfer_attempts`]).
+    #[must_use = "the bool is the abandon verdict; dropping it disables the stall budget"]
     pub const fn burn_transfer_attempt(&mut self) -> bool {
         self.transfer_attempts += 1;
         self.transfer_attempts > consensus::STATE_TRANSFER_MAX_STALL_RETRIES
@@ -3506,24 +3669,38 @@ where
     /// pre-purge frontier at this point.
     ///
     /// # Errors
-    /// When the write fails. Refused rather than logged: nothing has been
-    /// mutated yet, and a purge that cannot record its reset must not be the
-    /// one that erases the data proving the old frontier. The caller fences
-    /// this group for rebuild.
+    /// [`PurgeError::FrontierNotRecorded`]. Refused rather than logged: nothing
+    /// has been mutated yet, and a purge that cannot record its reset must not
+    /// be the one that erases the data proving the old frontier. The caller
+    /// RETRIES; it must not fence, since the chain is still whole and the live
+    /// counter still names the pre-purge space.
     #[allow(clippy::future_not_send)]
-    async fn record_purge_frontier_reset(&self, generation: u64) -> Result<(), IggyError> {
-        if self.reset_offset_frontier_to(0).await {
+    async fn record_purge_frontier_reset(&mut self, generation: u64) -> Result<(), PurgeError> {
+        if self.reset_offset_frontier_at(0).await {
+            self.purge_deferred = false;
             return Ok(());
         }
-        error!(
+        self.purge_deferred = true;
+        // The ONLY operator-visible signal for the withhold: `send_prepare_ok`
+        // returns silently, correctly, since it runs per prepare. So this line
+        // has to say that the replica is now out of quorum for this group, or
+        // the symptom reads as a network fault. The consecutive count
+        // correlates it with the superblock writer's own error log, which
+        // carries the `ENOSPC` / `EIO` cause but is rate-limited to
+        // power-of-two failures, while this deferral repeats per reconciler
+        // pass.
+        warn!(
             target: "iggy.partitions.diag",
             plane = "partitions",
             namespace_raw = self.namespace().inner(),
             generation,
-            "cannot record the purge's offset-frontier reset; refusing to purge so the \
-             durable frontier cannot outlive the data it describes"
+            superblock_write_failures = self.superblock_write_failures.get(),
+            "cannot record the purge's offset-frontier reset; deferring the purge so the \
+             durable frontier cannot outlive the data it describes. This replica now \
+             withholds PrepareOk for this partition until the purge lands, so it is \
+             quorum-invisible there; its other partitions are unaffected"
         );
-        Err(IggyError::Error)
+        Err(PurgeError::FrontierNotRecorded)
     }
 
     /// Reset the partition to a single empty segment at offset 0 and clear all
@@ -3537,19 +3714,20 @@ where
     /// `PurgeTopic` advances the committed generation and triggers a fresh pass).
     ///
     /// # Errors
-    /// If the frontier reset cannot be recorded, which happens before anything
-    /// is mutated, or if the replacement segment's log / index file cannot be
-    /// created, by which point every segment is already drained. Either way the
-    /// caller must FENCE this group (quarantine + retire for the reconciler to
+    /// [`PurgeError::FrontierNotRecorded`] before anything is mutated, which
+    /// the caller RETRIES: the reconciler re-issues the purge while
+    /// `committed > applied`, and fencing a partition that still holds its whole
+    /// chain would quarantine live data behind a counter that still names the
+    /// pre-purge offset space. [`PurgeError::Unserviceable`] once the drain has
+    /// run, which the caller FENCES (quarantine + retire for the reconciler to
     /// rebuild), exactly as the state-transfer install's `ConvergeFailed` arm
-    /// does: after the drain the next append panics on `active_segment()`, and
-    /// before it the partition still holds data the group believes it purged.
+    /// does, or the next append panics on `active_segment()`.
     #[allow(clippy::too_many_lines)]
     pub async fn purge(
         &mut self,
         config: &PartitionsConfig,
         generation: u64,
-    ) -> Result<(), IggyError> {
+    ) -> Result<(), PurgeError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -3609,7 +3787,7 @@ where
         }
         self.reuse_scan_memo.borrow_mut().take();
         if let Some(partition_dir) = self.partition_dir.clone() {
-            crate::state_transfer::sweep_staging_except(&partition_dir, &[]).await;
+            crate::state_transfer::sweep_staging_except(&partition_dir, &HashSet::new()).await;
         }
 
         let start_offset = 0u64;
@@ -3624,8 +3802,11 @@ where
         self.dirty_offset.store(start_offset, Ordering::Relaxed);
         self.should_increment_offset = false;
 
-        // Recreate a fresh empty segment at offset 0 with real writers.
-        self.install_empty_segment(config, start_offset).await?;
+        // Recreate a fresh empty segment at offset 0 with real writers. Every
+        // segment is drained by now, so a failure here is the fence case.
+        self.install_empty_segment(config, start_offset)
+            .await
+            .map_err(PurgeError::Unserviceable)?;
         // Make the unlinks AND the replanted dirent durable together: without
         // this a crash can resurrect pre-purge segments until the boot re-purge
         // fires. Bounded and self-healing, but the fsync is one call.
@@ -4009,6 +4190,15 @@ where
         if !self.persist_superblock_if_needed().await {
             return;
         }
+        // Same fail-closed shape for a purge this replica accepted but has not
+        // applied: its counter still names the pre-purge offset space, so an ack
+        // now helps commit an op it will stamp differently from every peer that
+        // did apply. The primary's retransmit re-drives the ack once the purge
+        // lands. Local commits still apply -- this fences the SEND, exactly as
+        // the durability gate above does.
+        if self.purge_deferred {
+            return;
+        }
         // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
         // Both `SendMessages` (via `append_send_messages_to_journal`) and
         // consumer-offset ops (via `apply_replicated_operation`) append
@@ -4320,7 +4510,7 @@ mod tests {
     async fn given_advanced_view_when_persist_gate_runs_should_write_vsr_state_once() {
         let mut partition = partition_at_view(3, 2);
         let store = Rc::new(RecordingSuperblock::default());
-        partition.set_superblock(store.clone());
+        partition.set_superblock(store.clone(), None);
 
         assert!(partition.persist_superblock_if_needed().await);
 
@@ -4361,7 +4551,7 @@ mod tests {
     async fn given_record_above_live_counter_when_advancing_should_keep_the_record() {
         let mut partition = partition_at_view(1, 1);
         let store = Rc::new(RecordingSuperblock::default());
-        partition.set_superblock(store.clone());
+        partition.set_superblock(store.clone(), None);
 
         assert!(partition.persist_offset_frontier_at(9_000).await);
         assert_eq!(last_recorded_frontier(&store), 9_000);
@@ -4381,6 +4571,37 @@ mod tests {
         );
     }
 
+    /// Attaching a store seeds the last-written frontier from the record
+    /// itself, so an advance maxes against what boot read off disk even before
+    /// this replica has written anything. The sibling test reaches that state by
+    /// WRITING first, which cannot catch an attach site that skips the seed.
+    #[compio::test]
+    async fn given_attached_record_when_advancing_should_keep_the_recorded_frontier() {
+        let mut partition = partition_at_view(1, 1);
+        let store = Rc::new(RecordingSuperblock::default());
+        let recovered = consensus::VsrState {
+            cluster: TEST_CLUSTER,
+            replica_id: 0,
+            replica_count: 3,
+            view: 1,
+            log_view: 1,
+            commit_max: 0,
+            checkpoint_op: 0,
+            checkpoint_checksum: 0,
+            offset_frontier: 4_200,
+        };
+        partition.set_superblock(store.clone(), Some(&recovered));
+        assert_eq!(partition.offset_frontier(), 0, "nothing minted locally");
+
+        assert!(partition.persist_offset_frontier().await);
+
+        assert_eq!(
+            last_recorded_frontier(&store),
+            4_200,
+            "the first write after an attach must not lower the record it was attached to"
+        );
+    }
+
     /// The reset direction is the only way down, and it must actually go there:
     /// an install under an advancing purge generation records a frontier below
     /// the live counter on purpose.
@@ -4388,14 +4609,14 @@ mod tests {
     async fn given_reset_below_live_counter_when_written_should_lower_the_record() {
         let mut partition = partition_at_view(1, 1);
         let store = Rc::new(RecordingSuperblock::default());
-        partition.set_superblock(store.clone());
+        partition.set_superblock(store.clone(), None);
         partition.offset.store(9_000, Ordering::Release);
         partition.should_increment_offset = true;
 
         assert!(partition.persist_offset_frontier().await);
         assert_eq!(last_recorded_frontier(&store), 9_001);
 
-        assert!(partition.reset_offset_frontier_to(12).await);
+        assert!(partition.reset_offset_frontier_at(12).await);
 
         assert_eq!(
             last_recorded_frontier(&store),
@@ -4412,18 +4633,52 @@ mod tests {
     async fn given_failing_store_when_purge_records_its_reset_should_refuse_before_mutating() {
         let mut partition = partition_at_view(1, 1);
         let store = Rc::new(RecordingSuperblock::default());
-        partition.set_superblock(store.clone());
+        partition.set_superblock(store.clone(), None);
         partition.offset.store(9_000, Ordering::Release);
         partition.should_increment_offset = true;
 
         store.fail_writes.set(true);
-        assert!(partition.record_purge_frontier_reset(7).await.is_err());
+        assert!(
+            matches!(
+                partition.record_purge_frontier_reset(7).await,
+                Err(PurgeError::FrontierNotRecorded)
+            ),
+            "the pre-mutation refusal must be distinguishable from a post-drain \
+             failure: the caller retries this one and fences the other"
+        );
+
+        assert!(
+            partition.purge_deferred,
+            "a deferred purge must fence the ack path: the counter still names the \
+             pre-purge offset space, and the view-change persist gate cannot see \
+             this because a stable view attempts no write at all"
+        );
 
         store.fail_writes.set(false);
+        assert!(
+            matches!(
+                partition.record_purge_frontier_reset(7).await,
+                Err(PurgeError::FrontierNotRecorded)
+            ),
+            "the failed write armed a backoff, and the retry must respect it rather \
+             than re-running a full atomic_replace against a disk that just refused one"
+        );
+        assert_eq!(
+            store.attempts.get(),
+            1,
+            "the backed-off retry must not reach the store at all"
+        );
+
+        // Backoff expiry, without a controllable clock in this fixture.
+        partition.superblock_retry_after_micros.set(0);
         partition
             .record_purge_frontier_reset(7)
             .await
-            .expect("a working store records the reset");
+            .expect("a working store records the reset once the backoff elapses");
+        assert!(
+            !partition.purge_deferred,
+            "recording the reset releases the fence"
+        );
         assert_eq!(
             last_recorded_frontier(&store),
             0,
@@ -4456,7 +4711,7 @@ mod tests {
             );
         let store = Rc::new(RecordingSuperblock::default());
         store.fail_writes.set(true);
-        partition.set_superblock(store.clone());
+        partition.set_superblock(store.clone(), None);
         // The ack path drops an op past the local head, so the head must cover it.
         partition.consensus().sequencer().set_sequence(1);
         let size = std::mem::size_of::<PrepareHeader>();
@@ -4500,7 +4755,7 @@ mod tests {
         let mut partition = partition_at_view(1, 1);
         let store = Rc::new(RecordingSuperblock::default());
         store.fail_writes.set(true);
-        partition.set_superblock(store.clone());
+        partition.set_superblock(store.clone(), None);
 
         assert!(
             !partition.persist_superblock_if_needed().await,
@@ -5850,7 +6105,7 @@ mod tests {
             groups: Vec::new(),
         };
         let refused = partition
-            .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode(), 0)
             .await;
         assert!(
             matches!(
@@ -5867,7 +6122,9 @@ mod tests {
 
         // A purge at the origin is the one legitimate rewind, and the artifact
         // carries the generation that proves it: the same offer passes the fence
-        // once its generation advances.
+        // once its generation advances past the COMMITTED one the caller reads
+        // off the metadata plane (0 here), not past this replica's memory-only
+        // applied value.
         let purged = crate::state_transfer::ConsumerOffsetsWire {
             purge_generation: 1,
             next_offset: 0,
@@ -5875,7 +6132,7 @@ mod tests {
             groups: Vec::new(),
         };
         let accepted = partition
-            .install_state_transfer(&repair_config(), 12, Vec::new(), &purged.encode())
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &purged.encode(), 0)
             .await;
         assert!(
             !matches!(
@@ -5883,6 +6140,51 @@ mod tests {
                 Err(crate::state_transfer::PartitionInstallError::OfferRewindsDurableData { .. })
             ),
             "a purge-advancing offer must pass the rewind fence, got {accepted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&partition_dir);
+    }
+
+    /// The canonical post-restart rejoin: this replica applied a purge before
+    /// the restart, so the metadata plane's COMMITTED generation is 1 while its
+    /// own memory-only `applied_purge_generation` is back at 0. Gated on the
+    /// local field, `offered(1) > applied(0)` reads as an advancing purge and
+    /// disables the rewind refusal -- on the one path it exists to guard.
+    #[compio::test]
+    async fn given_restarted_replica_when_offer_matches_committed_purge_should_refuse_rewind() {
+        let partition_dir = transfer_fence_dir("restart-purge-rewind").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.should_increment_offset = true;
+        partition.offset.store(99, Ordering::Release);
+        assert_eq!(
+            partition.applied_purge_generation(),
+            0,
+            "the local generation is memory-only and starts over after a restart"
+        );
+
+        let offer = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 1,
+            next_offset: 50,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+        };
+        let refused = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode(), 1)
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(
+                    crate::state_transfer::PartitionInstallError::OfferRewindsDurableData {
+                        offer_next_offset: 50,
+                        local_next_offset: 100,
+                    }
+                )
+            ),
+            "an offer that merely matches the committed generation is not a purge \
+             advancing past it, so the rewind fence must hold: got {refused:?}"
         );
 
         let _ = std::fs::remove_dir_all(&partition_dir);

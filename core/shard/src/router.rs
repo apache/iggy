@@ -698,15 +698,41 @@ where
                                 "purge-partition reset partition to empty"
                             );
                         }
-                        Err(error) => {
-                            // Fence this one group for rebuild, exactly as a
-                            // failed state-transfer convergence does. Both
-                            // failure points need it for different reasons: the
-                            // frontier reset fails before anything is mutated
-                            // and leaves a partition still holding data the
-                            // group believes it purged, while everything after
-                            // the drain leaves no serviceable chain at all and
-                            // the next append panics on `active_segment()`.
+                        Err(partitions::PurgeError::FrontierNotRecorded) => {
+                            // NOT fenced: nothing was mutated, so the chain is
+                            // whole and `applied_purge_generation` is unmoved,
+                            // which means the reconciler's `committed > applied`
+                            // gate still sees this purge as outstanding.
+                            // Fencing here would quarantine live data, and the
+                            // fence's own frontier write would first stamp the
+                            // pre-purge counter the purge was about to reset.
+                            //
+                            // NOT woken: staging a purge counts as work in the
+                            // pass, which keeps the fast-skip disarmed, so the
+                            // ordinary periodic pass re-issues until one lands
+                            // and stops once `applied` catches `committed`. An
+                            // eager wake here closes a loop with no pacing in
+                            // it at all -- pass, stage, defer, wake -- and on a
+                            // disk that refuses instantly that is a full O(N)
+                            // reconcile scan and a real `atomic_replace`
+                            // attempt per turn, holding the partition write
+                            // lock each time.
+                            tracing::warn!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                "purge-partition deferred: could not record the frontier reset; \
+                                 the reconciler re-issues it while the generation stays unapplied"
+                            );
+                        }
+                        Err(error @ partitions::PurgeError::Unserviceable(_)) => {
+                            // Past the drain, so this group has no serviceable
+                            // chain and the next append panics on
+                            // `active_segment()`. Fence it for rebuild, exactly
+                            // as a failed state-transfer convergence does. The
+                            // counters were already reset to 0 before the
+                            // fallible plant, so the fence's advancing write
+                            // records the post-purge frontier.
                             tracing::error!(
                                 shard = self.id,
                                 namespace_raw = namespace.inner(),
@@ -717,7 +743,8 @@ where
                             // Fenced, but the caches still describe the
                             // pre-purge bytes until the rebuild lands.
                             self.drop_partition_transfer_state(namespace, partition);
-                            self.fence_partition_for_rebuild(namespace, partition).await;
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
                         }
                     }
                 }

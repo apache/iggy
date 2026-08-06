@@ -41,6 +41,7 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
 use server_common::send_messages2::decode_batch_slice;
+use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -930,7 +931,14 @@ pub enum PartitionTransferUnavailable {
     /// still unhashed. Progress is memoized, so the next request resumes where
     /// this one stopped rather than starting the pass again.
     OfferBuildInProgress {
+        /// Bytes hashed so far over the chain AS THIS ROUND SEES IT. Carries
+        /// across rounds through the memo rather than resetting per round, but
+        /// retention GC dropping an already-hashed segment lowers it and
+        /// `remaining` together, so it tracks the live chain, not a monotone
+        /// total.
         hashed: u64,
+        /// Bytes of it still unhashed. The pair is the only signal that
+        /// separates a converging multi-round build from a stalled one.
         remaining: u64,
     },
     FlushFailed(iggy_common::IggyError),
@@ -982,7 +990,7 @@ impl fmt::Display for PartitionTransferUnavailable {
             }
             Self::OfferBuildInProgress { hashed, remaining } => write!(
                 f,
-                "offer checksum pass is {hashed} bytes in with {remaining} to go; \
+                "offer checksum pass has hashed {hashed} bytes with {remaining} to go; \
                  resuming on the next request"
             ),
             Self::FlushFailed(source) => {
@@ -1003,7 +1011,12 @@ impl std::error::Error for PartitionTransferUnavailable {}
 /// and the next offset commit blind-writes those files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionInstallOutcome {
-    pub applied_frontier: u64,
+    /// The consensus op the install applied. Named for what it holds: every
+    /// other `frontier` in this module is a MESSAGE OFFSET
+    /// (`VsrState::offset_frontier`, `StateArtifact::frontier`,
+    /// `installed_frontier`), and op-vs-offset confusion is what produced this
+    /// PR's durability defects.
+    pub applied_commit_op: u64,
     /// Every transferred offset file was WRITTEN (and the offset
     /// directories fsynced, so the old files' unlinks stick). Not a
     /// durability claim for the file contents: `persist_offset` fsyncs only
@@ -1070,6 +1083,13 @@ pub enum PartitionInstallError {
     /// whose first use kills the whole shard.
     ConvergeFailed {
         source: iggy_common::IggyError,
+        /// The offer's frontier, carried because the LIVE counter is not it on
+        /// this path: a mutate failure can leave the counter at its pre-install
+        /// value, and under an advancing purge generation that value is above
+        /// the group's. The fence records this instead, or it would stamp the
+        /// stale counter over the reset the install already made and then
+        /// quarantine the segments that would have contradicted it.
+        frontier: u64,
     },
 }
 
@@ -1111,9 +1131,10 @@ impl fmt::Display for PartitionInstallError {
             Self::SegmentOpen { path, source } => {
                 write!(f, "re-opening installed segment {path} failed: {source}")
             }
-            Self::ConvergeFailed { source } => write!(
+            Self::ConvergeFailed { source, frontier } => write!(
                 f,
-                "post-failure convergence failed, the partition must be fenced: {source}"
+                "post-failure convergence failed at frontier {frontier}, \
+                 the partition must be fenced: {source}"
             ),
         }
     }
@@ -1248,7 +1269,7 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
 /// passes none), so a wider filter would unlink every live `.log` and `.index`
 /// on the partition -- worst at the reuse scan, which runs at descriptor-accept
 /// on a serving partition.
-pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: &[&Path]) {
+pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: &HashSet<&Path>) {
     let Ok(entries) = segment_dir_entries(partition_dir) else {
         return;
     };
@@ -1256,7 +1277,7 @@ pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: &[&Path]) {
         let is_staging = path
             .to_str()
             .is_some_and(|path| path.ends_with(STAGING_SUFFIX));
-        if is_staging && !keep.contains(&path.as_path()) {
+        if is_staging && !keep.contains(path.as_path()) {
             let _ = compio::fs::remove_file(&path).await;
         }
     }
@@ -1425,18 +1446,27 @@ where
         // until the offer completes.
         let mut budget = OFFER_HASH_BUDGET_PER_ROUND_BYTES;
         let mut segments = Vec::with_capacity(planned.len());
-        for (index, (start_offset, size, log_path)) in planned.iter().enumerate() {
+        for (start_offset, size, log_path) in &planned {
             let Some(checksum) = self
                 .segment_checksum(*start_offset, *size, log_path, &mut budget)
                 .await?
             else {
-                let remaining = planned[index..]
-                    .iter()
-                    .map(|(_, size, _)| *size)
-                    .sum::<u64>();
+                // CUMULATIVE across rounds, read back off the memo: per-round
+                // figures are constant by construction (a partial round always
+                // spends exactly the budget and always stops inside one
+                // segment), so they render identically on round 1 and round 30
+                // and an operator cannot tell a converging pass from a wedged
+                // one. This is the only window onto a multi-round build.
+                let hashed = self.hashed_prefix_len(&planned);
+                let total = planned.iter().map(|(_, size, _)| *size).sum::<u64>();
+                // The completing round's sweep is skipped on this path, so
+                // prune here too: retention GC can unlink segments across a
+                // long build, and their memos would otherwise accumulate until
+                // some round finally runs the loop to the end.
+                self.retain_segment_checksum_memos(&planned);
                 return Err(PartitionTransferUnavailable::OfferBuildInProgress {
-                    hashed: OFFER_HASH_BUDGET_PER_ROUND_BYTES.saturating_sub(budget),
-                    remaining,
+                    hashed,
+                    remaining: total.saturating_sub(hashed),
                 });
             };
             segments.push(SegmentArtifactSource {
@@ -1480,7 +1510,18 @@ where
                 .retain(|start_offset, _| live.contains_key(start_offset));
         }
 
+        // Second phantom gate, on the BUILT offer rather than on `commit_max`.
+        // The gate above keys on `commit_max() == 0`, which a replica that lifted
+        // its commit floor through an offsets-only repair window clears while
+        // still holding zero bytes; such a replica passes `is_caught_up_primary`
+        // and would hand a data-holding peer an empty chain at frontier 0,
+        // making it unlink its own. An offer with no segments AND no offset
+        // space is indistinguishable from that phantom, and a group genuinely
+        // in that state has nothing worth transferring anyway.
         let offsets_wire = self.offsets_wire_snapshot();
+        if segments.is_empty() && offsets_wire.next_offset == 0 {
+            return Err(PartitionTransferUnavailable::NothingCommitted);
+        }
         let offsets_bytes = Rc::new(offsets_wire.encode());
         let offsets_entry = consensus::StateArtifact::for_bytes(
             artifact_kind::CONSUMER_OFFSETS,
@@ -1494,6 +1535,39 @@ where
         });
         *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
         Ok(offer)
+    }
+
+    /// Bytes of `planned` the memo already covers, clamped per segment to the
+    /// planned length so a memo carrying an active segment's later growth
+    /// cannot report more than this offer will hash.
+    fn hashed_prefix_len(&self, planned: &[(u64, u64, String)]) -> u64 {
+        let memos = self.segment_checksum_cache.borrow();
+        planned
+            .iter()
+            .map(|(start_offset, size, _)| {
+                memos
+                    .get(start_offset)
+                    .map_or(0, |memo| memo.hashed_len.min(*size))
+            })
+            .sum()
+    }
+
+    /// Drop memo entries whose segment is no longer in `planned`, which is the
+    /// live chain as of this round.
+    ///
+    /// Set-based rather than a scan per entry: this runs on every
+    /// budget-exhausted round, inside the frame body the budget exists to
+    /// bound, and `planned` is capped by `STATE_MANIFEST_ENTRIES_MAX` rather
+    /// than by anything an operator sized, so the quadratic form dominates the
+    /// hashing it was meant to make room for.
+    fn retain_segment_checksum_memos(&self, planned: &[(u64, u64, String)]) {
+        let live: HashSet<u64> = planned
+            .iter()
+            .map(|(start_offset, _, _)| *start_offset)
+            .collect();
+        self.segment_checksum_cache
+            .borrow_mut()
+            .retain(|start_offset, _| live.contains(start_offset));
     }
 
     /// The artifact stamp over the first `size` bytes of a segment file,
@@ -1823,7 +1897,7 @@ where
             matched_paths.clear();
         }
         // Sweep strays: anything staged that no adopted meta claims.
-        let keep: Vec<&Path> = matched_paths.iter().map(PathBuf::as_path).collect();
+        let keep: HashSet<&Path> = matched_paths.iter().map(PathBuf::as_path).collect();
         sweep_staging_except(&partition_dir, &keep).await;
         *self.reuse_scan_memo.borrow_mut() = Some(ReuseScanMemo {
             digest,
@@ -1852,6 +1926,7 @@ where
         commit_op: u64,
         mut staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
+        committed_purge_generation: u64,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         // ---- check phase: nothing below may mutate ----
         let Some(partition_dir) = self.partition_dir.clone() else {
@@ -1866,6 +1941,21 @@ where
             return Err(PartitionInstallError::StaleTransfer {
                 commit_op,
                 commit_min,
+            });
+        }
+        // The install rewinds the sequencer to `commit_op`, which erases ops
+        // this replica may already have journaled and acked. Bounding it below
+        // by what this replica knows to be COMMITTED keeps the erased window to
+        // ops it does not know are committed -- the checkable form of an
+        // argument the rewind's own comment only asserts. Free on an honest
+        // offer: only a caught-up primary can serve, so its `commit_min`
+        // equals its `commit_max`, and the receiver's descriptor gate already
+        // refused any peer whose `commit_max` was below this one's.
+        let commit_max = self.consensus().commit_max();
+        if commit_op < commit_max {
+            return Err(PartitionInstallError::StaleTransfer {
+                commit_op,
+                commit_min: commit_max,
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
@@ -1885,7 +1975,16 @@ where
         // replica than on the rest of the group. A purge is the one
         // legitimate rewind, and the artifact carries the generation that
         // proves one happened.
-        let purge_advances = offsets_wire.purge_generation > self.applied_purge_generation;
+        // Against the METADATA plane's committed generation, which the caller
+        // reads off durable state, NOT against `self.applied_purge_generation`:
+        // that one is memory-only and reads 0 after every restart, so a
+        // post-restart rejoin of any ever-purged topic would see
+        // `offered > 0 == applied` and call it an advancing purge. That is the
+        // canonical rejoin, and treating it as a purge disables the
+        // `OfferRewindsDurableData` refusal below -- the one guard standing
+        // between an offer that rewinds this replica's offset space and its
+        // durable data.
+        let purge_advances = offsets_wire.purge_generation > committed_purge_generation;
         let local_next_offset = self.offset_frontier();
         if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
         {
@@ -1933,7 +2032,7 @@ where
         // above a group that restarted at the offer's, and the next prepare
         // would stamp a `base_offset` and `batch_checksum` no peer shares.
         let frontier_durable = if purge_advances {
-            self.reset_offset_frontier_to(offsets_wire.next_offset)
+            self.reset_offset_frontier_at(offsets_wire.next_offset)
                 .await
         } else {
             self.persist_offset_frontier_at(offsets_wire.next_offset)
@@ -1974,7 +2073,10 @@ where
                 staged_was_empty,
             )
             .await
-            .map_err(|source| PartitionInstallError::ConvergeFailed { source })?;
+            .map_err(|source| PartitionInstallError::ConvergeFailed {
+                source,
+                frontier: offsets_wire.next_offset,
+            })?;
         }
         // The frontier just moved with nothing durable naming it (an all-GC'd
         // origin leaves no segment carrying it, and the crash windows inside
@@ -2017,7 +2119,11 @@ where
         // the reuse-scan sweeps too, and boot sweeps ALL of `.staging`
         // (`sweep_scratch_files_and_collect_offsets`), so a transfer abandoned
         // for good leaks at most until the next restart.
-        let keep: Vec<&Path> = staged
+        // A SET, not a list: the sweep tests every staging dirent against this,
+        // and `staged` is peer-supplied up to `STATE_MANIFEST_ENTRIES_MAX`, so a
+        // linear membership test makes the whole sweep quadratic in a number the
+        // requester chooses -- under the partition write lock, with no yields.
+        let keep: HashSet<&Path> = staged
             .iter()
             .flat_map(|meta| [meta.log_staging.as_path(), meta.index_staging.as_path()])
             .collect();
@@ -2109,6 +2215,16 @@ where
                 path: partition_dir.to_owned(),
                 source,
             })?;
+        // One directory handle for the whole loop. The per-rename fsync STAYS --
+        // each log rename is that segment's commit point and the ordering is the
+        // crash-safety argument -- but re-opening the directory to make each one
+        // is an `open`+`close` per segment for no durability gain.
+        let dir_handle = compio::fs::File::open(partition_dir)
+            .await
+            .map_err(|source| PartitionInstallError::SwapIo {
+                path: partition_dir.to_owned(),
+                source,
+            })?;
         for meta in &staged {
             let (log_final, _) = final_paths(partition_dir, meta.start_offset);
             compio::fs::rename(&meta.log_staging, &log_final)
@@ -2117,7 +2233,8 @@ where
                     path: log_final.clone(),
                     source,
                 })?;
-            fsync_dir(partition_dir)
+            dir_handle
+                .sync_all()
                 .await
                 .map_err(|source| PartitionInstallError::SwapIo {
                     path: partition_dir.to_owned(),
@@ -2439,6 +2556,14 @@ where
         self.applied_purge_generation = self
             .applied_purge_generation
             .max(offsets_wire.purge_generation);
+        // Releasing the deferred-purge fence with it. Satisfying the generation
+        // here is what stops the reconciler re-issuing the purge that armed the
+        // fence, so leaving the flag set strands the replica quorum-invisible on
+        // this group for good. The fence's premise is discharged either way:
+        // it exists because the counter still named the pre-purge offset space,
+        // and this install just re-seeded that counter and recorded it durably
+        // before the swap.
+        self.purge_deferred = false;
 
         let consensus = self.consensus();
         if commit_op > consensus.commit_min() {
@@ -2465,7 +2590,7 @@ where
         self.transfer_offer_cache.borrow_mut().take();
 
         Ok(PartitionInstallOutcome {
-            applied_frontier: commit_op,
+            applied_commit_op: commit_op,
             offsets_written,
         })
     }
@@ -2652,9 +2777,14 @@ const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
 /// The pass holds a frame body, and this shard's consensus ticks are a sibling
 /// select arm that stays unpolled for its duration, so the budget is really a
 /// bound on how long every OTHER group on this core goes without a heartbeat.
-/// 256 MiB is roughly a quarter second at commodity `NVMe` read rates, an order
-/// of magnitude under the shipped `heartbeat_timeout`, and still large enough
-/// that ordinary retention finishes in one round.
+///
+/// A BYTE budget standing in for a time bound, so the margin is storage-class
+/// specific: 256 MiB is roughly a quarter second on commodity `NVMe` against
+/// the shipped 5 s `heartbeat_timeout`, but about 2 s on a throttled cloud
+/// volume at 125 MB/s baseline, which is most of that window. Sized for the
+/// slower case still leaving room, and large enough that ordinary retention
+/// finishes in one round. An elapsed-time clamp would bound it properly on
+/// every storage class.
 const OFFER_HASH_BUDGET_PER_ROUND_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Feed bytes `[from, to)` of `path` into `hasher`, read in

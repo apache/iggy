@@ -26,8 +26,7 @@ use crate::dispatch::{
 use crate::http;
 use crate::partition_helpers::{
     build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
-    open_partition_superblock, restore_offset_frontier, restore_partition_view,
-    validate_namespace_bounds,
+    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
@@ -2351,7 +2350,7 @@ async fn load_partition(
             })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
-    partition.set_superblock(superblock);
+    partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
     // single-replica groups, so this only sizes the multi-replica ring.
@@ -2414,7 +2413,7 @@ async fn load_partition(
     // it is the only carrier left when the segments that named the frontier are
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
     // taking the max means real recovered data always wins.
-    restore_offset_frontier(&mut partition, recovered_state.as_ref());
+    partition.restore_offset_frontier(recovered_state.as_ref());
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;

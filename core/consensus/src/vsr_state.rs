@@ -188,7 +188,11 @@ impl fmt::Display for VsrStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongLength { expected, actual } => {
-                write!(f, "VsrState needs {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "VsrState needs {expected} bytes (or {ENCODED_LEN_WITHOUT_FRONTIER}, \
+                     the layout before the offset frontier), got {actual}"
+                )
             }
             Self::LogViewAheadOfView { view, log_view } => write!(
                 f,
