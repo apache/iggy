@@ -24,7 +24,7 @@ namespace Apache.Iggy.Tests.ClientTests;
 public sealed class IggyClientFactoryTests
 {
     [Fact]
-    public void CreateClient_DefaultsToClassicWireProtocol()
+    public void CreateClient_CreatesTcpClient()
     {
         var options = new IggyClientConfigurator
         {
@@ -32,39 +32,10 @@ public sealed class IggyClientFactoryTests
             Protocol = Protocol.Tcp
         };
 
-        Assert.Equal(WireProtocol.Classic, options.WireProtocol);
         Assert.Equal(64 * 1024 * 1024, options.MaxResponseFrameSize);
 
         using var client = IggyClientFactory.CreateClient(options) as IDisposable;
         Assert.NotNull(client);
-    }
-
-    [Fact]
-    public void CreateClient_AllowsVsrOverTcp()
-    {
-        var options = new IggyClientConfigurator
-        {
-            BaseAddress = "127.0.0.1:8090",
-            Protocol = Protocol.Tcp,
-            WireProtocol = WireProtocol.Vsr
-        };
-
-        using var client = IggyClientFactory.CreateClient(options) as IDisposable;
-        Assert.NotNull(client);
-    }
-
-    [Fact]
-    public void CreateClient_RejectsVsrOverHttp()
-    {
-        var options = new IggyClientConfigurator
-        {
-            BaseAddress = "http://127.0.0.1:3000",
-            Protocol = Protocol.Http,
-            WireProtocol = WireProtocol.Vsr
-        };
-
-        var exception = Assert.Throws<ArgumentException>(() => IggyClientFactory.CreateClient(options));
-        Assert.Contains("WireProtocol.Vsr requires Protocol.Tcp", exception.Message);
     }
 
     [Fact]
@@ -74,28 +45,10 @@ public sealed class IggyClientFactoryTests
         {
             BaseAddress = "127.0.0.1:8090",
             Protocol = Protocol.Tcp,
-            WireProtocol = WireProtocol.Vsr,
             MaxResponseFrameSize = 255
         };
 
         Assert.Throws<ArgumentOutOfRangeException>(() => IggyClientFactory.CreateClient(options));
-    }
-
-    /// <summary>
-    ///     Only the VSR reader bounds the buffer it rents for a peer-announced length, so a classic client is
-    ///     not failed over a value that never reaches its path.
-    /// </summary>
-    [Fact]
-    public void CreateClient_AcceptsMaxResponseFrameSizeBelowHeaderUnderClassic()
-    {
-        var options = new IggyClientConfigurator
-        {
-            BaseAddress = "127.0.0.1:8090",
-            Protocol = Protocol.Tcp,
-            MaxResponseFrameSize = 1
-        };
-
-        Assert.NotNull(IggyClientFactory.CreateClient(options));
     }
 
     [Fact]

@@ -68,11 +68,8 @@ public interface IIggyPublisher
     ///     Forces a flush of the unsaved buffer to disk for a specific partition.
     /// </summary>
     /// <remarks>
-    ///     This method ensures that all pending messages in the in-memory buffer for the specified partition are written to
-    ///     disk.
-    ///     If <paramref name="fsync" /> is true, the data is both flushed to disk and synchronized (fsync), ensuring
-    ///     durability.
-    ///     If false, the data is only flushed to disk without synchronization.
+    ///     This feature is not supported by the server. Durability is handled by replication and the journal,
+    ///     so there is no client-flushable in-memory buffer.
     /// </remarks>
     /// <param name="streamId">The stream identifier (numeric ID or name).</param>
     /// <param name="topicId">The topic identifier (numeric ID or name).</param>
@@ -80,6 +77,7 @@ public interface IIggyPublisher
     /// <param name="fsync">If true, the data is flushed and synchronized to disk (fsync). If false, only flushed.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="Exceptions.FeatureUnavailableException">Always thrown; the server does not support this command.</exception>
     Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
         CancellationToken token = default);
 }

@@ -19,7 +19,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -30,7 +29,6 @@ namespace Apache.Iggy.Tests.Integrations.Vsr;
 ///     Control-plane operations through the consensus path: every one of these consumes a request id and
 ///     comes back with a committed result section the decoder has to strip before the typed mapper runs.
 /// </summary>
-[RequiresServerNg]
 public class VsrMetadataTests
 {
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]

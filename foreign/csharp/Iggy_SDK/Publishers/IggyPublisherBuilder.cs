@@ -128,18 +128,6 @@ public class IggyPublisherBuilder
     }
 
     /// <summary>
-    ///     Selects the wire framing the publisher's client speaks. Defaults to <see cref="WireProtocol.Classic" />.
-    /// </summary>
-    /// <param name="wireProtocol">The wire framing to use. VSR requires <see cref="Protocol.Tcp" />.</param>
-    /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder WithWireProtocol(WireProtocol wireProtocol)
-    {
-        Config.WireProtocol = wireProtocol;
-
-        return this;
-    }
-
-    /// <summary>
     ///     Configures the partitioning strategy for messages sent by the publisher.
     ///     Determines how messages are distributed across topic partitions.
     /// </summary>
@@ -313,7 +301,6 @@ public class IggyPublisherBuilder
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
-                WireProtocol = Config.WireProtocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,

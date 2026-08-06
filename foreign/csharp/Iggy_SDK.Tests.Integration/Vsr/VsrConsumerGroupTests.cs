@@ -22,7 +22,6 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -33,7 +32,6 @@ namespace Apache.Iggy.Tests.Integrations.Vsr;
 ///     Group polls under VSR: the server hands out an assignment, the client caches it and round-robins the
 ///     assigned partitions itself, so a poll without an explicit partition id never reaches the broker as one.
 /// </summary>
-[RequiresServerNg]
 public class VsrConsumerGroupTests
 {
     private const uint PartitionsCount = 3;

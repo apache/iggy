@@ -45,10 +45,6 @@ public static class IggyClientFactory
     ///     Thrown when the specified protocol in <paramref name="options" /> is not
     ///     supported.
     /// </exception>
-    /// <exception cref="ArgumentException">
-    ///     Thrown when <see cref="IggyClientConfigurator.WireProtocol" /> is
-    ///     <see cref="WireProtocol.Vsr" /> and the transport is not <see cref="Protocol.Tcp" />.
-    /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">
     ///     Thrown when <see cref="IggyClientConfigurator.MaxResponseFrameSize" /> is below the 256-byte header.
     /// </exception>
@@ -66,22 +62,10 @@ public static class IggyClientFactory
 
     private static void Validate(IggyClientConfigurator options)
     {
-        if (options.WireProtocol != WireProtocol.Vsr)
-        {
-            return;
-        }
-
-        if (options.MaxResponseFrameSize < VsrHeader.HEADER_SIZE)
+        if (options.Protocol == Protocol.Tcp && options.MaxResponseFrameSize < VsrHeader.HEADER_SIZE)
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.MaxResponseFrameSize,
                 $"MaxResponseFrameSize must be at least {VsrHeader.HEADER_SIZE} bytes.");
-        }
-
-        if (options.Protocol != Protocol.Tcp)
-        {
-            throw new ArgumentException(
-                $"WireProtocol.Vsr requires Protocol.Tcp, but {options.Protocol} was configured.",
-                nameof(options));
         }
     }
 
@@ -98,7 +82,7 @@ public static class IggyClientFactory
 
     private static HttpClient CreateHttpClient(IggyClientConfigurator options)
     {
-        var client = new HttpClient();
+        var client = new HttpClient(new TransientHttpRetryHandler(new HttpClientHandler()));
         client.BaseAddress = new Uri(options.BaseAddress);
         return client;
     }

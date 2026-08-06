@@ -193,7 +193,6 @@ The SDK replays a request whenever the server says it never admitted it. Two cas
 ### Limitations
 
 - VSR requires `Protocol.Tcp`; configuring it with `Protocol.Http` throws at client creation.
-- VSR combined with `TlsSettings.Enabled` is not covered by the test suite yet.
 - `StoreOffsetAsync` / `DeleteOffsetAsync` need an explicit partition id under VSR: the broker does not
   resolve a `null` partition for a consumer-offset request, so passing one throws client-side.
 - `FlushUnsavedBufferAsync` is not available under VSR; the server refuses it.
@@ -788,15 +787,11 @@ Integration tests are located in `Iggy_SDK.Tests.Integration/`. Tests can run ag
 
 #### 1. Dockerization
 
-The whole suite runs once per server: `iggy-server`, then `iggy-server-ng` built with the `vsr` feature. On
-`iggy-server` every test runs over both `http` and `tcp`; the `iggy-server-ng` leg is TCP-only. Local runs
-therefore need both images.
+The suite runs against `iggy-server-ng` built with the `vsr` feature. TCP only: the SDK frames TCP with the
+VSR wire protocol, the cluster serves reads from the primary, and the HTTP surface has no equivalent path to
+route them through.
 
 ```bash
-cargo build
-
-docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
-
 cargo build --features vsr --bin iggy-server-ng --bin iggy
 
 docker build --no-cache -f core/server-ng/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server-ng:test .
@@ -812,23 +807,12 @@ dotnet build foreign/csharp/Iggy_SDK.Tests.Integration
 
 ```bash
 cd foreign/csharp
-export IGGY_SERVER_DOCKER_IMAGE=iggy-server:test
 export IGGY_SERVER_NG_DOCKER_IMAGE=iggy-server-ng:test
 dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
 ```
 
-`IGGY_TEST_SERVER` picks the server. It defaults to `classic`, so the command above needs no environment at
-all when only `iggy-server:test` is built. Run it a second time to cover `iggy-server-ng`, where TCP is framed
-with the VSR wire protocol. That leg runs TCP only: the cluster serves reads from the primary, and the HTTP
-surface has no equivalent path to route them through.
-
-```bash
-export IGGY_TEST_SERVER=ng
-dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build
-```
-
-Rider and Visual Studio need nothing configured for the classic run; set `IGGY_TEST_SERVER=ng` in the run
-configuration's environment for the other one.
+`IGGY_SERVER_NG_DOCKER_IMAGE` defaults to `iggy-server-ng:test`, so the export above is only needed to point
+at a different image. Rider and Visual Studio need nothing configured.
 
 ## Useful Resources
 

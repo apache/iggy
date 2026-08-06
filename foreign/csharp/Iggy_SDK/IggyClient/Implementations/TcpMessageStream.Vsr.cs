@@ -37,7 +37,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 /// <summary>
 ///     The consensus (VSR) half of the TCP client: the framed request path, the leader redirection, the
 ///     register handshake, and the client-side partitioning and consumer-group assignment the broker does not
-///     resolve server-side. The classic path lives in <see cref="TcpMessageStream" />.
+///     resolve server-side. The command surface lives in <see cref="TcpMessageStream" />.
 /// </summary>
 public sealed partial class TcpMessageStream
 {
@@ -108,7 +108,6 @@ public sealed partial class TcpMessageStream
 
     private readonly ConsensusSession _consensusSession = new();
     private readonly ConsumerGroupClientState _groupState = new();
-    private readonly bool _isVsr;
     private readonly byte[] _vsrReplyHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
 
     // The redirect budget is refunded by a completed request, and the roster check a redirect runs is itself a
@@ -198,11 +197,11 @@ public sealed partial class TcpMessageStream
 
     /// <summary>
     ///     Whether the partitioning has to be resolved to an explicit partition id before the request is framed.
-    ///     Only VSR needs this: the classic server still round-robins and hashes server-side.
+    ///     The broker never picks a partition, so balanced and message-key kinds resolve client-side.
     /// </summary>
-    private bool NeedsClientSidePartitioning(Partitioning partitioning)
+    private static bool NeedsClientSidePartitioning(Partitioning partitioning)
     {
-        return _isVsr && partitioning.Kind != Enums.Partitioning.PartitionId;
+        return partitioning.Kind != Enums.Partitioning.PartitionId;
     }
 
     private async Task SendMessagesResolvedAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
@@ -396,10 +395,7 @@ public sealed partial class TcpMessageStream
             return false;
         }
 
-        // Classic clients share this path and were never capped. Their only refund sites are the two roster
-        // checks above, so spending the VSR budget here would latch a classic client off the roster for good
-        // after a few genuine redirects.
-        if (_isVsr && Interlocked.Increment(ref _leaderRedirectCount) > VsrMaxLeaderRedirects)
+        if (Interlocked.Increment(ref _leaderRedirectCount) > VsrMaxLeaderRedirects)
         {
             _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}", _currentAddress);
             return false;
@@ -444,15 +440,10 @@ public sealed partial class TcpMessageStream
                 }
 
                 var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x =>
-                    x.Role == ClusterNodeRole.Leader && (!_isVsr || x.Status == ClusterNodeStatus.Healthy));
+                    x.Role == ClusterNodeRole.Leader && x.Status == ClusterNodeStatus.Healthy);
                 if (leaderNode != null)
                 {
                     return leaderNode;
-                }
-
-                if (!_isVsr)
-                {
-                    throw new MissingLeaderException();
                 }
 
                 if (Environment.TickCount64 >= leaderlessDeadline)
@@ -471,7 +462,7 @@ public sealed partial class TcpMessageStream
         {
             return null;
         }
-        catch (Exception e) when (_isVsr && e is not OperationCanceledException)
+        catch (Exception e) when (e is not OperationCanceledException)
         {
             _logger.LogWarning(e, "Failed to read the cluster metadata, continuing on {Address}", _currentAddress);
 

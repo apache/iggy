@@ -42,4 +42,6 @@ public class IggyTlsServerFixture : IggyServerFixture
     [
         new("Certs", "/app/certs/")
     ];
+
+    protected override int ClusterInstance => 1;
 }

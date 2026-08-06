@@ -18,7 +18,6 @@
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
@@ -28,7 +27,6 @@ namespace Apache.Iggy.Tests.Integrations.Vsr;
 ///     The register handshake and the session it binds. Every other VSR suite depends on this one passing:
 ///     without a bound session the server fences every replicated request.
 /// </summary>
-[RequiresServerNg]
 public class VsrHandshakeTests
 {
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]

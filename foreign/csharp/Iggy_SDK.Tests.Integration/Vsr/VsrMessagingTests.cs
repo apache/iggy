@@ -21,7 +21,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -33,7 +32,6 @@ namespace Apache.Iggy.Tests.Integrations.Vsr;
 ///     partitioning kind to an explicit id before the request leaves - these tests assert the resolution
 ///     lands where the Rust SDK's does.
 /// </summary>
-[RequiresServerNg]
 public class VsrMessagingTests
 {
     private const uint PartitionsCount = 4;

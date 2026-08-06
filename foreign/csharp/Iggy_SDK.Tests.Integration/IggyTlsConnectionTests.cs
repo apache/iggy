@@ -19,13 +19,11 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[RequiresClassicServer]
 public class IggyTlsConnectionTests
 {
     [ClassDataSource<IggyTlsServerFixture>(Shared = SharedType.PerAssembly)]
@@ -69,8 +67,10 @@ public class IggyTlsConnectionTests
             ReconnectionSettings = new ReconnectionSettings { Enabled = false }
         });
 
+        // The VSR register handshake runs inside ConnectAsync and dies against the TLS listener, so the
+        // client never reaches the connected state.
         await client.ConnectAsync();
-        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUserAsync("iggy", "iggy"));
+        await Should.ThrowAsync<NotConnectedException>(client.LoginUserAsync("iggy", "iggy"));
     }
 
     [Test]

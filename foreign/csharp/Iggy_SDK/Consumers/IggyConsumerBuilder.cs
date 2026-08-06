@@ -109,18 +109,6 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    ///     Selects the wire framing the consumer's client speaks. Defaults to <see cref="WireProtocol.Classic" />.
-    /// </summary>
-    /// <param name="wireProtocol">The wire framing to use. VSR requires <see cref="Protocol.Tcp" />.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithWireProtocol(WireProtocol wireProtocol)
-    {
-        Config.WireProtocol = wireProtocol;
-
-        return this;
-    }
-
-    /// <summary>
     ///     Configures message encryption on the client this builder creates. Encryption is a client-level concern:
     ///     the encryptor decrypts on poll (and encrypts on send) for the whole connection. Only valid when the
     ///     builder creates its own client; when an external client is supplied, configure the encryptor on that
@@ -253,7 +241,6 @@ public class IggyConsumerBuilder
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
-                WireProtocol = Config.WireProtocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,

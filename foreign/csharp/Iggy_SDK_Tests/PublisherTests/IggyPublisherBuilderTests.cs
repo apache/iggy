@@ -28,41 +28,13 @@ public class IggyPublisherBuilderTests
     private static readonly Identifier TopicId = Identifier.Numeric(1);
 
     [Fact]
-    public void WithWireProtocol_CarriesTheFramingToTheConfig()
-    {
-        var builder = IggyPublisherBuilder
-            .Create(StreamId, TopicId)
-            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass")
-                .WithWireProtocol(WireProtocol.Vsr);
-
-        Assert.Equal(WireProtocol.Vsr, builder.Config.WireProtocol);
-    }
-
-    [Fact]
-    public void TypedBuild_WithVsr_CreatesTheClient()
+    public void TypedBuild_OverTcp_CreatesTheClient()
     {
         IggyPublisherBuilder<string> builder
             = IggyPublisherBuilder<string>.Create(StreamId, TopicId, new StringSerializer());
-        builder.WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass")
-            .WithWireProtocol(WireProtocol.Vsr);
+        builder.WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
 
         Assert.NotNull(builder.Build());
-    }
-
-    /// <summary>
-    ///     The factory only rejects VSR over HTTP when the builder actually forwards the wire protocol, so the
-    ///     rejection is what proves the typed builder does not silently drop it and fall back to classic framing.
-    /// </summary>
-    [Fact]
-    public void TypedBuild_WithVsrOverHttp_Throws()
-    {
-        IggyPublisherBuilder<string> builder
-            = IggyPublisherBuilder<string>.Create(StreamId, TopicId, new StringSerializer());
-        builder.WithConnection(Protocol.Http, "http://127.0.0.1:3000", "user", "pass")
-            .WithWireProtocol(WireProtocol.Vsr);
-
-        var ex = Assert.Throws<ArgumentException>(() => builder.Build());
-        Assert.Contains("WireProtocol.Vsr requires Protocol.Tcp", ex.Message);
     }
 
     private sealed class StringSerializer : ISerializer<string>

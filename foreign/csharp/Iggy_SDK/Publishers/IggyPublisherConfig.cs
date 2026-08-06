@@ -56,13 +56,6 @@ public class IggyPublisherConfig
     public Protocol Protocol { get; set; }
 
     /// <summary>
-    ///     The wire framing to use. Defaults to <see cref="Enums.WireProtocol.Classic" />;
-    ///     <see cref="Enums.WireProtocol.Vsr" /> requires <see cref="Enums.Protocol.Tcp" />.
-    ///     Only used when <see cref="CreateIggyClient" /> is true.
-    /// </summary>
-    public WireProtocol WireProtocol { get; set; } = WireProtocol.Classic;
-
-    /// <summary>
     ///     Gets or sets the server address to connect to.
     ///     Format depends on protocol (e.g., "localhost:8090" for TCP/QUIC, "http://localhost:3000" for HTTP).
     ///     Only used when <see cref="CreateIggyClient" /> is true.

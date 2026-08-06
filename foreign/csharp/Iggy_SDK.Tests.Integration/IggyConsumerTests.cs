@@ -95,7 +95,6 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(2))
             .WithConnection(protocol, clientAddress, "iggy", "iggy")
-                .WithWireProtocol(IggyServerFixture.WireProtocolFor(protocol))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
             .WithConsumerGroup("test-group-init")

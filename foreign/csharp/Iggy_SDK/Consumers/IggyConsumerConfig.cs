@@ -55,13 +55,6 @@ public class IggyConsumerConfig
     public Protocol Protocol { get; set; }
 
     /// <summary>
-    ///     The wire framing to use. Defaults to <see cref="Enums.WireProtocol.Classic" />;
-    ///     <see cref="Enums.WireProtocol.Vsr" /> requires <see cref="Enums.Protocol.Tcp" />.
-    ///     Only used when <see cref="CreateIggyClient" /> is true.
-    /// </summary>
-    public WireProtocol WireProtocol { get; set; } = WireProtocol.Classic;
-
-    /// <summary>
     ///     The server address to connect to
     /// </summary>
     public string Address { get; set; } = string.Empty;

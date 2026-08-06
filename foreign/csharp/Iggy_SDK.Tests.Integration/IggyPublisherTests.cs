@@ -79,7 +79,6 @@ public class IggyPublisherTests
             .CreateStreamIfNotExists(stream)
             .CreateTopicIfNotExists(topic)
             .WithConnection(protocol, client, "iggy", "iggy")
-                .WithWireProtocol(IggyServerFixture.WireProtocolFor(protocol))
             .WithPartitioning(Partitioning.PartitionId(1))
             .Build();
 

@@ -165,14 +165,6 @@ jobs:
         with:
           save-cache: "false"
 
-      - name: Build Iggy server Docker image
-        id: docker_build
-        uses: ./.github/actions/utils/docker-build-test-server
-        with:
-          image-tag: "iggy-server:test"
-          libc: "glibc"
-          profile: "debug"
-
       - name: Restore and build
         working-directory: foreign/csharp
         run: |
@@ -190,21 +182,6 @@ jobs:
             --coverage-output-format cobertura \
             --coverage-output coverage.cobertura.xml \
             --results-directory ./reports/unit
-
-      - name: Run integration tests with coverage
-        working-directory: foreign/csharp
-        env:
-          IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
-          IGGY_TEST_SERVER: classic
-        run: |
-          dotnet test \
-            --project Iggy_SDK.Tests.Integration \
-            --no-build \
-            --verbosity normal \
-            --coverage \
-            --coverage-output-format cobertura \
-            --coverage-output coverage.cobertura.xml \
-            --results-directory ./reports/integration
 
       - name: Build iggy-server-ng Docker image
         shell: bash
@@ -227,12 +204,8 @@ jobs:
 
           echo "IGGY_SERVER_NG_DOCKER_IMAGE=$IMAGE_TAG" >> "$GITHUB_ENV"
 
-      # The PR side uploads its e2e-vsr run under the same csharp flag, so a baseline without this leg
-      # compares every VSR line against nothing and reports the whole transport as uncovered.
-      - name: Run VSR integration tests with coverage
+      - name: Run integration tests with coverage
         working-directory: foreign/csharp
-        env:
-          IGGY_TEST_SERVER: ng
         run: |
           dotnet test \
             --project Iggy_SDK.Tests.Integration \

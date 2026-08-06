@@ -42,8 +42,8 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 namespace Apache.Iggy.IggyClient.Implementations;
 
 /// <summary>
-///     A TCP client for interacting with the Iggy server. The consensus (VSR) framing, leader redirection and
-///     register handshake live in <c>TcpMessageStream.Vsr.cs</c>.
+///     A TCP client for interacting with the Iggy server over the consensus (VSR) framing. The framed request
+///     path, leader redirection and register handshake live in <c>TcpMessageStream.Vsr.cs</c>.
 /// </summary>
 public sealed partial class TcpMessageStream : IIggyClient
 {
@@ -63,7 +63,6 @@ public sealed partial class TcpMessageStream : IIggyClient
     private readonly SemaphoreSlim _connectGate = new(1, 1);
     private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
-    private readonly byte[] _responseHeaderBuffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
     private readonly SemaphoreSlim _sendingSemaphore;
     private string _currentAddress = string.Empty;
     private X509Certificate2Collection _customCaStore = [];
@@ -85,7 +84,6 @@ public sealed partial class TcpMessageStream : IIggyClient
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
         _configuration = configuration;
-        _isVsr = configuration.WireProtocol == WireProtocol.Vsr;
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
         _sendingSemaphore = new SemaphoreSlim(1, 1);
         _connectionSemaphore = new SemaphoreSlim(1, 1);
@@ -330,16 +328,14 @@ public sealed partial class TcpMessageStream : IIggyClient
         return SendMessagesCoreAsync(streamId, topicId, partitioning, span, token);
     }
 
-    /// <inheritdoc />
-    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
+    /// <summary>
+    ///     This feature is not supported by the server.
+    /// </summary>
+    /// <exception cref="FeatureUnavailableException"></exception>
+    public Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
         CancellationToken token = default)
     {
-        var message = TcpContracts.FlushUnsavedBuffer(streamId, topicId, partitionId, fsync);
-
-        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
-
-        await SendAckAsync(payload, token);
+        throw new FeatureUnavailableException();
     }
 
     /// <inheritdoc />
@@ -360,9 +356,9 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         ThrowIfAutoCommitWithEncryptor(autoCommit);
 
-        // Under VSR the broker routes explicit partitions only, so a group poll picks one of the member's
-        // assigned partitions client-side.
-        if (_isVsr && consumer.Type == ConsumerType.ConsumerGroup && partitionId is null)
+        // The broker routes explicit partitions only, so a group poll picks one of the member's assigned
+        // partitions client-side.
+        if (consumer.Type == ConsumerType.ConsumerGroup && partitionId is null)
         {
             return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategy, count, autoCommit,
                 token);
@@ -601,10 +597,7 @@ public sealed partial class TcpMessageStream : IIggyClient
 
         await SendAckAsync(payload, token);
 
-        if (_isVsr)
-        {
-            await RefreshGroupAssignmentsAsync(token);
-        }
+        await RefreshGroupAssignmentsAsync(token);
     }
 
     /// <inheritdoc />
@@ -821,36 +814,8 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw new NotConnectedException();
         }
 
-        if (_isVsr)
-        {
-            return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_CODE,
-                LoginRegister.Serialize(userName, password), token);
-        }
-
-        // TODO: Add binary protocol version
-        var message = TcpContracts.LoginUser(userName, password, SdkVersion.Value, LoginRegister.SDK_NAME);
-        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
-
-        SetConnectionStateAsync(ConnectionState.Authenticating);
-        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
-
-        if (responseBuffer.Memory.Length == 0)
-        {
-            return null;
-        }
-
-        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.Memory.Span[..responseBuffer.Memory.Length]);
-        SetConnectionStateAsync(ConnectionState.Authenticated);
-
-        if (!IsConnecting && await RedirectAsync(token))
-        {
-            await ConnectAsync(token);
-            return await LoginUserAsync(userName, password, token);
-        }
-
-        var authResponse = new AuthResponse(userId, null);
-        return authResponse;
+        return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_CODE,
+            LoginRegister.Serialize(userName, password), token);
     }
 
     /// <inheritdoc />
@@ -866,14 +831,11 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
         finally
         {
-            if (_isVsr)
-            {
-                await ResetConsensusSessionAsync();
+            await ResetConsensusSessionAsync();
 
-                if (_state == ConnectionState.Authenticated)
-                {
-                    SetConnectionStateAsync(ConnectionState.Connected);
-                }
+            if (_state == ConnectionState.Authenticated)
+            {
+                SetConnectionStateAsync(ConnectionState.Connected);
             }
         }
     }
@@ -927,35 +889,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default)
     {
-        if (_isVsr)
-        {
-            return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
-                LoginRegister.SerializeWithPersonalAccessToken(token), ct);
-        }
-
-        var message = TcpContracts.LoginWithPersonalAccessToken(token);
-        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE);
-
-        SetConnectionStateAsync(ConnectionState.Authenticating);
-        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, ct);
-
-        if (responseBuffer.Memory.Length == 0)
-        {
-            return null;
-        }
-
-        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.Memory.Span[..4]);
-
-        SetConnectionStateAsync(ConnectionState.Authenticated);
-
-        if (!IsConnecting && await RedirectAsync(ct))
-        {
-            await ConnectAsync(ct);
-            return await LoginWithPersonalAccessTokenAsync(token, ct);
-        }
-
-        return new AuthResponse(userId, null);
+        return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
+            LoginRegister.SerializeWithPersonalAccessToken(token), ct);
     }
 
     private async Task<PolledMessagesRental> PollPartitionMessagesRentedAsync(Identifier streamId, Identifier topicId,
@@ -1110,7 +1045,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 socket.SendBufferSize = _configuration.SendBufferSize;
                 socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
 
-                // The protocol is request/reply on both wire protocols, so a write is always the last one before
+                // The protocol is request/reply, so a write is always the last one before
                 // the client blocks on the answer and Nagle has nothing to coalesce it with - it only delays the
                 // trailing segment of a large request until the previous one is acked.
                 socket.NoDelay = true;
@@ -1141,7 +1076,7 @@ public sealed partial class TcpMessageStream : IIggyClient
 
                 socket = null;
 
-                if (_isVsr && await RedirectAsync(token))
+                if (await RedirectAsync(token))
                 {
                     await BackoffOrThrowAsync();
                     continue;
@@ -1311,102 +1246,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw new NotConnectedException();
         }
 
-        return _isVsr ? SendRawVsrAsync(payload, token) : SendRawClassicAsync(payload, token);
-    }
-
-    /// <summary>
-    ///     Sends a classic-framed payload (<c>[size u32][code u32][body]</c>) and reads the
-    ///     <c>[status u32][length u32]</c> reply header plus its body.
-    /// </summary>
-    private async Task<IMemoryOwner<byte>> SendRawClassicAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
-    {
-        await _sendingSemaphore.WaitAsync(token);
-
-        try
-        {
-            await _stream.SendAsync(payload, token);
-            await _stream.FlushAsync(token);
-
-            // Read the 8-byte header (4 bytes status + 4 bytes length)
-            var totalRead = 0;
-            while (totalRead < BufferSizes.EXPECTED_RESPONSE_SIZE)
-            {
-                var readBytes
-                    = await _stream.ReadAsync(
-                        _responseHeaderBuffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
-                        token);
-                if (readBytes == 0)
-                {
-                    throw new IggyZeroBytesException();
-                }
-
-                totalRead += readBytes;
-            }
-
-            var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(_responseHeaderBuffer);
-
-            if (response.Status != 0)
-            {
-                if (response.Length == 0)
-                {
-                    throw new IggyInvalidStatusCodeException(response.Status,
-                        $"Invalid response status code: {response.Status}", true);
-                }
-
-
-                using var errorBuffer = ArrayPoolHelper.Rent(response.Length);
-                totalRead = 0;
-                while (totalRead < response.Length)
-                {
-                    var readBytes
-                        = await _stream.ReadAsync(errorBuffer.Memory.Slice(totalRead, response.Length - totalRead),
-                            token);
-                    if (readBytes == 0)
-                    {
-                        throw new IggyZeroBytesException();
-                    }
-
-                    totalRead += readBytes;
-                }
-
-                throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer.Memory.Span));
-            }
-
-            if (response.Length == 0)
-            {
-                return EmptyMemoryOwner.Instance;
-            }
-
-            var responseBuffer = ArrayPoolHelper.Rent(response.Length);
-            try
-            {
-                totalRead = 0;
-                while (totalRead < response.Length)
-                {
-                    var readBytes
-                        = await _stream.ReadAsync(responseBuffer.Memory.Slice(totalRead, response.Length - totalRead),
-                            token);
-
-                    if (readBytes == 0)
-                    {
-                        throw new IggyZeroBytesException();
-                    }
-
-                    totalRead += readBytes;
-                }
-            }
-            catch
-            {
-                responseBuffer.Dispose();
-                throw;
-            }
-
-            return responseBuffer;
-        }
-        finally
-        {
-            _sendingSemaphore.Release();
-        }
+        return SendRawVsrAsync(payload, token);
     }
 
     private static bool IsConnectionException(Exception ex)

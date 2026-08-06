@@ -88,7 +88,6 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
-                WireProtocol = Config.WireProtocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,

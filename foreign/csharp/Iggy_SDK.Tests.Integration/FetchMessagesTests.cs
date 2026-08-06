@@ -91,13 +91,14 @@ public class FetchMessagesTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    [SkipServerNg(
-        "server-ng replies the empty-poll shape for an unresolved topic; a zero-byte error body would break the poll decoder")]
-    public async Task PollMessages_InvalidTopic_Should_Throw_InvalidResponse(Protocol protocol)
+    [SkipHttp]
+    public async Task PollMessages_InvalidTopic_Should_ReturnEmptyPoll(Protocol protocol)
     {
         var (client, streamName) = await CreateStreamWithMessages(protocol);
 
-        var invalidFetchRequest = new MessageFetchRequest
+        // TCP replies status 0 with an empty poll (partition 0, offset 0) so the
+        // SDK fails fast on decode instead of hanging until its read timeout.
+        var response = await client.PollMessagesAsync(new MessageFetchRequest
         {
             Count = 10,
             AutoCommit = true,
@@ -106,10 +107,32 @@ public class FetchMessagesTests
             PollingStrategy = PollingStrategy.Next(),
             StreamId = Identifier.String(streamName),
             TopicId = Identifier.Numeric(2137)
-        };
+        });
 
+        response.Messages.ShouldBeEmpty();
+        response.PartitionId.ShouldBe(0);
+        response.CurrentOffset.ShouldBe(0u);
+    }
+
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    [SkipTcp]
+    public async Task PollMessages_InvalidTopic_Should_Throw_NotFound(Protocol protocol)
+    {
+        var (client, streamName) = await CreateStreamWithMessages(protocol);
+
+        // HTTP keeps legacy-server parity and answers 404.
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            client.PollMessagesAsync(invalidFetchRequest));
+            client.PollMessagesAsync(new MessageFetchRequest
+            {
+                Count = 10,
+                AutoCommit = true,
+                Consumer = Consumer.New(1),
+                PartitionId = 0,
+                PollingStrategy = PollingStrategy.Next(),
+                StreamId = Identifier.String(streamName),
+                TopicId = Identifier.Numeric(2137)
+            }));
     }
 
     [Test]

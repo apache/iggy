@@ -19,24 +19,22 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[RequiresClassicServer]
 public class ClusterRedirectionTests
 {
-    [ClassDataSource<IggyClusterFixture>(Shared = SharedType.PerAssembly)]
-    public required IggyClusterFixture Fixture { get; init; }
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
-    public async Task ConnectToFollower_Should_ReturnClusterMetadataWithTwoNodes()
+    public async Task ConnectToFollower_Should_ReturnClusterMetadataWithAllNodes()
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetFollowerAddress(),
+            BaseAddress = await Fixture.GetFollowerTcpAddressAsync(),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false },
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
@@ -47,8 +45,8 @@ public class ClusterRedirectionTests
         var metadata = await client.GetClusterMetadataAsync();
 
         metadata.ShouldNotBeNull();
-        metadata.Name.ShouldBe("test-cluster");
-        metadata.Nodes.Length.ShouldBe(2);
+        metadata.Name.ShouldBe("test-vsr-cluster");
+        metadata.Nodes.Length.ShouldBe(3);
         metadata.Nodes.ShouldContain(n => n.Role == ClusterNodeRole.Leader);
         metadata.Nodes.ShouldContain(n => n.Role == ClusterNodeRole.Follower);
     }
@@ -58,7 +56,7 @@ public class ClusterRedirectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetFollowerAddress(),
+            BaseAddress = await Fixture.GetFollowerTcpAddressAsync(),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = true },
             AutoLoginSettings = new AutoLoginSettings
@@ -72,7 +70,7 @@ public class ClusterRedirectionTests
 
         var address = client.GetCurrentAddress();
         address.ShouldNotBeNullOrEmpty();
-        address.ShouldBe(Fixture.GetLeaderAddress());
+        address.ShouldBe(await Fixture.GetIggyAddressAsync(Protocol.Tcp));
     }
 
     [Test]
@@ -80,7 +78,7 @@ public class ClusterRedirectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetFollowerAddress(),
+            BaseAddress = await Fixture.GetFollowerTcpAddressAsync(),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = true },
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
@@ -90,16 +88,15 @@ public class ClusterRedirectionTests
 
         var address = client.GetCurrentAddress();
         address.ShouldNotBeNullOrEmpty();
-        address.ShouldBe(Fixture.GetLeaderAddress());
+        address.ShouldBe(await Fixture.GetIggyAddressAsync(Protocol.Tcp));
     }
 
     [Test]
-    [Skip("Currently personal access token exist only on leader. Unskip when it will be available on follower.")]
     public async Task ConnectToFollowerWithPersonalAccessToken_Should_RedirectToLeader()
     {
         using var leaderClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetLeaderAddress(),
+            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false },
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
@@ -113,7 +110,7 @@ public class ClusterRedirectionTests
 
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = Fixture.GetFollowerAddress(),
+            BaseAddress = await Fixture.GetFollowerTcpAddressAsync(),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = true },
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
@@ -126,6 +123,6 @@ public class ClusterRedirectionTests
 
         var address = client.GetCurrentAddress();
         address.ShouldNotBeNullOrEmpty();
-        address.ShouldBe(Fixture.GetLeaderAddress());
+        address.ShouldBe(await Fixture.GetIggyAddressAsync(Protocol.Tcp));
     }
 }

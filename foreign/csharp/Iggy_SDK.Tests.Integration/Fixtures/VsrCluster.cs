@@ -17,6 +17,7 @@
 
 using System.Net;
 using System.Net.Sockets;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Docker.DotNet.Models;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
@@ -34,18 +35,13 @@ internal sealed class VsrCluster : IAsyncDisposable
     private const int NodeCount = 3;
     private const string ClusterName = "test-vsr-cluster";
 
-    // Host-port pool, partitioned per .NET major the same way IggyClusterFixture partitions its own, and
-    // disjoint from it so both fixtures can be live in one process:
-    //   net8.0  - 29800..29899
-    //   net10.0 - 30000..30099
-    // Ten ports per cluster (five transports x two nodes) fit the range with room for a third node.
+    // Host-port pool, partitioned per .NET major so parallel `dotnet test` processes (net8.0 + net10.0)
+    // never race docker's allocator, and split in half per cluster instance:
+    //   net8.0  - 29800..29849 (instance 0), 29850..29899 (instance 1)
+    //   net10.0 - 30000..30049 (instance 0), 30050..30099 (instance 1)
+    // Fifteen ports per cluster (five transports x three nodes) fit a half.
     private const ushort PortRangeSize = 100;
 
-    // Roster peers dial each other by literal IP - the ip field is parsed, not resolved - so the containers
-    // need addresses known before they start. A per-TFM subnet keeps the two `dotnet test` processes off
-    // each other's network.
-    private static readonly string Subnet = $"172.30.{Environment.Version.Major}.0/24";
-    private static readonly string Gateway = $"172.30.{Environment.Version.Major}.1";
     private static readonly ushort BasePort = (ushort)(29000 + Environment.Version.Major * 100);
     private static readonly ushort EndPort = (ushort)(BasePort + PortRangeSize);
     private readonly IContainer[] _containers = new IContainer[NodeCount];
@@ -53,6 +49,13 @@ internal sealed class VsrCluster : IAsyncDisposable
     private readonly INetwork _network;
 
     private readonly List<TcpListener> _portReservations = [];
+
+    // Roster peers dial each other by literal IP - the ip field is parsed, not resolved - so the containers
+    // need addresses known before they start. The third octet is per TFM and per cluster instance, keeping
+    // the two `dotnet test` processes and the plain/TLS clusters inside one process off each other's
+    // network. TFM majors in use (8, 10) leave the odd octets free for instance 1.
+    private readonly int _subnetOctet;
+    private readonly ushort _portScanStart;
     private readonly ushort[] _tcpPorts = new ushort[NodeCount];
 
     private static string? LogDirectory =>
@@ -64,8 +67,21 @@ internal sealed class VsrCluster : IAsyncDisposable
     /// <summary>The same node's REST surface, which serves classic framing rather than VSR.</summary>
     public string LeaderHttpAddress => $"http://127.0.0.1:{_httpPorts[0]}";
 
-    public VsrCluster(string image, string idSuffix, bool traceLogs)
+    /// <summary>A backup of the initial view, so a client dialing it gets redirected to the primary.</summary>
+    public string FollowerTcpAddress => $"127.0.0.1:{_tcpPorts[1]}";
+
+    /// <summary>
+    ///     <paramref name="instance" /> isolates a second cluster in the same process (the TLS one) from the
+    ///     first: each instance scans its own half of the port pool and lives on its own subnet.
+    ///     <paramref name="extraEnvironment" /> wins over the base configuration, and
+    ///     <paramref name="resourceMappings" /> are mounted into every node.
+    /// </summary>
+    public VsrCluster(string image, string idSuffix, bool traceLogs,
+        IReadOnlyDictionary<string, string>? extraEnvironment = null,
+        IReadOnlyList<ResourceMapping>? resourceMappings = null, int instance = 0)
     {
+        _subnetOctet = Environment.Version.Major + instance;
+        _portScanStart = (ushort)(BasePort + instance * (PortRangeSize / 2));
         var quicPorts = new ushort[NodeCount];
         var websocketPorts = new ushort[NodeCount];
         var replicaPorts = new ushort[NodeCount];
@@ -95,8 +111,8 @@ internal sealed class VsrCluster : IAsyncDisposable
                 [
                     new IPAMConfig
                     {
-                        Subnet = Subnet,
-                        Gateway = Gateway
+                        Subnet = $"172.30.{_subnetOctet}.0/24",
+                        Gateway = $"172.30.{_subnetOctet}.1"
                     }
                 ]
             })
@@ -155,6 +171,22 @@ internal sealed class VsrCluster : IAsyncDisposable
                 builder = builder
                     .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
                     .WithEnvironment("RUST_LOG", "trace");
+            }
+
+            if (extraEnvironment != null)
+            {
+                foreach (var (key, value) in extraEnvironment)
+                {
+                    builder = builder.WithEnvironment(key, value);
+                }
+            }
+
+            if (resourceMappings != null)
+            {
+                foreach (var mapping in resourceMappings)
+                {
+                    builder = builder.WithResourceMapping(mapping.Source, mapping.Destination);
+                }
             }
 
             _containers[node] = builder.Build();
@@ -223,14 +255,14 @@ internal sealed class VsrCluster : IAsyncDisposable
         endpoint.IPAMConfig = new EndpointIPAMConfig { IPv4Address = address };
     }
 
-    private static string NodeAddress(int node)
+    private string NodeAddress(int node)
     {
-        return $"172.30.{Environment.Version.Major}.{10 + node}";
+        return $"172.30.{_subnetOctet}.{10 + node}";
     }
 
     private ushort ReservePort()
     {
-        for (var candidate = BasePort; candidate < EndPort; candidate++)
+        for (var candidate = _portScanStart; candidate < EndPort; candidate++)
         {
             try
             {
