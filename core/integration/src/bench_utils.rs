@@ -31,11 +31,14 @@ const BENCH_FILES_PREFIX: &str = "bench_";
 const MESSAGE_BATCHES: u64 = 100;
 const MESSAGES_PER_BATCH: u64 = 100;
 const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
-// Generous for a few MB of traffic even in debug builds. Exists because a
-// protocol mismatch (an SDK framing the server does not speak, e.g. a
-// default-features iggy-bench against a vsr cluster) hangs both sides
-// silently instead of erroring.
-const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+// Generous for a few MB of traffic even in debug builds, and deliberately
+// UNDER nextest's harness timeout (`.config/nextest.toml` sigkills at
+// 60s x 5): a longer wait here would never fire, taking the capture dump and
+// the `--features vsr` hint below with it. Exists because a protocol mismatch
+// (an SDK framing the server does not speak, e.g. a default-features
+// iggy-bench against a vsr cluster) hangs both sides silently instead of
+// erroring.
+const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub fn run_bench_and_wait_for_finish(
     server_addr: &str,

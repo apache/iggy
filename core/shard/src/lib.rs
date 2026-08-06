@@ -864,10 +864,39 @@ const SEGMENT_SIZE_CEILING_BYTES: u64 = 1 << 30;
 
 /// The most one segment can overshoot its size cap: rotation checks the cap
 /// AFTER appending, so a segment closes at most one maximum-size batch past it.
-/// A batch is bounded by the per-message payload ceiling plus its 256-byte
-/// command header; anything larger is refused at ingest.
-const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = iggy_common::MAX_PAYLOAD_SIZE as u64
-    + server_common::send_messages2::COMMAND_HEADER_SIZE as u64;
+///
+/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: server-ng never
+/// enforces the latter (its only enforcement sites are the legacy server and the
+/// SDK batch types), so the largest appendable batch is whatever the message bus
+/// will frame. This tracks the shipped `message_bus.max_message_size` default; an
+/// operator raising that is caught by the config validator, which requires
+/// `partition.transfer_artifact_bytes_max` to cover `system.segment.size` plus
+/// the configured bus cap.
+const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default alloc ceiling for ONE received state-transfer artifact.
+///
+/// Mirrors `[partition] transfer_artifact_bytes_max`. Free const so the config
+/// crate's copy can be pinned to it by a `const _: () = assert!(..)` at the
+/// server-ng build edge, the way every other runtime default is.
+pub const PARTITION_ARTIFACT_LEN_DEFAULT: u64 =
+    SEGMENT_SIZE_CEILING_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
+
+/// Default per-shard resident budget for served segment payloads
+/// (`[partition] transfer_served_cache_bytes_max`). Pinned like
+/// [`PARTITION_ARTIFACT_LEN_DEFAULT`].
+pub const SERVED_SEGMENT_CACHE_BYTES_DEFAULT: u64 =
+    SEGMENT_SIZE_CEILING_BYTES * CONCURRENT_SERVED_SEGMENTS;
+
+/// Distinct max-size segments the served-payload budget holds at once.
+///
+/// TWO, not the receiver's in-flight cap of four: the budget is PER SHARD and
+/// shard count defaults to core count, so each segment here multiplies by the
+/// core count during a whole-node rejoin, on top of page cache and the receive
+/// side's own in-flight artifacts. Two keeps one pull's segment resident while a
+/// second rotates through; running under the budget costs re-reads, not
+/// failures, and operators serving many concurrent rejoins raise the knob.
+const CONCURRENT_SERVED_SEGMENTS: u64 = 2;
 
 /// Shard-wide cache of segment payloads loaded to serve partition chunks,
 /// content-addressed by `(namespace, manifest checksum)` so every requester
@@ -910,31 +939,23 @@ impl ServedSegmentCache {
     /// whole segment to serve one 256 KiB chunk. That is the 4096:1 read
     /// amplification this cache exists to prevent, plus an offer eviction per
     /// failed re-verify feeding the hard-failure backoff.
-    const RESIDENT_BYTES_DEFAULT: u64 =
-        SEGMENT_SIZE_CEILING_BYTES * Self::CONCURRENT_SERVED_SEGMENTS;
-
-    /// Distinct max-size segments the budget holds at once. Matches the
-    /// receiver-side in-flight cap, since that is how many distinct segments one
-    /// requester can pull concurrently.
-    const CONCURRENT_SERVED_SEGMENTS: u64 = 4;
-
-    /// Sweeps a payload survives without serving a chunk.
+    /// Drop every payload that has served nothing for `idle_sweeps_max` sweeps.
     ///
-    /// The sweep runs on the raw consensus tick while the offers it serves
-    /// expire on `retry_ticks * MULTIPLE`, so a one-sweep lifetime meant every
-    /// chunk gap longer than a tick re-read and re-hashed the whole segment --
-    /// 4096 times over for a 1 GiB segment served in 256 KiB chunks. A payload
-    /// must outlive at least one stall-retry interval, which this multiple sets
-    /// against the same clock the offer's own expiry uses.
-    const IDLE_SWEEPS_MAX: u64 = STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE as u64;
-
-    /// Drop every payload that has served nothing for [`Self::IDLE_SWEEPS_MAX`]
-    /// sweeps. Runs from the same place offers expire: without it, one rejoin
-    /// leaves a permanent high-water of resident bytes (nothing else releases
-    /// the cache once the pulls stop).
-    fn expire_idle(&mut self) {
+    /// The budget comes from the caller because the two clocks differ: this
+    /// sweep runs on the raw 10 ms consensus tick while the offers these
+    /// payloads back expire on `retry_ticks * MULTIPLE`. Counting bare sweeps
+    /// gave a payload ~100 ms against an offer's ~10 s, so one dropped chunk
+    /// frame -- whose only re-drive is the 1 s stall sweep -- evicted the
+    /// payload and made the resume re-read and re-hash the whole segment to
+    /// serve the next 256 KiB. The trade in the other direction: an abandoned
+    /// pull now pins its resident payload for the full offer window.
+    ///
+    /// Runs from the same place offers expire: without it, one rejoin leaves a
+    /// permanent high-water of resident bytes (nothing else releases the cache
+    /// once the pulls stop).
+    fn expire_idle(&mut self, idle_sweeps_max: u64) {
         self.sweeps += 1;
-        let floor = self.sweeps.saturating_sub(Self::IDLE_SWEEPS_MAX);
+        let floor = self.sweeps.saturating_sub(idle_sweeps_max);
         let stale: Vec<(u64, u64)> = self
             .entries
             .iter()
@@ -1258,12 +1279,12 @@ where
 
     /// Live `[partition] transfer_served_cache_bytes_max`: the byte budget for
     /// segment payloads this shard keeps resident to serve chunk requests.
-    /// Defaults to [`ServedSegmentCache::RESIDENT_BYTES_DEFAULT`]; server-ng
+    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; server-ng
     /// overrides it at bootstrap.
     served_segment_cache_bytes_max: Cell<u64>,
 
     /// Live `[partition] transfer_artifact_bytes_max`: the alloc ceiling for one
-    /// RECEIVED artifact. Defaults to `PARTITION_ARTIFACT_LEN_DEFAULT`;
+    /// RECEIVED artifact. Defaults to [`PARTITION_ARTIFACT_LEN_DEFAULT`];
     /// server-ng overrides it at bootstrap.
     partition_artifact_len_max: Cell<u64>,
 
@@ -1393,8 +1414,8 @@ where
             metadata_transfer: RefCell::new(None),
             state_transfer_offers: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
-            served_segment_cache_bytes_max: Cell::new(ServedSegmentCache::RESIDENT_BYTES_DEFAULT),
-            partition_artifact_len_max: Cell::new(Self::PARTITION_ARTIFACT_LEN_DEFAULT),
+            served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
+            partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
@@ -1646,8 +1667,8 @@ where
             metadata_transfer: RefCell::new(None),
             state_transfer_offers: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
-            served_segment_cache_bytes_max: Cell::new(ServedSegmentCache::RESIDENT_BYTES_DEFAULT),
-            partition_artifact_len_max: Cell::new(Self::PARTITION_ARTIFACT_LEN_DEFAULT),
+            served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
+            partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
@@ -5360,16 +5381,15 @@ where
             futures::future::join_all(chunk).await;
         }
 
-        // Counted ONCE for the whole sweep, then tracked locally as arms land: a
-        // per-namespace count is a full scan per partition, so with per-partition
-        // groups the sweep is O(P^2) exactly when every group is re-arming at
-        // once (node-wide view change or rejoin). Capped arms reschedule on the
-        // flat retry interval, so the losers stay phase-locked and repeat that
-        // sweep every interval for the whole rejoin -- at a thousand partitions,
-        // past the 10 ms tick budget on the scan alone. A slot freed mid-sweep is
-        // seen on the next tick, which is the same latency a capped arm already
-        // accepts.
-        let mut transfers_inflight = self.partition_transfers_inflight();
+        // Counted at most ONCE per sweep and only if a re-arm actually fires,
+        // then tracked locally as arms land. Counting per namespace is a full
+        // scan per partition, so with per-partition groups the sweep would be
+        // O(P^2) exactly when every group is re-arming at once (node-wide view
+        // change or rejoin) -- and counting eagerly every tick pays that scan on
+        // every quiet tick too, since the re-arm branch is rare. A slot freed
+        // mid-sweep is seen on the next tick, the same latency a capped arm
+        // already accepts.
+        let mut transfers_inflight: Option<usize> = None;
 
         for namespace in namespaces {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
@@ -5518,15 +5538,17 @@ where
                 }
             };
             if let Some(peer) = rearm_peer {
+                // Counted here, before the `&mut partition` below exists: the
+                // scan takes shared borrows of every partition.
+                let inflight =
+                    *transfers_inflight.get_or_insert_with(|| self.partition_transfers_inflight());
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
                 partition.consensus().begin_state_transfer_await();
-                let armed = self
-                    .arm_partition_transfer(partition, peer, transfers_inflight)
-                    .await;
+                let armed = self.arm_partition_transfer(partition, peer, inflight).await;
                 if armed {
-                    transfers_inflight += 1;
+                    transfers_inflight = Some(inflight + 1);
                 }
             }
         }
@@ -5830,10 +5852,11 @@ where
                 ChunkAttempt::Reply(reply) => break reply,
                 ChunkAttempt::Load { log_path, entry } => {
                     // Chunked read + incremental hash: this runs on the pump to
-                    // answer ONE 256 KiB chunk request, and a whole-file read
-                    // plus a non-yielding hash over up to 2 GiB holds the core
-                    // long enough to miss the heartbeat and view-change
-                    // deadlines of every group it owns.
+                    // answer ONE 256 KiB chunk request, so a whole-file read
+                    // plus a single hash pass over up to a segment would be one
+                    // long uninterruptible CPU+IO block. The chunking keeps the
+                    // REACTOR moving; this shard's consensus ticks are a sibling
+                    // select arm of the same task and stay frozen either way.
                     let loaded = partitions::state_transfer::load_verified_segment_artifact(
                         &log_path, &entry,
                     )
@@ -5919,17 +5942,6 @@ where
         }
     }
 
-    /// Alloc cap per PARTITION artifact: the configured segment ceiling plus the
-    /// one maximum-size batch a segment may overshoot it by (rotation checks the
-    /// cap after appending). The metadata plane's flat 1 GiB cap would
-    /// deterministically reject a legal overshooting segment, and the previous
-    /// 2 GiB left the receiver holding twice the largest legal artifact --
-    /// `mem::take` moves the buffer out of the session, not out of memory, so it
-    /// stays resident through verify + walk + staging write, times the in-flight
-    /// cap, times the shard count.
-    const PARTITION_ARTIFACT_LEN_DEFAULT: u64 =
-        SEGMENT_SIZE_CEILING_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
-
     /// Sanity cap across a partition manifest. Segment artifacts spill to
     /// disk as they complete, so this bounds corruption, not memory.
     const PARTITION_TRANSFER_TOTAL_LEN_MAX: u64 = 1 << 40;
@@ -5989,14 +6001,28 @@ where
             .count()
     }
 
-    /// Drop every serving-side artifact this shard holds for `namespace`: the
-    /// cached offers and the resident segment payloads behind them.
+    /// Drop every trace of `namespace`'s current bytes from the serving side:
+    /// the partition's own offer cache, this shard's cached offers, and the
+    /// resident payloads behind them.
     ///
-    /// Called where the partition's bytes stop being the bytes the offers
-    /// describe (a purge). Neither cache can detect that on its own -- offers
-    /// are keyed by `commit_op`, payloads by the manifest checksum over the old
-    /// bytes -- so a puller mid-transfer would keep receiving purged data and
-    /// keep both expiry clocks reset while doing it.
+    /// Called wherever a partition's segments stop being the bytes an offer
+    /// describes -- retention cleaning, a committed truncate, a purge. None of
+    /// the caches can detect that themselves: the builder cache is keyed on
+    /// `commit_op` (which a metadata-plane truncate never moves), the shard's
+    /// offers on the requester, and the payloads on a checksum over the bytes
+    /// that just went away -- so a puller mid-transfer keeps receiving deleted
+    /// data and keeps both expiry clocks reset while doing it.
+    pub(crate) fn drop_partition_transfer_state(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) where
+        B: MessageBus,
+    {
+        partition.clear_state_transfer_offer_cache();
+        self.drop_served_state_for(namespace.inner());
+    }
+
     fn drop_served_state_for(&self, namespace: u64) {
         self.state_transfer_offers
             .borrow_mut()
@@ -6053,6 +6079,11 @@ where
         B: MessageBus + 'static,
         T: ShardsTable,
     {
+        // BEFORE the quarantine: it moves away the segments that are this
+        // partition's only other witness to the offset frontier, and the
+        // rebuild's sole anchor is then the durable record. Advancing form --
+        // the live counter is what the rebuild must not fall below.
+        partition.persist_offset_frontier().await;
         match partition.quarantine_partition_dir().await {
             Ok(Some(fenced_dir)) => tracing::error!(
                 shard = self.id,
@@ -6062,14 +6093,25 @@ where
                  inspection and never read again"
             ),
             Ok(None) => {}
-            Err(error) => tracing::error!(
-                shard = self.id,
-                namespace_raw = namespace.inner(),
-                %error,
-                "failed to quarantine the fenced partition's segment files; the rebuild \
-                 does NOT re-read them -- `build_partition_fresh` plants segment 0 with \
-                 `file_exists = false` and truncates whatever remains"
-            ),
+            Err(error) => {
+                // NO rebuild: `build_partition_fresh` plants segment 0 with
+                // `file_exists = false`, truncating whatever the failed
+                // quarantine left, so a rebuild here eats the chain one segment
+                // per attempt. Tombstone and stop -- the bytes stay for an
+                // operator, and the boot path makes the same call. The
+                // partition stays unreachable until it is dealt with; that is
+                // the intended fence, not a wait.
+                tracing::error!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    %error,
+                    "failed to quarantine the fenced partition's segment files; leaving it \
+                     tombstoned rather than rebuilding over them"
+                );
+                self.plane.partitions().tombstone(namespace);
+                self.shards_table.remove(&namespace);
+                return;
+            }
         }
         self.plane.partitions().tombstone(namespace);
         self.shards_table.remove(&namespace);
@@ -6854,7 +6896,13 @@ where
     /// counter on every chunk it fetches, so only an abandoned or finished
     /// transfer ages out.
     fn expire_idle_state_transfer_offers(&self) {
-        self.served_segment_cache.borrow_mut().expire_idle();
+        // Same clock the offers below age on: `retry_ticks * MULTIPLE` ticks,
+        // and this sweep runs once per tick.
+        let payload_idle_sweeps = u64::from(self.repair_retry_ticks.get().max(1))
+            * u64::from(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE);
+        self.served_segment_cache
+            .borrow_mut()
+            .expire_idle(payload_idle_sweeps);
         // `max(1)`: the retry interval is operator-configurable, and a zero would
         // make the expiry zero, dropping every offer on the tick after it was
         // built and breaking transfers outright.

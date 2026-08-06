@@ -277,6 +277,14 @@ impl ShardMetrics {
         self.partition_transfer_refusals_total.inc();
     }
 
+    /// Test-only read, mirroring the siblings; the production scrape goes
+    /// through the prometheus registry.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_transfer_refusals_value(&self) -> u64 {
+        self.partition_transfer_refusals_total.get()
+    }
+
     /// Bumped when a parked partition frame is answered instead of served
     /// because it was addressed to an incarnation this shard no longer holds
     /// (delete + recreate recycled the namespace's slab keys). Serving it would

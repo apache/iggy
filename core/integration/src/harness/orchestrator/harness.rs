@@ -518,6 +518,23 @@ impl TestHarness {
             .await
     }
 
+    /// Root-authenticated TCP client bound to ONE node of a cluster, unlike
+    /// [`Self::root_client_for`], which always targets node 0.
+    ///
+    /// # Errors
+    ///
+    /// [`TestBinaryError::MissingServer`] when `index` is out of range, or the
+    /// underlying connect/login failure.
+    pub async fn root_client_for_node(&self, index: usize) -> Result<IggyClient, TestBinaryError> {
+        self.servers
+            .get(index)
+            .ok_or(TestBinaryError::MissingServer)?
+            .tcp_client()?
+            .with_root_login()
+            .connect()
+            .await
+    }
+
     /// Create a new client logged in as root for the specified transport.
     pub fn client_builder_for(
         &self,

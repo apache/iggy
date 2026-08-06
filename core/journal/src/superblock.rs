@@ -70,10 +70,12 @@ const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
 
 /// Ceiling on a record's payload, bounding every allocation this module makes from
 /// a length it read off disk (`PrepareJournal::MAX_ENTRY_SIZE` bounds the WAL for the
-/// same reason). The only payload today is a 58-byte [`VsrState`]; the headroom is
-/// for a payload that grows fields, not for bulk data. `read_slot` treats a longer
-/// file as corrupt WITHOUT reading it, and `build_record` refuses to write one, so a
-/// length this store could have produced is always in bounds.
+/// same reason). The only payload today is a [`consensus::VsrState`], 66 bytes now
+/// that it carries the offset frontier (58 before it, a length its decode still
+/// accepts); the headroom is for a payload that grows fields, not for bulk data.
+/// `read_slot` treats a longer file as corrupt WITHOUT reading it, and
+/// `build_record` refuses to write one, so a length this store could have
+/// produced is always in bounds.
 const MAX_PAYLOAD_LEN: usize = 4096;
 /// Largest record `read_slot` will read into memory.
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN;

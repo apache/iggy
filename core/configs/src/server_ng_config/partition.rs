@@ -55,6 +55,18 @@ pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
 /// sizing endorsement.
 pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 256;
 
+/// Mirrors `shard::IggyShard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment ceiling
+/// plus the one whole batch a segment may close past it).
+pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 = 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+
+/// Mirrors `shard::ServedSegmentCache::RESIDENT_BYTES_DEFAULT`.
+pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Upper bound on the two state-transfer byte knobs. A typo guard, not a sizing
+/// endorsement: both are PER SHARD, so a slipped digit multiplies by the core
+/// count.
+pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Mirrors `partitions::EVICTED_RING_CAPACITY`.
 pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
 
@@ -142,12 +154,24 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if self.transfer_served_cache_bytes_max.as_bytes_u64() == 0 {
-            eprintln!("{COMPONENT_NG} partition.transfer_served_cache_bytes_max must be > 0");
+        // The FLOOR on `transfer_artifact_bytes_max` cannot live here (it needs
+        // `system.segment.size` and the bus cap); it is enforced in the
+        // `ServerNgConfig` validator, which is what turns that misconfiguration
+        // into a boot error instead of a silent per-partition rejoin livelock.
+        let served_cache = self.transfer_served_cache_bytes_max.as_bytes_u64();
+        if served_cache == 0 || served_cache > MAX_TRANSFER_BYTES {
+            eprintln!(
+                "{COMPONENT_NG} partition.transfer_served_cache_bytes_max ({served_cache} bytes) \
+                 must be > 0 and <= {MAX_TRANSFER_BYTES} bytes"
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if self.transfer_artifact_bytes_max.as_bytes_u64() == 0 {
-            eprintln!("{COMPONENT_NG} partition.transfer_artifact_bytes_max must be > 0");
+        let artifact_bytes = self.transfer_artifact_bytes_max.as_bytes_u64();
+        if artifact_bytes == 0 || artifact_bytes > MAX_TRANSFER_BYTES {
+            eprintln!(
+                "{COMPONENT_NG} partition.transfer_artifact_bytes_max ({artifact_bytes} bytes) \
+                 must be > 0 and <= {MAX_TRANSFER_BYTES} bytes"
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         let ring_bytes = self.evicted_ring_bytes_max.as_bytes_u64();
@@ -174,6 +198,25 @@ mod tests {
         // `Default` reads the shipped config.toml; the pristine deployment
         // must validate.
         assert!(PartitionConfig::default().validate().is_ok());
+    }
+
+    /// The shipped TOML strings are the only thing an operator sees, and nothing
+    /// else ties them to the constants the code sizes itself against -- a
+    /// decimal/binary slip ("1088 MB" for 1088 MiB) parses fine and ships a cap
+    /// BELOW the largest legal segment, which livelocks a rejoin per partition.
+    #[test]
+    fn shipped_transfer_defaults_match_the_runtime_constants() {
+        let config = PartitionConfig::default();
+        assert_eq!(
+            config.transfer_artifact_bytes_max.as_bytes_u64(),
+            DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX,
+            "config.toml transfer_artifact_bytes_max drifted from the runtime default"
+        );
+        assert_eq!(
+            config.transfer_served_cache_bytes_max.as_bytes_u64(),
+            DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX,
+            "config.toml transfer_served_cache_bytes_max drifted from the runtime default"
+        );
     }
 
     #[test]

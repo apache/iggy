@@ -624,6 +624,14 @@ where
                         .clean_expired_segments(now, message_expiry, max_bytes)
                         .await;
                     if segments > 0 {
+                        // Any unlink invalidates what this shard is SERVING:
+                        // the offer names files that are gone and the payload
+                        // cache can answer from RAM without touching disk, so a
+                        // puller would install deleted messages. Neither cache
+                        // can notice on its own -- one is keyed on the
+                        // partition's commit_op, which retention does not move,
+                        // the other on a checksum over the deleted bytes.
+                        self.drop_partition_transfer_state(namespace, partition);
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
@@ -645,6 +653,11 @@ where
                     let (segments, messages) =
                         partition.remove_sealed_segments_up_to(up_to_offset).await;
                     if segments > 0 {
+                        // See the cleaner arm: a truncate commits on the
+                        // METADATA plane, so this partition's commit_op never
+                        // moves and the cached offer stays a hit over unlinked
+                        // files.
+                        self.drop_partition_transfer_state(namespace, partition);
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
@@ -677,8 +690,7 @@ where
                             // disk, so a puller would install purged data. Both
                             // are keyed on pre-purge content, so neither can
                             // notice on its own.
-                            partition.clear_state_transfer_offer_cache();
-                            self.drop_served_state_for(namespace.inner());
+                            self.drop_partition_transfer_state(namespace, partition);
                             tracing::debug!(
                                 shard = self.id,
                                 namespace_raw = namespace.inner(),
@@ -700,6 +712,9 @@ where
                                 %error,
                                 "purge-partition failed to reset partition; fencing it for rebuild"
                             );
+                            // Fenced, but the caches still describe the
+                            // pre-purge bytes until the rebuild lands.
+                            self.drop_partition_transfer_state(namespace, partition);
                             self.fence_partition_for_rebuild(namespace, partition).await;
                         }
                     }

@@ -28,11 +28,23 @@
 
 use std::fmt;
 
-/// Number of bytes [`VsrState::to_bytes`] produces and [`VsrState::try_from`]
-/// expects: `cluster`(16) + `replica_id`(1) + `replica_count`(1) + `view`(4)
-/// + `log_view`(4) + `commit_max`(8) + `checkpoint_op`(8)
-/// + `checkpoint_checksum`(16) + `offset_frontier`(8).
+/// Number of bytes [`VsrState::to_bytes`] produces: `cluster`(16) +
+/// `replica_id`(1) + `replica_count`(1) + `view`(4) + `log_view`(4) +
+/// `commit_max`(8) + `checkpoint_op`(8) + `checkpoint_checksum`(16) +
+/// `offset_frontier`(8).
 pub const ENCODED_LEN: usize = 66;
+
+/// The layout before `offset_frontier` was appended.
+///
+/// [`VsrState::try_from`] still accepts records of this length and zero-fills
+/// the new field. Without it every superblock already on disk -- the metadata
+/// plane writes one on every view change and checkpoint, single-node included --
+/// would decode as [`VsrStateError::WrongLength`] and refuse boot as a
+/// durability violation. A version bump instead of this would not help on its
+/// own: `classify` compares the version for exact equality, so a v2 build turns
+/// every v1 record into `Unreadable`, which is the same refusal wearing a
+/// different name.
+pub const ENCODED_LEN_WITHOUT_FRONTIER: usize = 58;
 
 /// The durable consensus state of one replica for one consensus group.
 ///
@@ -109,13 +121,25 @@ impl TryFrom<&[u8]> for VsrState {
     type Error = VsrStateError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        // One length check up front puts every field slice below in bounds by
-        // construction, so the `try_into`s cannot fail.
-        let bytes: &[u8; ENCODED_LEN] =
-            bytes.try_into().map_err(|_| VsrStateError::WrongLength {
-                expected: ENCODED_LEN,
-                actual: bytes.len(),
-            })?;
+        // Length-tolerant: a pre-`offset_frontier` record is padded out and the
+        // new field reads as 0, which is exactly "no recorded frontier" (the
+        // read sites filter it). One length check up front then puts every
+        // field slice below in bounds by construction, so the `try_into`s
+        // cannot fail.
+        let mut padded = [0u8; ENCODED_LEN];
+        match bytes.len() {
+            ENCODED_LEN => padded.copy_from_slice(bytes),
+            ENCODED_LEN_WITHOUT_FRONTIER => {
+                padded[..ENCODED_LEN_WITHOUT_FRONTIER].copy_from_slice(bytes);
+            }
+            actual => {
+                return Err(VsrStateError::WrongLength {
+                    expected: ENCODED_LEN,
+                    actual,
+                });
+            }
+        }
+        let bytes = &padded;
         let state = Self {
             cluster: u128::from_le_bytes(field(bytes, 0)),
             replica_id: bytes[16],
@@ -213,6 +237,41 @@ mod tests {
         assert!(VsrState::try_from(&bytes[..ENCODED_LEN - 1]).is_err());
     }
 
+    /// A superblock written before `offset_frontier` existed must still decode:
+    /// the metadata plane writes one on every view change, so an exact-length
+    /// decode turns an in-place upgrade into a boot refusal on every deployment
+    /// that ever ran.
+    #[test]
+    fn given_pre_frontier_record_when_decoded_should_accept_and_zero_fill() {
+        let full = VsrState {
+            cluster: 3,
+            replica_id: 1,
+            replica_count: 3,
+            view: 9,
+            log_view: 8,
+            commit_max: 41,
+            checkpoint_op: 7,
+            checkpoint_checksum: 5,
+            offset_frontier: 77,
+        }
+        .to_bytes();
+
+        let legacy = &full[..ENCODED_LEN_WITHOUT_FRONTIER];
+        let decoded = VsrState::try_from(legacy).expect("a pre-frontier record must decode");
+        assert_eq!(decoded.offset_frontier, 0, "the new field zero-fills");
+        assert_eq!(decoded.view, 9);
+        assert_eq!(decoded.log_view, 8);
+        assert_eq!(decoded.commit_max, 41);
+        assert_eq!(decoded.checkpoint_op, 7);
+        assert_eq!(decoded.checkpoint_checksum, 5);
+
+        // Anything that is neither layout is still refused.
+        assert!(matches!(
+            VsrState::try_from(&full[..40]),
+            Err(VsrStateError::WrongLength { .. })
+        ));
+    }
+
     #[test]
     fn given_log_view_past_view_when_decoded_should_reject() {
         // Corruption inside the checksummed region can produce a length-valid record
@@ -228,9 +287,12 @@ mod tests {
             commit_max: 0,
             checkpoint_op: 0,
             checkpoint_checksum: 0,
-            offset_frontier: 0,
+            // Distinct and nonzero: with 0 here a transposed write over the
+            // trailing field would still satisfy every assertion below.
+            offset_frontier: 9,
         }
         .to_bytes();
+        assert_eq!(bytes[58], 9, "offset_frontier must occupy bytes 58..66");
         bytes[22] = 5; // log_view = 5, view stays 4
 
         assert_eq!(

@@ -85,7 +85,10 @@ const MARKER_POLL: Duration = Duration::from_millis(200);
 async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_partition(
     harness: &mut TestHarness,
 ) {
-    let client = connect(harness, 0).await;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
     seed_partition(&client).await;
     client
         .store_consumer_offset(
@@ -186,7 +189,10 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
     // Node 2 holds a durable prefix, then misses enough traffic that the
     // survivors' ring moves past its durable end: its repaired window cannot
     // connect, which is exactly the refusal-site trigger.
-    let client = connect(harness, 0).await;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
     seed_topic(&client).await;
     produce(&client, 40).await;
     sleep(Duration::from_secs(1)).await;
@@ -204,6 +210,21 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
     // buffered non-blocking appender, so a survivor's line can trail node 2's
     // install by more than one poll.
     await_marker_any(harness, &[0, 1], FULLY_SERVED_MARKER).await;
+
+    // The markers only say the machinery ran. Read node 2's OWN segment bytes
+    // and check every produced payload is there, in ascending file order: a
+    // truncated, short or reordered install fails here and passes above.
+    //
+    // Read off disk rather than polled: the SDK is leader-aware and redirects
+    // a poll to the primary, so no client-side read can be pinned to the
+    // rejoined node.
+    // Two produce runs, each numbering its payloads from 0, so the expected
+    // chain is 0..40 followed by 0..MESSAGES_COUNT.
+    let expected: Vec<String> = (0..40)
+        .chain(0..MESSAGES_COUNT)
+        .map(|sequence| format!("message-{sequence}"))
+        .collect();
+    await_installed_payloads(harness, 2, &expected).await;
 }
 
 #[iggy_harness(
@@ -225,7 +246,10 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
 async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partition(
     harness: &mut TestHarness,
 ) {
-    let client = connect(harness, 0).await;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
     seed_topic(&client).await;
     // Bulky payloads so the pull spans many 256 KiB chunks: the kill below
     // must land while the transfer is provably in flight, and a small
@@ -258,19 +282,30 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
         );
         sleep(KILL_GATE_POLL).await;
     }
+    // Baselines BEFORE the kill. Every marker check below counts occurrences
+    // against these instead of scanning the whole accumulated log: node 2 can
+    // have installed and node 1 can have fully served an earlier attempt while
+    // node 0 was still up, and a `contains` would call those the recovery.
+    let installs_before_kill = harness.node(2).stdout_occurrences(INSTALL_MARKER);
+    let served_before_kill = harness.node(1).stdout_occurrences(FULLY_SERVED_MARKER);
+    let abandons_before_kill = harness.node(2).stdout_occurrences(ABANDON_MARKER);
     harness
         .stop_node(0)
         .expect("stop the serving peer (node 0)");
 
     // The abandon is now deterministic: the pull was in flight against a
     // peer that is gone, so the stall budget must exhaust.
-    await_marker(harness, 2, ABANDON_MARKER).await;
+    await_new_marker(harness, 2, ABANDON_MARKER, abandons_before_kill).await;
 
     // Recovery: the scheduled re-arm targets the surviving primary. No
     // follow-up commit is asserted -- the cluster is quorum-marginal with
     // one node down, and an unanswered read mid-election is not a verdict.
-    await_marker(harness, 2, INSTALL_MARKER).await;
-    await_marker_any(harness, &[1], FULLY_SERVED_MARKER).await;
+    //
+    // Node 1 is named explicitly, not "any survivor": with node 0 dead it is
+    // the only replica left that can serve, so a marker from it is proof the
+    // re-arm found a new peer rather than proof of the pre-kill attempt.
+    await_new_marker(harness, 2, INSTALL_MARKER, installs_before_kill).await;
+    await_new_marker(harness, 1, FULLY_SERVED_MARKER, served_before_kill).await;
 
     // The manifest the install consumed carried one artifact per sealed
     // segment, and each was spilled and renamed separately: the seeded 64 MiB
@@ -289,18 +324,6 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
         );
         sleep(MARKER_POLL).await;
     }
-}
-
-/// Connect a root-authenticated TCP client to a specific node.
-async fn connect(harness: &TestHarness, node: usize) -> IggyClient {
-    harness
-        .node(node)
-        .tcp_client()
-        .expect("tcp client builder")
-        .with_root_login()
-        .connect()
-        .await
-        .unwrap_or_else(|e| panic!("connect to node {node}: {e}"))
 }
 
 async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClient> {
@@ -393,6 +416,85 @@ async fn poll_count(client: &IggyClient, count: u32) -> Result<u32, IggyError> {
         .await?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(polled.messages.len() as u32)
+}
+
+/// Polls node `node`'s installed segment files until every payload in
+/// `expected` is present, in the order given.
+///
+/// The payloads are the oracle the markers are not: a short install is missing
+/// the tail, a torn one is missing a middle, and a reordered one fails the
+/// ascending-position check.
+async fn await_installed_payloads(harness: &TestHarness, node: usize, expected: &[String]) {
+    let data_path = harness.node(node).data_path();
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    loop {
+        if let Err(missing) = installed_payloads_complete(&data_path, expected) {
+            assert!(
+                Instant::now() < deadline,
+                "node {node}'s installed segments never held the whole produced batch: {missing}"
+            );
+            sleep(MARKER_POLL).await;
+            continue;
+        }
+        return;
+    }
+}
+
+/// `Ok(())` when every payload in `expected` appears in node-local segment
+/// bytes at a non-decreasing position, otherwise the first discrepancy.
+fn installed_payloads_complete(data_path: &Path, expected: &[String]) -> Result<(), String> {
+    let mut chain = Vec::new();
+    let mut paths = Vec::new();
+    let _ = walk(data_path, &mut |path| {
+        if is_segment_log(path) {
+            paths.push(path.to_path_buf());
+        }
+        false
+    });
+    // Segment files are named for their zero-padded base offset, so lexical
+    // order is offset order.
+    paths.sort();
+    for path in paths {
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Err(format!("{} could not be read", path.display()));
+        };
+        chain.extend_from_slice(&bytes);
+    }
+    let mut searched_from = 0;
+    for payload in expected {
+        let found = chain[searched_from..]
+            .windows(payload.len())
+            .position(|window| window == payload.as_bytes())
+            // A bare find would match `message-1` inside `message-10`.
+            .map(|offset| searched_from + offset)
+            .filter(|start| {
+                chain
+                    .get(start + payload.len())
+                    .is_none_or(|byte| !byte.is_ascii_digit())
+            });
+        let Some(start) = found else {
+            return Err(format!(
+                "{payload:?} is absent from the {} installed bytes after position {searched_from}",
+                chain.len()
+            ));
+        };
+        searched_from = start;
+    }
+    Ok(())
+}
+
+/// [`await_marker`], but satisfied only by an occurrence beyond `baseline` -
+/// the whole-log scan cannot distinguish a line from before the fault.
+async fn await_new_marker(harness: &TestHarness, node: usize, marker: &str, baseline: usize) {
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    while harness.node(node).stdout_occurrences(marker) <= baseline {
+        assert!(
+            Instant::now() < deadline,
+            "node {node} never logged {marker:?} again after the fault \
+             (still at the pre-fault count of {baseline}) within {TRANSFER_BUDGET:?}"
+        );
+        sleep(MARKER_POLL).await;
+    }
 }
 
 /// [`await_marker`] over a set of nodes: satisfied by the first one to log it.

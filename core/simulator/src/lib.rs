@@ -368,45 +368,11 @@ impl Simulator {
     /// mesh construction caps it at `u16`).
     #[allow(clippy::cast_possible_truncation)]
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
-        for (i, replica) in self.replicas.iter_mut().enumerate() {
+        for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
             }
-            let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
-            let owner = calculate_shard_assignment(&namespace, shard_count);
-            // One store per group, minted on first materialisation and reused on
-            // every later one, so the recorded view survives a replica restart.
-            let superblock = Rc::clone(
-                replica
-                    .partition_superblocks
-                    .borrow_mut()
-                    .entry(namespace)
-                    .or_default(),
-            );
-            let recovered_state = superblock
-                .read_latest_sync()
-                .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
-            replica.shards[usize::from(owner)].init_partition(
-                namespace,
-                Some(superblock),
-                recovered_state,
-            );
-            // Commit the namespace before stamping the rows: a partition the
-            // metadata plane never heard of is a shape production cannot
-            // produce, and the shard refuses to serve client traffic whose
-            // routing-row epoch it cannot match against a committed
-            // `created_revision`.
-            let streams = replica.shards[0].plane.metadata().mux_stm.streams();
-            streams.seed_namespace(namespace, namespace.inner());
-            let epoch = streams
-                .created_revision_for_namespace(namespace)
-                .expect("namespace committed by the seed above");
-            for shard in &replica.shards {
-                shard.shards_table().insert(
-                    namespace,
-                    PartitionLocation::new(ShardId::new(owner), epoch),
-                );
-            }
+            materialise_partition(replica, namespace);
         }
     }
 
@@ -847,6 +813,25 @@ impl Simulator {
             pump_tasks,
         };
 
+        // Re-materialise every group this replica had before the crash, as a
+        // rebooted server-ng re-opens every partition directory it owns. This
+        // is what makes the carried-forward superblock load-bearing: the group
+        // recovers the `(view, log_view)` it recorded instead of re-entering
+        // view 0.
+        // SORTED: `HashMap` iteration order is seeded per process, and
+        // materialisation order is observable (shard init order, routing-row
+        // stamps), so replay would stop being byte-identical.
+        let mut materialised: Vec<IggyNamespace> = self.replicas[idx]
+            .partition_superblocks
+            .borrow()
+            .keys()
+            .copied()
+            .collect();
+        materialised.sort_unstable_by_key(IggyNamespace::inner);
+        for namespace in materialised {
+            materialise_partition(&self.replicas[idx], namespace);
+        }
+
         // Reconnect to the network and mark the replica live again.
         self.network
             .process_enable(ProcessId::Replica(replica_index));
@@ -953,6 +938,46 @@ impl Simulator {
                 let consensus = partition.consensus();
                 Some(consensus.primary_index(consensus.view()))
             })
+    }
+}
+
+/// Materialises `namespace` on its hash-owning shard of one replica and stamps
+/// the routing row on every shard of that replica.
+///
+/// Shared by [`SimCluster::init_partition`] and the restart path: a rebooted
+/// server-ng re-opens every partition directory it owns, so the sim has to
+/// re-materialise too, otherwise the superblock a restart carries forward is
+/// never read back and the recovered-view branch is dead code.
+fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
+    let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
+    let owner = calculate_shard_assignment(&namespace, shard_count);
+    // One store per group, minted on first materialisation and reused on every
+    // later one, so the recorded view survives a replica restart.
+    let superblock = Rc::clone(
+        replica
+            .partition_superblocks
+            .borrow_mut()
+            .entry(namespace)
+            .or_default(),
+    );
+    let recovered_state = superblock
+        .read_latest_sync()
+        .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
+    replica.shards[usize::from(owner)].init_partition(namespace, Some(superblock), recovered_state);
+    // Commit the namespace before stamping the rows: a partition the metadata
+    // plane never heard of is a shape production cannot produce, and the shard
+    // refuses to serve client traffic whose routing-row epoch it cannot match
+    // against a committed `created_revision`.
+    let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+    streams.seed_namespace(namespace, namespace.inner());
+    let epoch = streams
+        .created_revision_for_namespace(namespace)
+        .expect("namespace committed by the seed above");
+    for shard in &replica.shards {
+        shard.shards_table().insert(
+            namespace,
+            PartitionLocation::new(ShardId::new(owner), epoch),
+        );
     }
 }
 

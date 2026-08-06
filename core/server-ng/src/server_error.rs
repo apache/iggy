@@ -110,16 +110,23 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
-    // Refuses boot rather than treating the group as fresh or reading through
-    // to a superseded view: mirrors the metadata plane's
-    // `RecoveryError::SuperblockUnreadable` policy. Quarantining just the one
-    // partition is future work; skipping it here could hand the reconciler a
-    // reason to re-create it empty.
+    // Quarantines the one partition rather than treating the group as fresh or
+    // reading through to a superseded view: mirrors the metadata plane's
+    // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
+    // because one unreadable partition directory must not strand every healthy
+    // group on the shard.
     #[error(
-        "partition superblock at {dir} holds no record this build can trust \
-         (version {version:?}); refusing boot"
+        "partition superblock at {dir} is present but its format version \
+         {version} is unrecognized by this build (a downgrade, or a corrupt \
+         version field)"
     )]
-    PartitionSuperblockUnreadable { dir: PathBuf, version: Option<u16> },
+    PartitionSuperblockVersionUnknown { dir: PathBuf, version: u16 },
+    #[error(
+        "partition superblock at {dir} is present but a copy holds bytes that \
+         do not verify (bit-rot or a checksum failure), so its latest \
+         generation cannot be established"
+    )]
+    PartitionSuperblockUnverifiable { dir: PathBuf },
     #[error(
         "partition superblock at {dir} was checksum-clean but did not decode; \
          refusing boot rather than infer a stale view"

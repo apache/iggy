@@ -501,6 +501,16 @@ where
     /// THIS partition's group is fenced; the rest of the node keeps serving.
     #[allow(clippy::future_not_send)]
     async fn write_superblock(&self, superblock: &SB, offset_frontier: u64) -> bool {
+        // ADVANCE direction: never below what this replica has already minted.
+        // The reset direction (purge) goes through `write_superblock_inner`.
+        let advanced = offset_frontier.max(self.offset_frontier());
+        self.write_superblock_inner(superblock, advanced).await
+    }
+
+    /// The write itself; the advance and reset directions differ only in the
+    /// frontier they hand in.
+    #[allow(clippy::future_not_send)]
+    async fn write_superblock_inner(&self, superblock: &SB, offset_frontier: u64) -> bool {
         // The pairing fields stay `(0, 0)` and `commit_max` is a dead write
         // on this plane: nothing reads either back (`restore_partition_view`
         // restores view/log_view only), because recovery re-derives the
@@ -514,9 +524,7 @@ where
         // view change, or the explicit persist an install issues) leaves a
         // lower bound boot can re-seed from.
         let mut state = self.consensus.vsr_state(0, 0);
-        // Never regresses: a caller recording an incoming frontier passes a
-        // larger value, and the ordinary gate passes the live counter.
-        state.offset_frontier = offset_frontier.max(self.offset_frontier());
+        state.offset_frontier = offset_frontier;
         match superblock.write(&state.to_bytes()).await {
             Ok(()) => {
                 self.consensus
@@ -581,6 +589,26 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn persist_offset_frontier(&self) -> bool {
         self.persist_offset_frontier_at(self.offset_frontier())
+            .await
+    }
+
+    /// Record a frontier that may be LOWER than the one already on disk.
+    ///
+    /// The frontier is conditionally monotone: it advances everywhere except a
+    /// purge, which legitimately resets the offset space to 0. The advancing
+    /// form cannot express that -- it maxes against the live counter -- and the
+    /// distinction has to be explicit: a purge that leaves the old frontier
+    /// recorded makes the next boot re-seed the counter to the state the purge
+    /// just erased, and the following append stamps `base_offset` N where every
+    /// peer stamps 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn reset_offset_frontier(&self) -> bool {
+        let Some(superblock) = self.superblock.as_ref().map(Rc::clone) else {
+            return true;
+        };
+        let _superblock_guard = self.superblock_lock.acquire().await;
+        let frontier = self.offset_frontier();
+        self.write_superblock_inner(superblock.as_ref(), frontier)
             .await
     }
 
@@ -3504,8 +3532,19 @@ where
             crate::state_transfer::sweep_staging_except(&partition_dir, &[]).await;
         }
 
-        // Recreate a fresh empty segment at offset 0 with real writers.
         let start_offset = 0u64;
+        // Counters reset BEFORE the fallible plant, not after: `?` on
+        // `install_empty_segment` would otherwise leave the live counter at the
+        // pre-purge value, which is what the router's purge-failure fence then
+        // records and what a restart would re-seed. Safe to reorder --
+        // `install_empty_segment` takes `start_offset` as a parameter and never
+        // reads the counter, and the partition write lock is held across this
+        // whole body.
+        self.offset.store(start_offset, Ordering::Release);
+        self.dirty_offset.store(start_offset, Ordering::Relaxed);
+        self.should_increment_offset = false;
+
+        // Recreate a fresh empty segment at offset 0 with real writers.
         self.install_empty_segment(config, start_offset).await?;
         // Make the unlinks AND the replanted dirent durable together: without
         // this a crash can resurrect pre-purge segments until the boot re-purge
@@ -3513,11 +3552,6 @@ where
         if let Some(partition_dir) = self.partition_dir.clone() {
             let _ = crate::state_transfer::fsync_dir(&partition_dir).await;
         }
-
-        // Reset the offset counters so new messages start at offset 0.
-        self.offset.store(start_offset, Ordering::Release);
-        self.dirty_offset.store(start_offset, Ordering::Relaxed);
-        self.should_increment_offset = false;
         // The boot-time durable line marks recovered bytes that must not be
         // re-persisted, but the purge just deleted those bytes and offsets
         // restart at 0. Keeping it would make every post-purge batch at or
@@ -3592,6 +3626,12 @@ where
         // Same commit frontier, different (now empty) bytes: a cached offer
         // built pre-purge would advertise files the purge just unlinked.
         self.transfer_offer_cache.borrow_mut().take();
+        // RESET, not advance: the durable frontier still names the pre-purge
+        // offset space, and leaving it there makes the next boot re-seed the
+        // counter to the state this purge just erased -- after which the first
+        // append stamps `base_offset` N while every peer stamps 0. The live
+        // counter is 0 by now, so the reset records 0.
+        self.reset_offset_frontier().await;
         Ok(())
     }
 

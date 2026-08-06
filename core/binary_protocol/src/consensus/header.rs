@@ -1426,11 +1426,11 @@ pub struct StateTransferTargetHeader {
     /// load.
     ///
     /// This and `commit_max` below claim the HEAD of what used to be the
-    /// reserved tail, so every pre-existing field keeps its published offset:
-    /// this header ships in the `iggy_binary_protocol` crate, the size assert
-    /// cannot catch an equal-size reshuffle, and nothing on the link carries a
-    /// version signal -- a mid-struct insertion is silent non-interop between
-    /// mixed builds.
+    /// reserved tail, so every pre-existing field keeps its published offset.
+    /// Layout compatibility only: the size assert cannot catch an equal-size
+    /// reshuffle, so a mid-struct insertion would silently move every field
+    /// after it. It says nothing about the semantics of these two -- an older
+    /// peer presents zeros here and serves no partition transfers at all.
     pub unavailable_transient: u8,
     /// Explicit padding so `commit_max` sits 8-aligned without the implicit
     /// padding `NoUninit` forbids.

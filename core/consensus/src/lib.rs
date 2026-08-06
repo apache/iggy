@@ -155,8 +155,8 @@ pub use client_table::{
 };
 pub mod state_manifest;
 pub use state_manifest::{
-    StateArtifact, StateManifestError, artifact_kind, decode_state_manifest, encode_state_manifest,
-    state_artifact_checksum,
+    StateArtifact, StateArtifactHasher, StateManifestError, artifact_kind, decode_state_manifest,
+    encode_state_manifest, state_artifact_checksum,
 };
 pub mod state_transfer;
 pub use state_transfer::{

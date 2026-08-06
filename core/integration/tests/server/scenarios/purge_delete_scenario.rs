@@ -975,6 +975,11 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
         .purge_topic(&stream_ident, &topic_ident)
         .await
         .unwrap();
+    // Sampled BEFORE the restart: if the purge already drained the offset
+    // directories, a restart may not resurrect them, and the assert below stays
+    // instant even in the restart cells. Only the kill-lands-mid-purge case
+    // earns a tolerance.
+    let drained_before_restart = is_dir_empty(&consumers_dir) && is_dir_empty(&groups_dir);
     maybe_restart(harness, restart_server).await;
 
     // server-ng purges asynchronously (metadata commit -> reconciler -> pump);
@@ -985,22 +990,17 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     await_segment_layout(&partition_path, &[0]).await;
 
     // --- Verify consumer offsets cleared (memory + disk) ---
-    // Polled ONLY in the restart cells: there the kill can land mid-purge, and
-    // boot then plants the [0] layout itself (fencing a torn chain, or
-    // recovering an already-drained directory) with the offset files still
-    // present -- the layout gate above is satisfied BEFORE the reconciler's
-    // re-purge (the applied generation is not persisted, so a restart
-    // re-purges) clears them. Without a restart the pump clears offsets and
-    // files in the SAME frame that plants the layout, so the instant assert is
-    // correct there and strictly stronger; a poll would hide a regression that
-    // clears them one frame late.
-    // vsr-only, and only for the restart cells: the legacy flavor purges
-    // synchronously, and without a restart the pump clears offsets and files in
-    // the SAME frame that plants the layout, so the instant assert is correct
-    // and strictly stronger there. Kept short -- a client-visible stale offset
-    // after purge-then-restart is a real (bounded) window, not something to
-    // paper over with a long tolerance.
-    let poll_window = if cfg!(feature = "vsr") && restart_server {
+    // ZERO tolerance everywhere except one cell: vsr + restart where the kill
+    // landed mid-purge. There boot plants the [0] layout itself (fencing a torn
+    // chain, or recovering an already-drained directory) with the offset files
+    // still present, so the layout gate above is satisfied BEFORE the
+    // reconciler's re-purge clears them (the applied generation is not
+    // persisted, so a restart re-purges). Everywhere else the pump clears
+    // offsets and files in the SAME frame that plants the layout, and a poll
+    // would hide a regression that clears them one frame late. Kept short --
+    // a client-visible stale offset after purge-then-restart is a real
+    // (bounded) window, not something to paper over with a long tolerance.
+    let poll_window = if cfg!(feature = "vsr") && restart_server && !drained_before_restart {
         std::time::Duration::from_secs(2)
     } else {
         std::time::Duration::ZERO

@@ -32,6 +32,12 @@ use std::cell::{Cell, RefCell};
 
 /// See the module docs. Callers hold the returned guard across the awaited
 /// critical section; dropping it releases the gate and wakes every waiter.
+///
+/// Its exclusion is load-bearing in RELEASE, not only under
+/// `debug_assertions`: this gate is the only enforcement of the superblock
+/// single-writer contract there. The `WritingGuard` tripwire is debug-only,
+/// `PingPongSuperblock::write` takes `&self`, and two overlapping writers
+/// collide on one fixed `.tmp` path and tear a slot while both return `Ok`.
 pub struct LocalGate {
     busy: Cell<bool>,
     waiters: RefCell<Vec<std::task::Waker>>,
@@ -74,9 +80,14 @@ impl<'a> std::future::Future for LocalGateAcquire<'a> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if self.gate.busy.get() {
-            // Re-polls while still busy push a duplicate waker; the extra
-            // wake is spurious and harmless at pipeline-queue scale.
-            self.gate.waiters.borrow_mut().push(cx.waker().clone());
+            // Deduped, not appended: a waiter driven by a multi-source driver
+            // (`select!`, `join!`) is re-polled on every unrelated wake, and
+            // release wakes the whole list, so a bare push makes draining n
+            // contenders O(n^2) waker clones.
+            let mut waiters = self.gate.waiters.borrow_mut();
+            if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
             std::task::Poll::Pending
         } else {
             self.gate.busy.set(true);
@@ -103,11 +114,6 @@ impl Drop for LocalGateGuard<'_> {
     }
 }
 
-// NOT behind `cfg(debug_assertions)`: release is exactly the build where this
-// gate is the only enforcement of the superblock single-writer contract (the
-// `WritingGuard` tripwire is debug-only, `write` takes `&self`, and two
-// overlapping writers collide on one fixed `.tmp` path and tear a slot while
-// both return `Ok`).
 #[cfg(test)]
 mod tests {
     use super::*;

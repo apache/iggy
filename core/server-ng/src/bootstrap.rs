@@ -133,10 +133,11 @@ pub(crate) type ServerNgMetadata = IggyMetadata<
 
 /// The shard type the dispatch layer is generic over.
 ///
-/// `B`/`MJ`/`S` are free; the metadata state machine (`M`) and shards table
-/// (`T`) are pinned, being identical in production and the simulator.
-/// Production instantiates it as [`ServerNgShard`]; the simulator supplies its
-/// own `B`/`MJ`/`S`.
+/// `B`/`MJ`/`S`/`SB` are free; the metadata state machine (`M`) and shards
+/// table (`T`) are pinned, being identical in production and the simulator.
+/// Production instantiates it as [`ServerNgShard`], defaulting `SB` to the
+/// on-disk [`PingPongSuperblock`]; the simulator supplies its own
+/// `B`/`MJ`/`S`/`SB`.
 pub type ShellShard<B, MJ, S, SB = PingPongSuperblock> =
     IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable, SB>;
 
@@ -1808,6 +1809,33 @@ async fn build_shard_for_thread(
                 )
                 .await?
             }
+            // An untrustworthy superblock fences ONE group, not the node. The
+            // segment files stay exactly where they are -- unlike a refused
+            // chain, the data on disk is not the thing in doubt -- so there is
+            // nothing to quarantine and nothing to rebuild: rebuilding fresh
+            // would hand this replica a view-0 identity while a record it
+            // cannot read says otherwise. Tombstoned, the namespace stays
+            // unmaterialised and unrouted, the reconciler backs off, and an
+            // operator has every byte plus a message naming the directory.
+            Err(
+                error @ (ServerNgError::PartitionSuperblockIo { .. }
+                | ServerNgError::PartitionSuperblockVersionUnknown { .. }
+                | ServerNgError::PartitionSuperblockUnverifiable { .. }
+                | ServerNgError::PartitionSuperblockUndecodable { .. }
+                | ServerNgError::PartitionSuperblockIdentityMismatch { .. }),
+            ) => {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    %error,
+                    "cannot trust this partition's durable consensus state; tombstoning the \
+                     partition and continuing to boot the rest of the shard"
+                );
+                partition_stats.zero_out_all();
+                partitions.tombstone(namespace);
+                continue;
+            }
             Err(error) => return Err(error),
         };
         partitions.insert(namespace, partition);
@@ -1917,6 +1945,14 @@ const _: () = assert!(
 );
 const _: () = assert!(
     configs::ng_partition::DEFAULT_EVICTED_RING_BYTES_MAX == partitions::EVICTED_RING_BYTES_MAX
+);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX
+        == shard::PARTITION_ARTIFACT_LEN_DEFAULT
+);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX
+        == shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT
 );
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);

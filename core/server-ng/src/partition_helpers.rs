@@ -340,12 +340,20 @@ pub async fn ensure_initial_segment(
         return Ok(());
     }
 
-    let messages_path = config
-        .system
-        .get_messages_file_path(stream_id, topic_id, partition_id, 0);
+    // At the RESTORED FRONTIER, not always 0: after a crash inside the install's
+    // swap window the chain is empty while the recorded frontier is N, and a
+    // segment named 0 would then take the first append's `base_offset = N` --
+    // `rposition(|s| s.start_offset <= offset)` routes every poll for `0..N-1`
+    // into it, the next boot makes that shape durable, and this replica starts
+    // offering peers a segment that claims `[0..N]`.
+    let start_offset = partition.offset_frontier();
+    let messages_path =
+        config
+            .system
+            .get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
     let index_path = config
         .system
-        .get_index_path(stream_id, topic_id, partition_id, 0);
+        .get_index_path(stream_id, topic_id, partition_id, start_offset);
     let enforce_fsync = config.system.partition.enforce_fsync;
     // `file_exists = false` TRUNCATES both files, which is load-bearing here: a
     // fenced-and-rebuilt partition (or one whose quarantine failed) can reach
@@ -385,7 +393,7 @@ pub async fn ensure_initial_segment(
         .map(|writer| writer.size_counter())
         .unwrap_or_default();
     partition.log.add_persisted_segment(
-        Segment::new(0, config.system.segment.size),
+        Segment::new(start_offset, config.system.segment.size),
         storage,
         Some(Rc::new(
             MessagesWriter::new(
@@ -439,9 +447,9 @@ pub async fn ensure_initial_segment(
 /// Mirrors the metadata plane's recovery contract: an EMPTY superblock is a
 /// genuinely fresh group (or one that never changed view) and yields `None`;
 /// a present record must decode and match this replica's identity; a present
-/// but unverifiable record refuses boot, because treating it as fresh would
-/// let this replica re-enter a view it already acted in. Quarantining only
-/// the affected partition is future work.
+/// but unverifiable record is an error, because treating it as fresh would
+/// let this replica re-enter a view it already acted in. The boot path
+/// tombstones just that partition rather than refusing the whole node.
 ///
 /// The returned store is the ONE open instance for this group: the partition
 /// keeps writing through it, and re-opening later would fork the ping-pong
@@ -450,8 +458,8 @@ pub async fn ensure_initial_segment(
 /// # Errors
 ///
 /// [`ServerNgError::PartitionSuperblockIo`] when the directory or a slot
-/// cannot be read; the `Unreadable` / `Undecodable` / `IdentityMismatch`
-/// variants when a record exists but cannot be trusted.
+/// cannot be read; the `VersionUnknown` / `Unverifiable` / `Undecodable` /
+/// `IdentityMismatch` variants when a record exists but cannot be trusted.
 pub(crate) async fn open_partition_superblock(
     partition_dir: &str,
     identity: ReplicaIdentity,
@@ -476,10 +484,17 @@ pub(crate) async fn open_partition_superblock(
                 }
             })?)
         }
-        SuperblockContents::Unreadable { version } => {
-            return Err(ServerNgError::PartitionSuperblockUnreadable {
+        SuperblockContents::Unreadable {
+            version: Some(version),
+        } => {
+            return Err(ServerNgError::PartitionSuperblockVersionUnknown {
                 dir: PathBuf::from(partition_dir),
                 version,
+            });
+        }
+        SuperblockContents::Unreadable { version: None } => {
+            return Err(ServerNgError::PartitionSuperblockUnverifiable {
+                dir: PathBuf::from(partition_dir),
             });
         }
         SuperblockContents::Empty => None,
@@ -718,7 +733,17 @@ pub async fn build_partition_fresh(
     // A "fresh" build is also how a FENCED partition comes back (the shard
     // tombstones it and the reconciler rebuilds through here), and the fence
     // deliberately leaves the superblock in place, so the recorded frontier is
-    // what stops the rebuild from re-minting offsets the group already used.
+    // the rebuild's only anchor.
+    //
+    // It is a LOWER BOUND, not a guarantee: the record is written on view
+    // changes and transfer installs, so it lags the counter arbitrarily -- a
+    // fresh joiner that adopted a view while empty and then filled via repair
+    // has a record still reading 0, and this rebuild would re-seed at 0. For
+    // ordinary crash recovery that staleness is harmless (segments survive and
+    // win the max); it is the fence paths that promote the stale bound to sole
+    // source of truth. Closing it needs the runtime fence to persist the
+    // frontier before quarantining, and the boot-path chain refusal to carry
+    // the refused chain's max `end_offset` on its error.
     restore_offset_frontier(&mut partition, recovered_state.as_ref());
     let current_offset = partition.offset.load(Ordering::Acquire);
 

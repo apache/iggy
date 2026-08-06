@@ -33,7 +33,7 @@ use iggy_common::{IggyByteSize, IggyError, PartitionStats};
 use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndexReader, Segment};
 use server_common::SegmentStorage;
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
+use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header, decode_batch_slice};
 use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -70,8 +70,12 @@ pub async fn load_persisted_segments(
     let partition_path = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
-    sweep_scratch_files(&partition_path);
-    let mut start_offsets = collect_segment_start_offsets(&partition_path)?;
+    // ONE directory walk feeds both: the sweep only ever unlinks `.staging` and
+    // orphan `.index` files, never a `.log`, so the log stems it already
+    // collects ARE the post-sweep start-offset set. Note the error policy is
+    // the collect side's (NotFound => empty, anything else => refuse boot); the
+    // sweep's silent return would swallow an EACCES that must not be ignored.
+    let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
     start_offsets.sort_unstable();
 
     let enforce_fsync = config.system.partition.enforce_fsync;
@@ -257,13 +261,28 @@ fn ensure_contiguous_chain(
 /// recreates a segment at a given base offset opens its index through
 /// `SegmentStorage::new(.., file_exists = false)` first, which TRUNCATES: the
 /// stale entries are never read, only overwritten.
-fn sweep_scratch_files(partition_path: &str) {
-    let Ok(entries) = fs::read_dir(partition_path) else {
-        return;
+/// Sweeps boot-time scratch (`.staging` spill, orphan `.index`) and returns the
+/// start offset parsed out of every remaining zero-padded `.log` file name. A
+/// missing directory means a never-persisted partition.
+fn sweep_scratch_files_and_collect_offsets(
+    partition_path: &str,
+) -> Result<Vec<u64>, ServerNgError> {
+    let entries = match fs::read_dir(partition_path) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            error!(
+                partition_path,
+                error = %source,
+                "failed to list partition directory during recovery"
+            );
+            return Err(IggyError::CannotReadPartitions.into());
+        }
     };
     let mut swept = Vec::new();
     let mut orphan_candidates = Vec::new();
     let mut log_stems = std::collections::HashSet::new();
+    let mut start_offsets = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(as_str) = path.to_str() else {
@@ -277,6 +296,9 @@ fn sweep_scratch_files(partition_path: &str) {
             Some(LOG_EXTENSION) => {
                 if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
                     log_stems.insert(stem.to_owned());
+                    if let Ok(start_offset) = stem.parse::<u64>() {
+                        start_offsets.push(start_offset);
+                    }
                 }
             }
             Some(INDEX_EXTENSION) => orphan_candidates.push(path),
@@ -299,39 +321,6 @@ fn sweep_scratch_files(partition_path: &str) {
             );
         }
     }
-}
-
-/// Parses the zero-padded start offset out of every `.log` file name in the
-/// partition directory. A missing directory means a never-persisted partition.
-fn collect_segment_start_offsets(partition_path: &str) -> Result<Vec<u64>, ServerNgError> {
-    let entries = match fs::read_dir(partition_path) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            error!(
-                partition_path,
-                error = %source,
-                "failed to list partition directory during recovery"
-            );
-            return Err(IggyError::CannotReadPartitions.into());
-        }
-    };
-
-    let mut start_offsets = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(LOG_EXTENSION) {
-            continue;
-        }
-        if let Some(start_offset) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u64>().ok())
-        {
-            start_offsets.push(start_offset);
-        }
-    }
-
     Ok(start_offsets)
 }
 
@@ -401,12 +390,20 @@ async fn recover_segment_bounds(
             // true end offset; a header that no longer decodes marks a torn
             // tail, which truncates the readable range to the last whole
             // batch so the next append overwrites the torn bytes.
+            // Opened ONCE for the walk: the helper used to open the file per
+            // batch, which is an open + pread + close for every batch in the
+            // segment, synchronously, at boot. A failure to open a file that
+            // just stat'd walks nothing, which lands on the divergence refusal
+            // below rather than recovering an indexed segment as empty.
+            let messages = fs::File::open(messages_path).ok();
             let mut position = last.position;
             let mut end_offset = last.offset;
             let mut end_timestamp = last.timestamp;
             let mut walked_any = false;
-            while position < messages_size {
-                let Some(header) = read_batch_header(messages_path, position, messages_size) else {
+            while let Some(messages) = messages.as_ref()
+                && position < messages_size
+            {
+                let Some(header) = read_batch_header(messages, position, messages_size) else {
                     break;
                 };
                 let extent = position.saturating_add(header.total_size() as u64);
@@ -449,16 +446,36 @@ async fn recover_segment_bounds(
         // decode or does not fit, which keeps the torn-tail truncation the
         // indexed path performs.
         _ if messages_size > 0 => {
+            // Opened once, as above. Nothing walked means no whole batch,
+            // which is the `Ok(None)` the tail of this arm already returns.
+            let messages = fs::File::open(messages_path).ok();
             let mut position = 0u64;
             let mut start_timestamp = None;
             let mut end_offset = start_offset;
             let mut end_timestamp = 0;
-            while position < messages_size {
-                let Some(header) = read_batch_header(messages_path, position, messages_size) else {
+            let mut expected_offset = start_offset;
+            let mut scratch = Vec::new();
+            while let Some(messages) = messages.as_ref()
+                && position < messages_size
+            {
+                let Some(header) = read_batch_header(messages, position, messages_size) else {
                     break;
                 };
                 let extent = position.saturating_add(header.total_size() as u64);
                 if extent > messages_size {
+                    break;
+                }
+                // The FILENAME is the only trustworthy anchor once the index is
+                // gone, and `read_batch_header` checks a length, not a checksum.
+                // A torn header claiming an offset below `start_offset` would
+                // underflow the message count the caller derives; one claiming a
+                // jump above becomes this partition's counter, and the next
+                // prepare stamps a `base_offset` diverged from every peer. So
+                // the chain has to be contiguous from the filename onward, and
+                // the batch has to verify before its header is believed.
+                if header.base_offset != expected_offset
+                    || !batch_verifies(messages, position, &header, &mut scratch)
+                {
                     break;
                 }
                 if header.message_count > 0 {
@@ -467,6 +484,7 @@ async fn recover_segment_bounds(
                         .saturating_add(u64::from(header.message_count) - 1);
                     end_timestamp = header.base_timestamp;
                     start_timestamp.get_or_insert(header.base_timestamp);
+                    expected_offset = end_offset.saturating_add(1);
                 }
                 position = extent;
             }
@@ -496,16 +514,34 @@ async fn recover_segment_bounds(
 /// The batch command header at `position` in the messages file, or `None`
 /// when the header does not fit / decode (`position` past the file, header
 /// truncated, or garbage bytes).
+/// Whether the batch at `position` decodes and passes its own `batch_checksum`.
+///
+/// The index-less recovery walk trusts nothing else: without an index the only
+/// anchors are the filename and the payload's self-description, and a torn
+/// header is exactly what that walk exists to survive.
+fn batch_verifies(
+    messages: &fs::File,
+    position: u64,
+    header: &SendMessages2Header,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    scratch.clear();
+    scratch.resize(header.total_size(), 0);
+    if messages.read_exact_at(scratch, position).is_err() {
+        return false;
+    }
+    decode_batch_slice(scratch).is_ok()
+}
+
 fn read_batch_header(
-    messages_path: &str,
+    messages: &fs::File,
     position: u64,
     messages_size: u64,
 ) -> Option<SendMessages2Header> {
     if position.checked_add(COMMAND_HEADER_SIZE as u64)? > messages_size {
         return None;
     }
-    let file = fs::File::open(messages_path).ok()?;
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE];
-    file.read_exact_at(&mut header_bytes, position).ok()?;
+    messages.read_exact_at(&mut header_bytes, position).ok()?;
     SendMessages2Header::decode(&header_bytes).ok()
 }

@@ -956,17 +956,23 @@ evicted_ring_capacity = 4096
 evicted_ring_bytes_max = "16 MiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
-# state-transfer chunk requests, per shard (process-wide is this times the shard
-# count). Sized for concurrent pulls: at exactly one maximum segment a single
-# rejoining node thrashes the cache by itself, and every miss re-reads and
-# re-hashes a whole segment to serve one 256 KiB chunk. Must be > 0.
-transfer_served_cache_bytes_max = "4 GB"
+# state-transfer chunk requests. PER SHARD, and shard count defaults to core
+# count, so the process-wide high-water is this times the core count on top of
+# page cache -- keep that product in mind before raising it. The default holds
+# two maximum-size segments: below one, a single rejoining node thrashes the
+# cache by itself and every miss re-reads and re-hashes a whole segment to serve
+# one 256 KiB chunk. Running under the budget costs re-reads, not failures.
+# Must be > 0 and <= "64 GiB".
+transfer_served_cache_bytes_max = "2 GiB"
 
 # Alloc ceiling for ONE received state-transfer artifact, per shard. The
 # receiver holds it resident through verify, walk and staging write, and up to
-# four transfers run at once. Keep it above the largest legal segment
-# (segment.size plus one max batch) or legal segments are rejected. Must be > 0.
-transfer_artifact_bytes_max = "1088 MB"
+# four transfers run at once. MUST cover system.segment.size plus
+# message_bus.max_message_size (a segment may close one whole batch past its
+# cap): under that, a legal segment is refused, the whole manifest with it, and
+# the partition livelocks re-requesting it from every peer. Boot validates the
+# floor. Must be > 0 and <= "64 GiB".
+transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
