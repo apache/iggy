@@ -27,12 +27,20 @@ set -euo pipefail
 #   - core/connectors/runtime/Dockerfile           (fat image build + bundle)
 #   - .github/actions/utils/validate-third-party-licenses  (license gate)
 #
+# A plugin has two names and they are not interchangeable: cargo selects it by
+# package name, and writes the artifact as lib<cdylib target name>.so. They
+# match for every connector today only because every plugin package is named
+# with underscores; a hyphenated package name, or an explicit [lib] name, makes
+# them differ. Modes are split accordingly.
+#
 # Output modes (one plugin per line unless noted):
-#   --names           crate names           (iggy_connector_postgres_sink)
-#   --comma-names     crate names, one CSV line
-#   --package-flags   cargo -p flags, one line   (-p iggy_connector_... ...)
-#   --manifests       repo-relative Cargo.toml paths
-#   --manifest-flags  --manifest flags, one line (for third-party-licenses.sh)
+#   --names            cdylib target names, i.e. the <name> in lib<name>.so
+#   --comma-names      cdylib target names, one CSV line
+#   --packages         package names, i.e. what cargo -p takes
+#   --comma-packages   package names, one CSV line
+#   --package-flags    cargo -p flags, one line   (-p iggy_connector_... ...)
+#   --manifests        repo-relative Cargo.toml paths
+#   --manifest-flags   --manifest flags, one line (for third-party-licenses.sh)
 
 MODE="--names"
 if [[ $# -gt 0 ]]; then
@@ -42,29 +50,27 @@ fi
 METADATA="$(cargo metadata --format-version 1 --no-deps)"
 WORKSPACE_ROOT="$(jq -r '.workspace_root' <<<"$METADATA")"
 
-# cdylib packages whose manifest lives under core/connectors/. The path guard
-# keeps a future non-connector cdylib elsewhere in the workspace out of the set.
-NAMES="$(jq -r --arg root "$WORKSPACE_ROOT" '
+# Every cdylib target whose manifest lives under core/connectors/, as
+# "<target name><TAB><package name><TAB><manifest path>". The path guard keeps a
+# future non-connector cdylib elsewhere in the workspace out of the set.
+PLUGINS="$(jq -r --arg root "$WORKSPACE_ROOT" '
     .packages[]
+    | . as $pkg
     | select(.manifest_path | startswith($root + "/core/connectors/"))
-    | select(.targets[] | .kind[] == "cdylib")
-    | .name
+    | .targets[]
+    | select(.kind[] == "cdylib")
+    | [.name, $pkg.name, ($pkg.manifest_path | ltrimstr($root + "/"))]
+    | @tsv
 ' <<<"$METADATA" | sort -u)"
 
-if [[ -z "$NAMES" ]]; then
-    echo "connector-plugins: no cdylib plugin crates found under core/connectors/" >&2
+if [[ -z "$PLUGINS" ]]; then
+    echo "connector-plugins: no cdylib plugin targets found under core/connectors/" >&2
     exit 1
 fi
 
-# Map each crate name back to its repo-relative manifest path.
-manifest_for() {
-    jq -r --arg root "$WORKSPACE_ROOT" --arg name "$1" '
-        .packages[]
-        | select(.name == $name)
-        | .manifest_path
-        | ltrimstr($root + "/")
-    ' <<<"$METADATA"
-}
+NAMES="$(cut -f1 <<<"$PLUGINS")"
+PACKAGES="$(cut -f2 <<<"$PLUGINS")"
+MANIFESTS="$(cut -f3 <<<"$PLUGINS")"
 
 case "$MODE" in
     --names)
@@ -73,19 +79,26 @@ case "$MODE" in
     --comma-names)
         paste -sd, - <<<"$NAMES"
         ;;
+    --packages)
+        echo "$PACKAGES"
+        ;;
+    --comma-packages)
+        paste -sd, - <<<"$PACKAGES"
+        ;;
     --package-flags)
-        mapfile -t names_arr <<<"$NAMES"
-        printf '%s\n' "${names_arr[@]/#/-p }" | paste -sd' ' -
+        mapfile -t packages_arr <<<"$PACKAGES"
+        printf '%s\n' "${packages_arr[@]/#/-p }" | paste -sd' ' -
         ;;
     --manifests)
-        while IFS= read -r name; do manifest_for "$name"; done <<<"$NAMES"
+        echo "$MANIFESTS"
         ;;
     --manifest-flags)
-        while IFS= read -r name; do echo "--manifest $(manifest_for "$name")"; done <<<"$NAMES" | paste -sd' ' -
+        mapfile -t manifests_arr <<<"$MANIFESTS"
+        printf '%s\n' "${manifests_arr[@]/#/--manifest }" | paste -sd' ' -
         ;;
     *)
         echo "connector-plugins: unknown mode '$MODE'" >&2
-        echo "usage: $0 [--names|--comma-names|--package-flags|--manifests|--manifest-flags]" >&2
+        echo "usage: $0 [--names|--comma-names|--packages|--comma-packages|--package-flags|--manifests|--manifest-flags]" >&2
         exit 2
         ;;
 esac
