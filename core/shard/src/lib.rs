@@ -893,9 +893,16 @@ pub const SERVED_SEGMENT_CACHE_BYTES_DEFAULT: u64 =
 /// TWO, not the receiver's in-flight cap of four: the budget is PER SHARD and
 /// shard count defaults to core count, so each segment here multiplies by the
 /// core count during a whole-node rejoin, on top of page cache and the receive
-/// side's own in-flight artifacts. Two keeps one pull's segment resident while a
-/// second rotates through; running under the budget costs re-reads, not
-/// failures, and operators serving many concurrent rejoins raise the knob.
+/// side's own in-flight artifacts.
+///
+/// The gap between this and the in-flight cap is closed by ADMITTING fewer
+/// concurrent transfers rather than by holding more bytes: see
+/// `IggyShard::partition_transfer_admission_cap`, which derives its cap from
+/// this budget so the two can never disagree. Overrunning the budget does not
+/// degrade gracefully -- distinct groups are distinct cache keys, so a surplus
+/// pull evicts the others on every chunk and none of them converge -- and an
+/// operator who wants more concurrency raises the knob, which raises the cap
+/// with it.
 const CONCURRENT_SERVED_SEGMENTS: u64 = 2;
 
 /// Shard-wide cache of segment payloads loaded to serve partition chunks,
@@ -5587,6 +5594,39 @@ where
         }
     }
 
+    /// Whether this shard may build a partition offer for `namespace` without
+    /// pushing the served-payload working set past its byte budget.
+    ///
+    /// Counts DISTINCT groups rather than requesters: the payload cache is
+    /// content-addressed, so every requester pulling one group's offer shares
+    /// one resident copy, and it is the group count that decides how many
+    /// segments must be resident at once. A group already being served always
+    /// passes, so admission cannot revoke a transfer midway.
+    ///
+    /// The cap tracks the configured budget rather than a constant, so an
+    /// operator who raises `transfer_served_cache_bytes_max` gets the
+    /// concurrency it pays for; at least one is always admitted, since refusing
+    /// every rejoin is worse than re-reading for a single one.
+    fn partition_transfer_admission_cap(&self) -> usize {
+        let slots = self.served_segment_cache_bytes_max.get() / SEGMENT_SIZE_CEILING_BYTES;
+        usize::try_from(slots).unwrap_or(usize::MAX).max(1)
+    }
+
+    fn may_serve_another_partition_transfer(&self, namespace: u64) -> bool {
+        let offers = self.state_transfer_offers.borrow();
+        let mut served: Vec<u64> = offers
+            .iter()
+            .filter(|(_, served)| matches!(served.offer, ServedOffer::Partition(_)))
+            .map(|((offer_namespace, _), _)| *offer_namespace)
+            .collect();
+        if served.contains(&namespace) {
+            return true;
+        }
+        served.sort_unstable();
+        served.dedup();
+        served.len() < self.partition_transfer_admission_cap()
+    }
+
     /// Serve one partition `RequestStateTransfer`: build (or re-serve) this
     /// group's offer and answer with the descriptor.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -5643,6 +5683,36 @@ where
                      already served"
                 );
                 Some(offer)
+            }
+            None if !self.may_serve_another_partition_transfer(header.namespace) => {
+                // Admission control, because the served-payload budget is a
+                // BYTE budget and the pulls that overrun it do not degrade
+                // gracefully. Each concurrent pull holds a different segment
+                // resident, so admitting more distinct groups than the budget
+                // has max-size slots makes them evict each other on every
+                // chunk: every request then re-reads and re-hashes a whole
+                // segment to serve one 256 KiB range, and a per-chunk serve
+                // that outruns the requester's stall interval exhausts its
+                // retry budget, so the pull rotates peers and never converges.
+                // Refusing the surplus is what makes the admitted ones finish.
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = header.namespace,
+                    requester = header.replica,
+                    "already serving as many partition transfers as the served-payload \
+                     budget holds; refusing until one completes"
+                );
+                let (view, commit_max) = serving_progress(partition);
+                self.send_state_transfer_target(
+                    cluster,
+                    self_id,
+                    header.replica,
+                    header.nonce,
+                    header.namespace,
+                    TransferDescriptor::unavailable(true, view, commit_max),
+                )
+                .await;
+                return;
             }
             None => match partition.state_transfer_offer(&config).await {
                 Ok(offer) => {

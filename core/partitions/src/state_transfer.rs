@@ -926,6 +926,13 @@ pub enum PartitionTransferUnavailable {
     /// The segment chain changed while the offer's checksum passes ran, so the
     /// stamps no longer describe the bytes the offer addresses.
     SegmentSetChanged,
+    /// This round's share of the checksum pass ran out with retained bytes
+    /// still unhashed. Progress is memoized, so the next request resumes where
+    /// this one stopped rather than starting the pass again.
+    OfferBuildInProgress {
+        hashed: u64,
+        remaining: u64,
+    },
     FlushFailed(iggy_common::IggyError),
     SegmentUnreadable {
         start_offset: u64,
@@ -946,7 +953,8 @@ impl PartitionTransferUnavailable {
             Self::NotCaughtUpPrimary
             | Self::RepairInProgress
             | Self::NothingCommitted
-            | Self::SegmentSetChanged => true,
+            | Self::SegmentSetChanged
+            | Self::OfferBuildInProgress { .. } => true,
             Self::NoPartitionDir
             | Self::ManifestTooLarge { .. }
             | Self::FlushFailed(_)
@@ -972,6 +980,11 @@ impl fmt::Display for PartitionTransferUnavailable {
             Self::SegmentSetChanged => {
                 write!(f, "segment chain changed while the offer was being built")
             }
+            Self::OfferBuildInProgress { hashed, remaining } => write!(
+                f,
+                "offer checksum pass is {hashed} bytes in with {remaining} to go; \
+                 resuming on the next request"
+            ),
             Self::FlushFailed(source) => {
                 write!(f, "flushing the committed prefix failed: {source}")
             }
@@ -1398,11 +1411,34 @@ where
             });
         }
 
+        // The checksum pass is the expensive part and it runs inside ONE frame
+        // body: the router's tick arm is not polled while another arm's body
+        // awaits, and the yields inside `hash_segment_range` move the reactor,
+        // not this shard's consensus ticks. A cold pass over multi-GiB
+        // retention therefore silences every group on this core for its whole
+        // duration, past `heartbeat_timeout`, on the node that by construction
+        // is the caught-up primary of those groups.
+        //
+        // Bounded per round instead. The memo carries partial progress, so a
+        // refusal here is not lost work: the requester re-asks on its flat
+        // transient interval and each round advances the pass by the budget
+        // until the offer completes.
+        let mut budget = OFFER_HASH_BUDGET_PER_ROUND_BYTES;
         let mut segments = Vec::with_capacity(planned.len());
-        for (start_offset, size, log_path) in &planned {
-            let checksum = self
-                .segment_checksum(*start_offset, *size, log_path)
-                .await?;
+        for (index, (start_offset, size, log_path)) in planned.iter().enumerate() {
+            let Some(checksum) = self
+                .segment_checksum(*start_offset, *size, log_path, &mut budget)
+                .await?
+            else {
+                let remaining = planned[index..]
+                    .iter()
+                    .map(|(_, size, _)| *size)
+                    .sum::<u64>();
+                return Err(PartitionTransferUnavailable::OfferBuildInProgress {
+                    hashed: OFFER_HASH_BUDGET_PER_ROUND_BYTES.saturating_sub(budget),
+                    remaining,
+                });
+            };
             segments.push(SegmentArtifactSource {
                 entry: consensus::StateArtifact {
                     kind: artifact_kind::SEGMENT_LOG,
@@ -1469,6 +1505,10 @@ where
     /// retained history every round: `commit_op` advances per round, so the
     /// offer cache misses even when nothing else changed.
     ///
+    /// `budget` caps the bytes this call may read, charged as it goes. `None`
+    /// means the budget ran out first: the memo holds everything hashed so far
+    /// and the next call resumes from it.
+    ///
     /// # Errors
     /// [`PartitionTransferUnavailable::SegmentUnreadable`] when the file is
     /// unreadable or shorter than `size`.
@@ -1477,7 +1517,8 @@ where
         start_offset: u64,
         size: u64,
         log_path: &str,
-    ) -> Result<u64, PartitionTransferUnavailable> {
+        budget: &mut u64,
+    ) -> Result<Option<u64>, PartitionTransferUnavailable> {
         // Taken OUT of the map for the read: the hash awaits, and a half-fed
         // hasher left visible could be extended twice by a second build.
         let memo = self
@@ -1503,17 +1544,28 @@ where
                 SegmentChecksumMemo::new()
             }
         };
-        hash_segment_range(log_path, memo.hashed_len, size, &mut memo.hasher, None)
+        // Clamped to the round's remaining budget, so a single multi-GiB
+        // segment is split across rounds rather than being the granularity
+        // floor. `finish` does not consume the hasher, so a partial pass is
+        // simply a memo nobody stamps yet.
+        let target = size.min(memo.hashed_len.saturating_add(*budget));
+        let hashed = target.saturating_sub(memo.hashed_len);
+        // Dropped on failure, not reinserted: the hasher is fed chunk by chunk
+        // and a mid-range error leaves it holding bytes `hashed_len` does not
+        // account for, so resuming from it would stamp a checksum over a
+        // doubly-fed prefix. Losing the partial pass is the cheap side.
+        hash_segment_range(log_path, memo.hashed_len, target, &mut memo.hasher, None)
             .await
             .map_err(|source| PartitionTransferUnavailable::SegmentUnreadable {
                 start_offset,
                 source,
             })?;
-        memo.hashed_len = size;
-        let checksum = memo.hasher.finish();
+        memo.hashed_len = target;
+        let checksum = (target == size).then(|| memo.hasher.finish());
         self.segment_checksum_cache
             .borrow_mut()
             .insert(start_offset, memo);
+        *budget = budget.saturating_sub(hashed);
         Ok(checksum)
     }
 
@@ -1872,12 +1924,22 @@ where
         // wedge the in-memory case. Nothing has been mutated yet.
         //
         // Under `purge_advances` the offer's frontier is legitimately BELOW the
-        // live counter; the advancing write maxes it back up, which is correct
-        // here -- the reset belongs to `purge`, which records 0 as it runs.
-        if !self
-            .persist_offset_frontier_at(offsets_wire.next_offset)
-            .await
-        {
+        // live counter and must be written as a RESET. The advancing form would
+        // max it back up to the pre-purge value, and the reset it defers to
+        // belongs to a `purge` this replica provably never ran -- `purge_advances`
+        // is true precisely because it missed one. A crash between the old
+        // chain's unlink fsync and the last staged rename would then boot with
+        // zero `.log` files and re-seed the counter from the pre-purge frontier,
+        // above a group that restarted at the offer's, and the next prepare
+        // would stamp a `base_offset` and `batch_checksum` no peer shares.
+        let frontier_durable = if purge_advances {
+            self.reset_offset_frontier_to(offsets_wire.next_offset)
+                .await
+        } else {
+            self.persist_offset_frontier_at(offsets_wire.next_offset)
+                .await
+        };
+        if !frontier_durable {
             return Err(PartitionInstallError::FrontierNotDurable {
                 frontier: offsets_wire.next_offset,
             });
@@ -1918,7 +1980,22 @@ where
         // origin leaves no segment carrying it, and the crash windows inside
         // the swap leave none either), so record it before returning. Runs for
         // the converge path too: it seeds the counter from the same artifact.
-        self.persist_offset_frontier().await;
+        //
+        // Logged rather than refused: the install already mutated, and the
+        // pre-swap write above left a valid lower bound on disk either way. The
+        // failure still matters -- the ordinary retry is the view-change gate,
+        // which an idle group may not reach for a long time -- so it must not
+        // pass silently.
+        if !self.persist_offset_frontier().await {
+            tracing::error!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.consensus().namespace(),
+                frontier = self.offset_frontier(),
+                "state-transfer install could not record the installed offset frontier; \
+                 the durable record stays at the pre-swap claim until the next view change"
+            );
+        }
         outcome
     }
 
@@ -2568,6 +2645,17 @@ async fn yield_to_reactor() {
 /// that per-chunk overhead is noise, small enough that the pump yields to
 /// the reactor many times per segment.
 const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
+
+/// Bytes one offer-build round may read and hash before it refuses and resumes
+/// on the next request.
+///
+/// The pass holds a frame body, and this shard's consensus ticks are a sibling
+/// select arm that stays unpolled for its duration, so the budget is really a
+/// bound on how long every OTHER group on this core goes without a heartbeat.
+/// 256 MiB is roughly a quarter second at commodity `NVMe` read rates, an order
+/// of magnitude under the shipped `heartbeat_timeout`, and still large enough
+/// that ordinary retention finishes in one round.
+const OFFER_HASH_BUDGET_PER_ROUND_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Feed bytes `[from, to)` of `path` into `hasher`, read in
 /// [`OFFER_HASH_CHUNK_LEN`] chunks with one reactor yield per chunk, appending

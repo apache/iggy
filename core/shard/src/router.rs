@@ -699,12 +699,14 @@ where
                             );
                         }
                         Err(error) => {
-                            // The purge drained every segment before its first
-                            // fallible step, so a failure leaves the partition
-                            // with no serviceable chain and the next append
-                            // panics on `active_segment()`. Fence this one group
-                            // for rebuild, exactly as a failed state-transfer
-                            // convergence does.
+                            // Fence this one group for rebuild, exactly as a
+                            // failed state-transfer convergence does. Both
+                            // failure points need it for different reasons: the
+                            // frontier reset fails before anything is mutated
+                            // and leaves a partition still holding data the
+                            // group believes it purged, while everything after
+                            // the drain leaves no serviceable chain at all and
+                            // the next append panics on `active_segment()`.
                             tracing::error!(
                                 shard = self.id,
                                 namespace_raw = namespace.inner(),

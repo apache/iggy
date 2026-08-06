@@ -567,6 +567,13 @@ pub(crate) fn restore_offset_frontier(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     recovered: Option<&VsrState>,
 ) {
+    // Seeded even when the rest of this function returns early: the advance
+    // direction maxes against the last-written value, and leaving it at zero
+    // would let the first write after a fence lower the record below what boot
+    // just read off disk.
+    if let Some(state) = recovered {
+        partition.seed_durable_offset_frontier(state.offset_frontier);
+    }
     let Some(frontier) = recovered
         .map(|state| state.offset_frontier)
         .filter(|&f| f > 0)
