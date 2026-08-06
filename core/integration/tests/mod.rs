@@ -31,10 +31,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 // Drives the `iggy` CLI binary against a running server, in both legacy and
-// vsr/server-ng modes. Under vsr, single-node and the default 3-node cluster
-// both pass. A few cases are mode-split where server-ng diverges from legacy by
-// design: flush returns FeatureUnavailable, the session-timeout message
-// differs, and purge is eventually consistent so server state is polled.
+// vsr/server-ng modes. Under vsr, single-node (the default) and a 3-node
+// cluster (`IGGY_TEST_CLUSTER_NODES=3`) both pass. A few cases are mode-split
+// where server-ng diverges from legacy by design: flush returns
+// FeatureUnavailable, the session-timeout message differs, and purge is
+// eventually consistent so server state is polled.
 mod cli;
 // Raw-wire spec tests for VSR session continuity across a node restart
 // (IGGY-137); the module is vsr-only by construction (file-level cfg).

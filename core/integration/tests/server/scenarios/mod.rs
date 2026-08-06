@@ -50,8 +50,6 @@ pub mod single_message_per_batch_scenario;
 pub mod snapshot_scenario;
 pub mod stale_client_consumer_group_scenario;
 pub mod stream_size_validation_scenario;
-#[cfg(feature = "vsr")]
-pub mod stress_produce_consume_scenario;
 pub mod system_scenario;
 pub mod tcp_tls_scenario;
 pub mod timestamp_scenario;
