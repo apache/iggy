@@ -61,6 +61,9 @@
 
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/ci/lib/init.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
