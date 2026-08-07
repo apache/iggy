@@ -112,6 +112,7 @@ Every installation below compiles the Rust extension, so you'll need:
    git add -A
    prek run # runs pre-commit hooks
    prek run --hook-stage pre-push
+   # if a hook modifies files, re-run `git add -A` and `prek run`.
    ```
 
    These are some of the essential commands prek is running, so it's recommended to run them manually before
