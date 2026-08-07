@@ -17,7 +17,7 @@
 
 //! Apache Iggy is a high-performance, persistent message streaming platform written in Rust,
 //! capable of processing millions of messages per second with ultra-low latency.
-//! It is part of the [`Incubating Program`] of the [`Apache Software Foundation`] (ASF).
+//! It is part of the [`Apache Incubating Program`] of the [`Apache Software Foundation`] (ASF).
 //!
 //! **This library is the Apache Iggy SDK.**
 //! It exposes a low-level and a high-level API for the Apache Iggy message streaming infrastructure for the Rust programming language.
@@ -177,8 +177,8 @@
 //!
 //! # Async runtime
 //!
-//! The SDK is async and runs on the [Tokio] runtime, and this is a hard
-//! requirement rather than a pluggable choice. The SDK uses [quinn] (for QUIC), [reqwest] (for HTTP),
+//! The SDK is async and runs on the [Tokio] runtime. Note, this is a hard
+//! requirement rather not optional. The SDK uses [quinn] (for QUIC), [reqwest] (for HTTP),
 //! [tokio-tungstenite] (for WebSocket) and [tokio-rustls] (for TLS) which all build on Tokio.
 //! The SDK also spawns its own background work with [`tokio::spawn`] (the
 //! [`IggyClient::connect`] heartbeat, and the [`IggyProducer`] and
