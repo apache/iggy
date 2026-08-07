@@ -27,6 +27,8 @@ mod system;
 mod topics;
 mod users;
 
+pub use messages::decode_send_confirmations;
+
 use crate::IggyError;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,

@@ -53,12 +53,29 @@ impl HttpClient {
             .server()
             .http_addr()
             .expect("HTTP transport not configured on test server");
-        let base_url = format!("http://{addr}");
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("build reqwest client");
+        Self::login_root_with(client, format!("http://{addr}")).await
+    }
 
+    /// Log in as root against an explicit listener base URL, with redirects
+    /// surfaced instead of followed - for suites that assert on `Location`
+    /// (reqwest follows a 307 transparently by default). The explicit URL also
+    /// reaches a follower node, which [`Self::login_root`] (pinned to node 0)
+    /// cannot.
+    pub async fn login_root_no_redirect(base_url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build reqwest client");
+        Self::login_root_with(client, base_url).await
+    }
+
+    /// Shared root-login retry loop over an arbitrary client + base URL.
+    async fn login_root_with(client: reqwest::Client, base_url: String) -> Self {
         let body = json!({
             "username": DEFAULT_ROOT_USERNAME,
             "password": DEFAULT_ROOT_PASSWORD,

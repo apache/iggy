@@ -22,7 +22,9 @@ use crate::Validatable;
 use crate::error::IggyError;
 use crate::types::message::HeaderEntry;
 use crate::types::message::partitioning::Partitioning;
-use crate::{IggyMessage, IggyMessagesBatch};
+use crate::{
+    IggyMessage, IggyMessagesBatch, SendMessagesConfirmationResponse, SendMessagesResponse,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use serde::de::{self, MapAccess, Visitor};
@@ -299,6 +301,60 @@ impl<'de> Deserialize<'de> for SendMessages {
             &["partitioning", "messages"],
             SendMessagesVisitor,
         )
+    }
+}
+
+/// JSON body of a successful `POST .../messages`: one entry per partition the
+/// batch landed in. A list rather than a single confirmation, so a
+/// multi-partition produce needs no shape change.
+///
+/// Distinct from the binary `SendMessagesResponse` because wire types stay
+/// codec-only and carry no `serde` derives.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMessagesConfirmations {
+    pub confirmations: Vec<SendMessagesConfirmation>,
+}
+
+/// One partition's commit confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMessagesConfirmation {
+    pub stream_id: u32,
+    pub topic_id: u32,
+    pub partition_id: u32,
+    pub base_offset: u64,
+}
+
+impl From<SendMessagesResponse> for SendMessagesConfirmations {
+    fn from(response: SendMessagesResponse) -> Self {
+        Self {
+            confirmations: response
+                .confirmations
+                .into_iter()
+                .map(|confirmation| SendMessagesConfirmation {
+                    stream_id: confirmation.stream_id,
+                    topic_id: confirmation.topic_id,
+                    partition_id: confirmation.partition_id,
+                    base_offset: confirmation.base_offset,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<SendMessagesConfirmations> for SendMessagesResponse {
+    fn from(body: SendMessagesConfirmations) -> Self {
+        Self {
+            confirmations: body
+                .confirmations
+                .into_iter()
+                .map(|confirmation| SendMessagesConfirmationResponse {
+                    stream_id: confirmation.stream_id,
+                    topic_id: confirmation.topic_id,
+                    partition_id: confirmation.partition_id,
+                    base_offset: confirmation.base_offset,
+                })
+                .collect(),
+        }
     }
 }
 

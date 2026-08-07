@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice},
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -45,6 +45,16 @@ pub struct RetainedBatchMeta {
     pub base_timestamp: u64,
     pub total_size: u64,
     pub message_count: u32,
+}
+
+/// What one pass over the journal headers found for a repair window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairedWindowShape {
+    /// Every op in the window is resident. An EMPTY window is complete: nothing
+    /// left can arrive and change the floor verdict.
+    pub complete: bool,
+    /// At least one resident op in the window is a `SendMessages`.
+    pub holds_messages: bool,
 }
 
 /// Lookup key for querying messages from the journal.
@@ -283,9 +293,30 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
-    /// Entry bytes for `op`, from the resident journal or the evicted ring.
-    /// `None` when the op predates the ring (bulk-sync territory) or was
-    /// never journaled here.
+    /// Drop EVERYTHING this journal holds: resident entries, the
+    /// op/offset/timestamp indexes, and the evicted repair ring.
+    ///
+    /// State-transfer install only. The installed segments supersede every
+    /// journaled op at or below the new commit floor, and the stale suffix
+    /// ABOVE it (prepared-but-uncommitted ops from a superseded view) would
+    /// collide with the new view's prepares at the same op numbers. The
+    /// journal is memory-only, so a full clear IS the partition plane's
+    /// suffix truncation; the receiver re-fetches the live tail through
+    /// normal journal repair afterwards. Ring caps and the retention flag
+    /// survive: they are configuration, not content.
+    pub fn clear_all(&self) {
+        {
+            let inner = unsafe { &*self.inner.get() };
+            let _ = inner.storage.drain();
+        }
+        unsafe { &mut *self.op_to_storage_offset.get() }.clear();
+        unsafe { &mut *self.offset_to_op.get() }.clear();
+        unsafe { &mut *self.timestamp_to_op.get() }.clear();
+        unsafe { &mut *self.headers.get() }.clear();
+        unsafe { &mut *self.evicted_ring.get() }.clear();
+        self.evicted_ring_bytes.set(0);
+    }
+
     /// Disable repair retention (single-replica groups: nobody to repair).
     pub fn set_repair_retention(&self, enabled: bool) {
         self.repair_retention.set(enabled);
@@ -311,6 +342,9 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         op_to_storage_offset.len()
     }
 
+    /// Entry bytes for `op`, from the resident journal or the evicted ring.
+    /// `None` when the op predates the ring (bulk-sync territory) or was
+    /// never journaled here.
     pub fn repair_entry(&self, op: u64) -> Option<JournalBuffer> {
         {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
@@ -538,8 +572,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         // One decode feeds both the offset/timestamp index (keyed on
         // `origin_timestamp`) and the surfaced accounting meta (`base_timestamp`,
         // size, count); the two timestamps are distinct fields, do not conflate.
+        // Trusted (no batch-hash): every entry reaching append was just stamped
+        // by `stamp_prepare_for_persistence` (its checksum recomputed over this
+        // exact blob) or re-appended from an already-validated resident entry,
+        // so re-hashing the ~1 MiB blob here only to read the header is waste.
         let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
-            match decode_prepare_slice(entry.as_slice()) {
+            match decode_prepare_slice_trusted(entry.as_slice()) {
                 Ok(batch) if batch.message_count() != 0 => {
                     let message_count = batch.message_count();
                     let meta = RetainedBatchMeta {
@@ -625,6 +663,68 @@ where
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().find(|header| header.op == op).copied()
+    }
+
+    /// Presence and message-carrying shape of the repair window `(floor, to_op]`
+    /// in ONE pass over the header vec.
+    ///
+    /// [`Self::header_by_op`] is a linear scan with no index, so asking it
+    /// op-by-op over a window is O(window x headers): on the floor-refusal path
+    /// the replica is gap-stopped, so nothing evicts and the header vec grows
+    /// with the live tail, and the default 4096-op window over ~100k resident
+    /// headers is on the order of 4e8 comparisons -- synchronous, on the shard
+    /// pump, per repair round. Long enough to miss heartbeat and view-change
+    /// deadlines for every group on the core and turn one rejoin into an
+    /// election storm.
+    ///
+    /// The evicted ring is deliberately NOT consulted, matching the op-by-op
+    /// form: consulting it would change the floor-refusal verdict.
+    pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
+        let headers = unsafe { &*self.headers.get() };
+        let expected = to_op.saturating_sub(floor);
+        // More in-window ops than resident headers can never be covered, and
+        // `expected` is unbounded here (`to_op` rides the local `commit_max`),
+        // so this is both the early answer and what keeps the bitset below from
+        // being sized off an arbitrary number.
+        if expected > headers.len() as u64 {
+            return RepairedWindowShape {
+                complete: false,
+                holds_messages: headers.iter().any(|header| {
+                    header.op > floor
+                        && header.op <= to_op
+                        && header.operation == Operation::SendMessages
+                }),
+            };
+        }
+        // Dense window, so a flat presence vector beats a `HashSet`: no hashing
+        // per op and one contiguous allocation. One BYTE per op rather than one
+        // bit -- `expected` is bounded by `headers.len()`, so the 8x over a real
+        // bitset buys simpler indexing at a size the caller already holds in
+        // headers.
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_len = expected as usize;
+        let mut present = vec![false; expected_len];
+        let mut covered = 0usize;
+        let mut holds_messages = false;
+        for header in headers
+            .iter()
+            .filter(|header| header.op > floor && header.op <= to_op)
+        {
+            if header.operation == Operation::SendMessages {
+                holds_messages = true;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (header.op - floor - 1) as usize;
+            if !present[slot] {
+                present[slot] = true;
+                covered += 1;
+            }
+        }
+        RepairedWindowShape {
+            // In-window ops only, deduplicated, so a count match IS coverage.
+            complete: covered == expected_len,
+            holds_messages,
+        }
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
@@ -885,7 +985,10 @@ fn try_push_resident_entry(
     if header.operation != Operation::SendMessages {
         return;
     }
-    let Ok(batch) = decode_prepare_slice(prepare.as_slice()) else {
+    // Resident entries were locally stamped in `append_messages` or validated
+    // at repair ingress, so a validating re-decode would only re-hash our own
+    // write. See the invariant note at the committed-prefix flush walk.
+    let Ok(batch) = decode_prepare_slice_trusted(prepare.as_slice()) else {
         return;
     };
     let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {

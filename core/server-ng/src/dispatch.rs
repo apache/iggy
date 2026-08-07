@@ -84,6 +84,7 @@ use iggy_binary_protocol::{
     WireIdentifier, is_protocol_compatible,
 };
 use iggy_common::{IggyError, PollingStrategy, SnapshotCompression, SystemSnapshotType};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::client_listener::RequestHandler;
@@ -105,6 +106,7 @@ use shard::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -112,8 +114,8 @@ use tracing::{debug, warn};
 pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 
-pub(crate) fn make_client_request_handler<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn make_client_request_handler<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
     max_tokens_per_user: u32,
@@ -123,6 +125,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard = Rc::clone(shard);
     let sessions = Rc::clone(sessions);
@@ -176,21 +179,22 @@ pub(crate) fn make_list_clients_handler(
 /// against the local partitions plane and push the result back over the
 /// carried reply sender. The requesting shard bounds the wait with a
 /// timeout, so a dropped reply degrades to a client-visible read failure.
-pub(crate) fn make_partition_read_handler<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+pub(crate) fn make_partition_read_handler<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> PartitionReadHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     // Runs synchronously on the shard pump (see `process_lifecycle` ->
-    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
-    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
-    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
-    // poll replies here without spawning. See the `poll_plan` module docs.
+    // `on_partition_read`). `build_poll_snapshot` takes a pump-only `&mut`
+    // partition borrow (synchronous, so no sibling task can realloc under it) and
+    // returns an owned `PollPlan`; only owned data crosses into `spawn_poll_io`. A
+    // fully-resident poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;
@@ -265,8 +269,8 @@ where
 /// map), then replicate the auto-committed offset and send the reply. Holds no
 /// partition reference across the IO, so it is sound concurrently with the
 /// pump's `&mut` writes; the auto-commit submit re-borrows synchronously after.
-fn spawn_poll_io<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+fn spawn_poll_io<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
     plan: PollPlan,
     reply: shard::Sender<PartitionReadReply>,
@@ -275,6 +279,7 @@ fn spawn_poll_io<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let bus = shard.bus.clone();
     bus.spawn(async move {
@@ -321,8 +326,8 @@ fn spawn_poll_io<B, MJ, S>(
 /// data, hence no log). The gate reads committed state only, so an offset that
 /// merely sits in flight keeps resubmitting until its covering op commits -- a
 /// dropped op self-heals on the next poll instead of being suppressed forever.
-fn submit_auto_commit<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn submit_auto_commit<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
     applied: &AutoCommitApplied,
 ) where
@@ -330,6 +335,7 @@ fn submit_auto_commit<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     enum AutoCommitGate {
         Submit,
@@ -424,14 +430,15 @@ fn build_auto_commit_request(
     }))
 }
 
-pub(crate) fn make_deferred_replica_message_handler<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+pub(crate) fn make_deferred_replica_message_handler<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> MessageHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     Rc::new(move |_replica_id, message| {
@@ -441,9 +448,9 @@ where
     })
 }
 
-pub(crate) fn make_deferred_client_request_handler<B, MJ, S>(
+pub(crate) fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
     max_tokens_per_user: u32,
@@ -453,6 +460,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
@@ -509,14 +517,15 @@ where
 /// proposal. Spawns a task so the awaiting peer is woken once the op
 /// commits; replies `None` on transient submit failure so the peer never
 /// blocks forever.
-pub(crate) fn make_metadata_submit_handler<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+pub(crate) fn make_metadata_submit_handler<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> shard::MetadataSubmitHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     Rc::new(move |submit| {
@@ -633,8 +642,8 @@ where
 // empty-reply fail-fast below and must log in.
 
 #[allow(clippy::too_many_arguments)]
-fn enqueue_client_request<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+fn enqueue_client_request<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
     max_tokens_per_user: u32,
@@ -647,6 +656,7 @@ fn enqueue_client_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     queues
         .borrow_mut()
@@ -673,8 +683,8 @@ fn enqueue_client_request<B, MJ, S>(
 }
 
 #[allow(clippy::future_not_send)]
-async fn drain_client_requests<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+async fn drain_client_requests<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
     max_tokens_per_user: u32,
@@ -686,6 +696,7 @@ async fn drain_client_requests<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     loop {
         let Some(message) = pop_next_client_request(&queues, &active, client_id) else {
@@ -724,8 +735,8 @@ fn pop_next_client_request(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_client_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_client_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<NgSystemConfig>,
     max_tokens_per_user: u32,
@@ -736,6 +747,7 @@ async fn handle_client_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let request = match message.try_into_typed::<RequestHeader>() {
         Ok(request) => request,
@@ -761,7 +773,10 @@ async fn handle_client_request<B, MJ, S>(
     if header.operation == Operation::NonReplicated {
         // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
         // legitimately pre-auth (liveness probe + connection bootstrap
-        // metadata). Every other non-replicated code (`GET_STREAM*`,
+        // metadata). Pre-auth metadata is a narrow topology oracle: it leaks
+        // only the advertised-address mapping for networks the caller can
+        // already send packets from, and the HTTP mirror of the same read
+        // sits behind `Identity`. Every other non-replicated code (`GET_STREAM*`,
         // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
         // MUST go through Register first, which binds the acting user the
         // per-op authz gates resolve.
@@ -1029,8 +1044,8 @@ async fn handle_client_request<B, MJ, S>(
 /// out of the Users STM. Built here rather than in `build_non_replicated_response`
 /// which has no session context.
 #[allow(clippy::future_not_send)]
-async fn handle_get_personal_access_tokens<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
@@ -1039,6 +1054,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let response = build_get_personal_access_tokens_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
@@ -1055,8 +1071,8 @@ async fn handle_get_personal_access_tokens<B, MJ, S>(
 /// `SessionManager` (not `IggyMetadata`), so built here rather than in
 /// `build_non_replicated_response`.
 #[allow(clippy::future_not_send)]
-async fn handle_get_me<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_me<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
@@ -1065,6 +1081,7 @@ async fn handle_get_me<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let response = build_get_me_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
@@ -1087,15 +1104,16 @@ async fn handle_get_me<B, MJ, S>(
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
-/// dispatch replies (empty for an unresolvable namespace, a nonzero status
-/// for denials and the exhausted routable wait) so the client fails fast
-/// instead of wedging on a silent drop.
+/// dispatch replies with a nonzero status -- unresolvable namespace,
+/// authorization denial, exhausted routable wait -- so the client fails fast
+/// instead of wedging on a silent drop or reading a status-0 frame as a
+/// committed write.
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn dispatch_partition_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
     vsr_client_id: u128,
     bound_session: u64,
@@ -1106,6 +1124,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let header = *request.header();
     let namespace = match resolve_partition_request_namespace(
@@ -1116,17 +1135,26 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
-            // A partition op against a stream/topic that no longer
-            // resolves (e.g. a consumer's trailing auto-commit racing a
-            // `delete_stream`). A silent drop wedges the SDK connection
-            // forever; reply empty so the client fails fast instead.
+            // A partition op against a stream/topic that no longer resolves
+            // (e.g. a consumer's trailing auto-commit racing a `delete_stream`,
+            // or an explicit partition id that skipped the client-side
+            // resolve). The op never reached the partition plane, so a status-0
+            // reply would read as a committed ack for work that never happened.
+            // A silent drop is no better: the SDK connection processes replies
+            // in lockstep and would wedge forever.
             warn!(
                 transport_client_id,
                 error = %error,
                 operation = ?header.operation,
-                "partition request with unresolved namespace; replying empty"
+                "partition request with unresolved namespace; replying denied"
             );
-            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            send_partition_deny_reply(
+                shard,
+                transport_client_id,
+                &header,
+                IggyError::ResourceNotFound(String::new()).as_code(),
+            )
+            .await;
             return;
         }
     };
@@ -1161,13 +1189,14 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
         send_partition_deny_reply(shard, transport_client_id, &header, status).await;
         return;
     }
-    // Convergence wait: a CreateTopic commit returns to the client
-    // before the per-shard reconcilers seed routing rows and
-    // materialise the partition (next wake/periodic tick). The SDK
-    // does not replay sends, so an immediately-following partition op
-    // would be dropped as unroutable. Absorb that window here with a
-    // bounded wait; steady-state sends (row present, partition probed
-    // once) skip it entirely.
+    // Convergence wait: a CreateTopic commit returns to the client before the
+    // per-shard reconcilers seed routing rows and materialise the partition
+    // (next wake/periodic tick). An op arriving inside that window is not lost
+    // if it skips this wait -- `router::route_typed` falls back to the hash
+    // assignment, and the owning shard parks it -- so this is an admission
+    // courtesy that keeps the steady state off that park buffer, not a
+    // correctness gate. See `wait_for_partition_routable`, which spells out why
+    // there is no owner-readiness probe here any more.
     if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
         // The op never reached the partition plane, so it is safe to re-issue
         // anywhere -- the same contract the plane itself answers for a
@@ -1222,8 +1251,8 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_non_replicated_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_non_replicated_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
@@ -1233,13 +1262,15 @@ async fn handle_non_replicated_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    // Acting user for the read gates below, resolved once. `None` only on the
-    // pre-auth path (PING / GET_CLUSTER_METADATA), which serves ungated codes;
-    // the gated arms fail closed on it.
-    let user_id = sessions.borrow().get_user_id(transport_client_id);
+    // Acting user and peer address for the read gates below, resolved in one
+    // connection lookup. `user_id` is `None` only on the pre-auth path
+    // (PING / GET_CLUSTER_METADATA), which serves ungated codes; the gated
+    // arms fail closed on it.
+    let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -1353,6 +1384,14 @@ async fn handle_non_replicated_request<B, MJ, S>(
         }
         _ => {
             let roster = sessions.borrow().cluster_roster();
+            let client_ip = client_address.map(|address| address.ip());
+            if client_ip.is_none() {
+                debug!(
+                    transport_client_id,
+                    code,
+                    "no peer address recorded; advertised-address resolution degrades to the catch-all"
+                );
+            }
             handle_default_non_replicated(
                 shard,
                 transport_client_id,
@@ -1360,25 +1399,28 @@ async fn handle_non_replicated_request<B, MJ, S>(
                 &request,
                 user_id,
                 &roster,
+                client_ip,
             )
             .await;
         }
     }
 }
 
-#[allow(clippy::future_not_send)]
-async fn handle_default_non_replicated<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
+async fn handle_default_non_replicated<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     code: u32,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
     roster: &ClusterRoster,
+    client_ip: Option<IpAddr>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Gate by command code before the shared builder runs. The builder stays
     // authz-free (it is byte-shared with the HTTP read path, which gates
@@ -1387,7 +1429,14 @@ async fn handle_default_non_replicated<B, MJ, S>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
-    match build_non_replicated_response(shard, code, request_body(request), user_id, roster) {
+    match build_non_replicated_response(
+        shard,
+        code,
+        request_body(request),
+        user_id,
+        roster,
+        client_ip,
+    ) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
@@ -1430,8 +1479,8 @@ async fn handle_default_non_replicated<B, MJ, S>(
 /// plain authentication must not suffice), then await the off-thread
 /// collection (see `snapshot::collect`) and reply with the raw ZIP bytes.
 #[allow(clippy::future_not_send)]
-async fn handle_get_snapshot<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_snapshot<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
@@ -1441,6 +1490,7 @@ async fn handle_get_snapshot<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot) {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
@@ -1511,8 +1561,8 @@ fn decode_get_snapshot(
 /// metadata commit. Shared by the `get_me` / `get_clients` / `get_client`
 /// arms.
 #[allow(clippy::future_not_send)]
-async fn send_non_replicated_bytes<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_non_replicated_bytes<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RequestHeader>,
     transport_client_id: u128,
     bytes: Bytes,
@@ -1522,6 +1572,7 @@ async fn send_non_replicated_bytes<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     let reply = NonReplicatedResponse::Bytes(bytes).into_reply(
@@ -1547,14 +1598,15 @@ async fn send_non_replicated_bytes<B, MJ, S>(
 /// eviction context is best-effort off the metadata consensus (peer shards
 /// have none; zeroes are cosmetic -- the SDK only reads the reason).
 #[allow(clippy::future_not_send)]
-async fn send_unauthenticated_eviction<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_unauthenticated_eviction<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let ctx = shard.plane.metadata().consensus.as_ref().map_or(
         consensus::EvictionContext {
@@ -1588,8 +1640,8 @@ async fn send_unauthenticated_eviction<B, MJ, S>(
 /// groups + rebalances via the replicated `Logout`) and sends a session-
 /// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     interval: std::time::Duration,
     stop_rx: shard::Receiver<()>,
@@ -1598,6 +1650,7 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Legacy `MAX_THRESHOLD`: a client is stale once it misses ~1.2 intervals.
     let max_age = interval.mul_f64(1.2);
@@ -1647,8 +1700,8 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
 /// membership through a replicated `Logout`) and notify the client with a
 /// session-terminal `Eviction(StaleClient)`.
 #[allow(clippy::future_not_send)]
-async fn evict_stale_client<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn evict_stale_client<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) where
@@ -1656,6 +1709,7 @@ async fn evict_stale_client<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let bound = sessions.borrow_mut().remove_connection(transport_client_id);
     if let Some((vsr_client_id, session)) = bound {
@@ -1699,8 +1753,8 @@ async fn evict_stale_client<B, MJ, S>(
 /// Failures reply with an empty body so the SDK fails fast on decode
 /// instead of hanging until its read timeout.
 #[allow(clippy::future_not_send)]
-async fn handle_poll_messages<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_poll_messages<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
@@ -1709,6 +1763,7 @@ async fn handle_poll_messages<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Ok(wire) = PollMessagesRequest::decode_from(request_body(request)) else {
         // Undecodable poll: keep the fail-fast empty-poll shape.
@@ -1797,8 +1852,8 @@ async fn handle_poll_messages<B, MJ, S>(
 /// Serve `get_consumer_offset`. An empty body decodes as `None` on the SDK
 /// side (no offset stored / partition unknown).
 #[allow(clippy::future_not_send)]
-async fn handle_get_consumer_offset<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_consumer_offset<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
@@ -1807,6 +1862,7 @@ async fn handle_get_consumer_offset<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Ok(wire) = GetConsumerOffsetRequest::decode_from(request_body(request)) else {
         // Undecodable: an empty body decodes as None (no offset) on the SDK.
@@ -1869,8 +1925,8 @@ async fn handle_get_consumer_offset<B, MJ, S>(
 /// The member is keyed by the connection's bound VSR client id
 /// (`header().client`). An empty body decodes as "no assignment" on the SDK.
 #[allow(clippy::future_not_send)]
-async fn handle_sync_consumer_group<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_sync_consumer_group<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
 ) where
@@ -1878,6 +1934,7 @@ async fn handle_sync_consumer_group<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let body = match SyncConsumerGroupRequest::decode_from(request_body(request)) {
         Ok(wire) => shard
@@ -1917,13 +1974,13 @@ async fn handle_sync_consumer_group<B, MJ, S>(
     .await;
 }
 
-/// Ack a partition op whose namespace does not resolve (deleted stream /
-/// topic or unknown consumer group) with an empty Reply. The SDK connection
-/// processes replies in lockstep, so a silent drop wedges every
-/// subsequent request on that connection.
+/// Ack a consumer-offset op whose body could not be rewritten for the
+/// partition plane with an empty Reply. The SDK connection processes replies
+/// in lockstep, so a silent drop wedges every subsequent request on that
+/// connection.
 #[allow(clippy::future_not_send)]
-async fn send_empty_partition_reply<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_empty_partition_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
 ) where
@@ -1931,6 +1988,7 @@ async fn send_empty_partition_reply<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
@@ -1948,16 +2006,29 @@ async fn send_empty_partition_reply<B, MJ, S>(
     }
 }
 
-/// Wait (bounded) until `namespace` is routable: this shard's routing row
-/// exists and the owning shard answers a probe read (partition
-/// materialised). Fast path: row already present -> no probe, no wait.
+/// Wait (bounded) until this shard holds a routing row for `namespace`. Fast
+/// path: row already present -> no wait.
 ///
-/// Covers the post-`CreateTopic` convergence window where the metadata
-/// commit has returned to the client but the per-shard reconcilers have
-/// not yet seeded routing rows / materialised partitions.
+/// Covers the post-`CreateTopic` convergence window where the metadata commit
+/// has returned to the client but the per-shard reconcilers have not yet seeded
+/// routing rows. This is an admission courtesy, not a correctness gate: the row
+/// is a cache of the deterministic hash assignment and may exist before the
+/// owner has materialised anything, so its presence proves only where the
+/// partition belongs. What makes an early arrival safe is the owning shard
+/// itself - `park_if_unmaterialised` holds the frame until its partition lands,
+/// and `serves_committed_incarnation` refuses to serve a mismatched
+/// incarnation. Waiting here simply keeps the steady state off that park
+/// buffer, whose overflow is the one path that still sheds a request without
+/// replying (`frame_drops_total{variant=partition,reason=park_overflow}`).
+///
+/// Deliberately no owner-readiness probe. One used to run here, on the theory
+/// that the table could not be trusted; it could not close the window either,
+/// because the fast path above skipped it in exactly the case it was meant to
+/// cover - a row seeded from the hash by a shard that owns nothing. Readiness
+/// belongs to the owner, which is where it is now enforced.
 #[allow(clippy::future_not_send)]
-async fn wait_for_partition_routable<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn wait_for_partition_routable<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
 ) -> bool
 where
@@ -1965,6 +2036,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     const ATTEMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
     // 3s budget at 50ms per attempt. Counting attempts, not reading a
@@ -1972,9 +2044,6 @@ where
     // bus sleep advances virtual time, whereas `Instant::now` would not.
     const MAX_ATTEMPTS: u32 = 60;
 
-    if shard.shards_table().shard_for(namespace).is_some() {
-        return true;
-    }
     let mut attempts = 0u32;
     while shard.shards_table().shard_for(namespace).is_none() {
         if attempts >= MAX_ATTEMPTS {
@@ -1983,30 +2052,7 @@ where
         attempts += 1;
         shard.bus.sleep(ATTEMPT_DELAY).await;
     }
-    // The local row is seeded by THIS shard's reconciler; the owner
-    // materialises the partition on its own pass. Probe with a cheap read
-    // until the owner answers, so the write below normally clears the
-    // owner's "partition not initialized" guard. Not a hard guarantee: the
-    // partition can de-materialise between this probe and the dispatch, but
-    // the park/tombstone path re-checks and the client retries.
-    while attempts < MAX_ATTEMPTS {
-        match shard
-            .partition_read(
-                namespace,
-                PartitionRead::ConsumerOffset {
-                    consumer: PollingConsumer::Consumer(0, 0),
-                },
-            )
-            .await
-        {
-            Some(PartitionReadReply::NotFound) | None => {
-                attempts += 1;
-                shard.bus.sleep(ATTEMPT_DELAY).await;
-            }
-            Some(_) => return true,
-        }
-    }
-    false
+    true
 }
 
 /// The 16-byte `PolledMessages` body with zero messages
@@ -2028,8 +2074,8 @@ pub(crate) type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, Polli
 /// id = the connection's bound VSR client) and the HTTP route (client id 0,
 /// which fences group polls closed).
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn resolve_poll_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn resolve_poll_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &PollMessagesRequest,
     client_id: u128,
 ) -> Result<DecodedPollRequest, IggyError>
@@ -2038,6 +2084,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
@@ -2094,8 +2141,8 @@ where
 /// namespace, partition, and polling consumer. Shared by the TCP dispatch and
 /// the HTTP route; needs no client id because offset reads are not fenced
 /// (any client may read a group's offset, member or not).
-pub(crate) fn resolve_consumer_offset_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn resolve_consumer_offset_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &GetConsumerOffsetRequest,
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError>
 where
@@ -2103,6 +2150,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Omitted partition reads partition 0, matching the legacy resolver for
     // both consumer kinds (`unwrap_or(0)`).
@@ -2179,8 +2227,8 @@ fn polling_strategy_from_wire(
 /// committed op. A dropped reply (shard-0 inbox full / shutdown) maps to a
 /// transient `Canceled`, which the caller wraps so the SDK replays.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_register_on_owner<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn submit_register_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
 ) -> Result<BoundSession, MetadataSubmitError>
@@ -2189,6 +2237,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
         return shard
@@ -2212,8 +2261,8 @@ where
 
 /// Logout counterpart of [`submit_register_on_owner`].
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_logout_on_owner<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn submit_logout_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     session: u64,
     request: u64,
@@ -2223,6 +2272,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
         return shard
@@ -2255,8 +2305,8 @@ where
 /// of mistaking a dropped delete for success. Only a malformed / unresolvable
 /// request is acked empty without a commit.
 #[allow(clippy::future_not_send)]
-async fn handle_delete_segments_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_delete_segments_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     bound: Option<(u128, u64)>,
     request: &Message<RequestHeader>,
@@ -2265,6 +2315,7 @@ async fn handle_delete_segments_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let header = *request.header();
     let body = request_body(request);
@@ -2386,8 +2437,8 @@ async fn handle_delete_segments_request<B, MJ, S>(
 /// the error.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     template: &RequestHeader,
     client_id: u128,
     session: u64,
@@ -2398,6 +2449,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let parsed = DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
     let namespace_raw = match resolve_partition_request_namespace(
@@ -2508,8 +2560,8 @@ where
 /// shard 0 and forwards for peer-homed connections; its session guard drops a
 /// stale logout for a reused client id.
 #[allow(clippy::future_not_send)]
-fn submit_disconnect_logout<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+fn submit_disconnect_logout<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     session: u64,
 ) where
@@ -2517,6 +2569,7 @@ fn submit_disconnect_logout<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Synthetic request id: header validation rejects `request == 0` for
     // non-register ops, and a disconnect has no client-issued request id.
@@ -2549,8 +2602,8 @@ fn submit_disconnect_logout<B, MJ, S>(
 /// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
 /// `None` = transient submit failure (SDK read-timeout replays).
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_client_request_on_owner<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn submit_client_request_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
 ) -> Option<Message<GenericHeader>>
 where
@@ -2558,6 +2611,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
         return shard
@@ -2576,8 +2630,8 @@ where
 }
 
 #[allow(clippy::future_not_send)]
-async fn handle_logout_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_logout_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
@@ -2586,6 +2640,7 @@ async fn handle_logout_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
         warn!(
@@ -2620,8 +2675,8 @@ async fn handle_logout_request<B, MJ, S>(
     }
 }
 
-fn ensure_transport_connection<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn ensure_transport_connection<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) where
@@ -2629,6 +2684,7 @@ fn ensure_transport_connection<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Some(meta) = shard.bus.client_meta(transport_client_id) else {
         return;
@@ -2639,8 +2695,8 @@ fn ensure_transport_connection<B, MJ, S>(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_login_register_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_login_register_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
@@ -2649,6 +2705,7 @@ async fn handle_login_register_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
@@ -2790,8 +2847,8 @@ async fn handle_login_register_request<B, MJ, S>(
 /// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
 /// plus the protocol window on `IncompatibleProtocol`.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn send_login_eviction<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn send_login_eviction<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     vsr_client_id: u128,
     reason: EvictionReason,
@@ -2800,6 +2857,7 @@ pub(crate) async fn send_login_eviction<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let ctx = shard.plane.metadata().consensus.as_ref().map_or(
         EvictionContext {
@@ -2829,14 +2887,15 @@ pub(crate) async fn send_login_eviction<B, MJ, S>(
     }
 }
 
-pub(crate) fn upgrade_shard_handle<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
-) -> Option<Rc<ShellShard<B, MJ, S>>>
+pub(crate) fn upgrade_shard_handle<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+) -> Option<Rc<ShellShard<B, MJ, S, SB>>>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard_handle
         .borrow()
