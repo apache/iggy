@@ -109,7 +109,9 @@ use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
-use crate::dispatch::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::{
+    resolve_consumer_offset_request, resolve_poll_request, validate_topic_bounds,
+};
 use crate::http::error::{
     ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery, ReadError,
     WriteError,
@@ -794,6 +796,12 @@ pub(in crate::http) async fn create_topic(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     // Rejects empty/oversized name, partitions_count > MAX, replication_factor == Some(0).
     command.validate().map_err(WriteError::Rejected)?;
+    validate_topic_bounds(
+        &state.system_config,
+        command.partitions_count,
+        command.max_topic_size,
+    )
+    .map_err(WriteError::Rejected)?;
     let request = CreateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
@@ -1027,9 +1035,16 @@ pub(in crate::http) async fn poll_messages(
             Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
                 return Ok(Json(resync_required_polled_messages()));
             }
+            // A partition id the topic does not have is a client addressing
+            // error with its own code; collapsing it into the generic 404 body
+            // told an SDK "no such stream/topic" for a request whose stream and
+            // topic both resolved. TCP parity: the dispatch denies typed here.
+            Err(error @ IggyError::PartitionNotFound(..)) => {
+                return Err(ReadError::Rejected(error));
+            }
             // The remaining resolver failures are STM lookups that came up
-            // empty (unknown stream, topic, partition, or consumer group), so
-            // they render as the legacy 404 body.
+            // empty (unknown stream, topic, or consumer group), so they render
+            // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
     let reply = SendWrapper::new(

@@ -159,23 +159,26 @@ readonly EXAMPLES_SERVER_TIMEOUT=300
 readonly EXAMPLES_STOP_TIMEOUT=5
 
 # Resolve and validate the server binary path.
-# Usage: resolve_server_binary [target]
-# Sets global SERVER_BIN.
+# Usage: resolve_server_binary [target] [binary-name]
+# Sets global SERVER_BIN. binary-name defaults to iggy-server; vsr lanes
+# pass their server binary (built with --features vsr so the wire
+# protocol matches vsr-built clients).
 function resolve_server_binary() {
     local target="${1:-}"
+    local binary_name="${2:-iggy-server}"
     if [ -n "${target}" ]; then
-        SERVER_BIN="target/${target}/debug/iggy-server"
+        SERVER_BIN="target/${target}/debug/${binary_name}"
     else
-        SERVER_BIN="target/debug/iggy-server"
+        SERVER_BIN="target/debug/${binary_name}"
     fi
 
     if [ ! -f "${SERVER_BIN}" ]; then
         echo "Error: Server binary not found at ${SERVER_BIN}"
         echo "Please build the server binary before running this script:"
         if [ -n "${target}" ]; then
-            echo "  cargo build --target ${target} --bin iggy-server"
+            echo "  cargo build --target ${target} --bin ${binary_name}"
         else
-            echo "  cargo build --bin iggy-server"
+            echo "  cargo build --bin ${binary_name}"
         fi
         exit 1
     fi
@@ -233,12 +236,14 @@ function start_tls_server() {
     echo $! >"${EXAMPLES_PID_FILE}"
 }
 
-# Block until "has started" appears in the server log or timeout.
+# Block until the server logs readiness or timeout. Matches both the
+# legacy line ("has started") and the vsr server line ("client
+# listeners started", logged once the TCP socket is bound).
 # Usage: wait_for_server_ready [label]
 function wait_for_server_ready() {
     local label="${1:-Iggy}"
     local elapsed=0
-    while ! grep -q "has started" "${EXAMPLES_LOG_FILE}"; do
+    while ! grep -qE "has started|client listeners started" "${EXAMPLES_LOG_FILE}"; do
         if [ ${elapsed} -gt ${EXAMPLES_SERVER_TIMEOUT} ]; then
             echo "${label} server did not start within ${EXAMPLES_SERVER_TIMEOUT} seconds."
             ps fx 2>/dev/null || ps aux

@@ -28,7 +28,9 @@
 //! partition-specific payload handling on either end.
 
 use crate::messages_writer::MessagesWriter;
-use crate::offset_storage::{delete_persisted_offset, persist_offset};
+use crate::offset_storage::{
+    PURGE_GENERATION_FILE, delete_persisted_offset, persist_offset, persist_purge_generation,
+};
 use crate::segment::Segment;
 use crate::types::PartitionsConfig;
 use crate::{IggyIndexWriter, IggyPartition};
@@ -1977,13 +1979,13 @@ where
         // proves one happened.
         // Against the METADATA plane's committed generation, which the caller
         // reads off durable state, NOT against `self.applied_purge_generation`:
-        // that one is memory-only and reads 0 after every restart, so a
-        // post-restart rejoin of any ever-purged topic would see
-        // `offered > 0 == applied` and call it an advancing purge. That is the
-        // canonical rejoin, and treating it as a purge disables the
-        // `OfferRewindsDurableData` refusal below -- the one guard standing
-        // between an offer that rewinds this replica's offset space and its
-        // durable data.
+        // that one hydrates from `purge.gen`, which a kill before the purge's
+        // record step leaves absent or stale, so a post-restart rejoin of an
+        // ever-purged topic could see `offered > applied` and call it an
+        // advancing purge. That is the canonical rejoin, and treating it as a
+        // purge disables the `OfferRewindsDurableData` refusal below -- the
+        // one guard standing between an offer that rewinds this replica's
+        // offset space and its durable data.
         let purge_advances = offsets_wire.purge_generation > committed_purge_generation;
         let local_next_offset = self.offset_frontier();
         if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
@@ -2552,7 +2554,38 @@ where
         self.stats.set_current_offset(end);
 
         // A receiver that missed a purge must not be re-wiped by the
-        // reconciler right after installing post-purge data.
+        // reconciler right after installing post-purge data. Recorded durably
+        // for the same reason the purge itself records it: the reconciler
+        // gate hydrates from `purge.gen` at boot, so a memory-only stamp
+        // would make a restart re-purge the just-installed data and pull it
+        // all over again. A write failure only re-opens that restart window
+        // (the wipe-then-retransfer is self-healing, peers keep the data),
+        // so it degrades like the offset writes above instead of failing the
+        // install.
+        if offsets_wire.purge_generation > self.applied_purge_generation
+            && let Some(dir) = self.partition_dir.clone()
+        {
+            let path = format!("{dir}/{PURGE_GENERATION_FILE}");
+            if let Err(error) = persist_purge_generation(
+                &path,
+                offsets_wire.purge_generation,
+                self.created_revision,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.consensus().namespace(),
+                    purge_generation = offsets_wire.purge_generation,
+                    %error,
+                    "state-transfer install could not record the offered purge \
+                     generation; a restart before the next purge records it will \
+                     re-purge and re-transfer this partition"
+                );
+                offsets_written = false;
+            }
+        }
         self.applied_purge_generation = self
             .applied_purge_generation
             .max(offsets_wire.purge_generation);

@@ -3700,6 +3700,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
+        M: StreamsFrontend,
     {
         let header = *msg.header();
         let target = header.replica;
@@ -3809,6 +3810,35 @@ where
         }
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
+        // Purge convergence gate: while a committed purge is not yet locally
+        // applied, this journal still holds pre-purge entries with NO floor
+        // to fence them (the floor is installed by the purge itself), so
+        // serving now would hand a rejoiner batches the cluster purged.
+        // Defer instead: no RepairDone is sent, the rejoiner's stall retry
+        // re-asks, and the local purge (one reconciler wake away) installs
+        // the floor the fence below serves behind.
+        let namespace = IggyNamespace::from_raw(header.namespace);
+        let committed_purge = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_purge_generation(
+                namespace.stream_id(),
+                namespace.topic_id(),
+                namespace.partition_id(),
+            );
+        if committed_purge > partition.applied_purge_generation() {
+            self.metrics.record_partition_repair_serve_deferred();
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = header.namespace,
+                committed_purge,
+                applied_purge = partition.applied_purge_generation(),
+                "deferring repair serve until the committed purge applies locally"
+            );
+            return;
+        }
         let to_op = header.to_op.min(partition.consensus().commit_max());
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
@@ -3821,12 +3851,22 @@ where
         // journal instead reports eviction from the commit frontier, which
         // refuses the floor into a transfer (the empty window passes the
         // completeness check) and heals in one round.
+        //
+        // Purge fence on top: never serve entries at or below this replica's
+        // purge floor. The journal keeps them (own commit walk), but a
+        // rejoiner's floor died with its process, so served pre-purge batches
+        // would flush right back into its freshly reset segments. Reporting
+        // the floor as the retention start rides the normal `RangeEvicted`
+        // path: the rejoiner moves its commit floor to the purge point
+        // instead.
+        let purge_floor = partition.purge_floor_op();
         let retained_from = partition
             .log
             .journal()
             .inner
             .repair_retained_from()
-            .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1));
+            .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1))
+            .max(purge_floor.saturating_add(1));
         let mut from_op = header.from_op;
         if retained_from > from_op {
             self.send_repair_range_reply(
@@ -4110,17 +4150,50 @@ where
             0
         };
         let config = planes.1.0.config().clone();
-        let Some(partition) = planes
-            .1
-            .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
-        else {
+        let namespace = IggyNamespace::from_raw(header.namespace);
+        let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
         let Some(session) = partition.repair else {
             return;
         };
         if header.nonce != session.nonce {
+            return;
+        }
+        // Receiver half of the serve-side purge gate: while a committed purge
+        // is not yet locally applied, this replica's `recovered_durable_offset`
+        // still describes the PRE-purge segments, so a floor from a peer that
+        // did purge reads as connected against state the purge is about to
+        // delete -- and the post-purge batches (offsets restarting at 0) then
+        // flush-skip below that stale durable line and are silently lost.
+        // Defer the whole reply: the purge is one reconciler wake away and
+        // resets the line to `None`, and the stall retry re-asks, so the peer
+        // re-emits both `RangeEvicted` and `RepairDone` for the same window.
+        // TODO(hubcio): no direct test drives this gate -- `on_repair_range_reply`
+        // is only reachable through the real message bus and the shard crate has
+        // no fixture for it (the serve-side gate shares the gap). The loss shape
+        // is pinned at the partition level instead; a bus fixture would let both
+        // gates be exercised end to end.
+        let committed_purge = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_purge_generation(
+                namespace.stream_id(),
+                namespace.topic_id(),
+                namespace.partition_id(),
+            );
+        if committed_purge > partition.applied_purge_generation() {
+            self.metrics.record_partition_repair_serve_deferred();
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = header.namespace,
+                committed_purge,
+                applied_purge = partition.applied_purge_generation(),
+                command = ?header.command,
+                "deferring repair completion until the committed purge applies locally"
+            );
             return;
         }
         match header.command {
@@ -6863,9 +6936,10 @@ where
         // purged data durably: the local applied value stays at the newer
         // generation, and the reconciler's `committed > applied` gate never
         // re-fires. Compared against the METADATA plane's committed value, not
-        // this partition's applied one -- the latter is memory-only and reads 0
-        // after every restart. Routed through the ordinary failure arm, which
-        // rotates the peer; worst case is one wasted pull.
+        // this partition's applied one -- the latter hydrates from `purge.gen`,
+        // which a kill before the purge's record step leaves absent or stale.
+        // Routed through the ordinary failure arm, which rotates the peer;
+        // worst case is one wasted pull.
         let committed_purge_generation = self
             .plane
             .metadata()

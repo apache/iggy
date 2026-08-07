@@ -326,15 +326,36 @@ jobs:
           uv run --no-sync maturin develop
         shell: bash
 
+      - name: Build server Docker image for TLS tests
+        run: |
+          # test_tls.py spawns the server in a container; build it from the
+          # same vsr binaries the plain-TCP tests run against.
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
+          docker build \
+            -f core/server-ng/Dockerfile \
+            --target runtime-prebuilt \
+            --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
+            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+            -t iggy-server:local .
+        shell: bash
+
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
+        with:
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
 
       - name: Run tests
         run: |
           cd foreign/python
           IGGY_SERVER_HOST=127.0.0.1 \
           IGGY_SERVER_TCP_PORT=8090 \
+          IGGY_SERVER_DOCKER_IMAGE=iggy-server:local \
             uv run --no-sync pytest tests/ -v \
               --junitxml=../../reports/python-junit.xml \
               --tb=short \
