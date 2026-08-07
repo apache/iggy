@@ -158,6 +158,24 @@ where
     /// generation against this and resets only when it advances, so a redundant
     /// reconcile pass never re-wipes a partition already at this generation.
     pub(crate) applied_purge_generation: u64,
+    /// Highest partition op the last local purge superseded. A consumer-offset
+    /// op journaled before the purge but committed after it must NOT be
+    /// applied: `PurgeTopic` rides the metadata plane while
+    /// `StoreConsumerOffset*` rides this one, so the two logs carry no mutual
+    /// ordering, and a server-side auto-commit is dispatched with no client
+    /// waiting on it (`server-ng::dispatch::submit_auto_commit`) -- it can
+    /// still be in flight when the purge lands. Without this fence the commit
+    /// walk rewrites the offset map AND the offset file after the purge
+    /// cleared both, and nothing ever clears them again: this replica's
+    /// `applied_purge_generation` already matches the committed one, so the
+    /// reconciler sees no outstanding purge. The purge already fences the
+    /// other asynchronous writer of this state (the state-transfer install);
+    /// this is the symmetric fence for the offset-commit path.
+    ///
+    /// Memory-only on purpose, exactly like `applied_purge_generation`: a
+    /// restarted replica rehydrates its offsets from an already-empty
+    /// directory, so there is nothing for a persisted fence to protect.
+    pub(crate) consumer_offset_purge_fence: u64,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -268,6 +286,10 @@ where
             .field("recovered_durable_offset", &self.recovered_durable_offset)
             .field("observed_view", &self.observed_view)
             .field("applied_purge_generation", &self.applied_purge_generation)
+            .field(
+                "consumer_offset_purge_fence",
+                &self.consumer_offset_purge_fence,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -436,6 +458,7 @@ where
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
             applied_purge_generation: 0,
+            consumer_offset_purge_fence: 0,
             superblock: None,
             superblock_lock: LocalGate::new(),
             superblock_write_failures: Cell::new(0),
@@ -964,6 +987,17 @@ where
         &mut self,
         op: u64,
     ) -> Result<(), IggyError> {
+        // Superseded by a purge: this op was journaled before the partition was
+        // reset, so its offset describes messages that no longer exist. Drop it
+        // rather than let the commit walk write it back over the cleared state
+        // (see `consumer_offset_purge_fence`). A store admitted after the purge
+        // carries a higher op -- the primary assigns them monotonically at
+        // admission -- so it lands above the fence and applies normally, and a
+        // suppressed in-flight auto-commit is re-derived from the next poll.
+        if op <= self.consumer_offset_purge_fence {
+            self.pending_consumer_offset_commits.remove(&op);
+            return Ok(());
+        }
         // Peek (copy) instead of remove: if `persist_consumer_offset_commit`
         // fails (e.g. disk full, fd exhausted) the pending entry must remain
         // stageable for retry on the next apply. Removing first would strand
@@ -3823,6 +3857,16 @@ where
         self.installed_frontier = None;
         self.segment_checksum_cache.borrow_mut().clear();
 
+        // Fence the offset-commit path before clearing anything: every op the
+        // journal already holds predates this purge, so committing one later
+        // must not resurrect the offset the clear below is about to drop. The
+        // sequencer's current value is the right line -- it covers ops that are
+        // journaled but not yet committed, which is exactly where an in-flight
+        // auto-commit sits. Staged entries for those ops go too, so the commit
+        // walk cannot apply one straight out of the staging table.
+        self.consumer_offset_purge_fence = self.consensus().sequencer().current_sequence();
+        self.pending_consumer_offset_commits.clear();
+
         // Clear consumer + consumer-group offsets (memory + disk). Collect the
         // file paths before deleting so the map guard is not held across an
         // await.
@@ -5712,6 +5756,88 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A consumer-offset op journaled before a purge must not resurrect the
+    /// offset when its commit lands afterwards. `PurgeTopic` rides the metadata
+    /// plane while `StoreConsumerOffset*` rides this one, so the two logs carry
+    /// no mutual ordering; a server auto-commit in particular is dispatched
+    /// with nobody waiting on it and can still be in flight when the purge
+    /// runs. Applying it afterwards used to rewrite both the offset map and the
+    /// offset file over the cleared state, permanently: this replica's
+    /// `applied_purge_generation` already matches the committed one, so the
+    /// reconciler sees no outstanding purge to re-run.
+    #[compio::test]
+    async fn purge_fences_a_consumer_offset_op_journaled_before_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-purge-offset-fence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+
+        let mut partition = test_partition();
+        partition.set_partition_dir(dir.to_string_lossy().into_owned());
+        let consumer_id = 7u32;
+
+        // Journalled (staged) before the purge, not yet committed.
+        partition.consensus().sequencer().set_sequence(9);
+        partition.stage_consumer_offset_upsert(
+            9,
+            ConsumerKind::ConsumerGroup,
+            consumer_id,
+            9,
+            true,
+        );
+
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+
+        assert_eq!(
+            partition.consumer_offset_purge_fence, 9,
+            "the purge must fence every op the journal already held",
+        );
+        assert!(
+            partition.pending_consumer_offset_commits.is_empty(),
+            "the purge must drop staged pre-purge offset commits",
+        );
+
+        // The commit walk reaching that op afterwards is a no-op, not an error:
+        // refusing it would fail the commit and wedge the partition.
+        partition
+            .apply_staged_consumer_offset_commit(9)
+            .await
+            .expect("a fenced commit must not fail the commit walk");
+        assert!(
+            partition.consumer_group_offsets.pin().is_empty(),
+            "a pre-purge offset must not be resurrected after the purge",
+        );
+
+        // A store admitted after the purge carries a higher op -- the primary
+        // assigns them monotonically at admission -- so it still applies.
+        partition.stage_consumer_offset_upsert(
+            10,
+            ConsumerKind::ConsumerGroup,
+            consumer_id,
+            4,
+            false,
+        );
+        partition
+            .apply_staged_consumer_offset_commit(10)
+            .await
+            .expect("a post-purge commit applies");
+        assert_eq!(
+            partition.consumer_group_offsets.pin().len(),
+            1,
+            "a store admitted after the purge must survive the fence",
+        );
     }
 
     /// Purge unlinks every segment and recreates the same paths, so a poll

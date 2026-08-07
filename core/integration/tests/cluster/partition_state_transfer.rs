@@ -68,6 +68,15 @@ const INSTALL_MARKER: &str = "partition state transfer installed";
 const FULLY_SERVED_MARKER: &str = "partition state transfer fully served";
 const ABANDON_MARKER: &str =
     "partition state transfer stalled past its retry budget; abandoning with a backed-off re-arm";
+/// The second route off a dead transfer peer. A replica parked in
+/// `AwaitingTarget` re-arms the moment it adopts a StartView, and with the
+/// stock config that beats the stall budget every time: the budget needs six
+/// rounds of `repair_retry_interval` (~6s) while `heartbeat_timeout` elects
+/// the new primary in 5s. Both routes prove the same thing - the replica did
+/// not retry into the corpse - so a spec that pins one is asserting on
+/// scheduler luck.
+const REARM_ON_VIEW_MARKER: &str =
+    "adopted a live view while awaiting transfer; requesting partition state transfer";
 
 /// Transfer end-to-end: adoption, repair round-trip, conversion, chunk pull,
 /// install, tail repair. CI runners are slow; bound without hanging the suite.
@@ -243,7 +252,7 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
 // pull also runs the staged-segment reuse scan, but how much it can adopt
 // depends on how many artifacts completed before the kill, so nothing here
 // asserts on reuse.
-async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partition(
+async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recover_partition(
     harness: &mut TestHarness,
 ) {
     let client = harness
@@ -254,26 +263,26 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
     // Bulky payloads so the pull spans many 256 KiB chunks: the kill below
     // must land while the transfer is provably in flight, and a small
     // partition finishes inside the marker-poll latency, leaving the
-    // abandon path untested.
+    // dead-peer path untested.
     produce_bulky(&client, BULKY_MESSAGES_COUNT, BULKY_PAYLOAD_LEN).await;
     sleep(Duration::from_secs(1)).await;
     let _seed_client = client;
 
-    // Wipe node 2, wait until its rejoin CONVERTED to a transfer and the
-    // serving peer (the view-0 primary, node 0) proved it started serving
-    // the pull, then kill that peer mid-pull. Node 2 must not retry into
-    // the corpse forever: the stall budget abandons with a backed-off
-    // re-arm against the next peer, the survivors elect past node 0, and
-    // the transfer re-runs against the new primary (node 1).
+    // Wipe node 2, wait until its rejoin CONVERTED to a transfer, then kill
+    // the serving peer (the view-0 primary, node 0) mid-pull. Node 2 must not
+    // retry into the corpse forever: it re-arms against the next peer -- via
+    // the stall budget, or via the StartView it adopts once the survivors
+    // elect past node 0 -- and the transfer re-runs against the new primary
+    // (node 1).
     harness
         .restart_node_from_clean_slate(2)
         .expect("clean-slate restart of node 2");
     // Kill node 0 the moment node 2 CONVERTED: the transfer is then armed
     // at node 0 but the 64 MiB pull cannot possibly finish inside the kill
-    // latency, so node 2 deterministically ends up stalling against a dead
-    // peer -- whether the descriptor made it out or not, both funnels land
-    // in the stall budget. (Gating on the serving marker instead raced the
-    // pull itself: a release-build pull finishes in a few hundred ms.)
+    // latency, so node 2 deterministically ends up parked against a dead
+    // peer, whether the descriptor made it out or not. (Gating on the serving
+    // marker instead raced the pull itself: a release-build pull finishes in
+    // a few hundred ms.)
     let deadline = Instant::now() + TRANSFER_BUDGET;
     while !harness.node(2).stdout_contains(CONVERSION_MARKER) {
         assert!(
@@ -289,13 +298,22 @@ async fn given_transfer_peer_dies_when_stalled_should_abandon_and_recover_partit
     let installs_before_kill = harness.node(2).stdout_occurrences(INSTALL_MARKER);
     let served_before_kill = harness.node(1).stdout_occurrences(FULLY_SERVED_MARKER);
     let abandons_before_kill = harness.node(2).stdout_occurrences(ABANDON_MARKER);
+    let rearms_before_kill = harness.node(2).stdout_occurrences(REARM_ON_VIEW_MARKER);
     harness
         .stop_node(0)
         .expect("stop the serving peer (node 0)");
 
-    // The abandon is now deterministic: the pull was in flight against a
-    // peer that is gone, so the stall budget must exhaust.
-    await_new_marker(harness, 2, ABANDON_MARKER, abandons_before_kill).await;
+    // The pull was in flight against a peer that is gone, so node 2 must leave
+    // the dead session by one of the two routes off it, whichever fires first.
+    await_new_marker_any(
+        harness,
+        2,
+        &[
+            (ABANDON_MARKER, abandons_before_kill),
+            (REARM_ON_VIEW_MARKER, rearms_before_kill),
+        ],
+    )
+    .await;
 
     // Recovery: the scheduled re-arm targets the surviving primary. No
     // follow-up commit is asserted -- the cluster is quorum-marginal with
@@ -492,6 +510,25 @@ async fn await_new_marker(harness: &TestHarness, node: usize, marker: &str, base
             Instant::now() < deadline,
             "node {node} never logged {marker:?} again after the fault \
              (still at the pre-fault count of {baseline}) within {TRANSFER_BUDGET:?}"
+        );
+        sleep(MARKER_POLL).await;
+    }
+}
+
+/// [`await_new_marker`] over alternative markers on one node, each carried
+/// with its own pre-fault baseline: satisfied by the first to advance.
+async fn await_new_marker_any(harness: &TestHarness, node: usize, markers: &[(&str, usize)]) {
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    loop {
+        if markers
+            .iter()
+            .any(|(marker, baseline)| harness.node(node).stdout_occurrences(marker) > *baseline)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node {node} logged none of {markers:?} again after the fault within {TRANSFER_BUDGET:?}"
         );
         sleep(MARKER_POLL).await;
     }
