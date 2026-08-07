@@ -84,10 +84,7 @@ func (c *IggyTcpClient) resolvePartitioning(
 		return partitioning, nil
 	}
 
-	key, err := newTopicKey(streamId, topicId)
-	if err != nil {
-		return iggcon.Partitioning{}, err
-	}
+	key := newTopicKey(streamId, topicId)
 	partitionsCount, err := c.topicPartitionsCount(ctx, key, streamId, topicId)
 	if err != nil {
 		return iggcon.Partitioning{}, err

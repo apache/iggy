@@ -19,9 +19,17 @@ package tcp
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"log/slog"
+	"math/big"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -36,9 +44,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// certPath resolves a file of the repository certificate directory.
-func certPath(name string) string {
-	return filepath.Join("..", "..", "..", "..", "core", "certs", name)
+// selfSignedCert mints a throwaway server certificate for the loopback
+// listener, so the test carries no expiry or checkout-layout dependency.
+func selfSignedCert(t *testing.T) (tls.Certificate, string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	require.NoError(t, err)
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
+	require.NoError(t, err)
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(caPath, certPEM, 0o600))
+	return certificate, caPath
 }
 
 // testListener is a VSR server on a loopback port. The handler is called with
@@ -232,7 +269,7 @@ func TestConnect_KeepsTheConnectionWhenTheRosterHasOneNode(t *testing.T) {
 	assert.Equal(t, 1, server.connections(), "a one-node roster never redirects")
 }
 
-func TestExchange_ReSignsInBeforeReplayingOverAFreshConnection(t *testing.T) {
+func TestExchange_ReSignsInBeforeReplayingANonReplicatedRequest(t *testing.T) {
 	var server *testListener
 	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
 		switch {
@@ -241,7 +278,44 @@ func TestExchange_ReSignsInBeforeReplayingOverAFreshConnection(t *testing.T) {
 		case read.operation() == vsr.OperationRegister:
 			return registerReplyFrame(7, uint64(128+connection))
 		case connection == 0 && index == 2:
-			// Drop the first stream creation to force the reconnect path.
+			// Drop the first ping to force the reconnect path.
+			return nil
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+
+	require.NoError(t, client.Ping(context.Background()))
+
+	assert.Equal(t, 2, server.connections())
+	recorded := server.recorded()
+	require.Len(t, recorded, 6)
+
+	assert.Equal(t, uint32(command.PingCode), recorded[2].code(), "the dropped attempt")
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].code())
+	assert.Equal(t, vsr.OperationRegister, recorded[4].operation(),
+		"the replay signs in again before it repeats the request")
+	assert.Equal(t, uint32(command.PingCode), recorded[5].code())
+
+	assert.NotEqual(t, recorded[2].clientID(), recorded[5].clientID(),
+		"a fresh connection registers a new client identity")
+	assert.Equal(t, uint64(129), client.session.SessionID())
+}
+
+func TestExchange_RefusesToReplayAReplicatedRequestWithAnUnknownOutcome(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, uint64(128+connection))
+		case connection == 0 && index == 2:
+			// Drop the reply so the stream creation's outcome is unknown.
 			return nil
 		default:
 			return replyFrame(vsr.OperationCreateStream, resultSection())
@@ -253,21 +327,14 @@ func TestExchange_ReSignsInBeforeReplayingOverAFreshConnection(t *testing.T) {
 	require.NoError(t, client.Connect(context.Background()))
 
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	require.NoError(t, err)
+	assert.ErrorIs(t, err, ierror.ErrDisconnected,
+		"a replay would carry a fresh client identity the server cannot deduplicate")
 
-	assert.Equal(t, 2, server.connections())
+	assert.Equal(t, 1, server.connections(), "no reconnect was attempted")
 	recorded := server.recorded()
-	require.Len(t, recorded, 6)
-
-	assert.Equal(t, vsr.OperationCreateStream, recorded[2].operation(), "the dropped attempt")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].code())
-	assert.Equal(t, vsr.OperationRegister, recorded[4].operation(),
-		"the replay signs in again before it repeats the request")
-	assert.Equal(t, vsr.OperationCreateStream, recorded[5].operation())
-
-	assert.NotEqual(t, recorded[2].clientID(), recorded[5].clientID(),
-		"a fresh connection registers a new client identity")
-	assert.Equal(t, uint64(129), client.session.SessionID())
+	require.Len(t, recorded, 3)
+	assert.Equal(t, vsr.OperationCreateStream, recorded[2].operation(),
+		"the request reached the wire exactly once")
 }
 
 func TestExchange_ReconnectsThroughAKnownFollowerAfterTheLeaderDies(t *testing.T) {
@@ -432,9 +499,54 @@ func TestLogoutUser_ResetsTheSessionSoTheNextSignInIsANewIdentity(t *testing.T) 
 	assert.True(t, client.session.Bound())
 }
 
-func TestConnect_ExchangesOverTLS(t *testing.T) {
-	certificate, err := tls.LoadX509KeyPair(certPath("iggy_cert.pem"), certPath("iggy_key.pem"))
+func TestHandleLeaderRedirection_StopsAtTheRedirectBudget(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return clusterMetadataFrame(t, 0, "10.0.0.1:8090", "10.0.0.2:8090")
+	})
+	for range iggcon.MaxLeaderRedirects {
+		client.leaderRedirectionState.IncrementRedirect("10.0.0.1:8090")
+	}
+
+	redirect, err := client.HandleLeaderRedirection(context.Background())
 	require.NoError(t, err)
+	assert.False(t, redirect, "the budget stops a redirect storm")
+	assert.Equal(t, []string{"10.0.0.1:8090", "10.0.0.2:8090"}, client.knownServerAddresses,
+		"the roster still feeds the reconnect candidates")
+}
+
+func TestConnect_UnwindsWhenEveryReadFailsInsideTheConnectFlow(t *testing.T) {
+	// An accept-then-close listener makes every dial succeed and every first
+	// read fail, the shape that previously recursed Connect through the
+	// reconnect path until stack exhaustion.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	client := newDialingClient(t, listener.Addr().String(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = client.Connect(ctx)
+
+	require.Error(t, err, "the failure unwinds instead of recursing")
+	assert.NotErrorIs(t, err, context.DeadlineExceeded,
+		"Connect gave up on its own, not through the safety-net timeout")
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+}
+
+func TestConnect_ExchangesOverTLS(t *testing.T) {
+	certificate, caPath := selfSignedCert(t)
 
 	var server *testListener
 	server = listenVSR(t,
@@ -445,7 +557,7 @@ func TestConnect_ExchangesOverTLS(t *testing.T) {
 
 	client := newDialingClient(t, server.address(),
 		WithTLS(
-			WithTLSCAFile(certPath("iggy_ca_cert.pem")),
+			WithTLSCAFile(caPath),
 			WithTLSDomain("localhost"),
 		),
 		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))

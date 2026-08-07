@@ -30,16 +30,16 @@ type topicKey struct {
 	topic  string
 }
 
-func newTopicKey(streamId, topicId iggcon.Identifier) (topicKey, error) {
-	stream, err := streamId.MarshalBinary()
-	if err != nil {
-		return topicKey{}, err
-	}
-	topic, err := topicId.MarshalBinary()
-	if err != nil {
-		return topicKey{}, err
-	}
-	return topicKey{stream: string(stream), topic: string(topic)}, nil
+func newTopicKey(streamId, topicId iggcon.Identifier) topicKey {
+	stream, _ := streamId.MarshalBinary()
+	topic, _ := topicId.MarshalBinary()
+	return topicKey{stream: string(stream), topic: string(topic)}
+}
+
+// encodedStream is the stream half of a topicKey.
+func encodedStream(streamId iggcon.Identifier) string {
+	stream, _ := streamId.MarshalBinary()
+	return string(stream)
 }
 
 // topicCache holds what a send needs to pick a partition without a metadata
@@ -77,6 +77,23 @@ func (c *topicCache) drop(key topicKey) {
 	defer c.mtx.Unlock()
 	delete(c.partitionsCounts, key)
 	delete(c.balancedCursors, key)
+}
+
+// dropStream forgets every topic cached under the encoded stream identifier,
+// because deleting a stream invalidates each topic under it.
+func (c *topicCache) dropStream(stream string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	for key := range c.partitionsCounts {
+		if key.stream == stream {
+			delete(c.partitionsCounts, key)
+		}
+	}
+	for key := range c.balancedCursors {
+		if key.stream == stream {
+			delete(c.balancedCursors, key)
+		}
+	}
 }
 
 // nextBalanced returns the partition a balanced send targets and advances the

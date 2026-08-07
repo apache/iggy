@@ -30,8 +30,9 @@ import (
 
 // assignmentRefreshInterval is how long a cached assignment is trusted before
 // the client asks the coordinator again. A rebalance the client missed shows
-// up as a fenced poll long before this expires, so it only bounds the drift of
-// an idle member.
+// up as a fenced poll long before this expires. The periodic re-sync catches
+// what fencing cannot, like a partition added to an assignment that stays
+// valid; a same-generation re-sync keeps the round-robin position.
 const assignmentRefreshInterval = 5 * time.Second
 
 // groupPollAttempts bounds how many times one poll re-syncs its assignment
@@ -62,6 +63,11 @@ type groupAssignment struct {
 type groupAssignmentCache struct {
 	mtx     sync.Mutex
 	entries map[groupKey]*groupAssignment
+	// left records the groups the caller explicitly left, so a later poll
+	// does not join them back implicitly. An explicit join clears the mark.
+	// The mark survives clear, because leaving is caller intent rather than
+	// connection state.
+	left map[groupKey]struct{}
 }
 
 func (c *groupAssignmentCache) get(key groupKey) (groupAssignment, bool) {
@@ -99,6 +105,35 @@ func (c *groupAssignmentCache) drop(key groupKey) {
 	delete(c.entries, key)
 }
 
+// markJoined drops the cached assignment after an explicit join and clears
+// the left mark, so polling resumes with a fresh sync.
+func (c *groupAssignmentCache) markJoined(key groupKey) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	delete(c.entries, key)
+	delete(c.left, key)
+}
+
+// markLeft drops the cached assignment after an explicit leave or a group
+// deletion and records that the caller left on purpose.
+func (c *groupAssignmentCache) markLeft(key groupKey) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	delete(c.entries, key)
+	if c.left == nil {
+		c.left = make(map[groupKey]struct{})
+	}
+	c.left[key] = struct{}{}
+}
+
+// hasLeft reports whether the caller explicitly left the group.
+func (c *groupAssignmentCache) hasLeft(key groupKey) bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	_, ok := c.left[key]
+	return ok
+}
+
 // clear forgets every assignment. A new connection registers a new client
 // identity, so nothing the server assigned to the old one still holds.
 func (c *groupAssignmentCache) clear() {
@@ -108,20 +143,11 @@ func (c *groupAssignmentCache) clear() {
 }
 
 // newGroupKey builds the cache key from the encoded identifiers.
-func newGroupKey(streamId, topicId, groupId iggcon.Identifier) (groupKey, error) {
-	stream, err := streamId.MarshalBinary()
-	if err != nil {
-		return groupKey{}, err
-	}
-	topic, err := topicId.MarshalBinary()
-	if err != nil {
-		return groupKey{}, err
-	}
-	group, err := groupId.MarshalBinary()
-	if err != nil {
-		return groupKey{}, err
-	}
-	return groupKey{stream: string(stream), topic: string(topic), group: string(group)}, nil
+func newGroupKey(streamId, topicId, groupId iggcon.Identifier) groupKey {
+	stream, _ := streamId.MarshalBinary()
+	topic, _ := topicId.MarshalBinary()
+	group, _ := groupId.MarshalBinary()
+	return groupKey{stream: string(stream), topic: string(topic), group: string(group)}
 }
 
 // pollGroup polls a consumer group that named no explicit partition. The
@@ -136,10 +162,7 @@ func (c *IggyTcpClient) pollGroup(
 	count uint32,
 	autoCommit bool,
 ) (*iggcon.PolledMessage, error) {
-	key, err := newGroupKey(streamId, topicId, consumer.Id)
-	if err != nil {
-		return nil, err
-	}
+	key := newGroupKey(streamId, topicId, consumer.Id)
 
 	for range groupPollAttempts {
 		assignment, err := c.ensureAssignment(ctx, key, streamId, topicId, consumer.Id)
@@ -176,7 +199,13 @@ func (c *IggyTcpClient) pollGroup(
 		return polled, nil
 	}
 
-	return nil, ierror.ErrConsumerGroupPartitionNotOwned
+	// The attempt budget ran out mid-rebalance. A rebalance is not a failure:
+	// report an empty poll like a member that owns nothing yet, so a consumer
+	// that does not special-case rebalances just polls again.
+	return &iggcon.PolledMessage{
+		PartitionId: iggcon.NoAssignedPartition,
+		Messages:    []iggcon.IggyMessage{},
+	}, nil
 }
 
 // isAssignmentStale reports whether the error means the cached assignment no
@@ -187,7 +216,7 @@ func isAssignmentStale(err error) bool {
 }
 
 // ensureAssignment returns a fresh enough assignment, joining the group first
-// when the client turns out not to be a member.
+// when a client that never left turns out not to be a member.
 func (c *IggyTcpClient) ensureAssignment(
 	ctx context.Context,
 	key groupKey,
@@ -199,26 +228,29 @@ func (c *IggyTcpClient) ensureAssignment(
 	}
 
 	synced, err := c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-	if err != nil {
-		return groupAssignment{}, err
-	}
-	if synced == nil {
-		if err := c.JoinConsumerGroup(ctx, streamId, topicId, groupId); err != nil {
+	if errors.Is(err, ierror.ErrConsumerGroupMemberNotFound) && !c.groups.hasLeft(key) {
+		// The first poll may run before the caller joined, so the membership
+		// is established on its behalf. A group the caller explicitly left
+		// stays left, and the poll reports the membership error instead.
+		if err = c.JoinConsumerGroup(ctx, streamId, topicId, groupId); err != nil {
 			return groupAssignment{}, err
 		}
 		synced, err = c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-		if err != nil {
-			return groupAssignment{}, err
-		}
-		if synced == nil {
-			return groupAssignment{}, ierror.ErrConsumerGroupMemberNotFound
-		}
+	}
+	if err != nil {
+		return groupAssignment{}, err
 	}
 
 	assignment := groupAssignment{
 		generation: synced.Generation,
 		partitions: synced.Partitions,
 		fetchedAt:  time.Now(),
+	}
+	if current, ok := c.groups.get(key); ok && current.generation == synced.Generation {
+		// A same-generation refresh is not a rebalance: the member still owns
+		// the same partitions, so the round-robin position carries over
+		// instead of resetting and starving the partitions behind it.
+		assignment.cursor = current.cursor
 	}
 	c.logger.Debug("Synced the consumer group assignment",
 		slog.Uint64("generation", assignment.generation),

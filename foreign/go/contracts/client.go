@@ -95,9 +95,11 @@ type Client interface {
 	// Authentication is required, and the permission to send the messages.
 	//
 	// The returned confirmations report where the server committed the batch.
-	// Delivery is at-least-once: a send replayed after a reconnect arrives
-	// under a fresh client identity, so the server cannot deduplicate it
-	// against the original and the batch may commit twice.
+	// A send whose reply is lost to a dropped connection returns
+	// ErrDisconnected without a replay: a reconnect registers a fresh client
+	// identity, so the server could not deduplicate the replay against a
+	// batch that may have already committed. Retrying such a send is the
+	// caller's decision and may write the batch twice.
 	SendMessages(
 		ctx context.Context,
 		streamId Identifier,
@@ -108,6 +110,16 @@ type Client interface {
 
 	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// A group poll that names no partition is orchestrated client-side and
+	// has three outcomes:
+	//   - err == nil with PartitionId == NoAssignedPartition and an empty
+	//     batch: nothing to read right now, poll again. This covers a member
+	//     that owns no partition and a rebalance still settling.
+	//   - ErrConsumerGroupMemberNotFound: the client is not a member, for
+	//     example after an explicit LeaveConsumerGroup. JoinConsumerGroup
+	//     restores membership.
+	//   - err == nil with a real partition id: messages were read.
 	PollMessages(
 		ctx context.Context,
 		streamId Identifier,
@@ -201,7 +213,9 @@ type Client interface {
 
 	// SyncConsumerGroup fetch the partitions this client currently owns in a consumer group,
 	// together with the group generation, for the given stream and topic by unique IDs or names.
-	// Returns nil when the client is not a member of the group.
+	// Returns ErrConsumerGroupMemberNotFound when the client is not a member
+	// of the group. A member that owns no partition gets a non-nil assignment
+	// with an empty Partitions slice.
 	// Authentication is required, and the permission to read the streams or topics.
 	SyncConsumerGroup(
 		ctx context.Context,

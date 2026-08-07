@@ -394,10 +394,28 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 		"a partition request reads the watermark without consuming it")
 }
 
-func TestSendMessages_TreatsAnEmptyConfirmationBodyAsSuccess(t *testing.T) {
+func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	serve(serverConn, func(_ int, _ request) []byte {
+		// The server answers a replicated request on a dead session with an
+		// empty status-0 reply. Nothing was written, so reading it as a
+		// successful send would silently drop the batch.
+		return replyFrame(vsr.OperationSendMessages, nil)
+	})
+
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	_, err = client.SendMessages(context.Background(),
+		numericIdentifier(t, 1), numericIdentifier(t, 1),
+		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
+}
+
+func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationSendMessages, nil)
+		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 	})
 
 	message, err := iggcon.NewIggyMessage([]byte("payload"))
@@ -407,6 +425,11 @@ func TestSendMessages_TreatsAnEmptyConfirmationBodyAsSuccess(t *testing.T) {
 		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
 	require.NoError(t, err)
 	assert.Empty(t, response.Confirmations)
+}
+
+// zeroConfirmations builds a confirmation section with a zero entry count.
+func zeroConfirmations() []byte {
+	return binary.LittleEndian.AppendUint32(nil, 0)
 }
 
 func TestSendMessages_DegradesAnUnreadableConfirmationBody(t *testing.T) {
@@ -430,7 +453,7 @@ func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T)
 	client, serverConn := newPipeClient(t)
 	server := serve(serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
-			return replyFrame(vsr.OperationSendMessages, nil)
+			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
 		return replyFrame(vsr.OperationNonReplicated, topicDetailsBody(t, 4))
 	})
@@ -455,7 +478,7 @@ func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	server := serve(serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
-			return replyFrame(vsr.OperationSendMessages, nil)
+			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
 		return replyFrame(vsr.OperationNonReplicated, topicDetailsBody(t, 3))
 	})
@@ -496,6 +519,37 @@ func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 		numericIdentifier(t, 1), numericIdentifier(t, 1), iggcon.PartitionId(0), nil)
 	assert.ErrorIs(t, err, ierror.ErrInvalidMessagesCount)
 	assert.Empty(t, server.recorded())
+}
+
+func TestCanReplay_RefusesOnlyReplicatedRequestsWithAnUnknownOutcome(t *testing.T) {
+	tests := []struct {
+		name string
+		code uint32
+		err  error
+		want bool
+	}{
+		{name: "register replays by design",
+			code: uint32(command.LoginRegisterCode), err: ierror.ErrDisconnected, want: true},
+		{name: "non-replicated read replays",
+			code: uint32(command.PingCode), err: ierror.ErrDisconnected, want: true},
+		{name: "replicated write never sent replays",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrNotConnected, want: true},
+		{name: "replicated write refused by the server replays",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrUnauthenticated, want: true},
+		{name: "replicated write on a stale client replays",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrStaleClient, want: true},
+		{name: "replicated write with a lost reply is refused",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrDisconnected, want: false},
+		{name: "send with a lost reply is refused",
+			code: uint32(command.SendMessagesCode), err: ierror.ErrDisconnected, want: false},
+		{name: "token mint with a lost reply is refused",
+			code: uint32(command.CreateAccessTokenCode), err: ierror.ErrDisconnected, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, canReplay(test.code, test.err))
+		})
+	}
 }
 
 // topicDetailsBody builds the reply body of GetTopic for a topic with the

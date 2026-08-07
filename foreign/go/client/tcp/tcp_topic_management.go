@@ -121,5 +121,6 @@ func (c *IggyTcpClient) DeleteTopic(ctx context.Context, streamId, topicId iggco
 	if err != nil {
 		return err
 	}
-	return c.dropTopicCache(streamId, topicId)
+	c.dropTopicCache(streamId, topicId)
+	return nil
 }

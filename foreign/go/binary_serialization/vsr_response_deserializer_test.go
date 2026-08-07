@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -128,9 +129,9 @@ func TestDeserializeConsumerGroupAssignment_DecodesTheGolden(t *testing.T) {
 	assert.Equal(t, []uint32{0, 2, 4}, assignment.Partitions)
 }
 
-func TestDeserializeConsumerGroupAssignment_ReportsANonMemberAsNil(t *testing.T) {
+func TestDeserializeConsumerGroupAssignment_ReportsANonMemberAsATypedError(t *testing.T) {
 	assignment, err := DeserializeConsumerGroupAssignment(nil)
-	require.NoError(t, err)
+	assert.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound)
 	assert.Nil(t, assignment)
 }
 

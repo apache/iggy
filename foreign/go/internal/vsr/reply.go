@@ -86,6 +86,15 @@ func DecodeReply(header *[HeaderSize]byte, body []byte) ([]byte, error) {
 	if !IsKnownOperation(operation) {
 		return nil, ierror.ErrInvalidCommand
 	}
+	if operation == OperationSendMessages && expected == 0 {
+		// A committed send always carries a confirmation section. The server
+		// answers a replicated request on a dead session with an empty
+		// status-0 reply, expecting the decoder to reject it. Every other
+		// replicated operation is result-framed and fails on the missing
+		// section; SendMessages is not, so without this guard a send that
+		// wrote nothing would read as a success.
+		return nil, ierror.ErrInvalidCommand
+	}
 	return SplitMetadataResult(operation, body[:expected])
 }
 

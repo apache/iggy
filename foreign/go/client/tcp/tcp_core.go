@@ -400,12 +400,20 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 	return append(buf, body...), nil
 }
 
+// connectScoped marks the context of a request the connect flow itself
+// issues. exchange must not reconnect such a request: Connect is already on
+// the stack, and re-entering it has no depth bound.
+type connectScoped struct{}
+
 // exchange runs one request to completion, reconnecting and replaying it when
 // the failure is one a fresh connection recovers from.
 func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte) ([]byte, error) {
 	response, err := c.sendFrame(ctx, code, frame)
 	if err == nil || !isReconnectable(err) {
 		return response, err
+	}
+	if ctx.Value(connectScoped{}) != nil {
+		return nil, err
 	}
 	if !c.config.reconnection.enabled {
 		c.logger.Warn("Automatic reconnection is disabled.")
@@ -418,6 +426,11 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 	// register failure and expects the client to replay it.
 	login := isRegisterCode(code)
 	if !c.config.autoLogin.enabled && !login {
+		return nil, err
+	}
+	if !canReplay(code, err) {
+		c.logger.Warn("Not replaying a replicated request with an unknown outcome.",
+			slog.Int("code", int(code)), slog.Any("error", err))
 		return nil, err
 	}
 
@@ -443,6 +456,36 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 		return nil, reconnectErr
 	}
 	return c.sendFrame(ctx, code, frame)
+}
+
+// canReplay reports whether re-issuing the request over a fresh connection
+// cannot double-apply it. A reconnect registers a new client identity, so the
+// server cannot deduplicate the replay against the original request. A
+// sign-in is a deliberate exception the server expects, a non-replicated
+// request is never deduplicated in the first place, and two failures leave a
+// replicated request provably unapplied: one that struck before the frame was
+// written, and a session refusal the server answered instead of applying.
+// What remains is a replicated request whose reply was lost in transit, and
+// its unknown outcome makes the replay unsafe.
+func canReplay(code uint32, err error) bool {
+	if isRegisterCode(code) {
+		return true
+	}
+	if _, replicated := vsr.ReplicatedOperation(code); !replicated {
+		return true
+	}
+	neverApplied := []error{
+		ierror.ErrNotConnected,
+		ierror.ErrCannotEstablishConnection,
+		ierror.ErrUnauthenticated,
+		ierror.ErrStaleClient,
+	}
+	for _, target := range neverApplied {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // isReconnectable reports whether a fresh connection can recover the failure.
@@ -886,7 +929,13 @@ func (c *IggyTcpClient) connectionCandidates() []string {
 // budget instead of failing over. Cluster metadata is sessionless and works on
 // the unauthenticated connection.
 func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool) error {
-	redirect, err := c.HandleLeaderRedirection(ctx)
+	// The metadata request runs while Connect is on the stack. Reconnecting
+	// it would re-enter Connect and recurse without a bound, so its failure
+	// unwinds to this Connect instead. The sign-in below keeps the reconnect
+	// path: its replay is the documented recovery for a transient register
+	// failure, and the replayed sign-in suppresses the automatic one, so the
+	// depth is bounded at one nested Connect.
+	redirect, err := c.HandleLeaderRedirection(context.WithValue(ctx, connectScoped{}, struct{}{}))
 	if err != nil {
 		return err
 	}

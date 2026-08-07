@@ -664,11 +664,12 @@ const assignmentHeaderLength = 12
 
 // DeserializeConsumerGroupAssignment decodes
 // [generation u64][partitions_count u32][partition_id u32 x n]. An empty
-// payload means the client is not a member of the group, reported as a nil
-// assignment.
+// payload means the client is not a member of the group, reported as
+// ErrConsumerGroupMemberNotFound. A member holding no partition arrives as a
+// header with a zero count and decodes to an empty Partitions slice.
 func DeserializeConsumerGroupAssignment(payload []byte) (*iggcon.ConsumerGroupAssignment, error) {
 	if len(payload) == 0 {
-		return nil, nil
+		return nil, ierror.ErrConsumerGroupMemberNotFound
 	}
 	if len(payload) < assignmentHeaderLength {
 		return nil, fmt.Errorf("group assignment: %d bytes is short of the header", len(payload))

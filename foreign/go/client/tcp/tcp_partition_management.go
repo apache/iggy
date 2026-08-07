@@ -33,7 +33,8 @@ func (c *IggyTcpClient) CreatePartitions(ctx context.Context, streamId iggcon.Id
 	if err != nil {
 		return err
 	}
-	return c.invalidateTopicCache(streamId, topicId)
+	c.invalidateTopicCache(streamId, topicId)
+	return nil
 }
 
 func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
@@ -45,23 +46,14 @@ func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Id
 	if err != nil {
 		return err
 	}
-	return c.invalidateTopicCache(streamId, topicId)
-}
-
-func (c *IggyTcpClient) invalidateTopicCache(streamId, topicId iggcon.Identifier) error {
-	key, err := newTopicKey(streamId, topicId)
-	if err != nil {
-		return err
-	}
-	c.topics.invalidatePartitionsCount(key)
+	c.invalidateTopicCache(streamId, topicId)
 	return nil
 }
 
-func (c *IggyTcpClient) dropTopicCache(streamId, topicId iggcon.Identifier) error {
-	key, err := newTopicKey(streamId, topicId)
-	if err != nil {
-		return err
-	}
-	c.topics.drop(key)
-	return nil
+func (c *IggyTcpClient) invalidateTopicCache(streamId, topicId iggcon.Identifier) {
+	c.topics.invalidatePartitionsCount(newTopicKey(streamId, topicId))
+}
+
+func (c *IggyTcpClient) dropTopicCache(streamId, topicId iggcon.Identifier) {
+	c.topics.drop(newTopicKey(streamId, topicId))
 }
