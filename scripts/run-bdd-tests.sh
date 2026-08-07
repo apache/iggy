@@ -39,7 +39,9 @@ usage(){
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
-  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust only);"
+  # TODO(hubcio): change to iggy-server once legacy server is removed
+  # (core/server has VSR support)
+  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust and python);"
   log "           expects IGGY_SERVER_NG_PATH (default: target/debug/iggy-server-ng)"
   log "           and a vsr-built iggy CLI at IGGY_CLI_PATH"
   log ""
@@ -53,9 +55,9 @@ usage(){
 
 if [ "$VSR" = "1" ]; then
   case "$SDK" in
-    rust|clean) ;;
+    rust|python|clean) ;;
     *)
-      log "❌ --vsr supports only the Rust SDK (server-ng speaks the VSR wire protocol)"
+      log "❌ --vsr supports only the Rust and Python SDKs (server-ng speaks the VSR wire protocol)"
       usage
       exit 2 ;;
   esac

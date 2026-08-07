@@ -1062,8 +1062,10 @@ where
     SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let resolved_stream =
-            resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
+        // Legacy parity: a missing stream lists as empty, not StreamNotFound.
+        let Some(resolved_stream) = resolve_stream_id(streams, stream_id) else {
+            return Ok(GetTopicsResponse { topics: Vec::new() });
+        };
         let stream = streams
             .items
             .get(resolved_stream)
