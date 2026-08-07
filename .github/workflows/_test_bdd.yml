@@ -51,18 +51,23 @@ jobs:
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          if [ "${{ inputs.task }}" = "bdd-rust-vsr" ]; then
-            # server-ng lane: the vsr feature must be enabled on both the
-            # server and the CLI, otherwise the CLI cannot frame requests
-            # for the VSR wire protocol (healthcheck ping would fail).
+          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python)
+            # vsr lane: the feature must be enabled on both the server
+            # and the CLI, otherwise the CLI cannot frame requests for
+            # the VSR wire protocol (healthcheck ping would fail).
+            # Python wheels are vsr-built, so the whole lane runs vsr.
+            # TODO(hubcio): change to iggy-server once legacy server is
+            # removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"
-            echo "Building server-ng binary and CLI (--features vsr) for BDD tests..."
+            echo "Building server binary and CLI (--features vsr) for BDD tests..."
             cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
-          else
+            ;;
+          *)
             SERVER_BIN="iggy-server"
             echo "Building server binary and CLI for BDD tests..."
             cargo build --locked --bin iggy-server --bin iggy
-          fi
+            ;;
+          esac
 
           echo "Server binary built at: target/debug/${SERVER_BIN}"
           ls -lh "target/debug/${SERVER_BIN}"
@@ -85,17 +90,21 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
           # Extract SDK name from task (format: bdd-<sdk>, or bdd-<sdk>-vsr
-          # for the server-ng lane)
-          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
+          # for an explicit vsr lane). Python has no legacy lane, so its
+          # plain task name runs vsr.
+          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//; s/-vsr$//')
           EXTRA_FLAGS=()
-          if [ "$SDK_NAME" = "rust-vsr" ]; then
-            SDK_NAME="rust"
+          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python)
             EXTRA_FLAGS+=(--vsr)
+            # TODO(hubcio): change to iggy-server once legacy server is
+            # removed (core/server has VSR support)
             export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
             echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
-          else
+            ;;
+          *)
             echo "Server binary location: $(ls -lh target/debug/iggy-server)"
-          fi
+            ;;
+          esac
 
           echo "Running BDD tests for SDK: $SDK_NAME"
           echo "Current directory: $(pwd)"

@@ -23,7 +23,8 @@
 //! `InvalidTopicSize`; `ServerDefault` and `Unlimited` sizes pass. Update
 //! stores `max_topic_size` and `message_expiry` verbatim and gets echo the
 //! stored value (never the node default frozen at update time), matching
-//! legacy wire behavior.
+//! legacy wire behavior. Listing topics of a missing stream replies with an
+//! empty list, as the legacy server does.
 
 use std::str::FromStr;
 
@@ -250,5 +251,22 @@ async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
     assert_eq!(
         topic.partitions_count, 3,
         "the in-bounds add lands after the oversized denies"
+    );
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn given_missing_stream_when_listing_topics_should_return_empty(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream_id = Identifier::from_str_value("no-such-stream").expect("stream identifier");
+    let topics = client
+        .get_topics(&stream_id)
+        .await
+        .expect("get_topics on a missing stream");
+    assert!(
+        topics.is_empty(),
+        "a missing stream must list no topics, got {topics:?}"
     );
 }
