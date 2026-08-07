@@ -193,6 +193,11 @@ use tracing::{debug, error, trace, warn};
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
 
+/// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
+/// escalates to an operator-visible error (the backoff is capped, so
+/// retries alone never surface a permanently failing partition).
+const ESCALATE_AFTER_ATTEMPTS: u32 = 10;
+
 /// Doubles per attempt, clamped at `BACKOFF_MAX`.
 fn next_backoff(attempts: u32) -> Duration {
     let shift = attempts.saturating_sub(1).min(6);
@@ -294,6 +299,25 @@ impl ReconcilerCtx {
         });
         entry.attempts = entry.attempts.saturating_add(1);
         entry.next_retry_at = now + next_backoff(entry.attempts);
+        // Operator escalation: persistent on-disk corruption makes every
+        // retry fail identically, and unlike the boot path (which refuses
+        // loudly and fatally), this loop would hide the dead partition
+        // behind per-attempt error logs forever. Escalate once the backoff
+        // has long been at its ceiling, then again each doubling so a log
+        // pipeline cannot miss it.
+        if entry.attempts >= ESCALATE_AFTER_ATTEMPTS
+            && (entry.attempts == ESCALATE_AFTER_ATTEMPTS || entry.attempts.is_power_of_two())
+        {
+            error!(
+                namespace_raw = ns.inner(),
+                ?cause,
+                attempts = entry.attempts,
+                "partition reconciliation keeps failing; retries cannot repair \
+                 persistent on-disk damage -- operator intervention needed \
+                 (inspect the partition directory; moving it aside lets the \
+                 reconciler rebuild the replica from its group)"
+            );
+        }
     }
 
     /// Drop records whose namespace left both target and local sets;
@@ -377,6 +401,13 @@ struct PassCounters {
     /// acted on is not answered: aging answers requests, discarding also
     /// destroys prepares.
     parked_reclaimed: usize,
+    /// Purges staged this pass. Counted so the pass does not arm the
+    /// fast-skip: the pump can DEFER a purge it could not record
+    /// (`PurgeError::FrontierNotRecorded`), which leaves
+    /// `applied_purge_generation` unmoved and bumps no revision, so an armed
+    /// skip would swallow the only re-issue and drop a committed `PurgeTopic`
+    /// on this replica for good.
+    purges_staged: usize,
     /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
     /// so the pass does not arm the fast-skip: the pump's drop clears the
     /// tombstone and re-wakes us without bumping `Streams::revision`, so an
@@ -394,6 +425,7 @@ impl PassCounters {
             + self.stale
             + self.cg_offsets_purged
             + self.trims_pending
+            + self.purges_staged
             + self.deferred
             + self.parked_reclaimed
     }
@@ -449,7 +481,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_parked_frames(ctx, &staged, &mut counters);
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
     reconcile_segment_truncations(ctx, &mut counters);
-    reconcile_partition_purges(ctx);
+    reconcile_partition_purges(ctx, &mut counters);
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -1062,7 +1094,7 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounter
 /// `PurgeTopic` generation is newer than the one the local partition last
 /// applied. The pump re-checks the generation before wiping, so a redundant
 /// pass (e.g. from an unrelated revision bump) is a no-op.
-fn reconcile_partition_purges(ctx: &ReconcilerCtx) {
+fn reconcile_partition_purges(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let partitions = ctx.shard.plane.partitions();
     let namespaces: Vec<_> = partitions.namespaces().copied().collect();
     let streams = ctx.shard.plane.metadata().mux_stm.streams();
@@ -1072,11 +1104,19 @@ fn reconcile_partition_purges(ctx: &ReconcilerCtx) {
             namespace.topic_id(),
             namespace.partition_id(),
         );
-        let applied = partitions
-            .get_by_ns(&namespace)
-            .map_or(0, partitions::IggyPartition::applied_purge_generation);
+        // `namespaces()` is NOT tombstone-filtered while `get_by_ns` is, so an
+        // absent partition would read `applied = 0` and re-stage a purge on
+        // every pass for any ever-purged topic. That was inert while staging
+        // counted as nothing; now that it disarms the fast-skip it would pin
+        // the O(N) scan on forever and enqueue a lifecycle frame per pass that
+        // the pump's tombstone-gated handler silently discards.
+        let Some(partition) = partitions.get_by_ns(&namespace) else {
+            continue;
+        };
+        let applied = partition.applied_purge_generation();
         if committed > applied {
             ctx.shard.request_purge_partition(namespace, committed);
+            counters.purges_staged += 1;
         }
     }
 }

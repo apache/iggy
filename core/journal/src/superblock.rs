@@ -48,7 +48,6 @@ use std::cell::Cell;
 use std::hash::Hasher;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 
@@ -71,13 +70,27 @@ const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
 
 /// Ceiling on a record's payload, bounding every allocation this module makes from
 /// a length it read off disk (`PrepareJournal::MAX_ENTRY_SIZE` bounds the WAL for the
-/// same reason). The only payload today is a 58-byte [`VsrState`]; the headroom is
-/// for a payload that grows fields, not for bulk data. `read_slot` treats a longer
-/// file as corrupt WITHOUT reading it, and `build_record` refuses to write one, so a
-/// length this store could have produced is always in bounds.
+/// same reason). The only payload today is a [`consensus::VsrState`], 66 bytes now
+/// that it carries the offset frontier (58 before it, a length its decode still
+/// accepts); the headroom is for a payload that grows fields, not for bulk data.
+/// `read_slot` treats a longer file as corrupt WITHOUT reading it, and
+/// `build_record` refuses to write one, so a length this store could have
+/// produced is always in bounds.
 const MAX_PAYLOAD_LEN: usize = 4096;
 /// Largest record `read_slot` will read into memory.
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN;
+
+/// First retry delay after a failed superblock write, doubling per failure.
+///
+/// Starts near the 10 ms consensus tick, so a one-off failure costs no
+/// latency, and a persistent one stops re-running `atomic_replace` per tick.
+pub const SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS: u64 = 10_000;
+/// Ceiling on the retry delay. A replica fenced this long is not coming back without
+/// operator action, but the retry must stay frequent enough to recover on its own the
+/// moment the disk does.
+pub const SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS: u64 = 1_000_000;
+/// Caps the doubling so the shift cannot overflow before the ceiling clamps it.
+pub const SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT: u64 = 8;
 
 const FILE_A: &str = "superblock.a";
 const FILE_B: &str = "superblock.b";
@@ -127,33 +140,6 @@ pub trait SuperblockStore {
     /// version failure is NOT an I/O error: it surfaces as
     /// [`SuperblockContents::Unreadable`] so the caller decides how to respond.
     fn read_latest(&self) -> impl Future<Output = io::Result<SuperblockContents>>;
-}
-
-/// A boxed, lifetime-bound future, for the object-safe superblock adapter.
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
-
-/// Object-safe adapter over [`SuperblockStore`].
-///
-/// Lets a superblock be held as `Rc<dyn DynSuperblockStore>` without threading a
-/// generic through the consensus and metadata layers. Writes happen only on a
-/// view change or checkpoint, so the boxed future is off every hot path. The
-/// `dyn_` prefix avoids clashing with the inherent methods under the blanket impl.
-pub trait DynSuperblockStore {
-    /// See [`SuperblockStore::write`].
-    fn dyn_write<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, io::Result<()>>;
-
-    /// See [`SuperblockStore::read_latest`].
-    fn dyn_read_latest(&self) -> BoxFuture<'_, io::Result<SuperblockContents>>;
-}
-
-impl<T: SuperblockStore> DynSuperblockStore for T {
-    fn dyn_write<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(self.write(payload))
-    }
-
-    fn dyn_read_latest(&self) -> BoxFuture<'_, io::Result<SuperblockContents>> {
-        Box::pin(self.read_latest())
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +197,19 @@ impl PingPongSuperblock {
     /// # Errors
     /// I/O error if a slot file exists but cannot be read.
     pub async fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        Ok(Self::open_with_latest(dir).await?.0)
+    }
+
+    /// [`Self::open`] plus the latest recorded contents, from the SAME slot
+    /// reads `open` already performs -- boot paths that would otherwise call
+    /// `read_latest` right after `open` pay four slot reads per group
+    /// instead of two.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`]: any slot read failing at the io layer.
+    pub async fn open_with_latest(
+        dir: impl Into<PathBuf>,
+    ) -> io::Result<(Self, SuperblockContents)> {
         let dir = dir.into();
         let slot_a = read_slot(&dir.join(FILE_A)).await?;
         let slot_b = read_slot(&dir.join(FILE_B)).await?;
@@ -232,14 +231,15 @@ impl PingPongSuperblock {
         };
         let next_slot = if a_is_newest { Slot::B } else { Slot::A };
 
-        Ok(Self {
+        let store = Self {
             dir,
             next_sequence: Cell::new(latest + 1),
             next_slot: Cell::new(next_slot),
             degraded: has_unreadable_sequence(&slot_a) || has_unreadable_sequence(&slot_b),
             #[cfg(debug_assertions)]
             writing: Cell::new(false),
-        })
+        };
+        Ok((store, combine_slots(slot_a, slot_b)))
     }
 }
 

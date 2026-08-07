@@ -1527,6 +1527,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             commit_max: self.commit_max.get(),
             checkpoint_op,
             checkpoint_checksum,
+            // Consensus mints no message offsets: the PARTITION plane stamps
+            // this in before it writes (`IggyPartition::write_superblock`).
+            offset_frontier: 0,
         }
     }
 
@@ -3046,7 +3049,11 @@ where
         // never re-stamped (`restamp_prepare_view` patches only `view`), so this
         // survives view-change retransmits. The header `checksum` and its `parent`
         // chain stay `0`: activating them needs the retransmit path to re-seal a
-        // re-stamped header, a separate change.
+        // re-stamped header, a separate change. Whoever activates it must also
+        // audit every `set_last_prepare_checksum` caller for cross-plane carry --
+        // the repair router in `shard` drops metadata-plane frames it cannot
+        // journal precisely so one cannot stamp a PARTITION consensus, which is
+        // inert only while these values are structurally zero.
         //
         // Metadata plane only. A partition produce prepare already carries a verified
         // `batch_checksum` over the same bytes, so a second full-payload pass is pure
@@ -3079,7 +3086,12 @@ where
                 op,
                 timestamp,
                 operation: old.operation,
-                namespace: old.namespace,
+                // The GROUP's namespace, never the request's: a client
+                // RequestHeader carries namespace 0, and journaling that
+                // would make the stored prepare route to the wrong plane
+                // when repair later ships it verbatim (live replication
+                // masked this; repair replay is what broke).
+                namespace: consensus.namespace,
                 checksum_body,
                 // Copied verbatim: carries the stamped acting user for client
                 // ops (and the authenticated user on Register), so the in-apply

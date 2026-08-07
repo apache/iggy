@@ -176,6 +176,11 @@ impl Default for PartitionConfig {
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
+            transfer_served_cache_bytes_max: partition
+                .transfer_served_cache_bytes_max
+                .parse()
+                .unwrap(),
+            transfer_artifact_bytes_max: partition.transfer_artifact_bytes_max.parse().unwrap(),
         }
     }
 }

@@ -55,6 +55,22 @@ pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
 /// sizing endorsement.
 pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 256;
 
+/// Mirrors the free const `shard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment
+/// ceiling plus the one whole batch a segment may close past it).
+pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 = 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+
+/// Mirrors the free const `shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT`: room for
+/// two concurrently served segments at the size a SEALED one actually reaches,
+/// which is the artifact ceiling above, not the configured segment target. Sized
+/// off the target instead, two admitted pulls would not both fit and would evict
+/// each other on every chunk.
+pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 = 2 * DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX;
+
+/// Upper bound on the two state-transfer byte knobs. A typo guard, not a sizing
+/// endorsement: both are PER SHARD, so a slipped digit multiplies by the core
+/// count.
+pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Mirrors `partitions::EVICTED_RING_CAPACITY`.
 pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
 
@@ -95,6 +111,27 @@ pub struct PartitionConfig {
     /// [`MAX_EVICTED_RING_BYTES`].
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
+
+    /// Byte budget for segment payloads a SERVING shard keeps resident to
+    /// answer state-transfer chunk requests, per shard (so the process-wide
+    /// bound is this times the shard count).
+    ///
+    /// Sized for concurrent pulls, not one: at exactly one maximum segment a
+    /// single receiver arming several transfers thrashes the cache by itself,
+    /// and every miss re-reads and re-hashes a whole segment to serve one
+    /// chunk. Must be > 0.
+    #[config_env(leaf)]
+    pub transfer_served_cache_bytes_max: IggyByteSize,
+
+    /// Alloc ceiling for ONE received state-transfer artifact, per shard.
+    ///
+    /// A receiver holds the whole artifact resident through verify, walk and
+    /// staging write, so the in-flight cap multiplies this. It must stay above
+    /// the largest legal segment (`segment.size` plus the one batch a segment
+    /// may overshoot it by) or legal segments are rejected deterministically.
+    /// Must be > 0.
+    #[config_env(leaf)]
+    pub transfer_artifact_bytes_max: IggyByteSize,
 }
 
 impl Validatable<ConfigurationError> for PartitionConfig {
@@ -118,6 +155,26 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             eprintln!(
                 "{COMPONENT_NG} partition.evicted_ring_capacity ({}) exceeds the maximum ({MAX_EVICTED_RING_CAPACITY})",
                 self.evicted_ring_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        // The FLOOR on `transfer_artifact_bytes_max` cannot live here (it needs
+        // `system.segment.size` and the bus cap); it is enforced in the
+        // `ServerNgConfig` validator, which is what turns that misconfiguration
+        // into a boot error instead of a silent per-partition rejoin livelock.
+        let served_cache = self.transfer_served_cache_bytes_max.as_bytes_u64();
+        if served_cache == 0 || served_cache > MAX_TRANSFER_BYTES {
+            eprintln!(
+                "{COMPONENT_NG} partition.transfer_served_cache_bytes_max ({served_cache} bytes) \
+                 must be > 0 and <= {MAX_TRANSFER_BYTES} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let artifact_bytes = self.transfer_artifact_bytes_max.as_bytes_u64();
+        if artifact_bytes == 0 || artifact_bytes > MAX_TRANSFER_BYTES {
+            eprintln!(
+                "{COMPONENT_NG} partition.transfer_artifact_bytes_max ({artifact_bytes} bytes) \
+                 must be > 0 and <= {MAX_TRANSFER_BYTES} bytes"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -145,6 +202,25 @@ mod tests {
         // `Default` reads the shipped config.toml; the pristine deployment
         // must validate.
         assert!(PartitionConfig::default().validate().is_ok());
+    }
+
+    /// The shipped TOML strings are the only thing an operator sees, and nothing
+    /// else ties them to the constants the code sizes itself against -- a
+    /// decimal/binary slip ("1088 MB" for 1088 MiB) parses fine and ships a cap
+    /// BELOW the largest legal segment, which livelocks a rejoin per partition.
+    #[test]
+    fn shipped_transfer_defaults_match_the_runtime_constants() {
+        let config = PartitionConfig::default();
+        assert_eq!(
+            config.transfer_artifact_bytes_max.as_bytes_u64(),
+            DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX,
+            "config.toml transfer_artifact_bytes_max drifted from the runtime default"
+        );
+        assert_eq!(
+            config.transfer_served_cache_bytes_max.as_bytes_u64(),
+            DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX,
+            "config.toml transfer_served_cache_bytes_max drifted from the runtime default"
+        );
     }
 
     #[test]

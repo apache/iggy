@@ -186,6 +186,7 @@ pub struct ShardMetrics {
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
+    partition_transfer_refusals_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
@@ -218,6 +219,7 @@ impl ShardMetrics {
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
+            partition_transfer_refusals_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
@@ -261,6 +263,26 @@ impl ShardMetrics {
     /// full, permission denied, ENOENT on a path it cannot recreate, etc.).
     pub fn record_partition_reconcile_failure(&self) {
         self.partitions_reconcile_failures_total.inc();
+    }
+
+    /// Bumped every time a serving peer refuses a partition state transfer.
+    ///
+    /// Transient refusals re-arm on a flat interval and charge no failure
+    /// count -- deliberately, since the alternative routes through a 1024x
+    /// backoff cap that pins a partition for ~17 minutes after the peer has
+    /// already caught up -- which also means a partition stuck rejoining for
+    /// hours produces no signal of its own. This counter plus the escalating
+    /// log level at the refusal site is that signal.
+    pub fn record_partition_transfer_refusal(&self) {
+        self.partition_transfer_refusals_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings; the production scrape goes
+    /// through the prometheus registry.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_transfer_refusals_value(&self) -> u64 {
+        self.partition_transfer_refusals_total.get()
     }
 
     /// Bumped when a parked partition frame is answered instead of served
