@@ -24,6 +24,7 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
@@ -112,10 +113,11 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
 /// through the channel into the target shard's message pump.  This ensures
 /// that every mutation on a shard is serialized through a single point (the
 /// pump), preventing concurrent access from independent async tasks.
-impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
     B: MessageBus + ConnectionInstaller + Clone + 'static,
     T: ShardsTable,
+    SB: SuperblockStore,
 {
     /// Network-receive entry point. Classifies the raw
     /// `Message<GenericHeader>` and routes it to the owning shard via
@@ -345,6 +347,11 @@ where
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
                     self.tick_partitions().await;
+                    // Runs here, not inside `tick_metadata`: that early-returns
+                    // on shards without metadata consensus, and partition-plane
+                    // offers live on every shard that hosts a serving group --
+                    // parked behind the shard-0 gate they would never expire.
+                    self.expire_idle_state_transfer_offers();
                     // While a cooperative revocation is pending, wake the
                     // reconciler each tick so the handoff completes within ~one
                     // tick of the partition draining, not the periodic pass.
@@ -617,6 +624,14 @@ where
                         .clean_expired_segments(now, message_expiry, max_bytes)
                         .await;
                     if segments > 0 {
+                        // Any unlink invalidates what this shard is SERVING:
+                        // the offer names files that are gone and the payload
+                        // cache can answer from RAM without touching disk, so a
+                        // puller would install deleted messages. Neither cache
+                        // can notice on its own -- one is keyed on the
+                        // partition's commit_op, which retention does not move,
+                        // the other on a checksum over the deleted bytes.
+                        self.drop_partition_transfer_state(namespace, partition);
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
@@ -638,6 +653,11 @@ where
                     let (segments, messages) =
                         partition.remove_sealed_segments_up_to(up_to_offset).await;
                     if segments > 0 {
+                        // See the cleaner arm: a truncate commits on the
+                        // METADATA plane, so this partition's commit_op never
+                        // moves and the cached offer stays a hit over unlinked
+                        // files.
+                        self.drop_partition_transfer_state(namespace, partition);
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
@@ -662,19 +682,70 @@ where
                     && partition.applied_purge_generation() < generation
                 {
                     match partition.purge(&config, generation).await {
-                        Ok(()) => tracing::debug!(
-                            shard = self.id,
-                            namespace_raw = namespace.inner(),
-                            generation,
-                            "purge-partition reset partition to empty"
-                        ),
-                        Err(error) => tracing::error!(
-                            shard = self.id,
-                            namespace_raw = namespace.inner(),
-                            generation,
-                            %error,
-                            "purge-partition failed to reset partition"
-                        ),
+                        Ok(()) => {
+                            // The purge unlinked the very bytes this shard is
+                            // serving: the cached offer still advertises the
+                            // pre-purge manifest and the payload cache can
+                            // answer chunk requests for it without touching
+                            // disk, so a puller would install purged data. Both
+                            // are keyed on pre-purge content, so neither can
+                            // notice on its own.
+                            self.drop_partition_transfer_state(namespace, partition);
+                            tracing::debug!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                "purge-partition reset partition to empty"
+                            );
+                        }
+                        Err(partitions::PurgeError::FrontierNotRecorded) => {
+                            // NOT fenced: nothing was mutated, so the chain is
+                            // whole and `applied_purge_generation` is unmoved,
+                            // which means the reconciler's `committed > applied`
+                            // gate still sees this purge as outstanding.
+                            // Fencing here would quarantine live data, and the
+                            // fence's own frontier write would first stamp the
+                            // pre-purge counter the purge was about to reset.
+                            //
+                            // NOT woken: staging a purge counts as work in the
+                            // pass, which keeps the fast-skip disarmed, so the
+                            // ordinary periodic pass re-issues until one lands
+                            // and stops once `applied` catches `committed`. An
+                            // eager wake here closes a loop with no pacing in
+                            // it at all -- pass, stage, defer, wake -- and on a
+                            // disk that refuses instantly that is a full O(N)
+                            // reconcile scan and a real `atomic_replace`
+                            // attempt per turn, holding the partition write
+                            // lock each time.
+                            tracing::warn!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                "purge-partition deferred: could not record the frontier reset; \
+                                 the reconciler re-issues it while the generation stays unapplied"
+                            );
+                        }
+                        Err(error @ partitions::PurgeError::Unserviceable(_)) => {
+                            // Past the drain, so this group has no serviceable
+                            // chain and the next append panics on
+                            // `active_segment()`. Fence it for rebuild, exactly
+                            // as a failed state-transfer convergence does. The
+                            // counters were already reset to 0 before the
+                            // fallible plant, so the fence's advancing write
+                            // records the post-purge frontier.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition failed to reset partition; fencing it for rebuild"
+                            );
+                            // Fenced, but the caches still describe the
+                            // pre-purge bytes until the rebuild lands.
+                            self.drop_partition_transfer_state(namespace, partition);
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
+                        }
                     }
                 }
             }

@@ -31,6 +31,18 @@ publish = false
 name = "iggy-bench"
 path = "src/main.rs"
 
+[features]
+# Switches the SDK to the vsr Register-handshake framing spoken by server-ng
+# clusters. The framing is chosen at compile time, so a default-features bench
+# binary cannot talk to a vsr cluster at all (the first request never frames).
+# TRAP: `cargo test -p integration --features vsr` does NOT rebuild this
+# binary -- the harness spawns whatever the last build produced, and a
+# default-featured leftover trips the bench timeout in
+# `run_bench_and_wait_for_finish` (one per restart-matrix case). Build the
+# workspace (or this crate with --features vsr) first; `just nextest-vsr`
+# does.
+vsr = ["iggy/vsr"]
+
 [dependencies]
 async-trait = { workspace = true }
 bench-report = { workspace = true }

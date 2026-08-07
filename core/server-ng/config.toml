@@ -955,12 +955,42 @@ evicted_ring_capacity = 4096
 # large batches can pin. Must be > 0 and <= "256 MiB".
 evicted_ring_bytes_max = "16 MiB"
 
+# Byte budget for segment payloads a SERVING shard keeps resident to answer
+# state-transfer chunk requests. PER SHARD, and shard count defaults to core
+# count, so the process-wide high-water is this times the core count on top of
+# page cache -- keep that product in mind before raising it. The default is a
+# FIXED 2176 MiB: two sealed segments at the SHIPPED system.segment.size of
+# 1 GiB, each of which can close one whole message_bus.max_message_size past
+# its target, which is why it is not 2 GiB. It does not track your segment
+# size. How many groups this shard serves at once IS derived from yours:
+# floor(this / max(partition.transfer_artifact_bytes_max,
+# system.segment.size + 64 MiB)), minimum one. So raising either that knob or
+# system.segment.size without raising this lowers concurrency and can take it
+# to one, serialising rejoins, and nothing at boot warns about it.
+# Below one segment a single rejoining node thrashes the cache by itself and
+# every miss re-reads and re-hashes a whole segment to serve one 256 KiB chunk.
+# Running under the budget costs re-reads, not failures.
+# Must be > 0 and <= "64 GiB".
+transfer_served_cache_bytes_max = "2176 MiB"
+
+# Alloc ceiling for ONE received state-transfer artifact, per shard. The
+# receiver holds it resident through verify, walk and staging write, and up to
+# four transfers run at once. MUST cover system.segment.size plus
+# message_bus.max_message_size (a segment may close one whole batch past its
+# cap): under that, a legal segment is refused, the whole manifest with it, and
+# the partition livelocks re-requesting it from every peer. Boot validates the
+# floor. Raising this above the floor for headroom also DIVIDES the serving
+# concurrency derived from transfer_served_cache_bytes_max above, so raise that
+# in step. Must be > 0 and <= "64 GiB".
+transfer_artifact_bytes_max = "1088 MiB"
+
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
 # consensus traffic between replicas and SDK-client traffic between
 # shards. These knobs are consensus-liveness-critical (max_batch gates
 # throughput under backpressure). Defaults match
 # core::message_bus::config::MessageBusConfig::default().
+
 [message_bus]
 # Maximum number of BusMessage entries coalesced into a single writev(2)
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.

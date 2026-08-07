@@ -43,6 +43,7 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
+futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
