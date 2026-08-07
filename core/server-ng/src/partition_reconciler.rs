@@ -403,10 +403,10 @@ struct PassCounters {
     parked_reclaimed: usize,
     /// Purges staged this pass. Counted so the pass does not arm the
     /// fast-skip: the pump can DEFER a purge it could not record
-    /// (`PurgeError::FrontierNotRecorded`), which leaves
-    /// `applied_purge_generation` unmoved and bumps no revision, so an armed
-    /// skip would swallow the only re-issue and drop a committed `PurgeTopic`
-    /// on this replica for good.
+    /// (`PurgeError::FrontierNotRecorded` / `GenerationNotRecorded`), which
+    /// leaves `applied_purge_generation` unmoved and bumps no revision, so an
+    /// armed skip would swallow the only re-issue and drop a committed
+    /// `PurgeTopic` on this replica for good.
     purges_staged: usize,
     /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
     /// so the pass does not arm the fast-skip: the pump's drop clears the
@@ -507,6 +507,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             stale = counters.stale,
             deferred = counters.deferred,
             parked_reclaimed = counters.parked_reclaimed,
+            purges_staged = counters.purges_staged,
+            trims_pending = counters.trims_pending,
             "partition reconciler pass complete"
         );
     } else {
@@ -630,6 +632,7 @@ async fn reconcile_additions(
             ctx.config.as_ref(),
             ns,
             partition_stats,
+            epoch,
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
@@ -1093,7 +1096,17 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounter
 /// Stage a `PurgePartition` reset for every owned partition whose committed
 /// `PurgeTopic` generation is newer than the one the local partition last
 /// applied. The pump re-checks the generation before wiping, so a redundant
-/// pass (e.g. from an unrelated revision bump) is a no-op.
+/// pass (e.g. from an unrelated revision bump) is a no-op. A staged frame
+/// that the full pump inbox drops needs no upgrade here: the staged counter
+/// keeps passes running and the next one restages, and the pump's generation
+/// guard makes redundant frames free.
+// TODO(hubcio): purge lands per replica on reconciler timing, while StartView
+// journal repair re-materializes pre-purge ops byte-identical from a peer, so
+// a replica can purge and then repair purged batches back in (or the reverse).
+// The purge floor skews the same way even without repair: each replica reads
+// it off its LOCAL sequencer at purge-apply time, so replicas fence different
+// sets of in-flight sends (live divergence, not only the StartView case).
+// Ordering these needs a partition-plane checkpoint barrier; deferred.
 fn reconcile_partition_purges(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let partitions = ctx.shard.plane.partitions();
     let namespaces: Vec<_> = partitions.namespaces().copied().collect();
@@ -1147,6 +1160,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+        PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
         Command2, GenericHeader, Operation, PrepareHeader, ReplyHeader, RequestHeader,
@@ -2092,6 +2106,74 @@ mod tests {
         assert!(
             reconcile_once(&ctx).await,
             "a fresh commit must defeat the fast-skip"
+        );
+    }
+
+    /// A committed purge bumps `Streams::revision` exactly once, so only the
+    /// pass right after the commit is revision-driven. Until the pump applies
+    /// the wipe (it can be busy, or the purge can fail on I/O and need a
+    /// retry), every later pass runs only because `purges_staged` keeps the
+    /// pass from arming the fast-skip; dropping the counter would strand a
+    /// staged-but-unapplied purge until an unrelated commit.
+    #[compio::test]
+    async fn purge_pending_keeps_reconciler_passes_running_until_applied() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-purge");
+        seed_topic(&mux, 2, 0, "topic-purge", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(
+            !reconcile_once(&ctx).await,
+            "the scenario must start from a converged, fast-skipping state"
+        );
+
+        // Committed purge: generation 1 > applied 0.
+        let purge = PurgeTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::PurgeTopic, &purge))
+            .expect("PurgeTopic apply succeeds");
+
+        assert!(
+            reconcile_once(&ctx).await,
+            "the purge commit bumps the revision, so the next pass runs"
+        );
+        assert!(
+            reconcile_once(&ctx).await,
+            "an unapplied purge must keep passes running (retry surface), \
+             not arm the fast-skip"
+        );
+
+        // Pump applies the wipe; the partition catches up to generation 1.
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions_config = shard.plane.partitions().config().clone();
+        shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&ns)
+            .expect("purged partition is materialised")
+            .purge(&partitions_config, 1)
+            .await
+            .expect("apply staged purge");
+
+        assert!(
+            reconcile_once(&ctx).await,
+            "the pass observing the applied purge still runs (unarmed skip)"
+        );
+        assert!(
+            !reconcile_once(&ctx).await,
+            "once applied, the reconciler re-converges and fast-skips again"
         );
     }
 

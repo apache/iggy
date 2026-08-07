@@ -41,7 +41,6 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireC
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
-use iggy_binary_protocol::requests::topics::UpdateTopicRequest as WireUpdateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
@@ -874,6 +873,16 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.default_max_topic_size.set(max_topic_size_bytes);
     }
 
+    /// Byte value a stored `MaxTopicSize::ServerDefault` resolves to on this
+    /// node. Read by the per-shard segment cleaner, which enforces retention
+    /// locally and so must resolve the sentinel at enforcement time: create
+    /// admission rewrites it before replication, but an UPDATE back to
+    /// `ServerDefault` leaves the sentinel in committed state.
+    #[must_use]
+    pub const fn default_max_topic_size(&self) -> u64 {
+        self.default_max_topic_size.get()
+    }
+
     /// Raise the forced-checkpoint margin to cover a configured
     /// prepare-queue depth (`[metadata] prepare_queue_depth`). Clamped to
     /// the built-in floor by the coordinator; no-op on shards without a
@@ -892,23 +901,11 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.client_table.borrow_mut().set_capacity(max_clients);
     }
 
-    /// Resolved byte value for `MaxTopicSize::ServerDefault`.
-    #[must_use]
-    pub const fn default_max_topic_size(&self) -> u64 {
-        self.default_max_topic_size.get()
-    }
-
     /// Install the resolved micros value used for `IggyExpiry::ServerDefault`.
-    /// Server-ng bootstrap calls this with `system.topic.message_expiry` on every
-    /// shard (responses read it too); only shard 0's copy feeds admission.
+    /// Server-ng bootstrap calls this with `system.topic.message_expiry`; only
+    /// shard 0's copy feeds admission.
     pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
         self.default_message_expiry.set(message_expiry_micros);
-    }
-
-    /// Resolved micros value for `IggyExpiry::ServerDefault`.
-    #[must_use]
-    pub const fn default_message_expiry(&self) -> u64 {
-        self.default_message_expiry.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -3321,30 +3318,10 @@ where
                     &body,
                 ))
             }
-            Operation::UpdateTopic => {
-                let mut request = WireUpdateTopicRequest::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
-                // Same `ServerDefault` resolution as `CreateTopic` above; rebuild
-                // the prepare only if a sentinel actually needs stamping, else
-                // project the untouched buffer zero-copy.
-                let needs_rewrite = request.max_topic_size == 0 || request.message_expiry == 0;
-                if request.max_topic_size == 0 {
-                    request.max_topic_size = self.default_max_topic_size.get();
-                }
-                if request.message_expiry == 0 {
-                    request.message_expiry = self.default_message_expiry.get();
-                }
-                if needs_rewrite {
-                    let body = request.to_bytes();
-                    return Ok(build_prepare_message(
-                        consensus,
-                        &header,
-                        Operation::UpdateTopic,
-                        &body,
-                    ));
-                }
-                Ok(message.project(consensus))
-            }
+            // `UpdateTopic` deliberately takes the default arm: unlike create,
+            // an update stores `ServerDefault` sentinels verbatim (legacy
+            // parity), so a later get echoes `ServerDefault` instead of the
+            // node default frozen at update time.
             _ => Ok(message.project(consensus)),
         }
     }
@@ -3735,9 +3712,9 @@ where
     // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
     // in-process callers that bypass `Project::project` build their prepare
     // through this helper directly (the CreateTopic/CreatePartitions
-    // assignment rewrites, the UpdateTopic default-size rewrite, and the
-    // PAT-cleaner delete); the stamp is load-bearing for the creates and inert
-    // for the UpdateTopic rewrite and the delete, whose applies ignore it.
+    // assignment rewrites and the PAT-cleaner delete); the stamp is
+    // load-bearing for the creates and inert for the delete, whose apply
+    // ignores it.
     // Shared `next_monotonic_timestamp` keeps the in-process path on the same
     // monotonic-clock guard as the wire path.
     let timestamp = consensus.next_monotonic_timestamp();
@@ -3762,9 +3739,9 @@ where
         // Carry the acting user id so the in-apply RBAC gate sees the same
         // identity on every replica. The default projection copies it (see
         // `Project::project`); this helper builds prepares for the ops it
-        // rewrites (the CreateTopic/CreatePartitions assignment rewrites, the
-        // UpdateTopic default-size rewrite, and the PAT-cleaner delete), which
-        // would otherwise reset it to 0 via `..Default::default()`.
+        // rewrites (the CreateTopic/CreatePartitions assignment rewrites and
+        // the PAT-cleaner delete), which would otherwise reset it to 0 via
+        // `..Default::default()`.
         user_id: request.user_id,
         // Seal the body integrity field over the rewritten body, exactly as
         // `Project::project` does for wire-projected prepares. This helper builds
