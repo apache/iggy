@@ -76,7 +76,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected virtual int NodeCount =>
         int.TryParse(Environment.GetEnvironmentVariable("IGGY_TEST_CLUSTER_NODES"), out var count) && count >= 1
             ? count
-            : 3;
+            : 1;
 
     public async ValueTask DisposeAsync()
     {
