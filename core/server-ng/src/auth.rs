@@ -34,6 +34,7 @@ use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
@@ -60,8 +61,8 @@ pub(crate) fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
-pub(crate) fn verify_login_credentials<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn verify_login_credentials<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
     password: &str,
 ) -> Result<u32, LoginRegisterError>
@@ -70,6 +71,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Same bounds the legacy server enforces before any lookup or hashing;
     // also keeps arbitrary-length input out of the password hash. Collapsed
@@ -106,8 +108,8 @@ where
     })
 }
 
-pub(crate) fn verify_pat_credentials<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn verify_pat_credentials<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
 ) -> Result<u32, LoginRegisterError>
 where
@@ -115,6 +117,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
 }
@@ -123,8 +126,8 @@ where
 /// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
 /// per-token VSR session table on this expiry for lazy eviction; the wire and
 /// login paths only need the user id and go through [`verify_pat_credentials`].
-pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
 ) -> Result<(u32, u64), LoginRegisterError>
 where
@@ -132,6 +135,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let token_hash = PersonalAccessToken::hash_token(token);
     // PAT expiry gates the login accept/reject, and that outcome folds into
@@ -174,8 +178,8 @@ where
 }
 
 #[allow(clippy::future_not_send)]
-pub(crate) async fn complete_login_register<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn complete_login_register<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     vsr_client_id: u128,
@@ -188,6 +192,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let sdk_info = ClientSdkInfo {
         sdk_name: client_version.sdk_name.as_str().to_owned(),
@@ -283,8 +288,8 @@ where
 /// SDK surfaces the real reason (every frame transport decodes
 /// `Command2::Eviction`) instead of a decode error or a timeout.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn surface_login_failure<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
     error: &LoginRegisterError,
@@ -293,6 +298,7 @@ pub(crate) async fn surface_login_failure<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if error.is_terminal() {
         send_login_eviction(
@@ -317,8 +323,8 @@ pub(crate) async fn surface_login_failure<B, MJ, S>(
 /// same login on the same connection. Only call for transient errors -- see
 /// [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
-async fn send_login_transient_reply<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_login_transient_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
 ) where
@@ -326,6 +332,7 @@ async fn send_login_transient_reply<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     // `TransientNotAccepted`: a login/register replay is safe under any

@@ -236,6 +236,27 @@ pub struct RepairSession {
     pub idle_ticks: u32,
 }
 
+/// How a repair-window commit walk concluded, decided by
+/// `IggyPartition::complete_repair`.
+///
+/// `#[must_use]` because `FloorRefused` is the partition plane's
+/// state-transfer trigger: repair proved the gap below the floor is neither
+/// locally durable nor repairable, so ignoring it wedges the replica
+/// gap-stopped forever.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairConclusion {
+    /// The walk fell short of `to_op`; the session stays armed and the stall
+    /// retry re-requests the remains.
+    InProgress,
+    /// The walk reached the requested frontier; the session was dropped.
+    Done,
+    /// The floor's continuity check failed: ops below it are neither locally
+    /// durable nor repaired. The session was dropped here -- state transfer
+    /// supersedes repair -- and the caller arms the transfer.
+    FloorRefused { floor: u64, to_op: u64 },
+}
+
 /// Configuration for partition operations.
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and

@@ -48,11 +48,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use axum::Router;
+use axum::extract::connect_info::Connected;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Version, header::CONNECTION};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
+use compio::net::TcpListener;
 use configs::http::{HttpConfig, HttpCorsConfig};
 use configs::ng_cluster::{ClusterConfig, TransportPorts, http_forwarding_key_material};
 use configs::server_ng::NgSystemConfig;
@@ -146,7 +148,7 @@ pub async fn start(
         roster: ClusterRoster {
             enabled: cluster.enabled,
             name: cluster.name.clone(),
-            nodes: cluster.nodes.clone(),
+            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
             self_ip: bound_addr.ip().to_string(),
             // The self node reports the live bound HTTP port; the other client
             // ports arrive resolved from the caller.
@@ -189,9 +191,12 @@ pub async fn start(
         info!(address = %bound_addr, "server-ng HTTP listener started");
         let shutdown = shard.bus.token();
         let handle = compio::runtime::spawn(async move {
-            if let Err(error) = cyper_axum::serve(listener, router)
-                .with_graceful_shutdown(async move { shutdown.wait().await })
-                .await
+            if let Err(error) = cyper_axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<ClientAddr>(),
+            )
+            .with_graceful_shutdown(async move { shutdown.wait().await })
+            .await
             {
                 error!(%error, "server-ng HTTP listener terminated with error");
             }
@@ -200,6 +205,23 @@ pub async fn start(
     }
 
     Ok(())
+}
+
+/// Connect-info payload carrying the peer socket address of an HTTP client.
+///
+/// The plain listener records it through axum's connect-info make-service
+/// (the [`Connected`] impl below); the TLS path cannot (its hand-rolled serve
+/// loop bypasses the make-service), so `tls::serve` injects the identical
+/// `ConnectInfo<ClientAddr>` extension per connection instead. Handlers read
+/// it through the `Identity` extractor's `client_ip`, which picks the
+/// advertised address a client is told about - never authorization.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientAddr(pub SocketAddr);
+
+impl Connected<cyper_axum::IncomingStream<'_, TcpListener>> for ClientAddr {
+    fn connect_info(stream: cyper_axum::IncomingStream<'_, TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
 }
 
 /// Health-probe path. Public and pre-auth, and the one success route reached
@@ -327,7 +349,12 @@ fn router(
         None => router,
     };
 
-    merge_web_ui(router, web_ui)
+    // `with_state(())` finalizes every route eagerly, once for the whole
+    // listener - including the web-ui routes merged after the stateful
+    // `with_state` above, which would otherwise stay boxed handlers that
+    // axum rebuilds per request. Identity on already-finalized routes, so
+    // both the plain and the TLS serve paths share the finalized form.
+    merge_web_ui(router, web_ui).with_state(())
 }
 
 /// The control-plane route table: every write here commits through the
