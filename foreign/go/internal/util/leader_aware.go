@@ -31,20 +31,26 @@ import (
 
 // CheckAndRedirectToLeader queries the client for cluster metadata and returns
 // an address to redirect to (empty string means no redirection needed).
-func CheckAndRedirectToLeader(ctx context.Context, c iggcon.Client, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (string, error) {
+func CheckAndRedirectToLeader(
+	ctx context.Context,
+	c iggcon.Client,
+	currentAddress string,
+	transport iggcon.Protocol,
+	logger *slog.Logger,
+) (string, []string, error) {
 	logger.Debug("Checking cluster metadata for leader detection")
 
 	meta, err := c.GetClusterMetadata(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return "", err
+			return "", nil, err
 		}
 		logger.Warn(
 			"Failed to get cluster metadata, connection will continue on server node",
 			"error", err,
 			"current_address", currentAddress,
 		)
-		return "", nil
+		return "", nil, nil
 	}
 
 	logger.Debug(
@@ -52,7 +58,28 @@ func CheckAndRedirectToLeader(ctx context.Context, c iggcon.Client, currentAddre
 		"nodes", len(meta.Nodes),
 		"cluster", meta.Name,
 	)
-	return processClusterMetadata(meta, currentAddress, transport, logger)
+	addresses, err := clusterAddresses(meta, transport)
+	if err != nil {
+		return "", nil, err
+	}
+	leader, err := processClusterMetadata(meta, currentAddress, transport, logger)
+	return leader, addresses, err
+}
+
+func clusterAddresses(metadata *iggcon.ClusterMetadata, transport iggcon.Protocol) ([]string, error) {
+	addresses := make([]string, 0, len(metadata.Nodes))
+	for i := range metadata.Nodes {
+		node := &metadata.Nodes[i]
+		if node.Status != iggcon.Healthy {
+			continue
+		}
+		address, err := clusterNodeAddress(node, transport)
+		if err != nil {
+			return nil, err
+		}
+		addresses = append(addresses, address)
+	}
+	return addresses, nil
 }
 
 func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (string, error) {
@@ -81,21 +108,10 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 		return "", nil
 	}
 
-	var leaderPort uint16
-	switch transport {
-	case iggcon.Tcp:
-		leaderPort = leader.Endpoints.Tcp
-	case iggcon.Quic:
-		leaderPort = leader.Endpoints.Quic
-	case iggcon.Http:
-		leaderPort = leader.Endpoints.Http
-	case iggcon.WebSocket:
-		leaderPort = leader.Endpoints.WebSocket
-	default:
-		return "", fmt.Errorf("unsupported transport: %v", transport)
+	leaderAddress, err := clusterNodeAddress(leader, transport)
+	if err != nil {
+		return "", err
 	}
-
-	leaderAddress := net.JoinHostPort(leader.IP, strconv.Itoa(int(leaderPort)))
 	logger.Debug(
 		"Found leader node",
 		"leader", leader.Name,
@@ -114,6 +130,23 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 
 	logger.Debug("Already connected to leader", "current_address", currentAddress)
 	return "", nil
+}
+
+func clusterNodeAddress(node *iggcon.ClusterNode, transport iggcon.Protocol) (string, error) {
+	var port uint16
+	switch transport {
+	case iggcon.Tcp:
+		port = node.Endpoints.Tcp
+	case iggcon.Quic:
+		port = node.Endpoints.Quic
+	case iggcon.Http:
+		port = node.Endpoints.Http
+	case iggcon.WebSocket:
+		port = node.Endpoints.WebSocket
+	default:
+		return "", fmt.Errorf("unsupported transport: %v", transport)
+	}
+	return net.JoinHostPort(node.IP, strconv.Itoa(int(port))), nil
 }
 
 // isSameAddress returns true if two addresses refer to the same endpoint.

@@ -121,39 +121,36 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
-    - name: Build Iggy server Docker image for TLS tests
-      if: inputs.task == 'e2e'
-      id: docker_build
-      uses: ./.github/actions/utils/docker-build-test-server
-      with:
-        image-tag: "iggy-server:test"
-        libc: "glibc"
-        profile: "debug"
-
-    - name: Setup server for e2e tests
+    # The Go SDK speaks the VSR wire protocol, so every e2e lane runs against
+    # a locally built VSR server rather than a container of the legacy one.
+    - name: Start Iggy server (plain)
+      id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
+      with:
+        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-go-e2e.pid
+        log-file: ${{ runner.temp }}/iggy-go-e2e.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-go-e2e-data
 
     - name: Run e2e tests
       shell: bash
       if: inputs.task == 'e2e'
       env:
-        IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
       run: |
         echo "🧪 Running Go e2e tests..."
-
-        # Install ginkgo
-        echo "Installing ginkgo..."
-        go install github.com/onsi/ginkgo/v2/ginkgo@v2.23.4
-
-        # Ensure ginkgo is in PATH
-        export PATH="${PATH}:$(go env GOPATH)/bin"
 
         # Create reports directory
         mkdir -p reports
 
         # Run foreign/go e2e tests with coverage
-        echo "Running foreign/go e2e tests (including TLS integration tests)..."
+        echo "Running foreign/go e2e tests..."
         cd foreign/go
         go test -v -race \
           -coverprofile=../../reports/go-coverage-e2e-sdk.out \
@@ -175,6 +172,116 @@ runs:
         tail -n +2 reports/go-coverage-e2e-sdk.out >> reports/go-coverage-e2e.out
         tail -n +2 reports/go-coverage-e2e-bdd.out >> reports/go-coverage-e2e.out
 
-    - name: Stop server after e2e tests
+    - name: Stop Iggy server (plain)
       if: always() && inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy.outputs.pid_file }}
+        log-file: ${{ steps.iggy.outputs.log_file }}
+
+    - name: Start Iggy server (TLS)
+      id: iggy-tls
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-go-e2e-tls.pid
+        log-file: ${{ runner.temp }}/iggy-go-e2e-tls.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-go-e2e-tls-data
+        IGGY_TCP_TLS_ENABLED: "true"
+        IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
+        IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem
+
+    - name: Run TLS e2e tests
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+        IGGY_TCP_TLS_ENABLED: "true"
+      run: |
+        echo "🔐 Running Go e2e tests over TLS..."
+        cd foreign/go
+        go test -v -race ./tests/...
+
+    - name: Stop Iggy server (TLS)
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
+        log-file: ${{ steps.iggy-tls.outputs.log_file }}
+
+    - name: Start Iggy VSR cluster node 0
+      id: iggy-cluster-0
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-go-cluster-0.pid
+        log-file: ${{ runner.temp }}/iggy-go-cluster-0.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-go-cluster-0-data
+
+    - name: Start Iggy VSR cluster node 1
+      id: iggy-cluster-1
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "1"
+        tcp_address: 127.0.0.1:8091
+        http_address: 127.0.0.1:3001
+        pid-file: ${{ runner.temp }}/iggy-go-cluster-1.pid
+        log-file: ${{ runner.temp }}/iggy-go-cluster-1.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-go-cluster-1-data
+
+    - name: Run cluster e2e tests
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        # Point the client at the follower so the redirect path runs.
+        IGGY_TCP_ADDRESS: 127.0.0.1:8091
+      run: |
+        echo "🗳️ Running Go e2e tests against a two-node cluster..."
+        cd foreign/go
+        go test -v -race ./tests/...
+
+    - name: Stop Iggy VSR cluster node 1
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-1.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-1.outputs.log_file }}
+
+    - name: Stop Iggy VSR cluster node 0
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-0.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-0.outputs.log_file }}
+
+    - name: Upload e2e server logs
+      if: always() && inputs.task == 'e2e'
+      uses: actions/upload-artifact@v7
+      with:
+        name: iggy-go-e2e-server-logs
+        path: |
+          ${{ steps.iggy.outputs.log_file }}
+          ${{ steps.iggy-tls.outputs.log_file }}
+          ${{ steps.iggy-cluster-0.outputs.log_file }}
+          ${{ steps.iggy-cluster-1.outputs.log_file }}
+        if-no-files-found: ignore

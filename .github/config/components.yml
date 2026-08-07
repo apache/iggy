@@ -261,6 +261,12 @@ components:
       - "foreign/go/**"
       - "bdd/go/**"
       - "examples/go/**"
+      # The SDK compiles against the VSR wire contract, so a change to the
+      # protocol crate or the VSR server must rerun it.
+      - "core/binary_protocol/**"
+      # TODO: change to core/server once legacy server is removed (core/server has VSR support)
+      - "core/server-ng/**"
+    # VSR is the only protocol the Go SDK speaks, so there is no separate lane.
     tasks: ["lint", "test", "build", "e2e"]
 
   sdk-java:
@@ -348,6 +354,10 @@ components:
     paths:
       - "bdd/go/**"
       - "bdd/scenarios/**"
+      # The Go suites run against the VSR server, so its sources gate them.
+      - "core/binary_protocol/**"
+      # TODO: change to core/server once legacy server is removed (core/server has VSR support)
+      - "core/server-ng/**"
     tasks: ["bdd-go", "bdd-go-race"]
 
   bdd-node:

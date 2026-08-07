@@ -107,3 +107,22 @@ func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.
 	})
 	return err
 }
+
+func (c *IggyTcpClient) SyncConsumerGroup(
+	ctx context.Context,
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	groupId iggcon.Identifier,
+) (*iggcon.ConsumerGroupAssignment, error) {
+	buffer, err := c.do(ctx, &command.SyncConsumerGroup{
+		TopicPath: command.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		GroupId: groupId,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return binaryserialization.DeserializeConsumerGroupAssignment(buffer)
+}

@@ -473,11 +473,21 @@ jobs:
         with:
           save-cache: "false"
 
+      # The Go SDK speaks the VSR wire protocol, so its coverage run needs the
+      # VSR server rather than the legacy one.
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
+        with:
+          # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
+          replica-id: "0"
+          wait-timeout-seconds: "90"
 
       - name: Run unit tests with coverage
+        env:
+          IGGY_TCP_ADDRESS: 127.0.0.1:8090
         run: |
           cd foreign/go
           mkdir -p ../../reports

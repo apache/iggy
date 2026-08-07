@@ -215,6 +215,14 @@
   code: 55
   format: "users limit reached."
   fields: []
+- name: TransientNotCommitted
+  code: 57
+  format: "request transiently not committed; retry"
+  fields: []
+- name: TransientNotAccepted
+  code: 58
+  format: "request transiently not accepted; retry, on any replica"
+  fields: []
 - name: NotConnected
   code: 61
   format: "not connected"
@@ -1009,6 +1017,14 @@
       type: uint32
     - name: StreamId
       type: uint32
+- name: ConsumerGroupPartitionNotOwned
+  code: 5009
+  format: "consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress)."
+  fields:
+    - name: ClientId
+      type: uint32
+    - name: PartitionId
+      type: uint32
 - name: MissingBaseOffsetRetainedMessageBatch
   code: 6000
   format: "base offset is missing"
@@ -1109,3 +1125,13 @@
   code: 10012
   format: "cannot read index timestamp"
   fields: []
+- name: IncompatibleProtocolVersion
+  code: 14003
+  format: "incompatible binary protocol version: client %d, server accepts [%d, %d]"
+  fields:
+    - name: ClientVersion
+      type: uint32
+    - name: ServerVersionMin
+      type: uint32
+    - name: ServerVersionMax
+      type: uint32

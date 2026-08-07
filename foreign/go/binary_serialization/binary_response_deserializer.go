@@ -622,3 +622,71 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (igg
 		Expiry: expiry,
 	}, readBytes
 }
+
+// confirmationEntryLength is the width of one send confirmation:
+// [stream_id u32][topic_id u32][partition_id u32][base_offset u64].
+const confirmationEntryLength = 20
+
+// DeserializeSendMessagesConfirmations decodes [count u32] followed by count
+// confirmation entries. An empty payload is an empty list. Trailing bytes are
+// a decode error, because a frame the client cannot account for means the
+// stream is out of sync.
+func DeserializeSendMessagesConfirmations(payload []byte) (*iggcon.SendMessagesResponse, error) {
+	if len(payload) == 0 {
+		return &iggcon.SendMessagesResponse{}, nil
+	}
+	if len(payload) < 4 {
+		return nil, fmt.Errorf("send confirmations: %d bytes is short of the count", len(payload))
+	}
+
+	count := binary.LittleEndian.Uint32(payload)
+	body := payload[4:]
+	if uint64(len(body)) != uint64(count)*confirmationEntryLength {
+		return nil, fmt.Errorf(
+			"send confirmations: %d entries do not fill %d body bytes", count, len(body))
+	}
+
+	confirmations := make([]iggcon.SendMessagesConfirmation, 0, count)
+	for offset := 0; offset < len(body); offset += confirmationEntryLength {
+		entry := body[offset : offset+confirmationEntryLength]
+		confirmations = append(confirmations, iggcon.SendMessagesConfirmation{
+			StreamId:    binary.LittleEndian.Uint32(entry[0:4]),
+			TopicId:     binary.LittleEndian.Uint32(entry[4:8]),
+			PartitionId: binary.LittleEndian.Uint32(entry[8:12]),
+			BaseOffset:  binary.LittleEndian.Uint64(entry[12:20]),
+		})
+	}
+	return &iggcon.SendMessagesResponse{Confirmations: confirmations}, nil
+}
+
+// assignmentHeaderLength covers [generation u64][partitions_count u32].
+const assignmentHeaderLength = 12
+
+// DeserializeConsumerGroupAssignment decodes
+// [generation u64][partitions_count u32][partition_id u32 x n]. An empty
+// payload means the client is not a member of the group, reported as a nil
+// assignment.
+func DeserializeConsumerGroupAssignment(payload []byte) (*iggcon.ConsumerGroupAssignment, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	if len(payload) < assignmentHeaderLength {
+		return nil, fmt.Errorf("group assignment: %d bytes is short of the header", len(payload))
+	}
+
+	count := binary.LittleEndian.Uint32(payload[8:12])
+	body := payload[assignmentHeaderLength:]
+	if uint64(len(body)) != uint64(count)*4 {
+		return nil, fmt.Errorf(
+			"group assignment: %d partitions do not fill %d body bytes", count, len(body))
+	}
+
+	partitions := make([]uint32, 0, count)
+	for offset := 0; offset < len(body); offset += 4 {
+		partitions = append(partitions, binary.LittleEndian.Uint32(body[offset:offset+4]))
+	}
+	return &iggcon.ConsumerGroupAssignment{
+		Generation: binary.LittleEndian.Uint64(payload[0:8]),
+		Partitions: partitions,
+	}, nil
+}

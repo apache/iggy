@@ -93,13 +93,18 @@ type Client interface {
 
 	// SendMessages sends messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to send the messages.
+	//
+	// The returned confirmations report where the server committed the batch.
+	// Delivery is at-least-once: a send replayed after a reconnect arrives
+	// under a fresh client identity, so the server cannot deduplicate it
+	// against the original and the batch may commit twice.
 	SendMessages(
 		ctx context.Context,
 		streamId Identifier,
 		topicId Identifier,
 		partitioning Partitioning,
 		messages []IggyMessage,
-	) error
+	) (*SendMessagesResponse, error)
 
 	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
@@ -193,6 +198,17 @@ type Client interface {
 		topicId Identifier,
 		groupId Identifier,
 	) error
+
+	// SyncConsumerGroup fetch the partitions this client currently owns in a consumer group,
+	// together with the group generation, for the given stream and topic by unique IDs or names.
+	// Returns nil when the client is not a member of the group.
+	// Authentication is required, and the permission to read the streams or topics.
+	SyncConsumerGroup(
+		ctx context.Context,
+		streamId Identifier,
+		topicId Identifier,
+		groupId Identifier,
+	) (*ConsumerGroupAssignment, error)
 
 	// CreatePartitions create new N partitions for a topic by unique ID or name.
 	// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 1 to 5).

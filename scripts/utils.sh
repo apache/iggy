@@ -159,24 +159,30 @@ readonly EXAMPLES_SERVER_TIMEOUT=300
 readonly EXAMPLES_STOP_TIMEOUT=5
 
 # Resolve and validate the server binary path.
-# Usage: resolve_server_binary [target]
+# Usage: resolve_server_binary [target] [binary_name] [cargo_features]
 # Sets global SERVER_BIN.
 function resolve_server_binary() {
     local target="${1:-}"
+    local binary="${2:-iggy-server}"
+    local features="${3:-}"
+
     if [ -n "${target}" ]; then
-        SERVER_BIN="target/${target}/debug/iggy-server"
+        SERVER_BIN="target/${target}/debug/${binary}"
     else
-        SERVER_BIN="target/debug/iggy-server"
+        SERVER_BIN="target/debug/${binary}"
     fi
 
     if [ ! -f "${SERVER_BIN}" ]; then
+        local build_command="cargo build --bin ${binary}"
+        if [ -n "${target}" ]; then
+            build_command="cargo build --target ${target} --bin ${binary}"
+        fi
+        if [ -n "${features}" ]; then
+            build_command="${build_command} --features ${features}"
+        fi
         echo "Error: Server binary not found at ${SERVER_BIN}"
         echo "Please build the server binary before running this script:"
-        if [ -n "${target}" ]; then
-            echo "  cargo build --target ${target} --bin iggy-server"
-        else
-            echo "  cargo build --bin iggy-server"
-        fi
+        echo "  ${build_command}"
         exit 1
     fi
     echo "Using server binary at ${SERVER_BIN}"
@@ -233,12 +239,49 @@ function start_tls_server() {
     echo $! >"${EXAMPLES_PID_FILE}"
 }
 
-# Block until "has started" appears in the server log or timeout.
+# How wait_for_server_ready decides the server is up. "log" greps the startup
+# line. "tcp" polls the listener instead, which is what a lane running the VSR
+# server needs: it prints no such line.
+: "${SERVER_READY_PROBE:=log}"
+: "${SERVER_READY_ADDRESS:=127.0.0.1:8090}"
+
+# Report whether the server is accepting work.
+function server_is_ready() {
+    if [ "${SERVER_READY_PROBE}" = "tcp" ]; then
+        local host="${SERVER_READY_ADDRESS%:*}"
+        local port="${SERVER_READY_ADDRESS##*:}"
+        (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null || return 1
+        exec 3<&-
+        return 0
+    fi
+    grep -q "has started" "${EXAMPLES_LOG_FILE}"
+}
+
+# Report whether the server this script started is still running.
+function server_is_alive() {
+    local pid
+    pid="$(cat "${EXAMPLES_PID_FILE}" 2>/dev/null)" || return 0
+    [ -n "${pid}" ] || return 0
+    kill -0 "${pid}" 2>/dev/null
+}
+
+# Block until the server is ready or the timeout elapses.
 # Usage: wait_for_server_ready [label]
 function wait_for_server_ready() {
     local label="${1:-Iggy}"
     local elapsed=0
-    while ! grep -q "has started" "${EXAMPLES_LOG_FILE}"; do
+    while true; do
+        # Liveness is checked first so a server that died leaves its log here
+        # instead of the port probe latching onto an unrelated listener that
+        # already held the address.
+        if ! server_is_alive; then
+            echo "${label} server exited before it became ready."
+            cat "${EXAMPLES_LOG_FILE}"
+            exit 1
+        fi
+        if server_is_ready; then
+            return 0
+        fi
         if [ ${elapsed} -gt ${EXAMPLES_SERVER_TIMEOUT} ]; then
             echo "${label} server did not start within ${EXAMPLES_SERVER_TIMEOUT} seconds."
             ps fx 2>/dev/null || ps aux
