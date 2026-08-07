@@ -575,10 +575,12 @@ pub(crate) fn restore_partition_view(
 ///
 /// Returns [`ServerNgError`] when bounds validation, directory creation,
 /// superblock recovery, or segment provisioning fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_partition_fresh(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
+    created_revision: u64,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -683,7 +685,10 @@ pub async fn build_partition_fresh(
     // Fresh dirs read generation 0; a dir surviving from a crashed process
     // (this "fresh" build races repair re-materialization) reads the last
     // durably-applied purge so the reconciler does not re-wipe messages
-    // appended after it.
+    // appended after it. Keyed by incarnation, so a dir left behind by a failed
+    // delete does not fence the recreated partition's purges: set the revision
+    // first.
+    partition.set_created_revision(created_revision);
     partition.hydrate_applied_purge_generation().await?;
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);

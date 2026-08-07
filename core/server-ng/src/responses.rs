@@ -1192,14 +1192,21 @@ fn partition_response(
     partition: &metadata::stm::stream::Partition,
 ) -> Result<PartitionResponse, IggyError> {
     // Per-partition counters live in the shared stats registry (one `Arc`
-    // across all shards and both left-right buffers), populated when the
-    // owning shard materializes the partition; `None` only in the window
-    // before that first materialization.
+    // across all shards and both left-right buffers).
     //
-    // A committed partition always materializes with exactly one empty
-    // segment, so before the owning shard gets there (registry miss, or
-    // registered but not yet segmented) the reply reports that deterministic
-    // initial state instead of a zero a client would read as "no storage".
+    // Registration is NOT materialization: the owning shard's reconciler mints
+    // the entry (get-or-create in `fetch_partition_stats`) before it builds the
+    // partition, and `ensure_initial_segment` only bumps `segments_count` once
+    // the segment file is open. So a registry MISS and a registered entry still
+    // reading zero segments are the same thing to a caller -- committed, not yet
+    // holding storage -- and both report the deterministic shape every
+    // materialization lands on: one empty segment at offset 0. A bare zero
+    // would read as "no storage" to a client polling right after `create_topic`.
+    //
+    // Cost of the clamp: a partition fenced for rebuild (tombstoned after a
+    // refused chain) also reads as one empty segment rather than zero. Telling
+    // the two apart needs a materialization signal the registry does not carry
+    // today; the counters are still the honest source for size and messages.
     let stats = streams
         .stats_registry
         .partition_get(stream_id, topic_id, partition.id);
@@ -1726,6 +1733,37 @@ mod tests {
         assert_eq!(stats.process_id, std::process::id());
         assert!(stats.total_memory > 0);
         assert!(!stats.hostname.is_empty());
+    }
+
+    #[test]
+    fn partition_response_reports_the_initial_shape_until_a_segment_exists() {
+        use iggy_common::{StreamStats, TopicStats};
+        use metadata::stm::stream::{Partition, StreamsInner};
+
+        let streams = StreamsInner::new();
+        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0);
+
+        // Registry miss: the owning shard has not started building.
+        let predicted = partition_response(&streams, 0, 0, &partition).expect("response builds");
+        assert_eq!(predicted.segments_count, 1);
+        assert_eq!(predicted.messages_count, 0);
+
+        // Registered but not yet segmented: the reconciler mints the entry
+        // before `ensure_initial_segment` runs, so this is the SAME state to a
+        // caller and must not read as "no storage".
+        let topic_stats = Arc::new(TopicStats::new(Arc::new(StreamStats::default())));
+        let stats = streams.stats_registry.partition(0, 0, 0, topic_stats);
+        let mid_build = partition_response(&streams, 0, 0, &partition).expect("response builds");
+        assert_eq!(mid_build.segments_count, 1);
+
+        // Materialized: the real counters answer from here on.
+        stats.increment_segments_count(1);
+        stats.increment_messages_count(7);
+        stats.increment_size_bytes(64);
+        let live = partition_response(&streams, 0, 0, &partition).expect("response builds");
+        assert_eq!(live.segments_count, 1);
+        assert_eq!(live.messages_count, 7);
+        assert_eq!(live.size_bytes, 64);
     }
 
     #[test]

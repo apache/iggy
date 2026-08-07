@@ -99,7 +99,9 @@ pub struct Partition {
     /// Replicated delete watermark: the reconciler on every replica removes
     /// sealed segments with `end_offset` below this. Advanced monotonically by
     /// `TruncatePartition` (the resolved form of a client `DeleteSegments`).
-    /// `0` means nothing has been trimmed.
+    /// `0` means nothing has been trimmed. Monotone only WITHIN one offset
+    /// space: a purge restarts offsets at 0 and clears this back to 0, or the
+    /// stale watermark would keep re-staging trims over post-purge segments.
     pub deleted_up_to_offset: u64,
     /// Replicated purge counter: `PurgeTopic` increments it for every partition
     /// in the topic. The reconciler on every replica resets a partition to a
@@ -1506,10 +1508,11 @@ impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         // Stream purge = topic purge over every topic in the stream: advance
-        // each partition's monotonic purge generation; every replica's
-        // reconciler observes the committed generation and resets the
-        // partition to a single empty segment at offset 0 with cleared
-        // offsets (see `PurgeTopicRequest`). Metadata shape stays intact.
+        // each partition's monotonic purge generation and clear the delete
+        // watermark; every replica's reconciler observes the committed
+        // generation and resets the partition to a single empty segment at
+        // offset 0 with cleared offsets (see `PurgeTopicRequest`). Metadata
+        // shape stays intact.
         let advanced = {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(PurgeStreamResult::StreamNotFound);
@@ -1521,6 +1524,7 @@ impl StateHandler for PurgeStreamRequest {
             for (_, topic) in &mut stream.topics {
                 for partition in &mut topic.partitions {
                     partition.purge_generation = partition.purge_generation.wrapping_add(1);
+                    partition.deleted_up_to_offset = 0;
                     advanced = true;
                 }
             }
@@ -1762,6 +1766,12 @@ impl StateHandler for PurgeTopicRequest {
         // each partition's monotonic purge generation, which the reconciler
         // observes (committed generation > locally applied) and turns into a
         // single empty segment at offset 0 plus cleared offsets.
+        //
+        // The delete watermark is replicated state describing the PRE-purge
+        // offset space, so it is cleared in the same apply: the purge restarts
+        // offsets at 0 and drops the consumer-offset barrier that bounded the
+        // trim, and the reconciler re-stages any nonzero watermark on every
+        // pass -- a surviving one would delete post-purge segments.
         let advanced = {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(PurgeTopicResult::StreamNotFound);
@@ -1777,6 +1787,7 @@ impl StateHandler for PurgeTopicRequest {
             };
             for partition in &mut topic.partitions {
                 partition.purge_generation = partition.purge_generation.wrapping_add(1);
+                partition.deleted_up_to_offset = 0;
             }
             !topic.partitions.is_empty()
         };
@@ -2466,6 +2477,68 @@ mod tests {
         assert!(apply.body.is_empty());
         // Purge leaves the metadata shape intact: stream still present.
         assert_eq!(inner.items.len(), 1);
+    }
+
+    /// A purge restarts the offset space at 0, so a watermark from the old one
+    /// must not survive: the reconciler re-stages every nonzero watermark on
+    /// each pass, and the consumer-offset barrier that bounded the trim is
+    /// cleared by the purge too, so a stale watermark deletes post-purge
+    /// segments.
+    #[test]
+    fn given_truncated_partition_when_apply_purge_should_clear_delete_watermark() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "topic"),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+
+        let truncate = TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 0,
+            up_to_offset: 500,
+        };
+        let apply = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
+            500
+        );
+
+        let purge = PurgeTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        let apply = StateHandler::apply(&purge, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].deleted_up_to_offset, 0,
+            "the purge must clear the pre-purge delete watermark"
+        );
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].purge_generation, 1,
+            "the purge generation still advances"
+        );
+
+        // Same for the stream-wide purge, which walks every topic.
+        let _ = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
+            500
+        );
+        let purge_stream = PurgeStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        let _ = StateHandler::apply(&purge_stream, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].deleted_up_to_offset, 0,
+            "a stream purge clears the watermark on every partition it walks"
+        );
     }
 
     #[test]

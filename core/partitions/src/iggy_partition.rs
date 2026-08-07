@@ -161,6 +161,13 @@ where
     /// generation against this and resets only when it advances, so a redundant
     /// reconcile pass never re-wipes a partition already at this generation.
     pub(crate) applied_purge_generation: u64,
+    /// `Partition::created_revision` of the metadata row this partition was
+    /// built for (the reconciler's "epoch"). Keys the durable `purge.gen`
+    /// record: a delete whose on-disk cleanup failed leaves the directory
+    /// behind, and the recreated partition restarts its generations at 0, so
+    /// the dead incarnation's record must not hydrate. `0` for partitions built
+    /// without a metadata row (tests, in-memory storage).
+    pub(crate) created_revision: u64,
     /// Highest consensus op assigned when the last purge ran. INVARIANT: every
     /// journal-apply path must no-op entries with `op <= purge_floor_op`. The
     /// purge keeps journal entries resident (consensus history for backups,
@@ -464,6 +471,7 @@ where
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
             applied_purge_generation: 0,
+            created_revision: 0,
             purge_floor_op: 0,
             superblock: None,
             superblock_lock: LocalGate::new(),
@@ -499,13 +507,22 @@ where
         self.purge_floor_op
     }
 
+    /// Record the metadata incarnation this partition was built for. Must run
+    /// BEFORE [`Self::hydrate_applied_purge_generation`], which keys the
+    /// durable record on it.
+    pub const fn set_created_revision(&mut self, created_revision: u64) {
+        self.created_revision = created_revision;
+    }
+
     /// Seed [`Self::applied_purge_generation`] from the partition dir's
     /// `purge.gen` file at build time (both fresh create and recovery walk
     /// this). Absent file reads 0, so a partition that never purged and a
     /// repair-rebuilt dir both start below any committed generation and the
     /// reconciler re-applies the purge; a crash AFTER a purge's durable
     /// generation write correctly skips the re-wipe, keeping messages
-    /// appended since. No-op without a partition dir (in-memory storage).
+    /// appended since. A record left by a PREVIOUS incarnation of this
+    /// namespace reads 0 as well (see [`read_purge_generation`]). No-op
+    /// without a partition dir (in-memory storage).
     ///
     /// # Errors
     /// Propagates a real I/O failure reading `purge.gen`: booting with the
@@ -514,7 +531,8 @@ where
     pub async fn hydrate_applied_purge_generation(&mut self) -> Result<(), IggyError> {
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
-            self.applied_purge_generation = read_purge_generation(&path).await?;
+            self.applied_purge_generation =
+                read_purge_generation(&path, self.created_revision).await?;
         }
         Ok(())
     }
@@ -2983,9 +3001,19 @@ where
                 if entry.header.operation != Operation::SendMessages {
                     return None;
                 }
-                // Purge floor: a pre-purge send committing after the purge
-                // reports no visible offsets ("send without confirmation", the
-                // established degradation), which also keeps
+                // Purge floor: a pre-purge send committing after the purge is
+                // DELIBERATELY degraded to ZERO confirmations rather than
+                // failed. Its messages are genuinely gone (the purge deleted
+                // the segment they would have landed in) and no offset is left
+                // to report, so the reply carries the established "committed,
+                // no offsets to report" shape (`send_messages_reply_body`'s
+                // empty confirmation list, byte-identical to what a send
+                // without confirmation returns): the client sees success with
+                // an empty confirmations list and re-sends if it needs the
+                // offset. A typed transient status was the alternative and is
+                // wrong here -- the op DID commit cluster-wide, so telling the
+                // client to retry duplicates a committed send into the
+                // post-purge offset space. `None` is also what keeps
                 // `commit_partition_entry` from re-advancing the reset offset
                 // and stats with pre-purge values.
                 if entry.header.op <= self.purge_floor_op {
@@ -3989,6 +4017,23 @@ where
             .journal()
             .inner
             .clear_poll_index(self.purge_floor_op);
+        // Hand the already-walked fenced prefix to the normal eviction path so
+        // an idle purged partition does not pin it resident: the flush that
+        // would otherwise evict it is gated on `journal.info.messages_count`,
+        // which the reset above just zeroed, so with no post-purge traffic the
+        // entries never leave. Repair semantics are unchanged -- `evict_prefix`
+        // moves them into the evicted ring, still op-addressable by
+        // `repair_entry`, and the serve path clamps `retained_from` above the
+        // floor anyway. Bounded at `commit_min`, NOT `commit_max`: an op the
+        // commit walk has not reached yet still needs its header resident, or
+        // `committed_headers_from` stops at the hole and wedges `commit_min`.
+        let fenced_prefix = self
+            .log
+            .journal()
+            .inner
+            .committed_prefix(self.consensus.commit_min().min(self.purge_floor_op))
+            .len();
+        self.evict_committed_prefix(fenced_prefix).await;
 
         // Last durable step: record the applied generation before the
         // in-memory marker advances. On a write failure the marker stays old,
@@ -4001,7 +4046,9 @@ where
         // recorded the generation keep it.
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
-            if let Err(error) = persist_purge_generation(&path, generation).await {
+            if let Err(error) =
+                persist_purge_generation(&path, generation, self.created_revision).await
+            {
                 self.purge_deferred = true;
                 warn!(
                     target: "iggy.partitions.diag",
@@ -4269,6 +4316,7 @@ where
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
+        let op = message.header().op;
         let (base_offset, base_timestamp, total_size, message_count) = {
             let batch =
                 decode_prepare_slice(message.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
@@ -4282,6 +4330,24 @@ where
         if message_count == 0 {
             return Ok(None);
         }
+
+        // Purge floor: the same fence every other journal-apply path honors. A
+        // repaired pre-purge batch is still journaled -- the commit walk stops
+        // at the first missing op, so dropping it would wedge `commit_min` --
+        // but it must not re-advance the reset counters or re-count purged
+        // bytes. `None` also keeps it out of the session's
+        // `first_batch_offset`: that anchors the floor-connect check, and
+        // purged bytes cannot stand in for durable state.
+        if op <= self.purge_floor_op {
+            self.log
+                .journal()
+                .inner
+                .append(message.into_frozen())
+                .await
+                .map_err(|_| IggyError::CannotAppendMessage)?;
+            return Ok(None);
+        }
+
         let last_offset = base_offset + u64::from(message_count) - 1;
 
         self.should_increment_offset = true;
@@ -6654,7 +6720,7 @@ mod purge_floor_tests {
              the (fresh, empty) segments"
         );
         assert_eq!(
-            partition.log.journal().inner.resident_entries().len(),
+            partition.log.journal().inner.resident_count(),
             2,
             "journal entries are consensus history and must survive the purge"
         );
@@ -6662,6 +6728,11 @@ mod purge_floor_tests {
             partition.log.journal().inner.header_by_op(1).is_some()
                 && partition.log.journal().inner.header_by_op(2).is_some(),
             "repair and retransmission must still resolve pre-purge ops"
+        );
+        assert!(
+            partition.log.journal().inner.resident_entries().is_empty(),
+            "the poll view of the resident tier must exclude fenced entries, \
+             even though they stay resident for consensus"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6805,6 +6876,272 @@ mod purge_floor_tests {
         assert!(
             partition.log.journal().inner.header_by_op(2).is_some(),
             "the retained op stays consensus history"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The resident poll tier is sealed by the purge, but the first post-purge
+    /// indexed append re-arms it. The snapshot handed to the straddle and
+    /// retention-recovery walks matches on batch CONTENTS alone (no op), so
+    /// without the fence those walks serve purged bytes again.
+    #[compio::test]
+    async fn given_post_purge_append_when_snapshotting_resident_tail_should_skip_fenced_entries() {
+        let (mut partition, dir) = purge_test_partition("resident-fence");
+        // Two pre-purge batches: offsets 0 and 1 (the counter advances).
+        journal_send_batch(&mut partition, 1).await;
+        journal_send_batch(&mut partition, 2).await;
+
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+
+        // Re-arms the resident tier: this batch restarts at offset 0.
+        journal_send_batch(&mut partition, 3).await;
+
+        let snapshot = partition.resident_tail_snapshot();
+        assert_eq!(
+            snapshot.entries.len(),
+            1,
+            "only the post-purge entry may reach a poll"
+        );
+        // Offset 1 existed ONLY in the purged batch, so a resident poll there
+        // must come up empty instead of serving the fenced entry.
+        let purged_offset = crate::journal::select_resident(
+            &snapshot.entries,
+            MessageLookup::Offset {
+                offset: 1,
+                count: 10,
+                ceiling: u64::MAX,
+            },
+        );
+        assert!(
+            purged_offset.is_none(),
+            "a purged offset must not be servable from the resident tier"
+        );
+        assert!(
+            crate::journal::select_resident(
+                &snapshot.entries,
+                MessageLookup::Offset {
+                    offset: 0,
+                    count: 10,
+                    ceiling: u64::MAX,
+                },
+            )
+            .is_some(),
+            "the post-purge batch is still servable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The flush that would evict the fenced prefix is gated on
+    /// `journal.info.messages_count`, which the purge zeroes, so an idle purged
+    /// partition would pin those entries resident forever. The purge hands them
+    /// to the ordinary eviction path instead; repair still resolves them from
+    /// the evicted ring.
+    #[compio::test]
+    async fn given_walked_prefix_when_purged_should_evict_fenced_entries_to_the_ring() {
+        let (mut partition, dir) = purge_test_partition("fenced-evict");
+        // Single-replica test partitions disable repair retention; the ring is
+        // what makes eviction safe for repair, so exercise it.
+        partition.log.journal().inner.set_repair_retention(true);
+        journal_send_batch(&mut partition, 1).await;
+        journal_send_batch(&mut partition, 2).await;
+        partition.consensus().advance_commit_max(2);
+        // Walked already (a settled repair floor does this without flushing),
+        // so the entries are committed history that is still resident.
+        partition.consensus().set_commit_floor(2);
+
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+
+        assert_eq!(
+            partition.log.journal().inner.resident_count(),
+            0,
+            "the walked fenced prefix must not stay pinned in resident storage"
+        );
+        assert!(
+            partition.log.journal().inner.repair_entry(1).is_some()
+                && partition.log.journal().inner.repair_entry(2).is_some(),
+            "eviction moves them to the ring, where repair still resolves them"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `purge_floor_op` promises EVERY journal-apply path no-ops at or below the
+    /// floor. The repaired-prepare path writes the dirty offset, the segment
+    /// write cursor and `journal.info`, so it needs the same guard: only the
+    /// peer-side serve clamp kept purged bytes out, and that clamp is the
+    /// PEER's floor, not this replica's.
+    #[compio::test]
+    async fn given_repaired_send_at_or_below_floor_when_appended_should_not_mutate_state() {
+        let (mut partition, dir) = purge_test_partition("repaired-fenced");
+        journal_send_batch(&mut partition, 1).await;
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+        assert_eq!(partition.purge_floor_op(), 1, "the floor fences op 1");
+
+        // A repaired pre-purge batch for the fenced op, carrying its original
+        // (pre-purge) stamps exactly as the serving peer stored them.
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let record = build_segment_record(namespace, 40);
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let total = header_size + record.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&record);
+        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command2::Prepare;
+            header.operation = Operation::SendMessages;
+            header.op = 1;
+            header.namespace = namespace.inner();
+            header.size = u32::try_from(total).expect("prepare size fits u32");
+        });
+
+        let base_offset = partition
+            .append_repaired_send_messages(message)
+            .await
+            .expect("a fenced repaired prepare is journaled, not refused");
+
+        assert_eq!(
+            base_offset, None,
+            "a purged batch must not anchor the repair floor's connect check"
+        );
+        assert_eq!(
+            partition.dirty_offset.load(Ordering::Relaxed),
+            0,
+            "the reset counter must not jump to a purged offset"
+        );
+        let segment_index = partition.log.segments().len() - 1;
+        assert_eq!(
+            partition.log.segments()[segment_index].current_position,
+            0,
+            "no purged bytes may be reserved in the fresh segment"
+        );
+        assert_eq!(
+            partition.log.journal().info.messages_count,
+            0,
+            "purged bytes must not re-enter the flush accounting"
+        );
+        assert!(
+            partition.log.journal().inner.header_by_op(1).is_some(),
+            "the entry is still journaled: dropping it would wedge commit_min"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Why the shard defers repair COMPLETION while a committed purge is
+    /// unapplied: until the purge lands, `recovered_durable_offset` still names
+    /// the pre-purge segments, and every repaired post-purge batch (offsets
+    /// restart at 0) silently vanishes in the flush skip. The purge clears the
+    /// line, and the same batch persists.
+    #[compio::test]
+    async fn given_stale_recovered_durable_offset_when_committing_should_drop_until_purge_applies()
+    {
+        let (mut partition, dir) = purge_test_partition("stale-durable");
+        // A restart that recovered segments through offset 9.
+        partition.recovered_durable_offset = Some(9);
+
+        journal_send_batch(&mut partition, 1).await;
+        partition.consensus().advance_commit_max(1);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.log.active_segment().size.as_bytes_u64(),
+            0,
+            "a batch at offset 0 is skipped as already-durable while the stale \
+             recovered line stands"
+        );
+
+        partition
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+        assert_eq!(
+            partition.recovered_durable_offset, None,
+            "the purge deleted those bytes, so the line must go with them"
+        );
+
+        journal_send_batch(&mut partition, 2).await;
+        partition.consensus().advance_commit_max(2);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.log.active_segment().size.as_bytes_u64(),
+            build_segment_record(IggyNamespace::new(1, 1, 0), 0).len() as u64,
+            "after the purge the same offset-0 batch reaches the segment"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delete whose on-disk cleanup failed leaves the partition directory
+    /// (and `purge.gen`) behind. The recreated topic's rows restart their purge
+    /// generations at 0, so hydrating the DEAD incarnation's generation would
+    /// swallow the new topic's purges until the committed counter climbed past
+    /// it.
+    #[compio::test]
+    async fn given_purge_gen_from_a_dead_incarnation_when_rebuilt_should_hydrate_zero() {
+        let (mut partition, dir) = purge_test_partition("stale-incarnation");
+        partition.set_created_revision(7);
+        partition
+            .purge(&repair_config(), 4)
+            .await
+            .expect("purge partition");
+        assert_eq!(partition.applied_purge_generation(), 4);
+
+        let rebuild = |created_revision: u64| {
+            let mut rebuilt = test_partition();
+            rebuilt.set_partition_dir(dir.to_string_lossy().into_owned());
+            rebuilt.set_created_revision(created_revision);
+            rebuilt
+        };
+
+        // Same incarnation (an ordinary restart): the generation still stands.
+        let mut restarted = rebuild(7);
+        restarted
+            .hydrate_applied_purge_generation()
+            .await
+            .expect("hydrate purge generation");
+        assert_eq!(restarted.applied_purge_generation(), 4);
+
+        // New incarnation over the same directory.
+        let mut recreated = rebuild(8);
+        recreated
+            .hydrate_applied_purge_generation()
+            .await
+            .expect("hydrate purge generation");
+        assert_eq!(
+            recreated.applied_purge_generation(),
+            0,
+            "a dead incarnation's record must not fence the recreated partition"
+        );
+
+        // So the new topic's first purge (generation 1) passes the reconciler's
+        // `committed > applied` gate and re-keys the record.
+        recreated
+            .purge(&repair_config(), 1)
+            .await
+            .expect("purge partition");
+        let mut after = rebuild(8);
+        after
+            .hydrate_applied_purge_generation()
+            .await
+            .expect("hydrate purge generation");
+        assert_eq!(after.applied_purge_generation(), 1);
+        let mut dead = rebuild(7);
+        dead.hydrate_applied_purge_generation()
+            .await
+            .expect("hydrate purge generation");
+        assert_eq!(
+            dead.applied_purge_generation(),
+            0,
+            "re-keying leaves the dead incarnation with nothing to hydrate"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

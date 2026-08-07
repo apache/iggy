@@ -2566,7 +2566,12 @@ where
             && let Some(dir) = self.partition_dir.clone()
         {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
-            if let Err(error) = persist_purge_generation(&path, offsets_wire.purge_generation).await
+            if let Err(error) = persist_purge_generation(
+                &path,
+                offsets_wire.purge_generation,
+                self.created_revision,
+            )
+            .await
             {
                 tracing::warn!(
                     target: "iggy.partitions.diag",

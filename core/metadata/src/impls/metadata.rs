@@ -873,6 +873,16 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.default_max_topic_size.set(max_topic_size_bytes);
     }
 
+    /// Byte value a stored `MaxTopicSize::ServerDefault` resolves to on this
+    /// node. Read by the per-shard segment cleaner, which enforces retention
+    /// locally and so must resolve the sentinel at enforcement time: create
+    /// admission rewrites it before replication, but an UPDATE back to
+    /// `ServerDefault` leaves the sentinel in committed state.
+    #[must_use]
+    pub const fn default_max_topic_size(&self) -> u64 {
+        self.default_max_topic_size.get()
+    }
+
     /// Raise the forced-checkpoint margin to cover a configured
     /// prepare-queue depth (`[metadata] prepare_queue_depth`). Clamped to
     /// the built-in floor by the coordinator; no-op on shards without a

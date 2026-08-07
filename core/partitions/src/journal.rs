@@ -646,13 +646,34 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         inner.storage.is_empty()
     }
 
-    /// Owned, op-ascending clones of every resident journal entry. Each clone
-    /// is a `Frozen` refcount bump, not a deep copy. Used to snapshot the
-    /// resident tail at poll-plan time so a disk-tier straddle can be spliced
-    /// off the partition borrow on owned data ([`crate::iggy_partition`]).
+    /// Owned, op-ascending clones of the resident journal entries a poll may
+    /// serve. Each clone is a `Frozen` refcount bump, not a deep copy. Used to
+    /// snapshot the resident tail at poll-plan time so a disk-tier straddle can
+    /// be spliced off the partition borrow on owned data
+    /// ([`crate::iggy_partition`]).
+    ///
+    /// Entries at or below the purge floor are filtered out. They stay resident
+    /// (consensus history for backups, repair and retransmission) but are
+    /// poll-fenced exactly like the offset/timestamp indexes
+    /// [`Self::clear_poll_index`] sealed: the snapshot walk matches on the batch
+    /// contents alone, so an unfiltered list re-exposes purged bytes as soon as
+    /// one post-purge append puts an entry back into the index.
     pub fn resident_entries(&self) -> Vec<JournalBuffer> {
         let inner = unsafe { &*self.inner.get() };
-        inner.storage.entries()
+        let entries = inner.storage.entries();
+        let floor = self.poll_floor.get();
+        if floor == 0 {
+            return entries;
+        }
+        // `headers[i]` pairs with storage index `i` (see the length-lock
+        // invariant on `append_with_meta`), so the op comes from the header
+        // vector rather than a per-entry decode.
+        let headers = unsafe { &*self.headers.get() };
+        headers
+            .iter()
+            .zip(entries)
+            .filter_map(|(header, entry)| (header.op > floor).then_some(entry))
+            .collect()
     }
 }
 

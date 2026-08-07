@@ -222,6 +222,22 @@ async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
         "oversized delete_partitions must deny with TooManyPartitions, got {result:?}"
     );
 
+    // Zero is a no-op that still burns a replicated log entry, bumps the
+    // metadata revision and forces a rebalance pass. Legacy rejects it with the
+    // same code in both handlers (`1..=MAX` on create, `== 0` on delete); note
+    // that create_topic is deliberately NOT included, since a zero-partition
+    // topic is legal there in legacy too.
+    let result = client.create_partitions(&stream_id, &topic_id, 0).await;
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == too_many),
+        "create_partitions with 0 must deny with TooManyPartitions, got {result:?}"
+    );
+    let result = client.delete_partitions(&stream_id, &topic_id, 0).await;
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == too_many),
+        "delete_partitions with 0 must deny with TooManyPartitions, got {result:?}"
+    );
+
     client
         .create_partitions(&stream_id, &topic_id, 2)
         .await

@@ -17,9 +17,10 @@
 
 //! Poll semantics against server-ng (vsr): a poll aimed at a partition id the
 //! topic does not have must surface a typed `PartitionNotFound`, not an empty
-//! poll a consumer would read as end-of-partition; a timestamp poll must be
-//! at-or-after, including the message stamped exactly at the queried
-//! timestamp (the timestamp replies report per message).
+//! poll a consumer would read as end-of-partition; the same addressing error
+//! on `get_consumer_offset` must not decode as "no offset stored"; and a
+//! timestamp poll must be at-or-after, including the message stamped exactly at
+//! the queried timestamp (the timestamp replies report per message).
 
 use iggy::prelude::*;
 use integration::iggy_harness;
@@ -84,6 +85,62 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
         .await
         .expect("poll on the existing partition still succeeds");
     assert_eq!(valid.messages.len(), 0, "empty topic polls empty");
+}
+
+/// `get_consumer_offset` answered an unknown partition with an empty body,
+/// which the SDK decodes as `None` - the same value a consumer that simply has
+/// no stored offset yet gets back, so a client could not tell a typo from a
+/// fresh consumer. Legacy swallows this one too; server-ng surfaces the code
+/// the poll path already surfaces for the identical addressing error.
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn given_missing_partition_when_getting_consumer_offset_should_reject_partition_not_found(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("offset-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("offset-stream").expect("stream identifier");
+    client
+        .create_topic(
+            &stream_id,
+            "offset-topic",
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .expect("create topic");
+    let topic_id = Identifier::from_str_value("offset-topic").expect("topic identifier");
+    let consumer = Consumer::default();
+
+    let result = client
+        .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(7))
+        .await;
+
+    let expected =
+        IggyError::PartitionNotFound(7, Identifier::default(), Identifier::default()).as_code();
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == expected),
+        "get_consumer_offset on partition 7 of a 1-partition topic must surface \
+         Err(PartitionNotFound), got {result:?}"
+    );
+
+    // The existing partition still answers "no offset stored" as `None`.
+    let stored = client
+        .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(0))
+        .await
+        .expect("get_consumer_offset on the existing partition still succeeds");
+    assert!(
+        stored.is_none(),
+        "a consumer with no stored offset reads back as None, not an error"
+    );
 }
 
 #[iggy_harness(

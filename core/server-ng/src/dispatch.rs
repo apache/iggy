@@ -740,16 +740,35 @@ fn pop_next_client_request(
     message
 }
 
-/// Per-request partitions-count cap shared by create-topic, create-partitions
+/// Per-request partitions-count cap, shared by create-topic, create-partitions
 /// and delete-partitions admission. Runs pre-consensus like
 /// [`validate_topic_bounds`]: an oversized count must not burn a replicated
 /// log entry (create-partitions admission would also allocate that many
 /// consensus-group ids before replicating).
+///
+/// Zero passes here because a zero-partition TOPIC is legal (legacy
+/// `create_topic` admits `0..=MAX`); the add/remove requests reject it in
+/// [`validate_partitions_change_count`].
 pub(crate) const fn validate_partitions_count(partitions_count: u32) -> Result<(), IggyError> {
     if partitions_count > MAX_PARTITIONS_PER_REQUEST {
         return Err(IggyError::TooManyPartitions);
     }
     Ok(())
+}
+
+/// [`validate_partitions_count`] plus the zero rejection that create-partitions
+/// and delete-partitions carry: adding or removing zero partitions is a no-op
+/// that would still burn a replicated log entry, bump `Streams::revision` and
+/// force every shard through a rebalance pass. Legacy rejects it with
+/// `TooManyPartitions` in both handlers (`1..=MAX` on create, `== 0` on
+/// delete), so the code matches rather than inventing a new one.
+pub(crate) const fn validate_partitions_change_count(
+    partitions_count: u32,
+) -> Result<(), IggyError> {
+    if partitions_count == 0 {
+        return Err(IggyError::TooManyPartitions);
+    }
+    validate_partitions_count(partitions_count)
 }
 
 /// Static create-topic bounds shared by the TCP and HTTP ingresses. Runs
@@ -1044,12 +1063,12 @@ async fn handle_client_request<B, MJ, S, SB>(
         Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|create_partitions| {
-                validate_partitions_count(create_partitions.partitions_count)
+                validate_partitions_change_count(create_partitions.partitions_count)
             }),
         Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|delete_partitions| {
-                validate_partitions_count(delete_partitions.partitions_count)
+                validate_partitions_change_count(delete_partitions.partitions_count)
             }),
         _ => Ok(()),
     };
@@ -1991,6 +2010,20 @@ async fn handle_get_consumer_offset<B, MJ, S, SB>(
                 }) => build_consumer_offset_body(partition_id, current_offset, stored_offset),
                 _ => Bytes::new(),
             }
+        }
+        // A partition id that does not exist in a resolvable topic is a client
+        // addressing error, the same one the poll path denies typed. An empty
+        // body decodes as `None` -- indistinguishable from "this consumer has
+        // no stored offset yet" -- so the caller cannot tell a typo from a
+        // fresh consumer.
+        Err(error @ IggyError::PartitionNotFound(..)) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "get_consumer_offset rejected: partition not found"
+            );
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            return;
         }
         Err(error) => {
             warn!(
@@ -3682,6 +3715,32 @@ mod tests {
                 Err(IggyError::TooManyPartitions)
             ),
             "one past the cap must deny"
+        );
+        // Zero passes the shared cap because a zero-partition TOPIC is legal
+        // (legacy `create_topic` admits `0..=MAX`).
+        assert!(validate_partitions_count(0).is_ok());
+    }
+
+    #[test]
+    fn zero_partitions_change_denies_pre_consensus() {
+        // Adding or removing zero partitions is a no-op that would still burn
+        // a replicated log entry and force a rebalance. Legacy rejects it with
+        // `TooManyPartitions` in both handlers, so the code matches.
+        assert!(
+            matches!(
+                validate_partitions_change_count(0),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "adding or removing zero partitions must deny"
+        );
+        assert!(validate_partitions_change_count(1).is_ok());
+        assert!(validate_partitions_change_count(MAX_PARTITIONS_PER_REQUEST).is_ok());
+        assert!(
+            matches!(
+                validate_partitions_change_count(MAX_PARTITIONS_PER_REQUEST + 1),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "the cap still applies"
         );
     }
 }

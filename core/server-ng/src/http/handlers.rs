@@ -1035,9 +1035,16 @@ pub(in crate::http) async fn poll_messages(
             Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
                 return Ok(Json(resync_required_polled_messages()));
             }
+            // A partition id the topic does not have is a client addressing
+            // error with its own code; collapsing it into the generic 404 body
+            // told an SDK "no such stream/topic" for a request whose stream and
+            // topic both resolved. TCP parity: the dispatch denies typed here.
+            Err(error @ IggyError::PartitionNotFound(..)) => {
+                return Err(ReadError::Rejected(error));
+            }
             // The remaining resolver failures are STM lookups that came up
-            // empty (unknown stream, topic, partition, or consumer group), so
-            // they render as the legacy 404 body.
+            // empty (unknown stream, topic, or consumer group), so they render
+            // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
     let reply = SendWrapper::new(

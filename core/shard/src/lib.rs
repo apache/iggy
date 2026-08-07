@@ -3829,6 +3829,7 @@ where
                 namespace.partition_id(),
             );
         if committed_purge > partition.applied_purge_generation() {
+            self.metrics.record_partition_repair_serve_deferred();
             tracing::debug!(
                 shard = self.id,
                 namespace_raw = header.namespace,
@@ -4149,17 +4150,45 @@ where
             0
         };
         let config = planes.1.0.config().clone();
-        let Some(partition) = planes
-            .1
-            .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
-        else {
+        let namespace = IggyNamespace::from_raw(header.namespace);
+        let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
         let Some(session) = partition.repair else {
             return;
         };
         if header.nonce != session.nonce {
+            return;
+        }
+        // Receiver half of the serve-side purge gate: while a committed purge
+        // is not yet locally applied, this replica's `recovered_durable_offset`
+        // still describes the PRE-purge segments, so a floor from a peer that
+        // did purge reads as connected against state the purge is about to
+        // delete -- and the post-purge batches (offsets restarting at 0) then
+        // flush-skip below that stale durable line and are silently lost.
+        // Defer the whole reply: the purge is one reconciler wake away and
+        // resets the line to `None`, and the stall retry re-asks, so the peer
+        // re-emits both `RangeEvicted` and `RepairDone` for the same window.
+        let committed_purge = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_purge_generation(
+                namespace.stream_id(),
+                namespace.topic_id(),
+                namespace.partition_id(),
+            );
+        if committed_purge > partition.applied_purge_generation() {
+            self.metrics.record_partition_repair_serve_deferred();
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = header.namespace,
+                committed_purge,
+                applied_purge = partition.applied_purge_generation(),
+                command = ?header.command,
+                "deferring repair completion until the committed purge applies locally"
+            );
             return;
         }
         match header.command {

@@ -1801,6 +1801,7 @@ async fn build_shard_for_thread(
                     config,
                     namespace,
                     partition_stats,
+                    partition_metadata.created_revision,
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
@@ -2359,6 +2360,9 @@ async fn load_partition(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_partition_dir(partition_dir);
+    // Before the hydrate: the durable record is keyed by incarnation, so a
+    // `purge.gen` left behind by a previous life of this namespace reads 0.
+    partition.set_created_revision(partition_metadata.created_revision);
     partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,

@@ -507,6 +507,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             stale = counters.stale,
             deferred = counters.deferred,
             parked_reclaimed = counters.parked_reclaimed,
+            purges_staged = counters.purges_staged,
+            trims_pending = counters.trims_pending,
             "partition reconciler pass complete"
         );
     } else {
@@ -630,6 +632,7 @@ async fn reconcile_additions(
             ctx.config.as_ref(),
             ns,
             partition_stats,
+            epoch,
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
