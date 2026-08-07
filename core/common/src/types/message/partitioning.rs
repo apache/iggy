@@ -33,7 +33,8 @@ use std::{
 /// - `MessagesKey` - the partition ID is calculated by the server using the hash of the provided messages key.
 /// - `PartitionId` - the partition ID is provided by the client.
 ///
-/// Note, that using a [`Partitioner`] on top of [`Partitioning`] sets the strategy to [`PartitioningKind::PartitionId`] and the value to whatever [`Partitioner::calculate_partition_id()`] computes.
+/// Note, that using a [`Partitioner`] on top of [`Partitioning`] sets the strategy to [`PartitioningKind::PartitionId`]. The value is then computed
+/// based on your concrete implementation of [`Partitioner::calculate_partition_id()`].
 ///
 /// [^note]: [Website docs on how Iggy organizes data.](https://iggy.apache.org/docs/#how-iggy-organizes-data)
 #[serde_as]
