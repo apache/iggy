@@ -888,6 +888,20 @@ impl ConsensusHeader for PrepareHeader {
 /// Verification skips such entries so an older build's WAL still replays.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
+/// The frame's body, bounded by `size`. What `checksum_body` covers.
+///
+/// Not `&frame[HEADER_SIZE..]`: `Message::try_from` accepts a buffer longer than
+/// `size` without trimming, while the WAL scan reads exactly `size`, so slicing to
+/// the end makes the two disagree. Empty when `size` overruns the buffer.
+#[must_use]
+pub fn frame_body(frame: &[u8], size: u32) -> &[u8] {
+    let end = size as usize;
+    if end <= HEADER_SIZE || end > frame.len() {
+        return &[];
+    }
+    &frame[HEADER_SIZE..end]
+}
+
 impl PrepareHeader {
     /// Which prepare this is, independent of which view re-sent it.
     ///

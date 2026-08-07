@@ -49,7 +49,7 @@ use crate::responses::{
 use crate::session_manager::SessionManager;
 use crate::snapshot;
 use crate::users::maybe_rewrite_user_password_request;
-use crate::wire::{request_body, usize_to_u32};
+use crate::wire::{request_body, usize_to_u32, verify_request_checksum};
 use bytes::Bytes;
 use configs::server_ng::NgSystemConfig;
 use consensus::{
@@ -860,6 +860,37 @@ async fn handle_client_request<B, MJ, S, SB>(
             return;
         }
     };
+
+    // The last point that still sees the body the CLIENT sent; every rewrite below
+    // substitutes server-chosen bytes and carries the stamp through unchanged.
+    if let Err(error) = verify_request_checksum(&request) {
+        warn!(
+            transport_client_id,
+            operation = ?request.header().operation,
+            request = request.header().request,
+            "dropping client request whose body does not match its own checksum"
+        );
+        let commit = current_metadata_commit(shard);
+        let reply = build_deny_reply(
+            request.header(),
+            transport_client_id,
+            0,
+            commit,
+            error.as_code(),
+        );
+        if let Err(send_error) = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await
+        {
+            warn!(
+                transport_client_id,
+                error = %send_error,
+                "failed to send request-checksum deny reply"
+            );
+        }
+        return;
+    }
 
     ensure_transport_connection(shard, sessions, transport_client_id);
 

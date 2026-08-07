@@ -1056,10 +1056,7 @@ where
         // corrupted between primary and backup is journaled as-is and re-served to
         // peers, which the interior-corruption boot refusal turns into an unbootable
         // node on the next restart.
-        if let Err(reason) = verify_prepare_integrity(
-            &header,
-            &message.as_slice()[std::mem::size_of::<PrepareHeader>()..],
-        ) {
+        if let Err(reason) = verify_prepare_integrity(&header, message.as_slice()) {
             warn!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",

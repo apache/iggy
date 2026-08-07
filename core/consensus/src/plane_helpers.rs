@@ -21,7 +21,7 @@ use crate::{
 };
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
-    RequestHeader,
+    RequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
 use server_common::{Message, iobuf::Owned};
@@ -125,18 +125,22 @@ where
 /// bytes it arrived with, so a corrupted frame is admitted whenever its flipped
 /// value satisfies those comparisons, then journaled and re-served to peers.
 ///
-/// `body` is the frame past the header, empty for a header-only prepare.
-/// [`CHECKSUM_UNSEALED`] skips the partition plane, which seals neither and
-/// carries a verified `batch_checksum` over the same bytes.
+/// `frame` is the whole message. The body range comes from [`frame_body`], not the
+/// caller, so no ingress point can verify a different span than the producer sealed.
+/// [`CHECKSUM_UNSEALED`] skips the partition plane, which carries `batch_checksum`
+/// over the same bytes instead.
 ///
 /// # Errors
 /// Returns a static description of which field failed.
-pub fn verify_prepare_integrity(header: &PrepareHeader, body: &[u8]) -> Result<(), &'static str> {
+pub fn verify_prepare_integrity(header: &PrepareHeader, frame: &[u8]) -> Result<(), &'static str> {
     if header.checksum != CHECKSUM_UNSEALED && header.identity_checksum() != header.checksum {
         return Err("prepare header does not match its own checksum");
     }
     if header.checksum_body != 0
-        && u128::from(iggy_common::calculate_checksum(body)) != header.checksum_body
+        && u128::from(iggy_common::calculate_checksum(frame_body(
+            frame,
+            header.size,
+        ))) != header.checksum_body
     {
         return Err("prepare body does not match its checksum");
     }
@@ -1237,16 +1241,60 @@ mod tests {
         assert_eq!(verify_prepare_integrity(&header, &[]), Ok(()));
     }
 
+    /// A frame carrying `body`, with `size` covering exactly header + body and
+    /// `checksum_body` sealed over it, as the metadata projection does.
+    fn sealed_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; size_of::<PrepareHeader>() + body.len()];
+        frame[size_of::<PrepareHeader>()..].copy_from_slice(body);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut frame[..size_of::<PrepareHeader>()],
+        );
+        header.command = Command2::Prepare;
+        header.op = 7;
+        header.size = u32::try_from(size_of::<PrepareHeader>() + body.len()).expect("fits u32");
+        header.checksum_body = u128::from(calculate_checksum(body));
+        frame
+    }
+
     #[test]
     fn given_a_prepare_whose_body_was_altered_when_verifying_should_reject() {
-        let mut header = PrepareHeader {
-            command: Command2::Prepare,
-            op: 7,
-            ..Default::default()
-        };
-        header.checksum_body = u128::from(calculate_checksum(b"body"));
-        assert_eq!(verify_prepare_integrity(&header, b"body"), Ok(()));
-        assert!(verify_prepare_integrity(&header, b"bodY").is_err());
+        let frame = sealed_frame(b"body");
+        let header =
+            *bytemuck::checked::from_bytes::<PrepareHeader>(&frame[..size_of::<PrepareHeader>()]);
+        assert_eq!(verify_prepare_integrity(&header, &frame), Ok(()));
+
+        let mut altered = frame;
+        *altered.last_mut().expect("the frame carries a body") ^= 1;
+        assert!(verify_prepare_integrity(&header, &altered).is_err());
+    }
+
+    #[test]
+    fn given_bytes_past_the_frame_size_when_verifying_should_ignore_them() {
+        // `try_from` accepts a buffer longer than `size` without trimming; hashing to
+        // the end would reject a correctly sealed prepare and disagree with the WAL scan.
+        let frame = sealed_frame(b"body");
+        let header =
+            *bytemuck::checked::from_bytes::<PrepareHeader>(&frame[..size_of::<PrepareHeader>()]);
+
+        let mut padded = frame;
+        padded.extend_from_slice(b"trailing garbage");
+        assert_eq!(
+            verify_prepare_integrity(&header, &padded),
+            Ok(()),
+            "only the bytes `size` covers are the body"
+        );
+    }
+
+    #[test]
+    fn given_a_size_that_overruns_the_buffer_when_verifying_should_reject() {
+        // Truncated frame, header still claims the full length: the body it names is
+        // not there to hash.
+        let frame = sealed_frame(b"body");
+        let header =
+            *bytemuck::checked::from_bytes::<PrepareHeader>(&frame[..size_of::<PrepareHeader>()]);
+
+        let truncated = &frame[..frame.len() - 1];
+        assert!(verify_prepare_integrity(&header, truncated).is_err());
     }
 
     #[test]

@@ -29,6 +29,7 @@ use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RequestHeader, RequestStartViewHeader, StartViewChangeHeader, StartViewHeader,
+    frame_body,
 };
 use iggy_common::IggyTimestamp;
 use iggy_common::calculate_checksum;
@@ -3490,10 +3491,14 @@ where
         // to the view-change merge. Closing that wants `checksum_body` here to BE
         // the batch checksum, recomputed after stamping, so `checksum` covers the
         // body for free by hashing this field.
+        //
+        // Bounded by `size`, the range every verifier re-reads; the prepare
+        // inherits it verbatim below.
         let checksum_body = if consensus.namespace == METADATA_CONSENSUS_NAMESPACE {
-            u128::from(calculate_checksum(
-                &self.as_slice()[size_of::<PrepareHeader>()..],
-            ))
+            u128::from(calculate_checksum(frame_body(
+                self.as_slice(),
+                self.header().size,
+            )))
         } else {
             0
         };

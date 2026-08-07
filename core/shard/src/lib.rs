@@ -4062,9 +4062,7 @@ where
             // Recompute both integrity fields before durable storage: everything
             // above treats `header.checksum` as an opaque token, so a corrupted
             // frame passes whenever its flipped value satisfies the comparisons.
-            if let Err(reason) =
-                verify_prepare_integrity(&header, &msg.as_slice()[size_of::<PrepareHeader>()..])
-            {
+            if let Err(reason) = verify_prepare_integrity(&header, msg.as_slice()) {
                 tracing::warn!(
                     shard = self.id,
                     op = header.op,
@@ -4133,9 +4131,7 @@ where
         // The partition arm reaches the WAL via `apply_repaired_prepare` with no
         // view fence and no ack, so this is its only integrity gate. Without it a
         // repaired partition prepare is journaled on the serving peer's word alone.
-        if let Err(reason) =
-            verify_prepare_integrity(&header, &msg.as_slice()[size_of::<PrepareHeader>()..])
-        {
+        if let Err(reason) = verify_prepare_integrity(&header, msg.as_slice()) {
             tracing::warn!(
                 shard = self.id,
                 op = header.op,

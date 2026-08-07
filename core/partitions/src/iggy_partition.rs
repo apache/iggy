@@ -2102,10 +2102,7 @@ where
         // Same reason as the metadata plane: `checksum` is compared as an opaque token
         // downstream, so a corrupted frame passes whenever its flipped value satisfies
         // those comparisons.
-        if let Err(reason) = verify_prepare_integrity(
-            &header,
-            &message.as_slice()[std::mem::size_of::<PrepareHeader>()..],
-        ) {
+        if let Err(reason) = verify_prepare_integrity(&header, message.as_slice()) {
             emit_partition_diag(
                 tracing::Level::WARN,
                 &PartitionDiagEvent::new(

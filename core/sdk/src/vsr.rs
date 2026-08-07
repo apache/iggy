@@ -38,7 +38,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
-use iggy_common::{IggyError, eviction_reason_to_error};
+use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -142,6 +142,12 @@ pub(crate) fn encode_request_header(
         request: request_id,
         session: session_id,
         namespace,
+        // Lets the server's client table tell a genuine retry from a `request`
+        // number reused for different arguments. Zero means unstamped, which is what
+        // an SDK predating this sends. A server that rewrites the body (PAT,
+        // password) carries this through untouched, so it keeps describing what the
+        // client sent.
+        request_checksum: u128::from(calculate_checksum(payload)),
         // Zeroed: the field is "informational" -- the server copies it into
         // `ReplyHeader.timestamp` for RTT but nothing else reads it. Paying
         // a `clock_gettime` syscall per encoded request (formerly held the
