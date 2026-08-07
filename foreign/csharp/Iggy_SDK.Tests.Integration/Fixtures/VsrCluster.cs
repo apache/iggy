@@ -18,6 +18,7 @@
 using System.Net;
 using System.Net.Sockets;
 using Apache.Iggy.Tests.Integrations.Helpers;
+using Docker.DotNet;
 using Docker.DotNet.Models;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
@@ -26,180 +27,102 @@ using DotNet.Testcontainers.Networks;
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 /// <summary>
-///     The iggy-server-ng cluster a run scoped to that server uses. A single node commits with a quorum of
-///     one, so it would exercise the wire protocol without ever replicating; a real roster puts every test
-///     through consensus instead.
+///     The iggy-server-ng deployment a run scoped to that server uses. A single node runs with
+///     clustering disabled, exercising the wire protocol without replication; two or more nodes form
+///     a real roster that puts every test through consensus.
 /// </summary>
 internal sealed class VsrCluster : IAsyncDisposable
 {
-    private const int NodeCount = 3;
     private const string ClusterName = "test-vsr-cluster";
 
-    // Host-port pool, partitioned per .NET major so parallel `dotnet test` processes (net8.0 + net10.0)
-    // never race docker's allocator, and split in half per cluster instance:
-    //   net8.0  - 29800..29849 (instance 0), 29850..29899 (instance 1)
-    //   net10.0 - 30000..30049 (instance 0), 30050..30099 (instance 1)
-    // Fifteen ports per cluster (five transports x three nodes) fit a half.
-    private const ushort PortRangeSize = 100;
+    // TCP and HTTP get real host ports on every node: a view change can make any replica the
+    // primary clients are redirected to, so every advertised 127.0.0.1:port must be dialable from
+    // the host. QUIC/WebSocket/replica listeners are reachable only on the cluster network and get
+    // base + node. The offset is not for the network (each node has its own IP there) but because
+    // the server rejects a roster where two advertised endpoints collide.
+    private const ushort InternalQuicPortBase = 8200;
+    private const ushort InternalWebSocketPortBase = 8300;
+    private const ushort InternalReplicaPortBase = 8400;
 
+    // Host-port pool, partitioned per .NET major so the parallel `dotnet test` processes
+    // (net8.0 -> 29800..29949, net10.0 -> 30000..30149) never race each other for a port.
     private static readonly ushort BasePort = (ushort)(29000 + Environment.Version.Major * 100);
-    private static readonly ushort EndPort = (ushort)(BasePort + PortRangeSize);
-    private readonly IContainer[] _containers = new IContainer[NodeCount];
-    private readonly ushort[] _httpPorts = new ushort[NodeCount];
-    private readonly INetwork _network;
+    private static readonly ushort EndPort = (ushort)(BasePort + 150);
 
-    private readonly List<TcpListener> _portReservations = [];
+    // A reserved port is released before its container binds it, so another cluster in this process
+    // could scan onto it in that window. Ports stay claimed for the process lifetime to close it.
+    private static readonly HashSet<ushort> ClaimedPorts = [];
 
-    // Roster peers dial each other by literal IP - the ip field is parsed, not resolved - so the containers
-    // need addresses known before they start. The third octet is per TFM and per cluster instance, keeping
-    // the two `dotnet test` processes and the plain/TLS clusters inside one process off each other's
-    // network. TFM majors in use (8, 10) leave the odd octets free for instance 1.
-    private readonly int _subnetOctet;
-    private readonly ushort _portScanStart;
-    private readonly ushort[] _tcpPorts = new ushort[NodeCount];
+    private readonly IContainer?[] _containers;
+    private readonly IReadOnlyDictionary<string, string>? _extraEnvironment;
+    private readonly string _idSuffix;
+    private readonly string _image;
+    private readonly string _name;
+    private readonly INetwork? _network;
+    private readonly int _nodeCount;
+    private readonly NodePorts[] _ports;
+    private readonly IReadOnlyList<ResourceMapping>? _resourceMappings;
+    private readonly bool _traceLogs;
+
+    /// <summary>Replica 0 - primary of the initial view, and the node the tests talk to.</summary>
+    public string LeaderTcpAddress => $"127.0.0.1:{_ports[0].Tcp}";
+
+    /// <summary>The same node's REST surface, which serves classic framing rather than VSR.</summary>
+    public string LeaderHttpAddress => $"http://127.0.0.1:{_ports[0].Http}";
+
+    /// <summary>A backup of the initial view, so a client dialing it gets redirected to the primary.</summary>
+    public string FollowerTcpAddress => ClusterEnabled
+        ? $"127.0.0.1:{_ports[1].Tcp}"
+        : throw new InvalidOperationException(
+            "A follower address requires a cluster; set IGGY_TEST_CLUSTER_NODES to 2 or more.");
+
+    /// <summary>The same backup node's REST surface.</summary>
+    public string FollowerHttpAddress => ClusterEnabled
+        ? $"http://127.0.0.1:{_ports[1].Http}"
+        : throw new InvalidOperationException(
+            "A follower address requires a cluster; set IGGY_TEST_CLUSTER_NODES to 2 or more.");
+
+    private bool ClusterEnabled => _nodeCount > 1;
 
     private static string? LogDirectory =>
         Environment.GetEnvironmentVariable("IGGY_TEST_LOGS_DIR");
 
-    /// <summary>Replica 0 - primary of the initial view, and the node the tests talk to.</summary>
-    public string LeaderTcpAddress => $"127.0.0.1:{_tcpPorts[0]}";
-
-    /// <summary>The same node's REST surface, which serves classic framing rather than VSR.</summary>
-    public string LeaderHttpAddress => $"http://127.0.0.1:{_httpPorts[0]}";
-
-    /// <summary>A backup of the initial view, so a client dialing it gets redirected to the primary.</summary>
-    public string FollowerTcpAddress => $"127.0.0.1:{_tcpPorts[1]}";
-
     /// <summary>
-    ///     <paramref name="instance" /> isolates a second cluster in the same process (the TLS one) from the
-    ///     first: each instance scans its own half of the port pool and lives on its own subnet.
-    ///     <paramref name="extraEnvironment" /> wins over the base configuration, and
-    ///     <paramref name="resourceMappings" /> are mounted into every node.
+    ///     <paramref name="nodeCount" /> of 1 starts a standalone node with clustering disabled, higher
+    ///     values a cluster with that many replicas. <paramref name="name" /> labels the containers and
+    ///     network after the owning fixture. <paramref name="extraEnvironment" /> wins over the
+    ///     base configuration, and <paramref name="resourceMappings" /> are mounted into every node.
     /// </summary>
-    public VsrCluster(string image, string idSuffix, bool traceLogs,
+    public VsrCluster(string image, string name, string idSuffix, bool traceLogs, int nodeCount,
         IReadOnlyDictionary<string, string>? extraEnvironment = null,
-        IReadOnlyList<ResourceMapping>? resourceMappings = null, int instance = 0)
+        IReadOnlyList<ResourceMapping>? resourceMappings = null)
     {
-        _subnetOctet = Environment.Version.Major + instance;
-        _portScanStart = (ushort)(BasePort + instance * (PortRangeSize / 2));
-        var quicPorts = new ushort[NodeCount];
-        var websocketPorts = new ushort[NodeCount];
-        var replicaPorts = new ushort[NodeCount];
-
-        try
-        {
-            for (var node = 0; node < NodeCount; node++)
-            {
-                _tcpPorts[node] = ReservePort();
-                _httpPorts[node] = ReservePort();
-                quicPorts[node] = ReservePort();
-                websocketPorts[node] = ReservePort();
-                replicaPorts[node] = ReservePort();
-            }
-        }
-        finally
-        {
-            ReleaseReservedPorts();
-        }
-
-        var networkName = $"iggy-vsr-{idSuffix}";
-        _network = new NetworkBuilder()
-            .WithName(networkName)
-            .WithCreateParameterModifier(parameters => parameters.IPAM = new IPAM
-            {
-                Config =
-                [
-                    new IPAMConfig
-                    {
-                        Subnet = $"172.30.{_subnetOctet}.0/24",
-                        Gateway = $"172.30.{_subnetOctet}.1"
-                    }
-                ]
-            })
-            .Build();
-
-        var roster = new Dictionary<string, string>
-        {
-            ["IGGY_CLUSTER_ENABLED"] = "true",
-            ["IGGY_CLUSTER_NAME"] = ClusterName,
-            ["IGGY_MESSAGE_BUS_RECONNECT_PERIOD"] = "100ms"
-        };
-
-        for (var node = 0; node < NodeCount; node++)
-        {
-            roster[$"IGGY_CLUSTER_NODES_{node}_NAME"] = $"vsr-node-{node}";
-            roster[$"IGGY_CLUSTER_NODES_{node}_IP"] = NodeAddress(node);
-            roster[$"IGGY_CLUSTER_NODES_{node}_ADVERTISED_ADDRESS"] = "127.0.0.1";
-            roster[$"IGGY_CLUSTER_NODES_{node}_REPLICA_ID"] = node.ToString();
-            roster[$"IGGY_CLUSTER_NODES_{node}_PORTS_TCP"] = _tcpPorts[node].ToString();
-            roster[$"IGGY_CLUSTER_NODES_{node}_PORTS_HTTP"] = _httpPorts[node].ToString();
-            roster[$"IGGY_CLUSTER_NODES_{node}_PORTS_QUIC"] = quicPorts[node].ToString();
-            roster[$"IGGY_CLUSTER_NODES_{node}_PORTS_WEBSOCKET"] = websocketPorts[node].ToString();
-            roster[$"IGGY_CLUSTER_NODES_{node}_PORTS_TCP_REPLICA"] = replicaPorts[node].ToString();
-        }
-
-        for (var node = 0; node < NodeCount; node++)
-        {
-            var address = NodeAddress(node);
-            var builder = new ContainerBuilder(image)
-                .WithName($"iggy-vsr-{node}-{idSuffix}")
-                .WithCommand("--replica-id", node.ToString())
-                .WithNetwork(_network)
-                .WithNetworkAliases($"vsr-node-{node}")
-                .WithCreateParameterModifier(parameters => AssignStaticAddress(parameters, networkName, address))
-                // Host binding mirrors the container port so the loopback address advertised in cluster
-                // metadata resolves to the node that advertised it.
-                .WithPortBinding(_tcpPorts[node].ToString(), _tcpPorts[node].ToString())
-                .WithPortBinding(_httpPorts[node].ToString(), _httpPorts[node].ToString())
-                .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
-                .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
-                .WithEnvironment("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", "10m")
-                .WithEnvironment("IGGY_SYSTEM_PATH", $"local_data_vsr_{node}")
-                .WithEnvironment("IGGY_TCP_ADDRESS", $"0.0.0.0:{_tcpPorts[node]}")
-                .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{_httpPorts[node]}")
-                .WithEnvironment("IGGY_QUIC_ADDRESS", $"0.0.0.0:{quicPorts[node]}")
-                .WithEnvironment("IGGY_WEBSOCKET_ADDRESS", $"0.0.0.0:{websocketPorts[node]}")
-                .WithEnvironment(roster)
-                .WithPrivileged(true)
-                .WithCleanUp(true)
-                .WithWaitStrategy(Wait.ForUnixContainer()
-                    .UntilInternalTcpPortIsAvailable(_tcpPorts[node])
-                    .UntilInternalTcpPortIsAvailable(_httpPorts[node]));
-
-            if (traceLogs)
-            {
-                builder = builder
-                    .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
-                    .WithEnvironment("RUST_LOG", "trace");
-            }
-
-            if (extraEnvironment != null)
-            {
-                foreach (var (key, value) in extraEnvironment)
-                {
-                    builder = builder.WithEnvironment(key, value);
-                }
-            }
-
-            if (resourceMappings != null)
-            {
-                foreach (var mapping in resourceMappings)
-                {
-                    builder = builder.WithResourceMapping(mapping.Source, mapping.Destination);
-                }
-            }
-
-            _containers[node] = builder.Build();
-        }
+        _image = image;
+        _name = name;
+        _idSuffix = idSuffix;
+        _traceLogs = traceLogs;
+        _extraEnvironment = extraEnvironment;
+        _resourceMappings = resourceMappings;
+        _nodeCount = nodeCount;
+        _ports = ReservePorts(_nodeCount);
+        _network = ClusterEnabled
+            ? new NetworkBuilder().WithName($"iggy-vsr-{name}-{idSuffix}").Build()
+            : null;
+        _containers = new IContainer[_nodeCount];
     }
 
     public async ValueTask DisposeAsync()
     {
-        for (var node = 0; node < NodeCount; node++)
+        for (var node = 0; node < _nodeCount; node++)
         {
+            if (_containers[node] == null)
+            {
+                continue;
+            }
+
             try
             {
-                await SaveContainerLogsAsync(_containers[node], $"iggy-server-ng-{node}");
+                await SaveContainerLogsAsync(_containers[node]!, $"iggy-server-ng-{node}");
             }
             catch (Exception e)
             {
@@ -209,6 +132,11 @@ internal sealed class VsrCluster : IAsyncDisposable
 
         foreach (var container in _containers)
         {
+            if (container == null)
+            {
+                continue;
+            }
+
             try
             {
                 await container.DisposeAsync();
@@ -219,21 +147,156 @@ internal sealed class VsrCluster : IAsyncDisposable
             }
         }
 
-        try
+        if (_network != null)
         {
-            await _network.DeleteAsync();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"Failed to delete the iggy-server-ng network: {e}");
+            try
+            {
+                await _network.DeleteAsync();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Failed to delete the iggy-server-ng network: {e}");
+            }
         }
     }
 
+    /// <summary>
+    ///     The containers are built here rather than in the constructor because a roster needs every
+    ///     node's IP before any node starts, and those IPs come from the subnet Docker assigns when
+    ///     it creates the network.
+    /// </summary>
     public async Task StartAsync()
     {
-        await _network.CreateAsync();
-        // A two-node roster needs both replicas for a quorum, so nothing commits until the pair is up.
-        await Task.WhenAll(_containers.Select(container => container.StartAsync()));
+        var nodeAddresses = Array.Empty<string>();
+        if (_network != null)
+        {
+            await _network.CreateAsync();
+            nodeAddresses = await ResolveNodeAddressesAsync();
+        }
+
+        Dictionary<string, string> clusterEnvironment = BuildClusterEnvironment(nodeAddresses);
+        for (var node = 0; node < _nodeCount; node++)
+        {
+            _containers[node] = BuildNodeContainer(node, nodeAddresses, clusterEnvironment);
+        }
+
+        // A multi-node roster needs a quorum of replicas, so nothing commits until enough nodes are up.
+        await Task.WhenAll(_containers.Select(container => container!.StartAsync()));
+    }
+
+    /// <summary>
+    ///     Roster peers dial each other by literal IP - the ip field is parsed, not resolved - so every
+    ///     address must be known before any container starts. Docker picked the subnet when it created
+    ///     the network (guaranteeing no overlap with any other network on the host), so the addresses
+    ///     are read back from it instead of being managed by hand.
+    /// </summary>
+    private async Task<string[]> ResolveNodeAddressesAsync()
+    {
+        using var dockerClient = new DockerClientBuilder().Build();
+        var network = await dockerClient.Networks.InspectNetworkAsync(_network!.Name);
+        var subnet = IPAddress.Parse(network.IPAM.Config[0].Subnet.Split('/')[0]).GetAddressBytes();
+
+        // The gateway takes .1, so node addresses start at .10.
+        return Enumerable.Range(0, _nodeCount)
+            .Select(node => $"{subnet[0]}.{subnet[1]}.{subnet[2]}.{10 + node}")
+            .ToArray();
+    }
+
+    private IContainer BuildNodeContainer(int node, IReadOnlyList<string> nodeAddresses,
+        IReadOnlyDictionary<string, string> clusterEnvironment)
+    {
+        var ports = _ports[node];
+        var builder = new ContainerBuilder(_image)
+            .WithName($"iggy-vsr-{_name}-{node}-{_idSuffix}")
+            .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
+            .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
+            .WithEnvironment("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", "10m")
+            .WithEnvironment("IGGY_SYSTEM_PATH", $"local_data_vsr_{node}")
+            .WithEnvironment("IGGY_TCP_ADDRESS", $"0.0.0.0:{ports.Tcp}")
+            .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{ports.Http}")
+            .WithEnvironment("IGGY_QUIC_ADDRESS", $"0.0.0.0:{ports.Quic}")
+            .WithEnvironment("IGGY_WEBSOCKET_ADDRESS", $"0.0.0.0:{ports.WebSocket}")
+            .WithEnvironment(clusterEnvironment)
+            .WithPrivileged(true)
+            .WithCleanUp(true)
+            .WithWaitStrategy(Wait.ForUnixContainer()
+                .UntilInternalTcpPortIsAvailable(ports.Tcp)
+                .UntilInternalTcpPortIsAvailable(ports.Http));
+
+        // Host bindings mirror the container port so the loopback address advertised in cluster
+        // metadata resolves to the node that advertised it. Every node needs one: view changes
+        // can make any replica the primary clients get redirected to.
+        builder = builder
+            .WithPortBinding(ports.Tcp.ToString(), ports.Tcp.ToString())
+            .WithPortBinding(ports.Http.ToString(), ports.Http.ToString());
+
+        if (ClusterEnabled)
+        {
+            var address = nodeAddresses[node];
+            builder = builder
+                .WithCommand("--replica-id", node.ToString())
+                .WithNetwork(_network)
+                .WithNetworkAliases($"vsr-node-{node}")
+                .WithCreateParameterModifier(parameters =>
+                    AssignStaticAddress(parameters, _network!.Name, address));
+        }
+
+        if (_traceLogs)
+        {
+            builder = builder
+                .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
+                .WithEnvironment("RUST_LOG", "trace");
+        }
+
+        if (_extraEnvironment != null)
+        {
+            foreach (var (key, value) in _extraEnvironment)
+            {
+                builder = builder.WithEnvironment(key, value);
+            }
+        }
+
+        if (_resourceMappings != null)
+        {
+            foreach (var mapping in _resourceMappings)
+            {
+                builder = builder.WithResourceMapping(mapping.Source, mapping.Destination);
+            }
+        }
+
+        return builder.Build();
+    }
+
+    private Dictionary<string, string> BuildClusterEnvironment(IReadOnlyList<string> nodeAddresses)
+    {
+        var environment = new Dictionary<string, string>
+        {
+            ["IGGY_CLUSTER_ENABLED"] = ClusterEnabled ? "true" : "false"
+        };
+
+        if (!ClusterEnabled)
+        {
+            return environment;
+        }
+
+        environment["IGGY_CLUSTER_NAME"] = ClusterName;
+        environment["IGGY_MESSAGE_BUS_RECONNECT_PERIOD"] = "100ms";
+
+        for (var node = 0; node < _nodeCount; node++)
+        {
+            var ports = _ports[node];
+            environment[$"IGGY_CLUSTER_NODES_{node}_NAME"] = $"vsr-node-{node}";
+            environment[$"IGGY_CLUSTER_NODES_{node}_IP"] = nodeAddresses[node];
+            environment[$"IGGY_CLUSTER_NODES_{node}_ADVERTISED_ADDRESS"] = "127.0.0.1";
+            environment[$"IGGY_CLUSTER_NODES_{node}_REPLICA_ID"] = node.ToString();
+            environment[$"IGGY_CLUSTER_NODES_{node}_PORTS_TCP"] = ports.Tcp.ToString();
+            environment[$"IGGY_CLUSTER_NODES_{node}_PORTS_HTTP"] = ports.Http.ToString();
+            environment[$"IGGY_CLUSTER_NODES_{node}_PORTS_QUIC"] = ports.Quic.ToString();
+            environment[$"IGGY_CLUSTER_NODES_{node}_PORTS_WEBSOCKET"] = ports.WebSocket.ToString();
+            environment[$"IGGY_CLUSTER_NODES_{node}_PORTS_TCP_REPLICA"] = ports.Replica.ToString();
+        }
+
+        return environment;
     }
 
     /// <summary>
@@ -255,40 +318,64 @@ internal sealed class VsrCluster : IAsyncDisposable
         endpoint.IPAMConfig = new EndpointIPAMConfig { IPv4Address = address };
     }
 
-    private string NodeAddress(int node)
+    /// <summary>
+    ///     Finds free host ports for the host-dialed endpoints by briefly binding them, so concurrent
+    ///     clusters cannot pick the same port. The listeners are released before the containers start.
+    /// </summary>
+    private static NodePorts[] ReservePorts(int nodeCount)
     {
-        return $"172.30.{_subnetOctet}.{10 + node}";
+        var reservations = new List<TcpListener>();
+        try
+        {
+            var ports = new NodePorts[nodeCount];
+            for (var node = 0; node < nodeCount; node++)
+            {
+                ports[node] = new NodePorts(ReservePort(reservations),
+                    ReservePort(reservations),
+                    (ushort)(InternalQuicPortBase + node),
+                    (ushort)(InternalWebSocketPortBase + node),
+                    (ushort)(InternalReplicaPortBase + node));
+            }
+
+            return ports;
+        }
+        finally
+        {
+            foreach (var listener in reservations)
+            {
+                listener.Stop();
+            }
+        }
     }
 
-    private ushort ReservePort()
+    private static ushort ReservePort(List<TcpListener> reservations)
     {
-        for (var candidate = _portScanStart; candidate < EndPort; candidate++)
+        lock (ClaimedPorts)
         {
-            try
+            for (var candidate = BasePort; candidate < EndPort; candidate++)
             {
-                var listener = new TcpListener(IPAddress.Loopback, candidate);
-                listener.Start();
-                _portReservations.Add(listener);
-                return candidate;
-            }
-            catch (SocketException)
-            {
-                // Held by an earlier ReservePort() in this cluster, or by something else on the host.
+                if (ClaimedPorts.Contains(candidate))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var listener = new TcpListener(IPAddress.Loopback, candidate);
+                    listener.Start();
+                    reservations.Add(listener);
+                    ClaimedPorts.Add(candidate);
+                    return candidate;
+                }
+                catch (SocketException)
+                {
+                    // Held by something else on the host.
+                }
             }
         }
 
         throw new InvalidOperationException(
             $"No free ports available in [{BasePort}, {EndPort}) for .NET {Environment.Version.Major}.x.");
-    }
-
-    private void ReleaseReservedPorts()
-    {
-        foreach (var listener in _portReservations)
-        {
-            listener.Stop();
-        }
-
-        _portReservations.Clear();
     }
 
     private static async Task SaveContainerLogsAsync(IContainer container, string role)
@@ -326,4 +413,10 @@ internal sealed class VsrCluster : IAsyncDisposable
             Console.WriteLine($"Failed to save {role} container logs: {ex.Message}");
         }
     }
+
+    /// <summary>
+    ///     The ports one node listens on. The leader's and first follower's TCP/HTTP are host ports
+    ///     mirrored into the container; the rest are the fixed cluster-network ports.
+    /// </summary>
+    private readonly record struct NodePorts(ushort Tcp, ushort Http, ushort Quic, ushort WebSocket, ushort Replica);
 }

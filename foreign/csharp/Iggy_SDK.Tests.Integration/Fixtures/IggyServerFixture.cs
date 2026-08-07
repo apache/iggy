@@ -26,8 +26,9 @@ using TUnit.Core.Interfaces;
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 /// <summary>
-///     Runs the suite against an iggy-server-ng <see cref="VsrCluster" />, so every test commits through
-///     real replication. The SDK frames TCP with the VSR wire protocol, which only server-ng speaks.
+///     Runs the suite against an iggy-server-ng <see cref="VsrCluster" />: a standalone node by default,
+///     or a replicated cluster when IGGY_TEST_CLUSTER_NODES asks for one, so every test commits through
+///     consensus. The SDK frames TCP with the VSR wire protocol, which only server-ng speaks.
 /// </summary>
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
@@ -43,6 +44,12 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     /// </summary>
     protected virtual string DockerImage =>
         Environment.GetEnvironmentVariable("IGGY_SERVER_NG_DOCKER_IMAGE") ?? "iggy-server-ng:test";
+
+    /// <summary>
+    ///     Names the containers and network of this fixture's cluster, so a `docker ps` during a run
+    ///     shows which fixture owns which node.
+    /// </summary>
+    protected virtual string ClusterName => "general";
 
     /// <summary>
     ///     Enables iggy server trace logs.
@@ -61,10 +68,15 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected virtual ResourceMapping[] ResourceMappings => [];
 
     /// <summary>
-    ///     Cluster instance slot; a subclass running its own cluster next to the default one (the TLS
-    ///     fixture) claims slot 1 so the two never share ports or a subnet.
+    ///     Cluster size, mirroring the Rust integration harness knob of the same name: the
+    ///     IGGY_TEST_CLUSTER_NODES environment variable decides (default 1, a standalone node with
+    ///     clustering disabled; 2 or more, a replicated cluster). A subclass can pin its own size
+    ///     instead, the way the redirection cluster stays three nodes whatever the knob says.
     /// </summary>
-    protected virtual int ClusterInstance => 0;
+    protected virtual int NodeCount =>
+        int.TryParse(Environment.GetEnvironmentVariable("IGGY_TEST_CLUSTER_NODES"), out var count) && count >= 1
+            ? count
+            : 3;
 
     public async ValueTask DisposeAsync()
     {
@@ -166,9 +178,20 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         {
             if (_cluster == null)
             {
-                var cluster = new VsrCluster(DockerImage, _containerId, EnabledServerTraceLogs,
-                    EnvironmentVariables, ResourceMappings, ClusterInstance);
-                await cluster.StartAsync();
+                var cluster = new VsrCluster(DockerImage, ClusterName, _containerId,
+                    EnabledServerTraceLogs, NodeCount, EnvironmentVariables, ResourceMappings);
+                try
+                {
+                    await cluster.StartAsync();
+                }
+                catch
+                {
+                    // A later retry rebuilds the cluster under the same name, so a half-started one
+                    // must not leave its network or containers behind.
+                    await cluster.DisposeAsync();
+                    throw;
+                }
+
                 _cluster = cluster;
             }
 

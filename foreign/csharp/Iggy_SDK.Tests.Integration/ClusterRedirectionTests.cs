@@ -26,8 +26,8 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class ClusterRedirectionTests
 {
-    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
-    public required IggyServerFixture Fixture { get; init; }
+    [ClassDataSource<RedirectionClusterFixture>(Shared = SharedType.PerAssembly)]
+    public required RedirectionClusterFixture Fixture { get; init; }
 
     [Test]
     public async Task ConnectToFollower_Should_ReturnClusterMetadataWithAllNodes()

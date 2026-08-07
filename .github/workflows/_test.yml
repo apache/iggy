@@ -197,7 +197,7 @@ jobs:
           override_pr: ${{ github.event.pull_request.number }}
 
       - name: Upload C# coverage to Codecov
-        if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || inputs.task == 'e2e-vsr')
+        if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || inputs.task == 'e2e')
         uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
