@@ -160,7 +160,9 @@ readonly EXAMPLES_STOP_TIMEOUT=5
 
 # Resolve and validate the server binary path.
 # Usage: resolve_server_binary [target] [binary_name] [cargo_features]
-# Sets global SERVER_BIN.
+# Sets global SERVER_BIN. binary_name defaults to iggy-server; vsr lanes
+# pass their server binary and the vsr feature (so the wire protocol
+# matches vsr-built clients).
 function resolve_server_binary() {
     local target="${1:-}"
     local binary="${2:-iggy-server}"
@@ -240,8 +242,9 @@ function start_tls_server() {
 }
 
 # How wait_for_server_ready decides the server is up. "log" greps the startup
-# line. "tcp" polls the listener instead, which is what a lane running the VSR
-# server needs: it prints no such line.
+# lines: the legacy "has started" and the VSR server "client listeners
+# started" (logged once the TCP socket is bound). "tcp" polls the listener
+# instead for lanes that cannot rely on a startup line.
 : "${SERVER_READY_PROBE:=log}"
 : "${SERVER_READY_ADDRESS:=127.0.0.1:8090}"
 
@@ -254,7 +257,7 @@ function server_is_ready() {
         exec 3<&-
         return 0
     fi
-    grep -q "has started" "${EXAMPLES_LOG_FILE}"
+    grep -qE "has started|client listeners started" "${EXAMPLES_LOG_FILE}"
 }
 
 # Report whether the server this script started is still running.

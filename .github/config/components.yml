@@ -370,7 +370,7 @@ components:
     paths:
       - "bdd/node/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-node"]
+    tasks: ["bdd-node", "bdd-node-vsr"]
 
   bdd-csharp:
     depends_on:

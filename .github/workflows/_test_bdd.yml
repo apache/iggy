@@ -53,10 +53,11 @@ jobs:
         run: |
           # The VSR lanes need the vsr feature on both the server and the CLI,
           # otherwise the CLI cannot frame requests for the VSR wire protocol
-          # and the healthcheck ping fails. The Go SDK speaks only VSR, so its
-          # suites are always on this branch.
+          # and the healthcheck ping fails. The Go SDK speaks only VSR and the
+          # Python wheels are vsr-built, so those suites are always on this
+          # branch.
           case "${{ inputs.task }}" in
-          bdd-rust-vsr|bdd-go|bdd-go-race)
+          bdd-rust-vsr|bdd-go|bdd-go-race|bdd-python|bdd-node-vsr)
             # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"
             echo "Building the VSR server binary and CLI (--features vsr) for BDD tests..."
@@ -90,18 +91,18 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
           # Extract SDK name from task (format: bdd-<sdk>, or bdd-<sdk>-vsr
-          # for the server-ng lane)
-          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
+          # for an explicit vsr lane). Python has no legacy lane, so its
+          # plain task name runs vsr.
+          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//; s/-vsr$//')
           EXTRA_FLAGS=()
-          case "$SDK_NAME" in
-          rust-vsr)
-            SDK_NAME="rust"
+          case "${{ inputs.task }}" in
+          bdd-rust-vsr|bdd-python|bdd-node-vsr)
             EXTRA_FLAGS+=(--vsr)
             # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
             echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
             ;;
-          go|go-race)
+          bdd-go|bdd-go-race)
             # The Go SDK speaks only VSR, so the runner forces the overlay.
             # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"

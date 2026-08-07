@@ -257,7 +257,12 @@ run_go_examples() {
 
 # shellcheck disable=SC2329
 run_python_examples() {
-    resolve_server_binary "${TARGET}"
+    # Python wheels are vsr-built, so examples run against the vsr
+    # server. It takes no --fresh flag; cleanup_server_state wiping
+    # local_data is the fresh start.
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    resolve_server_binary "${TARGET}" iggy-server-ng
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     echo ""
@@ -270,7 +275,7 @@ run_python_examples() {
 
     # --- Non-TLS pass ---
     cleanup_server_state
-    start_plain_server --fresh
+    start_plain_server
     wait_for_server_ready "Python"
 
     cd examples/python || exit 1
@@ -290,7 +295,7 @@ run_python_examples() {
             echo "=== Running Python TLS examples ==="
             echo ""
             cleanup_server_state
-            start_tls_server --fresh
+            start_tls_server
             wait_for_server_ready "Python TLS"
 
             cd examples/python || exit 1
