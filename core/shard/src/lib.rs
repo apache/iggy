@@ -4169,6 +4169,11 @@ where
         // Defer the whole reply: the purge is one reconciler wake away and
         // resets the line to `None`, and the stall retry re-asks, so the peer
         // re-emits both `RangeEvicted` and `RepairDone` for the same window.
+        // TODO(hubcio): no direct test drives this gate -- `on_repair_range_reply`
+        // is only reachable through the real message bus and the shard crate has
+        // no fixture for it (the serve-side gate shares the gap). The loss shape
+        // is pinned at the partition level instead; a bus fixture would let both
+        // gates be exercised end to end.
         let committed_purge = self
             .plane
             .metadata()

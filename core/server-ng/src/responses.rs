@@ -1207,6 +1207,9 @@ fn partition_response(
     // refused chain) also reads as one empty segment rather than zero. Telling
     // the two apart needs a materialization signal the registry does not carry
     // today; the counters are still the honest source for size and messages.
+    // TODO(hubcio): carry that materialization signal in the stats registry
+    // (segment planted vs fenced-for-rebuild) so monitoring can see a real
+    // zero-segment partition instead of this clamp.
     let stats = streams
         .stats_registry
         .partition_get(stream_id, topic_id, partition.id);

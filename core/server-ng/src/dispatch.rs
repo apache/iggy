@@ -1961,6 +1961,10 @@ async fn handle_poll_messages<B, MJ, S, SB>(
 
 /// Serve `get_consumer_offset`. An empty body decodes as `None` on the SDK
 /// side (no offset stored / partition unknown).
+// TODO(hubcio): plain local partition_read with no primary gate, so a
+// follower answers from its own (possibly lagging) offset state. Needs the
+// same is-caught-up-primary gate the auto-commit path has, or an explicit
+// read-from-follower contract.
 #[allow(clippy::future_not_send)]
 async fn handle_get_consumer_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,

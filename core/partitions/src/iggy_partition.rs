@@ -3927,9 +3927,21 @@ where
             .map_err(PurgeError::Unserviceable)?;
         // Make the unlinks AND the replanted dirent durable together: without
         // this a crash can resurrect pre-purge segments until the boot re-purge
-        // fires. Bounded and self-healing, but the fsync is one call.
-        if let Some(partition_dir) = self.partition_dir.clone() {
-            let _ = crate::state_transfer::fsync_dir(&partition_dir).await;
+        // fires. Bounded and self-healing, so a failure is logged, not fenced:
+        // the generation write below has not run yet, so a crash after a failed
+        // fsync re-purges at boot anyway.
+        if let Some(partition_dir) = self.partition_dir.clone()
+            && let Err(error) = crate::state_transfer::fsync_dir(&partition_dir).await
+        {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                generation,
+                %error,
+                "purge could not fsync the partition dir; a crash before the \
+                 generation record re-purges at boot"
+            );
         }
         // The boot-time durable line marks recovered bytes that must not be
         // re-persisted, but the purge just deleted those bytes and offsets
@@ -3977,14 +3989,28 @@ where
         // crash right after the purge otherwise resurrects the offset files at
         // boot, and while recovery clamps a resurrected offset down to the
         // rebuilt head, "consumed through 0" is not the intended "no entry at
-        // all" -- that consumer skips the first post-purge message.
+        // all" -- that consumer skips the first post-purge message. Logged on
+        // failure, sharper than the partition-dir fsync above: the generation
+        // write below still runs, so a crash would resurrect these files with
+        // no boot re-purge left to clear them.
         for dir in self
             .consumer_offsets_path
             .clone()
             .into_iter()
             .chain(self.consumer_group_offsets_path.clone())
         {
-            let _ = crate::state_transfer::fsync_dir(&dir).await;
+            if let Err(error) = crate::state_transfer::fsync_dir(&dir).await {
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = namespace.inner(),
+                    generation,
+                    dir = %dir,
+                    %error,
+                    "purge could not fsync an offsets dir; a crash may resurrect \
+                     deleted offset files with the purge already recorded"
+                );
+            }
         }
         // The persisted-offset tracker mirrors the files unlinked above; a
         // stale entry would make a post-purge auto-commit skip its write and

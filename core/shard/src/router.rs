@@ -140,6 +140,16 @@ where
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
             Err(e) => {
+                // TODO(hubcio): this drop is the whole story for a consensus
+                // frame carrying an Operation this build does not know: no
+                // metric, no peer error, no eviction. An old node in a mixed
+                // cluster silently gap-stops the group here (never journals
+                // the op, never PrepareOks, every later prepare dies on the
+                // gap check) while quorum hides it, and repair wraps the same
+                // typed header so it cannot rescue. Rolling upgrades across
+                // consensus-op additions need a version fence (release_min /
+                // release_max bounds on the replica plane) before this arm is
+                // safe to hit.
                 tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
                 return;
             }
