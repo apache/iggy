@@ -217,7 +217,10 @@ run_rust_examples() {
 
 # shellcheck disable=SC2329
 run_node_examples() {
-    resolve_server_binary "${TARGET}"
+    # The Node SDK is vsr-only, so examples run against the vsr server.
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    resolve_server_binary "${TARGET}" iggy-server-ng
 
     export DEBUG=iggy:examples
     unset -f TRANSFORM_COMMAND 2>/dev/null || true

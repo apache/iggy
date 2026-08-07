@@ -142,6 +142,8 @@ const namespaceFromIds = (
  * `SendMessages`: `[metadata_len u32][stream ident][topic ident]
  * [partitioning kind u8, len u8, value]...`. Only explicit `PartitionId`
  * partitioning is routable under VSR; the broker never picks a partition.
+ * TODO(hubcio): Balanced and MessageKey partitioning to be implemented;
+ * not decided yet whether it'll be on server side or client side.
  */
 const namespaceFromSendMessages = (payload: Buffer): bigint => {
   if (payload.length < 4)
