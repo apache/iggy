@@ -23,8 +23,7 @@ Apache Iggy is the persistent message streaming platform written in Rust, suppor
 ### Basic Installation
 
 ```bash
-# Using uv
-uv venv # if not already created
+# Using uv in an existing project
 uv add apache-iggy
 
 # Using pip
@@ -33,57 +32,55 @@ source .venv/bin/activate
 pip install apache-iggy
 ```
 
-### Supported Python Versions
+### Prerequisites
+
+Every installation below compiles the Rust extension, so you'll need:
 
 - Python 3.10+
+- Rust toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- All checks tooling from [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).
+- Docker
 
 ### Local Development
+
+**IMPORTANT: All commands are supposed to be ran from `foreign/python` unless it's specified to run in repository's root folder.**
 
 1. Build a project for development
 
    With `uv`:
 
-   > Create a venv:
-   >
-   > ```bash
-   > uv venv
-   > ```
-   >
-   > Sync the environment without updating it:
-   >
-   > ```bash
-   > uv sync --frozen --all-extras --no-install-project
-   > ```
-   >
-   > Build the project - this runs cargo build and performs an editable install:
-   >
-   > ```bash
-   > uv run maturin develop
-   > ```
+   ```bash
+   # Create a venv
+   uv venv
+
+   # Sync the environment without updating it
+   uv sync --frozen --all-extras --no-install-project
+
+   # Build the project -- this builds the rust extension into the venv (debug profile) - re-run after any rust change
+   uv run --no-sync maturin develop
+   ```
 
    With `pip`:
 
-   > Create a venv:
-   >
-   > ```bash
-   > python3 -m venv .venv
-   > ```
-   >
-   > Activate the venv:
-   >
-   > ```bash
-   > source .venv/bin/activate
-   > ```
-   >
-   > Install the dependencies with `pip`:
-   >
-   > ```bash
-   > pip install -e ".[all]"
-   > ```
+   ```bash
+   # Create a venv
+   python3 -m venv .venv
 
-2. Run the server to be able to run the tests
+   # Activate the venv
+   source .venv/bin/activate
+
+   # Install the dependencies
+   pip install -e ".[all]"
+
+   # Build the project -- this builds the rust extension into the venv (debug profile) - re-run after any rust change
+   maturin develop
+   ```
+
+2. Run the server to be able to run the tests (this blocks the terminal - run steps 3-5 in a separate one). `--fresh` deletes `local_data/` on every run - drop it if you have existing data you want to keep.
 
    ```bash
+   # run from the repository's root directory
    cargo run --bin iggy-server -- --with-default-root-credentials --fresh
    ```
 
@@ -101,10 +98,12 @@ pip install apache-iggy
    pytest tests/ -v # make sure iggy-server is running and the venv is activated
    ```
 
-4. To update the stubs, use
+4. To update the stubs, only after changing the pyo3 API surface (nothing in CI checks stub freshness, so unconditional regen just invites `.pyi` churn), use
 
    ```bash
+   # run from foreign/python
    cargo run --bin stub_gen
+   # TODO: Known bug: running this from a subdirectory of `foreign/python` corrupts the tracked stub, see https://github.com/apache/iggy/pull/3825/changes/BASE..773a27971b4ddb7b44773ded395ed23afb1de4c9#r3727691619
    ```
 
 5. Before committing, test the pre-commit and pre-push hooks. `prek` only inspects staged content, so stage your work first:
@@ -115,26 +114,28 @@ pip install apache-iggy
    prek run --hook-stage pre-push
    ```
 
-   These are some of the essential commands prek is running, so it's recommended to run them manually before  running prek / committing / pushing. This list is not exhaustive and other hook failures are possible.
+   These are some of the essential commands prek is running, so it's recommended to run them manually before
+running prek / committing / pushing. This list is not exhaustive and other hook failures are possible.
 
    ```bash
-   ruff format .
+   uv run --no-sync ruff format .
    ```
 
    ```bash
-   ruff check --fix .
+   uv run --no-sync ruff check --fix .
    ```
 
    ```bash
-   cargo fmt --all
+   cargo fmt --manifest-path Cargo.toml
    ```
 
    ```bash
-   cargo clippy --all-targets --all-features -- -D warnings
+   cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
    ```
 
    ```bash
-   ./scripts/ci/markdownlint.sh --fix # read the diff after applying this, sometimes it gives unwanted results, e.g. messing up enumerations
+   # run from the repository's root directory
+   ./scripts/ci/markdownlint.sh --fix foreign/python/README.md # read the diff after applying this, sometimes it gives unwanted results, e.g. messing up enumerations
    ```
 
 ## Examples
@@ -143,7 +144,7 @@ Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examp
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md) for development setup and guidelines.
+See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md) for contribution guidelines.
 
 ## License
 
