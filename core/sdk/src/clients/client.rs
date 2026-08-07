@@ -64,14 +64,11 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// The `IggyClient` is configured with one of these transport modes, hence abstracting
 /// transport specific implementations away.
 ///
-/// The [`ClientWrapper`] lives behind an [`IggyRwLock`] so that one connection
+/// The [`ClientWrapper`] lives behind an [`IggyRwLock`] so that the connection
 /// can be shared safely. You create a single client and use it from many tasks
-/// at once (producers, consumers, the background heartbeat), and they all talk
-/// over the same connection. The lock keeps that safe. Many operations can read
-/// from the connection at the same time, while actions that reshape it, like
-/// connecting, reconnecting, or logging in, briefly take exclusive access. It is
-/// also async-aware, so holding it across a call to the server never blocks the
-/// runtime.
+/// at once (producers, consumers, the background heartbeat). Many operations can read
+/// from the connection concurrently, while actions that reshape it, like
+/// connecting, reconnecting, or logging in, briefly take exclusive access.
 ///
 /// A [`Partitioner`] and a client-side [`EncryptorKind`] are optional, and both
 /// default to disabled. The [`Partitioner`] computes on the client-side the target
@@ -80,12 +77,12 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///
 /// The [`EncryptorKind`] encrypts each message payload before it leaves the client and decrypts it on
 /// the way back, keeping payloads opaque to the server. Attach either through
-/// [`create`].
+/// [`create()`].
 ///
 /// # What you can do
 ///
 /// Configure a connection with an Iggy server and interact with it.
-/// The [`IggyClient`] provides various methods to setup the connection using connection strings,
+/// The `IggyClient` provides various methods to setup the connection using connection strings,
 /// builder patterns or an already existing [`ClientWrapper`].
 /// You can spawn [`IggyConsumer`]s and [`IggyProducer`]s that share that connection.
 ///
@@ -105,27 +102,27 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// - [`ConsumerOffsetClient`]: store, read, and delete consumer offsets.
 /// - [`MessageClient`]: send and poll messages, and flush the unsaved buffer.
 ///
-/// Additionally, you can bypass invoking methods from these traits and directly talk binary to the server with [`send_binary_request`] and [`send_http_request`] for http.
-/// Both are essentially backdoors for low-level control. You need to know the server codes and the wire format.
+/// Additionally, you can bypass invoking methods from these traits and directly talk to the server with [`send_binary_request`] and [`send_http_request`] for http.
+/// Both trade typed API's safety for low-level control. You need to know the server codes and the wire format.
 ///
 /// # Usage
 ///
-/// The typical lifecycle of an [`IggyClient`] is construct [`connect`], use, and finally [`shutdown`].
+/// The typical lifecycle of an `IggyClient` is construct, [`connect()`], use, and finally shutdown.
 ///
-/// 1. Construct a client from a connection string ([`from_connection_string`]),
-///    from the [`builder`], or by wrapping an existing transport client with
-///    [`new`] / [`create`].
-/// 2. Call [`connect`] to establish the connection. If the transport was
+/// 1. Construct a client from a connection string ([`from_connection_string()`]),
+///    from the [`builder()`], or by wrapping an existing transport client with
+///    [`new()`] / [`create()`].
+/// 2. Call [`connect()`] to establish the connection. If the transport was
 ///    configured with auto-login, this also authenticates. Otherwise call
-///    [`UserClient::login_user`] afterwards.
-/// 3. Spawn [`IggyConsumer`]s and [`IggyProducers`] to write and consume messages
-///    to and from the server.
-/// 4. Call [`shutdown`] (or drop the client) to release resources; drop also
-///    leaves any consumer groups the client had joined.
-///
-/// A client holds a shared connection and a background heartbeat to keep the connection alive.
-/// Create one [`IggyClient`] per server and share it (for example behind an [`Arc`]) across tasks rather
-/// than opening a client per operation.
+///    [`login_user()`] afterwards.
+/// 3. Spawn [`IggyConsumer`]s and [`IggyProducer`]s to write to, and consume messages
+///    from, the server.
+/// 4. To shut everything down, call [`IggyConsumer::shutdown()`] on each consumer to store their
+///    final offset and leave consumer groups. Then, call [`IggyProducer::shutdown()`] on each
+///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
+///    call [`shutdown()`] on the [`IggyClient`] which closes the connection and stops the heartbeat.
+///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
+///    client that has been shut down cannot reconnect.
 ///
 /// # Examples
 ///
@@ -192,11 +189,21 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// # }
 /// ```
 ///
-/// [`new`]: IggyClient::new
-/// [`create`]: IggyClient::create
-/// [`producer`]: IggyClient::producer
-/// [`consumer`]: IggyClient::consumer
-/// [`consumer_group`]: IggyClient::consumer_group
+/// [`IggyConsumer`]: crate::prelude::IggyConsumer
+/// [`IggyProducer`]: crate::prelude::IggyProducer
+/// [`IggyConsumer::shutdown()`]: crate::prelude::IggyConsumer::shutdown
+/// [`IggyProducer::shutdown()`]: crate::prelude::IggyProducer::shutdown
+/// [`new()`]: IggyClient::new
+/// [`create()`]: IggyClient::create
+/// [`shutdown()`]: IggyClient::shutdown
+/// [`login_user()`]: IggyClient::login_user
+/// [`connect()`]: IggyClient::connect
+/// [`disconnect()`]: IggyClient::disconnect
+/// [`producer()`]: IggyClient::producer
+/// [`consumer()`]: IggyClient::consumer
+/// [`builder()`]: IggyClient::builder
+/// [`from_connection_string()`]: IggyClient::from_connection_string
+/// [`consumer_group()`]: IggyClient::consumer_group
 /// [`Client`]: crate::prelude::Client
 /// [`SystemClient`]: crate::prelude::SystemClient
 /// [`UserClient`]: crate::prelude::UserClient
