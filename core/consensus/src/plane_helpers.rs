@@ -1243,43 +1243,53 @@ mod tests {
 
     /// A frame carrying `body`, with `size` covering exactly header + body and
     /// `checksum_body` sealed over it, as the metadata projection does.
-    fn sealed_frame(body: &[u8]) -> Vec<u8> {
-        let mut frame = vec![0u8; size_of::<PrepareHeader>() + body.len()];
-        frame[size_of::<PrepareHeader>()..].copy_from_slice(body);
+    /// `trailing` bytes of garbage past the sealed frame, which `size` does not
+    /// cover. The buffer is `MESSAGE_ALIGN`ed: `PrepareHeader` holds `u128`s, so a
+    /// `Vec<u8>` would only be 16-aligned by the allocator's good graces and miri
+    /// rejects the cast.
+    fn sealed_frame(body: &[u8], trailing: usize) -> Owned<MESSAGE_ALIGN> {
+        let size = size_of::<PrepareHeader>() + body.len();
+        let mut frame = Owned::<MESSAGE_ALIGN>::zeroed(size + trailing);
+        let bytes = frame.as_mut_slice();
+        bytes[size_of::<PrepareHeader>()..size].copy_from_slice(body);
+        bytes[size..].fill(0xAA);
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
-            &mut frame[..size_of::<PrepareHeader>()],
+            &mut bytes[..size_of::<PrepareHeader>()],
         );
         header.command = Command2::Prepare;
         header.op = 7;
-        header.size = u32::try_from(size_of::<PrepareHeader>() + body.len()).expect("fits u32");
+        header.size = u32::try_from(size).expect("fits u32");
         header.checksum_body = u128::from(calculate_checksum(body));
         frame
     }
 
+    fn frame_header(frame: &Owned<MESSAGE_ALIGN>) -> PrepareHeader {
+        *bytemuck::checked::from_bytes::<PrepareHeader>(
+            &frame.as_slice()[..size_of::<PrepareHeader>()],
+        )
+    }
+
     #[test]
     fn given_a_prepare_whose_body_was_altered_when_verifying_should_reject() {
-        let frame = sealed_frame(b"body");
-        let header =
-            *bytemuck::checked::from_bytes::<PrepareHeader>(&frame[..size_of::<PrepareHeader>()]);
-        assert_eq!(verify_prepare_integrity(&header, &frame), Ok(()));
+        let mut frame = sealed_frame(b"body", 0);
+        let header = frame_header(&frame);
+        assert_eq!(verify_prepare_integrity(&header, frame.as_slice()), Ok(()));
 
-        let mut altered = frame;
-        *altered.last_mut().expect("the frame carries a body") ^= 1;
-        assert!(verify_prepare_integrity(&header, &altered).is_err());
+        *frame
+            .as_mut_slice()
+            .last_mut()
+            .expect("the frame has a body") ^= 1;
+        assert!(verify_prepare_integrity(&header, frame.as_slice()).is_err());
     }
 
     #[test]
     fn given_bytes_past_the_frame_size_when_verifying_should_ignore_them() {
         // `try_from` accepts a buffer longer than `size` without trimming; hashing to
         // the end would reject a correctly sealed prepare and disagree with the WAL scan.
-        let frame = sealed_frame(b"body");
-        let header =
-            *bytemuck::checked::from_bytes::<PrepareHeader>(&frame[..size_of::<PrepareHeader>()]);
-
-        let mut padded = frame;
-        padded.extend_from_slice(b"trailing garbage");
+        let padded = sealed_frame(b"body", 16);
+        let header = frame_header(&padded);
         assert_eq!(
-            verify_prepare_integrity(&header, &padded),
+            verify_prepare_integrity(&header, padded.as_slice()),
             Ok(()),
             "only the bytes `size` covers are the body"
         );
@@ -1289,11 +1299,10 @@ mod tests {
     fn given_a_size_that_overruns_the_buffer_when_verifying_should_reject() {
         // Truncated frame, header still claims the full length: the body it names is
         // not there to hash.
-        let frame = sealed_frame(b"body");
-        let header =
-            *bytemuck::checked::from_bytes::<PrepareHeader>(&frame[..size_of::<PrepareHeader>()]);
+        let frame = sealed_frame(b"body", 0);
+        let header = frame_header(&frame);
 
-        let truncated = &frame[..frame.len() - 1];
+        let truncated = &frame.as_slice()[..frame.as_slice().len() - 1];
         assert!(verify_prepare_integrity(&header, truncated).is_err());
     }
 
