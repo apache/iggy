@@ -33,11 +33,25 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use utils::cpu_name::append_cpu_name_lowercase;
 
+/// Which SDK framing this binary was compiled with.
+///
+/// One binary name, two wire dialects, and the mismatch is asymmetric: a
+/// default-features bench against a vsr server HANGS rather than fails, because
+/// the server reads a full 256-byte header before validating anything and the
+/// client's own response timeout is itself vsr-gated. Printing the flavor in the
+/// always-on banner turns that from a silent hang into a one-second diagnosis.
+const SDK_FRAMING: &str = if cfg!(feature = "vsr") {
+    "vsr (server-ng Register handshake)"
+} else {
+    "legacy (classic server framing)"
+};
+
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {
     let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert("Iggy Bench");
     println!("{}", figure.unwrap());
+    println!("SDK framing: {SDK_FRAMING}");
 
     let mut args = IggyBenchArgs::parse();
     args.validate();

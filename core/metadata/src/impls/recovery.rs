@@ -434,9 +434,15 @@ where
     // state. One that merely lags a newer, atomically-complete snapshot is accepted,
     // since `commit_max` is a recovery lower bound and the WAL suffix re-commits.
     //
-    // TODO(state-transfer): there is no metadata state transfer yet, so refusing boot
-    // is the only sound response. Once it lands, fetch the checkpoint from a healthy
-    // replica here instead of erroring.
+    // Metadata state transfer exists now, and refusing boot here is still the right
+    // answer rather than a gap waiting on it. What this check catches is LOCAL
+    // durability damage -- a lost snapshot write, or a torn/corrupt one -- not a
+    // replica that merely fell behind the cluster. Transfer repairs the second, and
+    // does so post-boot once consensus has a view and a live primary to pull from;
+    // wiring it in here would silently re-sync over a failing disk instead of
+    // surfacing it. The operator remedy is to clear the metadata directory, after
+    // which the node rejoins through the ordinary transfer path (covered by
+    // `restart_from_clean_slate` and the fresh-late-join spec).
     let snapshot_op = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
     verify_checkpoint_pairing(
         recovered_state.as_ref(),
@@ -505,9 +511,12 @@ where
     //
     // A warning and not a refusal, deliberately: each journaled prepare stamps the
     // primary's commit point as of its SEND, so the derived watermark is a lower bound
-    // and trails `commit_max` on a perfectly healthy node. Only state transfer can turn
-    // this into a decision, which is why the field has no other reader (see the
-    // TODO(state-transfer) above).
+    // and trails `commit_max` on a perfectly healthy node. That is also why state
+    // transfer landing does not promote this into a trigger -- the comparison cannot
+    // separate "behind" from "healthy", so arming on it would make every restart
+    // transfer. The triggers that do fire are post-boot and precise: journal repair
+    // answering `RangeEvicted` (the gap is provably below a peer's retained floor), a
+    // StartView adopted while awaiting a target, and the same-view heartbeat backstop.
     if let Some(state) = recovered_state.as_ref()
         && state.commit_max > commit_watermark
     {
@@ -772,6 +781,7 @@ mod tests {
             commit_max: 100,
             checkpoint_op,
             checkpoint_checksum,
+            offset_frontier: 0,
         }
     }
 

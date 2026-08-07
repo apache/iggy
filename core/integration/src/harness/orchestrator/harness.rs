@@ -330,6 +330,46 @@ impl TestHarness {
         Ok(())
     }
 
+    /// Restart node `index` with its data directory INTACT, so it rejoins the
+    /// still-live cluster from its own recovered state (superblock, segments,
+    /// offset files). The counterpart of
+    /// [`Self::restart_node_from_clean_slate`] for the crash-and-return
+    /// shape rather than the provisioned-replacement one.
+    pub fn restart_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.stop()?;
+        server.start()
+    }
+
+    /// Restart node `index` with its data directory wiped, so it rejoins the
+    /// still-live cluster as a fresh replica with no local history. The other
+    /// nodes stay up throughout (they hold quorum and keep committing), which
+    /// is the late-joiner / provisioned-replacement scenario rather than a
+    /// full-cluster restart. Clients are left connected to their own nodes.
+    pub fn restart_node_from_clean_slate(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.restart_from_clean_slate()
+    }
+
+    /// Stop node `index` and leave it down. The surviving nodes keep quorum
+    /// (in a 3-node cluster, 2 of 3), and if the stopped node was the primary
+    /// they elect a new one, advancing the view. Pairs with
+    /// [`Self::restart_node_from_clean_slate`] to model a node that misses an
+    /// election entirely and rejoins at a stale view.
+    pub fn stop_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.stop()
+    }
+
     /// Restart EVERY node and reconnect all clients: the full-cluster
     /// restart path, where no settled primary survives to answer the rejoin
     /// probes and the replicas must fall back to an election among their
@@ -473,6 +513,23 @@ impl TestHarness {
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
         self.client_builder_for(transport)?
+            .with_root_login()
+            .connect()
+            .await
+    }
+
+    /// Root-authenticated TCP client bound to ONE node of a cluster, unlike
+    /// [`Self::root_client_for`], which always targets node 0.
+    ///
+    /// # Errors
+    ///
+    /// [`TestBinaryError::MissingServer`] when `index` is out of range, or the
+    /// underlying connect/login failure.
+    pub async fn root_client_for_node(&self, index: usize) -> Result<IggyClient, TestBinaryError> {
+        self.servers
+            .get(index)
+            .ok_or(TestBinaryError::MissingServer)?
+            .tcp_client()?
             .with_root_login()
             .connect()
             .await

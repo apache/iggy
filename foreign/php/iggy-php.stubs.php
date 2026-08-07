@@ -218,15 +218,17 @@ namespace Iggy {
         public function sendBinaryRequest(int $code, string $payload): string {}
 
         /**
-         * Sends messages to a topic.
+         * Sends messages to a topic and returns the commit confirmations.
+         *
+         * The list is empty against the legacy server, which reports no offsets.
          *
          * @param mixed $stream
          * @param mixed $topic
          * @param int $partition_id
          * @param array $messages
-         * @return void
+         * @return \Iggy\SendMessagesResponse
          */
-        public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): void {}
+        public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): \Iggy\SendMessagesResponse {}
     }
 
     /**
@@ -495,6 +497,57 @@ namespace Iggy {
          * @param string $data
          */
         public function __construct(string $data) {}
+    }
+
+    /**
+     * A PHP class representing where one partition's batch was committed.
+     */
+    class SendMessagesConfirmation {
+        /**
+         * The offset assigned to the first message of the batch in this partition.
+         *
+         * Delivery is at-least-once, so an earlier retry may already have committed the
+         * same batch at a lower offset. The value never implies uniqueness.
+         *
+         * A batch is confirmed once it is committed in memory, not once it is fsynced. A
+         * crash-restart can stamp a later batch with an offset a client has already
+         * recorded.
+         *
+         * The legacy server returns an empty confirmation list, so it reports no offset
+         * at all.
+         *
+         * @var int
+         */
+        public readonly int $base_offset;
+
+        public readonly int $partition_id;
+
+        public readonly int $stream_id;
+
+        public readonly int $topic_id;
+
+        public function __construct() {}
+    }
+
+    /**
+     * A PHP class representing the commit confirmations of a send.
+     */
+    class SendMessagesResponse {
+        /**
+         * One confirmation per partition the batch landed in.
+         *
+         * The list is empty when the server reports no offsets. The legacy server never
+         * reports any, and a server that does can still commit a batch it has no offsets
+         * to describe, so check for an empty array instead of indexing.
+         *
+         * The confirmations are rebuilt on each getter call; cache the result in PHP if
+         * they will be read repeatedly.
+         *
+         * @var array
+         */
+        public readonly array $confirmations;
+
+        public function __construct() {}
     }
 
     class StreamDetails {

@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.8.1-edge.3",
+  "version": "0.9.0-edge.1",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
@@ -58,10 +58,10 @@
   "devDependencies": {
     "@commitlint/cli": "21.2.1",
     "@commitlint/config-conventional": "21.2.0",
-    "@cucumber/cucumber": "13.1.1",
-    "@swc-node/register": "1.12.0",
+    "@cucumber/cucumber": "13.2.0",
+    "@swc-node/register": "1.12.1",
     "@types/debug": "4.1.13",
-    "@types/node": "26.1.1",
+    "@types/node": "26.1.2",
     "c8": "^12.0.0",
     "husky": "9.1.7",
     "typescript": "6.0.3",

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use iggy_common::MessageClient;
 use iggy_common::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
+    SendMessagesResponse,
 };
 
 #[async_trait]
@@ -109,7 +110,7 @@ impl MessageClient for ClientWrapper {
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
                 client

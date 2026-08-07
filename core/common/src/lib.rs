@@ -52,6 +52,9 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+pub use iggy_binary_protocol::responses::messages::{
+    SendMessagesConfirmationResponse, SendMessagesResponse,
+};
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 #[cfg(feature = "vsr")]
@@ -60,6 +63,7 @@ pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
 pub use traits::consumer_group_client::ConsumerGroupClient;
 pub use traits::consumer_offset_client::ConsumerOffsetClient;
+pub use traits::decode_send_confirmations;
 pub use traits::message_client::MessageClient;
 pub use traits::partition_client::PartitionClient;
 pub use traits::partitioner::Partitioner;

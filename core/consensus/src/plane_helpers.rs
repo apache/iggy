@@ -40,7 +40,10 @@ pub async fn pipeline_prepare_common<C, F>(
 {
     assert!(!consensus.is_follower(), "on_request: primary only");
     assert!(consensus.is_normal(), "on_request: status must be normal");
-    assert!(!consensus.is_syncing(), "on_request: must not be syncing");
+    assert!(
+        !consensus.is_transferring(),
+        "on_request: must not be transferring state"
+    );
 
     consensus.verify_pipeline();
     consensus.pipeline_message(plane, &prepare);
@@ -131,8 +134,8 @@ where
 {
     assert_eq!(header.command, Command2::Prepare);
 
-    if consensus.is_syncing() {
-        return Err(IgnoreReason::Syncing);
+    if consensus.is_transferring() {
+        return Err(IgnoreReason::StateTransfer);
     }
 
     let current_op = consensus.sequencer().current_sequence();
@@ -142,6 +145,10 @@ where
     }
 
     if header.view > consensus.view() {
+        // Dropped, but recorded: a newer-view prepare is proof the cluster
+        // moved past this replica, so the heartbeat-timeout handler probes to
+        // catch up rather than starting a futile election.
+        consensus.observe_newer_view(header.view);
         return Err(IgnoreReason::NewerView);
     }
 
@@ -582,7 +589,7 @@ pub async fn send_prepare_ok<B, P>(
         return;
     }
 
-    if consensus.is_syncing() {
+    if consensus.is_transferring() {
         return;
     }
 

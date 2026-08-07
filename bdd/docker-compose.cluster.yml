@@ -120,6 +120,9 @@ services:
   csharp-bdd:
     <<: *cluster-bdd-deps
 
+  java-bdd:
+    <<: *cluster-bdd-deps
+
 volumes:
   iggy_leader_data:
   iggy_follower_data:

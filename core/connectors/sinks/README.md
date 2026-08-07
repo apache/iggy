@@ -12,6 +12,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **elasticsearch_sink** | Sends messages to Elasticsearch indices for full-text search and analytics |
 | **iceberg_sink** | Writes data to Apache Iceberg tables via REST catalog with S3/GCS/Azure storage |
 | **influxdb_sink** | Writes messages to InfluxDB as line-protocol points; supports both V2 (org/bucket, Flux) and V3 (db, SQL) |
+| **meilisearch_sink** | Indexes messages in Meilisearch for full-text search |
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
 | **s3_sink** | Writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces) |

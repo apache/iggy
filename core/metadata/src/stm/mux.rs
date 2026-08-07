@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
+use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, RestoreSnapshotInPlace, SnapshotError};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::Either;
 use iggy_common::variadic;
@@ -185,6 +185,44 @@ where
         let head = Head::restore_snapshot(snapshot)?;
         let tail = Tail::restore_snapshot(snapshot)?;
         Ok((head, tail))
+    }
+}
+
+impl<SnapshotData, Head, Tail> RestoreSnapshotInPlace<SnapshotData> for variadic!(Head, ...Tail)
+where
+    Head: RestoreSnapshotInPlace<SnapshotData>,
+    Tail: RestoreSnapshotInPlace<SnapshotData>,
+{
+    fn restore_snapshot_in_place(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        // Two-phase, and the reason this is not a plain `?`-chain: the halves
+        // mutate independently with no rollback between them, and the caller
+        // has already persisted the transferred snapshot and seeded its
+        // pairing by the time it gets here. A half-restored mux would then be
+        // fed the local WAL's contiguous suffix by the follow-up
+        // `commit_journal`, replaying it into only the half that moved. The
+        // boot path fail-stops on the same input; this makes the running path
+        // agree.
+        self.check_restorable(snapshot)?;
+        self.0.restore_snapshot_in_place(snapshot)?;
+        self.1.restore_snapshot_in_place(snapshot)
+    }
+
+    fn check_restorable(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        self.0.check_restorable(snapshot)?;
+        self.1.check_restorable(snapshot)
+    }
+}
+
+impl<T, SnapshotData> RestoreSnapshotInPlace<SnapshotData> for MuxStateMachine<T>
+where
+    T: StateMachine + RestoreSnapshotInPlace<SnapshotData>,
+{
+    fn restore_snapshot_in_place(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        self.inner.restore_snapshot_in_place(snapshot)
+    }
+
+    fn check_restorable(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+        self.inner.check_restorable(snapshot)
     }
 }
 

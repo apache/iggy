@@ -25,7 +25,8 @@ use crate::dispatch::{
 };
 use crate::http;
 use crate::partition_helpers::{
-    configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
+    build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
+    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
@@ -50,7 +51,7 @@ use iggy_common::defaults::{
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
-use journal::superblock::{DynSuperblockStore, PingPongSuperblock};
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
@@ -71,8 +72,9 @@ use message_bus::{
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
+use metadata::ReplicaIdentity;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
-use metadata::impls::recovery::{ReplicaIdentity, recover};
+use metadata::impls::recovery::recover;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -130,14 +132,17 @@ pub(crate) type ServerNgMetadata = IggyMetadata<
 
 /// The shard type the dispatch layer is generic over.
 ///
-/// `B`/`MJ`/`S` are free; the metadata state machine (`M`) and shards table
-/// (`T`) are pinned, being identical in production and the simulator.
-/// Production instantiates it as [`ServerNgShard`]; the simulator supplies its
-/// own `B`/`MJ`/`S`.
-pub type ShellShard<B, MJ, S> = IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable>;
+/// `B`/`MJ`/`S`/`SB` are free; the metadata state machine (`M`) and shards
+/// table (`T`) are pinned, being identical in production and the simulator.
+/// Production instantiates it as [`ServerNgShard`], defaulting `SB` to the
+/// on-disk [`PingPongSuperblock`]; the simulator supplies its own
+/// `B`/`MJ`/`S`/`SB`.
+pub type ShellShard<B, MJ, S, SB = PingPongSuperblock> =
+    IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable, SB>;
 
 /// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
-pub type ShellShardHandle<B, MJ, S> = Rc<RefCell<Option<Weak<ShellShard<B, MJ, S>>>>>;
+pub type ShellShardHandle<B, MJ, S, SB = PingPongSuperblock> =
+    Rc<RefCell<Option<Weak<ShellShard<B, MJ, S, SB>>>>>;
 
 /// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
 /// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
@@ -185,16 +190,18 @@ impl ShellHandlers {
 /// They share one fresh [`SessionManager`]. The caller must set the weak
 /// self-reference in `shard_handle` once the shard is built, so the
 /// handlers can upgrade it per frame.
-pub fn wire_shell_handlers<B, MJ, S>(
+pub fn wire_shell_handlers<B, MJ, S, SB>(
     bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> ShellHandlers
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
     ShellHandlers {
@@ -204,6 +211,7 @@ where
             shard_handle,
             &sessions,
             system_config,
+            max_tokens_per_user,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
@@ -1023,7 +1031,7 @@ async fn shard_main(
         // ping-pong sequence counter. Consensus recovers its true (view, log_view)
         // from `recovered_state` instead of inferring a stale view from the WAL.
         let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
-        let superblock: Rc<dyn DynSuperblockStore> = Rc::new(owner.superblock);
+        let superblock = Rc::new(owner.superblock);
         (
             Some(consensus),
             Some(owner.journal),
@@ -1312,8 +1320,12 @@ async fn shard_main(
             boot_view,
             shard.plane.metadata().client_table.borrow().client_ids(),
         );
-        let on_client_request =
-            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
+        let on_client_request = make_client_request_handler(
+            &shard,
+            &sessions,
+            Arc::clone(&config.system),
+            config.personal_access_token.max_tokens_per_user,
+        );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -1590,7 +1602,13 @@ fn build_cluster_roster(
     ClusterRoster {
         enabled: config.cluster.enabled,
         name: config.cluster.name.clone(),
-        nodes: config.cluster.nodes.clone(),
+        nodes: config
+            .cluster
+            .nodes
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
         self_ip: topology.client_listen_addr.ip().to_string(),
         self_ports: configs::ng_cluster::TransportPorts {
             tcp: Some(topology.client_listen_addr.port()),
@@ -1711,17 +1729,114 @@ async fn build_shard_for_thread(
     for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
         validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let partition = load_partition(
+        let partition = match load_partition(
             config,
             namespace,
-            partition_stats,
+            Arc::clone(&partition_stats),
             &partition_metadata,
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
             Rc::clone(&bus),
         )
-        .await?;
+        .await
+        {
+            Ok(partition) => partition,
+            // ONE damaged local chain must not take the node down. The shapes
+            // this refuses are exactly what a failed state-transfer quarantine
+            // leaves behind, so fence that group the same way the runtime path
+            // does -- move its segment files aside, keeping the superblock so it
+            // cannot re-enter view 0 -- and materialise it fresh. The ordinary
+            // rejoin path (repair, then state transfer on a refused floor)
+            // recovers its data from a peer.
+            Err(ServerNgError::PartitionChainRefused { dir, reason, .. }) => {
+                let partition_dir = dir.to_string_lossy().into_owned();
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    partition_dir,
+                    %reason,
+                    "refusing the recovered segment chain; fencing this partition and \
+                     rebuilding it empty for the rejoin path"
+                );
+                match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
+                    Ok(fenced_dir) => error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        fenced_dir,
+                        "quarantined the refused segment files; they are kept for inspection"
+                    ),
+                    Err(error) => {
+                        // NOT rebuilt: `build_partition_fresh` reaches
+                        // `ensure_initial_segment`, which opens segment 0 with
+                        // `file_exists = false` and TRUNCATES whatever the
+                        // failed quarantine left behind. The likeliest failures
+                        // (suffix cap exhausted, `create_dir_all`) move zero
+                        // files, so rebuilding would destroy the oldest segment
+                        // on the first attempt while the higher-offset survivors
+                        // keep refusing every boot -- a loop that never
+                        // terminates and eats the chain one segment at a time.
+                        // Tombstone instead: the namespace stays unmaterialised
+                        // and unrouted, the reconciler backs off, and an
+                        // operator still has every byte.
+                        error!(
+                            stream_id,
+                            topic_id,
+                            partition_id = partition_metadata.id,
+                            partition_dir,
+                            %error,
+                            "failed to quarantine the refused segment files; leaving this \
+                             partition tombstoned rather than rebuilding over them"
+                        );
+                        partition_stats.zero_out_all();
+                        partitions.tombstone(namespace);
+                        continue;
+                    }
+                }
+                // The refused load already folded its segment counts in.
+                partition_stats.zero_out_all();
+                build_partition_fresh(
+                    config,
+                    namespace,
+                    partition_stats,
+                    topology.cluster_id,
+                    topology.self_replica_id,
+                    topology.replica_count,
+                    Rc::clone(&bus),
+                )
+                .await?
+            }
+            // An untrustworthy superblock fences ONE group, not the node. The
+            // segment files stay exactly where they are -- unlike a refused
+            // chain, the data on disk is not the thing in doubt -- so there is
+            // nothing to quarantine and nothing to rebuild: rebuilding fresh
+            // would hand this replica a view-0 identity while a record it
+            // cannot read says otherwise. Tombstoned, the namespace stays
+            // unmaterialised and unrouted, the reconciler backs off, and an
+            // operator has every byte plus a message naming the directory.
+            Err(
+                error @ (ServerNgError::PartitionSuperblockIo { .. }
+                | ServerNgError::PartitionSuperblockVersionUnknown { .. }
+                | ServerNgError::PartitionSuperblockUnverifiable { .. }
+                | ServerNgError::PartitionSuperblockUndecodable { .. }
+                | ServerNgError::PartitionSuperblockIdentityMismatch { .. }),
+            ) => {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    %error,
+                    "cannot trust this partition's durable consensus state; tombstoning the \
+                     partition and continuing to boot the rest of the shard"
+                );
+                partition_stats.zero_out_all();
+                partitions.tombstone(namespace);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -1741,7 +1856,12 @@ async fn build_shard_for_thread(
         on_list_clients,
         on_partition_read,
         sessions,
-    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
+    } = wire_shell_handlers(
+        &bus,
+        &shard_handle,
+        Arc::clone(&config.system),
+        config.personal_access_token.max_tokens_per_user,
+    );
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -1778,7 +1898,22 @@ async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_served_segment_cache_bytes_max(
+        config
+            .partition
+            .transfer_served_cache_bytes_max
+            .as_bytes_u64(),
+    );
+    shard.set_partition_artifact_len_max(
+        config.partition.transfer_artifact_bytes_max.as_bytes_u64(),
+    );
     shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
+    // Bounds a served state-transfer chunk. A frame above the bus ceiling is
+    // rejected by the RECEIVING transport, which tears the replica connection
+    // down rather than dropping one message.
+    shard.set_bus_max_message_size(
+        usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
+    );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1810,8 +1945,20 @@ const _: () = assert!(
 const _: () = assert!(
     configs::ng_partition::DEFAULT_EVICTED_RING_BYTES_MAX == partitions::EVICTED_RING_BYTES_MAX
 );
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX
+        == shard::PARTITION_ARTIFACT_LEN_DEFAULT
+);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX
+        == shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT
+);
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () = assert!(
+    configs::ng_cluster::STATE_CHUNK_HEADER_LEN
+        == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
+);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {
@@ -2024,6 +2171,12 @@ fn restore_metadata_consensus(
     if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
         consensus.init_as_backup();
         consensus.begin_view_probe();
+        // Restart in a cluster: replace snapshot-shaped metadata state
+        // (snapshot + client table) from the live primary the probe finds,
+        // then journal-repair the tail. If the probe exhausts instead --
+        // full-cluster bootstrap, nobody live to fetch from -- the election
+        // fallback clears the stage and this local recovery stands.
+        consensus.begin_state_transfer_await();
     } else {
         consensus.init();
     }
@@ -2120,7 +2273,7 @@ async fn load_partition(
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let consensus = VsrConsensus::new(
+    let mut consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
@@ -2135,10 +2288,33 @@ async fn load_partition(
     consensus.set_view_change_status_ticks(view_change_status_ticks(config));
     consensus.set_request_start_view_ticks(request_start_view_ticks(config));
     consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-    // A recovered partition lost its consensus state with the process: the
+
+    // (view, log_view) come from the group's durable superblock when present;
+    // a present but unverifiable record already refused boot inside
+    // `open_partition_superblock`. Restored BEFORE choosing how to join, so
+    // the backup probe below never advertises a view older than the recorded
+    // one.
+    let partition_dir = config
+        .system
+        .get_partition_path(stream_id, topic_id, partition_id);
+    let (superblock, recovered_state) = open_partition_superblock(
+        &partition_dir,
+        ReplicaIdentity {
+            cluster: cluster_id,
+            replica_id: self_replica_id,
+            replica_count,
+        },
+    )
+    .await?;
+    if let Some(state) = recovered_state.as_ref() {
+        restore_partition_view(&mut consensus, state);
+    }
+
+    // A recovered partition lost its journal state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
-    // this replica cannot know the group's (op, commit). In a cluster it
-    // boots as a quorum-invisible backup and probes for the current view
+    // this replica cannot know the group's (op, commit) even when the
+    // superblock restored its view. In a cluster it boots as a
+    // quorum-invisible backup and probes for the current view
     // (`RequestStartView`): the view's primary answers with a `StartView`,
     // journal repair fills the rejoin window, and the commit floor settles
     // at the serving peer's retention point. The probe re-broadcasts on its
@@ -2174,6 +2350,7 @@ async fn load_partition(
             })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
     // single-replica groups, so this only sizes the multi-replica ring.
@@ -2181,11 +2358,7 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
-    partition.set_partition_dir(config.system.get_partition_path(
-        stream_id,
-        topic_id,
-        partition_id,
-    ));
+    partition.set_partition_dir(partition_dir);
     hydrate_partition_log(
         &mut partition,
         config,
@@ -2196,33 +2369,52 @@ async fn load_partition(
     )
     .await?;
 
-    let current_offset = partition
+    let sized_end = partition
         .log
         .segments()
         .iter()
         .filter(|segment| segment.size > IggyByteSize::default())
         .map(|segment| segment.end_offset)
+        .max();
+    // An empty chain whose segment is named for a nonzero offset is the
+    // shape a state-transfer install (or its converge) plants at the group
+    // frontier after the origin GC'd everything: the file name carries the
+    // frontier, and re-minting offsets from 0 here would fork this
+    // replica's batch stamps from the rest of the group after a restart.
+    let empty_frontier = partition
+        .log
+        .segments()
+        .iter()
+        .map(|segment| segment.start_offset)
         .max()
-        .unwrap_or(0);
+        .filter(|&start| sized_end.is_none() && start > 0);
+    let current_offset = sized_end.or_else(|| empty_frontier.map(|start| start - 1));
     partition.created_at = partition_metadata.created_at;
-    if partition
-        .log
-        .segments()
-        .iter()
-        .any(|segment| segment.size > IggyByteSize::default())
-    {
-        partition.recovered_durable_offset = Some(current_offset);
-    }
-    partition.offset.store(current_offset, Ordering::Release);
-    partition
-        .dirty_offset
-        .store(current_offset, Ordering::Relaxed);
-    partition.should_increment_offset = partition
-        .log
-        .segments()
-        .iter()
-        .any(|segment| segment.size > IggyByteSize::default());
-    partition.stats.set_current_offset(current_offset);
+    partition.recovered_durable_offset = sized_end;
+    // The OFFSET COUNTER is restored from that file name (above), but the
+    // `installed_frontier` CLAIM deliberately is not: the claim says "everything
+    // below me is represented here", and `converge_to_empty_after_failed_install`
+    // refuses to make it when staged segments were dropped -- yet a converge
+    // plants exactly the same empty `{frontier:020}.log` a legitimate empty
+    // install does, so boot provably cannot tell them apart. Re-deriving it here
+    // would hand the refused claim back: the repair floor stand-in would accept a
+    // commit floor over ops this replica holds zero bytes for, and the replica
+    // would pass the serve gate and offer that emptiness onward, making a peer
+    // unlink its own chain. Leaving it `None` costs one spurious full
+    // re-transfer on the legitimate empty-install restart; a false caught-up
+    // claim is not recoverable. A durable home for the frontier (the partition
+    // superblock already reserves a field) is what would settle it properly.
+    let counter = current_offset.unwrap_or(0);
+    partition.offset.store(counter, Ordering::Release);
+    partition.dirty_offset.store(counter, Ordering::Relaxed);
+    partition.should_increment_offset = current_offset.is_some();
+    partition.stats.set_current_offset(counter);
+    // The durable frontier is a LOWER BOUND on top of what the segments proved:
+    // it is the only carrier left when the segments that named the frontier are
+    // gone (an all-GC'd origin's install, a crash inside the swap window), and
+    // taking the max means real recovered data always wins.
+    partition.restore_offset_frontier(recovered_state.as_ref());
+    let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
@@ -2592,6 +2784,7 @@ async fn start_tcp_runtime(
             http_addr,
             &config.http,
             config.metadata.clients_table_max,
+            config.personal_access_token.max_tokens_per_user,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
@@ -3948,6 +4141,7 @@ mod tests {
             name: "node".to_owned(),
             ip: ip.to_owned(),
             advertised_address: None,
+            advertised_addresses: Vec::new(),
             replica_id: 0,
             ports: configs::ng_cluster::TransportPorts {
                 tcp,
