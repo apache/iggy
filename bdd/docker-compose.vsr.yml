@@ -29,7 +29,7 @@
 # The leader_redirection feature runs a REAL 2-node VSR cluster here
 # (initial leader = replica 0), not the legacy mock `--follower` server.
 #
-# Activated by: ./scripts/run-bdd-tests.sh --vsr <rust|python|csharp> [feature]
+# Activated by: ./scripts/run-bdd-tests.sh --vsr <sdk> [feature]
 # Must be passed LAST so its overrides win over the server/cluster files.
 
 x-server-ng-image: &server-ng-image
@@ -64,6 +64,12 @@ services:
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+
+  # The Node SDK picks the wire protocol at runtime; classic is its default,
+  # so the VSR lane has to opt in explicitly.
+  node-bdd:
+    environment:
+      - IGGY_TEST_PROTOCOL=vsr
 
   iggy-leader:
     <<: *server-ng-image

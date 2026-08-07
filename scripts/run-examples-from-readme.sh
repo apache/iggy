@@ -235,7 +235,11 @@ run_node_examples() {
 
 # shellcheck disable=SC2329
 run_go_examples() {
-    resolve_server_binary "${TARGET}"
+    # The Go SDK speaks only the VSR wire protocol.
+    # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
+    # The VSR server logs no startup line, so readiness is a connect poll.
+    SERVER_READY_PROBE="tcp"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \
@@ -247,6 +251,8 @@ run_go_examples() {
         "^go run.*--tls" \
         0 \
         ""
+
+    SERVER_READY_PROBE="log"
 }
 
 # shellcheck disable=SC2329
