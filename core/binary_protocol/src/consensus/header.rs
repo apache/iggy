@@ -119,7 +119,11 @@ pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     /// boundary, so sealing them is an SDK change on both ends; [`GenericHeader`] is
     /// the type-erased pre-dispatch view and defers to the typed parse, where
     /// [`Self::verify_frame`] runs.
-    const FRAME_SEALED: bool = true;
+    ///
+    /// Required, not defaulted: [`Self::seal`] on an unsealed type overwrites the
+    /// identity checksum with a frame checksum, and in release only a `debug_assert`
+    /// stands in the way.
+    const FRAME_SEALED: bool;
 
     /// # Errors
     /// Returns `ConsensusError` if the header fields are inconsistent.
@@ -961,6 +965,21 @@ impl ConsensusHeader for RepairPrepareHeader {
                 found: self.0.command,
             });
         }
+        // Same rule as `PrepareHeader::validate`, same reason: the regions sit inside
+        // `identity_checksum`, and a repaired prepare is journaled and later re-read
+        // as a DVC suffix entry, where `dvc_blank`'s exact-equality classification is
+        // what a dirty byte defeats. Not delegated, so the command check above stays
+        // `RepairPrepare`.
+        if self.0.reserved_frame.iter().any(|&byte| byte != 0) {
+            return Err(ConsensusError::InvalidField(
+                "repair_prepare: reserved_frame bytes must be zero".to_string(),
+            ));
+        }
+        if self.0.reserved.iter().any(|&byte| byte != 0) {
+            return Err(ConsensusError::InvalidField(
+                "repair_prepare: reserved bytes must be zero".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1028,6 +1047,8 @@ impl Default for PrepareOkHeader {
 }
 
 impl ConsensusHeader for PrepareOkHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::PrepareOk;
 
     fn checksum(&self) -> u128 {
@@ -1091,6 +1112,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for CommitHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::Commit;
 
     fn checksum(&self) -> u128 {
@@ -1150,6 +1173,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for StartViewChangeHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StartViewChange;
 
     fn checksum(&self) -> u128 {
@@ -1256,6 +1281,8 @@ const _: () = {
 pub const DVC_HEADERS_MAX: usize = 128;
 
 impl ConsensusHeader for DoViewChangeHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::DoViewChange;
 
     fn checksum(&self) -> u128 {
@@ -1315,32 +1342,44 @@ impl ConsensusHeader for DoViewChangeHeader {
 impl DoViewChangeHeader {
     /// Number of `PrepareHeader`s in the body.
     ///
-    /// Zero is valid and means "no suffix": a replica with nothing uncommitted, or a
-    /// peer predating the suffix. Both contribute numbers only.
+    /// Zero is valid and means "no suffix": a replica with nothing uncommitted
+    /// contributes numbers only.
     ///
     /// # Errors
     /// [`ConsensusError::InvalidField`] when `size` is short of the header, is not a
     /// whole number of headers, or exceeds what the bitsets can address.
     pub fn suffix_len(&self) -> Result<usize, ConsensusError> {
-        let size = self.size as usize;
-        let Some(body_len) = size.checked_sub(HEADER_SIZE) else {
-            return Err(ConsensusError::InvalidField(format!(
-                "do_view_change: size {size} is shorter than the {HEADER_SIZE}-byte header"
-            )));
-        };
-        if body_len % HEADER_SIZE != 0 {
-            return Err(ConsensusError::InvalidField(format!(
-                "do_view_change: body of {body_len} bytes is not a whole number of headers"
-            )));
-        }
-        let suffix_len = body_len / HEADER_SIZE;
-        if suffix_len > DVC_HEADERS_MAX {
-            return Err(ConsensusError::InvalidField(format!(
-                "do_view_change: {suffix_len} suffix entries exceeds the maximum {DVC_HEADERS_MAX}"
-            )));
-        }
-        Ok(suffix_len)
+        suffix_len_of("do_view_change", self.size)
     }
+}
+
+/// Body length of a suffix-carrying control frame, in whole [`PrepareHeader`]s.
+///
+/// Shared by `DoViewChange` and `StartView`: same layout, same `DVC_HEADERS_MAX`
+/// bound. `frame` only names the sender in the error text.
+///
+/// # Errors
+/// [`ConsensusError::InvalidField`] when `size` is short of the header, is not a
+/// whole number of headers, or exceeds what a view change can address.
+fn suffix_len_of(frame: &str, size: u32) -> Result<usize, ConsensusError> {
+    let size = size as usize;
+    let Some(body_len) = size.checked_sub(HEADER_SIZE) else {
+        return Err(ConsensusError::InvalidField(format!(
+            "{frame}: size {size} is shorter than the {HEADER_SIZE}-byte header"
+        )));
+    };
+    if body_len % HEADER_SIZE != 0 {
+        return Err(ConsensusError::InvalidField(format!(
+            "{frame}: body of {body_len} bytes is not a whole number of headers"
+        )));
+    }
+    let suffix_len = body_len / HEADER_SIZE;
+    if suffix_len > DVC_HEADERS_MAX {
+        return Err(ConsensusError::InvalidField(format!(
+            "{frame}: {suffix_len} suffix entries exceeds the maximum {DVC_HEADERS_MAX}"
+        )));
+    }
+    Ok(suffix_len)
 }
 
 // StartViewHeader - new view announcement (header-only)
@@ -1372,10 +1411,9 @@ pub struct StartViewHeader {
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
     /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
-    /// A peer that predates it sends zeros, decoding as `incarnation == 0`, which
-    /// the `handle_start_view` guard treats as no claim rather than as a foreign
-    /// one, so a mixed-version rolling upgrade is wire-compatible: the pre-upgrade
-    /// peer's `StartView` is judged by the view checks alone, as before the field.
+    /// Zero is "no claim", which is what `handle_start_view` keys on and what the
+    /// unsolicited completion path sends. NOT mixed-version tolerance: the frame seal
+    /// drops a pre-seal peer before any field is read (see this module's header).
     pub incarnation: u128,
 }
 const _: () = {
@@ -1391,6 +1429,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for StartViewHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StartView;
 
     fn checksum(&self) -> u128 {
@@ -1436,31 +1476,14 @@ impl StartViewHeader {
     /// Number of `PrepareHeader`s in the body: the view's suffix, high-to-low op
     /// from `op` down toward `commit`.
     ///
-    /// Zero means numbers only, which is what a peer predating the suffix sends and
-    /// what the probe-answer path sends. A backup then falls back to trusting `op`.
+    /// Zero means numbers only, which is what the probe-answer path sends. A backup
+    /// then falls back to trusting `op`.
     ///
     /// # Errors
     /// [`ConsensusError::InvalidField`] when `size` is short of the header, is not a
     /// whole number of headers, or exceeds what a view change can address.
     pub fn suffix_len(&self) -> Result<usize, ConsensusError> {
-        let size = self.size as usize;
-        let Some(body_len) = size.checked_sub(HEADER_SIZE) else {
-            return Err(ConsensusError::InvalidField(format!(
-                "start_view: size {size} is shorter than the {HEADER_SIZE}-byte header"
-            )));
-        };
-        if body_len % HEADER_SIZE != 0 {
-            return Err(ConsensusError::InvalidField(format!(
-                "start_view: body of {body_len} bytes is not a whole number of headers"
-            )));
-        }
-        let suffix_len = body_len / HEADER_SIZE;
-        if suffix_len > DVC_HEADERS_MAX {
-            return Err(ConsensusError::InvalidField(format!(
-                "start_view: {suffix_len} suffix entries exceeds the maximum {DVC_HEADERS_MAX}"
-            )));
-        }
-        Ok(suffix_len)
+        suffix_len_of("start_view", self.size)
     }
 }
 
@@ -1493,9 +1516,9 @@ pub struct RequestStartViewHeader {
     /// `StartView` so a reply from a previous incarnation is detectable.
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
-    /// lands 16-aligned with no padding WITHOUT moving `namespace`. A peer that
-    /// predates it sends zeros, decoding as `incarnation == 0`, so a mixed-version
-    /// rolling upgrade is wire-compatible.
+    /// lands 16-aligned with no padding WITHOUT moving `namespace`. Zero is "no claim
+    /// to echo"; see [`StartViewHeader::incarnation`] on why that is not
+    /// mixed-version tolerance.
     pub incarnation: u128,
 }
 const _: () = {
@@ -1511,6 +1534,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestStartViewHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestStartView;
 
     fn checksum(&self) -> u128 {
@@ -1583,6 +1608,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestPreparesHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestPrepares;
 
     fn checksum(&self) -> u128 {
@@ -1654,6 +1681,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for RepairRangeReplyHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RepairDone;
 
     fn checksum(&self) -> u128 {
@@ -1734,6 +1763,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestStateTransferHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestStateTransfer;
 
     fn checksum(&self) -> u128 {
@@ -1856,6 +1887,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StateTransferTarget;
 
     fn checksum(&self) -> u128 {
@@ -1955,6 +1988,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestStateChunkHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestStateChunk;
 
     fn checksum(&self) -> u128 {
@@ -2037,6 +2072,8 @@ const _: () = {
 };
 
 impl ConsensusHeader for StateChunkHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StateChunk;
 
     fn checksum(&self) -> u128 {

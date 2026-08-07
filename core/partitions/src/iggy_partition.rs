@@ -5638,11 +5638,11 @@ mod tests {
             "a batch that fails its own checksum must fault-close"
         );
 
-        // The knob is really a knob: with verification off the same bytes serve.
+        // What the opt-out costs. The shipped default is `true` because of it.
         let outcome = plan(false).read_disk(query).await;
         assert!(
             matches!(outcome, DiskReadOutcome::Matched { .. }),
-            "with verification off the corrupt batch is served"
+            "verification off is an explicit opt-out: the corrupt batch is served"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

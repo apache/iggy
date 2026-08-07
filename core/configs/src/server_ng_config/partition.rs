@@ -148,7 +148,11 @@ impl Validatable<ConfigurationError> for PartitionConfig {
         }
         if self.prepare_queue_depth > MAX_PARTITION_PREPARE_QUEUE_DEPTH {
             eprintln!(
-                "{COMPONENT_NG} partition.prepare_queue_depth ({}) exceeds the maximum ({MAX_PARTITION_PREPARE_QUEUE_DEPTH})",
+                "{COMPONENT_NG} partition.prepare_queue_depth ({}) exceeds the maximum \
+                 ({MAX_PARTITION_PREPARE_QUEUE_DEPTH}). The ceiling is the view-change wire, not memory: \
+                 a DoViewChange describes the uncommitted suffix with one bit per op in a u128 \
+                 bitset, and this depth bounds that suffix. Deeper produces entries a new \
+                 primary can neither adopt nor prove dead. Lowered from 256; not raisable.",
                 self.prepare_queue_depth
             );
             return Err(ConfigurationError::InvalidConfigurationValue);

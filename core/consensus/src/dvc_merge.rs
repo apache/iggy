@@ -28,7 +28,7 @@
 #[cfg(test)]
 use crate::view_change_quorum::DvcSuffix;
 use crate::view_change_quorum::{DvcQuorumArray, StoredDvc, dvc_count, dvc_iter};
-use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::{CHECKSUM_UNSEALED, PrepareHeader};
 
 /// Sizes the merge needs from the replica.
 #[derive(Debug, Clone, Copy)]
@@ -83,8 +83,8 @@ pub struct MergedLog {
     /// Canonical headers for `commit_max..=op_head`, ordered high-to-low op.
     /// The new primary installs these over its own log.
     pub headers: Vec<PrepareHeader>,
-    /// Headers non-canonical senders report committed. Installed unconditionally,
-    /// because header repair will not cross a gap to reach them later.
+    /// Headers non-canonical senders report committed and the canonical chain
+    /// corroborates. See [`committed_elsewhere`].
     pub committed_elsewhere: Vec<PrepareHeader>,
 }
 
@@ -290,24 +290,32 @@ fn canonical_headers(
     Some(headers)
 }
 
-/// Headers that a non-canonical sender reports committed.
+/// Headers a non-canonical sender reports committed, corroborated by the canonical
+/// chain.
 ///
-/// Trusted on that sender's word alone, unlike anything above its commit point:
-/// header repair walks the chain backwards and stops at a gap, so an op missing
-/// below the new primary's commit point can never be repaired into place and
-/// refusing it here strands the log permanently. The claim is already
-/// quorum-backed, since a sender cannot report an op committed unless a
-/// replication quorum held it.
+/// Needed because header repair stops at a gap, so an op missing below the new
+/// primary's commit point can never be repaired into place.
 ///
-/// `None` when two senders report *different* prepares committed at one op. These
-/// install unconditionally, so guessing is least affordable here; as in
-/// [`canonical_header_at`], the caller treats it as undecidable.
+/// But a sender's `commit` is not proof: `commit_max` advances from the primary's
+/// claim without checking the local log matches, and reconcile leaves a divergent
+/// entry at or below the applied floor in place. So a replica can honestly report
+/// `commit >= N` holding a header at N that never committed. Nothing journals these,
+/// but they pin the repair gate: the genuine repaired prepare then mismatches and is
+/// discarded, and the view change stalls at N.
+///
+/// So each candidate must be the `parent` the entry one op above names, walking down
+/// from the canonical window: the canonical senders vouch, not the offering sender.
+/// One that chains to nothing is dropped, leaving the op unconstrained for repair
+/// rather than pinned to an unconfirmable header. Unsealed on either side passes.
+///
+/// `None` when two senders report *different* prepares committed at one op: as in
+/// [`canonical_header_at`], undecidable.
 fn committed_elsewhere(
     quorum: &DvcQuorumArray,
     canonical_log_view: u32,
     already_installed: &[PrepareHeader],
 ) -> Option<Vec<PrepareHeader>> {
-    let mut extra: Vec<PrepareHeader> = Vec::new();
+    let mut claimed: Vec<PrepareHeader> = Vec::new();
     for dvc in dvc_iter(quorum).filter(|dvc| dvc.log_view < canonical_log_view) {
         for (index, header) in dvc.suffix.headers().iter().enumerate() {
             if header.op > dvc.commit {
@@ -322,7 +330,7 @@ fn committed_elsewhere(
             {
                 continue;
             }
-            if let Some(queued) = extra.iter().find(|queued| queued.op == header.op) {
+            if let Some(queued) = claimed.iter().find(|queued| queued.op == header.op) {
                 if queued.checksum != header.checksum {
                     tracing::error!(
                         op = header.op,
@@ -334,8 +342,42 @@ fn committed_elsewhere(
                 }
                 continue;
             }
-            extra.push(*header);
+            claimed.push(*header);
         }
+    }
+
+    // Descending, so the entry a candidate must parent is already canonical or
+    // already corroborated.
+    claimed.sort_unstable_by_key(|header| std::cmp::Reverse(header.op));
+    let mut extra: Vec<PrepareHeader> = Vec::new();
+    for header in claimed {
+        let child = already_installed
+            .iter()
+            .chain(extra.iter())
+            .find(|candidate| candidate.op == header.op + 1);
+        let Some(child) = child else {
+            tracing::warn!(
+                op = header.op,
+                "op {} reported committed but nothing in the view's log chains to it; \
+                 leaving it unconstrained for repair",
+                header.op
+            );
+            continue;
+        };
+        if child.parent != header.checksum
+            && child.parent != CHECKSUM_UNSEALED
+            && header.checksum != CHECKSUM_UNSEALED
+        {
+            tracing::warn!(
+                op = header.op,
+                child_op = child.op,
+                "op {} reported committed but the entry above does not name it as parent; \
+                 dropping the claim",
+                header.op
+            );
+            continue;
+        }
+        extra.push(header);
     }
     Some(extra)
 }
@@ -723,11 +765,13 @@ mod tests {
     #[test]
     fn given_committed_header_on_a_stale_sender_should_be_installed_anyway() {
         // Replica 0 is behind on log_view but reports op 2 committed. The canonical
-        // window starts at 3, so op 2 is otherwise unreachable across the gap.
+        // window starts at 3, so op 2 is otherwise unreachable across the gap. Its
+        // header is genuine (a `view` stamp is when the entry was appended, not the
+        // sender's `log_view`), so op 3 names it as parent.
         let mut quorum = dvc_quorum_array_empty();
         dvc_record(
             &mut quorum,
-            dvc(0, 1, 2, 2, suffix_all_present(suffix_headers(2, 2, 1))),
+            dvc(0, 1, 2, 2, suffix_all_present(suffix_headers(2, 2, 2))),
         );
         dvc_record(
             &mut quorum,
@@ -740,6 +784,32 @@ mod tests {
         assert!(
             log.committed_elsewhere.iter().any(|header| header.op == 2),
             "a committed header from a stale sender must still be installed"
+        );
+    }
+
+    #[test]
+    fn given_a_committed_claim_the_canonical_log_does_not_chain_to_should_be_dropped() {
+        // A replica can honestly report `commit >= 2` while holding a header at 2
+        // that never committed. Installing it pins the repair gate: the genuine
+        // repaired prepare then mismatches, and the view change stalls at op 2.
+        let mut quorum = dvc_quorum_array_empty();
+        let mut impostor = prepare(2, 2);
+        impostor.checksum ^= 0xFF;
+        dvc_record(
+            &mut quorum,
+            dvc(0, 1, 2, 2, suffix_all_present(vec![impostor])),
+        );
+        dvc_record(
+            &mut quorum,
+            dvc(1, 2, 4, 3, suffix_all_present(suffix_headers(3, 4, 2))),
+        );
+
+        let MergeOutcome::Ready(log) = merge_dvc_quorum(&quorum, quorums_r3()) else {
+            panic!("the view must start");
+        };
+        assert!(
+            log.committed_elsewhere.is_empty(),
+            "a claim the canonical log does not chain to must not pin the repair gate"
         );
     }
 

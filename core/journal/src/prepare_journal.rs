@@ -742,6 +742,10 @@ impl PrepareJournal {
     clippy::future_not_send
 )]
 impl Journal<FileStorage> for PrepareJournal {
+    fn last_op(&self) -> Option<u64> {
+        self.last_op.get()
+    }
+
     /// Remove every entry at or above `from_op`, leaving the snapshot floor where
     /// it is. Returns how many entries went.
     ///

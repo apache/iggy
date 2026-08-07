@@ -176,10 +176,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     where
         Self: 'a;
 
-    /// The simulated journal retains everything for the run, so nothing is
-    /// ever superseded by a snapshot. Answered explicitly (the trait has no
-    /// default) so a simulated state transfer has to opt into a watermark
-    /// rather than silently inherit one that never moves.
+    fn last_op(&self) -> Option<u64> {
+        self.last_op.get()
+    }
+
     /// Drop the suffix, so a simulated backup whose entries disagree with a started
     /// view reconciles the way a real one does. Mirrors
     /// `PrepareJournal::truncate_from`, whose watermark stays put; here it never moves.
@@ -207,6 +207,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         Ok(doomed.len())
     }
 
+    /// The simulated journal retains everything for the run, so nothing is
+    /// ever superseded by a snapshot. Answered explicitly (the trait has no
+    /// default) so a simulated state transfer has to opt into a watermark
+    /// rather than silently inherit one that never moves.
     fn snapshot_op(&self) -> u64 {
         0
     }

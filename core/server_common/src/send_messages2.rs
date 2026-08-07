@@ -678,23 +678,36 @@ fn transcode_legacy_request(
 /// chunk and steps by `batch_length`. Callers whose buffer is meant to BE the
 /// batch must reject the surplus themselves - see [`convert_request_message`].
 pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
-    decode_batch_slice_verified(body, true)
+    decode_batch_slice_with(body, BatchIntegrity::Verify)
 }
 
-/// [`decode_batch_slice`] with the checksum check made optional.
+/// How much of a batch record [`decode_batch_slice_with`] proves before returning it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchIntegrity {
+    /// Re-hash the batch and reject it unless it matches its own `batch_checksum`.
+    Verify,
+    /// Check the framing only, and hand back whatever it describes. The caller is
+    /// accepting bytes that may not be the ones written.
+    LayoutOnly,
+}
+
+/// [`decode_batch_slice`] with the integrity level chosen by the caller.
 ///
-/// `verify_checksum` exists for the disk-poll path, whose operator knob decides
-/// whether a read pays for a full re-hash of every batch. The layout checks are not
-/// optional either way: a short or self-inconsistent record is rejected regardless,
-/// because the caller would otherwise index past it.
+/// An enum, not a bool: the one caller that passes anything but
+/// [`BatchIntegrity::Verify`] is the disk poll under its operator knob, and
+/// `..., false)` there reads like a detail rather than opting a read out of
+/// corruption detection.
+///
+/// Layout checks are not optional either way: a short or self-inconsistent record is
+/// rejected regardless, because the caller would otherwise index past it.
 ///
 /// # Errors
 /// [`IggyError::InvalidCommand`] for a short or inconsistent record, and
-/// [`IggyError::InvalidBatchChecksum`] when verification is on and the batch does not
-/// match. Callers that must tell corruption from a partial tail need both.
-pub fn decode_batch_slice_verified(
+/// [`IggyError::InvalidBatchChecksum`] under [`BatchIntegrity::Verify`] when the batch
+/// does not match. Callers that must tell corruption from a partial tail need both.
+pub fn decode_batch_slice_with(
     body: &[u8],
-    verify_checksum: bool,
+    integrity: BatchIntegrity,
 ) -> Result<SendMessages2Ref<'_>, IggyError> {
     if body.len() < COMMAND_HEADER_SIZE {
         return Err(IggyError::InvalidCommand);
@@ -708,17 +721,18 @@ pub fn decode_batch_slice_verified(
 
     let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
     let batch = SendMessages2Ref { header, blob };
-    if verify_checksum {
-        let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
-        if header.batch_checksum != expected_checksum {
-            return Err(IggyError::InvalidBatchChecksum(
-                header.batch_checksum,
-                expected_checksum,
-                header.base_offset,
-            ));
+    match integrity {
+        BatchIntegrity::Verify => {
+            let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
+            if header.batch_checksum != expected_checksum {
+                return Err(IggyError::InvalidBatchChecksum(
+                    header.batch_checksum,
+                    expected_checksum,
+                    header.base_offset,
+                ));
+            }
         }
-    } else {
-        validate_batch_layout(&batch)?;
+        BatchIntegrity::LayoutOnly => validate_batch_layout(&batch)?,
     }
 
     Ok(batch)

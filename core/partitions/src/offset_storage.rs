@@ -17,7 +17,7 @@
 
 use compio::{
     fs::{OpenOptions, create_dir_all, remove_file},
-    io::{AsyncReadAtExt, AsyncWriteAtExt},
+    io::{AsyncReadAt, AsyncReadAtExt, AsyncWriteAtExt},
 };
 use iggy_common::{IggyError, calculate_checksum};
 use std::path::Path;
@@ -153,16 +153,39 @@ pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Res
 /// tracker knows the file's value, warm commits persist with a blind
 /// [`persist_offset`] and skip covered offsets without reading.
 ///
+/// A file that fails its checksum folds as absent and is overwritten. Its value is
+/// untrusted and the boot loader already discarded it, so nothing is preserved by
+/// refusing, and refusing is not survivable: the caller reads a failed commit as
+/// divergence and aborts the shard, and the key is cold on every boot, so one damaged
+/// file aborts every boot. Redelivery is within at-least-once.
+///
 /// # Errors
-/// [`IggyError`] when the file cannot be read or written, or when the value on disk
-/// fails its checksum: folding against a cursor provably not the one written could
-/// rewind or skip the consumer.
+/// [`IggyError`] when the file cannot be read or written.
 pub async fn persist_offset_max(
     path: &str,
     offset: u64,
     enforce_fsync: bool,
 ) -> Result<u64, IggyError> {
-    let on_disk = read_persisted_offset(path).await?;
+    let on_disk = match read_offset_record(path).await? {
+        Some(OffsetRecord::Value { offset, .. }) => Some(offset),
+        Some(OffsetRecord::Corrupt {
+            offset: stored,
+            expected,
+            found,
+        }) => {
+            tracing::error!(
+                path,
+                stored,
+                expected,
+                found,
+                fold_to = offset,
+                "consumer offset file failed its checksum; overwriting it with the committed \
+                 offset. This consumer may see redelivery."
+            );
+            None
+        }
+        Some(OffsetRecord::Torn) | None => None,
+    };
     let effective = on_disk.map_or(offset, |current| current.max(offset));
     if on_disk != Some(effective) {
         persist_offset(path, effective, enforce_fsync).await?;
@@ -274,62 +297,29 @@ pub async fn read_purge_generation(path: &str, created_revision: u64) -> Result<
     Ok(generation)
 }
 
-/// Read a single persisted consumer offset. `None` if the file is absent or
-/// torn (shorter than 8 bytes): a crash between `persist_offset`'s truncate
-/// and write leaves a short file, and the boot-time loader already skips such
-/// files, so the commit-path reader must agree or a torn file turns every
-/// later commit-apply into an error. Real I/O errors still propagate: mapping
-/// them to `None` would silently rewind a valid higher offset.
+/// Read whatever a consumer-offset file holds. `None` only when absent; a short file
+/// reports [`OffsetRecord::Torn`] and the caller folds it as the boot loader does.
 ///
-/// A checksum mismatch is an error, not `None`. `None` means "no offset recorded",
-/// which the caller folds as `max(absent, incoming)` and overwrites; doing that to a
-/// failed-checksum file discards a cursor that may have been far ahead.
-async fn read_persisted_offset(path: &str) -> Result<Option<u64>, IggyError> {
-    if !Path::new(path).exists() {
+/// Real I/O errors propagate: unlike a failed checksum, an unreadable file may still
+/// hold an intact cursor, and folding it as absent would rewind the consumer.
+async fn read_offset_record(path: &str) -> Result<Option<OffsetRecord>, IggyError> {
+    // Absence answered by the open, not a `Path::exists()` probe: that is a BLOCKING
+    // stat on the pump before every cold-key commit (see `persist_offset`).
+    let file = match OpenOptions::new().read(true).open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(IggyError::CannotOpenConsumerOffsetsFile(path.to_owned())),
+    };
+    // One short read, not `read_exact` twice: `decode_offset_record` classifies any
+    // length, so the returned count separates a legacy 8-byte file from a full
+    // record. `..read` matters: the zero padding would otherwise decode as a
+    // checksum and the legacy file as `Corrupt`.
+    let compio::BufResult(read, buf) = file.read_at(vec![0u8; OFFSET_RECORD_SIZE], 0).await;
+    let read = read.map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
+    if read == 0 {
         return Ok(None);
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .await
-        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    // Read the whole record, falling back to a bare offset: a pre-checksum file is
-    // exactly `OFFSET_SIZE` long, so the first read reports EOF rather than failing.
-    let compio::BufResult(read, buf) = file.read_exact_at(vec![0u8; OFFSET_RECORD_SIZE], 0).await;
-    let bytes = match read {
-        Ok(()) => buf,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            let compio::BufResult(read, legacy) =
-                file.read_exact_at(vec![0u8; OFFSET_SIZE], 0).await;
-            match read {
-                Ok(()) => legacy,
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok(None);
-                }
-                Err(_) => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
-            }
-        }
-        Err(_) => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
-    };
-    match decode_offset_record(&bytes) {
-        OffsetRecord::Value { offset, .. } => Ok(Some(offset)),
-        OffsetRecord::Torn => Ok(None),
-        OffsetRecord::Corrupt {
-            offset,
-            expected,
-            found,
-        } => {
-            tracing::error!(
-                path,
-                offset,
-                expected,
-                found,
-                "consumer offset file failed its checksum; refusing to fold a value that may \
-                 rewind or skip the consumer"
-            );
-            Err(IggyError::CannotReadConsumerOffsets(path.to_owned()))
-        }
-    }
+    Ok(Some(decode_offset_record(&buf[..read])))
 }
 
 /// Unlink a persisted consumer-offset file. A no-op if the file is absent.
@@ -424,7 +414,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn read_persisted_offset_rejects_a_corrupt_file() {
+    async fn read_offset_record_reports_a_corrupt_file_as_corrupt() {
         let dir = unique_temp_dir();
         let path = dir.join("42").to_string_lossy().into_owned();
 
@@ -433,73 +423,89 @@ mod tests {
         bytes[0] ^= 0x01;
         std::fs::write(&path, &bytes).expect("corrupt the file");
 
-        let result = read_persisted_offset(&path).await;
+        let result = read_offset_record(&path).await;
         assert!(
-            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
-            "a corrupt cursor must not fold as absent, got {result:?}"
+            matches!(result, Ok(Some(OffsetRecord::Corrupt { .. }))),
+            "a corrupt cursor must be distinguishable from an absent one, got {result:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[compio::test]
-    async fn read_persisted_offset_reads_a_legacy_bare_value() {
+    async fn read_offset_record_reads_a_legacy_bare_value() {
         let dir = unique_temp_dir();
         let path = dir.join("42").to_string_lossy().into_owned();
         std::fs::write(&path, 114u64.to_le_bytes()).expect("write legacy file");
 
-        let read = read_persisted_offset(&path).await.expect("legacy file");
-        assert_eq!(read, Some(114));
+        let read = read_offset_record(&path).await.expect("legacy file");
+        assert_eq!(
+            read,
+            Some(OffsetRecord::Value {
+                offset: 114,
+                checksummed: false
+            })
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[compio::test]
-    async fn read_persisted_offset_absent_file_is_none() {
+    async fn read_offset_record_absent_file_is_none() {
         let dir = unique_temp_dir();
         let path = dir.join("42").to_string_lossy().into_owned();
 
-        let read = read_persisted_offset(&path).await.expect("absent file");
+        let read = read_offset_record(&path).await.expect("absent file");
         assert_eq!(read, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[compio::test]
-    async fn read_persisted_offset_round_trips_persisted_value() {
+    async fn read_offset_record_round_trips_persisted_value() {
         let dir = unique_temp_dir();
         let path = dir.join("42").to_string_lossy().into_owned();
 
         persist_offset(&path, 114, false).await.expect("persist");
-        let read = read_persisted_offset(&path).await.expect("valid file");
-        assert_eq!(read, Some(114));
+        let read = read_offset_record(&path).await.expect("valid file");
+        assert_eq!(
+            read,
+            Some(OffsetRecord::Value {
+                offset: 114,
+                checksummed: true
+            })
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[compio::test]
-    async fn read_persisted_offset_torn_file_is_none_not_error() {
+    async fn read_offset_record_torn_file_is_torn_not_error() {
         let dir = unique_temp_dir();
         let path = dir.join("42").to_string_lossy().into_owned();
         std::fs::write(&path, [0xAB, 0xCD, 0xEF]).expect("write torn file");
 
-        let read = read_persisted_offset(&path)
+        let read = read_offset_record(&path)
             .await
             .expect("torn file must not error the commit path");
-        assert_eq!(read, None, "short read maps to None like the boot loader");
+        assert_eq!(
+            read,
+            Some(OffsetRecord::Torn),
+            "a short file folds as absent, like the boot loader, but is not silence"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[compio::test]
-    async fn read_persisted_offset_real_io_error_propagates() {
+    async fn read_offset_record_real_io_error_propagates() {
         // A directory opens read-only but every read fails with EISDIR: a real
         // I/O error, not a short read. It must surface as Err, never as None
         // (a blanket None would silently rewind a valid higher offset).
         let dir = unique_temp_dir();
         let path = dir.to_string_lossy().into_owned();
 
-        let result = read_persisted_offset(&path).await;
+        let result = read_offset_record(&path).await;
         assert!(
             matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
             "real I/O error must propagate, got {result:?}",
@@ -600,8 +606,48 @@ mod tests {
         persist_offset_max(&path, 7, false)
             .await
             .expect("torn file folds as absent");
-        let read = read_persisted_offset(&path).await.expect("repaired file");
-        assert_eq!(read, Some(7));
+        let read = read_offset_record(&path).await.expect("repaired file");
+        assert_eq!(
+            read,
+            Some(OffsetRecord::Value {
+                offset: 7,
+                checksummed: true
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crash-loop guard: a fold against a failed-checksum file must repair it,
+    /// not fail the commit. The caller aborts the shard on a failed commit, and the
+    /// key is cold on every boot, so the abort would repeat.
+    #[compio::test]
+    async fn persist_offset_max_overwrites_a_corrupt_file_instead_of_failing() {
+        let dir = unique_temp_dir();
+        let path = dir.join("42").to_string_lossy().into_owned();
+
+        persist_offset(&path, 114, false).await.expect("persist");
+        let mut bytes = std::fs::read(&path).expect("offset file exists");
+        bytes[0] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("corrupt the file");
+
+        let folded = persist_offset_max(&path, 7, false)
+            .await
+            .expect("a corrupt file must not fail the commit");
+        assert_eq!(
+            folded, 7,
+            "the untrusted stored value must not win the fold"
+        );
+
+        let read = read_offset_record(&path).await.expect("repaired file");
+        assert_eq!(
+            read,
+            Some(OffsetRecord::Value {
+                offset: 7,
+                checksummed: true
+            }),
+            "the corrupt file must be repaired in place, not left to trip the next commit"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -527,10 +527,12 @@ path = "partitions"
 enforce_fsync = false
 
 # Enables checksum validation for data integrity (boolean).
-# TODO(hubcio): inert in server-ng, which never verifies checksums on load
-# whatever this says - `true` buys no corruption guard here. Boot warns when
-# set.
-validate_checksum = false
+# `true` re-hashes every batch a disk poll reads and fails the poll closed on a
+# mismatch, so a segment damaged at rest is reported instead of served.
+# `false` skips the re-hash and serves whatever decodes, which hands a consumer
+# bytes provably not the ones written. Only turn it off with a corruption guard
+# somewhere else in the stack.
+validate_checksum = true
 
 # The count threshold of buffered messages before triggering a save to disk.
 # Together with `size_of_messages_required_to_save` it defines the threshold.

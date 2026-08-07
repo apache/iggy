@@ -202,34 +202,16 @@ where
     Ok(current_op)
 }
 
-/// Compute a prepare's identity checksum: which prepare this is, independent of
-/// which view re-sent it.
-///
-/// `view` is excluded from the covered bytes even though the frame checksum covers
-/// it, because `restamp_prepare_view` rewrites `view` in place to clear the
-/// receiver's `header.view < view` fence. Covering it would give one logical op a
-/// different checksum per replica, and the merge would read those as competing
-/// prepares nacking each other. Not merely a workaround either: two frames
-/// differing only in `view` ARE the same op, and everything that makes them
-/// genuinely different (client, request, timestamp, parent, operation, or the body
-/// via `checksum_body`) stays covered.
-///
-/// `checksum_body` must already be set, since it is how the body reaches this
-/// value. A prepare left unsealed there gets an identity over its header alone.
-#[must_use]
-pub fn prepare_identity_checksum(header: &PrepareHeader) -> u128 {
-    header.identity_checksum()
-}
-
-/// Stamp [`prepare_identity_checksum`] into a freshly built prepare.
+/// Stamp [`PrepareHeader::identity_checksum`] into a freshly built prepare.
 ///
 /// Call once, after every other field is final: the checksum covers them.
+/// `checksum_body` in particular, since that is how the body reaches the value.
 ///
 /// # Panics
 /// If the message is shorter than its own header.
 #[must_use]
 pub fn seal_prepare_checksum(mut message: Message<PrepareHeader>) -> Message<PrepareHeader> {
-    let checksum = prepare_identity_checksum(message.header());
+    let checksum = message.header().identity_checksum();
     let bytes = &mut message.as_mut_slice()[..size_of::<PrepareHeader>()];
     let header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(bytes)
         .expect("a prepare header round-trips its own bit pattern");
@@ -935,8 +917,8 @@ mod tests {
         };
         let restamped = PrepareHeader { view: 12, ..base };
         assert_eq!(
-            prepare_identity_checksum(&base),
-            prepare_identity_checksum(&restamped),
+            base.identity_checksum(),
+            restamped.identity_checksum(),
             "view must not participate in a prepare's identity"
         );
     }
@@ -956,8 +938,8 @@ mod tests {
         };
         let second = PrepareHeader { client: 2, ..first };
         assert_ne!(
-            prepare_identity_checksum(&first),
-            prepare_identity_checksum(&second),
+            first.identity_checksum(),
+            second.identity_checksum(),
             "distinct prepares at the same op must not share an identity"
         );
 
@@ -966,8 +948,8 @@ mod tests {
             ..first
         };
         assert_ne!(
-            prepare_identity_checksum(&first),
-            prepare_identity_checksum(&body_differs),
+            first.identity_checksum(),
+            body_differs.identity_checksum(),
             "the body reaches the identity through checksum_body"
         );
     }
@@ -1481,9 +1463,24 @@ mod tests {
     }
 
     #[test]
+    fn given_a_suffix_with_mixed_view_stamps_when_decoding_should_be_accepted() {
+        // A stitched suffix: a held op keeps the view that delivered it, a repaired
+        // neighbour carries the view that decided it. Rejecting drops the sender's
+        // vote forever (the retransmit is byte-identical) and the cluster can fail to
+        // elect. No re-seal: `identity_checksum` excludes `view`.
+        let mut headers = suffix_headers(2, 4, 2);
+        headers[1].view = 1;
+        let body = encode_body(&headers);
+
+        let suffix = crate::dvc_suffix_decode(&body, 4, 0, 0)
+            .expect("a stitched suffix with mixed view stamps must decode");
+        assert_eq!(suffix.len(), 3);
+    }
+
+    #[test]
     fn given_an_unsealed_suffix_when_decoding_should_be_accepted() {
-        // A pre-sealing peer sends the unsealed sentinel. Rejecting those breaks
-        // rolling upgrades, so identity and chain checks skip them: no evidence.
+        // The on-disk sentinel: suffixes are read out of the journal, which may hold
+        // pre-seal entries, and partition-plane prepares are unsealed by construction.
         let headers: Vec<PrepareHeader> = suffix_headers(2, 4, 1)
             .into_iter()
             .map(|mut header| {

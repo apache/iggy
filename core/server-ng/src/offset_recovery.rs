@@ -192,6 +192,10 @@ fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> 
         }
         // Skipped rather than loaded: resuming from a cursor provably not the one
         // written reads as ordinary redelivery or a gap, never as corruption.
+        //
+        // And unlinked, not just skipped: the offset map starts cold every boot, so a
+        // file left behind is re-read by the first auto-commit and trips the commit
+        // path again.
         OffsetRecord::Corrupt {
             offset,
             expected,
@@ -200,8 +204,14 @@ fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> 
             error!(
                 "{COMPONENT} - {offset_kind} file failed its checksum \
                  (offset: {offset}, expected: {expected}, found: {found}), \
-                 path: {path}, skipping."
+                 path: {path}, removing it and resuming this consumer from the start."
             );
+            if let Err(e) = std::fs::remove_file(path) {
+                error!(
+                    "{COMPONENT} (error: {e}) - could not remove the corrupt \
+                     {offset_kind} file, path: {path}; remove it manually."
+                );
+            }
             None
         }
     }

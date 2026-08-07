@@ -17,7 +17,7 @@
 
 use crate::REPLICAS_MAX;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, DVC_HEADERS_MAX, Operation, PrepareHeader,
+    CHECKSUM_UNSEALED, Command2, ConsensusHeader, DVC_HEADERS_MAX, Operation, PrepareHeader,
 };
 
 /// Write prepare headers into a control-message body, high-to-low op.
@@ -271,8 +271,6 @@ pub enum DvcSuffixError {
     BitsetBeyondSuffix { count: usize },
     /// An entry's identity checksum does not match its own contents.
     ChecksumMismatch { index: usize },
-    /// A lower entry claims a view newer than the entry above it.
-    ViewRegressed { index: usize },
     /// A lower entry claims a timestamp at or after the entry above it.
     TimestampNotDecreasing { index: usize },
     /// Consecutive entries do not hash-chain.
@@ -312,10 +310,6 @@ impl std::fmt::Display for DvcSuffixError {
             Self::ChecksumMismatch { index } => write!(
                 f,
                 "do_view_change suffix entry {index} does not match its own identity checksum"
-            ),
-            Self::ViewRegressed { index } => write!(
-                f,
-                "do_view_change suffix entry {index} claims a newer view than the entry above it"
             ),
             Self::TimestampNotDecreasing { index } => write!(
                 f,
@@ -384,6 +378,13 @@ pub fn dvc_suffix_decode(
         let chunk = &body[index * header_size..(index + 1) * header_size];
         let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(chunk)
             .map_err(|_| DvcSuffixError::MalformedHeader { index })?;
+        // The cast proves the enums, not the reserved regions. A dirty reserved byte
+        // with `checksum == 0` reads as Valid here (blanks are classified by exact
+        // struct equality) AND skips the identity recompute below, so it conflicts
+        // with every honest header at that op and no canonical one can be picked.
+        header
+            .validate()
+            .map_err(|_| DvcSuffixError::MalformedHeader { index })?;
         let expected = head_op
             .checked_sub(index as u64)
             .ok_or(DvcSuffixError::OpOutOfOrder {
@@ -403,18 +404,24 @@ pub fn dvc_suffix_decode(
             // Recompute rather than trust the field. Otherwise one bit flipped in
             // transit becomes a canonical header no replica holds, honest senders
             // read as disagreeing, and a corrupted frame turns into a nack quorum
-            // against a committed op. A pre-sealing peer's sentinel is skipped.
+            // against a committed op. The on-disk sentinel is skipped: a suffix is read
+            // out of the journal, which may hold entries a pre-seal build wrote, and
+            // partition-plane prepares are unsealed by construction.
             if header.checksum != CHECKSUM_UNSEALED && header.identity_checksum() != header.checksum
             {
                 return Err(DvcSuffixError::ChecksumMismatch { index });
             }
             if let Some(child) = child {
-                // Views never go backwards down the log, timestamps never forwards,
-                // and consecutive entries hash-chain. A frame breaking any of these
-                // describes a log that cannot exist.
-                if header.view > child.view {
-                    return Err(DvcSuffixError::ViewRegressed { index });
-                }
+                // Timestamps never run forwards down the log, and consecutive entries
+                // hash-chain. A frame breaking either describes a log that cannot exist.
+                //
+                // `view` is NOT checked. Monotone along one log, but a suffix is two:
+                // `build_dvc_suffix` stitches the journal over the adopted view's
+                // headers, and `restamp_prepare_view` rewrites `view` in place, so a
+                // held op keeps whichever view delivered it. A hole below one is enough
+                // to make an honest sender's suffix look regressed, and rejecting drops
+                // its vote forever (the retransmit is byte-identical). Nothing reads a
+                // suffix entry's `view`; the merge ranks by the message's `log_view`.
                 if header.timestamp >= child.timestamp {
                     return Err(DvcSuffixError::TimestampNotDecreasing { index });
                 }

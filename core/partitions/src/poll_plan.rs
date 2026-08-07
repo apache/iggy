@@ -39,7 +39,7 @@ use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
 };
 use server_common::iobuf::{Frozen, Owned};
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, decode_batch_slice_verified};
+use server_common::send_messages2::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
 use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 use std::rc::Rc;
@@ -286,12 +286,18 @@ impl PollPlan {
                     crate::journal::select_resident(&resident_tail.entries, query)
                         .unwrap_or_else(|| (PollFragments::new(), None))
                 }
-                // Disk read stopped on an IO fault. Fail-closed: return an empty
-                // poll WITHOUT the journal-forward fallback. Falling forward
-                // here would splice the next resident op over the unreadable run
-                // and silently skip live data; the fault instead surfaces as a
-                // visibly stuck consumer that recovers on a later poll once the
-                // segment reads again.
+                // Disk read stopped on a fault. Fail-closed: return an empty poll
+                // WITHOUT the journal-forward fallback. Falling forward here would
+                // splice the next resident op over the unreadable run and silently
+                // skip live data.
+                //
+                // TODO(partitions): the poll reply has no error channel, so this
+                // reaches the consumer as an ordinary empty poll. Fair for a transient
+                // IO fault, wrong for a batch that failed its own checksum: data
+                // damaged at rest never reads again, so the consumer waits forever.
+                // Surfacing it needs a status on the poll reply, an SDK-visible change
+                // on every client. Until then the ERROR in `walk_disk_chunk` is the
+                // only signal, and it is server-side only.
                 DiskReadOutcome::Faulted => (PollFragments::new(), None),
                 // Straddle: continue past the last disk match into the resident
                 // tail (gate + race argument live on `straddle_continuation`).
@@ -543,7 +549,11 @@ impl DiskReadPlan {
                     &mut matched,
                     &mut fragments,
                     &mut last_matching_offset,
-                    self.validate_checksum,
+                    if self.validate_checksum {
+                        BatchIntegrity::Verify
+                    } else {
+                        BatchIntegrity::LayoutOnly
+                    },
                     self.namespace_raw,
                 );
                 if corrupt {
@@ -903,14 +913,14 @@ fn walk_disk_chunk(
     matched: &mut u32,
     fragments: &mut PollFragments<4096>,
     last_matching_offset: &mut Option<u64>,
-    validate_checksum: bool,
+    integrity: BatchIntegrity,
     namespace_raw: u64,
 ) -> ChunkWalk {
     let bytes: &[u8] = chunk;
     let mut cursor = 0usize;
 
     while *matched < count && cursor + COMMAND_HEADER_SIZE <= bytes.len() {
-        let batch = match decode_batch_slice_verified(&bytes[cursor..], validate_checksum) {
+        let batch = match decode_batch_slice_with(&bytes[cursor..], integrity) {
             Ok(batch) => batch,
             Err(IggyError::InvalidBatchChecksum(found, expected, base_offset)) => {
                 // Distinguished from the incomplete-tail case below: this batch is

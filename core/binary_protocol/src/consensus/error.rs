@@ -30,7 +30,15 @@ pub enum ConsensusError {
     InvalidChecksum,
 
     #[error(
-        "{command:?}: header checksum {found:#034x} does not cover the frame (expected {expected:#034x})"
+        "{command:?}: header checksum {found:#034x} does not cover the frame (expected \
+         {expected:#034x}){}",
+        if *found == 0 {
+            ". A zeroed checksum is the signature of a peer predating the frame seal, \
+             which is a hard version break: replicas must be upgraded together, with the \
+             cluster down"
+        } else {
+            ""
+        }
     )]
     FrameChecksumMismatch {
         command: Command2,

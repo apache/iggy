@@ -39,9 +39,9 @@ use crossfire::AsyncRxTrait;
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, Operation,
-    PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
     StateTransferTargetHeader,
 };
@@ -2330,7 +2330,7 @@ where
             Ok(MessageBag::RequestStateChunk(ref msg)) => self.on_request_state_chunk(msg).await,
             Ok(MessageBag::StateChunk(ref msg)) => self.on_state_chunk(msg).await,
             Err(e) => {
-                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+                tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
             }
         }
     }
@@ -3526,6 +3526,11 @@ where
         };
         let actions = consensus.handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
+        if adopted && let Some(pending) = consensus.pending_view_log() {
+            // Ahead of the local dispatch, which rebuilds the pipeline out of the
+            // journal this rewrites. Same position as the metadata arm's twin.
+            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+        }
         let (local_actions, wire_actions) = split_local_actions(actions);
         // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
@@ -3783,7 +3788,13 @@ where
             // Skip the compacted prefix (below the snapshot floor) in one
             // RangeEvicted notice, then serve contiguously until the range
             // ends or the WAL runs out.
-            let mut from_op = header.from_op;
+            //
+            // Floored, not just walked up to: `validate` asks only for
+            // `1 <= from_op <= to_op`, and the walk steps op by op with no `.await`,
+            // so a peer sending `from_op = 1` against a large compacted frontier pins
+            // the pump against a 10 ms tick. Nothing at or below the watermark is
+            // servable anyway. The partition arm jumps to `retained_from` likewise.
+            let mut from_op = header.from_op.max(journal.snapshot_op() + 1);
             #[allow(clippy::cast_possible_truncation)]
             while from_op <= to_op && journal.header(from_op as usize).is_none() {
                 from_op += 1;
@@ -4030,34 +4041,37 @@ where
             if header.op > session.to_op {
                 return;
             }
-            let pending = consensus.pending_view_log();
-            if !repair_op_in_scope(
-                pending.as_ref(),
-                consensus.is_primary_for_view(consensus.view()),
-                consensus.commit_min(),
-                header.op,
-            ) {
+            let is_primary = consensus.is_primary_for_view(consensus.view());
+            let commit_min = consensus.commit_min();
+            // In place: runs once per repaired prepare, and the clone is two Vecs.
+            let in_scope = consensus
+                .with_pending_view_log(|pending| {
+                    repair_op_in_scope(Some(pending), is_primary, commit_min, header.op)
+                })
+                .unwrap_or_else(|| repair_op_in_scope(None, is_primary, commit_min, header.op));
+            if !in_scope {
                 return;
             }
             // Applies to both planes, and is why a backup parks a log at all. The
             // view already decided which prepare belongs at this op; a different
             // one forks the log. An op the parked log omits is unconstrained.
-            if let Some(pending) = &pending {
-                let expected = pending
-                    .headers
-                    .iter()
-                    .chain(pending.committed_elsewhere.iter())
-                    .find(|expected| expected.op == header.op);
-                if let Some(expected) = expected
-                    && expected.checksum != header.checksum
-                {
-                    tracing::warn!(
-                        shard = self.id,
-                        op = header.op,
-                        "discarding repaired prepare that disagrees with the merged log"
-                    );
-                    return;
-                }
+            let disagrees = consensus
+                .with_pending_view_log(|pending| {
+                    pending
+                        .headers
+                        .iter()
+                        .chain(pending.committed_elsewhere.iter())
+                        .find(|expected| expected.op == header.op)
+                        .is_some_and(|expected| expected.checksum != header.checksum)
+                })
+                .unwrap_or(false);
+            if disagrees {
+                tracing::warn!(
+                    shard = self.id,
+                    op = header.op,
+                    "discarding repaired prepare that disagrees with the merged log"
+                );
+                return;
             }
             // Recompute both integrity fields before durable storage: everything
             // above treats `header.checksum` as an opaque token, so a corrupted
@@ -4543,10 +4557,15 @@ where
             let Some(pending) = consensus.pending_view_log() else {
                 return;
             };
+            // Before the scan can mean anything: the repair ingest skips an op it
+            // already holds a header for, so the scan would report a gap nothing
+            // fills. Backups reach this on StartView adoption; a primary-elect has no
+            // adoption to hang it off.
+            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            // Identity, not presence: see the metadata twin.
             let missing = {
                 let journal = partition.log.journal();
-                (pending.commit_max.max(1)..=pending.op_head)
-                    .find(|op| journal.inner.header_by_op(*op).is_none())
+                first_op_not_covered(&pending, 0, |op| journal.inner.header_by_op(op))
             };
             if let Some(missing_op) = missing {
                 tracing::debug!(
@@ -4601,8 +4620,8 @@ where
             // `ViewChange` too: a parked view change repairs toward its merged log
             // and cannot start until the window fills. Gating on `Normal` alone
             // defers a dropped frame to the 500-tick escalation.
-            let repairing_view = consensus.pending_view_log().is_some()
-                && consensus.is_primary_for_view(consensus.view());
+            let repairing_view =
+                consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view());
             let mut session = self.metadata_repair.borrow_mut();
             session.as_mut().and_then(|session| {
                 if !consensus.is_normal() && !repairing_view {
@@ -4624,12 +4643,10 @@ where
             // suffix is only a verification reference; resuming from its commit
             // point would restart at the view's opening head, not at the gap.
             let from_op = consensus
-                .pending_view_log()
-                .filter(|_| consensus.is_primary_for_view(consensus.view()))
-                .map_or_else(
-                    || consensus.commit_min() + 1,
-                    |pending| pending.commit_max.max(1),
-                );
+                .is_primary_for_view(consensus.view())
+                .then(|| consensus.with_pending_view_log(|pending| pending.commit_max.max(1)))
+                .flatten()
+                .unwrap_or_else(|| consensus.commit_min() + 1);
             if from_op <= to_op {
                 tracing::info!(
                     shard = self.id,
@@ -4652,12 +4669,19 @@ where
         }
     }
 
-    /// Compare a backup's log against the headers the concluding `StartView`
-    /// published, and report where they disagree.
+    /// Compare this replica's log against the headers the view decided, and drop or
+    /// report where they disagree.
     ///
-    /// Without this, divergence is silent and permanent: the backup acks with its
+    /// Without this, divergence is silent and permanent: the replica acks with its
     /// own checksum, the primary rejects the ack, and journal repair skips an op
     /// it already has a header for.
+    ///
+    /// Both roles. A backup runs it against the `StartView` suffix it adopted, the
+    /// primary-elect against the merged log before the coverage scan in
+    /// [`Self::advance_pending_metadata_view`]. The merge does NOT reconcile the
+    /// primary's log for it: nothing installs the merged headers into the journal,
+    /// `RebuildPipeline` reads the pipeline back out of it, and `CommitJournal`
+    /// applies whatever sits at each op up to the merged commit point.
     ///
     /// The split at the announced commit point is what matters. Above it a
     /// disagreement is ordinary, so the entry is dropped and the primary's
@@ -4684,10 +4708,6 @@ where
         let Some(ref consensus) = metadata.consensus else {
             return;
         };
-        // Backups only; a primary reconciles through the merge itself.
-        if consensus.is_primary_for_view(consensus.view()) {
-            return;
-        }
         let Some(pending) = consensus.pending_view_log() else {
             return;
         };
@@ -4709,7 +4729,7 @@ where
             else {
                 continue;
             };
-            if local.checksum == canonical.checksum {
+            if header_is_view_entry(&local, canonical) {
                 continue;
             }
             if canonical.op <= applied_floor {
@@ -4730,9 +4750,30 @@ where
             repairable_from = Some(repairable_from.map_or(canonical.op, |op| op.min(canonical.op)));
         }
 
+        // A suffix ABOVE the announced head is named by nobody, so the loop cannot
+        // see it, and it is exactly the log that AGREES in-window (restart and
+        // re-adopt), where `repairable_from` never arms. Adoption drops the head
+        // under it, and the next prepare at `op_head + 1` then collides in `append`,
+        // which refuses the slot even when the ops match. Floored at the applied
+        // point too: an executed op is not rollback-able whatever the head says.
+        let above_head = pending.op_head.max(applied_floor) + 1;
+        if journal
+            .handle()
+            .last_op()
+            .is_some_and(|last_op| last_op >= above_head)
+        {
+            repairable_from = Some(repairable_from.map_or(above_head, |op| op.min(above_head)));
+        }
+
         let Some(from_op) = repairable_from else {
             return;
         };
+        // SERIALIZATION: the drain guard excludes `truncate_from` against `drain`,
+        // NOT against an append; that is metadata's private `journal_gate`. It holds
+        // by call-site placement, not construction: the pump is single-threaded, and
+        // both callers run with a view change parked, so no submit is admitted and no
+        // repair prepare is in flight for these ops. Routing shard-side journal
+        // mutations through gate-taking metadata methods would make it structural.
         match journal.handle().truncate_from(from_op).await {
             Ok(removed) => {
                 // The snapshot's `(op, commit)` tag does not move when entries are
@@ -4795,6 +4836,10 @@ where
         if !consensus.is_primary_for_view(consensus.view()) {
             return;
         }
+        // Before the coverage scan, and a primary-elect's only shot at it: the repair
+        // ingest skips an op it already holds a header for, so a diverging entry would
+        // never be replaced. No-op when nothing diverges.
+        self.reconcile_metadata_view_divergence().await;
         let Some(pending) = consensus.pending_view_log() else {
             return;
         };
@@ -4802,30 +4847,17 @@ where
             return;
         };
 
-        let held = |op: u64| {
-            usize::try_from(op)
-                .ok()
-                .and_then(|slot| journal.handle().header(slot))
-                .is_some()
-        };
         // Floor on what this replica can be asked to hold before starting the view.
         // Entries at or below the snapshot watermark are compacted, so no repair puts
         // one back: demanding one parks the view change forever on an op already
         // applied and durable in the snapshot.
         let repair_floor = journal.handle().snapshot_op();
-        // Every op the merged log names, including headers inherited from senders
-        // behind the canonical log_view: those sit below the canonical window and
-        // header repair cannot walk back across the gap later.
-        let missing = (pending.commit_max.max(1)..=pending.op_head)
-            .find(|op| !held(*op))
-            .or_else(|| {
-                pending
-                    .committed_elsewhere
-                    .iter()
-                    .map(|header| header.op)
-                    .filter(|op| *op > repair_floor)
-                    .find(|op| !held(*op))
-            });
+        let missing = first_op_not_covered(&pending, repair_floor, |op| {
+            usize::try_from(op)
+                .ok()
+                .and_then(|slot| journal.handle().header(slot))
+                .map(|header| *header)
+        });
 
         let Some(missing_op) = missing else {
             let actions = consensus.start_pending_view(PlaneKind::Metadata);
@@ -8124,10 +8156,20 @@ where
     let commit = consensus.commit_max().min(op);
     let journal = partition.log.journal();
     let pending = adopted_view_headers(consensus);
+    // The window materialized once: probing `repair_header` per op is two linear
+    // scans each, up to `DVC_HEADERS_MAX` of them, on every SVC/DVC arrival and
+    // non-Normal tick, on the pump. The internal clamp only narrows this range.
+    let head = op.max(
+        pending
+            .as_ref()
+            .and_then(|pending| pending.headers.first())
+            .map_or(0, |header| header.op),
+    );
+    let window = journal.inner.repair_headers_in(commit.max(1)..=head);
     let suffix = build_dvc_suffix(
         commit,
         op,
-        |entry_op| journal.inner.repair_header(entry_op),
+        |entry_op| window.get(&entry_op).copied(),
         pending.as_ref().map(|pending| pending.headers.as_slice()),
     );
     consensus.set_local_dvc_suffix(suffix);
@@ -8168,8 +8210,9 @@ fn control_body_checksum(body: &[u8]) -> u128 {
 /// Keyed on whether a body is present, NOT on whether `checksum_body` looks
 /// sealed: skipping the check when that field reads zero makes the layer
 /// bypassable by clearing the one field that decides whether anything is checked.
-/// A peer predating the suffix sends no body, so a non-empty body always came
-/// from a sender that seals it, and a zero checksum there is corruption.
+/// A frame legitimately carries no body (a sender with nothing uncommitted, a
+/// probe-answer `StartView`), so emptiness is the only exemption. A non-empty body
+/// always came from a sender that seals it, and a zero checksum there is corruption.
 fn control_suffix_body_verified<H>(msg: &Message<H>, checksum_body: u128) -> Option<&[u8]>
 where
     H: iggy_binary_protocol::ConsensusHeader,
@@ -8374,6 +8417,152 @@ fn build_dvc_suffix(
         }
     }
     DvcSuffix::new(headers, nack_bitset, present_bitset)
+}
+
+/// Partition-plane twin of `Shard::reconcile_metadata_view_divergence`: same split
+/// at the announced commit point, dropping above it and reporting at or below.
+///
+/// Worse to skip here than on the metadata plane, which is why this exists.
+/// Partition `append` has no slot-collision check, so a re-prepared op pushes a
+/// duplicate header and rewrites `op_to_storage_offset`, and `committed_prefix` walks
+/// positionally, so the stale entry is what `evict_prefix` flushes to the segment:
+/// durable divergent bytes, no error anywhere.
+#[allow(clippy::future_not_send)]
+async fn reconcile_partition_view_divergence<B, SB>(
+    shard: u16,
+    partition: &IggyPartition<B, SB>,
+    pending: &MergedLog,
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let consensus = partition.consensus();
+    // Truncation is safe only above what this replica has *applied*, which is not
+    // the view's commit point: a backup can sit above it.
+    let applied_floor = pending.commit_max.max(consensus.commit_min());
+
+    let mut repairable_from: Option<u64> = None;
+    for canonical in &pending.headers {
+        let Some(local) = partition.log.journal().inner.header_by_op(canonical.op) else {
+            continue;
+        };
+        if header_is_view_entry(&local, canonical) {
+            continue;
+        }
+        if canonical.op <= applied_floor {
+            tracing::error!(
+                shard,
+                namespace_raw = consensus.namespace(),
+                op = canonical.op,
+                view = consensus.view(),
+                commit_max = pending.commit_max,
+                commit_min = consensus.commit_min(),
+                local_checksum = local.checksum,
+                canonical_checksum = canonical.checksum,
+                "committed partition op {} disagrees with the view that just started; this \
+                 replica applied a different op and log repair cannot reconcile it",
+                canonical.op
+            );
+            continue;
+        }
+        repairable_from = Some(repairable_from.map_or(canonical.op, |op| op.min(canonical.op)));
+    }
+
+    // The suffix above the announced head, which no canonical header names. As on
+    // the metadata twin, except here `append` pushes a duplicate rather than erroring.
+    let above_head = pending.op_head.max(applied_floor) + 1;
+    if partition
+        .log
+        .journal()
+        .inner
+        .last_op()
+        .is_some_and(|last_op| last_op >= above_head)
+    {
+        repairable_from = Some(repairable_from.map_or(above_head, |op| op.min(above_head)));
+    }
+
+    let Some(from_op) = repairable_from else {
+        return;
+    };
+    match partition.log.journal().inner.truncate_from(from_op).await {
+        Ok(removed) => {
+            tracing::warn!(
+                shard,
+                namespace_raw = consensus.namespace(),
+                from_op,
+                removed,
+                op_head = pending.op_head,
+                view = consensus.view(),
+                "dropped {removed} uncommitted partition entries from op {from_op} that \
+                 disagreed with the view's log; the primary's retransmission refills the range"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                shard,
+                namespace_raw = consensus.namespace(),
+                from_op,
+                %error,
+                "could not drop the diverging uncommitted partition entries from op \
+                 {from_op}; repair skips ops it already holds, so this replica will not \
+                 converge there until restarted"
+            );
+        }
+    }
+}
+
+/// Whether a locally journaled header IS the entry the view's log names at that op.
+///
+/// Identity, not presence: otherwise a stale prepare at the right op reads as
+/// coverage everywhere: the repair ingest skips it as already held,
+/// `RebuildPipeline` seeds the pipeline from it and self-acks, `CommitJournal`
+/// applies it. `identity_checksum` excludes `view`, so a restamp still compares equal.
+///
+/// An unsealed checksum on either side is not evidence (pre-seal WAL, partition-plane
+/// prepare), so it counts as agreement, as in `dvc_suffix_decode`.
+const fn header_is_view_entry(local: &PrepareHeader, canonical: &PrepareHeader) -> bool {
+    local.checksum == CHECKSUM_UNSEALED
+        || canonical.checksum == CHECKSUM_UNSEALED
+        || local.checksum == canonical.checksum
+}
+
+/// The lowest op in the merged log this replica cannot serve, or `None` when the
+/// view can start.
+///
+/// Coverage is identity, not presence (see [`header_is_view_entry`]): starting a view
+/// over a differing entry commits this replica's own operation where the view says
+/// another belongs.
+///
+/// Covers every op the merged log names, including headers inherited from senders
+/// behind the canonical `log_view`, which sit below the canonical window where header
+/// repair cannot walk back to them. `repair_floor` drops the ones compacted under a
+/// snapshot, which no repair can put back.
+fn first_op_not_covered(
+    pending: &MergedLog,
+    repair_floor: u64,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+) -> Option<u64> {
+    let held = |op: u64| {
+        let Some(local) = header_at(op) else {
+            return false;
+        };
+        pending
+            .headers
+            .iter()
+            .chain(pending.committed_elsewhere.iter())
+            .find(|header| header.op == op)
+            .is_none_or(|canonical| header_is_view_entry(&local, canonical))
+    };
+    (pending.commit_max.max(1)..=pending.op_head)
+        .find(|op| !held(*op))
+        .or_else(|| {
+            pending
+                .committed_elsewhere
+                .iter()
+                .map(|header| header.op)
+                .filter(|op| *op > repair_floor)
+                .find(|op| !held(*op))
+        })
 }
 
 /// The adopted view's header at `op`, or `None` when the view says nothing about
@@ -8956,6 +9145,44 @@ mod repair_scope_tests {
 }
 
 #[cfg(test)]
+mod view_coverage_tests {
+    //! Holding an op is not holding the view's op.
+
+    use super::{MergedLog, first_op_not_covered};
+    use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+
+    fn sealed(op: u64, request: u64) -> PrepareHeader {
+        let mut header = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::CreateStream,
+            op,
+            request,
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+        header
+    }
+
+    #[test]
+    fn given_a_diverging_entry_when_scanning_should_report_it_like_a_hole() {
+        // Op 99 is present and is not the view's op 99. Reading presence as coverage
+        // starts the view over an operation the view says is something else, which
+        // `CommitJournal` then applies at or below the commit point unchecked.
+        let pending = MergedLog {
+            op_head: 100,
+            commit_max: 98,
+            headers: (98..=100).rev().map(|op| sealed(op, 1)).collect(),
+            committed_elsewhere: Vec::new(),
+        };
+        let held = [sealed(100, 1), sealed(99, 7), sealed(98, 1)];
+        let missing = first_op_not_covered(&pending, 0, |op| {
+            held.iter().find(|header| header.op == op).copied()
+        });
+        assert_eq!(missing, Some(99));
+    }
+}
+
+#[cfg(test)]
 mod dvc_suffix_window_tests {
     //! The suffix window's floor is a scan bound, not a commit point.
     //!
@@ -9114,6 +9341,32 @@ mod dvc_suffix_window_tests {
         let from_zero = build_dvc_suffix(0, 3, |op| Some(held(op)), None);
         assert_eq!(floor(&from_zero), Some(1));
     }
+
+    #[test]
+    fn given_a_compacted_log_when_building_should_still_describe_the_commit_point() {
+        // The commit point goes out blank AND un-nacked, so the merge can neither
+        // adopt nor discard it: a quorum that all compacted to the same op deadlocks
+        // and no further message fixes it. Both planes must keep that header
+        // reachable (metadata's drain stops one op short, a partition serves it from
+        // the evicted ring); nothing in `build_dvc_suffix` enforces it.
+        let commit = 500;
+        let compacted = |op: u64| (op >= commit).then(|| held(op));
+        let suffix = build_dvc_suffix(commit, commit + 3, compacted, None);
+
+        let commit_index = suffix.index_of(commit + 3, commit).expect("in window");
+        assert!(
+            suffix.valid_header_at(commit_index).is_some(),
+            "a blank at the commit point is undecidable for the merge"
+        );
+        assert!(
+            suffix.offers_body(commit_index),
+            "the commit point must be servable, or the merge stalls waiting for a peer"
+        );
+        assert!(
+            !suffix.nacks(commit_index),
+            "the commit point can never be nacked"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9161,9 +9414,9 @@ mod control_frame_tests {
 
     #[test]
     fn given_a_body_with_a_zeroed_checksum_when_verifying_should_reject() {
-        // A peer predating the suffix sends no body, so a non-empty body always came
-        // from a sender that seals it; a zero here is corruption, not age. Treating
-        // it as "unsealed, skip" disables the layer by clearing one field.
+        // A non-empty body always came from a sender that seals it, so a zero here is
+        // corruption. Treating it as "unsealed, skip" disables the layer by clearing
+        // the one field that decides whether anything is checked.
         let msg = frame(2, 0);
         assert!(
             control_suffix_body_verified(&msg, msg.header().checksum_body).is_none(),
@@ -9189,7 +9442,7 @@ mod control_frame_tests {
 
     #[test]
     fn given_a_header_only_frame_when_verifying_should_accept() {
-        // Rolling upgrade: a peer predating the suffix sends numbers only, no body.
+        // A sender with nothing uncommitted contributes numbers only, no body.
         let msg = frame(0, 0);
         let body = control_suffix_body_verified(&msg, msg.header().checksum_body)
             .expect("a header-only frame has nothing to verify");

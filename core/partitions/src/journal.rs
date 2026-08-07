@@ -25,6 +25,7 @@ use std::io;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap, VecDeque},
+    ops::RangeInclusive,
 };
 use tracing::warn;
 
@@ -390,6 +391,39 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .ok()
             .copied()
+    }
+
+    /// Every repairable header with an op in `ops`, in ONE pass over the resident
+    /// headers and ONE over the evicted ring.
+    ///
+    /// [`Self::repair_header`] is two linear scans, so probing it per op costs
+    /// O(window x (headers + ring)), and the `DoViewChange` suffix build does
+    /// exactly that, up to `DVC_HEADERS_MAX` probes, on every SVC/DVC arrival and
+    /// non-Normal tick, on the pump. Result size is bounded by what the journal
+    /// holds, not by the width of `ops`. Resident wins over ring, as `repair_header`
+    /// probes.
+    #[must_use]
+    pub fn repair_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
+        let mut found = BTreeMap::new();
+        {
+            let headers = unsafe { &*self.headers.get() };
+            for header in headers.iter().filter(|header| ops.contains(&header.op)) {
+                found.insert(header.op, *header);
+            }
+        }
+        let ring = unsafe { &*self.evicted_ring.get() };
+        for (op, entry) in ring.iter().filter(|(op, _)| ops.contains(op)) {
+            if found.contains_key(op) {
+                continue;
+            }
+            let Some(header_bytes) = entry.as_slice().get(..PREPARE_HEADER_SIZE) else {
+                continue;
+            };
+            if let Ok(header) = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes) {
+                found.insert(*op, *header);
+            }
+        }
+        found
     }
 
     /// Oldest op this journal can still serve for repair (ring front, else
@@ -933,6 +967,59 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
         self.bytes_by_op(header.op).await
     }
+
+    /// Appends are in op order and every rewrite preserves it, so the tail header
+    /// carries the highest op.
+    fn last_op(&self) -> Option<u64> {
+        let headers = unsafe { &*self.headers.get() };
+        headers.last().map(|header| header.op)
+    }
+
+    /// Drop every entry at or above `from_op`, rebuilding the indexes. Same
+    /// drain-and-re-append shape as `evict_prefix`, from the other end and retaining
+    /// nothing: `append` has no slot-collision check here, so a superseded entry left
+    /// in place sits beside the new view's prepare at the same op and
+    /// `committed_prefix`, which walks positionally, flushes the stale one.
+    ///
+    /// Dropped entries do NOT enter the evicted repair ring: it answers repair for
+    /// committed ops, and these are ones the view just decided against.
+    async fn truncate_from(&self, from_op: u64) -> io::Result<usize> {
+        if from_op == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+            ));
+        }
+        let all_entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.drain()
+        };
+        // Positional against `headers` until the clear below (see the length-lock
+        // invariant on `append_with_meta`), so the ops are captured first.
+        let ops: Vec<u64> = {
+            let headers = unsafe { &*self.headers.get() };
+            headers.iter().map(|header| header.op).collect()
+        };
+        {
+            unsafe { &mut *self.headers.get() }.clear();
+            unsafe { &mut *self.op_to_storage_offset.get() }.clear();
+            unsafe { &mut *self.offset_to_op.get() }.clear();
+            unsafe { &mut *self.timestamp_to_op.get() }.clear();
+        }
+
+        let mut removed = 0usize;
+        for (op, entry) in ops.into_iter().zip(all_entries) {
+            if op >= from_op {
+                removed += 1;
+                continue;
+            }
+            // Replays bytes this journal already accepted once, so it cannot fail.
+            self.append_with_meta(entry)
+                .await
+                .expect("re-appending a retained journal entry must not fail");
+        }
+        Ok(removed)
+    }
 }
 
 pub fn select_batch_slice(
@@ -1186,6 +1273,74 @@ mod tests {
             cloned.as_slice(),
             entry.as_slice(),
             "cloning a journal entry must yield identical bytes (refcount bump, not deep copy)"
+        );
+    }
+
+    #[compio::test]
+    async fn truncate_from_drops_the_suffix_and_keeps_the_prefix_readable() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=5 {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        let removed = journal.truncate_from(4).await.expect("truncate");
+        assert_eq!(removed, 2, "ops 4 and 5 must go");
+        assert_eq!(journal.last_op(), Some(3));
+        for op in 1..=3u64 {
+            let header = journal
+                .header_by_op(op)
+                .expect("a retained op must survive");
+            assert!(
+                journal.entry(&header).await.is_some(),
+                "a retained entry must still read back after the rewrite"
+            );
+        }
+        for op in 4..=5u64 {
+            assert!(journal.header_by_op(op).is_none(), "op {op} must be gone");
+        }
+
+        // The point of dropping them: the primary's retransmission refills the range.
+        journal
+            .append(build_prepare(4, HEADER_SIZE + 16).into_frozen())
+            .await
+            .expect("a truncated op must be appendable again");
+        assert_eq!(journal.last_op(), Some(4));
+    }
+
+    #[compio::test]
+    async fn repair_headers_in_serves_the_commit_point_from_the_evicted_ring() {
+        // Blank AT the commit point is the one slot a merge can neither adopt nor
+        // discard, so a quorum that all flushed there deadlocks. A flushed replica has
+        // no resident header there, so the ring must answer.
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=4 {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+        // `commit_messages` evicts the committed prefix inclusively, so the commit
+        // point's own resident header goes with it.
+        journal.evict_prefix(2).await;
+        assert!(
+            journal.header_by_op(2).is_none(),
+            "the resident header at the commit point is gone after the flush"
+        );
+
+        let window = journal.repair_headers_in(2..=4);
+        assert!(
+            window.contains_key(&2),
+            "the commit point must still be describable, or the view change deadlocks"
+        );
+        for op in 3..=4u64 {
+            assert!(window.contains_key(&op), "op {op} is resident and in range");
+        }
+        assert!(
+            !window.contains_key(&1),
+            "ops outside the window must not be reported"
         );
     }
 

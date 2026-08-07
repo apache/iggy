@@ -2051,8 +2051,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::DoViewChangeMessage);
 
-        // The same snapshot the first send used. A retransmit that re-derived the
-        // suffix could retract a nack the candidate already counted.
+        // NOT the snapshot the first send used: `build_do_view_change` re-reads
+        // `local_dvc_suffix()`, whose `(op, commit)` tag can have moved since, in
+        // which case it answers EMPTY, retracting every nack and body offer already
+        // sent. Survivable only because `dvc_record` drops a duplicate sender, so the
+        // candidate keeps the first vote. Allow a retransmit to replace a seated vote
+        // and this must pin the snapshot instead.
         let action = self.build_do_view_change(self.primary_index(self.view.get()));
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -3170,9 +3174,25 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// The merged log this replica is repairing toward, if a view change is
     /// mid-transition. The shard reads it for the op range it must cover before the
     /// view can start, and for which peers offered the bodies.
+    ///
+    /// Clones two `Vec<PrepareHeader>`. Prefer [`Self::view_log_is_pending`] /
+    /// [`Self::with_pending_view_log`]; clone only to hold it across an `.await` or
+    /// across [`Self::start_pending_view`], which takes the cell.
     #[must_use]
     pub fn pending_view_log(&self) -> Option<MergedLog> {
         self.pending_view_log.borrow().clone()
+    }
+
+    /// Whether a merge is parked, without cloning it.
+    #[must_use]
+    pub fn view_log_is_pending(&self) -> bool {
+        self.pending_view_log.borrow().is_some()
+    }
+
+    /// Read the parked merge in place. The closure must not re-enter consensus: the
+    /// `RefCell` stays borrowed for its whole body.
+    pub fn with_pending_view_log<T>(&self, read: impl FnOnce(&MergedLog) -> T) -> Option<T> {
+        self.pending_view_log.borrow().as_ref().map(read)
     }
 
     /// Replicas that offered a body for `op`, most-recent-log_view first.
@@ -3216,6 +3236,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         };
         let new_op = merged.op_head;
         let max_commit = merged.commit_max;
+
+        // The one view-change exit that skips `reset_view_change_state`, so the DVCs
+        // (a suffix `Vec` per sender, per group led) would be held for the whole
+        // primaryship. Nothing reads the array after the view starts: a late
+        // same-view DVC returns at the status gate, a higher-view one resets first.
+        //
+        // `dvc_reset`, not `reset_dvc_quorum`: the latter also clears the
+        // `do_view_change_quorum` latch, which from here means "log decided" and is
+        // what stops `handle_do_view_change_timeout` retransmitting.
+        dvc_reset(&mut self.do_view_change_from_all_replicas.borrow_mut());
+        self.invalidate_local_dvc_suffix();
 
         self.status.set(Status::Normal);
         self.ceded_primaryship.set(false);
@@ -3486,11 +3517,21 @@ where
         // is the designed "nothing to verify" sentinel, so a future durable partition
         // journal skips verification instead of failing every entry as corrupt.
         //
-        // So a partition prepare's `checksum` identifies its header alone, and two
-        // such prepares at one op with matching header fields are indistinguishable
-        // to the view-change merge. Closing that wants `checksum_body` here to BE
-        // the batch checksum, recomputed after stamping, so `checksum` covers the
-        // body for free by hashing this field.
+        // TODO(consensus): a partition prepare's `checksum` covers its header alone,
+        // so two at one op with matching header fields are indistinguishable however
+        // far their batch bytes diverge. The merge then counts a divergent replica as
+        // holding a servable copy, and the partition repair ingest (no merged-log
+        // identity gate) short-circuits `verify_prepare_integrity`'s body branch on
+        // the zero. Two closures, both larger than they look:
+        //
+        // 1. The batch checksum, recomputed after `stamp_prepare_for_persistence`.
+        //    But stamping runs per replica after replication and folds `base_offset`
+        //    in, so identity would change at stamp time and the journaled entry would
+        //    no longer match the pipeline entry `handle_prepare_ok` compares.
+        // 2. The stamp-invariant cover: everything past the 256-byte command header,
+        //    which stamping never touches. Identical on every replica, safe to seal
+        //    here, but costs a produce-path pass and retires the "0 means nothing to
+        //    verify" sentinel that lets an existing WAL replay.
         //
         // Bounded by `size`, the range every verifier re-reads; the prepare
         // inherits it verbatim below.

@@ -53,20 +53,17 @@ where
     /// it removed, which would mark the removed ops evictable when a suffix
     /// truncation needs them refillable.
     ///
-    /// Defaults to `Unsupported` rather than a silent zero: "removed nothing" and
-    /// "cannot remove anything" demand different responses from the caller.
+    /// Required, not defaulted: an `Unsupported` default hides a missing impl until
+    /// mid-view-change, where the caller can only wedge or start a view over a log it
+    /// cannot serve.
     ///
     /// # Errors
-    /// I/O error if the rewrite fails, or `Unsupported` if the implementation cannot
-    /// truncate.
-    fn truncate_from(&self, _from_op: u64) -> impl Future<Output = io::Result<usize>> {
-        async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "this journal cannot truncate a suffix",
-            ))
-        }
-    }
+    /// I/O error if the rewrite fails.
+    fn truncate_from(&self, from_op: u64) -> impl Future<Output = io::Result<usize>>;
+
+    /// Highest op the index holds. Not derivable from [`Self::header`]: a caller
+    /// looking for a suffix ABOVE some op has no bound to probe up to.
+    fn last_op(&self) -> Option<u64>;
 
     /// Remove entries with ops in `ops` from the journal,
     /// returning the removed entries sorted by op.
