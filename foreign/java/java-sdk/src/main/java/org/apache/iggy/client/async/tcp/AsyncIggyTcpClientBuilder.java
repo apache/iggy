@@ -72,7 +72,6 @@ public final class AsyncIggyTcpClientBuilder {
     private File tlsCertificate;
     private Duration connectionTimeout;
     private Duration requestTimeout;
-    private Integer connectionPoolSize;
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
 
@@ -191,17 +190,6 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
-     * Sets the connection pool size.
-     *
-     * @param connectionPoolSize the connection pool size
-     * @return this builder
-     */
-    public AsyncIggyTcpClientBuilder connectionPoolSize(Integer connectionPoolSize) {
-        this.connectionPoolSize = connectionPoolSize;
-        return this;
-    }
-
-    /**
      * Sets the retry policy.
      *
      * @param retryPolicy the retry policy
@@ -222,7 +210,6 @@ public final class AsyncIggyTcpClientBuilder {
     public AsyncIggyTcpClient build() {
         validateHost();
         validatePort();
-        validateConnectionPoolSize();
         validateConnectionTimeout();
         validateAcquireTimeout();
 
@@ -234,7 +221,6 @@ public final class AsyncIggyTcpClientBuilder {
                 connectionTimeout,
                 acquireTimeout,
                 requestTimeout,
-                connectionPoolSize,
                 retryPolicy,
                 enableTls,
                 Optional.ofNullable(tlsCertificate));
@@ -249,12 +235,6 @@ public final class AsyncIggyTcpClientBuilder {
     private void validatePort() {
         if (port == null || port <= 0) {
             throw new IggyInvalidArgumentException("Port must be a positive integer");
-        }
-    }
-
-    private void validateConnectionPoolSize() {
-        if (connectionPoolSize != null && connectionPoolSize <= 0) {
-            throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
         }
     }
 

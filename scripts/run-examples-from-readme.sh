@@ -352,7 +352,10 @@ run_php_examples() {
 
 # shellcheck disable=SC2329
 run_java_examples() {
-    resolve_server_binary "${TARGET}"
+    # Java examples run against the VSR server.
+    # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+    resolve_server_binary "${TARGET}" iggy-server-ng
+    SERVER_READY_PATTERN="client listeners started"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \
@@ -394,6 +397,7 @@ run_one() {
 
     EXAMPLES_EXIT_CODE=0
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
+    unset SERVER_READY_PATTERN 2>/dev/null || true
 
     set +e
     ${lang_fn}
@@ -401,6 +405,7 @@ run_one() {
     set -e
 
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
+    unset SERVER_READY_PATTERN 2>/dev/null || true
 
     if [ ${rc} -ne 0 ]; then
         echo ""

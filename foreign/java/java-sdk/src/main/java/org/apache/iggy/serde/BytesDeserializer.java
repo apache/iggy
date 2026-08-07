@@ -27,6 +27,7 @@ import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.apache.iggy.cluster.TransportEndpoints;
 import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
@@ -38,6 +39,8 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.SendConfirmation;
+import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.Partition;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
@@ -177,11 +180,43 @@ public final class BytesDeserializer {
         return new ConsumerGroup(groupId, name, partitionsCount, membersCount);
     }
 
+    public static ConsumerGroupAssignment readConsumerGroupAssignment(ByteBuf response) {
+        // The generation is a monotonic rebalance counter compared only for
+        // equality, so reading the u64 as a signed long is safe.
+        var generation = response.readLongLE();
+        var partitionsCount = response.readUnsignedIntLE();
+        List<Long> partitions = new ArrayList<>(toInt(partitionsCount));
+        for (long i = 0; i < partitionsCount; i++) {
+            partitions.add(response.readUnsignedIntLE());
+        }
+        return new ConsumerGroupAssignment(generation, partitions);
+    }
+
     public static ConsumerOffsetInfo readConsumerOffsetInfo(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
         var storedOffset = readU64AsBigInteger(response);
         return new ConsumerOffsetInfo(partitionId, currentOffset, storedOffset);
+    }
+
+    public static SendMessagesResponse readSendMessagesResponse(ByteBuf response) {
+        if (!response.isReadable()) {
+            return SendMessagesResponse.empty();
+        }
+        var confirmationsCount = response.readUnsignedIntLE();
+        var confirmations = new ArrayList<SendConfirmation>(toInt(confirmationsCount));
+        for (long i = 0; i < confirmationsCount; i++) {
+            var streamId = response.readUnsignedIntLE();
+            var topicId = response.readUnsignedIntLE();
+            var partitionId = response.readUnsignedIntLE();
+            var baseOffset = readU64AsBigInteger(response);
+            confirmations.add(new SendConfirmation(streamId, topicId, partitionId, baseOffset));
+        }
+        if (response.isReadable()) {
+            throw new IggyMalformedResponseException(
+                    "send messages response has " + response.readableBytes() + " trailing bytes");
+        }
+        return new SendMessagesResponse(confirmations);
     }
 
     public static PolledMessages readPolledMessages(ByteBuf response) {

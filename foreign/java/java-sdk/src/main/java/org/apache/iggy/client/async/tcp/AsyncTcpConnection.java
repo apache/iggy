@@ -21,15 +21,14 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
-import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.pool.AbstractChannelPoolHandler;
 import io.netty.channel.pool.ChannelHealthChecker;
@@ -38,12 +37,17 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.util.concurrent.FutureListener;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
+import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrResponseHandler;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyEmptyResponseException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
 import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
@@ -55,11 +59,13 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -69,11 +75,26 @@ import java.util.function.Function;
 public class AsyncTcpConnection {
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
+    // Transient VSR denials (not-committed / not-accepted) are replayed with
+    // the same encoded frame so the server's dedup sees the same request id.
+    // A not-committed outcome is unknown, so it replays for the whole budget.
+    // A not-accepted deny was refused outright (typically a demoted primary),
+    // so it fails fast to free the pinned channel and let the caller re-login
+    // toward the new leader; mirrors TRANSIENT_FAILOVER_CHECK_INTERVAL in
+    // core/sdk/src/tcp/tcp_client.rs.
+    private static final int TRANSIENT_NOT_COMMITTED = 57;
+    private static final int TRANSIENT_NOT_ACCEPTED = 58;
+    private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
+    private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
+    private static final Duration NOT_ACCEPTED_RETRY_BUDGET = Duration.ofSeconds(2);
 
     private final IoEventLoopGroup eventLoopGroup;
     private final FixedChannelPool channelPool;
     private final AtomicBoolean isClosed = new AtomicBoolean(false);
     private final AtomicLong authGeneration = new AtomicLong(0);
+    private final VsrRequestEncoder vsrEncoder;
+    private final Runnable sessionResetListener;
+    private final Consumer<Throwable> connectionFailureListener;
     private ByteBuf loginPayload;
 
     private volatile int loginCommandCode;
@@ -86,6 +107,21 @@ public class AsyncTcpConnection {
             Optional<File> tlsCertificate,
             TcpConnectionPoolConfig poolConfig,
             Optional<Duration> connectionTimeout) {
+        this(host, port, enableTls, tlsCertificate, poolConfig, connectionTimeout, () -> {}, ignored -> {});
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    AsyncTcpConnection(
+            String host,
+            int port,
+            boolean enableTls,
+            Optional<File> tlsCertificate,
+            TcpConnectionPoolConfig poolConfig,
+            Optional<Duration> connectionTimeout,
+            Runnable sessionResetListener,
+            Consumer<Throwable> connectionFailureListener) {
+        this.sessionResetListener = sessionResetListener;
+        this.connectionFailureListener = connectionFailureListener;
         SslContext sslContext = null;
         if (enableTls) {
             try {
@@ -97,6 +133,8 @@ public class AsyncTcpConnection {
             }
         }
 
+        ConsensusSession consensusSession = new ConsensusSession();
+        this.vsrEncoder = new VsrRequestEncoder(consensusSession);
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
         var bootstrap = new Bootstrap()
@@ -108,16 +146,19 @@ public class AsyncTcpConnection {
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .remoteAddress(host, port);
 
+        // The VSR session (client id, fence epoch, request counter) is bound
+        // to one transport connection server-side; sharing it across channels
+        // would interleave request ids, so the pool holds a single channel.
         this.channelPool = new FixedChannelPool(
                 bootstrap,
-                new PoolChannelHandler(host, port, enableTls, sslContext),
+                new PoolChannelHandler(host, port, enableTls, sslContext, consensusSession, this::onSessionEvicted),
                 ChannelHealthChecker.ACTIVE,
                 FixedChannelPool.AcquireTimeoutAction.FAIL,
                 poolConfig.getAcquireTimeoutMillis(),
-                poolConfig.getMaxConnections(),
+                1,
                 poolConfig.getMaxPendingAcquires());
 
-        log.info("Connection pool initialized with max connections: {}", poolConfig.getMaxConnections());
+        log.info("Connection pool initialized with a single VSR-pinned connection");
     }
 
     /**
@@ -193,6 +234,9 @@ public class AsyncTcpConnection {
     }
 
     public CompletableFuture<ByteBuf> send(int commandCode, ByteBuf payload) {
+        if (isLoginCode(commandCode) && authenticated) {
+            return logoutThenLogin(commandCode, payload);
+        }
         captureLoginPayloadIfNeeded(commandCode, payload);
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
         CompletableFuture<ByteBuf> callerFuture = new CompletableFuture<>();
@@ -200,91 +244,213 @@ public class AsyncTcpConnection {
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
             if (!f.isSuccess()) {
                 payload.release();
+                notifyConnectionFailure(f.cause());
                 callerFuture.completeExceptionally(mapAcquireException(f.cause()));
                 return;
             }
+            dispatchOnChannel(f.getNow(), commandCode, payload, responseFuture, callerFuture);
+        });
 
-            Channel channel = f.getNow();
-            boolean isLoginCommand = (commandCode == CommandCode.User.LOGIN.getValue()
-                    || commandCode == CommandCode.PersonalAccessToken.LOGIN.getValue());
-            boolean requiresAuth = !isLoginCommand
-                    && commandCode != CommandCode.System.PING.getValue()
-                    && commandCode != CommandCode.System.GET_STATS.getValue();
+        return callerFuture;
+    }
 
-            responseFuture.whenComplete((response, error) -> {
-                try {
-                    handlePostResponse(channel, commandCode, isLoginCommand, error);
-                } catch (RuntimeException bookkeepingError) {
-                    log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
-                }
-                if (error != null) {
-                    callerFuture.completeExceptionally(error);
-                } else {
-                    callerFuture.complete(response);
-                }
-            });
+    private void dispatchOnChannel(
+            Channel channel,
+            int commandCode,
+            ByteBuf payload,
+            CompletableFuture<ByteBuf> responseFuture,
+            CompletableFuture<ByteBuf> callerFuture) {
+        boolean isLoginCommand = isLoginCode(commandCode);
+        boolean requiresAuth = !isLoginCommand && requiresAuthentication(commandCode);
 
-            CompletableFuture<Void> authStep;
-            if (!requiresAuth) {
-                authStep = CompletableFuture.completedFuture(null);
-            } else if (!authenticated) {
+        responseFuture.whenComplete((response, error) -> {
+            try {
+                handlePostResponse(channel, commandCode, isLoginCommand, error);
+            } catch (RuntimeException bookkeepingError) {
+                log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
+            }
+            if (error != null) {
+                callerFuture.completeExceptionally(error);
+            } else {
+                callerFuture.complete(response);
+            }
+        });
+
+        CompletableFuture<Void> authStep;
+        if (!requiresAuth) {
+            authStep = CompletableFuture.completedFuture(null);
+        } else if (!authenticated) {
+            payload.release();
+            responseFuture.completeExceptionally(new IggyNotConnectedException("Not authenticated, call login first"));
+            return;
+        } else {
+            ByteBuf loginPayloadCopy = getLoginPayloadCopy();
+            if (loginPayloadCopy == null) {
                 payload.release();
                 responseFuture.completeExceptionally(
                         new IggyNotConnectedException("Not authenticated, call login first"));
                 return;
-            } else {
-                ByteBuf loginPayloadCopy = getLoginPayloadCopy();
-                if (loginPayloadCopy == null) {
-                    payload.release();
-                    responseFuture.completeExceptionally(
-                            new IggyNotConnectedException("Not authenticated, call login first"));
-                    return;
-                }
-                authStep = IggyAuthenticator.ensureAuthenticated(
-                        channel, loginPayloadCopy, loginCommandCode, authGeneration);
             }
+            authStep = IggyAuthenticator.ensureAuthenticated(
+                    channel, loginPayloadCopy, loginCommandCode, authGeneration, vsrEncoder);
+        }
 
-            authStep.thenRun(() -> sendFrame(channel, payload, commandCode, responseFuture))
-                    .exceptionally(ex -> {
-                        responseFuture.completeExceptionally(ex);
-                        return null;
-                    });
+        authStep.whenComplete((ignored, authError) -> {
+            if (authError != null) {
+                payload.release();
+                responseFuture.completeExceptionally(authError);
+                return;
+            }
+            sendFrame(channel, payload, commandCode, responseFuture);
         });
+    }
 
-        return callerFuture;
+    /**
+     * A failed pool acquire on an established connection means the target
+     * node could not be (re)dialed; the listener lets the owning client run
+     * its redial strategy while the failed request surfaces to its caller.
+     */
+    private void notifyConnectionFailure(Throwable cause) {
+        try {
+            connectionFailureListener.accept(cause);
+        } catch (RuntimeException listenerError) {
+            log.warn("Connection failure listener threw: {}", listenerError.getMessage());
+        }
     }
 
     private static Throwable mapAcquireException(Throwable cause) {
         if (cause instanceof IllegalStateException) {
             return new IggyNotConnectedException("Connection pool is closed");
         }
+        if (cause instanceof TimeoutException) {
+            return new IggyTimeoutException("Timed out acquiring a connection from the pool", cause);
+        }
         return cause;
+    }
+
+    /**
+     * A Register on an already-bound VSR connection is answered with a replay
+     * of the original register reply, while the client has re-armed a fresh
+     * identity; its reset request counter would then collide with the
+     * server's dedup table and mutations would be silently swallowed. Unbind
+     * first, then login fresh.
+     */
+    private CompletableFuture<ByteBuf> logoutThenLogin(int commandCode, ByteBuf payload) {
+        return send(CommandCode.User.LOGOUT.getValue(), Unpooled.EMPTY_BUFFER)
+                .handle((logoutResponse, logoutError) -> {
+                    if (logoutResponse != null) {
+                        logoutResponse.release();
+                    }
+                    return null;
+                })
+                .thenCompose(ignored -> send(commandCode, payload));
+    }
+
+    private static boolean isLoginCode(int commandCode) {
+        return commandCode == CommandCode.User.LOGIN.getValue()
+                || commandCode == CommandCode.PersonalAccessToken.LOGIN.getValue();
+    }
+
+    /**
+     * Ping and cluster metadata are the only sessionless bootstrap commands.
+     * Cluster metadata must be available before Register so a VSR client can
+     * select the leader; every other non-login command requires a bound
+     * session.
+     */
+    private static boolean requiresAuthentication(int commandCode) {
+        return !isAllowedBeforeAuthentication(commandCode);
+    }
+
+    private static boolean isAllowedBeforeAuthentication(int commandCode) {
+        return commandCode == CommandCode.System.PING.getValue()
+                || commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue();
     }
 
     private void sendFrame(
             Channel channel, ByteBuf payload, int commandCode, CompletableFuture<ByteBuf> responseFuture) {
         try {
-            IggyResponseHandler handler = channel.pipeline().get(IggyResponseHandler.class);
+            VsrResponseHandler handler = channel.pipeline().get(VsrResponseHandler.class);
             if (handler == null) {
-                throw new IggyClientException("Channel missing IggyResponseHandler");
+                throw new IggyClientException("Channel missing VsrResponseHandler");
             }
 
-            handler.enqueueRequest(responseFuture);
-            ByteBuf frame = IggyFrameEncoder.encode(channel.alloc(), commandCode, payload);
-
-            channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) {
-                    log.error("Failed to send frame: {}", future.cause().getMessage());
-                    responseFuture.completeExceptionally(future.cause());
-                } else {
-                    log.trace("Frame sent successfully to {}", channel.remoteAddress());
-                }
-            });
+            ByteBuf frame = vsrEncoder.encode(channel.alloc(), commandCode, payload);
+            long nowNanos = System.nanoTime();
+            long deadlineNanos = nowNanos + TRANSIENT_RETRY_BUDGET.toNanos();
+            long notAcceptedDeadlineNanos =
+                    isLoginCode(commandCode) ? deadlineNanos : nowNanos + NOT_ACCEPTED_RETRY_BUDGET.toNanos();
+            writeVsrFrame(channel, handler, frame, responseFuture, deadlineNanos, notAcceptedDeadlineNanos);
         } catch (RuntimeException e) {
             responseFuture.completeExceptionally(e);
         } finally {
             payload.release();
         }
+    }
+
+    /**
+     * One VSR write attempt. A transient denial (the cluster could not commit
+     * or accept yet) replays the SAME encoded frame so the server's dedup
+     * sees the same request id; everything else resolves the caller.
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private void writeVsrFrame(
+            Channel channel,
+            VsrResponseHandler handler,
+            ByteBuf frame,
+            CompletableFuture<ByteBuf> responseFuture,
+            long deadlineNanos,
+            long notAcceptedDeadlineNanos) {
+        CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
+        handler.enqueueRequest(attempt);
+        channel.writeAndFlush(frame.retainedDuplicate()).addListener((ChannelFutureListener) future -> {
+            if (!future.isSuccess()) {
+                log.error("Failed to send frame: {}", future.cause().getMessage());
+                attempt.completeExceptionally(future.cause());
+                // A failed write leaves the attempt queued and the framing
+                // undefined; close so pending requests fail instead of
+                // matching later responses.
+                channel.close();
+            }
+        });
+        attempt.whenComplete((response, error) -> {
+            if (shouldRetryTransient(error, deadlineNanos, notAcceptedDeadlineNanos) && channel.isActive()) {
+                try {
+                    channel.eventLoop()
+                            .schedule(
+                                    () -> writeVsrFrame(
+                                            channel,
+                                            handler,
+                                            frame,
+                                            responseFuture,
+                                            deadlineNanos,
+                                            notAcceptedDeadlineNanos),
+                                    TRANSIENT_RETRY_INTERVAL_MS,
+                                    TimeUnit.MILLISECONDS);
+                    return;
+                } catch (RejectedExecutionException retryRejected) {
+                    log.warn("Event loop rejected a VSR retry, failing the request: {}", retryRejected.getMessage());
+                }
+            }
+            frame.release();
+            if (error != null) {
+                responseFuture.completeExceptionally(error);
+            } else {
+                responseFuture.complete(response);
+            }
+        });
+    }
+
+    private static boolean shouldRetryTransient(Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos) {
+        if (!(error instanceof IggyServerException serverError)) {
+            return false;
+        }
+        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED) {
+            return System.nanoTime() < deadlineNanos;
+        }
+        if (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED) {
+            return System.nanoTime() < notAcceptedDeadlineNanos;
+        }
+        return false;
     }
 
     private void handlePostResponse(Channel channel, int commandCode, boolean isLoginOp, Throwable ex) {
@@ -305,9 +471,20 @@ public class AsyncTcpConnection {
         channelPool.release(channel);
     }
 
+    /**
+     * A server-side eviction unbinds the transport session while the channel
+     * stays pooled; bumping the generation makes the next authenticated send
+     * re-run login (which re-registers) instead of riding the stale channel.
+     * The re-registered session gets a fresh client id, so listeners caching
+     * state keyed by it (consumer-group assignments) are told to drop it.
+     */
+    private void onSessionEvicted() {
+        authGeneration.incrementAndGet();
+        sessionResetListener.run();
+    }
+
     private void captureLoginPayloadIfNeeded(int commandCode, ByteBuf payload) {
-        if (commandCode == CommandCode.User.LOGIN.getValue()
-                || commandCode == CommandCode.PersonalAccessToken.LOGIN.getValue()) {
+        if (isLoginCode(commandCode)) {
             updateLoginPayload(commandCode, payload);
         }
     }
@@ -357,12 +534,22 @@ public class AsyncTcpConnection {
         private final int port;
         private final boolean enableTls;
         private final SslContext sslContext;
+        private final ConsensusSession consensusSession;
+        private final Runnable onEviction;
 
-        PoolChannelHandler(String host, int port, boolean enableTls, SslContext sslContext) {
+        PoolChannelHandler(
+                String host,
+                int port,
+                boolean enableTls,
+                SslContext sslContext,
+                ConsensusSession consensusSession,
+                Runnable onEviction) {
             this.host = host;
             this.port = port;
             this.enableTls = enableTls;
             this.sslContext = sslContext;
+            this.consensusSession = consensusSession;
+            this.onEviction = onEviction;
         }
 
         @Override
@@ -371,84 +558,28 @@ public class AsyncTcpConnection {
             if (enableTls) {
                 pipeline.addLast("ssl", sslContext.newHandler(ch.alloc(), host, port));
             }
-            pipeline.addLast("frameDecoder", new IggyFrameDecoder());
-            pipeline.addLast("responseHandler", new IggyResponseHandler());
-        }
-    }
-
-    public static class IggyResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
-        private final Queue<CompletableFuture<ByteBuf>> responseQueue = new ConcurrentLinkedQueue<>();
-
-        public void enqueueRequest(CompletableFuture<ByteBuf> future) {
-            responseQueue.add(future);
-        }
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-            int status = msg.readIntLE();
-            int length = msg.readIntLE();
-
-            CompletableFuture<ByteBuf> future = responseQueue.poll();
-
-            if (future != null) {
-                if (status == 0) {
-                    future.complete(msg.retainedSlice());
-                } else {
-                    byte[] errorBytes = length > 0 ? new byte[length] : new byte[0];
-                    msg.readBytes(errorBytes);
-                    future.completeExceptionally(IggyServerException.fromTcpResponse(status, errorBytes));
-                }
-            } else {
-                log.error(
-                        "Received response on channel {} but no request was waiting!",
-                        ctx.channel().id());
-            }
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            failPendingRequests(new IggyConnectionException("Connection closed before a response arrived"));
-            ctx.fireChannelInactive();
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            failPendingRequests(cause);
-            ctx.close();
-        }
-
-        private void failPendingRequests(Throwable cause) {
-            CompletableFuture<ByteBuf> pending;
-            while ((pending = responseQueue.poll()) != null) {
-                pending.completeExceptionally(cause);
-            }
+            pipeline.addLast("frameDecoder", new VsrFrameDecoder());
+            pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));
         }
     }
 
     public static class TcpConnectionPoolConfig {
-        private final int maxConnections;
         private final int maxPendingAcquires;
         private final long acquireTimeoutMillis;
 
         public TcpConnectionPoolConfig() {
             this(
-                    TcpConnectionPoolConfigBuilder.DEFAULT_MAX_CONNECTION,
                     TcpConnectionPoolConfigBuilder.DEFAULT_MAX_PENDING_ACQUIRES,
                     TcpConnectionPoolConfigBuilder.DEFAULT_ACQUIRE_TIMEOUT_MILLIS);
         }
 
-        public TcpConnectionPoolConfig(int maxConnections, int maxPendingAcquires, long acquireTimeoutMillis) {
-            this.maxConnections = maxConnections;
+        public TcpConnectionPoolConfig(int maxPendingAcquires, long acquireTimeoutMillis) {
             this.maxPendingAcquires = maxPendingAcquires;
             this.acquireTimeoutMillis = acquireTimeoutMillis;
         }
 
         public static TcpConnectionPoolConfigBuilder builder() {
             return new TcpConnectionPoolConfigBuilder();
-        }
-
-        public int getMaxConnections() {
-            return this.maxConnections;
         }
 
         public int getMaxPendingAcquires() {
@@ -460,23 +591,13 @@ public class AsyncTcpConnection {
         }
 
         public static final class TcpConnectionPoolConfigBuilder {
-            public static final int DEFAULT_MAX_CONNECTION = 5;
             public static final int DEFAULT_MAX_PENDING_ACQUIRES = 1000;
             public static final int DEFAULT_ACQUIRE_TIMEOUT_MILLIS = 3000;
 
-            private int maxConnections;
             private int maxPendingAcquires;
             private long acquireTimeoutMillis;
 
             public TcpConnectionPoolConfigBuilder() {}
-
-            public TcpConnectionPoolConfigBuilder setMaxConnections(int maxConnections) {
-                if (maxConnections <= 0) {
-                    throw new IggyInvalidArgumentException("Connection pool size cannot be 0 or negative");
-                }
-                this.maxConnections = maxConnections;
-                return this;
-            }
 
             public TcpConnectionPoolConfigBuilder setMaxPendingAcquires(int maxPendingAcquires) {
                 if (maxPendingAcquires <= 0) {
@@ -495,16 +616,13 @@ public class AsyncTcpConnection {
             }
 
             public TcpConnectionPoolConfig build() {
-                if (this.maxConnections == 0) {
-                    this.maxConnections = DEFAULT_MAX_CONNECTION;
-                }
                 if (this.acquireTimeoutMillis == 0) {
                     this.acquireTimeoutMillis = DEFAULT_ACQUIRE_TIMEOUT_MILLIS;
                 }
                 if (this.maxPendingAcquires == 0) {
                     this.maxPendingAcquires = DEFAULT_MAX_PENDING_ACQUIRES;
                 }
-                return new TcpConnectionPoolConfig(maxConnections, maxPendingAcquires, acquireTimeoutMillis);
+                return new TcpConnectionPoolConfig(maxPendingAcquires, acquireTimeoutMillis);
             }
         }
     }

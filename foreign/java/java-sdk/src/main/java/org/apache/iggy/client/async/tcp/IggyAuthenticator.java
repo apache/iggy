@@ -23,8 +23,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.util.AttributeKey;
-import org.apache.iggy.client.async.tcp.AsyncTcpConnection.IggyResponseHandler;
-import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrResponseHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,10 +46,15 @@ final class IggyAuthenticator {
      * @param loginPayload      the login payload to send (will be released by this method)
      * @param commandCode       the login command code
      * @param currentGeneration the current authentication generation counter
+     * @param encoder           encodes the login command into a VSR request frame
      * @return a future that completes when authentication is done
      */
     static CompletableFuture<Void> ensureAuthenticated(
-            Channel channel, ByteBuf loginPayload, int commandCode, AtomicLong currentGeneration) {
+            Channel channel,
+            ByteBuf loginPayload,
+            int commandCode,
+            AtomicLong currentGeneration,
+            VsrRequestEncoder encoder) {
         Long channelGeneration = channel.attr(AUTH_GENERATION_KEY).get();
         long requiredGeneration = currentGeneration.get();
 
@@ -58,18 +63,24 @@ final class IggyAuthenticator {
             return CompletableFuture.completedFuture(null);
         }
 
-        if (loginPayload == null) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
+        ByteBuf frame;
+        try {
+            frame = encoder.encode(channel.alloc(), commandCode, loginPayload);
+        } catch (RuntimeException encodeError) {
+            loginPayload.release();
+            return CompletableFuture.failedFuture(encodeError);
         }
-
-        CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
-        IggyResponseHandler handler = channel.pipeline().get(IggyResponseHandler.class);
-        handler.enqueueRequest(loginFuture);
-        ByteBuf frame = IggyFrameEncoder.encode(channel.alloc(), commandCode, loginPayload);
         loginPayload.release();
+        CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
+        VsrResponseHandler handler = channel.pipeline().get(VsrResponseHandler.class);
+        handler.enqueueRequest(loginFuture);
         channel.writeAndFlush(frame).addListener((ChannelFutureListener) f -> {
             if (!f.isSuccess()) {
                 loginFuture.completeExceptionally(f.cause());
+                // A failed write leaves the future queued and the framing
+                // undefined; close so pending requests fail instead of
+                // matching later responses.
+                channel.close();
             }
         });
 
