@@ -78,7 +78,7 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{EncryptorKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use iggy_common::{EncryptorKind, Identifier, IggyError, IggyTimestamp};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
@@ -462,13 +462,33 @@ where
     SB: SuperblockStore + 'static,
 {
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .namespace_from_partition(stream_id, topic_id, partition_id)
-        .ok_or(IggyError::InvalidIdentifier)
+    let streams = shard.plane.metadata().mux_stm.streams();
+    if let Some(namespace) = streams.namespace_from_partition(stream_id, topic_id, partition_id) {
+        return Ok(namespace);
+    }
+    // Tell a bad partition id apart from a bad stream/topic: the former is a
+    // typed not-found the client can act on, the latter keeps the generic
+    // rejection every caller already handles.
+    if streams.topic_partition_ids(stream_id, topic_id).is_some() {
+        Err(IggyError::PartitionNotFound(
+            partition_id as usize,
+            wire_identifier_for_display(topic_id),
+            wire_identifier_for_display(stream_id),
+        ))
+    } else {
+        Err(IggyError::InvalidIdentifier)
+    }
+}
+
+/// Best-effort conversion for error payloads only: the wire reply carries just
+/// the error code, so a failed conversion may fall back to a default without
+/// changing what the client sees.
+fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
+    match id {
+        WireIdentifier::Numeric(numeric_id) => Identifier::numeric(*numeric_id),
+        WireIdentifier::String(name) => Identifier::named(name.as_str()),
+    }
+    .unwrap_or_default()
 }
 
 /// `user_id` is the authenticated caller, used only by the identity-scoped
@@ -873,8 +893,6 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
-    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
             return Ok(None);
@@ -888,9 +906,7 @@ where
             topics: stream
                 .topics
                 .iter()
-                .map(|(_, topic)| {
-                    topic_header(topic, default_max_topic_size, default_message_expiry)
-                })
+                .map(|(_, topic)| topic_header(topic))
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     })
@@ -1008,8 +1024,6 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
-    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
             return Ok(None);
@@ -1026,7 +1040,7 @@ where
             .get(topic_id)
             .ok_or(IggyError::InvalidIdentifier)?;
         Ok(Some(GetTopicResponse {
-            topic: topic_header(topic, default_max_topic_size, default_message_expiry)?,
+            topic: topic_header(topic)?,
             partitions: topic
                 .partitions
                 .iter()
@@ -1047,8 +1061,6 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
-    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let resolved_stream =
             resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
@@ -1059,7 +1071,7 @@ where
         stream
             .topics
             .iter()
-            .map(|(_, topic)| topic_header(topic, default_max_topic_size, default_message_expiry))
+            .map(|(_, topic)| topic_header(topic))
             .collect::<Result<Vec<_>, _>>()
             .map(|topics| GetTopicsResponse { topics })
     })
@@ -1153,48 +1165,19 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
     })
 }
 
-/// Resolve a topic's stored [`MaxTopicSize`] to the wire byte value, mapping
-/// the `ServerDefault` sentinel to this node's configured default. Replicated
-/// apply stores the sentinel verbatim so commit stays config-independent across
-/// a cluster; the per-node default is applied here on read, matching the legacy
-/// "what this server treats the limit as" semantics. Primary admission stamps
-/// the same default before replication, so this only bites topics whose stored
-/// size predates that stamping (older snapshot / WAL data). Explicit `Custom`
-/// and `Unlimited` values pass through.
-fn resolve_max_topic_size(max_topic_size: MaxTopicSize, default_bytes: u64) -> u64 {
-    match max_topic_size {
-        MaxTopicSize::ServerDefault => default_bytes,
-        resolved => resolved.as_bytes_u64(),
-    }
-}
-
-/// Resolve a topic's stored [`IggyExpiry`] to the wire micros value, mapping the
-/// `ServerDefault` sentinel to this node's configured default. Mirrors
-/// [`resolve_max_topic_size`]: replicated apply stores the sentinel verbatim so
-/// commit stays config-independent across a cluster, and the per-node default is
-/// applied here on read. Primary admission stamps the same default before
-/// replication, so this only bites topics whose stored expiry predates that
-/// stamping (older snapshot / WAL data). Explicit durations and never-expire pass
-/// through.
-fn resolve_message_expiry(message_expiry: IggyExpiry, default_micros: u64) -> u64 {
-    match message_expiry {
-        IggyExpiry::ServerDefault => default_micros,
-        resolved => u64::from(resolved),
-    }
-}
-
-fn topic_header(
-    topic: &metadata::stm::stream::Topic,
-    default_max_topic_size: u64,
-    default_message_expiry: u64,
-) -> Result<StreamTopicHeader, IggyError> {
+/// Stored `message_expiry` and `max_topic_size` echo verbatim, `ServerDefault`
+/// as the wire sentinel (0), matching legacy: create admission resolves the
+/// sentinels against server config before replication, so a stored sentinel
+/// came from an update and must read back as `ServerDefault`, not as the node
+/// default frozen at read time.
+fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
         partitions_count: usize_to_u32(topic.partitions.len())?,
-        message_expiry: resolve_message_expiry(topic.message_expiry, default_message_expiry),
+        message_expiry: u64::from(topic.message_expiry),
         compression_algorithm: topic.compression_algorithm.as_code(),
-        max_topic_size: resolve_max_topic_size(topic.max_topic_size, default_max_topic_size),
+        max_topic_size: topic.max_topic_size.as_bytes_u64(),
         replication_factor: topic.replication_factor,
         size_bytes: topic.stats.size_bytes_inconsistent(),
         messages_count: topic.stats.messages_count_inconsistent(),
@@ -1212,13 +1195,18 @@ fn partition_response(
     // across all shards and both left-right buffers), populated when the
     // owning shard materializes the partition; `None` only in the window
     // before that first materialization.
+    //
+    // A committed partition always materializes with exactly one empty
+    // segment, so before the owning shard gets there (registry miss, or
+    // registered but not yet segmented) the reply reports that deterministic
+    // initial state instead of a zero a client would read as "no storage".
     let stats = streams
         .stats_registry
         .partition_get(stream_id, topic_id, partition.id);
     let (segments_count, current_offset, size_bytes, messages_count) =
-        stats.map_or((0, 0, 0, 0), |stats| {
+        stats.map_or((1, 0, 0, 0), |stats| {
             (
-                stats.segments_count_inconsistent(),
+                stats.segments_count_inconsistent().max(1),
                 stats.current_offset(),
                 stats.size_bytes_inconsistent(),
                 stats.messages_count_inconsistent(),
@@ -1741,14 +1729,11 @@ mod tests {
     }
 
     #[test]
-    fn topic_header_resolves_server_default_and_passes_explicit_values_through() {
+    fn topic_header_echoes_stored_size_and_expiry_verbatim() {
         use iggy_common::{
-            CompressionAlgorithm, IggyDuration, IggyExpiry, StreamStats, TopicStats,
+            CompressionAlgorithm, IggyDuration, IggyExpiry, MaxTopicSize, StreamStats, TopicStats,
         };
         use std::sync::atomic::AtomicUsize;
-
-        const NODE_DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
-        const EXPIRY_DEFAULT_MICROS: u64 = 3_600_000_000;
 
         let parent = Arc::new(StreamStats::default());
         let topic_with = |max_topic_size, message_expiry| metadata::stm::stream::Topic {
@@ -1767,35 +1752,29 @@ mod tests {
             next_consumer_group_id: 0,
         };
 
-        // ServerDefault (0 on the wire) resolves to this node's configured
-        // default for both size and expiry, not the raw 0 the pre-fix read path
-        // echoed.
-        let resolved = topic_header(
-            &topic_with(MaxTopicSize::ServerDefault, IggyExpiry::ServerDefault),
-            NODE_DEFAULT,
-            EXPIRY_DEFAULT_MICROS,
-        )
+        // Stored `ServerDefault` sentinels echo the wire sentinel (0)
+        // verbatim, so an update to `ServerDefault` reads back as
+        // `ServerDefault` instead of the node default frozen at read time.
+        let sentinel = topic_header(&topic_with(
+            MaxTopicSize::ServerDefault,
+            IggyExpiry::ServerDefault,
+        ))
         .expect("topic header builds");
-        assert_eq!(resolved.max_topic_size, NODE_DEFAULT);
-        assert_eq!(resolved.message_expiry, EXPIRY_DEFAULT_MICROS);
+        assert_eq!(sentinel.max_topic_size, 0);
+        assert_eq!(sentinel.message_expiry, 0);
 
-        // Explicit values round-trip unchanged, independent of the node default.
-        let custom = topic_header(
-            &topic_with(
-                MaxTopicSize::from(1024u64),
-                IggyExpiry::ExpireDuration(IggyDuration::from(5_000_000u64)),
-            ),
-            NODE_DEFAULT,
-            EXPIRY_DEFAULT_MICROS,
-        )
+        // Explicit values round-trip unchanged.
+        let custom = topic_header(&topic_with(
+            MaxTopicSize::from(1024u64),
+            IggyExpiry::ExpireDuration(IggyDuration::from(5_000_000u64)),
+        ))
         .expect("topic header builds");
         assert_eq!(custom.max_topic_size, 1024);
         assert_eq!(custom.message_expiry, 5_000_000);
-        let unlimited = topic_header(
-            &topic_with(MaxTopicSize::Unlimited, IggyExpiry::NeverExpire),
-            NODE_DEFAULT,
-            EXPIRY_DEFAULT_MICROS,
-        )
+        let unlimited = topic_header(&topic_with(
+            MaxTopicSize::Unlimited,
+            IggyExpiry::NeverExpire,
+        ))
         .expect("topic header builds");
         assert_eq!(unlimited.max_topic_size, u64::MAX);
         assert_eq!(unlimited.message_expiry, u64::MAX);

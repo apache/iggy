@@ -24,6 +24,10 @@ use std::path::Path;
 
 const OFFSET_SIZE: usize = core::mem::size_of::<u64>();
 
+/// Per-partition file recording the purge generation this replica last applied
+/// locally (LE u64, in the partition dir beside the segments it fences).
+pub const PURGE_GENERATION_FILE: &str = "purge.gen";
+
 pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
     // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
     // in front of every write, which serialises a batched fan-out on stats
@@ -81,6 +85,35 @@ pub async fn persist_offset_max(
         persist_offset(path, effective, enforce_fsync).await?;
     }
     Ok(effective)
+}
+
+/// Durably record the purge generation a partition has locally applied. Same
+/// layout as [`persist_offset`] (LE u64, truncate+write) but ALWAYS data-synced,
+/// regardless of the consumer-offset fsync knob: purges are rare, the file is
+/// 8 bytes, and a generation lost from the page cache in a crash makes the
+/// reconciler re-purge on restart, wiping messages appended after the purge.
+/// A failure leaves the previous generation on disk so the caller keeps its
+/// in-memory applied generation old and retries.
+///
+/// # Errors
+/// Propagates the underlying open/write/sync failure.
+pub async fn persist_purge_generation(path: &str, generation: u64) -> Result<(), IggyError> {
+    persist_offset(path, generation, true).await
+}
+
+/// Read the persisted purge generation. Absent and torn files map to `Ok(0)`:
+/// both imply a purge died mid-write, and `0` makes the reconciler re-apply
+/// the purge, the correct self-healing recovery for an idempotent wipe. A
+/// real I/O error propagates instead: collapsing it to `0` would re-purge a
+/// partition whose durable generation is intact but momentarily unreadable,
+/// destroying every message appended after that purge.
+///
+/// # Errors
+/// Propagates a real open/read failure (anything but absent or short).
+pub async fn read_purge_generation(path: &str) -> Result<u64, IggyError> {
+    read_persisted_offset(path)
+        .await
+        .map(|offset| offset.unwrap_or(0))
 }
 
 /// Read a single persisted consumer offset. `None` if the file is absent or
@@ -189,6 +222,48 @@ mod tests {
         let path = dir.to_string_lossy().into_owned();
 
         let result = read_persisted_offset(&path).await;
+        assert!(
+            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+            "real I/O error must propagate, got {result:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_generation_absent_or_torn_is_zero_but_io_error_propagates() {
+        let dir = unique_temp_dir();
+        let path = dir
+            .join(PURGE_GENERATION_FILE)
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            read_purge_generation(&path).await.expect("absent file"),
+            0,
+            "absent file is 0"
+        );
+
+        persist_purge_generation(&path, 3)
+            .await
+            .expect("persist generation");
+        assert_eq!(
+            read_purge_generation(&path).await.expect("valid file"),
+            3,
+            "round-trip"
+        );
+
+        std::fs::write(&path, [0xAB, 0xCD]).expect("write torn file");
+        assert_eq!(
+            read_purge_generation(&path).await.expect("torn file"),
+            0,
+            "torn file degrades to 0 so the reconciler re-applies the purge"
+        );
+
+        // A directory path is a real I/O error, not a short read: it must
+        // surface, not collapse to the re-purge sentinel (a silent re-purge
+        // would destroy post-purge messages).
+        let result = read_purge_generation(&dir.to_string_lossy()).await;
         assert!(
             matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
             "real I/O error must propagate, got {result:?}",

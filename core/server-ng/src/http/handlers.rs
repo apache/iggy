@@ -109,7 +109,9 @@ use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
-use crate::dispatch::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::{
+    resolve_consumer_offset_request, resolve_poll_request, validate_topic_bounds,
+};
 use crate::http::error::{
     ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery, ReadError,
     WriteError,
@@ -794,6 +796,12 @@ pub(in crate::http) async fn create_topic(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     // Rejects empty/oversized name, partitions_count > MAX, replication_factor == Some(0).
     command.validate().map_err(WriteError::Rejected)?;
+    validate_topic_bounds(
+        &state.system_config,
+        command.partitions_count,
+        command.max_topic_size,
+    )
+    .map_err(WriteError::Rejected)?;
     let request = CreateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,

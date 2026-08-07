@@ -172,7 +172,7 @@ where
     op_to_storage_offset: UnsafeCell<BTreeMap<u64, usize>>,
     /// Maps message offset -> op (for queryable entries)
     offset_to_op: UnsafeCell<BTreeMap<u64, u64>>,
-    /// Maps `(origin_timestamp, op)` -> op (for queryable entries).
+    /// Maps `(base_timestamp, op)` -> op (for queryable entries).
     ///
     /// Keeping `op` in the key preserves duplicate timestamps while still
     /// letting us seek to the closest batch for timestamp-based polling.
@@ -198,6 +198,13 @@ where
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
+    /// Poll-index seal installed by a partition purge: ops at or below this
+    /// floor never enter `offset_to_op` / `timestamp_to_op`. Without it,
+    /// `evict_prefix` re-appending the retained tail would re-insert
+    /// pre-purge entries the purge just sealed off, and resident polls would
+    /// serve purged bytes. Survives only as long as the journal (in-memory),
+    /// same lifetime argument as the partition's `purge_floor_op`.
+    poll_floor: Cell<u64>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -228,6 +235,7 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
+            poll_floor: Cell::new(0),
         }
     }
 }
@@ -569,9 +577,11 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
         let op = header.op;
-        // One decode feeds both the offset/timestamp index (keyed on
-        // `origin_timestamp`) and the surfaced accounting meta (`base_timestamp`,
-        // size, count); the two timestamps are distinct fields, do not conflate.
+        // One decode feeds both the offset/timestamp index and the surfaced
+        // accounting meta. Both are keyed on `base_timestamp`, the broker
+        // append time stamped into replies: the seek hint must live on the
+        // same clock as `select_batch_slice`'s filter or timestamp polls seek
+        // to the wrong resident entry.
         // Trusted (no batch-hash): every entry reaching append was just stamped
         // by `stamp_prepare_for_persistence` (its checksum recomputed over this
         // exact blob) or re-appended from an already-validated resident entry,
@@ -587,7 +597,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                         message_count,
                     };
                     (
-                        Some((batch.header.base_offset, batch.header.origin_timestamp)),
+                        Some((batch.header.base_offset, batch.header.base_timestamp)),
                         Some(meta),
                     )
                 }
@@ -614,7 +624,13 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             op_to_storage_offset.insert(op, storage_offset);
         }
 
-        if let Some((offset, timestamp)) = index_offset_timestamp {
+        // Poll-index only ops above the purge floor: `op_to_storage_offset`
+        // above stays unconditional (consensus history for the repair and
+        // commit walks), but a fenced pre-purge entry re-appended by
+        // `evict_prefix` must not become poll-resolvable again.
+        if op > self.poll_floor.get()
+            && let Some((offset, timestamp)) = index_offset_timestamp
+        {
             let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
             offset_to_op.insert(offset, op);
 
@@ -657,6 +673,7 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
+            poll_floor: Cell::new(0),
         }
     }
 
@@ -756,6 +773,25 @@ where
     pub fn oldest_resident_offset(&self) -> Option<u64> {
         let offset_to_op = unsafe { &*self.offset_to_op.get() };
         offset_to_op.keys().next().copied()
+    }
+
+    /// Seal the resident poll tier: clear the offset and timestamp poll
+    /// indexes ONLY, so `oldest_resident_offset` reads `None` and every poll
+    /// falls back to the on-disk segments. Called by a partition purge, which
+    /// wipes the segments but must KEEP the journal entries themselves:
+    /// headers, storage, `op_to_storage_offset` and the evicted ring are
+    /// consensus history that backups, repair and retransmission still walk.
+    /// Clearing those would wedge `commit_min` until a view change.
+    ///
+    /// `floor` (the purge's fence op) makes the seal survive eviction:
+    /// `evict_prefix` re-appends the retained tail, and without the floor
+    /// that re-append would re-index the pre-purge entries just cleared.
+    pub fn clear_poll_index(&self, floor: u64) {
+        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+        offset_to_op.clear();
+        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+        timestamp_to_op.clear();
+        self.poll_floor.set(floor);
     }
 
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
@@ -886,8 +922,12 @@ pub fn select_batch_slice(
                 ..
             } => offset >= query_offset,
             MessageLookup::Timestamp { timestamp, .. } => {
-                batch.header.origin_timestamp + u64::from(record.message.header.timestamp_delta)
-                    >= timestamp
+                // Match on the broker append time: replies stamp every message
+                // with the flat batch `base_timestamp` (the per-message delta
+                // applies to `origin_timestamp` only), so filtering on the
+                // producer clock would skip the message stamped exactly at the
+                // queried timestamp.
+                batch.header.base_timestamp >= timestamp
             }
         };
         if !selected {
@@ -1054,9 +1094,14 @@ pub fn select_resident(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use iggy_binary_protocol::{Command2, HEADER_SIZE};
     use journal::Journal;
     use server_common::Message;
+    use server_common::send_messages2::{
+        IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned, decode_batch_slice,
+    };
+    use server_common::sharding::IggyNamespace;
 
     fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
@@ -1213,6 +1258,74 @@ mod tests {
         assert!(
             journal.committed_headers_from(5, 4).is_empty(),
             "from_op past commit_max yields nothing"
+        );
+    }
+
+    /// Three-message batch with the broker append time (`base_timestamp`)
+    /// deliberately AFTER every producer stamp (`origin_timestamp` + deltas),
+    /// the layout every real batch has (the broker stamps later than the
+    /// producer). Timestamp polls filter on the broker time because that is
+    /// the timestamp replies surface per message.
+    fn build_timestamped_batch(base_timestamp: u64, origin_timestamp: u64) -> Vec<u8> {
+        let mut messages = IggyMessages2::with_capacity(3);
+        for index in 0..3u64 {
+            messages.push(IggyMessage2 {
+                header: IggyMessage2Header {
+                    origin_timestamp: origin_timestamp + index,
+                    payload_length: 8,
+                    ..Default::default()
+                },
+                payload: Bytes::from_static(b"abcdefgh"),
+                user_headers: None,
+            });
+        }
+        let mut owned = SendMessages2Owned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+            .expect("build send_messages batch");
+        owned.header.base_timestamp = base_timestamp;
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+
+        let mut record = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
+        owned.header.encode_into(&mut record[..COMMAND_HEADER_SIZE]);
+        record[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
+        record
+    }
+
+    #[test]
+    fn timestamp_poll_at_exact_broker_timestamp_includes_the_batch() {
+        // A client polls with a timestamp read from a previous reply, which is
+        // the batch `base_timestamp`. Filtering on the producer origin clock
+        // (always a little earlier) made `origin >= base` false and silently
+        // skipped the message stamped exactly at the queried time.
+        let record = build_timestamped_batch(1_000, 900);
+        let batch = decode_batch_slice(&record).expect("batch decodes");
+
+        let at_exact = select_batch_slice(
+            &batch,
+            MessageLookup::Timestamp {
+                timestamp: 1_000,
+                count: 10,
+                ceiling: u64::MAX,
+            },
+            0,
+        )
+        .expect("selection at the exact broker timestamp");
+        assert_eq!(
+            at_exact.matched_messages, 3,
+            "poll at the reported timestamp must include the whole batch"
+        );
+
+        assert!(
+            select_batch_slice(
+                &batch,
+                MessageLookup::Timestamp {
+                    timestamp: 1_001,
+                    count: 10,
+                    ceiling: u64::MAX,
+                },
+                0,
+            )
+            .is_none(),
+            "poll past the broker timestamp must match nothing"
         );
     }
 }

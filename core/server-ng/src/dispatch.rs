@@ -69,9 +69,13 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     GetConsumerOffsetRequest, StoreConsumerOffset2Request,
 };
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsRequest, DeletePartitionsRequest,
+};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
@@ -80,10 +84,12 @@ use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, Command2, EvictionReason, GenericHeader, HEADER_SIZE,
-    KIND_CONSUMER_GROUP, Operation, ProtocolVersion, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, is_protocol_compatible,
+    KIND_CONSUMER_GROUP, MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader,
+    WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
 };
-use iggy_common::{IggyError, PollingStrategy, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{
+    IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression, SystemSnapshotType,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
@@ -734,6 +740,81 @@ fn pop_next_client_request(
     message
 }
 
+/// Per-request partitions-count cap shared by create-topic, create-partitions
+/// and delete-partitions admission. Runs pre-consensus like
+/// [`validate_topic_bounds`]: an oversized count must not burn a replicated
+/// log entry (create-partitions admission would also allocate that many
+/// consensus-group ids before replicating).
+pub(crate) const fn validate_partitions_count(partitions_count: u32) -> Result<(), IggyError> {
+    if partitions_count > MAX_PARTITIONS_PER_REQUEST {
+        return Err(IggyError::TooManyPartitions);
+    }
+    Ok(())
+}
+
+/// Static create-topic bounds shared by the TCP and HTTP ingresses. Runs
+/// pre-consensus: a rejected request must not burn a replicated log entry,
+/// and `prepare_request` errors evict the session instead of denying typed.
+/// `ServerDefault` is exempt from the size floor (it resolves against server
+/// config at admission, matching legacy); `Unlimited` passes numerically.
+pub(crate) fn validate_topic_bounds(
+    system_config: &NgSystemConfig,
+    partitions_count: u32,
+    max_topic_size: MaxTopicSize,
+) -> Result<(), IggyError> {
+    validate_partitions_count(partitions_count)?;
+    if !matches!(max_topic_size, MaxTopicSize::ServerDefault)
+        && max_topic_size.as_bytes_u64() < system_config.segment.size.as_bytes_u64()
+    {
+        return Err(IggyError::InvalidTopicSize(
+            max_topic_size,
+            system_config.segment.size,
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a request before it reaches consensus: warn, then send the typed
+/// deny reply. A silent drop would wedge every later request on the
+/// connection until the socket read timeout. `context` labels the rejection
+/// site in both log lines.
+#[allow(clippy::future_not_send)]
+async fn send_pre_consensus_deny<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    header: &RequestHeader,
+    transport_client_id: u128,
+    error: &IggyError,
+    context: &'static str,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    warn!(
+        transport_client_id,
+        error = %error,
+        operation = ?header.operation,
+        context,
+        "denying request pre-consensus"
+    );
+    let commit = current_metadata_commit(shard);
+    let reply = build_deny_reply(header, transport_client_id, 0, commit, error.as_code());
+    if let Err(send_error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %send_error,
+            context,
+            "failed to send pre-consensus deny reply"
+        );
+    }
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -920,29 +1001,15 @@ async fn handle_client_request<B, MJ, S, SB>(
     ) {
         Ok(rewritten) => rewritten,
         Err(error) => {
-            // Pre-consensus rejection (token cap reached, malformed body, or a
-            // lost session binding): deny fast with the typed code. A silent
-            // drop would wedge every later request on the connection until the
-            // socket read timeout.
-            warn!(
+            // Token cap reached, malformed body, or a lost session binding.
+            send_pre_consensus_deny(
+                shard,
+                &header,
                 transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "denying personal-access-token request"
-            );
-            let commit = current_metadata_commit(shard);
-            let reply = build_deny_reply(&header, transport_client_id, 0, commit, error.as_code());
-            if let Err(send_error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %send_error,
-                    "failed to send personal-access-token deny reply"
-                );
-            }
+                &error,
+                "personal-access-token",
+            )
+            .await;
             return;
         }
     };
@@ -954,31 +1021,42 @@ async fn handle_client_request<B, MJ, S, SB>(
     let request = match maybe_rewrite_user_password_request(shard, request) {
         Ok(rewritten) => rewritten,
         Err(error) => {
-            // Malformed body: deny fast with InvalidCommand. A silent drop
-            // would wedge every later request on the connection until the
-            // socket read timeout.
-            warn!(
-                transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "denying user password request"
-            );
-            let commit = current_metadata_commit(shard);
-            let reply = build_deny_reply(&header, transport_client_id, 0, commit, error.as_code());
-            if let Err(send_error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %send_error,
-                    "failed to send password-deny reply"
-                );
-            }
+            // Malformed body: deny fast with InvalidCommand.
+            send_pre_consensus_deny(shard, &header, transport_client_id, &error, "user-password")
+                .await;
             return;
         }
     };
+    // Static bounds run pre-consensus so a rejected request burns no
+    // replicated log entry; HTTP covers the same bounds via
+    // `command.validate()`. A body that fails to decode denies typed too
+    // (`InvalidCommand`), instead of riding consensus just to fail there.
+    let bounds = match header.operation {
+        Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|create_topic| {
+                validate_topic_bounds(
+                    system_config,
+                    create_topic.partitions_count,
+                    MaxTopicSize::from(create_topic.max_topic_size),
+                )
+            }),
+        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|create_partitions| {
+                validate_partitions_count(create_partitions.partitions_count)
+            }),
+        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|delete_partitions| {
+                validate_partitions_count(delete_partitions.partitions_count)
+            }),
+        _ => Ok(()),
+    };
+    if let Err(error) = bounds {
+        send_pre_consensus_deny(shard, &header, transport_client_id, &error, "static-bounds").await;
+        return;
+    }
     // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
     // partition count for Join) before replication; see `crate::consumer_group`.
     let request = match maybe_rewrite_consumer_group_request(shard, request).await {
@@ -1828,6 +1906,19 @@ async fn handle_poll_messages<B, MJ, S, SB>(
             }
         }
         Err(error) => {
+            // A partition id that does not exist in a resolvable topic is a
+            // client addressing error and must surface as a typed rejection,
+            // not an empty poll a consumer would read as end-of-partition.
+            if matches!(error, IggyError::PartitionNotFound(..)) {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "poll_messages rejected: partition not found"
+                );
+                send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             // A zero-byte body would panic the SDK's `PolledMessages`
             // decoder; reply the 16-byte empty-poll shape instead. A generation
             // fence (the client's cached assignment is stale after a rebalance)
@@ -2910,9 +3001,7 @@ mod tests {
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
-    };
+    use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
     use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, WireName, WirePartitioning};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::variadic;
@@ -3532,6 +3621,67 @@ mod tests {
             IggyError::TransientNotAccepted.as_code(),
             "a discarded parked send must surface the retriable transient \
              status so the SDK replays it instead of timing out"
+        );
+    }
+
+    #[test]
+    fn create_topic_bounds_deny_pre_consensus() {
+        let config = NgSystemConfig::default();
+        let segment_size = config.segment.size.as_bytes_u64();
+        assert!(segment_size > 0, "default segment size must be nonzero");
+
+        assert!(
+            validate_topic_bounds(
+                &config,
+                MAX_PARTITIONS_PER_REQUEST,
+                MaxTopicSize::ServerDefault
+            )
+            .is_ok(),
+            "the partition cap itself is admissible"
+        );
+        assert!(
+            matches!(
+                validate_topic_bounds(
+                    &config,
+                    MAX_PARTITIONS_PER_REQUEST + 1,
+                    MaxTopicSize::ServerDefault
+                ),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "one past the partition cap must deny"
+        );
+        // ServerDefault is numerically 0 yet exempt from the segment-size
+        // floor: it resolves against server config, matching legacy.
+        assert!(validate_topic_bounds(&config, 1, MaxTopicSize::ServerDefault).is_ok());
+        assert!(validate_topic_bounds(&config, 1, MaxTopicSize::Unlimited).is_ok());
+        let below_floor = MaxTopicSize::Custom((segment_size - 1).into());
+        assert!(
+            matches!(
+                validate_topic_bounds(&config, 1, below_floor),
+                Err(IggyError::InvalidTopicSize(size, floor))
+                    if size == below_floor && floor == config.segment.size
+            ),
+            "custom size below the segment size must deny with the bounds"
+        );
+        let at_floor = MaxTopicSize::Custom(config.segment.size);
+        assert!(
+            validate_topic_bounds(&config, 1, at_floor).is_ok(),
+            "a topic exactly one segment large is admissible"
+        );
+    }
+
+    #[test]
+    fn partitions_count_cap_denies_pre_consensus() {
+        assert!(
+            validate_partitions_count(MAX_PARTITIONS_PER_REQUEST).is_ok(),
+            "the cap itself is admissible"
+        );
+        assert!(
+            matches!(
+                validate_partitions_count(MAX_PARTITIONS_PER_REQUEST + 1),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "one past the cap must deny"
         );
     }
 }
