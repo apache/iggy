@@ -231,7 +231,9 @@ func TestNewEvictionError_MapsEveryReason(t *testing.T) {
 		{reason: EvictionSessionError, want: ierror.UnauthenticatedCode},
 		{reason: EvictionStaleClient, want: ierror.StaleClientCode},
 		{reason: EvictionMalformedLogin, want: ierror.InvalidFormatCode},
-		{reason: EvictionReason(200), want: ierror.UnauthenticatedCode},
+		// An unrecognized reason maps like the core/common fallback and must
+		// not become a reconnectable error.
+		{reason: EvictionReason(200), want: ierror.InvalidCommandCode},
 	}
 	for _, test := range tests {
 		got := NewEvictionError(Eviction{Reason: test.reason})

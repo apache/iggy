@@ -18,6 +18,7 @@
 package tcp
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -28,6 +29,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -51,8 +53,19 @@ func GetDefaultOptions() Options {
 }
 
 type IggyTcpClient struct {
-	conn                   net.Conn
-	mtx                    sync.Mutex
+	conn net.Conn
+	// reader buffers reads off conn, so a reply costs one syscall instead of
+	// one for the header and one for the body; guarded by c.mtx.
+	reader *bufio.Reader
+	mtx    sync.Mutex
+	// registerMtx single-flights the sign-in transaction: BeginRegister and
+	// Bind live in different c.mtx critical sections, and two interleaved
+	// sign-ins would commit one Register whose session is never bound.
+	registerMtx sync.Mutex
+	// closed unblocks a replay wait when Close is called, which cannot go
+	// through c.mtx because the replay loop holds it.
+	closed                 chan struct{}
+	closeOnce              sync.Once
 	config                 config
 	logger                 *slog.Logger
 	MessageCompression     iggcon.IggyMessageCompression
@@ -69,6 +82,9 @@ type IggyTcpClient struct {
 	// skipAutoLoginOnce suppresses the next automatic sign-in so a replayed
 	// login is not preempted by one the reconnect issues; guarded by c.mtx.
 	skipAutoLoginOnce bool
+	// loggedOut records an explicit sign-out, so a reconnect's automatic
+	// sign-in does not silently reverse it; guarded by c.mtx.
+	loggedOut bool
 	// groups caches the consumer-group assignments this client polls with.
 	groups groupAssignmentCache
 	// topics caches what a send needs to resolve a partition locally.
@@ -98,7 +114,9 @@ func defaultTcpClientConfig() config {
 		tls:           defaultTLSConfig(),
 		autoLogin:     AutoLogin{},
 		reconnection:  defaultTcpClientReconnectionConfig(),
-		noDelay:       false,
+		// The lockstep request model stalls a multi-segment frame behind
+		// Nagle's algorithm, so coalescing is off by default.
+		noDelay: true,
 	}
 }
 
@@ -221,6 +239,15 @@ func WithTLSValidateCertificate(validate bool) TLSOption {
 	}
 }
 
+// WithNoDelay controls TCP_NODELAY. It defaults to true because the lockstep
+// request model stalls behind Nagle's algorithm; pass false to re-enable
+// segment coalescing for bandwidth-bound workloads.
+func WithNoDelay(noDelay bool) Option {
+	return func(opts *Options) {
+		opts.config.noDelay = noDelay
+	}
+}
+
 // NewIggyTcpClient creates a new Iggy TCP client with the given options.
 // warning: don't use this function directly, use iggycli.NewIggyClient with iggycli.WithTcp instead.
 func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
@@ -245,6 +272,7 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		leaderRedirectionState: iggcon.LeaderRedirectionState{},
 		currentServerAddress:   opts.config.serverAddress,
 		session:                vsr.NewSession(),
+		closed:                 make(chan struct{}),
 	}
 }
 
@@ -268,14 +296,12 @@ const (
 	failoverCheckInterval = 2 * time.Second
 )
 
-// requestPrologue is the zeroed space a frame reserves ahead of its payload.
-// The header is stamped into it once the payload length is known.
-var requestPrologue [vsr.HeaderSize]byte
-
-// requestBufPool reuses wire-payload buffers across RPCs.
+// requestBufPool reuses wire-payload buffers across RPCs. A fresh buffer
+// already holds the header plus room for a small payload, so a metadata
+// command does not reallocate on its first byte.
 var requestBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 0, 256)
+		b := make([]byte, 0, vsr.HeaderSize+512)
 		return &b
 	},
 }
@@ -285,7 +311,10 @@ func acquireRequestBuf() *[]byte {
 }
 
 func releaseRequestBuf(bp *[]byte) {
-	const maxPooled = 64 * 1024
+	// Producer batches routinely grow to megabytes and reusing them is the
+	// point of the pool; the ceiling only stops a pathological frame from
+	// pinning memory for the process lifetime.
+	const maxPooled = 4 * 1024 * 1024
 	if cap(*bp) > maxPooled {
 		return
 	}
@@ -302,8 +331,12 @@ func (c *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
 	return n, buffer, nil
 }
 
-// readInto reads exactly len(buf) bytes from the connection into buf.
+// readInto reads exactly len(buf) bytes from the connection into buf, through
+// the buffered reader when the connect flow installed one.
 func (c *IggyTcpClient) readInto(buf []byte) (int, error) {
+	if c.reader != nil {
+		return io.ReadFull(c.reader, buf)
+	}
 	var totalRead int
 	expected := len(buf)
 	for totalRead < expected {
@@ -342,10 +375,14 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 	defer releaseRequestBuf(bp)
 
 	frame, err := appendCommandFrame(*bp, cmd)
+	if frame != nil {
+		// Keep the grown buffer even when the encode failed, so the pool gets
+		// it back at its new capacity.
+		*bp = frame
+	}
 	if err != nil {
 		return nil, err
 	}
-	*bp = frame
 
 	return c.exchange(ctx, uint32(cmd.Code()), frame)
 }
@@ -360,10 +397,18 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 
-	frame := append(append((*bp)[:0], requestPrologue[:]...), payload...)
+	frame := append(reserveHeader(*bp), payload...)
 	*bp = frame
 
 	return c.exchange(ctx, code, frame)
+}
+
+// reserveHeader returns buf truncated to exactly the header prologue, growing
+// it as needed. The prologue bytes are not zeroed here: EncodeRequestHeader
+// clears the full header when the frame is stamped, and zeroing twice would
+// write four extra cache lines per request.
+func reserveHeader(buf []byte) []byte {
+	return slices.Grow(buf[:0], vsr.HeaderSize)[:vsr.HeaderSize]
 }
 
 func isSessionControlCode(code uint32) bool {
@@ -386,16 +431,18 @@ func isRegisterCode(code uint32) bool {
 }
 
 // appendCommandFrame reserves the request prologue in buf and appends the
-// encoded command payload after it, so the frame is a single allocation the
-// header can be stamped into once the payload length is known.
+// encoded command payload after it. A command implementing
+// encoding.BinaryAppender encodes straight into the buffer, keeping the frame
+// a single allocation; the MarshalBinary fallback pays one extra body
+// allocation and copy.
 func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
-	buf = append(buf[:0], requestPrologue[:]...)
+	buf = reserveHeader(buf)
 	if appender, ok := cmd.(encoding.BinaryAppender); ok {
 		return appender.AppendBinary(buf)
 	}
 	body, err := cmd.MarshalBinary()
 	if err != nil {
-		return nil, err
+		return buf, err
 	}
 	return append(buf, body...), nil
 }
@@ -405,12 +452,24 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 // the stack, and re-entering it has no depth bound.
 type connectScoped struct{}
 
+// localPreconditionError marks a request that failed before its frame was
+// written. The connection is healthy, so exchange must not tear it down and
+// re-dial over what is purely local state.
+type localPreconditionError struct{ err error }
+
+func (e *localPreconditionError) Error() string { return e.err.Error() }
+func (e *localPreconditionError) Unwrap() error { return e.err }
+
 // exchange runs one request to completion, reconnecting and replaying it when
 // the failure is one a fresh connection recovers from.
 func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte) ([]byte, error) {
 	response, err := c.sendFrame(ctx, code, frame)
 	if err == nil || !isReconnectable(err) {
 		return response, err
+	}
+	var precondition *localPreconditionError
+	if errors.As(err, &precondition) {
+		return nil, err
 	}
 	if ctx.Value(connectScoped{}) != nil {
 		return nil, err
@@ -426,6 +485,14 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 	// register failure and expects the client to replay it.
 	login := isRegisterCode(code)
 	if !c.config.autoLogin.enabled && !login {
+		return nil, err
+	}
+	c.mtx.Lock()
+	loggedOut := c.loggedOut
+	c.mtx.Unlock()
+	if loggedOut && !login {
+		// An explicit sign-out stays signed out: the reconnect's automatic
+		// sign-in would silently reverse it.
 		return nil, err
 	}
 	if !canReplay(code, err) {
@@ -588,8 +655,10 @@ func (c *IggyTcpClient) attempt(
 	if !stamped {
 		// Stamp once per session: the header consumes a request id, and a
 		// replay must carry the same one for the server to deduplicate it.
+		// A stamp failure is local and pre-write, so it is marked as such:
+		// the connection is healthy and must not be torn down for it.
 		if err := vsr.StampRequestHeader(c.session, code, frame); err != nil {
-			return nil, false, err
+			return nil, false, &localPreconditionError{err}
 		}
 		stamped = true
 	}
@@ -642,26 +711,44 @@ func (c *IggyTcpClient) exchangeLocked(
 		c.logger.Debug("Sending a TCP request",
 			slog.Int("frame_length", len(frame)), slog.Int("code", int(code)))
 		if _, err := c.write(frame); err != nil {
+			// Normalized like the read failures below, so callers can match
+			// a dropped connection with one sentinel in both directions.
+			c.logger.Error("Failed to write the request frame",
+				slog.Int("code", int(code)), slog.Any("error", err))
 			c.invalidateConnLocked()
-			return nil, err
+			return nil, ierror.ErrDisconnected
 		}
 
 		body, err := c.readReplyLocked(code)
 		if err != nil {
 			return nil, err
 		}
+		if vsr.PeekCommand(&c.respHeader) == vsr.FrameReply {
+			// A reply must answer the request in flight. An unexpected echo
+			// means the stream is delivering some other request's answer, and
+			// every later reply would pair off by one.
+			expected := vsr.StampedRequestID(frame)
+			if echoed := vsr.ReadReplyRequestID(&c.respHeader); echoed != expected {
+				c.logger.Error("The reply answers a different request",
+					slog.Uint64("expected_request", expected),
+					slog.Uint64("echoed_request", echoed))
+				c.invalidateConnLocked()
+				return nil, ierror.ErrDisconnected
+			}
+		}
 
 		response, err := vsr.DecodeReply(&c.respHeader, body)
 		switch {
 		case errors.Is(err, ierror.ErrTransientNotCommitted) && time.Now().Before(readDeadline):
 			// The outcome is unknown, so only a replay of the same request id
-			// on this session is safe. The server's client table answers from
-			// its reply cache if the request did commit.
-			if waitErr := waitBeforeReplay(ctx, readDeadline); waitErr != nil {
+			// on this session is safe. On the metadata plane the client table
+			// answers a committed request from its reply cache; the partition
+			// plane keeps no client table, so its replay is at-least-once.
+			if waitErr := c.waitBeforeReplay(ctx, readDeadline); waitErr != nil {
 				return nil, waitErr
 			}
 		case errors.Is(err, ierror.ErrTransientNotAccepted) && time.Now().Before(transientDeadline):
-			if waitErr := waitBeforeReplay(ctx, transientDeadline); waitErr != nil {
+			if waitErr := c.waitBeforeReplay(ctx, transientDeadline); waitErr != nil {
 				return nil, waitErr
 			}
 		default:
@@ -723,8 +810,11 @@ func (c *IggyTcpClient) handleReplyFailureLocked(err error) {
 }
 
 // waitBeforeReplay pauses before resending a transiently rejected request,
-// never past the deadline and never past the caller's cancellation.
-func waitBeforeReplay(ctx context.Context, deadline time.Time) error {
+// never past the deadline, the caller's cancellation, or a client shutdown.
+// The shutdown channel matters because this wait runs with c.mtx held, which
+// is the lock Close needs; without it Close would block for the rest of the
+// request budget.
+func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time) error {
 	interval := replayInterval
 	if remaining := time.Until(deadline); remaining < interval {
 		interval = remaining
@@ -738,6 +828,8 @@ func waitBeforeReplay(ctx context.Context, deadline time.Time) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-c.closed:
+		return ierror.ErrClientShutdown
 	case <-timer.C:
 		return nil
 	}
@@ -750,7 +842,7 @@ func (c *IggyTcpClient) invalidateConnLocked() {
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
 	c.groups.clear()
-	c.topics.clear()
+	c.topics.clearCounts()
 }
 
 // closeConnLocked closes and drops the current connection.
@@ -760,6 +852,7 @@ func (c *IggyTcpClient) closeConnLocked() error {
 	}
 	err := c.conn.Close()
 	c.conn = nil
+	c.reader = nil
 	return err
 }
 
@@ -881,6 +974,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 
 	c.mtx.Lock()
 	c.conn = conn
+	c.reader = bufio.NewReaderSize(conn, 64*1024)
 	c.transportState = iggcon.TransportStateConnected
 	c.connectedAt = time.Now()
 	// The server fence does not survive the old socket, so the new connection
@@ -940,6 +1034,16 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool
 		return err
 	}
 	if redirect {
+		if skipAutoLogin {
+			// The suppression belongs to the sign-in replay, not to this
+			// connection attempt. Connect already consumed the flag, so it is
+			// re-armed for the post-redirect Connect; otherwise that nested
+			// Connect signs in automatically and the replayed login then
+			// commits a second Register.
+			c.mtx.Lock()
+			c.skipAutoLoginOnce = true
+			c.mtx.Unlock()
+		}
 		return c.Connect(ctx)
 	}
 
@@ -1018,7 +1122,7 @@ func (c *IggyTcpClient) disconnect() error {
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
 	c.groups.clear()
-	c.topics.clear()
+	c.topics.clearCounts()
 
 	err := c.closeConnLocked()
 
@@ -1028,6 +1132,14 @@ func (c *IggyTcpClient) disconnect() error {
 }
 
 func (c *IggyTcpClient) shutdown() error {
+	// Unblock any in-flight replay wait before taking the lock it holds,
+	// otherwise this call queues behind the rest of that request's budget.
+	c.closeOnce.Do(func() {
+		if c.closed != nil {
+			close(c.closed)
+		}
+	})
+
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
@@ -1043,7 +1155,7 @@ func (c *IggyTcpClient) shutdown() error {
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
 	c.groups.clear()
-	c.topics.clear()
+	c.topics.clearCounts()
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
 	// TODO push shutdown event
 	return err

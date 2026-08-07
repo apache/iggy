@@ -167,6 +167,79 @@ func TestDeserializeConsumerGroupAssignment_DoesNotAllocateOnABogusCount(t *test
 	assert.Error(t, err)
 }
 
+// pollPayload builds a poll reply body carrying the given messages.
+func pollPayload(t *testing.T, partitionId uint32, payloads ...[]byte) []byte {
+	t.Helper()
+
+	body := binary.LittleEndian.AppendUint32(nil, partitionId)
+	body = binary.LittleEndian.AppendUint64(body, 42)
+	body = binary.LittleEndian.AppendUint32(body, uint32(len(payloads)))
+	for _, payload := range payloads {
+		message, err := iggcon.NewIggyMessage(payload)
+		require.NoError(t, err)
+		headerBytes, err := message.Header.AppendBinary(nil)
+		require.NoError(t, err)
+		body = append(body, headerBytes...)
+		body = append(body, message.Payload...)
+	}
+	return body
+}
+
+func TestDeserializeFetchMessagesResponse_DecodesABatch(t *testing.T) {
+	payload := pollPayload(t, 3, []byte("first"), []byte("second"))
+
+	polled, err := DeserializeFetchMessagesResponse(payload, iggcon.MESSAGE_COMPRESSION_NONE)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(3), polled.PartitionId)
+	assert.Equal(t, uint64(42), polled.CurrentOffset)
+	require.Len(t, polled.Messages, 2)
+	assert.Equal(t, []byte("first"), polled.Messages[0].Payload)
+	assert.Equal(t, []byte("second"), polled.Messages[1].Payload)
+}
+
+func TestDeserializeFetchMessagesResponse_TreatsAnEmptyPayloadAsAnEmptyBatch(t *testing.T) {
+	polled, err := DeserializeFetchMessagesResponse(nil, iggcon.MESSAGE_COMPRESSION_NONE)
+	require.NoError(t, err)
+	assert.Empty(t, polled.Messages)
+}
+
+func TestDeserializeFetchMessagesResponse_RejectsEveryTruncation(t *testing.T) {
+	payload := pollPayload(t, 1, []byte("first"), []byte("second"))
+
+	for length := 1; length < len(payload); length++ {
+		_, err := DeserializeFetchMessagesResponse(
+			payload[:length], iggcon.MESSAGE_COMPRESSION_NONE)
+		assert.Error(t, err,
+			"a reply truncated to %d bytes must not decode as a shorter batch", length)
+	}
+}
+
+func TestDeserializeFetchMessagesResponse_RejectsACountAboveTheDecodedMessages(t *testing.T) {
+	payload := pollPayload(t, 1, []byte("only"))
+	binary.LittleEndian.PutUint32(payload[12:16], 5)
+
+	_, err := DeserializeFetchMessagesResponse(payload, iggcon.MESSAGE_COMPRESSION_NONE)
+	assert.Error(t, err,
+		"a declared count the body does not satisfy must surface, not silently shrink")
+}
+
+func TestDeserializeFetchMessagesResponse_RejectsOverrunningUserHeaders(t *testing.T) {
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	message.Header.UserHeaderLength = 64
+
+	body := binary.LittleEndian.AppendUint32(nil, 1)
+	body = binary.LittleEndian.AppendUint64(body, 0)
+	body = binary.LittleEndian.AppendUint32(body, 1)
+	headerBytes, err := message.Header.AppendBinary(nil)
+	require.NoError(t, err)
+	body = append(body, headerBytes...)
+	body = append(body, message.Payload...)
+
+	_, err = DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	assert.Error(t, err, "user headers past the body must not panic or pass")
+}
+
 func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
 	const nameOffset = 50
 	name := "orders"

@@ -52,6 +52,14 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 // the existing session untouched, and a connection that dies mid-attempt is
 // already reset by invalidateConnLocked.
 func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+	// One sign-in at a time. BeginRegister runs inside the exchange lock but
+	// Bind runs after it, so two interleaved sign-ins would let the second
+	// BeginRegister reset the identity the first is about to bind: one
+	// committed Register would be orphaned in the server's client table and
+	// the losing caller would see ErrSessionAlreadyBound.
+	c.registerMtx.Lock()
+	defer c.registerMtx.Unlock()
+
 	c.logger.Info("Iggy client is signing in...", slog.String("client_address", c.clientAddress))
 
 	if err := c.endBoundSession(ctx); err != nil {
@@ -60,7 +68,7 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
-	frame := append(append((*bp)[:0], requestPrologue[:]...), body...)
+	frame := append(reserveHeader(*bp), body...)
 	*bp = frame
 
 	response, err := c.exchange(ctx, code, frame)
@@ -77,6 +85,12 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 	err = c.session.Bind(registered.Session)
 	if err == nil {
 		c.sessionState = iggcon.SessionStateAuthenticated
+		c.loggedOut = false
+	} else {
+		// The server committed a Register this client failed to adopt, so the
+		// connection carries a session the local state does not track. It is
+		// unusable; drop it like any other terminal session failure.
+		c.invalidateConnLocked()
 	}
 	c.mtx.Unlock()
 	if err != nil {
@@ -108,8 +122,11 @@ func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	c.mtx.Lock()
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
+	// The sign-out is caller intent: it suppresses the automatic sign-in on
+	// the reconnect path until the caller explicitly signs in again.
+	c.loggedOut = true
 	c.groups.clear()
-	c.topics.clear()
+	c.topics.clearCounts()
 	c.mtx.Unlock()
 	return nil
 }

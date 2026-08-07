@@ -52,8 +52,7 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	}
 
 	// Namespace derivation can fail on a malformed payload. Run it before
-	// taking a request id so a local failure never burns one, which would gap
-	// the sequence and make the primary drop the next metadata request.
+	// taking a request id so a local failure leaves the counter untouched.
 	namespace, err := NamespaceForRequest(code, payload, operation)
 	if err != nil {
 		return err
@@ -71,9 +70,10 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	default:
 		sessionID = session.SessionID()
 		if IsPartition(operation) {
-			// Partition operations replicate in their own per-partition group
-			// with no client-table dedup, so they read the watermark without
-			// consuming it.
+			// Partition operations replicate in per-partition groups that
+			// keep no client table, so there is nothing to deduplicate
+			// against: the watermark is read without being consumed and a
+			// partition-plane replay is at-least-once.
 			request = session.CurrentRequestID()
 		} else if request, err = session.NextRequestID(); err != nil {
 			return err

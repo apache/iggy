@@ -127,6 +127,7 @@ func listenVSR(t *testing.T, wrap func(net.Conn) net.Conn,
 					if answer == nil {
 						return
 					}
+					echoReplyRequest(answer, read)
 					if _, err := conn.Write(answer); err != nil {
 						return
 					}

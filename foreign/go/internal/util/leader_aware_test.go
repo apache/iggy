@@ -139,6 +139,11 @@ func TestIsSameAddress(t *testing.T) {
 		{"localhost", "localhost:8090", "127.0.0.1:8090", true},
 		{"different port", "127.0.0.1:8090", "127.0.0.1:8091", false},
 		{"different ip", "192.168.1.1:8090", "127.0.0.1:8090", false},
+		{"ipv6 spellings", "[::1]:8090", "[0:0:0:0:0:0:0:1]:8090", true},
+		{"same hostname", "IGGY.local:8090", "iggy.local:8090", true},
+		// Hostnames compare lexically: this path runs during failover, where
+		// a resolver lookup could block with no deadline.
+		{"hostname versus its ip", "iggy.local:8090", "10.0.0.1:8090", false},
 	}
 
 	for _, tc := range cases {

@@ -149,30 +149,32 @@ func clusterNodeAddress(node *iggcon.ClusterNode, transport iggcon.Protocol) (st
 	return net.JoinHostPort(node.IP, strconv.Itoa(int(port))), nil
 }
 
-// isSameAddress returns true if two addresses refer to the same endpoint.
+// isSameAddress reports whether two addresses refer to the same endpoint.
+// The comparison is lexical after normalization, with an IP-literal fast path
+// for spelling differences like ::1 versus 0:0:0:0:0:0:0:1. It deliberately
+// never resolves names: both sides come from the same cluster-metadata roster
+// or config, and this runs on the failover path where a resolver lookup would
+// block with neither a context nor a deadline to interrupt it.
 func isSameAddress(addr1, addr2 string) bool {
-	a1 := parseAddress(addr1)
-	a2 := parseAddress(addr2)
-
-	if a1 != nil && a2 != nil {
-		return a1.IP.Equal(a2.IP) && a1.Port == a2.Port
+	host1, port1 := splitAddress(normalizeAddress(addr1))
+	host2, port2 := splitAddress(normalizeAddress(addr2))
+	if port1 != port2 {
+		return false
 	}
-
-	return normalizeAddress(addr1) == normalizeAddress(addr2)
+	if ip1, ip2 := net.ParseIP(host1), net.ParseIP(host2); ip1 != nil && ip2 != nil {
+		return ip1.Equal(ip2)
+	}
+	return host1 == host2
 }
 
-// parseAddress attempts to parse an address into a *net.TCPAddr.
-func parseAddress(addr string) *net.TCPAddr {
-	// Try direct parse
-	if ta, err := net.ResolveTCPAddr("tcp", addr); err == nil {
-		return ta
+// splitAddress splits host:port, treating an unparsable address as a bare
+// host so the comparison degrades to a string match instead of failing.
+func splitAddress(addr string) (string, string) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, ""
 	}
-	// Normalize then try again
-	normalized := normalizeAddress(addr)
-	if ta, err := net.ResolveTCPAddr("tcp", normalized); err == nil {
-		return ta
-	}
-	return nil
+	return host, port
 }
 
 // normalizeAddress canonicalizes address strings for fallback comparison.

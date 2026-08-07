@@ -19,6 +19,7 @@ package tcp
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
@@ -59,6 +60,12 @@ func (c *IggyTcpClient) SendMessages(
 		Messages:     messages,
 	})
 	if err != nil {
+		if errors.Is(err, ierror.ErrPartitionNotFound) {
+			// The cached count pointed this send at a partition the server
+			// does not have, so the topic was likely recreated smaller.
+			// Nothing else invalidates a count another client changed.
+			c.topics.invalidatePartitionsCount(newTopicKey(streamId, topicId))
+		}
 		return nil, err
 	}
 

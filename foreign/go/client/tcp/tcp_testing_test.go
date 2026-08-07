@@ -42,6 +42,7 @@ const (
 	frameOffsetSession   = 192
 	frameOffsetReserved  = 204
 
+	replyFrameOffsetRequest   = 200
 	replyFrameOffsetOperation = 208
 	replyFrameOffsetStatus    = 224
 
@@ -153,6 +154,17 @@ func clusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []
 	return replyFrame(vsr.OperationNonReplicated, body)
 }
 
+// echoReplyRequest stamps the request id into a reply frame the way the
+// server echoes it, so handlers do not repeat the correlation plumbing. An
+// eviction frame passes through untouched.
+func echoReplyRequest(answer []byte, read request) {
+	if len(answer) < vsr.HeaderSize || answer[frameOffsetCommand] != 8 {
+		return
+	}
+	copy(answer[replyFrameOffsetRequest:replyFrameOffsetRequest+8],
+		read.header[frameOffsetRequest:frameOffsetRequest+8])
+}
+
 // readRequest reads one complete frame from conn.
 func readRequest(conn net.Conn) (request, error) {
 	var read request
@@ -195,6 +207,7 @@ func serve(conn net.Conn, handler func(index int, read request) []byte) *fakeSer
 			if answer == nil {
 				continue
 			}
+			echoReplyRequest(answer, read)
 			if _, err := conn.Write(answer); err != nil {
 				return
 			}
@@ -237,5 +250,6 @@ func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
 		logger:         slog.New(slog.DiscardHandler),
 		session:        vsr.NewSession(),
 		config:         defaultTcpClientConfig(),
+		closed:         make(chan struct{}),
 	}
 }

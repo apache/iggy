@@ -29,6 +29,7 @@ import (
 	"strings"
 	"testing"
 
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,6 +48,8 @@ var rustSources = map[string]string{
 	"operation": "core/binary_protocol/src/consensus/operation.rs",
 	"namespace": "core/binary_protocol/src/namespace.rs",
 	"cargo":     "core/binary_protocol/Cargo.toml",
+	"eviction":  "core/common/src/error/eviction.rs",
+	"sdk":       "core/sdk/src/vsr.rs",
 }
 
 // goOperations names every discriminant the codec declares. It exists so the
@@ -165,8 +168,10 @@ var rustFieldLayout = map[string][2]int{
 	"EvictionReason": {1, 1},
 }
 
-// loadRustSources reads the protocol crate files, skipping the test when the
-// checkout is not available.
+// loadRustSources reads the protocol crate files. One sentinel path answers
+// "is this a full checkout" and is the only reason to skip; every other read
+// is required, so a moved or renamed Rust source fails the suite instead of
+// silently turning every parity assertion into a skip.
 func loadRustSources(t *testing.T) map[string]string {
 	t.Helper()
 
@@ -174,12 +179,16 @@ func loadRustSources(t *testing.T) map[string]string {
 	require.NoError(t, err)
 	root := filepath.Clean(filepath.Join(workDir, "..", "..", "..", ".."))
 
+	sentinel := filepath.Join(root, "core", "binary_protocol", "Cargo.toml")
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Skipf("not a full checkout, %s is missing: %v", sentinel, err)
+	}
+
 	sources := make(map[string]string, len(rustSources))
 	for name, relative := range rustSources {
 		content, err := os.ReadFile(filepath.Join(root, relative))
-		if err != nil {
-			t.Skipf("protocol sources are not available at %s: %v", root, err)
-		}
+		require.NoError(t, err,
+			"protocol source %s moved or vanished; update rustSources", relative)
 		sources[name] = string(content)
 	}
 	return sources
@@ -503,6 +512,98 @@ func rustMatchesAllowlist(t *testing.T, source, predicate string) map[string]str
 	}
 	require.NotEmpty(t, names)
 	return names
+}
+
+// rustEvictionErrorCodes maps the IggyError variant names the canonical
+// eviction mapping uses to their wire codes.
+var rustEvictionErrorCodes = map[string]ierror.Code{
+	"InvalidCredentials":         ierror.InvalidCredentialsCode,
+	"InvalidPersonalAccessToken": ierror.InvalidPersonalAccessTokenCode,
+	"Unauthenticated":            ierror.UnauthenticatedCode,
+	"StaleClient":                ierror.StaleClientCode,
+	"InvalidFormat":              ierror.InvalidFormatCode,
+	"InvalidCommand":             ierror.InvalidCommandCode,
+}
+
+func TestProtocolParity_EvictionReasonMapping(t *testing.T) {
+	sources := loadRustSources(t)
+	body := captureBlock(sources["eviction"], `match reason \{`)
+	require.NotEmpty(t, body, "the eviction_reason_to_error match was not found")
+
+	armPattern := regexp.MustCompile(
+		`(?s)((?:EvictionReason::[A-Za-z0-9]+\s*\|?\s*)+)=>\s*IggyError::([A-Za-z0-9]+)`)
+	reasonPattern := regexp.MustCompile(`EvictionReason::([A-Za-z0-9]+)`)
+
+	checked := 0
+	for _, arm := range armPattern.FindAllStringSubmatch(body, -1) {
+		wantCode, ok := rustEvictionErrorCodes[arm[2]]
+		require.True(t, ok, "IggyError::%s is not in the parity table", arm[2])
+		for _, reason := range reasonPattern.FindAllStringSubmatch(arm[1], -1) {
+			value, ok := goEvictionReasons[reason[1]]
+			require.True(t, ok, "unknown eviction reason %s", reason[1])
+			mapped := NewEvictionError(Eviction{Reason: value})
+			assert.Equal(t, wantCode, mapped.Code(), "EvictionReason::%s", reason[1])
+			checked++
+		}
+	}
+	require.GreaterOrEqual(t, checked, 8, "the mapping arms did not parse")
+
+	// The fallback arm has teeth: a reason byte from a newer server must map
+	// the same way on both sides, and never to a reconnectable error.
+	fallback := regexp.MustCompile(`_ => IggyError::([A-Za-z0-9]+)`).FindStringSubmatch(body)
+	require.NotNil(t, fallback, "the fallback arm was not found")
+	wantFallback, ok := rustEvictionErrorCodes[fallback[1]]
+	require.True(t, ok, "IggyError::%s is not in the parity table", fallback[1])
+	mapped := NewEvictionError(Eviction{Reason: EvictionReason(0xEE)})
+	assert.Equal(t, wantFallback, mapped.Code(),
+		"the unknown-reason fallback diverges from core/common")
+	// IncompatibleProtocol carries its own window logic, covered by the
+	// dedicated eviction tests in reply_test.go.
+}
+
+func TestProtocolParity_NamespaceRouting(t *testing.T) {
+	sources := loadRustSources(t)
+	codeValues := rustCommandCodes(sources["codes"])
+	require.NotEmpty(t, codeValues)
+
+	body := captureBlock(sources["sdk"], `fn namespace_for_request\(`)
+	require.NotEmpty(t, body, "the Rust namespace_for_request routing was not found")
+
+	armed := make(map[uint32]string)
+	for _, arm := range regexp.MustCompile(`(?m)^\s*([A-Z0-9_]+_CODE) => \{`).
+		FindAllStringSubmatch(body, -1) {
+		value, ok := codeValues[arm[1]]
+		require.True(t, ok, "unknown command constant %s", arm[1])
+		armed[uint32(value)] = arm[1]
+	}
+	require.NotEmpty(t, armed, "no payload-peek arms were parsed")
+
+	for name, value := range codeValues {
+		code := uint32(value)
+		operation := OperationForCode(code)
+		if operation == OperationRegister || operation == OperationLogout ||
+			operation == OperationNonReplicated || IsMetadata(operation) {
+			continue
+		}
+		// A code that reaches the payload peek fails on an empty payload; a
+		// code Rust does not route is refused outright. The two errors keep
+		// the routing decisions distinguishable without crafting payloads.
+		_, err := NamespaceForRequest(code, nil, operation)
+		if _, peeked := armed[code]; peeked {
+			assert.ErrorIs(t, err, ierror.ErrInvalidCommand,
+				"%s must derive its namespace from the payload", name)
+		} else {
+			assert.ErrorIs(t, err, ierror.ErrFeatureUnavailable,
+				"%s must be refused rather than routed blindly", name)
+		}
+	}
+
+	for code, name := range armed {
+		operation := OperationForCode(code)
+		shortCircuited := operation == OperationRegister || operation == OperationLogout ||
+			operation == OperationNonReplicated || IsMetadata(operation)
+		assert.False(t, shortCircuited, "%s never reaches the namespace peek in Go", name)
+	}
 }
 
 func TestProtocolParity_PackedProtocolVersion(t *testing.T) {

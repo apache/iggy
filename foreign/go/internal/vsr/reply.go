@@ -157,12 +157,12 @@ func NewEvictionError(eviction Eviction) *EvictionError {
 		}
 	case EvictionMalformedLogin:
 		mapped = ierror.ErrInvalidFormat
-	case EvictionReserved, EvictionClientReleaseTooLow, EvictionClientReleaseTooHigh,
-		EvictionInvalidRequestOperation, EvictionInvalidRequestBody,
-		EvictionInvalidRequestBodySize:
-		mapped = ierror.ErrInvalidCommand
 	default:
-		mapped = ierror.ErrUnauthenticated
+		// Everything else, including a reason byte this SDK does not know,
+		// maps to InvalidCommand like the core/common fallback. The unknown
+		// byte must not map to a reconnectable error, or a newer server's new
+		// reason silently drives a disconnect and re-login loop.
+		mapped = ierror.ErrInvalidCommand
 	}
 	return &EvictionError{
 		Reason:                   eviction.Reason,

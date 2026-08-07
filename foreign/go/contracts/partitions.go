@@ -120,9 +120,10 @@ func EntityIdGuid(value uuid.UUID) Partitioning {
 }
 
 func (p Partitioning) MarshalBinary() ([]byte, error) {
-	bytes := make([]byte, 2+p.Length)
-	bytes[0] = byte(p.Kind)
-	bytes[1] = byte(p.Length)
-	copy(bytes[2:], p.Value)
-	return bytes, nil
+	return p.AppendBinary(make([]byte, 0, 2+p.Length))
+}
+
+func (p Partitioning) AppendBinary(b []byte) ([]byte, error) {
+	b = append(b, byte(p.Kind), byte(p.Length))
+	return append(b, p.Value...), nil
 }

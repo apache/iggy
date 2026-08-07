@@ -120,6 +120,10 @@ type Client interface {
 	//     example after an explicit LeaveConsumerGroup. JoinConsumerGroup
 	//     restores membership.
 	//   - err == nil with a real partition id: messages were read.
+	//
+	// The returned message payloads and user headers alias the reply buffer,
+	// so retaining one message pins the whole reply; copy the bytes out when
+	// they outlive the poll.
 	PollMessages(
 		ctx context.Context,
 		streamId Identifier,

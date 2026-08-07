@@ -2758,10 +2758,27 @@ async fn handle_logout_request<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
+        // Logout on an unbound transport: the desired state already holds,
+        // so answer ok. A silent drop would wedge the lockstep SDK on this
+        // connection until its socket read timeout, and the SDK routinely
+        // sends a logout before each re-login.
         warn!(
             transport_client_id,
-            "dropping logout for unbound VSR session"
+            "logout for unbound VSR session; answering ok"
         );
+        let commit = current_metadata_commit(shard);
+        let reply = build_empty_reply(request.header(), transport_client_id, 0, commit);
+        if let Err(error) = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await
+        {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "failed to send unbound logout reply"
+            );
+        }
         return;
     };
 
@@ -2769,7 +2786,29 @@ async fn handle_logout_request<B, MJ, S, SB>(
     let commit = match submit_logout_on_owner(shard, vsr_client_id, session, request_id).await {
         Ok(commit) => commit,
         Err(error) => {
-            warn!(transport_client_id, error = %error, "logout/unregister failed");
+            // Deny as transient instead of dropping the frame: the submit
+            // usually fails because this replica is not the metadata owner
+            // right now, and the SDK replays a transient rejection.
+            warn!(transport_client_id, error = %error, "logout/unregister failed; denying transient");
+            let commit = current_metadata_commit(shard);
+            let reply = build_deny_reply(
+                request.header(),
+                vsr_client_id,
+                session,
+                commit,
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            if let Err(send_error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %send_error,
+                    "failed to send logout deny reply"
+                );
+            }
             return;
         }
     };

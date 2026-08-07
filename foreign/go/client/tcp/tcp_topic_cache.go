@@ -112,10 +112,13 @@ func (c *topicCache) nextBalanced(key topicKey, partitionsCount uint32) uint32 {
 	return partition
 }
 
-// clear forgets topic state so a new session rereads current metadata.
-func (c *topicCache) clear() {
+// clearCounts forgets the partition counts so a new session rereads current
+// metadata. Balanced cursors survive on purpose: they are client-side
+// fairness state with no dependency on cluster metadata, and resetting them
+// on a reconnect would point every producer's first post-failover batch at
+// partition 0 at once.
+func (c *topicCache) clearCounts() {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	clear(c.partitionsCounts)
-	clear(c.balancedCursors)
 }

@@ -89,14 +89,37 @@ func (c *groupAssignmentCache) put(key groupKey, assignment groupAssignment) {
 	c.entries[key] = &assignment
 }
 
-// advance moves the round-robin cursor of a cached entry past the partition
-// that was just polled.
-func (c *groupAssignmentCache) advance(key groupKey, cursor int) {
+// nextPartition returns the partition the next poll targets and advances the
+// round-robin cursor, both under one lock. A separate read and advance would
+// let two concurrent polls target the same partition and skip another.
+func (c *groupAssignmentCache) nextPartition(key groupKey) (uint32, bool) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	if entry, ok := c.entries[key]; ok {
-		entry.cursor = cursor
+	entry, ok := c.entries[key]
+	if !ok || len(entry.partitions) == 0 {
+		return 0, false
 	}
+	cursor := entry.cursor % len(entry.partitions)
+	entry.cursor = (cursor + 1) % len(entry.partitions)
+	return entry.partitions[cursor], true
+}
+
+// putSynced stores a fresh sync result, carrying the round-robin cursor
+// forward when the generation is unchanged, all under one lock so a
+// concurrent poll's advance is never overwritten with a stale value.
+func (c *groupAssignmentCache) putSynced(key groupKey, assignment groupAssignment) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[groupKey]*groupAssignment)
+	}
+	if current, ok := c.entries[key]; ok && current.generation == assignment.generation {
+		// A same-generation refresh is not a rebalance: the member still owns
+		// the same partitions, so the round-robin position carries over
+		// instead of resetting and starving the partitions behind it.
+		assignment.cursor = current.cursor
+	}
+	c.entries[key] = &assignment
 }
 
 func (c *groupAssignmentCache) drop(key groupKey) {
@@ -176,9 +199,11 @@ func (c *IggyTcpClient) pollGroup(
 			}, nil
 		}
 
-		cursor := assignment.cursor % len(assignment.partitions)
-		partitionId := assignment.partitions[cursor]
-		c.groups.advance(key, (cursor+1)%len(assignment.partitions))
+		partitionId, owned := c.groups.nextPartition(key)
+		if !owned {
+			// The entry vanished between the sync and this read; re-sync.
+			continue
+		}
 
 		polled, err := c.pollPartition(
 			ctx, streamId, topicId, consumer, strategy, count, autoCommit, &partitionId)
@@ -191,8 +216,9 @@ func (c *IggyTcpClient) pollGroup(
 		}
 
 		// The server marks a stale assignment by answering an empty batch on
-		// the resync sentinel partition.
-		if polled.PartitionId == iggcon.ResyncRequiredPartition && polled.MessageCount == 0 {
+		// the resync sentinel partition. The gate reads the decoded batch, not
+		// the server-declared count, which is the same signal Rust checks.
+		if polled.PartitionId == iggcon.ResyncRequiredPartition && len(polled.Messages) == 0 {
 			c.groups.drop(key)
 			continue
 		}
@@ -246,15 +272,9 @@ func (c *IggyTcpClient) ensureAssignment(
 		partitions: synced.Partitions,
 		fetchedAt:  time.Now(),
 	}
-	if current, ok := c.groups.get(key); ok && current.generation == synced.Generation {
-		// A same-generation refresh is not a rebalance: the member still owns
-		// the same partitions, so the round-robin position carries over
-		// instead of resetting and starving the partitions behind it.
-		assignment.cursor = current.cursor
-	}
 	c.logger.Debug("Synced the consumer group assignment",
 		slog.Uint64("generation", assignment.generation),
 		slog.Int("partitions", len(assignment.partitions)))
-	c.groups.put(key, assignment)
+	c.groups.putSynced(key, assignment)
 	return assignment, nil
 }

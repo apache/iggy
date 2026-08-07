@@ -49,6 +49,7 @@ const (
 const (
 	replyOffsetSize      = 48
 	replyOffsetCommand   = 60
+	replyOffsetRequest   = 200
 	replyOffsetOperation = 208
 	replyOffsetNamespace = 216
 	replyOffsetStatus    = 224
@@ -168,6 +169,18 @@ func ReadStatus(header *[HeaderSize]byte) uint32 {
 // server-controlled, so callers must check it with IsKnownOperation.
 func ReadReplyOperation(header *[HeaderSize]byte) Operation {
 	return Operation(header[replyOffsetOperation])
+}
+
+// ReadReplyRequestID reads the request id the reply echoes from the request
+// it answers, which is how the transport correlates a reply with the request
+// in flight.
+func ReadReplyRequestID(header *[HeaderSize]byte) uint64 {
+	return binary.LittleEndian.Uint64(header[replyOffsetRequest:])
+}
+
+// StampedRequestID reads the request id back out of a stamped request frame.
+func StampedRequestID(frame []byte) uint64 {
+	return binary.LittleEndian.Uint64(frame[requestOffsetRequest:])
 }
 
 // Eviction holds the eviction-header fields the client acts on.
