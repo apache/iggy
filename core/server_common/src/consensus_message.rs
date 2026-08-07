@@ -656,7 +656,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Operation, ReplyHeader};
+    use iggy_binary_protocol::{Operation, ReplyHeader, RequestHeader};
     use smallvec::smallvec;
 
     // Field offsets via `offset_of!`: a field reorder fails to compile here
@@ -820,7 +820,10 @@ mod tests {
 
     #[test]
     fn try_as_typed_invalid_validation_returns_err() {
-        // RoutedRequestHeader::validate rejects operation=Register with non-zero session.
+        // `RequestHeader::validate` rejects operation=Register with non-zero
+        // session. The client-wire header is the one carrying the field rules;
+        // `RoutedRequestHeader` is the post-resolution shape and gates on the
+        // command alone.
         let mut owned = header_bytes(Command2::Request, 256);
         {
             let buf = owned.as_mut_slice();
@@ -828,7 +831,7 @@ mod tests {
             buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8].copy_from_slice(&5u64.to_le_bytes());
         }
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
-        let result = generic.try_as_typed::<RoutedRequestHeader>();
+        let result = generic.try_as_typed::<RequestHeader>();
         assert!(matches!(result, Err(ConsensusError::InvalidField(_))));
     }
 
@@ -902,8 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn messagebag_dispatch_request_with_invalid_register_session_returns_err() {
-        // `RoutedRequestHeader::validate` rejects Register with non-zero session.
+    fn client_wire_decode_of_request_with_invalid_register_session_returns_err() {
+        // `RequestHeader::validate` rejects Register with non-zero session.
+        // Not routed through `MessageBag`: that path decodes the already-routed
+        // `RoutedRequestHeader` for replica-to-replica frames, and the field
+        // rules are the client boundary's job.
         let mut owned = header_bytes(Command2::Request, 256);
         {
             let buf = owned.as_mut_slice();
@@ -911,16 +917,16 @@ mod tests {
             buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8].copy_from_slice(&5u64.to_le_bytes());
         }
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
-        let result = MessageBag::try_from(generic);
+        let result = generic.try_into_typed::<RequestHeader>();
         assert!(matches!(result, Err(ConsensusError::InvalidField(_))));
     }
 
     // Ingress validation runs on every client frame at the network boundary,
-    // reached through `MessageBag::try_from` -> `try_into_typed` ->
-    // `RoutedRequestHeader::validate`. Several dedup and authz conclusions rest on
-    // it running, so pin the field rules rather than the plumbing: whatever
-    // `request_preflight` and the operation gate see downstream has already
-    // passed these.
+    // reached through `try_into_typed` -> `RequestHeader::validate` before
+    // dispatch promotes the frame to `RoutedRequestHeader`. Several dedup and
+    // authz conclusions rest on it running, so pin the field rules rather than
+    // the plumbing: whatever `request_preflight` and the operation gate see
+    // downstream has already passed these.
     #[test]
     fn ingress_validation_enforces_the_request_header_field_rules() {
         // (operation, session, request, must_pass)
@@ -951,7 +957,7 @@ mod tests {
                     .copy_from_slice(&request.to_le_bytes());
             }
             let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
-            let accepted = MessageBag::try_from(generic).is_ok();
+            let accepted = generic.try_into_typed::<RequestHeader>().is_ok();
             assert_eq!(
                 accepted, must_pass,
                 "{operation:?} with session={session} request={request}"
@@ -973,7 +979,7 @@ mod tests {
         }
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         assert!(matches!(
-            MessageBag::try_from(generic),
+            generic.try_into_typed::<RequestHeader>(),
             Err(ConsensusError::InvalidField(_))
         ));
     }

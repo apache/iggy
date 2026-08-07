@@ -110,19 +110,26 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
-    // Refuses boot rather than treating the group as fresh or reading through
-    // to a superseded view: mirrors the metadata plane's
-    // `RecoveryError::SuperblockUnreadable` policy. Quarantining just the one
-    // partition is future work; skipping it here could hand the reconciler a
-    // reason to re-create it empty.
+    // Quarantines the one partition rather than treating the group as fresh or
+    // reading through to a superseded view: mirrors the metadata plane's
+    // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
+    // because one unreadable partition directory must not strand every healthy
+    // group on the shard.
     #[error(
-        "partition superblock at {dir} holds no record this build can trust \
-         (version {version:?}); refusing boot"
+        "partition superblock at {dir} is present but its format version \
+         {version} is unrecognized by this build (a downgrade, or a corrupt \
+         version field)"
     )]
-    PartitionSuperblockUnreadable { dir: PathBuf, version: Option<u16> },
+    PartitionSuperblockVersionUnknown { dir: PathBuf, version: u16 },
+    #[error(
+        "partition superblock at {dir} is present but a copy holds bytes that \
+         do not verify (bit-rot or a checksum failure), so its latest \
+         generation cannot be established"
+    )]
+    PartitionSuperblockUnverifiable { dir: PathBuf },
     #[error(
         "partition superblock at {dir} was checksum-clean but did not decode; \
-         refusing boot rather than infer a stale view"
+         tombstoning this partition rather than inferring a stale view"
     )]
     PartitionSuperblockUndecodable {
         dir: PathBuf,
@@ -136,9 +143,25 @@ pub enum ServerNgError {
     )]
     PartitionSuperblockIdentityMismatch {
         dir: PathBuf,
-        field: metadata::impls::recovery::IdentityField,
+        field: metadata::IdentityField,
         expected: u128,
         found: u128,
+    },
+    // Per-partition, not fatal: the boot path fences this one group (quarantines
+    // its segment files and materialises it fresh) instead of taking the node
+    // down for one damaged local chain. The shapes it reports are exactly what a
+    // failed state-transfer quarantine leaves behind, and the rebuild recovers
+    // the data from a peer.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} at {dir} recovered an \
+         unusable segment chain: {reason}"
+    )]
+    PartitionChainRefused {
+        dir: PathBuf,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        reason: PartitionChainRefusal,
     },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
@@ -231,6 +254,49 @@ pub enum ServerNgError {
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
     ShardJoinFailures { failures: Vec<ShardJoinFailure> },
+}
+
+/// Why a recovered segment chain cannot be served.
+///
+/// Both shapes mean the same thing operationally -- the local files do not form
+/// a chain this replica can serve -- but they are distinguished because they
+/// point at different causes: an empty non-tail segment is a failed rebuild's
+/// orphan pairing, a hole is a stray or half-unlinked file.
+#[derive(Debug)]
+pub enum PartitionChainRefusal {
+    EmptyNonTailSegment {
+        empty_start: u64,
+        next_start: u64,
+    },
+    Hole {
+        previous_start: u64,
+        previous_end: u64,
+        next_start: u64,
+    },
+}
+
+impl std::fmt::Display for PartitionChainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyNonTailSegment {
+                empty_start,
+                next_start,
+            } => write!(
+                f,
+                "segment {empty_start} is empty yet {next_start} follows it, so the \
+                 chain cannot be served past it"
+            ),
+            Self::Hole {
+                previous_start,
+                previous_end,
+                next_start,
+            } => write!(
+                f,
+                "segment {previous_start} ends at offset {previous_end} but the next \
+                 starts at {next_start}, leaving a hole"
+            ),
+        }
+    }
 }
 
 /// Per-shard outcome captured by [`crate::bootstrap::ShardHandles::join_all`]

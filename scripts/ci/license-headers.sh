@@ -202,7 +202,12 @@ find_duplicate_license_headers() {
       continue
     fi
 
-    # short-circuit the symlink that may point to dir.
+    # git tracks a symlink as a blob, so it arrives here as an ordinary path.
+    # HawkEye skips symlinks too, and the target is scanned under its own path.
+    if [ -L "$path" ]; then
+      continue
+    fi
+
     if [ ! -f "$path" ] || ! LC_ALL=C grep -Iq . "$path"; then
       continue
     fi

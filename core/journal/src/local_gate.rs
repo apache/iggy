@@ -32,6 +32,12 @@ use std::cell::{Cell, RefCell};
 
 /// See the module docs. Callers hold the returned guard across the awaited
 /// critical section; dropping it releases the gate and wakes every waiter.
+///
+/// Its exclusion is load-bearing in RELEASE, not only under
+/// `debug_assertions`: this gate is the only enforcement of the superblock
+/// single-writer contract there. The `WritingGuard` tripwire is debug-only,
+/// `PingPongSuperblock::write` takes `&self`, and two overlapping writers
+/// collide on one fixed `.tmp` path and tear a slot while both return `Ok`.
 pub struct LocalGate {
     busy: Cell<bool>,
     waiters: RefCell<Vec<std::task::Waker>>,
@@ -74,9 +80,14 @@ impl<'a> std::future::Future for LocalGateAcquire<'a> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if self.gate.busy.get() {
-            // Re-polls while still busy push a duplicate waker; the extra
-            // wake is spurious and harmless at pipeline-queue scale.
-            self.gate.waiters.borrow_mut().push(cx.waker().clone());
+            // Deduped, not appended: a waiter driven by a multi-source driver
+            // (`select!`, `join!`) is re-polled on every unrelated wake, and
+            // release wakes the whole list, so a bare push makes draining n
+            // contenders O(n^2) waker clones.
+            let mut waiters = self.gate.waiters.borrow_mut();
+            if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
             std::task::Poll::Pending
         } else {
             self.gate.busy.set(true);
@@ -100,5 +111,97 @@ impl Drop for LocalGateGuard<'_> {
         for waker in waiters {
             waker.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+    use futures::future::join;
+    use std::rc::Rc;
+
+    /// Two writers queued on the same gate run one after the other, never
+    /// interleaved -- the property a torn superblock slot depends on.
+    #[compio::test]
+    async fn given_two_waiters_when_acquiring_should_serialize() {
+        let gate = LocalGate::new();
+        let gate = &gate;
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let first = {
+            let log = Rc::clone(&log);
+            async move {
+                let guard = gate.acquire().await;
+                log.borrow_mut().push("first:enter");
+                // A yield inside the critical section: without exclusion the
+                // second writer would slot in right here.
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                log.borrow_mut().push("first:exit");
+                drop(guard);
+            }
+        };
+        let second = {
+            let log = Rc::clone(&log);
+            async move {
+                let guard = gate.acquire().await;
+                log.borrow_mut().push("second:enter");
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                log.borrow_mut().push("second:exit");
+                drop(guard);
+            }
+        };
+        join(first, second).await;
+
+        let log = log.borrow();
+        assert_eq!(log.len(), 4, "both sections ran: {log:?}");
+        let first_exit = log.iter().position(|entry| *entry == "first:exit").unwrap();
+        let second_enter = log
+            .iter()
+            .position(|entry| *entry == "second:enter")
+            .unwrap();
+        assert!(
+            first_exit < second_enter,
+            "sections must not interleave: {log:?}"
+        );
+    }
+
+    /// Dropping the guard wakes a queued waiter, so the gate does not wedge
+    /// once contended.
+    #[compio::test]
+    async fn given_queued_waiter_when_guard_drops_should_wake_it() {
+        let gate = LocalGate::new();
+        let held = gate.acquire().await;
+
+        let mut waiter = Box::pin(gate.acquire());
+        assert!(
+            waiter.as_mut().now_or_never().is_none(),
+            "the gate is held, so the waiter must park"
+        );
+
+        drop(held);
+        assert!(
+            waiter.now_or_never().is_some(),
+            "dropping the guard must wake the queued waiter"
+        );
+    }
+
+    /// A waiter that goes away leaves only a stale waker behind: the next
+    /// acquirer still gets the gate. Cancel safety is load-bearing here, since
+    /// every acquire site sits in a future a shard can drop.
+    #[compio::test]
+    async fn given_dropped_waiter_when_guard_releases_should_not_wedge() {
+        let gate = LocalGate::new();
+        let held = gate.acquire().await;
+
+        let mut abandoned = Box::pin(gate.acquire());
+        assert!(abandoned.as_mut().now_or_never().is_none());
+        drop(abandoned);
+
+        drop(held);
+        assert!(
+            gate.acquire().now_or_never().is_some(),
+            "a dropped waiter must not keep the gate busy"
+        );
     }
 }

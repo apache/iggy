@@ -291,6 +291,34 @@ impl SessionManager {
         }
     }
 
+    /// The transport-level peer address a connection arrived from, recorded by
+    /// [`Self::ensure_connection`] for every transport. The non-replicated
+    /// read path uses it to pick the advertised address a client is told
+    /// about; `None` (unknown connection) degrades to the catch-all address.
+    #[must_use]
+    pub fn connection_address(&self, connection_id: u128) -> Option<SocketAddr> {
+        self.connections
+            .get(&connection_id)
+            .map(|conn| conn.address)
+    }
+
+    /// Acting user and transport peer address for a connection, in one map
+    /// lookup: the non-replicated dispatch path needs both, and the separate
+    /// accessors would walk the connection map twice per request.
+    #[must_use]
+    pub fn read_context(&self, connection_id: u128) -> (Option<u32>, Option<SocketAddr>) {
+        let Some(conn) = self.connections.get(&connection_id) else {
+            return (None, None);
+        };
+        let user_id = match conn.state {
+            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
+                Some(user_id)
+            }
+            ConnectionState::Connected => None,
+        };
+        (user_id, Some(conn.address))
+    }
+
     /// Look up the authenticated user id for a connection.
     #[must_use]
     pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {

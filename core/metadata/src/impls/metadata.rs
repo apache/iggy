@@ -1291,8 +1291,7 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        let op = message.header().operation();
-        op.is_metadata() || matches!(op, Operation::Register | Operation::Logout)
+        message.header().operation().is_metadata_plane()
     }
 }
 

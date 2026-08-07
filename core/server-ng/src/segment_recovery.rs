@@ -27,17 +27,20 @@
 //! recovery panic). This module is the server-ng-owned loader, reading the same
 //! 24-byte format its writer emits.
 
-use crate::server_error::ServerNgError;
+use crate::server_error::{PartitionChainRefusal, ServerNgError};
 use configs::server_ng::ServerNgConfig;
 use iggy_common::{IggyByteSize, IggyError, PartitionStats};
+use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndexReader, Segment};
 use server_common::SegmentStorage;
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
+use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header, decode_batch_slice};
 use std::fs;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use tracing::{error, warn};
 
 const LOG_EXTENSION: &str = "log";
+const INDEX_EXTENSION: &str = "index";
 
 /// A persisted segment recovered from disk: its metadata plus the storage
 /// handles (readers/writers) opened over its `.log` / `.index` files.
@@ -67,8 +70,12 @@ pub async fn load_persisted_segments(
     let partition_path = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
-    sweep_staging_files(&partition_path);
-    let mut start_offsets = collect_segment_start_offsets(&partition_path)?;
+    // ONE directory walk feeds both: the sweep only ever unlinks `.staging` and
+    // orphan `.index` files, never a `.log`, so the log stems it already
+    // collects ARE the post-sweep start-offset set. Note the error policy is
+    // the collect side's (NotFound => empty, anything else => refuse boot); the
+    // sweep's silent return would swallow an EACCES that must not be ignored.
+    let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
     start_offsets.sort_unstable();
 
     let enforce_fsync = config.system.partition.enforce_fsync;
@@ -99,13 +106,15 @@ pub async fn load_persisted_segments(
         )
         .await?;
 
-        // An index without a single whole entry means any log bytes were torn
-        // off mid-write (the crash landed between the message write and the
-        // index write). Recover the segment as EMPTY: counting the bytes with
-        // `end_offset == start_offset` would fabricate one phantom message for
-        // the bootstrap non-empty filters, and appending after the torn bytes
-        // would strand undecodable garbage inside the readable range. Zeroed
-        // sizes make the next append overwrite the torn bytes instead.
+        // `bounds == None` now means the log holds no whole BATCH either (the
+        // index-less path above already tried walking the log), so there is
+        // nothing to recover: zeroed sizes make the next append overwrite the
+        // torn bytes, where counting them with `end_offset == start_offset`
+        // would fabricate one phantom message for the bootstrap non-empty
+        // filters and strand undecodable garbage inside the readable range.
+        // Note this is NOT tail-only -- a torn index is reachable mid-chain on
+        // the shipped `enforce_fsync = false`, which is why the walk above
+        // exists rather than refusing the partition.
         let (start_timestamp, end_timestamp, end_offset, effective_messages_size) =
             if let Some((start_timestamp, end_timestamp, end_offset, walked_size)) = bounds {
                 (start_timestamp, end_timestamp, end_offset, walked_size)
@@ -171,7 +180,13 @@ pub async fn load_persisted_segments(
         last.segment.sealed = false;
     }
 
-    ensure_contiguous_chain(&recovered, stream_id, topic_id, partition_id)?;
+    ensure_contiguous_chain(
+        &recovered,
+        &partition_path,
+        stream_id,
+        topic_id,
+        partition_id,
+    )?;
 
     Ok(recovered)
 }
@@ -181,12 +196,27 @@ pub async fn load_persisted_segments(
 /// an operator copy) would otherwise splice a hole or an overlap into the
 /// chain and push `current_offset` past data this replica does not hold.
 /// Refuse loudly instead of serving a holed log.
+///
+/// The refusal names the partition and its directory so the caller can fence
+/// THAT group rather than abort the node's boot: the shapes it rejects are
+/// exactly what a failed quarantine leaves behind, and one damaged local chain
+/// must not take the whole node down.
 fn ensure_contiguous_chain(
     recovered: &[RecoveredSegment],
+    partition_path: &str,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
 ) -> Result<(), ServerNgError> {
+    let refused = |reason| {
+        Err(ServerNgError::PartitionChainRefused {
+            dir: PathBuf::from(partition_path),
+            stream_id,
+            topic_id,
+            partition_id,
+            reason,
+        })
+    };
     for pair in recovered.windows(2) {
         let previous = &pair[0].segment;
         let next = &pair[1].segment;
@@ -196,59 +226,47 @@ fn ensure_contiguous_chain(
         // more chain is exactly what a failed converge rebuild leaves behind.
         // Skipping it here was the guard's blind spot.
         if previous.size == IggyByteSize::default() {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                empty_start = previous.start_offset,
-                next_start = next.start_offset,
-                "recovered chain holds an empty non-tail segment; refusing to serve past it"
-            );
-            return Err(IggyError::CannotReadPartitions.into());
+            return refused(PartitionChainRefusal::EmptyNonTailSegment {
+                empty_start: previous.start_offset,
+                next_start: next.start_offset,
+            });
         }
         if next.start_offset != previous.end_offset + 1 {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                previous_start = previous.start_offset,
-                previous_end = previous.end_offset,
-                next_start = next.start_offset,
-                "recovered segment chain is not contiguous; refusing to serve a holed log"
-            );
-            return Err(IggyError::CannotReadPartitions.into());
+            return refused(PartitionChainRefusal::Hole {
+                previous_start: previous.start_offset,
+                previous_end: previous.end_offset,
+                next_start: next.start_offset,
+            });
         }
     }
     Ok(())
 }
 
-/// Unlink every `*.staging` spill file in the partition directory. Boot is
-/// the one sweep that always runs: the install-time and reuse-time sweeps
-/// only fire on the NEXT transfer attempt, so a transfer abandoned for good
-/// would otherwise leak a full partition copy across restarts. Staging files
-/// are pure scratch (never a rename source until an install owns them), so
-/// unlinking is always safe here.
-fn sweep_staging_files(partition_path: &str) {
-    let Ok(entries) = fs::read_dir(partition_path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_staging = path.to_str().is_some_and(|path| path.ends_with(".staging"));
-        if is_staging && let Err(error) = fs::remove_file(&path) {
-            warn!(
-                partition_path,
-                path = %path.display(),
-                %error,
-                "failed to sweep a stale staging file at boot"
-            );
-        }
-    }
-}
-
-/// Parses the zero-padded start offset out of every `.log` file name in the
-/// partition directory. A missing directory means a never-persisted partition.
-fn collect_segment_start_offsets(partition_path: &str) -> Result<Vec<u64>, ServerNgError> {
+/// Unlink the partition directory's scratch leftovers: every `*.staging` spill
+/// file, and every `.index` with no `.log` beside it.
+///
+/// Boot is the one sweep that always runs. The install-time and reuse-time
+/// staging sweeps only fire on the NEXT transfer attempt, so a transfer
+/// abandoned for good would otherwise leak a full partition copy across
+/// restarts; staging files are pure scratch (never a rename source until an
+/// install owns them), so unlinking is always safe.
+///
+/// Orphaned indexes come from the state-transfer install, which renames ALL
+/// indexes to their final names, fsyncs the directory, and only then renames the
+/// logs -- a crash in that window is GUARANTEED to leave final-name `.index`
+/// files with no `.log`. Recovery keys on `.log` stems, so nothing else ever
+/// looks at them again: they are invisible to it and to the size stats, and
+/// without this they are a permanent leak at offsets the partition may never
+/// revisit. Unlinking rather than keeping them is safe because every path that
+/// recreates a segment at a given base offset opens its index through
+/// `SegmentStorage::new(.., file_exists = false)` first, which TRUNCATES: the
+/// stale entries are never read, only overwritten.
+/// Sweeps boot-time scratch (`.staging` spill, orphan `.index`) and returns the
+/// start offset parsed out of every remaining zero-padded `.log` file name. A
+/// missing directory means a never-persisted partition.
+fn sweep_scratch_files_and_collect_offsets(
+    partition_path: &str,
+) -> Result<Vec<u64>, ServerNgError> {
     let entries = match fs::read_dir(partition_path) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -261,22 +279,48 @@ fn collect_segment_start_offsets(partition_path: &str) -> Result<Vec<u64>, Serve
             return Err(IggyError::CannotReadPartitions.into());
         }
     };
-
+    let mut swept = Vec::new();
+    let mut orphan_candidates = Vec::new();
+    let mut log_stems = std::collections::HashSet::new();
     let mut start_offsets = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(LOG_EXTENSION) {
+        let Some(as_str) = path.to_str() else {
+            continue;
+        };
+        if as_str.ends_with(STAGING_SUFFIX) {
+            swept.push(path);
             continue;
         }
-        if let Some(start_offset) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u64>().ok())
-        {
-            start_offsets.push(start_offset);
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(LOG_EXTENSION) => {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    log_stems.insert(stem.to_owned());
+                    if let Ok(start_offset) = stem.parse::<u64>() {
+                        start_offsets.push(start_offset);
+                    }
+                }
+            }
+            Some(INDEX_EXTENSION) => orphan_candidates.push(path),
+            _ => {}
         }
     }
-
+    swept.extend(orphan_candidates.into_iter().filter(|path| {
+        !path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| log_stems.contains(stem))
+    }));
+    for path in swept {
+        if let Err(error) = fs::remove_file(&path) {
+            warn!(
+                partition_path,
+                path = %path.display(),
+                %error,
+                "failed to sweep a stale scratch file at boot"
+            );
+        }
+    }
     Ok(start_offsets)
 }
 
@@ -292,6 +336,7 @@ fn file_len(path: &str) -> u64 {
 /// `enforce_fsync` there is no ordering barrier between the message write and
 /// the index write, and a tail torn mid-flush would otherwise pass while
 /// `end_offset` claims offsets whose bytes are incomplete.
+#[allow(clippy::too_many_lines)]
 async fn recover_segment_bounds(
     index_path: &str,
     messages_path: &str,
@@ -345,12 +390,20 @@ async fn recover_segment_bounds(
             // true end offset; a header that no longer decodes marks a torn
             // tail, which truncates the readable range to the last whole
             // batch so the next append overwrites the torn bytes.
+            // Opened ONCE for the walk: the helper used to open the file per
+            // batch, which is an open + pread + close for every batch in the
+            // segment, synchronously, at boot. A failure to open a file that
+            // just stat'd walks nothing, which lands on the divergence refusal
+            // below rather than recovering an indexed segment as empty.
+            let messages = fs::File::open(messages_path).ok();
             let mut position = last.position;
             let mut end_offset = last.offset;
             let mut end_timestamp = last.timestamp;
             let mut walked_any = false;
-            while position < messages_size {
-                let Some(header) = read_batch_header(messages_path, position, messages_size) else {
+            while let Some(messages) = messages.as_ref()
+                && position < messages_size
+            {
+                let Some(header) = read_batch_header(messages, position, messages_size) else {
                     break;
                 };
                 let extent = position.saturating_add(header.total_size() as u64);
@@ -379,6 +432,81 @@ async fn recover_segment_bounds(
             }
             Ok(Some((first.timestamp, end_timestamp, end_offset, position)))
         }
+        // No whole index entry, but the log holds bytes: recover the bounds by
+        // WALKING the log from byte 0 instead of declaring the segment empty.
+        //
+        // The index is not the only self-describing copy -- batch headers carry
+        // their own offsets, timestamps and lengths -- and with the shipped
+        // `enforce_fsync = false` there is no write ordering between a log and
+        // its index, so a torn index is reachable on default config for a
+        // MID-CHAIN segment too, not just the tail. Recovering that as empty
+        // then trips the contiguity guard and refuses the whole partition:
+        // total serve loss (and offset reuse from 0) for a chain whose bytes
+        // are all present. The walk stops at the first header that does not
+        // decode or does not fit, which keeps the torn-tail truncation the
+        // indexed path performs.
+        _ if messages_size > 0 => {
+            // Opened once, as above. Nothing walked means no whole batch,
+            // which is the `Ok(None)` the tail of this arm already returns.
+            let messages = fs::File::open(messages_path).ok();
+            let mut position = 0u64;
+            let mut start_timestamp = None;
+            let mut end_offset = start_offset;
+            let mut end_timestamp = 0;
+            let mut expected_offset = start_offset;
+            let mut scratch = Vec::new();
+            while let Some(messages) = messages.as_ref()
+                && position < messages_size
+            {
+                let Some(header) = read_batch_header(messages, position, messages_size) else {
+                    break;
+                };
+                let extent = position.saturating_add(header.total_size() as u64);
+                if extent > messages_size {
+                    break;
+                }
+                // The FILENAME is the only trustworthy anchor once the index is
+                // gone, and `read_batch_header` checks a length, not a checksum.
+                // A torn header claiming an offset below `start_offset` would
+                // underflow the message count the caller derives; one claiming a
+                // jump above becomes this partition's counter, and the next
+                // prepare stamps a `base_offset` diverged from every peer. So
+                // the chain has to be contiguous from the filename onward, and
+                // the batch has to verify before its header is believed.
+                if header.base_offset != expected_offset
+                    || !batch_verifies(messages, position, &header, &mut scratch)
+                {
+                    break;
+                }
+                if header.message_count > 0 {
+                    end_offset = header
+                        .base_offset
+                        .saturating_add(u64::from(header.message_count) - 1);
+                    end_timestamp = header.base_timestamp;
+                    start_timestamp.get_or_insert(header.base_timestamp);
+                    expected_offset = end_offset.saturating_add(1);
+                }
+                position = extent;
+            }
+            let Some(start_timestamp) = start_timestamp else {
+                // Not one whole batch either: the bytes really are unusable, so
+                // the caller's empty recovery is right after all.
+                return Ok(None);
+            };
+            warn!(
+                stream_id,
+                topic_id,
+                partition_id,
+                start_offset,
+                messages_size,
+                walked_size = position,
+                "sparse index holds no whole entry; recovered segment bounds by \
+                 walking the log instead of discarding it (the index repopulates \
+                 on the next flush, and polls take the index-less fallback until \
+                 then)"
+            );
+            Ok(Some((start_timestamp, end_timestamp, end_offset, position)))
+        }
         _ => Ok(None),
     }
 }
@@ -386,16 +514,34 @@ async fn recover_segment_bounds(
 /// The batch command header at `position` in the messages file, or `None`
 /// when the header does not fit / decode (`position` past the file, header
 /// truncated, or garbage bytes).
+/// Whether the batch at `position` decodes and passes its own `batch_checksum`.
+///
+/// The index-less recovery walk trusts nothing else: without an index the only
+/// anchors are the filename and the payload's self-description, and a torn
+/// header is exactly what that walk exists to survive.
+fn batch_verifies(
+    messages: &fs::File,
+    position: u64,
+    header: &SendMessages2Header,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    scratch.clear();
+    scratch.resize(header.total_size(), 0);
+    if messages.read_exact_at(scratch, position).is_err() {
+        return false;
+    }
+    decode_batch_slice(scratch).is_ok()
+}
+
 fn read_batch_header(
-    messages_path: &str,
+    messages: &fs::File,
     position: u64,
     messages_size: u64,
 ) -> Option<SendMessages2Header> {
     if position.checked_add(COMMAND_HEADER_SIZE as u64)? > messages_size {
         return None;
     }
-    let file = fs::File::open(messages_path).ok()?;
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE];
-    file.read_exact_at(&mut header_bytes, position).ok()?;
+    messages.read_exact_at(&mut header_bytes, position).ok()?;
     SendMessages2Header::decode(&header_bytes).ok()
 }

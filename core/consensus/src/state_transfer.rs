@@ -39,7 +39,10 @@ pub const STATE_TRANSFER_MAX_STALL_RETRIES: u32 = 5;
 /// Decode-failure rounds a receiver spends on ONE offered generation
 /// before refusing to pull it again.
 ///
-/// METADATA plane only, keyed on `snapshot_seq`: a peer whose snapshot
+/// Read by the METADATA arm only -- it lives here because the chunk cursor it
+/// pairs with is plane-agnostic, not because both planes use it.
+///
+/// Keyed on `snapshot_seq`: a peer whose snapshot
 /// generation advances resets the budget (new bytes are worth full
 /// retries), while a generation this build cannot decode costs one refused
 /// descriptor per repair round instead of a full pull. The partition plane
@@ -60,13 +63,6 @@ pub struct ArtifactProgress {
     pub buf: Vec<u8>,
 }
 
-impl ArtifactProgress {
-    #[must_use]
-    pub const fn complete(&self) -> bool {
-        self.buf.len() as u64 == self.entry.len
-    }
-}
-
 /// What [`next_pending_chunk`] and [`append_chunk`] need from one slot.
 ///
 /// Exists so a plane can track completion in richer shapes -- the
@@ -79,6 +75,11 @@ pub trait ChunkProgress {
     /// Only called after the cursor checks `received + payload <= declared`,
     /// so an impl whose slot cannot grow (already complete) never sees it.
     fn extend_from_chunk(&mut self, payload: &[u8]);
+    /// Reserve room for the whole declared length, called once per artifact on
+    /// its FIRST chunk (see [`append_chunk`]). Default: nothing, for slots that
+    /// do not accumulate in memory. Reserving at accept time instead would
+    /// commit address space for every manifest entry at once.
+    fn reserve_declared(&mut self) {}
     fn complete(&self) -> bool {
         self.received_len() == self.declared_len()
     }
@@ -95,6 +96,14 @@ impl ChunkProgress for ArtifactProgress {
 
     fn extend_from_chunk(&mut self, payload: &[u8]) {
         self.buf.extend_from_slice(payload);
+    }
+
+    fn reserve_declared(&mut self) {
+        // Exact rather than geometric: `entry.len` already passed the caller's
+        // per-kind caps, and doubling to gigabyte sizes copies roughly twice the
+        // bytes at a ~1.5x transient peak.
+        #[allow(clippy::cast_possible_truncation)]
+        self.buf.reserve_exact(self.entry.len as usize);
     }
 }
 
@@ -123,16 +132,21 @@ pub fn next_pending_chunk<T: ChunkProgress>(
 /// Append one received chunk; `true` only when bytes actually landed, which
 /// is the caller's cue to reset its liveness counters and re-drive progress.
 ///
-/// Everything else is dropped without side effects: an out-of-range artifact
-/// index, a non-sequential offset (chunks are pulled lockstep, so anything
-/// else is a duplicate or reorder -- the stall retry re-requests from the
-/// current frontier), an overrun past the declared length, and a zero-byte
-/// payload. A zero-byte payload is not progress: it extends nothing and the
-/// same offset is re-requested immediately, and resetting liveness counters
-/// on one is what turned a short rebuilt offer into an unbounded empty-frame
-/// ping-pong on the metadata plane. The serving side refuses to produce
-/// these now; the guard stays because a peer running an older build still
-/// can.
+/// Everything else is dropped without side effects: an artifact that is not
+/// the FIRST incomplete one, a non-sequential offset (chunks are pulled
+/// lockstep, so anything else is a duplicate or reorder -- the stall retry
+/// re-requests from the current frontier), an overrun past the declared
+/// length, and a zero-byte payload. The first-incomplete restriction mirrors
+/// what [`next_pending_chunk`] would have requested, and bounds the
+/// reservation below to ONE artifact at a time: without it a peer that pushes
+/// one byte into every manifest entry would make each slot reserve its whole
+/// declared length, committing address space for the sum of the manifest, and
+/// a failed `Vec` reservation aborts the process rather than erroring. A
+/// zero-byte payload is not progress: it extends nothing and the same offset is re-requested
+/// immediately, and resetting liveness counters on one is what turned a
+/// short rebuilt offer into an unbounded empty-frame ping-pong on the
+/// metadata plane. The serving side refuses to produce these now; the guard
+/// stays because a peer running an older build still can.
 #[must_use]
 pub fn append_chunk<T: ChunkProgress>(
     artifacts: &mut [T],
@@ -140,6 +154,10 @@ pub fn append_chunk<T: ChunkProgress>(
     offset: u64,
     payload: &[u8],
 ) -> bool {
+    let first_incomplete = artifacts.iter().position(|artifact| !artifact.complete());
+    if first_incomplete != Some(artifact_index as usize) {
+        return false;
+    }
     let Some(artifact) = artifacts.get_mut(artifact_index as usize) else {
         return false;
     };
@@ -156,6 +174,11 @@ pub fn append_chunk<T: ChunkProgress>(
     }
     if payload.is_empty() {
         return false;
+    }
+    // First chunk of this artifact: give the slot its full declared length in
+    // one allocation, so a segment-sized artifact is not grown by doubling.
+    if artifact.received_len() == 0 {
+        artifact.reserve_declared();
     }
     artifact.extend_from_chunk(payload);
     true

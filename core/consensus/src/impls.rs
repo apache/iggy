@@ -1528,6 +1528,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             commit_max: self.commit_max.get(),
             checkpoint_op,
             checkpoint_checksum,
+            // Consensus mints no message offsets: the PARTITION plane stamps
+            // this in before it writes (`IggyPartition::write_superblock`).
+            offset_frontier: 0,
         }
     }
 
@@ -2078,7 +2081,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// that will be the primary in the new view."
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     pub fn handle_start_view_change(
         &self,
         plane: PlaneKind,
@@ -2231,7 +2234,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// and selects as the new log the one contained in the message with the largest v'..."
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     pub fn handle_do_view_change(
         &self,
         plane: PlaneKind,
@@ -2519,7 +2522,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// their status to normal, and send `PrepareOK` for any uncommitted ops."
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     /// # Client-table maintenance
     ///
     /// Backups maintain the client-table during normal operation via
@@ -2692,7 +2695,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// to prevent old/replayed messages from suppressing view changes.
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> CommitOutcome {
         assert_eq!(header.group, self.group, "Commit routed to wrong group");
 
@@ -3038,7 +3041,11 @@ where
         // never re-stamped (`restamp_prepare_view` patches only `view`), so this
         // survives view-change retransmits. The header `checksum` and its `parent`
         // chain stay `0`: activating them needs the retransmit path to re-seal a
-        // re-stamped header, a separate change.
+        // re-stamped header, a separate change. Whoever activates it must also
+        // audit every `set_last_prepare_checksum` caller for cross-plane carry --
+        // the repair router in `shard` drops metadata-plane frames it cannot
+        // journal precisely so one cannot stamp a PARTITION consensus, which is
+        // inert only while these values are structurally zero.
         //
         // Metadata plane only. A partition produce prepare already carries a verified
         // `batch_checksum` over the same bytes, so a second full-payload pass is pure
@@ -3071,11 +3078,11 @@ where
                 op,
                 timestamp,
                 operation: old.operation,
-                // The GROUP's namespace, never the request's: a client
-                // RoutedRequestHeader carries namespace 0, and journaling that
-                // would make the stored prepare route to the wrong plane
-                // when repair later ships it verbatim (live replication
-                // masked this; repair replay is what broke).
+                // The GROUP's own id, never the request's: a routed request
+                // header can carry group 0, and journaling that would make
+                // the stored prepare route to the wrong plane when repair
+                // later ships it verbatim (live replication masked this;
+                // repair replay is what broke).
                 group: consensus.group,
                 checksum_body,
                 // Copied verbatim: carries the stamped acting user for client

@@ -52,6 +52,9 @@ const MESSAGES_COUNT: u32 = 10;
 /// then the restarted node's probe and repair), and CI runners are slow. 60s bounds
 /// the worst case without hanging the suite.
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Boot line reporting the `(view, log_view)` a partition group restored from its
+/// superblock: the recovered replica's own account of what it read back.
+const RESTORED_VIEW_MARKER: &str = "restored partition view from its superblock";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
@@ -61,7 +64,10 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
     // Baseline: node 0 is the view-0 primary of every group (its replica id is 0).
     // Commit a topic with ONE partition and a batch of messages through it, so
     // exactly one partition consensus group exists and holds committed state.
-    let client = connect(harness, 0).await;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
     client
         .create_stream(STREAM_NAME)
         .await
@@ -117,11 +123,6 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
     // `view >= 1`) is the settled form: the gate persists `view` the moment a
     // replica advances it to vote, before it adopts the new primary's log.
     let view_before = wait_for_advanced_partition_view(harness, 2).await;
-    assert!(
-        view_before.view >= 1 && view_before.log_view >= 1,
-        "a survivor that took part in the partition view change must persist \
-         view/log_view >= 1, got {view_before:?}"
-    );
 
     // Bring the crashed primary back so it rejoins from its own disk: partition
     // recovery opens the superblock, restores its recorded view, and the boot
@@ -152,30 +153,69 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
         .start()
         .expect("restart the survivor (node 2)");
 
-    // The reformed cluster must serve the pre-crash batch again, proving the
-    // partition group is live under its recovered view.
-    wait_until_partition_serves(harness, &[0, 1, 2]).await;
+    // NODE 2 specifically must serve the pre-crash batch: the helper returns on
+    // the first node that answers, and nodes 0 and 1 were not restarted, so
+    // asking the whole set would never contact the node under test.
+    wait_until_partition_serves(harness, &[2]).await;
 
-    // The advanced view survived the survivor's own restart: re-read its partition
-    // superblock once resettled and confirm it did not regress toward a fresh 0.
-    let view_after = wait_for_advanced_partition_view(harness, 2).await;
+    // The recovered replica's own BEHAVIOR, not the file's contents: the
+    // superblock is read only at boot and written only when the persist gate
+    // fires, so re-reading node 2's own record here would return the
+    // pre-restart bytes even if recovery were broken and node 2 came back at
+    // view 0. Node 2's boot line reports the view it actually restored.
+    //
+    // The expectation is read from NODE 1, which was never restarted: comparing
+    // node 2's restored view against node 2's own file would be `x >= x` and
+    // would pass with the restore path deleted.
+    let expected = read_partition_superblock_state(&harness.node(1).data_path())
+        .expect("the survivor that never restarted holds the cluster's recorded view");
+    let restored = restored_partition_view(harness, 2)
+        .expect("node 2 must log the partition view it restored from its superblock");
     assert!(
-        view_after.view >= view_before.view && view_after.log_view >= view_before.log_view,
-        "the durable partition view must survive node 2's restart without regressing: \
-         before={view_before:?}, after={view_after:?}"
+        restored.0 >= expected.view && restored.1 >= expected.log_view,
+        "node 2 restored (view {}, log_view {}) but the untouched survivor's record is \
+         {expected:?}; a replica that resumes below the view it already acted in can \
+         re-enter it",
+        restored.0,
+        restored.1
     );
 }
 
-/// Connect a root-authenticated TCP client to a specific node.
-async fn connect(harness: &TestHarness, node: usize) -> IggyClient {
-    harness
-        .node(node)
-        .tcp_client()
-        .expect("tcp client builder")
-        .with_root_login()
-        .connect()
-        .await
-        .unwrap_or_else(|e| panic!("connect to node {node}: {e}"))
+/// `(view, log_view)` the node reports restoring at boot, parsed out of the
+/// structured fields of its restore line. `None` while the line is absent.
+///
+/// Reads the node's OWN log file as well as the harness stdout capture: under
+/// `IGGY_TEST_VERBOSE` the child inherits stdout and the capture is empty, and
+/// an oracle that silently skips in the mode someone debugging this would run
+/// is not an oracle.
+fn restored_partition_view(harness: &TestHarness, node: usize) -> Option<(u32, u32)> {
+    let mut log = harness.node(node).stdout_plain();
+    let own_logs = harness.node(node).data_path().join("logs");
+    if let Ok(entries) = std::fs::read_dir(own_logs) {
+        for entry in entries.flatten() {
+            if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                log.push_str(&contents);
+            }
+        }
+    }
+    log.lines()
+        .filter(|line| line.contains(RESTORED_VIEW_MARKER))
+        .filter_map(|line| {
+            // Leading space so the `view` key cannot match inside `log_view`.
+            let view = field(line, " view=")?;
+            let log_view = field(line, " log_view=")?;
+            Some((view, log_view))
+        })
+        .max()
+}
+
+/// Value of a space-prefixed `key=<u32>` tracing field.
+fn field(line: &str, key: &str) -> Option<u32> {
+    let start = line.find(key)? + key.len();
+    line[start..]
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
 }
 
 /// Poll the whole pre-crash batch from offset 0; `Ok(count)` of messages seen.

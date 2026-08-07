@@ -84,7 +84,7 @@ macro_rules! op_dispatch {
 
         /// In-flight entry recorded on submit, removed on reply.
         ///
-        /// `request_namespace` is the `header.namespace` the request was
+        /// `request_namespace` is the `header.group` the request was
         /// submitted with; the auditor cross-checks it against the
         /// reply's namespace so a misrouted reply cannot update the
         /// wrong VSR group's bookkeeping.

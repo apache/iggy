@@ -1554,7 +1554,40 @@ pub struct StateTransferTargetHeader {
     pub commit_op: u64,
     pub group: u64,
     pub available: u8,
-    pub reserved: [u8; 95],
+    /// Set on an `available == 0` refusal that means "not right now" rather than
+    /// "this node is broken".
+    ///
+    /// PARTITION arm only: it is the only side with a consecutive-failure count
+    /// to charge. The requester then re-arms on a flat interval instead of
+    /// charging that count, whose exponential backoff climbs to 1024x the retry
+    /// interval and is reset only by a completed install. A serving primary
+    /// momentarily behind its own frontier is the common case under produce
+    /// load.
+    ///
+    /// This and `commit_max` below claim the HEAD of what used to be the
+    /// reserved tail, so every pre-existing field keeps its published offset.
+    /// Layout compatibility only: the size assert cannot catch an equal-size
+    /// reshuffle, so a mid-struct insertion would silently move every field
+    /// after it. It says nothing about the semantics of these two -- an older
+    /// peer presents zeros here and serves no partition transfers at all.
+    pub unavailable_transient: u8,
+    /// Explicit padding so `commit_max` sits 8-aligned without the implicit
+    /// padding `NoUninit` forbids.
+    pub reserved_alignment: [u8; 6],
+    /// Serving replica's `commit_max` when the descriptor was built.
+    ///
+    /// Read by the PARTITION receiver only; the metadata arm branches on
+    /// `available` and falls back to journal repair without a refusal.
+    ///
+    /// A partition receiver refuses an offer from a replica that knows LESS
+    /// than it does:
+    /// without this the descriptor carried no proof of the sender's own
+    /// progress, and a phantom view-0 primary (a group whose directory vanished
+    /// boots `init()` rather than `init_as_backup()`, comes up Normal at view 0,
+    /// and an empty log is trivially caught up) could hand a data-holding
+    /// rejoiner an empty offer that unlinks its chain.
+    pub commit_max: u64,
+    pub reserved: [u8; 80],
 }
 const _: () = {
     assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
@@ -1562,7 +1595,14 @@ const _: () = {
         offset_of!(StateTransferTargetHeader, nonce)
             == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
+    // The pre-existing published offsets. New fields grow into the reserved
+    // tail only; a change that moves one of these is a wire break.
+    assert!(offset_of!(StateTransferTargetHeader, commit_op) == 144);
+    assert!(offset_of!(StateTransferTargetHeader, group) == 152);
+    assert!(offset_of!(StateTransferTargetHeader, available) == 160);
+    assert!(offset_of!(StateTransferTargetHeader, unavailable_transient) == 161);
+    assert!(offset_of!(StateTransferTargetHeader, commit_max) == 168);
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {
@@ -1587,6 +1627,20 @@ impl ConsensusHeader for StateTransferTargetHeader {
         if self.available > 1 {
             return Err(ConsensusError::InvalidField(
                 "available must be 0 or 1".to_string(),
+            ));
+        }
+        if self.unavailable_transient > 1 {
+            return Err(ConsensusError::InvalidField(
+                "unavailable_transient must be 0 or 1".to_string(),
+            ));
+        }
+        // The flag qualifies a refusal, so it is meaningless on an offer. Inert
+        // today (the receiver reads it only inside the `available == 0` arm),
+        // rejected anyway because a self-contradictory descriptor says the
+        // sender is not the build this field was designed for.
+        if self.available == 1 && self.unavailable_transient == 1 {
+            return Err(ConsensusError::InvalidField(
+                "unavailable_transient must be 0 on an available offer".to_string(),
             ));
         }
         // Unavailable is a bare refusal; a manifest body on it would be

@@ -34,9 +34,9 @@ use consumer::{
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
-use send_message::SendMessage;
+use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stream::StreamDetails;
-use topic::{Topic, TopicDetails};
+use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 use user::{UserInfo, UserInfoDetails, UserStatus};
 use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 
@@ -44,11 +44,16 @@ use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 #[pymodule]
 fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessage>()?;
+    m.add_class::<SendMessagesResponse>()?;
+    m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
     m.add_class::<StreamDetails>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
+    m.add_class::<IggyExpiry>()?;
+    m.add_class::<MaxTopicSize>()?;
+    m.add_class::<Partition>()?;
     m.add_class::<ConsumerGroup>()?;
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;

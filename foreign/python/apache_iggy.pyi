@@ -37,10 +37,15 @@ __all__ = [
     "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
+    "IggyExpiry",
+    "MaxTopicSize",
+    "Partition",
     "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
+    "SendMessagesConfirmation",
+    "SendMessagesResponse",
     "StreamDetails",
     "StreamPermissions",
     "Topic",
@@ -956,12 +961,27 @@ class IggyClient:
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
         replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            name: Topic name as `str`.
+            partitions_count: Number of partitions as `int`.
+            compression_algorithm: Compression algorithm as `str | None`.
+            replication_factor: Replication factor as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is created.
+
+        Raises:
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def get_topic(
         self,
@@ -994,8 +1014,8 @@ class IggyClient:
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
         replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1009,14 +1029,15 @@ class IggyClient:
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
             replication_factor: Replication factor as `int | None`.
-            message_expiry: Message expiry as `datetime.timedelta | None`.
-            max_topic_size: Maximum topic size in bytes as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -1193,10 +1214,13 @@ class IggyClient:
         topic: builtins.str | builtins.int,
         partitioning: builtins.int,
         messages: list[SendMessage],
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+        Returns a SendMessagesResponse carrying the per-partition commit
+        confirmations, or a PyRuntimeError on failure. The confirmation list is
+        empty when the server reports no offsets, and the legacy server never
+        reports any.
         """
     def poll_messages(
         self,
@@ -1323,6 +1347,134 @@ class IggyConsumer:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+        """
+
+class IggyExpiry:
+    r"""
+    The expiry of the messages in a topic.
+    """
+    @typing.final
+    class ServerDefault(IggyExpiry):
+        r"""
+        Use the message expiry configured on the server for this topic,
+        rather than an explicit value set by the client.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class ExpireDuration(IggyExpiry):
+        r"""
+        Expire messages this long after they are appended to the topic.
+
+        `duration` must be greater than zero and less than the maximum
+        microsecond count a `u64` can hold (about 584,542 years): those two
+        values are reserved on the wire for `ServerDefault` and `NeverExpire`
+        respectively, so a `duration` at either boundary raises `ValueError`
+        when passed to `create_topic`/`update_topic`. A negative `timedelta`
+        also raises `ValueError`.
+        """
+
+        __match_args__ = ("duration",)
+        @property
+        def duration(self) -> datetime.timedelta: ...
+        def __new__(cls, duration: datetime.timedelta) -> IggyExpiry.ExpireDuration: ...
+
+    @typing.final
+    class NeverExpire(IggyExpiry):
+        r"""
+        Retain messages indefinitely; they never expire.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.NeverExpire: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+class MaxTopicSize:
+    r"""
+    The maximum size of a topic.
+    """
+    @typing.final
+    class ServerDefault(MaxTopicSize):
+        r"""
+        Use the maximum topic size configured on the server, rather than an
+        explicit value set by the client.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Custom(MaxTopicSize):
+        r"""
+        Cap the topic at this many bytes; as the topic approaches this size,
+        the server deletes the oldest sealed segments to make room for new
+        messages.
+
+        `bytes` must be greater than zero and less than the maximum value of
+        an unsigned 64-bit integer: those two values are reserved on the wire
+        for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
+        at either boundary raises `ValueError` when passed to
+        `create_topic`/`update_topic`.
+        """
+
+        __match_args__ = ("bytes",)
+        @property
+        def bytes(self) -> builtins.int: ...
+        def __new__(cls, bytes: builtins.int) -> MaxTopicSize.Custom: ...
+
+    @typing.final
+    class Unlimited(MaxTopicSize):
+        r"""
+        Do not cap the topic size; it may grow without bound.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.Unlimited: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+@typing.final
+class Partition:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the partition.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp of the partition creation, in microseconds.
+        """
+    @property
+    def segments_count(self) -> builtins.int:
+        r"""
+        The number of segments in the partition.
+        """
+    @property
+    def current_offset(self) -> builtins.int:
+        r"""
+        The current offset of the partition.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The size of the partition in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The number of messages in the partition.
         """
 
 @typing.final
@@ -1460,6 +1612,65 @@ class SendMessage:
         """
 
 @typing.final
+class SendMessagesConfirmation:
+    r"""
+    A Python class representing the commit confirmation for one partition
+    written by a send.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the stream the batch was written to.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the topic the batch was written to.
+        """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        Gets the identifier of the partition the batch was written to.
+        """
+    @property
+    def base_offset(self) -> builtins.int:
+        r"""
+        Gets the offset assigned to the first message of the batch in this partition.
+
+        The offset locates the batch, it does not identify it. Delivery is
+        at-least-once, so an earlier retry may already have committed these
+        messages at a lower offset.
+
+        A batch is confirmed once it is committed in memory, not once it is
+        fsynced. A crash-restart can stamp a later batch with an offset a client
+        has already recorded.
+
+        The legacy server confirms nothing, so its confirmation list is empty
+        and this value is never reached.
+        """
+
+@typing.final
+class SendMessagesResponse:
+    r"""
+    A Python class representing the outcome of a successful send.
+    """
+    @property
+    def confirmations(self) -> builtins.list[SendMessagesConfirmation]:
+        r"""
+        Gets the commit confirmations, one per partition the batch was written to.
+
+        The list is empty when the server reports no offsets, and the legacy
+        server never reports any, so branch on it being empty rather than
+        indexing into it.
+
+        A reported `base_offset` never implies uniqueness, because delivery is
+        at-least-once and an earlier retry may already have committed the same
+        messages at a lower offset. A batch is confirmed once it is committed in
+        memory, not once it is fsynced. A crash-restart can stamp a later batch
+        with an offset a client has already recorded.
+        """
+
+@typing.final
 class StreamDetails:
     @property
     def id(self) -> builtins.int: ...
@@ -1574,6 +1785,36 @@ class Topic:
         r"""
         The total number of partitions in the topic.
         """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
+    def compression_algorithm(self) -> builtins.str:
+        r"""
+        Compression algorithm for the topic.
+        """
+    @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
+    def replication_factor(self) -> builtins.int:
+        r"""
+        Replication factor for the topic.
+        """
 
 @typing.final
 class TopicDetails:
@@ -1598,14 +1839,42 @@ class TopicDetails:
         The total number of partitions in the topic.
         """
     @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
     def compression_algorithm(self) -> builtins.str:
         r"""
         Compression algorithm for the topic.
         """
     @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
     def replication_factor(self) -> builtins.int:
         r"""
         Replication factor for the topic.
+        """
+    @property
+    def partitions(self) -> builtins.list[Partition]:
+        r"""
+        The collection of partitions in the topic.
+
+        Rebuilds the list from scratch on every access; cache the result
+        rather than reading this repeatedly in a loop.
         """
 
 @typing.final
