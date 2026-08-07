@@ -58,7 +58,7 @@ internal sealed class VsrCluster : IAsyncDisposable
     private readonly string _idSuffix;
     private readonly string _image;
     private readonly string _name;
-    private readonly INetwork? _network;
+    private INetwork? _network;
     private readonly int _nodeCount;
     private readonly NodePorts[] _ports;
     private readonly IReadOnlyList<ResourceMapping>? _resourceMappings;
@@ -105,9 +105,6 @@ internal sealed class VsrCluster : IAsyncDisposable
         _resourceMappings = resourceMappings;
         _nodeCount = nodeCount;
         _ports = ReservePorts(_nodeCount);
-        _network = ClusterEnabled
-            ? new NetworkBuilder().WithName($"iggy-vsr-{name}-{idSuffix}").Build()
-            : null;
         _containers = new IContainer[_nodeCount];
     }
 
@@ -162,16 +159,19 @@ internal sealed class VsrCluster : IAsyncDisposable
 
     /// <summary>
     ///     The containers are built here rather than in the constructor because a roster needs every
-    ///     node's IP before any node starts, and those IPs come from the subnet Docker assigns when
-    ///     it creates the network.
+    ///     node's IP before any node starts, and those IPs come from the subnet the network is
+    ///     created with.
     /// </summary>
     public async Task StartAsync()
     {
         var nodeAddresses = Array.Empty<string>();
-        if (_network != null)
+        if (ClusterEnabled)
         {
-            await _network.CreateAsync();
-            nodeAddresses = await ResolveNodeAddressesAsync();
+            var subnetPrefix = await CreateNetworkAsync();
+            // The gateway takes .1, so node addresses start at .10.
+            nodeAddresses = Enumerable.Range(0, _nodeCount)
+                .Select(node => $"{subnetPrefix}.{10 + node}")
+                .ToArray();
         }
 
         Dictionary<string, string> clusterEnvironment = BuildClusterEnvironment(nodeAddresses);
@@ -186,20 +186,36 @@ internal sealed class VsrCluster : IAsyncDisposable
 
     /// <summary>
     ///     Roster peers dial each other by literal IP - the ip field is parsed, not resolved - so every
-    ///     address must be known before any container starts. Docker picked the subnet when it created
-    ///     the network (guaranteeing no overlap with any other network on the host), so the addresses
-    ///     are read back from it instead of being managed by hand.
+    ///     node gets a static address, and Docker only honors static addresses on networks created with
+    ///     an explicit subnet. The subnet is picked from a private /16 here; a candidate overlapping
+    ///     another network on the host fails the create and the next one is tried.
     /// </summary>
-    private async Task<string[]> ResolveNodeAddressesAsync()
+    private async Task<string> CreateNetworkAsync()
     {
-        using var dockerClient = new DockerClientBuilder().Build();
-        var network = await dockerClient.Networks.InspectNetworkAsync(_network!.Name);
-        var subnet = IPAddress.Parse(network.IPAM.Config[0].Subnet.Split('/')[0]).GetAddressBytes();
+        for (var candidate = 0; candidate < 256; candidate++)
+        {
+            var subnetPrefix = $"10.213.{candidate}";
+            var network = new NetworkBuilder()
+                .WithName($"iggy-vsr-{_name}-{_idSuffix}")
+                .WithCreateParameterModifier(parameters => parameters.IPAM = new IPAM
+                {
+                    Config = [new IPAMConfig { Subnet = $"{subnetPrefix}.0/24" }]
+                })
+                .Build();
 
-        // The gateway takes .1, so node addresses start at .10.
-        return Enumerable.Range(0, _nodeCount)
-            .Select(node => $"{subnet[0]}.{subnet[1]}.{subnet[2]}.{10 + node}")
-            .ToArray();
+            try
+            {
+                await network.CreateAsync();
+                _network = network;
+                return subnetPrefix;
+            }
+            catch (DockerApiException)
+            {
+                // The subnet overlaps a network already on the host.
+            }
+        }
+
+        throw new InvalidOperationException("No free /24 subnet in 10.213.0.0/16 for the cluster network.");
     }
 
     private IContainer BuildNodeContainer(int node, IReadOnlyList<string> nodeAddresses,
