@@ -183,6 +183,34 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        // A received segment artifact can be one whole batch larger than the
+        // segment cap (rotation checks the cap AFTER appending), and the real
+        // batch bound is the BUS frame cap -- server-ng never enforces
+        // `MAX_PAYLOAD_SIZE`. An artifact ceiling under that floor refuses a
+        // legal segment, and the manifest check is all-or-nothing, so the
+        // partition livelocks re-requesting the same segment from every peer at
+        // the backoff ceiling. Caught here so it is a boot error rather than one
+        // partition that silently never rejoins.
+        let artifact_floor = self
+            .system
+            .segment
+            .size
+            .as_bytes_u64()
+            .saturating_add(self.message_bus.max_message_size.as_bytes_u64());
+        if self.partition.transfer_artifact_bytes_max.as_bytes_u64() < artifact_floor {
+            eprintln!(
+                "{COMPONENT_NG} partition.transfer_artifact_bytes_max ({} B) must be at least \
+                 system.segment.size ({} B) + message_bus.max_message_size ({} B) = \
+                 {artifact_floor} B: a segment may close one whole batch past its cap, and an \
+                 artifact ceiling below that refuses a legal segment and livelocks the \
+                 partition's rejoin",
+                self.partition.transfer_artifact_bytes_max.as_bytes_u64(),
+                self.system.segment.size.as_bytes_u64(),
+                self.message_bus.max_message_size.as_bytes_u64(),
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         self.message_bus
             .validate()
             .error(|e: &ConfigurationError| {

@@ -781,6 +781,7 @@ mod tests {
             commit_max: 100,
             checkpoint_op,
             checkpoint_checksum,
+            offset_frontier: 0,
         }
     }
 

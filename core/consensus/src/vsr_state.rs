@@ -28,11 +28,23 @@
 
 use std::fmt;
 
-/// Number of bytes [`VsrState::to_bytes`] produces and [`VsrState::try_from`]
-/// expects: `cluster`(16) + `replica_id`(1) + `replica_count`(1) + `view`(4)
-/// + `log_view`(4) + `commit_max`(8) + `checkpoint_op`(8)
-/// + `checkpoint_checksum`(16).
-pub const ENCODED_LEN: usize = 58;
+/// Number of bytes [`VsrState::to_bytes`] produces: `cluster`(16) +
+/// `replica_id`(1) + `replica_count`(1) + `view`(4) + `log_view`(4) +
+/// `commit_max`(8) + `checkpoint_op`(8) + `checkpoint_checksum`(16) +
+/// `offset_frontier`(8).
+pub const ENCODED_LEN: usize = 66;
+
+/// The layout before `offset_frontier` was appended.
+///
+/// [`VsrState::try_from`] still accepts records of this length and zero-fills
+/// the new field. Without it every superblock already on disk -- the metadata
+/// plane writes one on every view change and checkpoint, single-node included --
+/// would decode as [`VsrStateError::WrongLength`] and refuse boot as a
+/// durability violation. A version bump instead of this would not help on its
+/// own: `classify` compares the version for exact equality, so a v2 build turns
+/// every v1 record into `Unreadable`, which is the same refusal wearing a
+/// different name.
+pub const ENCODED_LEN_WITHOUT_FRONTIER: usize = 58;
 
 /// The durable consensus state of one replica for one consensus group.
 ///
@@ -69,6 +81,22 @@ pub struct VsrState {
     /// Integrity tag of the paired checkpoint, detecting a torn
     /// snapshot/superblock pairing across a crash.
     pub checkpoint_checksum: u128,
+    /// PARTITION plane: the next message offset this replica will mint, or `0`
+    /// for a group whose offset space is still empty.
+    ///
+    /// A durable LOWER BOUND, not a completeness claim: boot takes the max of
+    /// this and whatever the recovered segments prove. It exists because
+    /// nothing else durably names the frontier once the segments that carried
+    /// it are gone -- a state-transfer install of an all-GC'd origin, a crash
+    /// inside the install's swap window, and the fence-and-rebuild path all
+    /// leave a replica whose counter would otherwise restart at 0 while the
+    /// group is at N. That is not a lag: replicas re-stamp `base_offset` from
+    /// this counter and recompute `batch_checksum` over it, so the next
+    /// replicated prepare would persist different bytes here than on every
+    /// peer, silently.
+    ///
+    /// Always `0` on the metadata plane, which mints no message offsets.
+    pub offset_frontier: u64,
 }
 
 impl VsrState {
@@ -84,6 +112,7 @@ impl VsrState {
         out[26..34].copy_from_slice(&self.commit_max.to_le_bytes());
         out[34..42].copy_from_slice(&self.checkpoint_op.to_le_bytes());
         out[42..58].copy_from_slice(&self.checkpoint_checksum.to_le_bytes());
+        out[58..66].copy_from_slice(&self.offset_frontier.to_le_bytes());
         out
     }
 }
@@ -92,13 +121,25 @@ impl TryFrom<&[u8]> for VsrState {
     type Error = VsrStateError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        // One length check up front puts every field slice below in bounds by
-        // construction, so the `try_into`s cannot fail.
-        let bytes: &[u8; ENCODED_LEN] =
-            bytes.try_into().map_err(|_| VsrStateError::WrongLength {
-                expected: ENCODED_LEN,
-                actual: bytes.len(),
-            })?;
+        // Length-tolerant: a pre-`offset_frontier` record is padded out and the
+        // new field reads as 0, which is exactly "no recorded frontier" (the
+        // read sites filter it). One length check up front then puts every
+        // field slice below in bounds by construction, so the `try_into`s
+        // cannot fail.
+        let mut padded = [0u8; ENCODED_LEN];
+        match bytes.len() {
+            ENCODED_LEN => padded.copy_from_slice(bytes),
+            ENCODED_LEN_WITHOUT_FRONTIER => {
+                padded[..ENCODED_LEN_WITHOUT_FRONTIER].copy_from_slice(bytes);
+            }
+            actual => {
+                return Err(VsrStateError::WrongLength {
+                    expected: ENCODED_LEN,
+                    actual,
+                });
+            }
+        }
+        let bytes = &padded;
         let state = Self {
             cluster: u128::from_le_bytes(field(bytes, 0)),
             replica_id: bytes[16],
@@ -108,6 +149,7 @@ impl TryFrom<&[u8]> for VsrState {
             commit_max: u64::from_le_bytes(field(bytes, 26)),
             checkpoint_op: u64::from_le_bytes(field(bytes, 34)),
             checkpoint_checksum: u128::from_le_bytes(field(bytes, 42)),
+            offset_frontier: u64::from_le_bytes(field(bytes, 58)),
         };
         // A record violating `log_view <= view` decodes into a replica that looks
         // healthy locally while `DoViewChangeHeader::validate` makes every peer drop
@@ -146,7 +188,11 @@ impl fmt::Display for VsrStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongLength { expected, actual } => {
-                write!(f, "VsrState needs {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "VsrState needs {expected} bytes (or {ENCODED_LEN_WITHOUT_FRONTIER}, \
+                     the layout before the offset frontier), got {actual}"
+                )
             }
             Self::LogViewAheadOfView { view, log_view } => write!(
                 f,
@@ -178,6 +224,7 @@ mod tests {
             commit_max: 6,
             checkpoint_op: 7,
             checkpoint_checksum: 8,
+            offset_frontier: 0,
         };
         let bytes = state.to_bytes();
         assert_eq!(bytes.len(), ENCODED_LEN);
@@ -192,6 +239,41 @@ mod tests {
 
         assert_eq!(VsrState::try_from(&bytes[..]).unwrap(), state);
         assert!(VsrState::try_from(&bytes[..ENCODED_LEN - 1]).is_err());
+    }
+
+    /// A superblock written before `offset_frontier` existed must still decode:
+    /// the metadata plane writes one on every view change, so an exact-length
+    /// decode turns an in-place upgrade into a boot refusal on every deployment
+    /// that ever ran.
+    #[test]
+    fn given_pre_frontier_record_when_decoded_should_accept_and_zero_fill() {
+        let full = VsrState {
+            cluster: 3,
+            replica_id: 1,
+            replica_count: 3,
+            view: 9,
+            log_view: 8,
+            commit_max: 41,
+            checkpoint_op: 7,
+            checkpoint_checksum: 5,
+            offset_frontier: 77,
+        }
+        .to_bytes();
+
+        let legacy = &full[..ENCODED_LEN_WITHOUT_FRONTIER];
+        let decoded = VsrState::try_from(legacy).expect("a pre-frontier record must decode");
+        assert_eq!(decoded.offset_frontier, 0, "the new field zero-fills");
+        assert_eq!(decoded.view, 9);
+        assert_eq!(decoded.log_view, 8);
+        assert_eq!(decoded.commit_max, 41);
+        assert_eq!(decoded.checkpoint_op, 7);
+        assert_eq!(decoded.checkpoint_checksum, 5);
+
+        // Anything that is neither layout is still refused.
+        assert!(matches!(
+            VsrState::try_from(&full[..40]),
+            Err(VsrStateError::WrongLength { .. })
+        ));
     }
 
     #[test]
@@ -209,8 +291,12 @@ mod tests {
             commit_max: 0,
             checkpoint_op: 0,
             checkpoint_checksum: 0,
+            // Distinct and nonzero: with 0 here a transposed write over the
+            // trailing field would still satisfy every assertion below.
+            offset_frontier: 9,
         }
         .to_bytes();
+        assert_eq!(bytes[58], 9, "offset_frontier must occupy bytes 58..66");
         bytes[22] = 5; // log_view = 5, view stays 4
 
         assert_eq!(

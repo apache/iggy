@@ -42,6 +42,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 };
 use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RequestHeader, WireIdentifier};
 use iggy_common::IggyError;
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::consumer_group::{
@@ -60,8 +61,8 @@ use std::rc::Rc;
 /// (via the partition-read mesh), so the cooperative rebalance pending-revokes
 /// only those and hands off never-polled/drained partitions synchronously at
 /// join. Every other operation passes through.
-pub(crate) async fn maybe_rewrite_consumer_group_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn maybe_rewrite_consumer_group_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
 ) -> Result<Message<RequestHeader>, IggyError>
 where
@@ -69,6 +70,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let operation = request.header().operation;
     let client_id = request.header().client;
@@ -112,8 +114,8 @@ where
 /// no `PendingRevocation` record, so the reconciler never revisits it -- a
 /// misclassification here just redelivers the uncommitted range to the new
 /// owner, which is correct under at-least-once.
-async fn gather_in_flight<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn gather_in_flight<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     group_id: &WireIdentifier,
@@ -123,6 +125,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let streams = shard.plane.metadata().mux_stm.streams();
     let Some(monotonic_group_id) = streams.resolve_consumer_group_id(stream_id, topic_id, group_id)
@@ -203,8 +206,8 @@ where
 /// purge agree, and a re-created group (new id) never inherits a stale offset.
 /// Individual-consumer ops and every other operation pass through untouched.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn maybe_rewrite_consumer_offset_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
 ) -> Result<Message<RequestHeader>, IggyError>
 where
@@ -212,6 +215,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let operation = request.header().operation;
     if !matches!(
@@ -260,8 +264,8 @@ where
 /// Resolve the monotonic group id for a group consumer-offset op, or `None` for
 /// an individual consumer (kind != 2) / unresolved group (leave the body as-is;
 /// the apply / read path handle the miss).
-fn resolve_group_offset_id<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn resolve_group_offset_id<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
     namespace: (&WireIdentifier, &WireIdentifier),
 ) -> Option<u64>
@@ -270,6 +274,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if consumer.kind != KIND_CONSUMER_GROUP {
         return None;
