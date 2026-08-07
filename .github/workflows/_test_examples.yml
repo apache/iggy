@@ -113,10 +113,10 @@ jobs:
           echo "Building common binaries for all examples tests..."
           echo "Current directory: $(pwd)"
 
-          # Python wheels are vsr-built, so the Python examples run
-          # against the vsr server; every other language still runs
-          # against the legacy server.
-          if [[ "${{ inputs.task }}" == "examples-python" ]]; then
+          # Python wheels and the .NET SDK are vsr-built, so their
+          # examples run against the vsr server; every other language
+          # still runs against the legacy server.
+          if [[ "${{ inputs.task }}" == "examples-python" || "${{ inputs.task }}" == "examples-csharp" ]]; then
             # TODO(hubcio): change to iggy-server once legacy server is
             # removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"

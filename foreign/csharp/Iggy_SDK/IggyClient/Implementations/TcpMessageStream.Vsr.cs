@@ -127,7 +127,7 @@ public sealed partial class TcpMessageStream
     /// </remarks>
     private async Task<AuthResponse?> LoginRegisterAsync(int code, byte[] message, CancellationToken token)
     {
-        for (var redirects = 0;; redirects++)
+        for (var redirects = 0; ; redirects++)
         {
             if (_consensusSession.IsBound)
             {
@@ -293,10 +293,10 @@ public sealed partial class TcpMessageStream
                     pollingStrategy, count, autoCommit, token);
             }
             catch (IggyInvalidStatusCodeException e) when (e is
-                                                           {
-                                                               StatusCode: VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED,
-                                                               FromServer: true
-                                                           })
+            {
+                StatusCode: VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED,
+                FromServer: true
+            })
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
                 // re-sync below.
@@ -459,9 +459,9 @@ public sealed partial class TcpMessageStream
         }
         // todo: change after error refactoring, error code 5 is for feature not supported
         catch (IggyInvalidStatusCodeException e) when (e is
-                                                       {
-                                                           StatusCode: VsrError.FEATURE_UNAVAILABLE, FromServer: true
-                                                       })
+        {
+            StatusCode: VsrError.FEATURE_UNAVAILABLE, FromServer: true
+        })
         {
             return null;
         }

@@ -794,7 +794,7 @@ route them through.
 ```bash
 cargo build --features vsr --bin iggy-server-ng --bin iggy
 
-docker build --no-cache -f core/server-ng/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server-ng:test .
+docker build --no-cache -f core/server-ng/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
 ```
 
 #### 2. Build the Test Project
@@ -807,11 +807,11 @@ dotnet build foreign/csharp/Iggy_SDK.Tests.Integration
 
 ```bash
 cd foreign/csharp
-export IGGY_SERVER_NG_DOCKER_IMAGE=iggy-server-ng:test
+export IGGY_SERVER_DOCKER_IMAGE=iggy-server:test
 dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
 ```
 
-`IGGY_SERVER_NG_DOCKER_IMAGE` defaults to `iggy-server-ng:test`, so the export above is only needed to point
+`IGGY_SERVER_DOCKER_IMAGE` defaults to `iggy-server:test`, so the export above is only needed to point
 at a different image. Rider and Visual Studio need nothing configured.
 
 ## Useful Resources

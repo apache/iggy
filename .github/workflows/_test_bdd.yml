@@ -51,11 +51,12 @@ jobs:
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python)
+          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python|bdd-csharp)
             # vsr lane: the feature must be enabled on both the server
             # and the CLI, otherwise the CLI cannot frame requests for
             # the VSR wire protocol (healthcheck ping would fail).
-            # Python wheels are vsr-built, so the whole lane runs vsr.
+            # Python wheels and the .NET SDK are vsr-built, so their
+            # whole lanes run vsr.
             # TODO(hubcio): change to iggy-server once legacy server is
             # removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"
@@ -90,11 +91,11 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
           # Extract SDK name from task (format: bdd-<sdk>, or bdd-<sdk>-vsr
-          # for an explicit vsr lane). Python has no legacy lane, so its
-          # plain task name runs vsr.
+          # for an explicit vsr lane). Python and C# have no legacy
+          # lane, so their plain task names run vsr.
           SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//; s/-vsr$//')
           EXTRA_FLAGS=()
-          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python)
+          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python|bdd-csharp)
             EXTRA_FLAGS+=(--vsr)
             # TODO(hubcio): change to iggy-server once legacy server is
             # removed (core/server has VSR support)

@@ -38,12 +38,12 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     private VsrCluster? _cluster;
 
     /// <summary>
-    ///     Docker image to use. Can be overridden via IGGY_SERVER_NG_DOCKER_IMAGE environment variable
-    ///     or by subclasses. Defaults to the locally built <c>iggy-server-ng:test</c>; build it with
-    ///     <c>docker build -f core/server-ng/Dockerfile -t iggy-server-ng:test .</c> from the repository root.
+    ///     Docker image to use. Can be overridden via IGGY_SERVER_DOCKER_IMAGE environment variable
+    ///     or by subclasses. Defaults to the locally built <c>iggy-server:test</c>; build it with
+    ///     <c>docker build -f core/server-ng/Dockerfile -t iggy-server:test .</c> from the repository root.
     /// </summary>
     protected virtual string DockerImage =>
-        Environment.GetEnvironmentVariable("IGGY_SERVER_NG_DOCKER_IMAGE") ?? "iggy-server-ng:test";
+        Environment.GetEnvironmentVariable("IGGY_SERVER_DOCKER_IMAGE") ?? "iggy-server:test";
 
     /// <summary>
     ///     Names the containers and network of this fixture's cluster, so a `docker ps` during a run

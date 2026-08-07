@@ -214,6 +214,21 @@ jobs:
         with:
           save-cache: "false"
 
+      - name: Build Iggy server Docker image
+        id: docker_build
+        run: |
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo build --locked --features vsr --bin iggy-server-ng --bin iggy
+          docker build \
+            -f core/server-ng/Dockerfile \
+            --target runtime-prebuilt \
+            -t iggy-server:test \
+            --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
+            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+            .
+          echo "docker_image=iggy-server:test" >> "$GITHUB_OUTPUT"
+
       - name: Restore and build
         working-directory: foreign/csharp
         run: |
@@ -232,29 +247,10 @@ jobs:
             --coverage-output coverage.cobertura.xml \
             --results-directory ./reports/unit
 
-      - name: Build iggy-server-ng Docker image
-        shell: bash
-        run: |
-          set -euo pipefail
-          IMAGE_TAG="iggy-server-ng:test"
-          SERVER_BINARY="target/debug/iggy-server-ng"
-          CLI_BINARY="target/debug/iggy"
-
-          # server-ng only speaks the VSR wire protocol when built with the vsr feature.
-          cargo build --locked --features vsr --bin iggy-server-ng --bin iggy
-
-          docker build \
-            -f core/server-ng/Dockerfile \
-            --target runtime-prebuilt \
-            -t "$IMAGE_TAG" \
-            --build-arg PREBUILT_IGGY_SERVER_NG="$SERVER_BINARY" \
-            --build-arg PREBUILT_IGGY_CLI="$CLI_BINARY" \
-            .
-
-          echo "IGGY_SERVER_NG_DOCKER_IMAGE=$IMAGE_TAG" >> "$GITHUB_ENV"
-
       - name: Run integration tests with coverage
         working-directory: foreign/csharp
+        env:
+          IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
         run: |
           dotnet test \
             --project Iggy_SDK.Tests.Integration \
@@ -263,7 +259,7 @@ jobs:
             --coverage \
             --coverage-output-format cobertura \
             --coverage-output coverage.cobertura.xml \
-            --results-directory ./reports/vsr
+            --results-directory ./reports/integration
 
       - name: Merge coverage reports
         working-directory: foreign/csharp
