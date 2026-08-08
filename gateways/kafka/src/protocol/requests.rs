@@ -81,6 +81,13 @@ macro_rules! produce_decode {
     };
 }
 
+fn ensure_body_exhausted(d: &Decoder) -> Result<()> {
+    if d.remaining() != 0 {
+        return Err(KafkaProtocolError::UnexpectedTrailingBytes);
+    }
+    Ok(())
+}
+
 pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult {
     let mut d = Decoder::new(body);
     let flexible = version >= 9;
@@ -161,6 +168,7 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult 
     if flexible {
         produce_decode!(acks_read, d.read_tagged_fields());
     }
+    produce_decode!(acks_read, ensure_body_exhausted(&d));
 
     ProduceDecodeResult::Ok(ProduceRequest {
         transactional_id,
@@ -317,6 +325,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
     if flexible {
         d.read_tagged_fields()?;
     }
+    ensure_body_exhausted(&d)?;
 
     Ok(FetchRequest {
         max_wait_ms,
@@ -413,6 +422,7 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
     if flexible {
         d.read_tagged_fields()?;
     }
+    ensure_body_exhausted(&d)?;
 
     Ok(ListOffsetsRequest {
         isolation_level,
@@ -525,6 +535,7 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
     if flexible {
         d.read_tagged_fields()?;
     }
+    ensure_body_exhausted(&d)?;
 
     Ok(CreateTopicsRequest {
         topics,

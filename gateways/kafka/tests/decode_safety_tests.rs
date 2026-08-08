@@ -44,6 +44,20 @@ fn compact_array_varint_zero_nullable_decodes_as_empty() {
 }
 
 #[test]
+fn produce_decoder_rejects_trailing_bytes_after_valid_body() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(-1_i16).to_be_bytes()); // null transactional_id (legacy)
+    body.extend_from_slice(&1_i16.to_be_bytes()); // acks
+    body.extend_from_slice(&1000_i32.to_be_bytes()); // timeout_ms
+    body.extend_from_slice(&0_i32.to_be_bytes()); // empty topics
+    body.push(0xFF); // trailing garbage
+    let err = decode_produce_request(3, Bytes::from(body))
+        .into_request()
+        .unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::UnexpectedTrailingBytes));
+}
+
+#[test]
 fn negative_i32_array_length_returns_error_not_panic() {
     let mut raw = Vec::new();
     raw.extend_from_slice(&(-1_i32).to_be_bytes());
