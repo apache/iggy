@@ -35,8 +35,15 @@
 //! [`serialize_redacted`] and [`serialize_optional_redacted`] write
 //! [`REDACTED`] in place of the value, for a struct that must be serializable
 //! for unrelated reasons but whose credential no reader is entitled to.
-//! Redacted output does not round-trip: deserializing it yields the literal
-//! placeholder, so never feed it back into a config loader.
+//!
+//! **Redacted output is not a config.** Deserializing it hands back the literal
+//! [`REDACTED`] as the secret, silently, so a redact-then-reload round trip
+//! replaces the credential with the placeholder instead of failing. Nothing
+//! in-tree can reach that today: these helpers have no consumers, and the one
+//! persist/reload path round-trips a raw `serde_json::Value` rather than a
+//! typed struct. If a consumer ever needs the round trip closed mechanically,
+//! the shape that cannot be half-applied is a newtype owning both directions,
+//! not a paired `deserialize_with` that a caller can forget to add.
 //!
 //! If neither applies, leave `serialize_with` off and let the missing impl keep
 //! the field unserializable.
