@@ -167,13 +167,13 @@ key_file = "core/certs/iggy_key.pem"
 > credentials included - a database connection string, an S3 secret key, a
 > webhook signing secret. There is no redaction layer anywhere in the runtime.
 >
-> The exposure is not limited to disclosure. `POST /{sinks,sources}/{key}/configs`
-> followed by `PUT .../configs/active` and `POST .../restart` is enough to
-> repoint a connector at a destination of the caller's choosing: `restart`
-> re-reads the stored configuration and starts the connector from it, so the
-> runtime then forwards your topic data using its own Iggy credentials. The
-> stored plugin `path` is `dlopen`ed on the next start as well. `DELETE
-> .../configs` is on the same footing.
+> The exposure is not limited to disclosure. Publishing a configuration with
+> `POST /{sinks,sources}/{key}/configs` and then calling `POST .../restart` is
+> enough to repoint a connector at a destination of the caller's choosing,
+> because `restart` re-reads the stored configuration and starts the connector
+> from it. The runtime then forwards your topic data using its own Iggy
+> credentials, and the stored plugin `path` is `dlopen`ed on the next start.
+> `PUT .../configs/active` and `DELETE .../configs` sit behind the same key.
 >
 > `api_key` is empty by default, which means authentication is **off** by
 > default. Only `/` and `/health` are exempt once it is set, so everything above
