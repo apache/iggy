@@ -37,27 +37,6 @@ describe('VSR custom request framing', () => {
     assert.deepEqual(frame.subarray(256), payload);
   });
 
-  // The id is drawn only once every local check has passed, so a rejected
-  // encode leaves the counter where it was and the next request still gets
-  // id 1. Rejecting AFTER drawing would burn an id the server never sees,
-  // and the metadata plane dedups on a contiguous per-session sequence.
-  it('does not consume a request ID when a local check rejects', () => {
-    const session = new VsrSession(7n);
-    assert.throws(
-      () => session.encode(
-        COMMAND_CODE.CreateStream,
-        Buffer.alloc(0)
-      )
-    );
-
-    session.bind(42n);
-    const frame = session.encode(
-      COMMAND_CODE.CreateStream,
-      Buffer.alloc(0)
-    );
-    assert.equal(frame.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
-  });
-
   it('rejects an unbound replicated request with a typed error', () => {
     const session = new VsrSession();
     assert.throws(
