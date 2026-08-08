@@ -6977,6 +6977,19 @@ mod purge_floor_tests {
             "the fenced op must not linger in the staged-commit table"
         );
 
+        // A store admitted after the purge carries a higher op -- the primary
+        // assigns them monotonically at admission -- so it lands above the
+        // floor and applies normally.
+        journal_store_offset(&mut partition, 2, 7, 4).await;
+        partition.consensus().advance_commit_max(2);
+        partition.commit_journal(&repair_config()).await;
+
+        assert_eq!(
+            partition.consumer_offsets.pin().len(),
+            1,
+            "a store admitted after the purge must survive the floor"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
