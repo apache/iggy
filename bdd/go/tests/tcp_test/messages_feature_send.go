@@ -36,7 +36,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			messages := createDefaultMessages()
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-			err := client.SendMessages(
+			_, err := client.SendMessages(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
@@ -53,7 +53,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			messages := createDefaultMessages()
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-			err := client.SendMessages(
+			_, err := client.SendMessages(
 				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
@@ -66,14 +66,16 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 		ginkgo.Context("and tries to send messages to the non existing stream", func() {
 			client := createAuthorizedConnection()
 			messages := createDefaultMessages()
-			err := client.SendMessages(
+			_, err := client.SendMessages(
 				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				iggcon.None(),
 				messages,
 			)
-			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
+			// Balanced partitioning resolves to an explicit partition first,
+			// and that topic lookup is what fails when neither exists.
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to send messages to non existing partition", func() {
@@ -84,14 +86,16 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			messages := createDefaultMessages()
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-			err := client.SendMessages(
+			_, err := client.SendMessages(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				iggcon.PartitionId(createRandomUInt32()),
 				messages,
 			)
-			itShouldReturnSpecificError(err, ierror.ErrPartitionNotFound)
+			// The send is routed by its packed namespace, so the shard that
+			// owns no such partition reports a missing resource.
+			itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
 		})
 
 		ginkgo.Context("and tries to send messages to valid topic but with 0 messages in payload", func() {
@@ -101,7 +105,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-			err := client.SendMessages(
+			_, err := client.SendMessages(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,

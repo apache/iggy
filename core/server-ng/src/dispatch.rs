@@ -644,8 +644,8 @@ where
 // password / PAT verification, `UserStatus::Active`, PAT expiry, the
 // protocol-version gate, and SDK-info recording.
 //
-// An unbound transport sending a replicated frame therefore gets the
-// empty-reply fail-fast below and must log in.
+// An unbound transport sending a replicated frame therefore gets the typed
+// `Eviction(NoSession)` fail-fast below and must log in.
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_client_request<B, MJ, S, SB>(
@@ -937,32 +937,19 @@ async fn handle_client_request<B, MJ, S, SB>(
         // Replicated request on an unbound transport. Without this short-
         // circuit, the rewrite below overwrites `header.client` with
         // `transport_client_id` and dispatches; the request_preflight then
-        // rejects with `NoSession`/`Fenced` and the failure either
-        // disappears silently or emits an Eviction the SDK previously
-        // could not decode. Either way the SDK blocked until socket
-        // timeout. Emit an empty Reply so the SDK fails fast: the typed
-        // decoder downstream rejects the empty body with `InvalidCommand`
-        // instead of hanging.
-        let commit = current_metadata_commit(shard);
-        let reply = build_empty_reply(&header, transport_client_id, 0, commit);
-        if let Err(error) = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await
-        {
-            warn!(
-                transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "failed to surface unbound-session reply"
-            );
-        } else {
-            warn!(
-                transport_client_id,
-                operation = ?header.operation,
-                "dropping replicated request from unbound transport; replied empty"
-            );
-        }
+        // rejects with `NoSession`/`Fenced` and the failure disappears
+        // silently, wedging the SDK until the socket timeout. Reject with
+        // the same typed `Eviction(NoSession)` the pre-auth read guard
+        // sends: the session is gone, so the client must register again. An
+        // empty status-0 Reply is not safe here, because SendMessages is the
+        // one replicated operation without a result section, and its decoder
+        // would read the empty body as a successful send.
+        warn!(
+            transport_client_id,
+            operation = ?header.operation,
+            "rejecting replicated request from unbound transport with Eviction(NoSession)"
+        );
+        send_unauthenticated_eviction(shard, transport_client_id).await;
         return;
     }
 
@@ -2771,10 +2758,27 @@ async fn handle_logout_request<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
+        // Logout on an unbound transport: the desired state already holds,
+        // so answer ok. A silent drop would wedge the lockstep SDK on this
+        // connection until its socket read timeout, and the SDK routinely
+        // sends a logout before each re-login.
         warn!(
             transport_client_id,
-            "dropping logout for unbound VSR session"
+            "logout for unbound VSR session; answering ok"
         );
+        let commit = current_metadata_commit(shard);
+        let reply = build_empty_reply(request.header(), transport_client_id, 0, commit);
+        if let Err(error) = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await
+        {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "failed to send unbound logout reply"
+            );
+        }
         return;
     };
 
@@ -2782,7 +2786,29 @@ async fn handle_logout_request<B, MJ, S, SB>(
     let commit = match submit_logout_on_owner(shard, vsr_client_id, session, request_id).await {
         Ok(commit) => commit,
         Err(error) => {
-            warn!(transport_client_id, error = %error, "logout/unregister failed");
+            // Deny as transient instead of dropping the frame: the submit
+            // usually fails because this replica is not the metadata owner
+            // right now, and the SDK replays a transient rejection.
+            warn!(transport_client_id, error = %error, "logout/unregister failed; denying transient");
+            let commit = current_metadata_commit(shard);
+            let reply = build_deny_reply(
+                request.header(),
+                vsr_client_id,
+                session,
+                commit,
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            if let Err(send_error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %send_error,
+                    "failed to send logout deny reply"
+                );
+            }
             return;
         }
     };

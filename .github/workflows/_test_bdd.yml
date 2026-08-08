@@ -51,15 +51,16 @@ jobs:
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python)
-            # vsr lane: the feature must be enabled on both the server
-            # and the CLI, otherwise the CLI cannot frame requests for
-            # the VSR wire protocol (healthcheck ping would fail).
-            # Python wheels are vsr-built, so the whole lane runs vsr.
-            # TODO(hubcio): change to iggy-server once legacy server is
-            # removed (core/server has VSR support)
+          # The VSR lanes need the vsr feature on both the server and the CLI,
+          # otherwise the CLI cannot frame requests for the VSR wire protocol
+          # and the healthcheck ping fails. The Go SDK speaks only VSR and the
+          # Python wheels are vsr-built, so those suites are always on this
+          # branch.
+          case "${{ inputs.task }}" in
+          bdd-rust-vsr|bdd-go|bdd-go-race|bdd-python|bdd-node-vsr)
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"
-            echo "Building server binary and CLI (--features vsr) for BDD tests..."
+            echo "Building the VSR server binary and CLI (--features vsr) for BDD tests..."
             cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
             ;;
           *)
@@ -94,10 +95,16 @@ jobs:
           # plain task name runs vsr.
           SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//; s/-vsr$//')
           EXTRA_FLAGS=()
-          case "${{ inputs.task }}" in bdd-rust-vsr|bdd-python)
+          case "${{ inputs.task }}" in
+          bdd-rust-vsr|bdd-python|bdd-node-vsr)
             EXTRA_FLAGS+=(--vsr)
-            # TODO(hubcio): change to iggy-server once legacy server is
-            # removed (core/server has VSR support)
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+            export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
+            echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
+            ;;
+          bdd-go|bdd-go-race)
+            # The Go SDK speaks only VSR, so the runner forces the overlay.
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
             echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
             ;;
