@@ -1775,6 +1775,34 @@ where
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply));
     }
 
+    /// `true` when an `InsertOwned` for `namespace` is built and queued but not
+    /// yet applied.
+    ///
+    /// The reconciler's own "already handled" test is `IggyPartitions::contains`,
+    /// which only turns true once the pump applies, so without this a pass run
+    /// during that lag rebuilds a namespace an earlier pass already built. The
+    /// queue IS the record of that in-flight work, so asking it cannot drift
+    /// from reality the way a parallel set would: every op leaves the queue
+    /// through `apply_reconcile_ops`, which either inserts or discards.
+    ///
+    /// Deliberately blind to `epoch`. Matching it would let a delete + recreate
+    /// landing inside the lag build a second incarnation over the queued one's
+    /// on-disk path, which is the case this exists to prevent; the recreate is
+    /// not lost, it costs one pass. The queued (dead-epoch) op applies, and the
+    /// next pass reads the epoch mismatch off the routing row and takes the
+    /// stale-incarnation teardown into a clean rebuild.
+    pub fn has_staged_insert_owned(&self, namespace: IggyNamespace) -> bool {
+        self.reconcile_queue.borrow().iter().any(|op| {
+            matches!(
+                op,
+                ReconcileOp::InsertOwned {
+                    namespace: staged_namespace,
+                    ..
+                } if *staged_namespace == namespace
+            )
+        })
+    }
+
     /// Stage a segment-cleaner pass for `namespace` on this shard's pump. The
     /// timer task resolves retention config off-pump and stamps `now`; the pump
     /// is the single writer of partition state, so the deletion runs there,
@@ -1882,21 +1910,26 @@ where
                     epoch,
                 } => {
                     // Idempotent apply, mirroring `ConfirmRemove` (idempotent
-                    // via `remove`'s `None` early-return). The reconciler
-                    // stages this from a task separate from the pump, so under
-                    // a commit burst two passes can each observe
-                    // `!contains(ns)` and build the same namespace before
-                    // either drains here. A second unconditional `insert`
-                    // would push a duplicate partition and overwrite the
-                    // `ns -> idx` entry, orphaning the first (its VSR group +
-                    // segment writers leak and `len` inflates). The discarded
-                    // build is a fresh empty incarnation over the same on-disk
-                    // path the kept one owns, so dropping it just closes a few
-                    // fds.
+                    // via `remove`'s `None` early-return). An unconditional
+                    // `insert` over a live namespace would push a duplicate
+                    // partition and overwrite the `ns -> idx` entry, orphaning
+                    // the first: its VSR group + segment writers leak and `len`
+                    // inflates.
+                    //
+                    // A backstop, not the mechanism. `reconcile_additions`
+                    // skips a namespace whose `InsertOwned` is already staged
+                    // ([`Self::has_staged_insert_owned`]), so a second op for a
+                    // live namespace should not be built at all. Dropping one
+                    // here is damage control rather than a free no-op: the
+                    // build already planted its initial segment over the live
+                    // incarnation's path and folded that into the namespace's
+                    // shared stats.
                     if partitions.contains(&namespace) {
                         drop(partition);
                         continue;
                     }
+                    // Only the adopted incarnation may seed the shared stats.
+                    partition.publish_current_offset();
                     partitions.insert(namespace, *partition);
                     self.shards_table.insert(
                         namespace,
@@ -3197,6 +3230,7 @@ where
         // the restore at all, a simulator replica rebuilt against a retained
         // store resumes minting at 0 while its group is at N.
         partition.restore_offset_frontier(recovered_state.as_ref());
+        partition.publish_current_offset();
         partitions.insert(namespace, partition);
     }
 

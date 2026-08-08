@@ -1838,6 +1838,7 @@ async fn build_shard_for_thread(
             }
             Err(error) => return Err(error),
         };
+        partition.publish_current_offset();
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -2413,7 +2414,6 @@ async fn load_partition(
     partition.offset.store(counter, Ordering::Release);
     partition.dirty_offset.store(counter, Ordering::Relaxed);
     partition.should_increment_offset = current_offset.is_some();
-    partition.stats.set_current_offset(counter);
     // The durable frontier is a LOWER BOUND on top of what the segments proved:
     // it is the only carrier left when the segments that named the frontier are
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
