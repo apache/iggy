@@ -30,7 +30,7 @@ mod wire;
 
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -50,10 +50,11 @@ use tcp::{
     build_produce_v3_body, build_request_frame, parse_response_payload, read_byte_with_timeout,
     round_trip, scan_for_error_code,
 };
-use wire::build_metadata_flexible_request_v10;
 use wire::{
-    OUT_OF_SCOPE_API_KEYS, build_create_topics_empty_request, build_fetch_empty_topics_request,
-    build_list_offsets_request,
+    OUT_OF_SCOPE_API_KEYS, build_api_versions_flexible_request, build_create_topics_empty_request,
+    build_fetch_empty_topics_request, build_list_offsets_request,
+    build_metadata_all_topics_flexible, build_metadata_all_topics_legacy,
+    build_metadata_flexible_request_v10,
 };
 
 #[test]
@@ -111,8 +112,13 @@ fn apiversions_advertises_exact_supported_ranges_v1() {
 
 #[test]
 fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
+    let body = handle_request(
+        API_KEY_API_VERSIONS,
+        3,
+        build_api_versions_flexible_request("iggy-test", "0.1.0"),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).expect("api count fits usize");
@@ -152,13 +158,13 @@ fn apiversions_advertises_produce_min_zero_while_firewall_stays_three() {
 #[test]
 fn apiversions_all_versions_return_success() {
     for version in 0i16..=3 {
-        let body = handle_request(
-            API_KEY_API_VERSIONS,
-            version,
-            Bytes::new(),
-            &default_broker(),
-        )
-        .expect_response("test request has acks != 0 and expects a response");
+        let request = if version >= 3 {
+            build_api_versions_flexible_request("iggy-test", "0.1.0")
+        } else {
+            Bytes::new()
+        };
+        let body = handle_request(API_KEY_API_VERSIONS, version, request, &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         assert_eq!(d.read_i16().unwrap(), 0, "ApiVersions v{version}");
     }
@@ -254,16 +260,36 @@ fn fetch_unsupported_version_returns_well_formed_error_response() {
 }
 
 #[test]
-fn fetch_unsupported_version_above_max_uses_top_level_error() {
-    let body = handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_varint().unwrap(), 1);
-    d.read_tagged_fields().unwrap();
-    assert_eq!(d.remaining(), 0);
+fn fetch_unsupported_version_above_max_closes_connection() {
+    // Fetch v13+ response shape differs from the v12 encoder; a clamped body is unparsable.
+    assert!(
+        handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker()).is_close(),
+        "Fetch above encoder max must close rather than return a clamped body"
+    );
+}
+
+#[test]
+fn produce_unsupported_version_above_max_closes_connection() {
+    assert!(
+        handle_request(API_KEY_PRODUCE, 13, Bytes::new(), &default_broker()).is_close(),
+        "Produce above encoder max must close rather than return a clamped body"
+    );
+}
+
+#[test]
+fn create_topics_unsupported_version_above_max_closes_connection() {
+    assert!(
+        handle_request(API_KEY_CREATE_TOPICS, 7, Bytes::new(), &default_broker()).is_close(),
+        "CreateTopics above encoder max must close rather than return a clamped body"
+    );
+}
+
+#[test]
+fn list_offsets_unsupported_version_above_max_closes_connection() {
+    assert!(
+        handle_request(API_KEY_LIST_OFFSETS, 7, Bytes::new(), &default_broker()).is_close(),
+        "ListOffsets above encoder max must close rather than return a clamped body"
+    );
 }
 
 #[test]
@@ -428,15 +454,22 @@ fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
 
 // ── Comprehensive scoped-API coverage (correlation id, boundary versions) ──
 
-fn metadata_empty_legacy_body() -> Bytes {
-    let mut body = BytesMut::new();
-    body.put_i32(0);
-    body.freeze()
-}
-
 fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes {
     match api_key {
-        API_KEY_METADATA => metadata_empty_legacy_body(),
+        API_KEY_METADATA => {
+            if version >= 9 {
+                build_metadata_all_topics_flexible(version)
+            } else {
+                build_metadata_all_topics_legacy(version)
+            }
+        }
+        API_KEY_API_VERSIONS => {
+            if version >= 3 {
+                build_api_versions_flexible_request("iggy-test", "0.1.0")
+            } else {
+                Bytes::new()
+            }
+        }
         API_KEY_PRODUCE => {
             if fixture_exists(api_key, name, version) {
                 load_fixture_body(api_key, name, version)
@@ -551,7 +584,7 @@ fn out_of_scope_api_keys_return_unsupported_version_without_panic() {
 // ── Boundary versions keep the TCP session (except Metadata) ───────────────
 
 #[tokio::test]
-async fn each_scoped_api_above_max_version_e2e_keeps_connection() {
+async fn each_scoped_api_above_max_version_e2e_closes_or_kip511() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -568,23 +601,25 @@ async fn each_scoped_api_above_max_version_e2e_keeps_connection() {
             .write_all(&frame)
             .await
             .unwrap_or_else(|_| panic!("write {name} v{above}"));
-        if api_key == API_KEY_METADATA {
-            // Unsupported Metadata closes: clamped bodies are unparsable at the client version.
-            assert_eq!(
-                read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
-                ByteRead::Closed,
-                "Metadata v{above} must close the connection"
+        if api_key == API_KEY_API_VERSIONS {
+            // KIP-511: ApiVersions above max still answers with a v0 UNSUPPORTED_VERSION body.
+            let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+            assert!(
+                !payload.is_empty(),
+                "{name} v{above} must still respond on wire"
             );
-            stream = TcpStream::connect(addr)
-                .await
-                .expect("reconnect after Metadata close");
             continue;
         }
-        let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-        assert!(
-            !payload.is_empty(),
-            "{name} v{above} must still respond on wire"
+        // Other APIs: encoding at the client's raw version above our encoder max would omit
+        // later-version fields, so Close is the honest contract (same as Metadata).
+        assert_eq!(
+            read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+            ByteRead::Closed,
+            "{name} v{above} must close the connection"
         );
+        stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|_| panic!("reconnect after {name} close"));
     }
 
     let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 89_999, Some("scope-test"), &[]);
@@ -666,20 +701,21 @@ fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
 // ── Unsupported-version e2e paths for remaining scoped APIs ─────────────────
 
 #[tokio::test]
-async fn list_offsets_v7_unsupported_e2e_returns_error() {
+async fn list_offsets_v7_unsupported_e2e_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(
-        addr,
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let frame = build_request_frame(
         API_KEY_LIST_OFFSETS,
         7,
         370,
+        Some("scope-test"),
         &[0x00, 0x00, 0x00, 0x00],
-    )
-    .await;
-    assert_eq!(corr, 370);
-    assert!(
-        scan_for_error_code(&body, ERROR_UNSUPPORTED_VERSION),
-        "ListOffsets v7 must be rejected"
+    );
+    stream.write_all(&frame).await.expect("write");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "ListOffsets v7 is above encoder max and must close"
     );
 }
 

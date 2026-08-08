@@ -213,7 +213,8 @@ async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    let frame = build_request_frame(API_KEY_API_VERSIONS, 3, 200, Some("len-test"), &[]);
+    let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 3, 200, Some("len-test"), &request);
     stream.write_all(&frame).await.expect("write");
 
     let mut len_buf = [0u8; 4];
@@ -327,7 +328,8 @@ async fn e2e_empty_client_id_request_succeeds() {
 #[tokio::test]
 async fn e2e_flexible_apiversions_v3_request_succeeds() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = tcp::round_trip(addr, API_KEY_API_VERSIONS, 3, 401, &[]).await;
+    let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
+    let (corr, body) = tcp::round_trip(addr, API_KEY_API_VERSIONS, 3, 401, &request).await;
     assert_eq!(corr, 401);
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);

@@ -133,7 +133,10 @@ pub fn build_list_offsets_v0_request_with_topic_t() -> Bytes {
     body.freeze()
 }
 
-/// Legacy Metadata request body listing topic names (non-flexible, v0-v8).
+/// Legacy Metadata request body listing topic names (non-flexible, v0–v3 fields only).
+///
+/// Prefer version-aware wire helpers when targeting Metadata v4+, which also require
+/// `allow_auto_topic_creation` (and later authorized-ops flags).
 pub fn build_metadata_legacy_request(topic_names: &[&str]) -> Bytes {
     let mut body = BytesMut::new();
     body.put_i32(i32::try_from(topic_names.len()).expect("topic name count fits i32"));

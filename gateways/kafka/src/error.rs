@@ -44,6 +44,14 @@ pub enum KafkaProtocolError {
     StringTooLong { length: usize },
     #[error("null topic name in request")]
     NullTopicName,
+    /// Compact-array prefix `0` is Kafka's null encoding; invalid for non-nullable arrays.
+    #[error("null compact array where a non-null array is required")]
+    NullCompactArray,
+    /// Compact-string prefix `0` is null; invalid where a non-null string is required.
+    #[error("null compact string where a non-null string is required")]
+    NullCompactString,
+    #[error("unexpected bytes remaining in request body")]
+    UnexpectedTrailingBytes,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

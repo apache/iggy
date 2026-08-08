@@ -24,7 +24,7 @@ Source of truth for supported ranges: `SUPPORTED_RANGES` in [`src/protocol/api.r
 
 ### Governance model
 
-Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows; out-of-range requests receive `UNSUPPORTED_VERSION` (35) without dropping the connection.
+Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows. Versions below an API's min (but still encodable) receive `UNSUPPORTED_VERSION` (35) in a version-correct body; versions above the encoder max close the connection (a clamped body would be unparsable at the client's version). ApiVersions is the KIP-511 exception: out-of-range still answers with a v0 error body.
 
 ---
 

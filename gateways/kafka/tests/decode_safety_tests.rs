@@ -30,10 +30,17 @@ use iggy_gateway_kafka::protocol::requests::{
 };
 
 #[test]
-fn compact_array_varint_zero_decodes_as_empty_without_panic() {
-    // Per Kafka spec, compact-array varint=0 means null/absent → 0 elements (not an error).
+fn compact_array_varint_zero_rejected_on_non_nullable_array() {
+    // Compact-array varint=0 is Kafka's null encoding; required (non-nullable) arrays reject it.
     let mut d = Decoder::new(Bytes::from_static(&[0x00]));
-    assert_eq!(d.read_compact_array_count().unwrap(), 0);
+    let err = d.read_compact_array_count().unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullCompactArray));
+}
+
+#[test]
+fn compact_array_varint_zero_nullable_decodes_as_empty() {
+    let mut d = Decoder::new(Bytes::from_static(&[0x00]));
+    assert_eq!(d.read_compact_array_count_nullable().unwrap(), 0);
 }
 
 #[test]
