@@ -28,6 +28,11 @@ const STREAM_NAME: &str = "cg-partition-test-stream";
 const TOPIC_NAME: &str = "cg-partition-test-topic";
 const CONSUMER_GROUP_NAME: &str = "cg-partition-test-group";
 const PARTITIONS_COUNT: u32 = 3;
+/// Slices the slab-reuse wait so the surviving consumer can prove liveness
+/// inside the server's staleness window. Product of the two is the 3s the
+/// spec waits for the freed slab to become reusable.
+const CONSUMER1_KEEPALIVE_PINGS: u32 = 3;
+const CONSUMER1_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 async fn create_stale_tcp_client(server_addr: &str) -> IggyClient {
     let config = TcpClientConfig {
@@ -3144,7 +3149,18 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
 
     // 3. Consumer2 (revocation target) disconnects — its slab is freed
     drop(client2);
-    sleep(Duration::from_secs(3)).await;
+    // Consumer1 must stay alive across the wait. This spec asks the server for
+    // `heartbeat.interval = 2s`, so its verifier evicts any consumer-group
+    // member idle past 1.2 intervals, and harness clients never ping on their
+    // own (the SDK pinger is spawned by `IggyClient::connect`, which the
+    // builder does not call). Silence here evicted consumer1 mid-wait and its
+    // offset store below came back `StaleClient`. Any request refreshes
+    // liveness; a ping is the cheapest. Consumer2 stays silent by construction
+    // - it is already dropped, and the socket close frees its slab.
+    for _ in 0..CONSUMER1_KEEPALIVE_PINGS {
+        sleep(CONSUMER1_KEEPALIVE_INTERVAL).await;
+        client1.ping().await.unwrap();
+    }
 
     // 4. Consumer3 joins — may reuse consumer2's old slab
     let client3 = harness.new_client().await.unwrap();
