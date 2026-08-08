@@ -39,9 +39,11 @@ usage(){
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
-  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust only);"
+  # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust, python, go, node);"
   log "           expects IGGY_SERVER_NG_PATH (default: target/debug/iggy-server-ng)"
-  log "           and a vsr-built iggy CLI at IGGY_CLI_PATH"
+  log "           and a vsr-built iggy CLI at IGGY_CLI_PATH."
+  log "           The go suites imply it: the Go SDK speaks only the VSR protocol."
   log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
@@ -53,9 +55,9 @@ usage(){
 
 if [ "$VSR" = "1" ]; then
   case "$SDK" in
-    rust|clean) ;;
+    rust|python|go|go-race|node|clean) ;;
     *)
-      log "❌ --vsr supports only the Rust SDK (server-ng speaks the VSR wire protocol)"
+      log "❌ --vsr supports only the Rust, Python, Go, and Node SDKs so far"
       usage
       exit 2 ;;
   esac
@@ -108,7 +110,8 @@ trap cleanup EXIT INT TERM
 
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
-if [ "$VSR" = "1" ]; then
+if [ "$VSR" = "1" ] || [ "$SDK" = "go" ] || [ "$SDK" = "go-race" ]; then
+  # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
   log "🗳️ Server: iggy-server-ng (--features vsr)"
 fi
 if [ "$COVERAGE" = "1" ]; then
@@ -132,12 +135,20 @@ run_suite(){
     esac
   fi
 
+  # The Go SDK speaks only the VSR wire protocol, so its suites always run
+  # against the VSR server even when the caller did not ask for it. Each suite
+  # tears its own stack down, so an `all` run can mix the two servers.
+  local files=("${COMPOSE_FILES[@]}")
+  if [ "$svc" = "go-bdd" ] && [ "$VSR" != "1" ]; then
+    files+=(-f docker-compose.vsr.yml)
+  fi
+
   log "${emoji} ${label}..."
   local code=0
-  docker compose "${COMPOSE_FILES[@]}" \
+  docker compose "${files[@]}" \
     up --build --exit-code-from "$svc" "$svc" \
     || code=$?
-  docker compose "${COMPOSE_FILES[@]}" \
+  docker compose "${files[@]}" \
     down -v --remove-orphans >/dev/null 2>&1 || true
   return "$code"
 }

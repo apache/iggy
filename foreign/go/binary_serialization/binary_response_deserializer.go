@@ -129,6 +129,13 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, erro
 	}, totalSize, nil
 }
 
+// pollBatchHeaderLength covers [partition_id u32][current_offset u64][count u32].
+const pollBatchHeaderLength = 16
+
+// DeserializeFetchMessagesResponse decodes a poll reply. A truncated body is
+// a decode error rather than a shorter batch: silently dropping the tail
+// would let a consumer that commits CurrentOffset skip messages it never saw.
+// The returned messages alias the reply buffer; a retained message pins it.
 func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMessageCompression) (*iggcon.PolledMessage, error) {
 	if len(payload) == 0 {
 		return &iggcon.PolledMessage{
@@ -139,31 +146,44 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 	}
 
 	length := len(payload)
+	if length < pollBatchHeaderLength {
+		return nil, fmt.Errorf("poll response: %d bytes is short of the batch header", length)
+	}
 	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	messagesCount := binary.LittleEndian.Uint32(payload[12:16])
-	position := 16
-	var messages = make([]iggcon.IggyMessage, 0)
+	position := pollBatchHeaderLength
+
+	// The declared count is server-controlled; the allocation hint is capped
+	// by what the body could possibly hold.
+	maxMessages := (length - pollBatchHeaderLength) / iggcon.MessageHeaderSize
+	if int(messagesCount) < maxMessages {
+		maxMessages = int(messagesCount)
+	}
+	messages := make([]iggcon.IggyMessage, 0, maxMessages)
 	for position < length {
-		if position+iggcon.MessageHeaderSize >= length {
-			// body needs to be at least 1 byte
-			break
+		if position+iggcon.MessageHeaderSize > length {
+			return nil, fmt.Errorf("poll response: truncated message header at byte %d", position)
 		}
 		header, err := iggcon.MessageHeaderFromBytes(payload[position : position+iggcon.MessageHeaderSize])
 		if err != nil {
 			return nil, err
 		}
 		position += iggcon.MessageHeaderSize
-		payload_end := position + int(header.PayloadLength)
-		if int(payload_end) > length {
-			break
+		if uint64(header.PayloadLength) > uint64(length-position) {
+			return nil, fmt.Errorf(
+				"poll response: message payload of %d bytes overruns the body", header.PayloadLength)
 		}
-		payloadSlice := payload[position:payload_end]
-		position = int(payload_end)
+		payloadSlice := payload[position : position+int(header.PayloadLength)]
+		position += int(header.PayloadLength)
 
-		var user_headers []byte = nil
+		if uint64(header.UserHeaderLength) > uint64(length-position) {
+			return nil, fmt.Errorf(
+				"poll response: user headers of %d bytes overrun the body", header.UserHeaderLength)
+		}
+		var userHeaders []byte
 		if header.UserHeaderLength > 0 {
-			user_headers = payload[position : position+int(header.UserHeaderLength)]
+			userHeaders = payload[position : position+int(header.UserHeaderLength)]
 		}
 		position += int(header.UserHeaderLength)
 
@@ -181,8 +201,13 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 		messages = append(messages, iggcon.IggyMessage{
 			Header:      *header,
 			Payload:     payloadSlice,
-			UserHeaders: user_headers,
+			UserHeaders: userHeaders,
 		})
+	}
+	if uint32(len(messages)) != messagesCount {
+		return nil, fmt.Errorf(
+			"poll response: %d decoded messages do not match the declared %d",
+			len(messages), messagesCount)
 	}
 
 	// !TODO: Add message offset ordering
@@ -621,4 +646,73 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (igg
 		Name:   name,
 		Expiry: expiry,
 	}, readBytes
+}
+
+// confirmationEntryLength is the width of one send confirmation:
+// [stream_id u32][topic_id u32][partition_id u32][base_offset u64].
+const confirmationEntryLength = 20
+
+// DeserializeSendMessagesConfirmations decodes [count u32] followed by count
+// confirmation entries. An empty payload is an empty list. Trailing bytes are
+// a decode error, because a frame the client cannot account for means the
+// stream is out of sync.
+func DeserializeSendMessagesConfirmations(payload []byte) (*iggcon.SendMessagesResponse, error) {
+	if len(payload) == 0 {
+		return &iggcon.SendMessagesResponse{}, nil
+	}
+	if len(payload) < 4 {
+		return nil, fmt.Errorf("send confirmations: %d bytes is short of the count", len(payload))
+	}
+
+	count := binary.LittleEndian.Uint32(payload)
+	body := payload[4:]
+	if uint64(len(body)) != uint64(count)*confirmationEntryLength {
+		return nil, fmt.Errorf(
+			"send confirmations: %d entries do not fill %d body bytes", count, len(body))
+	}
+
+	confirmations := make([]iggcon.SendMessagesConfirmation, 0, count)
+	for offset := 0; offset < len(body); offset += confirmationEntryLength {
+		entry := body[offset : offset+confirmationEntryLength]
+		confirmations = append(confirmations, iggcon.SendMessagesConfirmation{
+			StreamId:    binary.LittleEndian.Uint32(entry[0:4]),
+			TopicId:     binary.LittleEndian.Uint32(entry[4:8]),
+			PartitionId: binary.LittleEndian.Uint32(entry[8:12]),
+			BaseOffset:  binary.LittleEndian.Uint64(entry[12:20]),
+		})
+	}
+	return &iggcon.SendMessagesResponse{Confirmations: confirmations}, nil
+}
+
+// assignmentHeaderLength covers [generation u64][partitions_count u32].
+const assignmentHeaderLength = 12
+
+// DeserializeConsumerGroupAssignment decodes
+// [generation u64][partitions_count u32][partition_id u32 x n]. An empty
+// payload means the client is not a member of the group, reported as
+// ErrConsumerGroupMemberNotFound. A member holding no partition arrives as a
+// header with a zero count and decodes to an empty Partitions slice.
+func DeserializeConsumerGroupAssignment(payload []byte) (*iggcon.ConsumerGroupAssignment, error) {
+	if len(payload) == 0 {
+		return nil, ierror.ErrConsumerGroupMemberNotFound
+	}
+	if len(payload) < assignmentHeaderLength {
+		return nil, fmt.Errorf("group assignment: %d bytes is short of the header", len(payload))
+	}
+
+	count := binary.LittleEndian.Uint32(payload[8:12])
+	body := payload[assignmentHeaderLength:]
+	if uint64(len(body)) != uint64(count)*4 {
+		return nil, fmt.Errorf(
+			"group assignment: %d partitions do not fill %d body bytes", count, len(body))
+	}
+
+	partitions := make([]uint32, 0, count)
+	for offset := 0; offset < len(body); offset += 4 {
+		partitions = append(partitions, binary.LittleEndian.Uint32(body[offset:offset+4]))
+	}
+	return &iggcon.ConsumerGroupAssignment{
+		Generation: binary.LittleEndian.Uint64(payload[0:8]),
+		Partitions: partitions,
+	}, nil
 }

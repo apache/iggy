@@ -83,7 +83,11 @@ func (c *IggyTcpClient) DeleteConsumerGroup(ctx context.Context, streamId iggcon
 		},
 		GroupId: groupId,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	c.groups.markLeft(newGroupKey(streamId, topicId, groupId))
+	return nil
 }
 
 func (c *IggyTcpClient) JoinConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
@@ -94,7 +98,11 @@ func (c *IggyTcpClient) JoinConsumerGroup(ctx context.Context, streamId iggcon.I
 		},
 		GroupId: groupId,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	c.groups.markJoined(newGroupKey(streamId, topicId, groupId))
+	return nil
 }
 
 func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
@@ -105,5 +113,28 @@ func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.
 		},
 		GroupId: groupId,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	c.groups.markLeft(newGroupKey(streamId, topicId, groupId))
+	return nil
+}
+
+func (c *IggyTcpClient) SyncConsumerGroup(
+	ctx context.Context,
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	groupId iggcon.Identifier,
+) (*iggcon.ConsumerGroupAssignment, error) {
+	buffer, err := c.do(ctx, &command.SyncConsumerGroup{
+		TopicPath: command.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		GroupId: groupId,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return binaryserialization.DeserializeConsumerGroupAssignment(buffer)
 }
