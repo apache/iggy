@@ -61,6 +61,9 @@ fn stage_owned_partitions(shard: &Rc<ServerNgShard>) {
     let now = IggyTimestamp::now();
     let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
     let streams = shard.plane.metadata().mux_stm.streams();
+    // Resolved once per pass, not per partition: the node default is a `Cell`
+    // written at bootstrap and never after.
+    let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     for namespace in namespaces {
         let Some((message_expiry, max_topic_size, partition_count)) =
             streams.topic_retention_config(namespace.stream_id(), namespace.topic_id())
@@ -75,22 +78,93 @@ fn stage_owned_partitions(shard: &Rc<ServerNgShard>) {
             message_expiry,
             IggyExpiry::NeverExpire | IggyExpiry::ServerDefault
         );
-        let max_bytes = match max_topic_size {
-            // Per-partition budget: the cluster has no single owner of a
-            // topic-wide total, so each partition keeps an equal share.
-            MaxTopicSize::Custom(size) => {
-                let divisor = u64::try_from(partition_count).unwrap_or(1).max(1);
-                Some(size.as_bytes_u64() / divisor)
-            }
-            // No per-partition cap. `ServerDefault` must NOT fall through to a
-            // sized branch: its `as_bytes_u64()` is 0, which would trim every
-            // sealed segment. The server-ng default topic size is unlimited.
-            MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
-        };
+        let max_bytes =
+            per_partition_size_budget(max_topic_size, default_max_topic_size, partition_count);
 
         if !has_expiry && max_bytes.is_none() {
             continue;
         }
         shard.request_clean_partition(namespace, now, message_expiry, max_bytes);
+    }
+}
+
+/// Per-partition byte budget for a topic, or `None` for "no cap".
+///
+/// The cluster has no single owner of a topic-wide total, so each partition
+/// keeps an equal share.
+///
+/// `ServerDefault` is resolved against the node default HERE, at enforcement
+/// time. Create admission rewrites the sentinel before replication, but an
+/// UPDATE to `ServerDefault` leaves it in committed state, and reading that as
+/// "no cap" made an updated topic behave differently from an identically
+/// configured created one. A node default of unlimited (the shipped config)
+/// still yields `None`.
+///
+/// `ServerDefault` must never reach a sized branch: its `as_bytes_u64()` is 0,
+/// which would trim every sealed segment.
+fn per_partition_size_budget(
+    max_topic_size: MaxTopicSize,
+    default_max_topic_size: u64,
+    partition_count: usize,
+) -> Option<u64> {
+    let resolved = match max_topic_size {
+        MaxTopicSize::ServerDefault => MaxTopicSize::from(default_max_topic_size),
+        sized => sized,
+    };
+    match resolved {
+        MaxTopicSize::Custom(size) => {
+            let divisor = u64::try_from(partition_count).unwrap_or(1).max(1);
+            Some(size.as_bytes_u64() / divisor)
+        }
+        // `From<u64>` maps 0 back to `ServerDefault`, so a node default of 0
+        // lands here as "no cap" rather than as a trim-everything budget.
+        MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::per_partition_size_budget;
+    use iggy_common::MaxTopicSize;
+
+    #[test]
+    fn server_default_resolves_to_the_node_default_at_enforcement_time() {
+        // A topic UPDATED back to `ServerDefault` keeps the sentinel in
+        // committed state; the cleaner must enforce the node default anyway, or
+        // it diverges from a topic CREATED with the same setting (whose
+        // sentinel admission already rewrote).
+        assert_eq!(
+            per_partition_size_budget(MaxTopicSize::ServerDefault, 4096, 4),
+            Some(1024),
+            "the node default is resolved and split across partitions"
+        );
+        // Shipped config: server default is unlimited -> still no cap.
+        assert_eq!(
+            per_partition_size_budget(MaxTopicSize::ServerDefault, u64::MAX, 4),
+            None
+        );
+        // A zero node default must read as "no cap", never as a zero budget
+        // that trims every sealed segment.
+        assert_eq!(
+            per_partition_size_budget(MaxTopicSize::ServerDefault, 0, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_sizes_ignore_the_node_default() {
+        assert_eq!(
+            per_partition_size_budget(MaxTopicSize::Custom(4096u64.into()), 64, 2),
+            Some(2048)
+        );
+        assert_eq!(
+            per_partition_size_budget(MaxTopicSize::Unlimited, 64, 2),
+            None
+        );
+        // Zero partitions must not divide by zero.
+        assert_eq!(
+            per_partition_size_budget(MaxTopicSize::Custom(4096u64.into()), 64, 0),
+            Some(4096)
+        );
     }
 }

@@ -90,12 +90,13 @@ pub(crate) fn encode_request_header(
         _ => {
             let operation = operation_for_code(code);
             // NonReplicated ops (ping, reads) bypass server-side dedup --
-            // `ClientTable` only tracks request_ids for replicated ops. If
-            // they consumed the monotonic counter, the next replicated
-            // request would skip an id and the primary's `request_preflight`
-            // would see a `RequestGap` and silently drop it. Read the
-            // current id without advancing; the server ignores it for
-            // NonReplicated.
+            // `ClientTable` only tracks request_ids for replicated ops, and
+            // the table accepts any id above the watermark with no
+            // contiguity requirement (client_table.rs: "There is no
+            // `RequestGap`"), so consuming the counter would not break the
+            // next metadata op. Read the current id without advancing
+            // because the server ignores it for NonReplicated and burning
+            // ids for requests the table never sees buys nothing.
             //
             // They are also sessionless on the server (routed by transport
             // id; protected codes are auth-gated server-side), so send with
@@ -111,9 +112,11 @@ pub(crate) fn encode_request_header(
             } else if operation.is_partition() {
                 // Partition ops replicate in their own per-partition group,
                 // which is at-least-once with no `ClientTable` dedup -- the
-                // metadata table never records their request ids. Consuming
-                // the counter here would gap the NEXT metadata op's id and
-                // `request_preflight` would silently drop it (`RequestGap`).
+                // metadata table never records their request ids, so there
+                // is nothing for a consumed id to deduplicate against. Every
+                // partition request on a session therefore carries the id
+                // the next metadata op will claim, and a partition-plane
+                // replay is at-least-once.
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.current_request_id(), session_id)
             } else {
