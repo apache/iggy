@@ -314,7 +314,12 @@ run_python_examples() {
 
 # shellcheck disable=SC2329
 run_php_examples() {
-    resolve_server_binary "${TARGET}"
+    # The PHP extension is vsr-built, so examples run against the vsr server.
+    # It takes no --fresh flag; cleanup_server_state wiping local_data is the
+    # fresh start.
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    resolve_server_binary "${TARGET}" iggy-server-ng
 
     local php_bin="${PHP:-php}"
     if [ -z "${PHP_IGGY_EXTENSION:-}" ]; then
@@ -350,7 +355,7 @@ run_php_examples() {
         "" \
         "" \
         0 \
-        "--fresh"
+        ""
 }
 
 # shellcheck disable=SC2329
