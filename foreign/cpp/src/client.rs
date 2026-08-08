@@ -96,13 +96,11 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
         }
         _ => return Err("Unsupported automatic login kind".to_owned()),
     }
-    if config.set_reconnection_max_retries {
-        builder = builder.with_reconnection_max_retries(
-            config
-                .has_reconnection_max_retries
-                .then_some(config.reconnection_max_retries),
-        );
-    }
+    builder = builder.with_reconnection_max_retries(
+        config
+            .has_reconnection_max_retries
+            .then_some(config.reconnection_max_retries),
+    );
     if config.has_reconnection_interval {
         builder = builder.with_reconnection_interval(RustIggyDuration::from(
             config.reconnection_interval_micros,
@@ -112,19 +110,22 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
         builder =
             builder.with_reestablish_after(RustIggyDuration::from(config.reestablish_after_micros));
     }
-    if config.has_tls_enabled {
-        builder = builder.with_tls_enabled(config.tls_enabled);
-        if config.tls_enabled {
-            if !config.tls_domain.is_empty() {
-                builder = builder.with_tls_domain(config.tls_domain);
-            }
-            if !config.tls_ca_file.is_empty() {
-                builder = builder.with_tls_ca_file(config.tls_ca_file);
-            }
-            if config.has_tls_validate_certificate {
-                builder = builder.with_tls_validate_certificate(config.tls_validate_certificate);
-            }
-        }
+    if !config.tls_enabled
+        && (!config.tls_domain.is_empty()
+            || !config.tls_ca_file.is_empty()
+            || config.has_tls_validate_certificate)
+    {
+        return Err("TLS settings require TLS to be enabled".to_owned());
+    }
+    builder = builder.with_tls_enabled(config.tls_enabled);
+    if !config.tls_domain.is_empty() {
+        builder = builder.with_tls_domain(config.tls_domain);
+    }
+    if !config.tls_ca_file.is_empty() {
+        builder = builder.with_tls_ca_file(config.tls_ca_file);
+    }
+    if config.has_tls_validate_certificate {
+        builder = builder.with_tls_validate_certificate(config.tls_validate_certificate);
     }
     if config.no_delay {
         builder = builder.with_no_delay();

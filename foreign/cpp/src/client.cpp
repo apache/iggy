@@ -126,13 +126,11 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithPersonalAccessToke
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithReconnectionMaxRetries(std::uint32_t retries) {
-    set_reconnection_max_retries_ = true;
-    reconnection_max_retries_     = retries;
+    reconnection_max_retries_ = retries;
     return *this;
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithoutReconnectionLimit() {
-    set_reconnection_max_retries_ = true;
     reconnection_max_retries_.reset();
     return *this;
 }
@@ -187,15 +185,13 @@ IggyBlockingClient IggyBlockingClient::Builder::Build() const {
         config.username                     = auto_login_username_;
         config.password                     = auto_login_password_;
         config.personal_access_token        = personal_access_token_;
-        config.set_reconnection_max_retries = set_reconnection_max_retries_;
         config.has_reconnection_max_retries = reconnection_max_retries_.has_value();
         config.reconnection_max_retries     = reconnection_max_retries_.value_or(0);
         config.has_reconnection_interval    = reconnection_interval_micros_.has_value();
         config.reconnection_interval_micros = reconnection_interval_micros_.value_or(0);
         config.has_reestablish_after        = reestablish_after_micros_.has_value();
         config.reestablish_after_micros     = reestablish_after_micros_.value_or(0);
-        config.has_tls_enabled              = tls_enabled_.has_value();
-        config.tls_enabled                  = tls_enabled_.value_or(false);
+        config.tls_enabled                  = tls_enabled_;
         config.tls_domain                   = tls_domain_;
         config.tls_ca_file                  = tls_ca_file_;
         config.has_tls_validate_certificate = tls_validate_certificate_.has_value();

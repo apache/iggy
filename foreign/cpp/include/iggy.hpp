@@ -461,8 +461,9 @@ class IggyException : public std::runtime_error {
 /**
  * @brief Owning client connection to an Apache Iggy server.
  *
- * Create instances with Builder or FromConnectionString(). The client owns the
- * underlying Rust-backed connection and releases it when destroyed.
+ * Create instances with Builder or FromConnectionString(). The client owns a
+ * handle to the underlying Rust client. Destroying the C++ object releases that
+ * handle, but does not stop heartbeat processing started by Connect().
  *
  * Builder initializes a TCP client. To use QUIC, HTTP, or WebSocket, create the
  * client with FromConnectionString().
@@ -473,6 +474,7 @@ class IggyException : public std::runtime_error {
  *                   .Build();
  * client.Connect();
  * client.Login("iggy", "iggy");
+ * client.Shutdown();
  * @endcode
  */
 class IggyBlockingClient final {
@@ -497,16 +499,20 @@ class IggyBlockingClient final {
      * @param other Client whose connection ownership is transferred.
      * @return Reference to this client.
      *
-     * Any client currently owned by this object is released first. The
-     * moved-from client must not be used for client operations.
+     * Any Rust client handle currently owned by this object is released first.
+     * Call Shutdown() before replacing a connected client. The moved-from
+     * client must not be used for client operations.
      */
     IggyBlockingClient &operator=(IggyBlockingClient &&other) noexcept;
 
     /**
-     * @brief Releases the underlying Rust client.
+     * @brief Releases the handle to the underlying Rust client.
      *
-     * Cleanup errors cannot be reported from the destructor. Call Shutdown()
-     * explicitly when graceful transport shutdown must be observed.
+     * Destruction does not stop the heartbeat task started by Connect(). For
+     * stateful transports, call Shutdown() before destruction to close the
+     * transport and let the heartbeat task observe the shutdown state. HTTP
+     * shutdown is a no-op, so its heartbeat remains subject to this limitation.
+     * Cleanup errors cannot be reported from the destructor.
      */
     ~IggyBlockingClient();
 
@@ -601,12 +607,17 @@ class IggyBlockingClient final {
      *
      * Establishes the configured transport connection and starts heartbeat
      * processing. If automatic login was configured, authentication is also
-     * performed. Calling this on an already connected client has no effect.
+     * performed.
      *
      * @note HTTP is stateless; connecting initializes heartbeat processing but
      *       does not open a persistent transport connection.
-     * @throws IggyException if the connection or automatic authentication
-     *         fails.
+     * @note Every successful call starts a heartbeat task, including calls made
+     *       while already connected. Call Connect() only once per client.
+     * @note The default reconnection limit is unlimited. If the server remains
+     *       unavailable, this method keeps retrying and blocks the caller. Use
+     *       WithReconnectionMaxRetries() to bound the wait.
+     * @throws IggyException if automatic authentication fails, or if a finite
+     *         reconnection limit is configured and exhausted.
      */
     void Connect();
 
@@ -618,6 +629,9 @@ class IggyBlockingClient final {
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
      *
+     * @note Disconnect() does not stop the existing heartbeat task. Calling
+     *       Connect() again starts an additional task, so avoid disconnect and
+     *       reconnect cycles until this SDK limitation is resolved.
      * @note The HTTP transport is stateless and treats this operation as a
      *       no-op.
      * @throws IggyException if the client cannot disconnect cleanly.
@@ -631,8 +645,9 @@ class IggyBlockingClient final {
      * Shutdown is terminal for stateful transports. It gracefully closes the
      * active transport where supported, releases transport resources, and
      * changes the client state to shutdown. Binary operations then fail with a
-     * client-shutdown error, which also causes the background heartbeat task to
-     * stop. Create a new client instead of reusing a shut-down client.
+     * client-shutdown error. The background heartbeat task stops when it next
+     * observes that error. Create a new client instead of reusing a shut-down
+     * client.
      *
      * @note The HTTP transport is stateless and treats this operation as a
      *       no-op.
@@ -788,7 +803,7 @@ class IggyBlockingClient::Builder final {
      * @brief Enables or disables TLS.
      *
      * TLS is disabled by default. TLS domain, CA file, and certificate
-     * validation settings are applied only when TLS is enabled.
+     * validation settings require TLS to be enabled.
      *
      * @param enabled Whether TLS is enabled.
      * @return Reference to this builder.
@@ -799,7 +814,7 @@ class IggyBlockingClient::Builder final {
      * @brief Sets the domain used for TLS server-name verification.
      *
      * When empty, the domain is derived from the configured server address.
-     * This setting has no effect unless TLS is enabled.
+     * Build() throws IggyException if this is set while TLS is disabled.
      *
      * @param domain TLS domain name.
      * @return Reference to this builder.
@@ -810,7 +825,8 @@ class IggyBlockingClient::Builder final {
      * @brief Sets the certificate-authority file used by TLS.
      *
      * When omitted, system root certificates are used. This setting has no
-     * effect unless TLS is enabled.
+     * effect unless TLS is enabled. Build() throws IggyException if a path is
+     * set while TLS is disabled.
      *
      * @param path Path to a PEM-encoded certificate-authority file.
      * @return Reference to this builder.
@@ -823,7 +839,8 @@ class IggyBlockingClient::Builder final {
      * Certificate validation is enabled by default. Disabling it accepts
      * certificates without verifying their trust chain or server identity and
      * should be limited to controlled development environments. This setting
-     * has no effect unless TLS is enabled.
+     * requires TLS; Build() throws IggyException if certificate validation is
+     * configured while TLS is disabled.
      *
      * @param enabled Whether the server certificate is validated.
      * @return Reference to this builder.
@@ -859,11 +876,10 @@ class IggyBlockingClient::Builder final {
     std::string auto_login_username_;
     std::string auto_login_password_;
     std::string personal_access_token_;
-    bool set_reconnection_max_retries_ = false;
     std::optional<std::uint32_t> reconnection_max_retries_;
     std::optional<std::uint64_t> reconnection_interval_micros_;
     std::optional<std::uint64_t> reestablish_after_micros_;
-    std::optional<bool> tls_enabled_;
+    bool tls_enabled_ = false;
     std::string tls_domain_;
     std::string tls_ca_file_;
     std::optional<bool> tls_validate_certificate_;
