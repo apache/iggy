@@ -22,58 +22,112 @@ import (
 	"log/slog"
 	"time"
 
-	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/util"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/vsr"
 )
 
 func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password string) (*iggcon.IdentityInfo, error) {
-	return c.login(ctx, &command.LoginUser{
-		Username: username,
-		Password: password,
-	})
+	body, err := vsr.SerializeLoginRegister(username, password, iggcon.Version)
+	if err != nil {
+		return nil, err
+	}
+	return c.register(ctx, uint32(command.LoginRegisterCode), body)
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
-	return c.login(ctx, &command.LoginWithPersonalAccessToken{
-		Token: token,
-	})
+	body, err := vsr.SerializeLoginRegisterWithToken(token, iggcon.Version)
+	if err != nil {
+		return nil, err
+	}
+	return c.register(ctx, uint32(command.LoginRegisterWithPATCode), body)
 }
 
-func (c *IggyTcpClient) login(ctx context.Context, loginCmd command.Command) (*iggcon.IdentityInfo, error) {
+// register runs the sign-in handshake and binds the session the server
+// assigned. Leadership is already settled by the connect flow, so no
+// redirection happens here.
+//
+// A failed sign-in never writes the session state: a server-side reject leaves
+// the existing session untouched, and a connection that dies mid-attempt is
+// already reset by invalidateConnLocked.
+func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+	// One sign-in at a time. BeginRegister runs inside the exchange lock but
+	// Bind runs after it, so two interleaved sign-ins would let the second
+	// BeginRegister reset the identity the first is about to bind: one
+	// committed Register would be orphaned in the server's client table and
+	// the losing caller would see ErrSessionAlreadyBound.
+	c.registerMtx.Lock()
+	defer c.registerMtx.Unlock()
+
 	c.logger.Info("Iggy client is signing in...", slog.String("client_address", c.clientAddress))
 
-	// A failed login never writes the session state: a server-side reject
-	// leaves the existing session untouched, and a connection that dies
-	// mid-attempt is already reset to unauthenticated by invalidateConnLocked.
-	buffer, err := c.do(ctx, loginCmd)
+	if err := c.endBoundSession(ctx); err != nil {
+		return nil, err
+	}
+
+	bp := acquireRequestBuf()
+	defer releaseRequestBuf(bp)
+	frame := append(reserveHeader(*bp), body...)
+	*bp = frame
+
+	response, err := c.exchange(ctx, code, frame)
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("Iggy client has signed in successfully.", slog.String("client_address", c.clientAddress))
-	identity := binaryserialization.DeserializeLogInResponse(buffer)
-	c.setSessionState(iggcon.SessionStateAuthenticated)
-	shouldRedirect, err := c.HandleLeaderRedirection(ctx)
+	registered, err := vsr.DecodeLoginRegister(response)
 	if err != nil {
 		return nil, err
 	}
-	if shouldRedirect {
-		if err = c.Connect(ctx); err != nil {
-			return nil, err
-		}
-		return c.login(ctx, loginCmd)
+
+	c.mtx.Lock()
+	err = c.session.Bind(registered.Session)
+	if err == nil {
+		c.sessionState = iggcon.SessionStateAuthenticated
+		c.loggedOut = false
+	} else {
+		// The server committed a Register this client failed to adopt, so the
+		// connection carries a session the local state does not track. It is
+		// unusable; drop it like any other terminal session failure.
+		c.invalidateConnLocked()
 	}
-	return identity, nil
+	c.mtx.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	c.logger.Info("Iggy client has signed in successfully.",
+		slog.String("client_address", c.clientAddress),
+		slog.String("server_version", registered.ServerVersion))
+	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
+}
+
+// endBoundSession logs out a live session before a re-login, so the server
+// drops its client-table entry instead of leaving it to be fenced.
+func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
+	c.mtx.Lock()
+	bound := c.session.Bound()
+	c.mtx.Unlock()
+	if !bound {
+		return nil
+	}
+	return c.LogoutUser(ctx)
 }
 
 func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	if _, err := c.do(ctx, &command.LogoutUser{}); err != nil {
 		return err
 	}
-	c.setSessionState(iggcon.SessionStateUnauthenticated)
+	c.mtx.Lock()
+	c.sessionState = iggcon.SessionStateUnauthenticated
+	c.session.Reset()
+	// The sign-out is caller intent: it suppresses the automatic sign-in on
+	// the reconnect path until the caller explicitly signs in again.
+	c.loggedOut = true
+	c.groups.clear()
+	c.topics.clearCounts()
+	c.mtx.Unlock()
 	return nil
 }
 
@@ -83,7 +137,7 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	currentAddress := c.currentServerAddress
 	c.mtx.Unlock()
 
-	leaderAddress, err := util.CheckAndRedirectToLeader(
+	leaderAddress, serverAddresses, err := util.CheckAndRedirectToLeader(
 		ctx,
 		c,
 		currentAddress,
@@ -92,6 +146,11 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	)
 	if err != nil {
 		return false, err
+	}
+	if len(serverAddresses) > 0 {
+		c.mtx.Lock()
+		c.knownServerAddresses = serverAddresses
+		c.mtx.Unlock()
 	}
 
 	if leaderAddress == "" {

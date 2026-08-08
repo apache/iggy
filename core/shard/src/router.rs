@@ -140,6 +140,16 @@ where
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
             Err(e) => {
+                // TODO(hubcio): this drop is the whole story for a consensus
+                // frame carrying an Operation this build does not know: no
+                // metric, no peer error, no eviction. An old node in a mixed
+                // cluster silently gap-stops the group here (never journals
+                // the op, never PrepareOks, every later prepare dies on the
+                // gap check) while quorum hides it, and repair wraps the same
+                // typed header so it cannot rescue. Rolling upgrades across
+                // consensus-op additions need a version fence (release_min /
+                // release_max bounds on the replica plane) before this arm is
+                // safe to hit.
                 tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
                 return;
             }
@@ -723,6 +733,24 @@ where
                                 generation,
                                 "purge-partition deferred: could not record the frontier reset; \
                                  the reconciler re-issues it while the generation stays unapplied"
+                            );
+                        }
+                        Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
+                            // NOT fenced: the wipe ran and a fresh chain is
+                            // planted, so the partition is serviceable; only
+                            // the durable generation record failed, which
+                            // leaves `applied_purge_generation` unmoved and
+                            // the reconciler re-issuing the (now cheap) purge.
+                            // Same pacing argument as the frontier deferral
+                            // above; the caches already describe wiped bytes.
+                            self.drop_partition_transfer_state(namespace, partition);
+                            tracing::warn!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition deferred: reset applied but the generation \
+                                 record failed; the reconciler re-issues it"
                             );
                         }
                         Err(error @ partitions::PurgeError::Unserviceable(_)) => {

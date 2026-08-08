@@ -23,6 +23,7 @@ import (
 
 	"github.com/apache/iggy/foreign/go/contracts"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/s2"
 )
 
 func TestSerialize_TcpFetchMessagesRequest(t *testing.T) {
@@ -131,6 +132,82 @@ func TestSerialize_SendMessagesRequest(t *testing.T) {
 	// Check if the serialized bytes match the expected bytes
 	if !bytes.Equal(serialized, expected) {
 		t.Errorf("Serialized bytes are incorrect. \nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+func TestSerialize_SendMessagesCompressesThePayloadCoherently(t *testing.T) {
+	// A compressible payload above the 32-byte floor.
+	payload := bytes.Repeat([]byte("abcdefgh"), 32)
+	message, err := iggcon.NewIggyMessage(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(1))
+	request := SendMessages{
+		StreamId:     streamId,
+		TopicId:      topicId,
+		Partitioning: iggcon.PartitionId(0),
+		Messages:     []iggcon.IggyMessage{message},
+		Compression:  iggcon.MESSAGE_COMPRESSION_S2,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	compressed := request.Messages[0]
+	if got := int(compressed.Header.PayloadLength); got != len(compressed.Payload) {
+		t.Fatalf("header claims %d payload bytes, the slice holds %d: the wire would mis-frame",
+			got, len(compressed.Payload))
+	}
+	if len(compressed.Payload) >= len(payload) {
+		t.Fatalf("the payload did not compress: %d >= %d", len(compressed.Payload), len(payload))
+	}
+
+	// The message section must be framed by the compressed length: header,
+	// then exactly PayloadLength payload bytes, and nothing after.
+	messageStart := len(serialized) - int(compressed.Header.PayloadLength) - iggcon.MessageHeaderSize
+	header, err := iggcon.MessageHeaderFromBytes(
+		serialized[messageStart : messageStart+iggcon.MessageHeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.PayloadLength != compressed.Header.PayloadLength {
+		t.Fatalf("wire header claims %d, in-memory header %d",
+			header.PayloadLength, compressed.Header.PayloadLength)
+	}
+
+	decoded, err := s2.Decode(nil, serialized[messageStart+iggcon.MessageHeaderSize:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatal("the compressed payload does not round-trip")
+	}
+}
+
+func TestSerialize_SendMessagesSkipsCompressionBelowTheFloor(t *testing.T) {
+	message, err := iggcon.NewIggyMessage([]byte("short"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(1))
+	request := SendMessages{
+		StreamId:     streamId,
+		TopicId:      topicId,
+		Partitioning: iggcon.PartitionId(0),
+		Messages:     []iggcon.IggyMessage{message},
+		Compression:  iggcon.MESSAGE_COMPRESSION_S2,
+	}
+
+	if _, err := request.MarshalBinary(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(request.Messages[0].Payload, []byte("short")) {
+		t.Fatal("a payload under 32 bytes must pass through uncompressed")
 	}
 }
 

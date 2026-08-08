@@ -103,7 +103,7 @@ func (s basicMessagingSteps) whenSendMessages(
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicID)
 	partitioning := iggcon.PartitionId(partitionID)
-	if err = c.client.SendMessages(ctx, streamIdentifier, topicIdentifier, partitioning, messages); err != nil {
+	if _, err = c.client.SendMessages(ctx, streamIdentifier, topicIdentifier, partitioning, messages); err != nil {
 		return fmt.Errorf("failed to sending messages: %w", err)
 	}
 
