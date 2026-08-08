@@ -24,8 +24,7 @@ use config::{HttpConfig, configure_cors};
 use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use secrecy::ExposeSecret;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::net::lookup_host;
-use tokio::spawn;
+use tokio::{net::lookup_host, spawn};
 use tracing::{error, info, warn};
 
 mod auth;
@@ -43,12 +42,7 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
         return;
     }
 
-    if is_unauthenticated_beyond_loopback(config).await {
-        warn!(
-            "{NAME} HTTP API is enabled on {} with no api_key configured. Anyone able to reach that address can read or rewrite every connector configuration, credentials included, and restart connectors from it. Set http.api_key, and http.tls unless the key and the responses may cross in cleartext, or bind the API to loopback.",
-            config.address
-        );
-    }
+    warn_on_weak_containment(config).await;
 
     let mut system_router = Router::new().route("/stats", get(get_stats));
 
@@ -130,14 +124,41 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     });
 }
 
-/// Whether the API would answer beyond loopback with no key required.
+/// Warns once for each way this API is less contained than its defaults look.
 ///
-/// The configuration endpoints return plugin configuration verbatim and also
-/// accept writes, so an unauthenticated listener on a routable address hands
-/// out every credential an operator put in their config and lets a caller
-/// repoint a connector. Loopback with no key is the shipped default and a
-/// defensible posture for an admin API; moving only the address is the
-/// combination no other layer catches.
+/// Separate warnings rather than one, because the three compose independently
+/// and an operator who closes one has not necessarily closed the others. All
+/// three are the paths the runtime README documents.
+async fn warn_on_weak_containment(config: &HttpConfig) {
+    let unauthenticated = config.api_key.expose_secret().is_empty();
+    let beyond_loopback = resolves_beyond_loopback(&config.address).await;
+
+    if unauthenticated && beyond_loopback {
+        warn!(
+            "{NAME} HTTP API is enabled on {} with no api_key configured. Anyone able to reach that address can read or rewrite every connector configuration, credentials included, and restart connectors from it. Set http.api_key, or bind the API to loopback.",
+            config.address
+        );
+    }
+
+    // Loopback does not contain this one. A browser is a local process, and the
+    // CORS layer wraps outside authentication, so the shipped
+    // `allowed_origins = ["*"]` lets any page the operator visits read these
+    // endpoints cross-origin.
+    if unauthenticated && config.cors.enabled {
+        warn!(
+            "{NAME} HTTP API has http.cors enabled with no api_key configured. Any page the operator visits can read the configuration endpoints, credentials included, cross-origin. Set http.api_key, or disable http.cors."
+        );
+    }
+
+    if beyond_loopback && !config.tls.enabled {
+        warn!(
+            "{NAME} HTTP API is enabled on {} with http.tls disabled. The api-key header and the configuration responses carrying connector credentials both cross the network in cleartext. Enable http.tls, or bind the API to loopback.",
+            config.address
+        );
+    }
+}
+
+/// Whether `address` resolves to anything outside loopback.
 ///
 /// Resolves rather than parses because `address` is a free-form `String` that
 /// takes a hostname, as `[iggy] address` does in the same file. Not because the
@@ -150,12 +171,10 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
 /// Classification only. Do not bind what this resolves: `TcpListener::bind`
 /// walks every resolved address and takes the first that works, so collapsing
 /// to one would drop the `localhost` -> `[::1, 127.0.0.1]` fallback on hosts
-/// with IPv6 disabled.
-async fn is_unauthenticated_beyond_loopback(config: &HttpConfig) -> bool {
-    if !config.api_key.expose_secret().is_empty() {
-        return false;
-    }
-    let Ok(resolved) = lookup_host(&config.address).await else {
+/// with IPv6 disabled. The cost is resolving twice at startup, which is the
+/// trade for keeping that fallback.
+async fn resolves_beyond_loopback(address: &str) -> bool {
+    let Ok(resolved) = lookup_host(address).await else {
         return true;
     };
     let addresses: Vec<SocketAddr> = resolved.collect();
@@ -193,15 +212,10 @@ mod tests {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 
-    /// Reserved for documentation by RFC 5737, so no host routes it and the
-    /// bind fails. That is what lets the test reach the warning without
-    /// listening anywhere: a non-loopback address that binds successfully would
-    /// put a port on every interface for the life of the test binary.
+    /// Reserved for documentation by RFC 5737, so the bind fails and the test
+    /// reaches the warning without listening anywhere. A routable address that
+    /// binds would put a port on every interface for the life of the binary.
     const UNASSIGNABLE_ROUTABLE_ADDRESS: &str = "192.0.2.1:8081";
-
-    /// Port 0 rather than a port reserved by binding and dropping first. The
-    /// tests never need to know which port it lands on, and reserving one is a
-    /// race that buys nothing.
     const EPHEMERAL_LOOPBACK_ADDRESS: &str = "127.0.0.1:0";
 
     type Captured = Arc<Mutex<Vec<(Level, String)>>>;
@@ -214,24 +228,19 @@ mod tests {
         }
     }
 
-    /// Captures events for the current thread only, for as long as the returned
-    /// guard lives.
-    ///
-    /// Deliberately not a global subscriber: that slot is process-wide, so
-    /// claiming it would break any later test that installs its own, and a
-    /// shared buffer would leave every negative assertion hostage to warnings
-    /// from elsewhere in the binary.
+    /// Captures events for the current thread only, for as long as the guard
+    /// lives. Not a global subscriber: that slot is process-wide, and a shared
+    /// buffer would leave negative assertions hostage to the rest of the binary.
     ///
     /// `#[tokio::test]` builds a current-thread runtime, so a task spawned by
-    /// the test body runs on this thread and sees this subscriber. Under a
-    /// multi-thread flavour the capture would come back empty and these
-    /// assertions would fail rather than quietly pass.
+    /// the test body sees this subscriber. Under a multi-thread flavour the
+    /// capture would come back empty and these tests would fail, not pass.
+    ///
+    /// Filtered rather than checking the level in `on_event`: a layer with no
+    /// filter reports no `max_level_hint`, which pushes the global max level to
+    /// TRACE and stops every callsite in the binary short-circuiting.
     fn capture_events() -> (DefaultGuard, Captured) {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
-        // Filtered rather than checking the level inside `on_event`: a layer
-        // with no filter reports no `max_level_hint`, which pushes the global
-        // max level to TRACE and stops every callsite in the binary from
-        // short-circuiting.
         let layer = CaptureEvents {
             captured: Arc::clone(&captured),
         }
@@ -240,16 +249,18 @@ mod tests {
         (guard, captured)
     }
 
-    fn warned_about(captured: &Captured, address: &str) -> bool {
+    fn warnings(captured: &Captured) -> Vec<String> {
         captured
             .lock()
             .expect("the capture mutex is only held to push a line")
             .iter()
-            .any(|(level, message)| *level == Level::WARN && message.contains(address))
+            .filter(|(level, _)| *level == Level::WARN)
+            .map(|(_, message)| message.clone())
+            .collect()
     }
 
     /// Whether `init` got as far as serving. The positive control for tests
-    /// whose real assertion is that nothing was warned about.
+    /// whose real assertion is that something was not warned about.
     fn started_serving(captured: &Captured) -> bool {
         captured
             .lock()
@@ -273,13 +284,8 @@ mod tests {
         }
     }
 
-    /// Every field the event carried, rendered into one line.
-    ///
-    /// Unconditional on purpose. These tests only ask whether an event
-    /// mentioned a given string, so singling out the `message` field would add
-    /// a branch to the scaffolding whose other side nothing here would ever
-    /// take. `record_str` needs no impl either: it forwards here by default,
-    /// and a formatted message arrives as `fmt::Arguments` regardless.
+    /// Unconditional on purpose: singling out the `message` field would add a
+    /// branch whose other side nothing here takes.
     struct Recorded(String);
 
     impl Visit for Recorded {
@@ -288,14 +294,11 @@ mod tests {
         }
     }
 
-    /// The cheapest context `init` will accept. Nothing here reaches Iggy: the
-    /// clients are never connected, and the warning is decided from the config
-    /// alone.
+    /// The cheapest context `init` will accept. Nothing here reaches Iggy.
     ///
-    /// `api_key` is a parameter rather than always empty because the guard
-    /// reads `config.api_key` while the middleware enforces `context.api_key`.
-    /// They come from one binding in `main.rs` today, but a test that set only
-    /// one of them would be exercising a state the runtime cannot reach.
+    /// `api_key` is a parameter because the guard reads `config.api_key` while
+    /// the middleware enforces `context.api_key`; a test that set only one
+    /// would exercise a state the runtime cannot reach.
     async fn context(api_key: &str) -> (Arc<RuntimeContext>, TempDir) {
         let directory = tempfile::tempdir().expect("a temp dir must be available");
         let config_provider =
@@ -322,36 +325,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_loopback_address_and_no_key_when_checked_should_stay_quiet() {
-        // The shipped posture. Warning here would train operators to ignore it.
-        assert!(!is_unauthenticated_beyond_loopback(&config("127.0.0.1:8081", "")).await);
-        assert!(!is_unauthenticated_beyond_loopback(&config("[::1]:8081", "")).await);
+    async fn given_loopback_addresses_when_classified_should_report_contained() {
+        assert!(!resolves_beyond_loopback("127.0.0.1:8081").await);
+        assert!(!resolves_beyond_loopback("[::1]:8081").await);
         assert!(
-            !is_unauthenticated_beyond_loopback(&config("localhost:8081", "")).await,
+            !resolves_beyond_loopback("localhost:8081").await,
             "`address` accepts a hostname, and parsing alone would misjudge one"
         );
     }
 
     #[tokio::test]
-    async fn given_routable_address_and_no_key_when_checked_should_report_it() {
+    async fn given_routable_or_unresolvable_addresses_when_classified_should_report_exposed() {
         assert!(
-            is_unauthenticated_beyond_loopback(&config("0.0.0.0:8081", "")).await,
+            resolves_beyond_loopback("0.0.0.0:8081").await,
             "binding every interface to reach the API from outside a container \
              is the case this exists to catch"
         );
-        assert!(is_unauthenticated_beyond_loopback(&config("192.0.2.10:8081", "")).await);
-    }
-
-    #[tokio::test]
-    async fn given_configured_key_when_checked_should_stay_quiet_on_any_address() {
-        assert!(!is_unauthenticated_beyond_loopback(&config("0.0.0.0:8081", "secret")).await);
-    }
-
-    #[tokio::test]
-    async fn given_unresolvable_address_when_checked_should_report_it() {
-        // About to fail the bind regardless, so the warning costs nothing and
-        // the alternative is silence about an address we cannot classify.
-        assert!(is_unauthenticated_beyond_loopback(&config("not a valid address", "")).await);
+        assert!(resolves_beyond_loopback("192.0.2.10:8081").await);
+        // About to fail the bind regardless, so staying quiet about an address
+        // we cannot classify is the wrong direction to be wrong in.
+        assert!(resolves_beyond_loopback("not a valid address").await);
     }
 
     #[tokio::test]
@@ -374,7 +367,13 @@ mod tests {
              it instead, and this test has then started a listener that outlives the run"
         );
         assert!(
-            warned_about(&captured, UNASSIGNABLE_ROUTABLE_ADDRESS),
+            !started_serving(&captured),
+            "the bind must not have completed, or this proves nothing about ordering"
+        );
+        assert!(
+            warnings(&captured)
+                .iter()
+                .any(|warning| warning.contains(UNASSIGNABLE_ROUTABLE_ADDRESS)),
             "init must consult the guard and name the address it is exposing"
         );
     }
@@ -386,18 +385,80 @@ mod tests {
 
         init(&config(EPHEMERAL_LOOPBACK_ADDRESS, ""), context).await;
 
-        // Positive control first. Without it the assertion below passes for any
-        // reason `init` might return early, including `enabled` defaulting to
-        // false, and the only in-`init` loopback coverage would disappear
-        // silently.
+        // Positive control first: without it the assertion below passes for any
+        // reason `init` returns early, including `enabled` ever defaulting to
+        // false, and the only in-`init` loopback coverage disappears silently.
         assert!(
             started_serving(&captured),
             "init must reach the listener, or the assertion below proves nothing"
         );
+        // Any warning at all, not one matching this address: matching on the
+        // address goes vacuous the moment the message is reworded.
         assert!(
-            !warned_about(&captured, EPHEMERAL_LOOPBACK_ADDRESS),
-            "the shipped posture is loopback with no key; warning about it \
-             would teach operators to ignore the one that matters"
+            warnings(&captured).is_empty(),
+            "the shipped posture is loopback with no key; warning about it would \
+             teach operators to ignore the ones that matter: {:?}",
+            warnings(&captured)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_cors_enabled_and_no_key_when_initialized_should_warn_despite_loopback() {
+        let (_capture, captured) = capture_events();
+        let (context, _directory) = context("").await;
+        let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
+        config.cors.enabled = true;
+
+        init(&config, context).await;
+
+        assert!(started_serving(&captured));
+        assert!(
+            warnings(&captured)
+                .iter()
+                .any(|warning| warning.contains("http.cors")),
+            "loopback does not contain CORS: a browser is a local process and the \
+             layer wraps outside authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_key_but_no_tls_beyond_loopback_when_initialized_should_still_warn() {
+        let (_capture, captured) = capture_events();
+        let (context, _directory) = context("configured").await;
+        let config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "configured");
+
+        let _ = tokio::spawn(async move { init(&config, context).await }).await;
+
+        let warnings = warnings(&captured);
+        assert!(
+            warnings.iter().any(|warning| warning.contains("http.tls")),
+            "setting a key does not stop the key and the credential-bearing \
+             responses crossing the network in cleartext"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("no api_key")),
+            "and the key that was set must not still be reported as missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_disabled_api_when_initialized_should_warn_about_nothing() {
+        let (_capture, captured) = capture_events();
+        let (context, _directory) = context("").await;
+        // Routable, keyless and untrusting in every direction, but switched off.
+        let mut config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "");
+        config.enabled = false;
+        config.cors.enabled = true;
+
+        init(&config, context).await;
+
+        assert!(
+            warnings(&captured).is_empty(),
+            "an API that is not listening exposes nothing, and warning about one \
+             is the false positive that teaches operators to ignore the rest: {:?}",
+            warnings(&captured)
         );
     }
 }
