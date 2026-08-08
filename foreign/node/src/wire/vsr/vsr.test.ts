@@ -37,16 +37,20 @@ describe('VSR custom request framing', () => {
     assert.deepEqual(frame.subarray(256), payload);
   });
 
-  it('does not consume a request ID when local routing fails', () => {
+  // The id is drawn only once every local check has passed, so a rejected
+  // encode leaves the counter where it was and the next request still gets
+  // id 1. Rejecting AFTER drawing would burn an id the server never sees,
+  // and the metadata plane dedups on a contiguous per-session sequence.
+  it('does not consume a request ID when a local check rejects', () => {
     const session = new VsrSession(7n);
-    session.bind(42n);
     assert.throws(
       () => session.encode(
-        COMMAND_CODE.SendMessages,
+        COMMAND_CODE.CreateStream,
         Buffer.alloc(0)
       )
     );
 
+    session.bind(42n);
     const frame = session.encode(
       COMMAND_CODE.CreateStream,
       Buffer.alloc(0)
