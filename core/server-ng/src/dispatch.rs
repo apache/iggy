@@ -59,8 +59,9 @@ use consensus::{
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_USER_CODE,
-    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
+    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -1544,6 +1545,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
+    // Stats is the one default read with an async input: the cross-shard
+    // connected-client gather. Run it here so the shared builder stays sync.
+    let clients_count = if code == GET_STATS_CODE {
+        u32::try_from(shard.list_all_clients().await.len()).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
     match build_non_replicated_response(
         shard,
         code,
@@ -1551,6 +1559,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         user_id,
         roster,
         client_ip,
+        clients_count,
     ) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
@@ -1943,14 +1952,19 @@ async fn handle_poll_messages<B, MJ, S, SB>(
             }
         }
         Err(error) => {
-            // A partition id that does not exist in a resolvable topic is a
+            // A stream, topic, or partition id that does not resolve is a
             // client addressing error and must surface as a typed rejection,
             // not an empty poll a consumer would read as end-of-partition.
-            if matches!(error, IggyError::PartitionNotFound(..)) {
+            if matches!(
+                error,
+                IggyError::PartitionNotFound(..)
+                    | IggyError::StreamIdNotFound(_)
+                    | IggyError::TopicIdNotFound(..)
+            ) {
                 warn!(
                     transport_client_id,
                     error = %error,
-                    "poll_messages rejected: partition not found"
+                    "poll_messages rejected: target not found"
                 );
                 send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
                     .await;
