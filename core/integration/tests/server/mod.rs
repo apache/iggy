@@ -26,6 +26,17 @@ mod flush_vsr;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 #[cfg(feature = "vsr")]
 mod legacy_login_vsr;
+// Poll addressing + timestamp semantics: typed PartitionNotFound on a bad
+// partition id, at-or-after timestamp polls.
+#[cfg(feature = "vsr")]
+mod poll_semantics_vsr;
+// Create-topic static bounds deny typed before consensus.
+#[cfg(feature = "vsr")]
+mod topic_admission_vsr;
+// Purge durability: applied generation survives restart; journal-resident
+// purged batches stay fenced behind the purge floor.
+#[cfg(feature = "vsr")]
+mod purge_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server-ng suites below.
 #[cfg(feature = "vsr")]

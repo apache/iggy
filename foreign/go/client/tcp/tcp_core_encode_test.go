@@ -19,192 +19,110 @@ package tcp
 
 import (
 	"bytes"
-	"context"
-	"encoding/binary"
 	"errors"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
+	"github.com/apache/iggy/foreign/go/internal/vsr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// fakeMarshalOnlyCmd implements command.Command without AppendBinary; it forces
-// encodeWireRequest down the MarshalBinary fallback branch.
-type fakeMarshalOnlyCmd struct {
+// marshalOnlyCmd implements command.Command without AppendBinary; it forces
+// appendCommandFrame down the MarshalBinary fallback branch.
+type marshalOnlyCmd struct {
 	body    []byte
 	code    command.Code
 	wantErr error
 }
 
-func (f *fakeMarshalOnlyCmd) Code() command.Code { return f.code }
-func (f *fakeMarshalOnlyCmd) MarshalBinary() ([]byte, error) {
+func (f *marshalOnlyCmd) Code() command.Code { return f.code }
+func (f *marshalOnlyCmd) MarshalBinary() ([]byte, error) {
 	if f.wantErr != nil {
 		return nil, f.wantErr
 	}
-	out := make([]byte, len(f.body))
-	copy(out, f.body)
-	return out, nil
+	return bytes.Clone(f.body), nil
 }
 
-func newTestPollCmd() *command.PollMessages {
-	consumerId, _ := iggcon.NewIdentifier(uint32(42))
-	streamId, _ := iggcon.NewIdentifier("test_stream_id")
-	topicId, _ := iggcon.NewIdentifier("test_topic_id")
-	pid := uint32(7)
+func testPollCmd(t *testing.T) *command.PollMessages {
+	t.Helper()
+	partitionId := uint32(7)
 	return &command.PollMessages{
-		Consumer:    iggcon.NewSingleConsumer(consumerId),
-		StreamId:    streamId,
-		TopicId:     topicId,
-		PartitionId: &pid,
+		Consumer:    iggcon.NewSingleConsumer(numericIdentifier(t, 42)),
+		StreamId:    numericIdentifier(t, 1),
+		TopicId:     numericIdentifier(t, 2),
+		PartitionId: &partitionId,
 		Strategy:    iggcon.FirstPollingStrategy(),
 		Count:       100,
 		AutoCommit:  true,
 	}
 }
 
-func TestEncodeWireRequest_AppenderPathMatchesFallback(t *testing.T) {
-	cmd := newTestPollCmd()
-
+func TestAppendCommandFrame_AppenderPathMatchesTheFallback(t *testing.T) {
+	cmd := testPollCmd(t)
 	body, err := cmd.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Force the same logical request down the MarshalBinary fallback;
-	// the AppendBinary fast path must produce identical wire bytes.
-	fallback := &fakeMarshalOnlyCmd{body: body, code: cmd.Code()}
-	want, err := encodeWireRequest(make([]byte, 0, 256), fallback)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	fallback := &marshalOnlyCmd{body: body, code: cmd.Code()}
 
-	got, err := encodeWireRequest(make([]byte, 0, 256), cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
+	want, err := appendCommandFrame(nil, fallback)
+	require.NoError(t, err)
+	got, err := appendCommandFrame(nil, cmd)
+	require.NoError(t, err)
 
-	if !bytes.Equal(got, want) {
-		t.Fatalf("fast path diverges from MarshalBinary fallback\nwant: %v\n got: %v", want, got)
-	}
+	assert.Equal(t, want[vsr.HeaderSize:], got[vsr.HeaderSize:],
+		"the fast path diverges from the MarshalBinary fallback")
+	assert.Len(t, got, vsr.HeaderSize+len(body),
+		"the frame is the reserved prologue followed by the payload")
 }
 
-func TestEncodeWireRequest_FallbackPathMatchesWireSpec(t *testing.T) {
-	cmd := &fakeMarshalOnlyCmd{
-		body: []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03},
-		code: command.Code(42),
-	}
-	// Wire spec: [length-le32][code-le32][body].
-	want := []byte{
-		0x0B, 0x00, 0x00, 0x00, // length = 11 (7-byte body + 4-byte code)
-		0x2A, 0x00, 0x00, 0x00, // code = 42
-		0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, // body
-	}
-
-	got, err := encodeWireRequest(make([]byte, 0, 256), cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("fallback bytes diverge from wire spec\nwant: %v\n got: %v", want, got)
-	}
-}
-
-func TestEncodeWireRequest_FallbackPropagatesMarshalError(t *testing.T) {
+func TestAppendCommandFrame_FallbackPropagatesTheMarshalError(t *testing.T) {
 	sentinel := errors.New("marshal failed")
-	cmd := &fakeMarshalOnlyCmd{code: command.Code(1), wantErr: sentinel}
-	if _, err := encodeWireRequest(nil, cmd); !errors.Is(err, sentinel) {
-		t.Fatalf("got err=%v, want %v", err, sentinel)
-	}
+	cmd := &marshalOnlyCmd{code: command.Code(1), wantErr: sentinel}
+
+	frame, err := appendCommandFrame(make([]byte, 0, 4), cmd)
+	assert.ErrorIs(t, err, sentinel)
+	assert.NotNil(t, frame, "the grown buffer survives the error so the pool keeps it")
 }
 
-func TestEncodeWireRequest_GrowsUndersizedBuffer(t *testing.T) {
-	cmd := newTestPollCmd()
-	// Reference: full wire bytes when starting from a generous buffer.
-	want, err := encodeWireRequest(make([]byte, 0, 256), cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Start with a cap=4 buffer — far smaller than the encoded request needs.
-	got, err := encodeWireRequest(make([]byte, 0, 4), cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("undersized buf produced different bytes\nwant: %v\n got: %v", want, got)
-	}
-	// Fallback branch should also grow.
-	fb := &fakeMarshalOnlyCmd{body: bytes.Repeat([]byte{0xAB}, 64), code: command.Code(9)}
-	got2, err := encodeWireRequest(make([]byte, 0, 4), fb)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got2) != 8+len(fb.body) {
-		t.Errorf("fallback grown len=%d, want %d", len(got2), 8+len(fb.body))
-	}
+func TestAppendCommandFrame_GrowsAnUndersizedBuffer(t *testing.T) {
+	cmd := testPollCmd(t)
+	want, err := appendCommandFrame(make([]byte, 0, 4096), cmd)
+	require.NoError(t, err)
+
+	got, err := appendCommandFrame(make([]byte, 0, 4), cmd)
+	require.NoError(t, err)
+	assert.Equal(t, want[vsr.HeaderSize:], got[vsr.HeaderSize:])
 }
 
 func TestRequestBufPool_AcquireReleaseRoundTrip(t *testing.T) {
 	bp := acquireRequestBuf()
-	if bp == nil || *bp == nil {
-		t.Fatalf("acquireRequestBuf returned nil")
-	}
-	// Use the buffer.
+	require.NotNil(t, bp)
+	require.NotNil(t, *bp)
+	assert.GreaterOrEqual(t, cap(*bp), vsr.HeaderSize,
+		"a fresh buffer already holds the header prologue")
+
 	*bp = append(*bp, []byte("hello")...)
 	releaseRequestBuf(bp)
 
-	// Next acquire may or may not return the same slice (sync.Pool semantics),
-	// but the returned slice should be usable and zero-length.
-	bp2 := acquireRequestBuf()
-	if bp2 == nil || len(*bp2) != 0 {
-		t.Fatalf("acquireRequestBuf returned bp=%p len=%d, want non-nil len=0", bp2, len(*bp2))
-	}
-	releaseRequestBuf(bp2)
+	next := acquireRequestBuf()
+	require.NotNil(t, next)
+	assert.Empty(t, *next, "a pooled buffer comes back empty")
+	releaseRequestBuf(next)
 }
 
-func TestRequestBufPool_OversizedBufferDropped(t *testing.T) {
-	// A buffer grown past the maxPooled threshold should NOT be put back.
-	huge := make([]byte, 0, 128*1024)
+func TestRequestBufPool_KeepsABatchSizedBuffer(t *testing.T) {
+	batch := make([]byte, 0, 1<<20)
+	releaseRequestBuf(&batch)
+	// sync.Pool gives no delivery guarantee; what must hold is that the
+	// release accepted the megabyte buffer instead of dropping it on the
+	// floor, which the truncation observes.
+	assert.Empty(t, batch)
+}
+
+func TestRequestBufPool_DropsAPathologicalBuffer(t *testing.T) {
+	huge := make([]byte, 0, 8<<20)
+	huge = append(huge, 1)
 	releaseRequestBuf(&huge)
-	// Next acquire should give us a fresh small buffer, not the huge one.
-	bp := acquireRequestBuf()
-	if cap(*bp) > 64*1024 {
-		t.Errorf("oversized buffer leaked into pool: cap=%d", cap(*bp))
-	}
-	releaseRequestBuf(bp)
-}
-
-func TestDo_PollMessagesEndToEnd(t *testing.T) {
-	c, serverConn := newTestClient(t)
-	cmd := newTestPollCmd()
-
-	captured := make(chan []byte, 1)
-	go func() {
-		captured <- serverRespondCapture(t, serverConn, 0, nil)
-	}()
-
-	out, err := c.do(context.Background(), cmd)
-	if err != nil {
-		t.Fatalf("do returned err: %v", err)
-	}
-	if len(out) != 0 {
-		t.Errorf("expected empty response body, got %d bytes", len(out))
-	}
-
-	got := <-captured
-	if got == nil {
-		t.Fatalf("server side failed to receive request")
-	}
-
-	// The body the server saw must equal cmd.MarshalBinary().
-	want, err := cmd.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// First 4 bytes of `got` are the command code; the rest is the body.
-	gotCode := command.Code(binary.LittleEndian.Uint32(got[:4]))
-	if gotCode != cmd.Code() {
-		t.Errorf("server saw code=%d, want %d", gotCode, cmd.Code())
-	}
-	if !bytes.Equal(got[4:], want) {
-		t.Errorf("server saw body diverging from cmd.MarshalBinary()\nwant: %v\n got: %v", want, got[4:])
-	}
+	assert.Len(t, huge, 1, "an over-ceiling buffer is not truncated, it is dropped")
 }

@@ -69,10 +69,10 @@ class TestMessageOperations:
         )
 
     @pytest.mark.asyncio
-    async def test_send_messages_reports_no_confirmations_from_legacy_server(
+    async def test_send_messages_reports_committed_confirmation(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test the send response confirms nothing without server-side offsets."""
+        """Test the send response reports the committed partition and offset."""
         stream_name = unique_name()
         topic_name = unique_name()
         partition_id = 0
@@ -101,12 +101,13 @@ class TestMessageOperations:
 
         assert [message.payload().decode() for message in polled_messages] == payloads
 
-        # This suite runs against the legacy server, which sends no confirmation
-        # payload at all. A genuine confirmation for this send would read as all
-        # zeros (partition 0, first batch at offset 0), so an entry here proves
-        # nothing and could only have been invented. Against a server that does
-        # report offsets, compare base_offset with polled_messages[0].offset().
-        assert response.confirmations == []
+        # The server confirms committed sends with the partition and the base
+        # offset of the batch; the whole send targeted one partition, so a
+        # single confirmation covers it.
+        assert len(response.confirmations) == 1
+        confirmation = response.confirmations[0]
+        assert confirmation.partition_id == partition_id
+        assert confirmation.base_offset == polled_messages[0].offset()
 
     @pytest.mark.asyncio
     async def test_send_and_poll_messages_as_bytes(

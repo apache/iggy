@@ -448,6 +448,26 @@ func (e UsersLimitReached) Is(target error) bool {
 	return ok
 }
 
+type TransientNotCommitted struct{}
+
+func (e TransientNotCommitted) Error() string { return "request transiently not committed; retry" }
+func (e TransientNotCommitted) Code() Code    { return 57 }
+func (e TransientNotCommitted) Is(target error) bool {
+	_, ok := target.(TransientNotCommitted)
+	return ok
+}
+
+type TransientNotAccepted struct{}
+
+func (e TransientNotAccepted) Error() string {
+	return "request transiently not accepted; retry, on any replica"
+}
+func (e TransientNotAccepted) Code() Code { return 58 }
+func (e TransientNotAccepted) Is(target error) bool {
+	_, ok := target.(TransientNotAccepted)
+	return ok
+}
+
 type NotConnected struct{}
 
 func (e NotConnected) Error() string { return "not connected" }
@@ -2009,6 +2029,20 @@ func (e CannotDeleteConsumerGroupInfo) Is(target error) bool {
 	return ok
 }
 
+type ConsumerGroupPartitionNotOwned struct {
+	ClientId    uint32
+	PartitionId uint32
+}
+
+func (e ConsumerGroupPartitionNotOwned) Error() string {
+	return fmt.Sprintf("consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress).", e.ClientId, e.PartitionId)
+}
+func (e ConsumerGroupPartitionNotOwned) Code() Code { return 5009 }
+func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
+	_, ok := target.(ConsumerGroupPartitionNotOwned)
+	return ok
+}
+
 type MissingBaseOffsetRetainedMessageBatch struct{}
 
 func (e MissingBaseOffsetRetainedMessageBatch) Error() string { return "base offset is missing" }
@@ -2236,6 +2270,21 @@ func (e CannotReadIndexTimestamp) Is(target error) bool {
 	return ok
 }
 
+type IncompatibleProtocolVersion struct {
+	ClientVersion    uint32
+	ServerVersionMin uint32
+	ServerVersionMax uint32
+}
+
+func (e IncompatibleProtocolVersion) Error() string {
+	return fmt.Sprintf("incompatible binary protocol version: client %d, server accepts [%d, %d]", e.ClientVersion, e.ServerVersionMin, e.ServerVersionMax)
+}
+func (e IncompatibleProtocolVersion) Code() Code { return 14003 }
+func (e IncompatibleProtocolVersion) Is(target error) bool {
+	_, ok := target.(IncompatibleProtocolVersion)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2277,6 +2326,8 @@ var (
 	ErrInvalidPersonalAccessToken                 = InvalidPersonalAccessToken{}
 	ErrPersonalAccessTokenExpired                 = PersonalAccessTokenExpired{}
 	ErrUsersLimitReached                          = UsersLimitReached{}
+	ErrTransientNotCommitted                      = TransientNotCommitted{}
+	ErrTransientNotAccepted                       = TransientNotAccepted{}
 	ErrNotConnected                               = NotConnected{}
 	ErrClientShutdown                             = ClientShutdown{}
 	ErrInvalidTlsDomain                           = InvalidTlsDomain{}
@@ -2415,6 +2466,7 @@ var (
 	ErrConsumerGroupMemberNotFound                = ConsumerGroupMemberNotFound{}
 	ErrCannotCreateConsumerGroupInfo              = CannotCreateConsumerGroupInfo{}
 	ErrCannotDeleteConsumerGroupInfo              = CannotDeleteConsumerGroupInfo{}
+	ErrConsumerGroupPartitionNotOwned             = ConsumerGroupPartitionNotOwned{}
 	ErrMissingBaseOffsetRetainedMessageBatch      = MissingBaseOffsetRetainedMessageBatch{}
 	ErrMissingLastOffsetDeltaRetainedMessageBatch = MissingLastOffsetDeltaRetainedMessageBatch{}
 	ErrMissingMaxTimestampRetainedMessageBatch    = MissingMaxTimestampRetainedMessageBatch{}
@@ -2440,6 +2492,7 @@ var (
 	ErrCannotReadIndexOffset                      = CannotReadIndexOffset{}
 	ErrCannotReadIndexPosition                    = CannotReadIndexPosition{}
 	ErrCannotReadIndexTimestamp                   = CannotReadIndexTimestamp{}
+	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 )
 
 type Code uint32
@@ -2485,6 +2538,8 @@ const (
 	InvalidPersonalAccessTokenCode                 Code = 53
 	PersonalAccessTokenExpiredCode                 Code = 54
 	UsersLimitReachedCode                          Code = 55
+	TransientNotCommittedCode                      Code = 57
+	TransientNotAcceptedCode                       Code = 58
 	NotConnectedCode                               Code = 61
 	ClientShutdownCode                             Code = 63
 	InvalidTlsDomainCode                           Code = 64
@@ -2623,6 +2678,7 @@ const (
 	ConsumerGroupMemberNotFoundCode                Code = 5006
 	CannotCreateConsumerGroupInfoCode              Code = 5007
 	CannotDeleteConsumerGroupInfoCode              Code = 5008
+	ConsumerGroupPartitionNotOwnedCode             Code = 5009
 	MissingBaseOffsetRetainedMessageBatchCode      Code = 6000
 	MissingLastOffsetDeltaRetainedMessageBatchCode Code = 6001
 	MissingMaxTimestampRetainedMessageBatchCode    Code = 6002
@@ -2648,6 +2704,7 @@ const (
 	CannotReadIndexOffsetCode                      Code = 10010
 	CannotReadIndexPositionCode                    Code = 10011
 	CannotReadIndexTimestampCode                   Code = 10012
+	IncompatibleProtocolVersionCode                Code = 14003
 )
 
 func (c Code) String() string {
@@ -2732,6 +2789,10 @@ func (c Code) String() string {
 		return "PersonalAccessTokenExpired"
 	case UsersLimitReachedCode:
 		return "UsersLimitReached"
+	case TransientNotCommittedCode:
+		return "TransientNotCommitted"
+	case TransientNotAcceptedCode:
+		return "TransientNotAccepted"
 	case NotConnectedCode:
 		return "NotConnected"
 	case ClientShutdownCode:
@@ -3008,6 +3069,8 @@ func (c Code) String() string {
 		return "CannotCreateConsumerGroupInfo"
 	case CannotDeleteConsumerGroupInfoCode:
 		return "CannotDeleteConsumerGroupInfo"
+	case ConsumerGroupPartitionNotOwnedCode:
+		return "ConsumerGroupPartitionNotOwned"
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return "MissingBaseOffsetRetainedMessageBatch"
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:
@@ -3058,6 +3121,8 @@ func (c Code) String() string {
 		return "CannotReadIndexPosition"
 	case CannotReadIndexTimestampCode:
 		return "CannotReadIndexTimestamp"
+	case IncompatibleProtocolVersionCode:
+		return "IncompatibleProtocolVersion"
 	default:
 		return "Unknown error code"
 	}
@@ -3145,6 +3210,10 @@ func FromCode(code Code) IggyError {
 		return ErrPersonalAccessTokenExpired
 	case UsersLimitReachedCode:
 		return ErrUsersLimitReached
+	case TransientNotCommittedCode:
+		return ErrTransientNotCommitted
+	case TransientNotAcceptedCode:
+		return ErrTransientNotAccepted
 	case NotConnectedCode:
 		return ErrNotConnected
 	case ClientShutdownCode:
@@ -3421,6 +3490,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotCreateConsumerGroupInfo
 	case CannotDeleteConsumerGroupInfoCode:
 		return ErrCannotDeleteConsumerGroupInfo
+	case ConsumerGroupPartitionNotOwnedCode:
+		return ErrConsumerGroupPartitionNotOwned
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return ErrMissingBaseOffsetRetainedMessageBatch
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:
@@ -3471,6 +3542,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotReadIndexPosition
 	case CannotReadIndexTimestampCode:
 		return ErrCannotReadIndexTimestamp
+	case IncompatibleProtocolVersionCode:
+		return ErrIncompatibleProtocolVersion
 	default:
 		return ErrError
 	}

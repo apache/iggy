@@ -103,6 +103,19 @@ func (l *LeaveConsumerGroup) MarshalBinary() ([]byte, error) {
 	return iggcon.MarshalIdentifiers(l.StreamId, l.TopicId, l.GroupId)
 }
 
+type SyncConsumerGroup struct {
+	TopicPath
+	GroupId iggcon.Identifier
+}
+
+func (s *SyncConsumerGroup) Code() Code {
+	return SyncGroupCode
+}
+
+func (s *SyncConsumerGroup) MarshalBinary() ([]byte, error) {
+	return iggcon.MarshalIdentifiers(s.StreamId, s.TopicId, s.GroupId)
+}
+
 type DeleteConsumerGroup struct {
 	TopicPath
 	GroupId iggcon.Identifier
