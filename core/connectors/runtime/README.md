@@ -161,17 +161,38 @@ key_file = "core/certs/iggy_key.pem"
 ```
 
 > [!IMPORTANT]
-> **Treat this API as privileged.** The configuration endpoints return plugin
-> configuration exactly as it was parsed from TOML, credentials included - a
-> database connection string, an S3 secret key, a webhook signing secret. There
-> is no redaction layer. `api_key` is empty by default, which means
-> authentication is **off** by default; the loopback default `address` is what
-> confines that to local processes.
+> **Treat this API as privileged. It reads and it writes.**
 >
-> If you change `address` to reach the API from outside a container, set
-> `api_key` in the same edit. The runtime logs a warning at startup when the
-> address resolves beyond loopback with no key configured, but nothing prevents
-> it.
+> The configuration endpoints return plugin configuration exactly as stored,
+> credentials included - a database connection string, an S3 secret key, a
+> webhook signing secret. There is no redaction layer anywhere in the runtime.
+>
+> The exposure is not limited to disclosure. `POST /{sinks,sources}/{key}/configs`
+> followed by `PUT .../configs/active` and `POST .../restart` is enough to
+> repoint a connector at a destination of the caller's choosing: `restart`
+> re-reads the stored configuration and starts the connector from it, so the
+> runtime then forwards your topic data using its own Iggy credentials. The
+> stored plugin `path` is `dlopen`ed on the next start as well. `DELETE
+> .../configs` is on the same footing.
+>
+> `api_key` is empty by default, which means authentication is **off** by
+> default. Only `/` and `/health` are exempt once it is set, so everything above
+> sits behind that one empty string, and the loopback default `address` is what
+> confines it to local processes.
+>
+> Three ways that containment goes away:
+>
+> - **Moving `address` off loopback.** Set `api_key` in the same edit. The
+>   runtime warns at startup when the address resolves beyond loopback with no
+>   key configured, but nothing prevents it.
+> - **Enabling `[http.cors]`.** It ships `allowed_origins = ["*"]`, which becomes
+>   `AllowOrigin::any()`, and the CORS layer wraps *outside* authentication. A
+>   browser is a local process, so with CORS enabled and no key, any page the
+>   operator visits can read the configuration endpoints cross-origin. Setting
+>   `api_key` closes it, since an attacker's page cannot supply the header.
+> - **Leaving `http.tls.enabled = false`.** It ships disabled, so the `api-key`
+>   header and the responses carrying your credentials both travel in cleartext.
+>   Enable TLS alongside `api_key` whenever this API leaves loopback.
 
 Currently, it does expose the following endpoints:
 
@@ -183,19 +204,23 @@ Currently, it does expose the following endpoints:
 - `GET /sinks/{key}`: sink details.
 - `GET /sinks/{key}/configs`: list of configuration versions for the sink.
 - `POST /sinks/{key}/configs`: add a new configuration version for the sink.
+- `DELETE /sinks/{key}/configs`: delete configuration versions for the sink.
 - `GET /sinks/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sinks/{key}/configs/active`: active configuration details.
 - `PUT /sinks/{key}/configs/active`: activate a specific configuration version for the sink.
 - `GET /sinks/{key}/configs/plugin`: sink plugin config, including the optional `format` query parameter to specify the config format.
+- `POST /sinks/{key}/restart`: stop the sink and start it again from its stored active configuration.
 - `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
 - `GET /sources`: list of sources.
 - `GET /sources/{key}`: source details.
 - `GET /sources/{key}/configs`: list of configuration versions for the source.
 - `POST /sources/{key}/configs`: add a new configuration version for the source.
+- `DELETE /sources/{key}/configs`: delete configuration versions for the source.
 - `GET /sources/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sources/{key}/configs/active`: active configuration details.
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
 - `GET /sources/{key}/configs/plugin`: source plugin config, including the optional `format` query parameter to specify the config format.
+- `POST /sources/{key}/restart`: stop the source and start it again from its stored active configuration.
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
 
 ## Telemetry
