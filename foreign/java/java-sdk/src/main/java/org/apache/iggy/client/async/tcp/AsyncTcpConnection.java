@@ -75,13 +75,15 @@ import java.util.function.Function;
 public class AsyncTcpConnection {
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
+    // A missing reply must not hold the single VSR-pinned channel forever.
+    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     // Transient VSR denials (not-committed / not-accepted) are replayed with
     // the same encoded frame so the server's dedup sees the same request id.
     // A not-committed outcome is unknown, so it replays for the whole budget.
     // A not-accepted deny was refused outright (typically a demoted primary),
-    // so it fails fast to free the pinned channel and let the caller re-login
-    // toward the new leader; mirrors TRANSIENT_FAILOVER_CHECK_INTERVAL in
-    // core/sdk/src/tcp/tcp_client.rs.
+    // so after a short same-node retry it is handed to the owning client for
+    // a leader recheck and safe replay; mirrors TRANSIENT_FAILOVER_CHECK_INTERVAL
+    // in core/sdk/src/tcp/tcp_client.rs.
     private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int TRANSIENT_NOT_ACCEPTED = 58;
     private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
@@ -93,8 +95,10 @@ public class AsyncTcpConnection {
     private final AtomicBoolean isClosed = new AtomicBoolean(false);
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
+    private final TransientFailoverHandler transientFailoverHandler;
     private final Runnable sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
+    private final long requestTimeoutNanos;
     private ByteBuf loginPayload;
 
     private volatile int loginCommandCode;
@@ -107,7 +111,17 @@ public class AsyncTcpConnection {
             Optional<File> tlsCertificate,
             TcpConnectionPoolConfig poolConfig,
             Optional<Duration> connectionTimeout) {
-        this(host, port, enableTls, tlsCertificate, poolConfig, connectionTimeout, () -> {}, ignored -> {});
+        this(
+                host,
+                port,
+                enableTls,
+                tlsCertificate,
+                poolConfig,
+                connectionTimeout,
+                Optional.empty(),
+                null,
+                () -> {},
+                ignored -> {});
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -118,10 +132,14 @@ public class AsyncTcpConnection {
             Optional<File> tlsCertificate,
             TcpConnectionPoolConfig poolConfig,
             Optional<Duration> connectionTimeout,
+            Optional<Duration> requestTimeout,
+            TransientFailoverHandler transientFailoverHandler,
             Runnable sessionResetListener,
             Consumer<Throwable> connectionFailureListener) {
+        this.transientFailoverHandler = transientFailoverHandler;
         this.sessionResetListener = sessionResetListener;
         this.connectionFailureListener = connectionFailureListener;
+        this.requestTimeoutNanos = toTimeoutNanos(requestTimeout.orElse(DEFAULT_REQUEST_TIMEOUT));
         SslContext sslContext = null;
         if (enableTls) {
             try {
@@ -234,21 +252,35 @@ public class AsyncTcpConnection {
     }
 
     public CompletableFuture<ByteBuf> send(int commandCode, ByteBuf payload) {
+        return send(commandCode, payload, 0);
+    }
+
+    CompletableFuture<ByteBuf> send(int commandCode, ByteBuf payload, long requestDeadlineNanos) {
         if (isLoginCode(commandCode) && authenticated) {
             return logoutThenLogin(commandCode, payload);
         }
         captureLoginPayloadIfNeeded(commandCode, payload);
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
         CompletableFuture<ByteBuf> callerFuture = new CompletableFuture<>();
+        ByteBuf failoverPayload =
+                transientFailoverHandler != null && !isLoginCode(commandCode) ? payload.retainedDuplicate() : null;
 
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
             if (!f.isSuccess()) {
                 payload.release();
+                releaseIfPresent(failoverPayload);
                 notifyConnectionFailure(f.cause());
                 callerFuture.completeExceptionally(mapAcquireException(f.cause()));
                 return;
             }
-            dispatchOnChannel(f.getNow(), commandCode, payload, responseFuture, callerFuture);
+            dispatchOnChannel(
+                    f.getNow(),
+                    commandCode,
+                    payload,
+                    failoverPayload,
+                    responseFuture,
+                    callerFuture,
+                    requestDeadlineNanos);
         });
 
         return callerFuture;
@@ -258,23 +290,25 @@ public class AsyncTcpConnection {
             Channel channel,
             int commandCode,
             ByteBuf payload,
+            ByteBuf failoverPayload,
             CompletableFuture<ByteBuf> responseFuture,
-            CompletableFuture<ByteBuf> callerFuture) {
+            CompletableFuture<ByteBuf> callerFuture,
+            long inheritedRequestDeadlineNanos) {
         boolean isLoginCommand = isLoginCode(commandCode);
         boolean requiresAuth = !isLoginCommand && requiresAuthentication(commandCode);
+        long requestDeadlineNanos = inheritedRequestDeadlineNanos == 0
+                ? System.nanoTime() + requestTimeoutNanos
+                : inheritedRequestDeadlineNanos;
 
-        responseFuture.whenComplete((response, error) -> {
-            try {
-                handlePostResponse(channel, commandCode, isLoginCommand, error);
-            } catch (RuntimeException bookkeepingError) {
-                log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
-            }
-            if (error != null) {
-                callerFuture.completeExceptionally(error);
-            } else {
-                callerFuture.complete(response);
-            }
-        });
+        responseFuture.whenComplete((response, error) -> completeRequest(
+                channel,
+                commandCode,
+                isLoginCommand,
+                failoverPayload,
+                requestDeadlineNanos,
+                callerFuture,
+                response,
+                error));
 
         CompletableFuture<Void> authStep;
         if (!requiresAuth) {
@@ -292,7 +326,11 @@ public class AsyncTcpConnection {
                 return;
             }
             authStep = IggyAuthenticator.ensureAuthenticated(
-                    channel, loginPayloadCopy, loginCommandCode, authGeneration, vsrEncoder);
+                    channel,
+                    loginPayloadCopy,
+                    authGeneration,
+                    payloadToLogin ->
+                            sendAuthenticationFrame(channel, payloadToLogin, loginCommandCode, requestDeadlineNanos));
         }
 
         authStep.whenComplete((ignored, authError) -> {
@@ -301,14 +339,94 @@ public class AsyncTcpConnection {
                 responseFuture.completeExceptionally(authError);
                 return;
             }
-            sendFrame(channel, payload, commandCode, responseFuture);
+            sendFrame(channel, payload, commandCode, responseFuture, requestDeadlineNanos);
         });
     }
 
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private void completeRequest(
+            Channel channel,
+            int commandCode,
+            boolean isLoginCommand,
+            ByteBuf failoverPayload,
+            long requestDeadlineNanos,
+            CompletableFuture<ByteBuf> callerFuture,
+            ByteBuf response,
+            Throwable error) {
+        try {
+            handlePostResponse(channel, commandCode, isLoginCommand, error);
+        } catch (RuntimeException bookkeepingError) {
+            log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
+        }
+        if (error == null) {
+            releaseIfPresent(failoverPayload);
+            completeWithResponse(callerFuture, response);
+            return;
+        }
+        completeFailedRequest(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, error);
+    }
+
+    private void completeFailedRequest(
+            int commandCode,
+            ByteBuf failoverPayload,
+            long requestDeadlineNanos,
+            CompletableFuture<ByteBuf> callerFuture,
+            Throwable error) {
+        IggyTimeoutException timeout = findResponseTimeout(error);
+        if (timeout != null) {
+            notifyConnectionFailure(timeout);
+        }
+        IggyServerException serverError = findServerError(error);
+        if (shouldRecheckLeader(serverError, failoverPayload, requestDeadlineNanos)) {
+            retryAfterLeaderRecheck(commandCode, failoverPayload, requestDeadlineNanos, serverError, callerFuture);
+            return;
+        }
+        releaseIfPresent(failoverPayload);
+        callerFuture.completeExceptionally(error);
+    }
+
+    private static boolean shouldRecheckLeader(
+            IggyServerException serverError, ByteBuf failoverPayload, long requestDeadlineNanos) {
+        return serverError != null
+                && serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED
+                && failoverPayload != null
+                && requestDeadlineNanos - System.nanoTime() > 0;
+    }
+
+    private void retryAfterLeaderRecheck(
+            int commandCode,
+            ByteBuf payload,
+            long requestDeadlineNanos,
+            IggyServerException rejection,
+            CompletableFuture<ByteBuf> callerFuture) {
+        CompletableFuture<ByteBuf> retry;
+        try {
+            retry = transientFailoverHandler.retry(this, commandCode, payload, requestDeadlineNanos, rejection);
+        } catch (RuntimeException retryError) {
+            payload.release();
+            callerFuture.completeExceptionally(retryError);
+            return;
+        }
+        retry.whenComplete((response, error) -> {
+            if (error != null) {
+                callerFuture.completeExceptionally(error);
+            } else {
+                completeWithResponse(callerFuture, response);
+            }
+        });
+    }
+
+    private CompletableFuture<ByteBuf> sendAuthenticationFrame(
+            Channel channel, ByteBuf payload, int commandCode, long requestDeadlineNanos) {
+        CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
+        sendFrame(channel, payload, commandCode, loginFuture, requestDeadlineNanos);
+        return loginFuture;
+    }
+
     /**
-     * A failed pool acquire on an established connection means the target
-     * node could not be (re)dialed; the listener lets the owning client run
-     * its redial strategy while the failed request surfaces to its caller.
+     * Pool acquire failures and expired replies both make the current target
+     * unusable. The listener lets the owning client run its redial strategy
+     * while the failed request surfaces to its caller.
      */
     private void notifyConnectionFailure(Throwable cause) {
         try {
@@ -367,7 +485,11 @@ public class AsyncTcpConnection {
     }
 
     private void sendFrame(
-            Channel channel, ByteBuf payload, int commandCode, CompletableFuture<ByteBuf> responseFuture) {
+            Channel channel,
+            ByteBuf payload,
+            int commandCode,
+            CompletableFuture<ByteBuf> responseFuture,
+            long requestDeadlineNanos) {
         try {
             VsrResponseHandler handler = channel.pipeline().get(VsrResponseHandler.class);
             if (handler == null) {
@@ -379,7 +501,15 @@ public class AsyncTcpConnection {
             long deadlineNanos = nowNanos + TRANSIENT_RETRY_BUDGET.toNanos();
             long notAcceptedDeadlineNanos =
                     isLoginCode(commandCode) ? deadlineNanos : nowNanos + NOT_ACCEPTED_RETRY_BUDGET.toNanos();
-            writeVsrFrame(channel, handler, frame, responseFuture, deadlineNanos, notAcceptedDeadlineNanos);
+            writeVsrFrame(
+                    channel,
+                    handler,
+                    frame,
+                    responseFuture,
+                    requestDeadlineNanos,
+                    deadlineNanos,
+                    notAcceptedDeadlineNanos,
+                    commandCode);
         } catch (RuntimeException e) {
             responseFuture.completeExceptionally(e);
         } finally {
@@ -398,10 +528,19 @@ public class AsyncTcpConnection {
             VsrResponseHandler handler,
             ByteBuf frame,
             CompletableFuture<ByteBuf> responseFuture,
+            long requestDeadlineNanos,
             long deadlineNanos,
-            long notAcceptedDeadlineNanos) {
+            long notAcceptedDeadlineNanos,
+            int commandCode) {
+        if (requestDeadlineNanos - System.nanoTime() <= 0) {
+            IggyTimeoutException timeout = responseTimeout(commandCode);
+            handler.closeChannel(channel, timeout);
+            frame.release();
+            responseFuture.completeExceptionally(timeout);
+            return;
+        }
         CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
-        handler.enqueueRequest(attempt);
+        handler.enqueueRequest(channel, attempt, requestDeadlineNanos, commandCode);
         channel.writeAndFlush(frame.retainedDuplicate()).addListener((ChannelFutureListener) future -> {
             if (!future.isSuccess()) {
                 log.error("Failed to send frame: {}", future.cause().getMessage());
@@ -422,8 +561,10 @@ public class AsyncTcpConnection {
                                             handler,
                                             frame,
                                             responseFuture,
+                                            requestDeadlineNanos,
                                             deadlineNanos,
-                                            notAcceptedDeadlineNanos),
+                                            notAcceptedDeadlineNanos,
+                                            commandCode),
                                     TRANSIENT_RETRY_INTERVAL_MS,
                                     TimeUnit.MILLISECONDS);
                     return;
@@ -440,6 +581,52 @@ public class AsyncTcpConnection {
         });
     }
 
+    private static IggyTimeoutException responseTimeout(int commandCode) {
+        return new IggyTimeoutException("Timed out waiting for a response to command code " + commandCode);
+    }
+
+    private static IggyTimeoutException findResponseTimeout(Throwable error) {
+        Throwable cause = error;
+        while (cause != null) {
+            if (cause instanceof IggyTimeoutException timeout) {
+                return timeout;
+            }
+            cause = cause.getCause();
+        }
+        return null;
+    }
+
+    private static IggyServerException findServerError(Throwable error) {
+        Throwable cause = error;
+        while (cause != null) {
+            if (cause instanceof IggyServerException serverError) {
+                return serverError;
+            }
+            cause = cause.getCause();
+        }
+        return null;
+    }
+
+    private static void releaseIfPresent(ByteBuf payload) {
+        if (payload != null) {
+            payload.release();
+        }
+    }
+
+    private static void completeWithResponse(CompletableFuture<ByteBuf> future, ByteBuf response) {
+        if (!future.complete(response)) {
+            response.release();
+        }
+    }
+
+    private static long toTimeoutNanos(Duration timeout) {
+        try {
+            return timeout.toNanos();
+        } catch (ArithmeticException ignored) {
+            return Long.MAX_VALUE;
+        }
+    }
+
     private static boolean shouldRetryTransient(Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos) {
         if (!(error instanceof IggyServerException serverError)) {
             return false;
@@ -454,21 +641,24 @@ public class AsyncTcpConnection {
     }
 
     private void handlePostResponse(Channel channel, int commandCode, boolean isLoginOp, Throwable ex) {
-        if (isLoginOp) {
-            if (ex == null) {
-                authenticated = true;
-                long generation = authGeneration.incrementAndGet();
-                IggyAuthenticator.setAuthGeneration(channel, generation);
-            } else {
-                releaseLoginPayload();
+        try {
+            if (isLoginOp) {
+                if (ex == null) {
+                    authenticated = true;
+                    long generation = authGeneration.incrementAndGet();
+                    IggyAuthenticator.setAuthGeneration(channel, generation);
+                } else {
+                    releaseLoginPayload();
+                }
             }
+            if (commandCode == CommandCode.User.LOGOUT.getValue()) {
+                authenticated = false;
+                authGeneration.incrementAndGet();
+                IggyAuthenticator.clearAuthGeneration(channel);
+            }
+        } finally {
+            channelPool.release(channel);
         }
-        if (commandCode == CommandCode.User.LOGOUT.getValue()) {
-            authenticated = false;
-            authGeneration.incrementAndGet();
-            IggyAuthenticator.clearAuthGeneration(channel);
-        }
-        channelPool.release(channel);
     }
 
     /**
@@ -502,6 +692,13 @@ public class AsyncTcpConnection {
             return loginPayload.retainedDuplicate();
         }
         return null;
+    }
+
+    synchronized Optional<AuthenticationSnapshot> authenticationSnapshot() {
+        if (!authenticated || loginPayload == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new AuthenticationSnapshot(loginCommandCode, loginPayload.retainedDuplicate()));
     }
 
     private synchronized void releaseLoginPayload() {
@@ -561,6 +758,18 @@ public class AsyncTcpConnection {
             pipeline.addLast("frameDecoder", new VsrFrameDecoder());
             pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));
         }
+    }
+
+    record AuthenticationSnapshot(int commandCode, ByteBuf payload) {}
+
+    @FunctionalInterface
+    interface TransientFailoverHandler {
+        CompletableFuture<ByteBuf> retry(
+                AsyncTcpConnection source,
+                int commandCode,
+                ByteBuf payload,
+                long requestDeadlineNanos,
+                IggyServerException rejection);
     }
 
     public static class TcpConnectionPoolConfig {

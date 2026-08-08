@@ -354,7 +354,7 @@ run_php_examples() {
 run_java_examples() {
     # Java examples run against the VSR server.
     # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-    resolve_server_binary "${TARGET}" iggy-server-ng
+    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
     SERVER_READY_PATTERN="client listeners started"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 

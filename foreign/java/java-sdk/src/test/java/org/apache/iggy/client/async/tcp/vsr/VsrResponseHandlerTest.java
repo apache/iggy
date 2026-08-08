@@ -24,6 +24,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -70,6 +71,18 @@ class VsrResponseHandlerTest {
         } finally {
             response.release();
         }
+    }
+
+    @Test
+    void shouldReleaseResponseBodyWhenRequestWasCancelled() {
+        CompletableFuture<ByteBuf> future = enqueue();
+        future.cancel(false);
+        ByteBuf frame =
+                replyFrame(VsrOperation.NON_REPLICATED, Unpooled.buffer().writeIntLE(1234));
+
+        channel.writeInbound(frame);
+
+        assertThat(frame.refCnt()).isZero();
     }
 
     @Test
@@ -167,6 +180,17 @@ class VsrResponseHandlerTest {
 
         assertThat(pending).isCompletedExceptionally();
         assertThatThrownBy(pending::join).hasCause(failure);
+    }
+
+    @Test
+    void shouldCloseChannelWhenResponseDeadlineExpires() {
+        CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
+        handler.enqueueRequest(channel, pending, System.nanoTime(), 1);
+
+        channel.runScheduledPendingTasks();
+
+        assertThat(channel.isActive()).isFalse();
+        assertThatThrownBy(pending::join).hasCauseInstanceOf(IggyTimeoutException.class);
     }
 
     private CompletableFuture<ByteBuf> enqueue() {

@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp.vsr;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
@@ -155,6 +156,7 @@ class VsrRequestEncoderTest {
             IggyServerException error = catchThrowableOfType(
                     IggyServerException.class, () -> encoder.encode(alloc, SEND_MESSAGES_CODE, payload));
             assertThat(error.getRawErrorCode()).isEqualTo(5);
+            assertThat(error.getErrorCode()).isEqualTo(IggyErrorCode.FEATURE_UNAVAILABLE);
         } finally {
             payload.release();
         }

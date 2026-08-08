@@ -77,6 +77,8 @@ import java.util.Optional;
  */
 public final class BytesDeserializer {
 
+    private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
+    private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
     private static final int MIN_CLUSTER_NODE_BYTES = 18;
 
     private BytesDeserializer() {}
@@ -185,7 +187,12 @@ public final class BytesDeserializer {
         // equality, so reading the u64 as a signed long is safe.
         var generation = response.readLongLE();
         var partitionsCount = response.readUnsignedIntLE();
-        List<Long> partitions = new ArrayList<>(toInt(partitionsCount));
+        int capacity = validatedCollectionSize(
+                partitionsCount,
+                response.readableBytes(),
+                CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES,
+                "Consumer group partitions count");
+        List<Long> partitions = new ArrayList<>(capacity);
         for (long i = 0; i < partitionsCount; i++) {
             partitions.add(response.readUnsignedIntLE());
         }
@@ -204,7 +211,9 @@ public final class BytesDeserializer {
             return SendMessagesResponse.empty();
         }
         var confirmationsCount = response.readUnsignedIntLE();
-        var confirmations = new ArrayList<SendConfirmation>(toInt(confirmationsCount));
+        int capacity = validatedCollectionSize(
+                confirmationsCount, response.readableBytes(), SEND_CONFIRMATION_BYTES, "Send confirmations count");
+        var confirmations = new ArrayList<SendConfirmation>(capacity);
         for (long i = 0; i < confirmationsCount; i++) {
             var streamId = response.readUnsignedIntLE();
             var topicId = response.readUnsignedIntLE();
@@ -528,6 +537,14 @@ public final class BytesDeserializer {
                     + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
         }
         return buffer.readCharSequence(toInt(length), StandardCharsets.UTF_8).toString();
+    }
+
+    private static int validatedCollectionSize(long count, int readableBytes, int entryBytes, String field) {
+        if (count > readableBytes / entryBytes) {
+            throw new IggyMalformedResponseException(
+                    field + " " + count + " exceeds remaining payload of " + readableBytes + " bytes");
+        }
+        return Math.toIntExact(count);
     }
 
     static BigInteger readU64AsBigInteger(ByteBuf buffer) {

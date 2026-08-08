@@ -116,7 +116,7 @@ Shows how to use the stream builder API to create and configure streams with cus
 
 ### Async Producer
 
-High-throughput async production with pipelining:
+Non-blocking batch production with concurrent request submission:
 
 ```bash
 ./gradlew runAsyncProducer
@@ -125,7 +125,7 @@ High-throughput async production with pipelining:
 Shows:
 
 - CompletableFuture chaining patterns
-- Pipelining multiple sends without blocking
+- Submitting multiple sends without blocking
 - Performance comparison with blocking client
 
 ### Async Consumer
@@ -191,7 +191,7 @@ The Iggy Java SDK provides two client types: **blocking (synchronous)** and **as
 
 - Need high throughput
 - Application is already async/reactive (Spring WebFlux, Vert.x)
-- Want to pipeline multiple requests over a single connection
+- Want to compose non-blocking requests with `CompletableFuture`
 - Building services that handle many concurrent streams
 
 ## Key Async Patterns
@@ -209,15 +209,19 @@ client.connect()
     });
 ```
 
-### Pipelining for Throughput
+### Submitting Multiple Sends
 
 ```java
-List<CompletableFuture<Void>> sends = new ArrayList<>();
+List<CompletableFuture<SendMessagesResponse>> sends = new ArrayList<>();
 for (int i = 0; i < 10; i++) {
     sends.add(client.messages().sendMessages(...));
 }
 CompletableFuture.allOf(sends.toArray(new CompletableFuture[0])).join();
 ```
+
+The client accepts these calls without blocking, but its single VSR-pinned TCP
+connection processes them in order. Batch more messages into each send to improve
+throughput.
 
 ### Thread Pool Offloading
 

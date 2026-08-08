@@ -212,6 +212,7 @@ public final class AsyncIggyTcpClientBuilder {
         validatePort();
         validateConnectionTimeout();
         validateAcquireTimeout();
+        validateRequestTimeout();
 
         return new AsyncIggyTcpClient(
                 host,
@@ -254,6 +255,12 @@ public final class AsyncIggyTcpClientBuilder {
     private void validateAcquireTimeout() {
         if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
             throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
+        }
+    }
+
+    private void validateRequestTimeout() {
+        if (requestTimeout != null && (requestTimeout.equals(Duration.ZERO) || requestTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("RequestTimeout Cannot be 0 or Negative");
         }
     }
 

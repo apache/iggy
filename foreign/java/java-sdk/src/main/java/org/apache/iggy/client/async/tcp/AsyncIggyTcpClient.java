@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ConnectTimeoutException;
 import org.apache.iggy.IggyVersion;
@@ -38,6 +39,7 @@ import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
@@ -432,18 +434,109 @@ public class AsyncIggyTcpClient {
                 tlsCertificate,
                 poolConfig,
                 connectionTimeout,
+                requestTimeout,
+                this::retryTransientOnLeader,
                 routingState::clearAssignments,
                 this::onConnectionFailure);
     }
 
     /**
-     * Entry point of the background redial: a pool acquire failed because the
-     * current node could not be dialed. Requests that were in flight stay
-     * failed (their outcome is unknown); the redial only restores the client
-     * for subsequent calls. Alternates the current endpoint with the seed,
-     * paced by the configured retry policy, and replays the builder
-     * credentials on the restored connection. Personal-access-token logins
-     * cannot be replayed here; those clients must log in again themselves.
+     * A not-accepted request was never admitted, so it is safe to recheck the
+     * leader, restore authentication on a new connection, and retry it within
+     * the original request deadline.
+     */
+    private CompletableFuture<ByteBuf> retryTransientOnLeader(
+            AsyncTcpConnection source,
+            int commandCode,
+            ByteBuf payload,
+            long requestDeadlineNanos,
+            IggyServerException rejection) {
+        AtomicReference<ByteBuf> requestPayload = new AtomicReference<>(payload);
+        Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication = source.authenticationSnapshot();
+        AtomicReference<ByteBuf> authenticationPayload = new AtomicReference<>(authentication
+                .map(AsyncTcpConnection.AuthenticationSnapshot::payload)
+                .orElse(null));
+
+        CompletableFuture<Void> ready = prepareTransientFailover(
+                source, authentication, authenticationPayload, requestDeadlineNanos, rejection);
+        CompletableFuture<ByteBuf> retried = ready.thenCompose(ignored -> {
+            if (requestDeadlineNanos - System.nanoTime() <= 0) {
+                return CompletableFuture.failedFuture(rejection);
+            }
+            AsyncTcpConnection currentConnection = connection.get();
+            if (currentConnection == null) {
+                return CompletableFuture.failedFuture(new IggyNotConnectedException());
+            }
+            return currentConnection.send(commandCode, takePayload(requestPayload), requestDeadlineNanos);
+        });
+        return retried.whenComplete((response, error) -> {
+            releasePayload(requestPayload);
+            releasePayload(authenticationPayload);
+        });
+    }
+
+    private CompletableFuture<Void> prepareTransientFailover(
+            AsyncTcpConnection source,
+            Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication,
+            AtomicReference<ByteBuf> authenticationPayload,
+            long requestDeadlineNanos,
+            IggyServerException rejection) {
+        CompletableFuture<Void> gate = new CompletableFuture<>();
+        CompletableFuture<Void> previous = loginChain.getAndSet(gate);
+        LeaderRedirectionState redirectionState = new LeaderRedirectionState();
+        CompletableFuture<Void> transaction = previous.thenCompose(ignored -> {
+            if (closed) {
+                return CompletableFuture.failedFuture(new IggyNotConnectedException());
+            }
+            if (requestDeadlineNanos - System.nanoTime() <= 0) {
+                return CompletableFuture.failedFuture(rejection);
+            }
+            if (connection.get() != source) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return redirectToLeader(redirectionState).thenCompose(redirected -> {
+                AsyncTcpConnection currentConnection = connection.get();
+                if (currentConnection == null || currentConnection == source || authentication.isEmpty()) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                if (requestDeadlineNanos - System.nanoTime() <= 0) {
+                    return CompletableFuture.failedFuture(rejection);
+                }
+                return currentConnection
+                        .send(
+                                authentication.orElseThrow().commandCode(),
+                                takePayload(authenticationPayload),
+                                requestDeadlineNanos)
+                        .thenAccept(ByteBuf::release);
+            });
+        });
+        transaction.whenComplete((ignored, error) -> gate.complete(null));
+        return transaction;
+    }
+
+    private static ByteBuf takePayload(AtomicReference<ByteBuf> payload) {
+        ByteBuf owned = payload.getAndSet(null);
+        if (owned == null) {
+            throw new IllegalStateException("Request payload ownership was already transferred");
+        }
+        return owned;
+    }
+
+    private static void releasePayload(AtomicReference<ByteBuf> payload) {
+        ByteBuf owned = payload.getAndSet(null);
+        if (owned != null) {
+            owned.release();
+        }
+    }
+
+    /**
+     * Entry point of the background redial after a pool acquire failure or an
+     * expired reply. Requests that were in flight stay failed (their outcome
+     * is unknown); the redial only restores the client for subsequent calls.
+     * Alternates the current endpoint with the seed, paced by the configured
+     * retry policy, and replays the builder credentials on the restored
+     * connection. Personal-access-token logins cannot be replayed here; those
+     * clients must log in again themselves.
      */
     private void onConnectionFailure(Throwable cause) {
         if (closed || !isConnectionLoss(cause)) {
@@ -458,7 +551,9 @@ public class AsyncIggyTcpClient {
     }
 
     private static boolean isConnectionLoss(Throwable cause) {
-        return cause instanceof ConnectTimeoutException || cause instanceof IOException;
+        return cause instanceof ConnectTimeoutException
+                || cause instanceof IOException
+                || cause instanceof IggyTimeoutException;
     }
 
     private CompletableFuture<Void> redialAttempt(int attempt, RetryPolicy policy) {

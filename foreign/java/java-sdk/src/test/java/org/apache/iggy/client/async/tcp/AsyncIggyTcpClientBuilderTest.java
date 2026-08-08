@@ -194,6 +194,20 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void shouldThrowExceptionForZeroRequestTimeout() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().requestTimeout(Duration.ZERO);
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForNegativeRequestTimeout() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().requestTimeout(Duration.ofMillis(-1));
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
         client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());

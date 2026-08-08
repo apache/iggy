@@ -20,16 +20,19 @@
 package org.apache.iggy.client.async.tcp.vsr;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Correlates in-flight requests with responses in FIFO order, decodes VSR
@@ -50,6 +53,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final Queue<CompletableFuture<ByteBuf>> responseQueue = new ConcurrentLinkedQueue<>();
     private final ConsensusSession session;
     private final Runnable onEviction;
+    private volatile Throwable closeCause;
 
     public VsrResponseHandler(ConsensusSession session, Runnable onEviction) {
         this.session = session;
@@ -60,9 +64,37 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         responseQueue.add(future);
     }
 
+    public void enqueueRequest(
+            Channel channel, CompletableFuture<ByteBuf> future, long deadlineNanos, int commandCode) {
+        responseQueue.add(future);
+        long timeoutNanos = Math.max(0, deadlineNanos - System.nanoTime());
+        var timeoutFuture = channel.eventLoop()
+                .schedule(
+                        () -> {
+                            if (!future.isDone()) {
+                                closeChannel(
+                                        channel,
+                                        new IggyTimeoutException(
+                                                "Timed out waiting for a response to command code " + commandCode));
+                            }
+                        },
+                        timeoutNanos,
+                        TimeUnit.NANOSECONDS);
+        future.whenComplete((response, error) -> timeoutFuture.cancel(false));
+    }
+
+    public void closeChannel(Channel channel, Throwable cause) {
+        closeCause = cause;
+        channel.close();
+    }
+
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        failPendingRequests(new IggyConnectionException("Connection closed before a response arrived"));
+        Throwable cause = closeCause;
+        if (cause == null) {
+            cause = new IggyConnectionException("Connection closed before a response arrived");
+        }
+        failPendingRequests(cause);
         ctx.fireChannelInactive();
     }
 
@@ -88,7 +120,9 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             future.completeExceptionally(error);
             return;
         }
-        future.complete(body);
+        if (!future.complete(body)) {
+            body.release();
+        }
     }
 
     private ByteBuf decodeReply(ByteBuf frame) {

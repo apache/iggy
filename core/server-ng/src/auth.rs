@@ -20,7 +20,7 @@
 //! Verifies password + PAT credentials locally, then runs the consensus
 //! `Register` proposal on the metadata owner; terminal failures are
 //! surfaced as typed `Eviction` frames, transient ones as
-//! `TransientNotCommitted` replay hints.
+//! `TransientNotAccepted` replay hints.
 
 use crate::bootstrap::{ShellBus, ShellShard};
 use crate::dispatch::{send_login_eviction, submit_register_on_owner};
@@ -310,7 +310,7 @@ pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
         .await;
     } else {
         // Transient consensus failure (not-caught-up / not-primary / pipeline
-        // full): send the explicit `TransientNotCommitted` frame instead of
+        // full): send the explicit `TransientNotAccepted` frame instead of
         // staying silent, so the SDK replays the login immediately rather than
         // waiting out its read-timeout. Same contract as a transient metadata
         // request -- nothing committed, so the replayed Register is idempotent.
@@ -318,7 +318,7 @@ pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
     }
 }
 
-/// Result-framed `TransientNotCommitted` Reply on a transient (non-terminal)
+/// Result-framed `TransientNotAccepted` Reply on a transient (non-terminal)
 /// failed Register. The SDK decodes the nonzero result code and replays the
 /// same login on the same connection. Only call for transient errors -- see
 /// [`surface_login_failure`].

@@ -352,6 +352,17 @@ class BytesDeserializerTest {
             assertThat(assignment.generation()).isEqualTo(2L);
             assertThat(assignment.partitions()).isEmpty();
         }
+
+        @Test
+        void shouldRejectPartitionCountLargerThanPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeLongLE(2);
+            buffer.writeIntLE(Integer.MAX_VALUE);
+
+            assertThatThrownBy(() -> readConsumerGroupAssignment(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("partitions count");
+        }
     }
 
     @Nested
@@ -518,6 +529,16 @@ class BytesDeserializerTest {
 
             // then
             assertThat(response.confirmations()).isEmpty();
+        }
+
+        @Test
+        void shouldRejectConfirmationCountLargerThanPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeIntLE(Integer.MAX_VALUE);
+
+            assertThatThrownBy(() -> readSendMessagesResponse(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("confirmations count");
         }
 
         @Test
