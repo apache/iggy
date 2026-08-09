@@ -501,12 +501,16 @@ async fn corrupt_produce_body_e2e_returns_error_without_disconnect() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
+    // acks is readable (=1), so the client expects an error response; the topics array is
+    // truncated, forcing INVALID_REQUEST.
     let bad = build_request_frame(
         API_KEY_PRODUCE,
         3,
         391,
         Some("scope-test"),
-        &[0xFF, 0xFF, 0xFF],
+        &[
+            0xFF, 0xFF, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+        ],
     );
     stream.write_all(&bad).await.expect("corrupt produce");
     let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;

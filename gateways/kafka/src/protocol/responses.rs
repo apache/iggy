@@ -326,8 +326,9 @@ pub fn encode_create_topics_response(version: i16, req: &CreateTopicsRequest) ->
 ///
 /// KIP-464: on v4+, `num_partitions = -1` / `replication_factor = -1` mean broker default.
 /// Error 37 / 38 only for `0` and values `< -1` (and any non-positive value on v2–v3).
-/// When validation passes, the stub returns [`ERROR_NOT_CONTROLLER`] so clients do not
-/// believe the topic was created before the Iggy bridge exists.
+/// When validation passes, the stub returns [`ERROR_NOT_CONTROLLER`] (including for
+/// `validate_only`, which it cannot honestly resolve without a real controller) so clients do
+/// not believe the topic was created before the Iggy bridge exists.
 const fn create_topics_topic_error(version: i16, topic: &CreatableTopic, forced_error: i16) -> i16 {
     if forced_error != ERROR_NONE {
         return forced_error;

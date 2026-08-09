@@ -40,6 +40,8 @@ pub enum KafkaProtocolError {
     InvalidArrayLength(i32),
     #[error("collection length {count} exceeds maximum {max}")]
     CollectionTooLarge { count: usize, max: usize },
+    #[error("request element budget exceeded: {count} more requested, {remaining} remaining")]
+    RequestElementBudgetExceeded { count: usize, remaining: usize },
     #[error("string length {length} exceeds i16::MAX")]
     StringTooLong { length: usize },
     #[error("null topic name in request")]

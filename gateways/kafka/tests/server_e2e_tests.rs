@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNSUPPORTED_VERSION,
+    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NOT_LEADER_OR_FOLLOWER,
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
@@ -95,23 +95,19 @@ async fn e2e_produce_v3_round_trip_with_fixture() {
 }
 
 #[tokio::test]
-async fn e2e_unsupported_api_key_returns_error_then_closes() {
+async fn e2e_unsupported_api_key_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
+    // Unknown api key (8, OffsetCommit) has no response schema this gateway can encode, so the
+    // server closes the connection without a (misparseable) response body.
     let frame1 = build_request_frame(8, 2, 99, Some("e2e-test"), &[]);
     stream.write_all(&frame1).await.unwrap();
-    let payload1 = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-    let (corr, body) = parse_response_payload(8, 2, payload1);
-    assert_eq!(corr, 99);
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 
-    // The unsupported-version error is terminal: the server closes the connection.
     assert_eq!(
         read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
         ByteRead::Closed,
-        "connection must close after the unsupported-version error response"
+        "unknown api key must close the connection without a response"
     );
 }
 
@@ -447,7 +443,7 @@ async fn metadata_empty_body_e2e_all_topics_request_returns_broker() {
 // ── Out-of-scope API keys (SCOPE.md unsupported list) ───────────────────────
 
 #[tokio::test]
-async fn out_of_scope_api_keys_e2e_respond_then_close() {
+async fn out_of_scope_api_keys_e2e_close() {
     let (addr, _shutdown) = spawn_test_server().await;
 
     for &(api_key, name) in &OUT_OF_SCOPE_API_KEYS[..4] {
@@ -455,18 +451,11 @@ async fn out_of_scope_api_keys_e2e_respond_then_close() {
         let frame = build_request_frame(api_key, 0, i32::from(api_key), Some("scope-test"), &[]);
         stream.write_all(&frame).await.expect("write oos key");
 
-        let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-        let mut d = Decoder::new(parse_response_payload(api_key, 0, payload).1);
-        assert_eq!(
-            d.read_i16().unwrap(),
-            ERROR_UNSUPPORTED_VERSION,
-            "{name} (key {api_key})"
-        );
-
+        // No response schema exists for an out-of-scope key: the server closes without a body.
         assert_eq!(
             read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
             ByteRead::Closed,
-            "{name} (key {api_key}) must close the connection after the error response"
+            "{name} (key {api_key}) must close the connection without a response"
         );
     }
 }

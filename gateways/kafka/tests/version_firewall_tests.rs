@@ -47,8 +47,8 @@ use scope::{SCOPED_API_KEYS, default_broker};
 use server::spawn_test_server;
 use tcp::{
     ByteRead, build_list_offsets_v0_request_with_topic_t, build_metadata_legacy_request,
-    build_produce_v3_body, build_request_frame, parse_response_payload, read_byte_with_timeout,
-    round_trip, scan_for_error_code,
+    build_produce_flexible_body, build_produce_v2_body, build_produce_v3_body, build_request_frame,
+    parse_response_payload, read_byte_with_timeout, round_trip, scan_for_error_code,
 };
 use wire::build_metadata_flexible_request_v10;
 use wire::{
@@ -223,8 +223,13 @@ async fn e2e_metadata_above_max_version_closes_tcp_connection() {
 
 #[test]
 fn produce_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
+    let body = handle_request(
+        API_KEY_PRODUCE,
+        2,
+        build_produce_v2_body(1, 0),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
@@ -293,15 +298,12 @@ fn create_topics_unsupported_version_returns_well_formed_error_response() {
 }
 
 #[test]
-fn unsupported_api_keys_return_error_only() {
+fn unsupported_api_keys_close_connection() {
     for key in [8, 9, 10, 11, 17, 20, 42, 999] {
-        let body = handle_request(key, 0, Bytes::new(), &default_broker())
-            .expect_response("test request has acks != 0 and expects a response");
-        let mut d = Decoder::new(body);
-        assert_eq!(
-            d.read_i16().unwrap(),
-            ERROR_UNSUPPORTED_VERSION,
-            "api_key {key}"
+        let outcome = handle_request(key, 0, Bytes::new(), &default_broker());
+        assert!(
+            outcome.is_close(),
+            "unknown api_key {key} must close (no parseable response schema)"
         );
     }
 }
@@ -332,7 +334,14 @@ fn supported_fetch_versions_accept_valid_fixture() {
 
 #[test]
 fn corrupt_produce_body_returns_invalid_request_error() {
-    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    // null transactional_id, acks=1, timeout=0, then a truncated topics array: acks is readable,
+    // so the client expects (and gets) an error response.
+    let body = Bytes::from_static(&[
+        0xFF, 0xFF, // null transactional_id
+        0x00, 0x01, // acks = 1
+        0x00, 0x00, 0x00, 0x00, // timeout_ms = 0
+        0xFF, 0xFF, 0xFF, // truncated topics count
+    ]);
     let resp = handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
@@ -341,6 +350,18 @@ fn corrupt_produce_body_returns_invalid_request_error() {
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn corrupt_produce_body_before_acks_is_silent() {
+    // Decode fails before acks is read: the client's response expectation is unknowable, and an
+    // error response could desync an acks=0 fire-and-forget client, so the server stays silent.
+    let body = Bytes::from_static(&[0xFF, 0xFF]); // null transactional_id, then EOF
+    let outcome = handle_request(API_KEY_PRODUCE, 3, body, &default_broker());
+    assert!(
+        outcome.is_no_response(),
+        "produce decode failure before acks must be silent"
+    );
 }
 
 #[test]
@@ -440,8 +461,12 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
         API_KEY_PRODUCE => {
             if fixture_exists(api_key, name, version) {
                 load_fixture_body(api_key, name, version)
-            } else {
+            } else if version >= 9 {
+                build_produce_flexible_body(1, 0)
+            } else if version >= 3 {
                 build_produce_v3_body(1, 0)
+            } else {
+                build_produce_v2_body(1, 0)
             }
         }
         API_KEY_FETCH => {
@@ -535,16 +560,10 @@ async fn apiversions_v4_out_of_range_e2e_returns_unsupported() {
 // ── Out-of-scope API keys (SCOPE.md unsupported list) ───────────────────────
 
 #[test]
-fn out_of_scope_api_keys_return_unsupported_version_without_panic() {
+fn out_of_scope_api_keys_close_without_panic() {
     for &(api_key, name) in OUT_OF_SCOPE_API_KEYS {
-        let body = handle_request(api_key, 0, Bytes::new(), &default_broker())
-            .expect_response("test request has acks != 0 and expects a response");
-        let mut d = Decoder::new(body);
-        assert_eq!(
-            d.read_i16().unwrap(),
-            ERROR_UNSUPPORTED_VERSION,
-            "{name} (key {api_key})"
-        );
+        let outcome = handle_request(api_key, 0, Bytes::new(), &default_broker());
+        assert!(outcome.is_close(), "{name} (key {api_key}) must close");
     }
 }
 
@@ -557,12 +576,15 @@ async fn each_scoped_api_above_max_version_e2e_keeps_connection() {
 
     for &(api_key, name, _min_ver, max_ver) in SCOPED_API_KEYS {
         let above = max_ver + 1;
+        // Produce is decoded before the firewall check, so it needs a body with a readable acks
+        // (built for the flexible wire version); the other APIs reject on version pre-decode.
+        let body = request_body_for_scoped_api(api_key, name, above);
         let frame = build_request_frame(
             api_key,
             above,
             50_000 + i32::from(api_key),
             Some("scope-test"),
-            &[],
+            &body,
         );
         stream
             .write_all(&frame)
@@ -603,12 +625,15 @@ async fn each_scoped_api_below_min_version_e2e_keeps_connection() {
 
     for &(api_key, name, min_ver, _max_ver) in SCOPED_API_KEYS {
         let below = min_ver - 1;
+        // Produce is decoded before the firewall check (to honor acks=0 silence), so it needs a
+        // body with a readable acks; the other APIs reject on version before touching the body.
+        let body = request_body_for_scoped_api(api_key, name, below);
         let frame = build_request_frame(
             api_key,
             below,
             40_000 + i32::from(api_key),
             Some("scope-test"),
-            &[],
+            &body,
         );
         stream
             .write_all(&frame)
@@ -653,8 +678,13 @@ fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
     assert!(!is_supported_version(API_KEY_PRODUCE, 0));
     assert!(!is_supported_version(API_KEY_PRODUCE, 2));
 
-    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
+    let body = handle_request(
+        API_KEY_PRODUCE,
+        2,
+        build_produce_v2_body(1, 0),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _topics = d.read_i32().unwrap();
     let _name = d.read_nullable_string().unwrap();

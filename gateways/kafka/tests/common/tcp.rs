@@ -119,6 +119,27 @@ pub fn build_produce_v3_body(acks: i16, topics_count: i32) -> Bytes {
     body.freeze()
 }
 
+/// Minimal Produce v0-v2 body (no `transactional_id`): acks, timeout, empty topics array.
+pub fn build_produce_v2_body(acks: i16, topics_count: i32) -> Bytes {
+    let mut body = BytesMut::new();
+    body.put_i16(acks);
+    body.put_i32(1_000); // timeout_ms
+    body.put_i32(topics_count);
+    body.freeze()
+}
+
+/// Minimal flexible Produce body (v9+): null compact `transactional_id`, acks, timeout,
+/// compact topics array, empty tagged fields.
+pub fn build_produce_flexible_body(acks: i16, topics_count: u32) -> Bytes {
+    let mut body = BytesMut::new();
+    body.put_u8(0); // null transactional_id (compact string, varint 0)
+    body.put_i16(acks);
+    body.put_i32(1_000); // timeout_ms
+    body.put_u8(u8::try_from(topics_count + 1).expect("small topic count")); // compact array len
+    body.put_u8(0); // empty tagged fields
+    body.freeze()
+}
+
 /// `ListOffsets` v0 request body for topic "t", partition 0.
 pub fn build_list_offsets_v0_request_with_topic_t() -> Bytes {
     let mut body = BytesMut::new();

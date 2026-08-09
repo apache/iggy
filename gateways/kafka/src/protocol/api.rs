@@ -49,8 +49,6 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
 
-const MAX_SUPPORTED_METADATA_VERSION: i16 = 9;
-
 /// Sentinel for `topic_authorized_operations` / `cluster_authorized_operations` when ACLs are not supported.
 const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
 
@@ -59,30 +57,13 @@ const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
 pub enum HandleOutcome {
     /// Write this response body (with a response header).
     Respond(Bytes),
-    /// Write this response body (with a response header), then close the TCP connection.
-    RespondAndClose(Bytes),
     /// Produce with `acks=0`: write nothing, keep the connection open.
     NoResponse,
-    /// Client cannot parse an error at this request wire version; close the TCP connection.
+    /// No parseable response exists for this request; close the TCP connection.
     Close,
 }
 
 impl HandleOutcome {
-    /// Collapse to `Some(body)` for a normal response, or `None` for [`HandleOutcome::NoResponse`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on [`HandleOutcome::Close`] - match on `Close` explicitly, or use
-    /// [`Self::expect_response`] in tests that require a body.
-    #[must_use]
-    pub fn into_optional_response(self) -> Option<Bytes> {
-        match self {
-            Self::Respond(body) | Self::RespondAndClose(body) => Some(body),
-            Self::NoResponse => None,
-            Self::Close => panic!("HandleOutcome::Close has no response body"),
-        }
-    }
-
     /// Return the response body, or panic with `msg` if the outcome is not [`Self::Respond`].
     ///
     /// # Panics
@@ -91,7 +72,7 @@ impl HandleOutcome {
     #[must_use]
     pub fn expect_response(self, msg: &str) -> Bytes {
         match self {
-            Self::Respond(body) | Self::RespondAndClose(body) => body,
+            Self::Respond(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
         }
@@ -213,7 +194,22 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
             );
             HandleOutcome::NoResponse
         }
-        ProduceDecodeResult::Err { error, .. } => {
+        ProduceDecodeResult::Err { acks: None, error } => {
+            // Decode failed before `acks` was read (malformed transactional_id or a truncated
+            // frame). Whether the client wants a response is unknowable, and an error response
+            // would desync an acks=0 fire-and-forget client's correlation stream. Frames are
+            // length-delimited, so the malformed frame does not affect the next frame's boundary;
+            // stay silent and keep the connection usable rather than risk that desync.
+            tracing::warn!(
+                "Failed to decode Produce request before acks was read (no response): {:?}",
+                error
+            );
+            HandleOutcome::NoResponse
+        }
+        ProduceDecodeResult::Err {
+            acks: Some(_),
+            error,
+        } => {
             tracing::warn!("Failed to decode Produce request: {:?}", error);
             let code = if is_supported_version(API_KEY_PRODUCE, api_version) {
                 ERROR_INVALID_REQUEST
@@ -255,7 +251,7 @@ fn handle_other_request(
                 // survives. Clients that skip ApiVersions get a naked close instead.
                 tracing::warn!(
                     api_version,
-                    max_supported = MAX_SUPPORTED_METADATA_VERSION,
+                    max_supported = supported_max_version(API_KEY_METADATA),
                     "Metadata version unsupported; closing connection"
                 );
                 HandleOutcome::Close
@@ -322,7 +318,9 @@ fn handle_other_request(
                 ))
             }
         }
-        _ => HandleOutcome::RespondAndClose(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
+        // Unknown API key: no api-specific response schema exists, so any body we send is
+        // misparsed by the client against the schema it expected. Close is unambiguous.
+        _ => HandleOutcome::Close,
     }
 }
 
@@ -332,6 +330,15 @@ pub fn is_supported_version(api_key: i16, api_version: i16) -> bool {
         .iter()
         .find(|r| r.api_key == api_key)
         .is_some_and(|r| api_version >= r.min_version && api_version <= r.max_version)
+}
+
+/// Highest version this gateway accepts for `api_key`, from the single firewall table.
+#[must_use]
+pub fn supported_max_version(api_key: i16) -> Option<i16> {
+    SUPPORTED_RANGES
+        .iter()
+        .find(|r| r.api_key == api_key)
+        .map(|r| r.max_version)
 }
 
 /// Min version advertised in `ApiVersions` (may differ from the firewall min).
@@ -440,11 +447,10 @@ fn encode_metadata_response(
     } else {
         e.write_i32(1); // brokers array length
         e.write_i32(1); // node_id
-        // broker.host is config-derived (IGGY_KAFKA_ADVERTISED_HOST), not request-decoded - use
-        // the checked variant so an overly long hostname returns an error instead of panicking.
-        if e.write_nullable_string(Some(&broker.host)).is_err() {
-            return encode_error_only_response(ERROR_INVALID_REQUEST);
-        }
+        // broker.host is bounded to i16::MAX at BrokerAdvertise::from_server_config, so the
+        // unchecked writer cannot exceed the length prefix - same guarantee the flexible path
+        // relies on for its compact string.
+        e.write_nullable_string_unchecked(Some(&broker.host));
         e.write_i32(broker.port);
         if response_version >= 1 {
             e.write_nullable_string_unchecked(None); // rack
@@ -474,13 +480,6 @@ fn encode_metadata_response(
         }
     }
 
-    e.freeze()
-}
-
-#[must_use]
-pub fn encode_error_only_response(error_code: i16) -> Bytes {
-    let mut e = Encoder::with_capacity(2);
-    e.write_i16(error_code);
     e.freeze()
 }
 

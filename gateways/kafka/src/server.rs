@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast};
@@ -28,10 +28,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::api::{
-    BrokerAdvertise, DEFAULT_KAFKA_PORT, ERROR_INVALID_REQUEST, HandleOutcome,
-    encode_error_only_response, handle_request,
-};
+use crate::protocol::api::{BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request};
 use crate::protocol::codec::Decoder;
 use crate::protocol::header::{
     RequestHeader, ResponseHeader, request_header_version, response_header_version,
@@ -294,27 +291,12 @@ async fn handle_connection(
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
         let req_hdr_ver = request_header_version(api_key, api_version);
         let resp_hdr_ver = response_header_version(api_key, api_version);
-        let correlation_id = correlation_id_from_frame(&frame);
 
+        // `request_header_version` only ever returns 1 or 2, both of which `decode_from`
+        // handles, so its `UnsupportedHeaderVersion` arm is unreachable here; any decode error
+        // is a malformed header and closes the connection.
         let mut decoder = Decoder::new(frame);
-        let req = match RequestHeader::decode_from(&mut decoder, req_hdr_ver) {
-            Ok(req) => req,
-            Err(KafkaProtocolError::UnsupportedHeaderVersion(_)) => {
-                warn!(%peer, api_key, api_version, "unsupported request header version");
-                let body_response = encode_error_only_response(ERROR_INVALID_REQUEST);
-                let resp_header = ResponseHeader { correlation_id };
-                send_response(
-                    &mut stream,
-                    &resp_header,
-                    0,
-                    &body_response,
-                    config.write_timeout,
-                )
-                .await?;
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+        let req = RequestHeader::decode_from(&mut decoder, req_hdr_ver)?;
 
         debug!(
             %peer,
@@ -327,7 +309,6 @@ async fn handle_connection(
 
         let body = decoder.read_bytes(decoder.remaining())?;
         let outcome = handle_request(req.api_key, req.api_version, body, &broker);
-        let close_after_response = matches!(outcome, HandleOutcome::RespondAndClose(_));
         match outcome {
             HandleOutcome::NoResponse => {
                 // Produce with acks=0: the wire protocol forbids a response.
@@ -337,12 +318,11 @@ async fn handle_connection(
                     %peer,
                     api_key = req.api_key,
                     api_version = req.api_version,
-                    "closing connection: no parseable error response for this request version"
+                    "closing connection: no parseable response for this request"
                 );
                 return Ok(());
             }
-            HandleOutcome::Respond(body_response)
-            | HandleOutcome::RespondAndClose(body_response) => {
+            HandleOutcome::Respond(body_response) => {
                 let resp_header = ResponseHeader {
                     correlation_id: req.correlation_id,
                 };
@@ -350,31 +330,25 @@ async fn handle_connection(
                     &mut stream,
                     &resp_header,
                     resp_hdr_ver,
-                    &body_response,
+                    body_response,
                     config.write_timeout,
                 )
                 .await?;
-                if close_after_response {
-                    warn!(
-                        %peer,
-                        api_key = req.api_key,
-                        api_version = req.api_version,
-                        "closing connection after unsupported-version error response"
-                    );
-                    return Ok(());
-                }
             }
         }
     }
 }
 
-/// Write a single length-prefixed Kafka frame using one allocation.
-/// Avoids the separate header-encode + payload-concat + length-prefix allocations.
+/// Write a single length-prefixed Kafka frame.
+///
+/// The length prefix and header are built in a small buffer, then chained with the already-owned
+/// `body` so `write_all_buf` streams both without copying the body. The whole frame is written
+/// before returning (or the connection errors), so no partial frame ever precedes the next one.
 async fn send_response(
     stream: &mut TcpStream,
     header: &ResponseHeader,
     header_version: i16,
-    body: &[u8],
+    body: Bytes,
     write_timeout: Duration,
 ) -> Result<()> {
     let header_size = ResponseHeader::encoded_size(header_version);
@@ -384,18 +358,14 @@ async fn send_response(
             max_bytes: i32::MAX as usize,
             actual_bytes: payload_size,
         })?;
-    let mut frame = BytesMut::with_capacity(4 + payload_size);
-    frame.put_i32(payload_len_i32);
-    header.encode_into(&mut frame, header_version);
-    frame.put_slice(body);
-    timeout(write_timeout, stream.write_all(&frame))
+    let mut prefix = BytesMut::with_capacity(4 + header_size);
+    prefix.put_i32(payload_len_i32);
+    header.encode_into(&mut prefix, header_version);
+    let mut frame = prefix.freeze().chain(body);
+    timeout(write_timeout, stream.write_all_buf(&mut frame))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
     Ok(())
-}
-
-fn correlation_id_from_frame(frame: &bytes::Bytes) -> i32 {
-    i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
 }
 
 /// Read one length-prefixed Kafka frame from `stream`.
@@ -506,13 +476,6 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn correlation_id_is_extracted_from_frame() {
-        let frame =
-            bytes::Bytes::from_static(&[0x00, 0x12, 0x00, 0x01, 0x11, 0x22, 0x33, 0x44, 0xaa]);
-        assert_eq!(correlation_id_from_frame(&frame), 0x1122_3344);
-    }
-
     #[tokio::test]
     async fn send_response_writes_header_and_body() {
         let (mut client, mut server) = tcp_pair().await;
@@ -521,9 +484,15 @@ mod tests {
         };
         let body = [9u8, 8, 7];
 
-        send_response(&mut server, &header, 1, &body, Duration::from_secs(1))
-            .await
-            .unwrap();
+        send_response(
+            &mut server,
+            &header,
+            1,
+            Bytes::copy_from_slice(&body),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let mut len = [0u8; 4];
         client.read_exact(&mut len).await.unwrap();
@@ -764,9 +733,15 @@ mod tests {
         };
         let body = [5u8, 6, 7];
 
-        send_response(&mut server, &header, 0, &body, Duration::from_secs(1))
-            .await
-            .unwrap();
+        send_response(
+            &mut server,
+            &header,
+            0,
+            Bytes::copy_from_slice(&body),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let mut len = [0u8; 4];
         client.read_exact(&mut len).await.unwrap();

@@ -43,17 +43,45 @@ pub const MAX_COLLECTION_LEN: usize = 65_536;
 /// still grow correctly via `Vec::push`'s amortized doubling once real elements are decoded.
 pub const PREALLOC_HINT: usize = 128;
 
+/// Cumulative cap on the total array elements decoded from one request frame.
+///
+/// `MAX_COLLECTION_LEN` bounds a single array, but not the product across nested arrays
+/// (`topics` x `partitions`): an 8 MB frame packed with minimal partition entries decodes into
+/// ~1M owned structs before any per-array limit trips. This budget bounds the sum of every array
+/// count in one decode, so materialized struct count stays proportional to a fixed ceiling
+/// regardless of nesting. Real requests never approach it (a Fetch over thousands of partitions
+/// is still far below).
+pub const MAX_REQUEST_ELEMENTS: usize = MAX_COLLECTION_LEN;
+
 pub struct Decoder {
     bytes: Bytes,
+    element_budget: usize,
 }
 
 impl Decoder {
     pub fn new(bytes: Bytes) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            element_budget: MAX_REQUEST_ELEMENTS,
+        }
     }
 
     pub fn remaining(&self) -> usize {
         self.bytes.remaining()
+    }
+
+    /// Debit the cumulative element budget shared across every array in this decode.
+    fn charge_elements(&mut self, count: usize) -> Result<()> {
+        match self.element_budget.checked_sub(count) {
+            Some(remaining) => {
+                self.element_budget = remaining;
+                Ok(())
+            }
+            None => Err(KafkaProtocolError::RequestElementBudgetExceeded {
+                count,
+                remaining: self.element_budget,
+            }),
+        }
     }
 
     pub fn read_u8(&mut self) -> Result<u8> {
@@ -122,6 +150,7 @@ impl Decoder {
                 max: MAX_COLLECTION_LEN,
             });
         }
+        self.charge_elements(count)?;
         Ok(count)
     }
 
@@ -146,6 +175,7 @@ impl Decoder {
                 max: MAX_COLLECTION_LEN,
             });
         }
+        self.charge_elements(count)?;
         Ok(count)
     }
 
@@ -167,6 +197,7 @@ impl Decoder {
                 max: MAX_COLLECTION_LEN,
             });
         }
+        self.charge_elements(count)?;
         Ok(count)
     }
 
@@ -197,6 +228,14 @@ impl Decoder {
                 max: MAX_COLLECTION_LEN,
             }
         })?;
+        // Parity with the legacy i16-length string (naturally <= 32767); the compact form is
+        // otherwise bounded only by the frame, letting one flexible name reach max_frame_size.
+        if len > MAX_COLLECTION_LEN {
+            return Err(KafkaProtocolError::CollectionTooLarge {
+                count: len,
+                max: MAX_COLLECTION_LEN,
+            });
+        }
         self.ensure(len)?;
         let s = std::str::from_utf8(&self.bytes.chunk()[..len])
             .map_err(|_| KafkaProtocolError::InvalidUtf8)?

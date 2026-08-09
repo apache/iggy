@@ -138,11 +138,12 @@ fn unsupported_metadata_version_closes_connection() {
 // ── Misc ────────────────────────────────────────────────────────────────────
 
 #[test]
-fn unknown_api_key_returns_error_only_payload() {
-    let body = handle_request(999, 0, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
+fn unknown_api_key_closes_connection() {
+    let outcome = handle_request(999, 0, Bytes::new(), &default_broker());
+    assert!(
+        outcome.is_close(),
+        "unknown api_key must close (no parseable response schema)"
+    );
 }
 
 #[test]

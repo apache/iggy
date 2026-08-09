@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt::Display;
+use std::str::FromStr;
+use std::time::Duration;
+
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 use iggy_gateway_kafka::server::init_tracing;
 use iggy_gateway_kafka::{KafkaServer, ServerConfig};
@@ -26,36 +30,8 @@ use iggy_gateway_kafka::{KafkaServer, ServerConfig};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
-    let mut config = ServerConfig::default();
-    if let Ok(bind_addr) = std::env::var("IGGY_KAFKA_BIND_ADDR") {
-        config.bind_addr = bind_addr;
-    }
-    if let Ok(advertised_host) = std::env::var("IGGY_KAFKA_ADVERTISED_HOST") {
-        config.advertised_host = Some(advertised_host);
-    }
-    if let Ok(advertised_port) = std::env::var("IGGY_KAFKA_ADVERTISED_PORT") {
-        config.advertised_port =
-            Some(advertised_port.parse().map_err(|e| {
-                format!("invalid IGGY_KAFKA_ADVERTISED_PORT `{advertised_port}`: {e}")
-            })?);
-    }
-    if let Ok(max_connections) = std::env::var("IGGY_KAFKA_MAX_CONNECTIONS") {
-        config.max_connections = max_connections
-            .parse()
-            .map_err(|e| format!("invalid IGGY_KAFKA_MAX_CONNECTIONS `{max_connections}`: {e}"))?;
-    }
-    if let Ok(idle_timeout_secs) = std::env::var("IGGY_KAFKA_IDLE_TIMEOUT_SECS") {
-        let secs: u64 = idle_timeout_secs.parse().map_err(|e| {
-            format!("invalid IGGY_KAFKA_IDLE_TIMEOUT_SECS `{idle_timeout_secs}`: {e}")
-        })?;
-        config.idle_timeout = std::time::Duration::from_secs(secs);
-    }
-    if let Ok(drain_secs) = std::env::var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
-        let secs: u64 = drain_secs.parse().map_err(|e| {
-            format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{drain_secs}`: {e}")
-        })?;
-        config.shutdown_drain_timeout = std::time::Duration::from_secs(secs);
-    }
+    let config = load_config()?;
+
     let listener = TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
@@ -75,6 +51,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server_task.await??;
     Ok(())
+}
+
+/// Build [`ServerConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
+/// break the listener (a zero connection cap serves nothing, a zero timeout drops every
+/// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
+fn load_config() -> Result<ServerConfig, String> {
+    let mut config = ServerConfig::default();
+
+    if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
+        config.bind_addr = bind_addr;
+    }
+    if let Some(advertised_host) = env_var("IGGY_KAFKA_ADVERTISED_HOST") {
+        config.advertised_host = Some(advertised_host);
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_ADVERTISED_PORT") {
+        config.advertised_port = Some(parse_positive("IGGY_KAFKA_ADVERTISED_PORT", &raw)?);
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_MAX_CONNECTIONS") {
+        let max_connections: usize = parse_positive("IGGY_KAFKA_MAX_CONNECTIONS", &raw)?;
+        if max_connections > Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "IGGY_KAFKA_MAX_CONNECTIONS {max_connections} exceeds maximum {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
+        config.max_connections = max_connections;
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_MAX_FRAME_SIZE") {
+        config.max_frame_size = parse_positive("IGGY_KAFKA_MAX_FRAME_SIZE", &raw)?;
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_IDLE_TIMEOUT_SECS") {
+        config.idle_timeout =
+            Duration::from_secs(parse_positive("IGGY_KAFKA_IDLE_TIMEOUT_SECS", &raw)?);
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_READ_TIMEOUT_SECS") {
+        config.read_timeout =
+            Duration::from_secs(parse_positive("IGGY_KAFKA_READ_TIMEOUT_SECS", &raw)?);
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_WRITE_TIMEOUT_SECS") {
+        config.write_timeout =
+            Duration::from_secs(parse_positive("IGGY_KAFKA_WRITE_TIMEOUT_SECS", &raw)?);
+    }
+    // Drain of 0 is valid: abandon in-flight connections immediately on shutdown.
+    if let Some(raw) = env_var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
+        let secs: u64 = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
+        config.shutdown_drain_timeout = Duration::from_secs(secs);
+    }
+
+    Ok(config)
+}
+
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// Parse a strictly-positive value, rejecting `0` (which for connection caps and timeouts would
+/// silently disable the listener) and unparseable input.
+fn parse_positive<T>(key: &str, raw: &str) -> Result<T, String>
+where
+    T: FromStr + Default + PartialEq,
+    T::Err: Display,
+{
+    let value: T = raw
+        .parse()
+        .map_err(|e| format!("invalid {key} `{raw}`: {e}"))?;
+    if value == T::default() {
+        return Err(format!("{key} must be greater than 0"));
+    }
+    Ok(value)
 }
 
 /// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM (`docker stop`).
@@ -99,5 +146,27 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_positive;
+
+    #[test]
+    fn parse_positive_rejects_zero() {
+        assert!(parse_positive::<usize>("KEY", "0").is_err());
+        assert!(parse_positive::<u16>("KEY", "0").is_err());
+    }
+
+    #[test]
+    fn parse_positive_rejects_non_numeric() {
+        assert!(parse_positive::<usize>("KEY", "abc").is_err());
+    }
+
+    #[test]
+    fn parse_positive_accepts_positive_value() {
+        assert_eq!(parse_positive::<u64>("KEY", "42").unwrap(), 42);
+        assert_eq!(parse_positive::<u16>("KEY", "9093").unwrap(), 9093);
     }
 }
