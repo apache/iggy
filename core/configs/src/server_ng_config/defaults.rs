@@ -119,6 +119,7 @@ impl Default for ClusterConfig {
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
                     advertised_address: None,
+                    advertised_addresses: Vec::new(),
                     replica_id: u8::try_from(node.replica_id).expect(
                         "static_toml replica_id must fit in u8 (0..=255); \
                          fix core/server-ng/config.toml",
@@ -175,6 +176,11 @@ impl Default for PartitionConfig {
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
+            transfer_served_cache_bytes_max: partition
+                .transfer_served_cache_bytes_max
+                .parse()
+                .unwrap(),
+            transfer_artifact_bytes_max: partition.transfer_artifact_bytes_max.parse().unwrap(),
         }
     }
 }

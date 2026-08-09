@@ -27,7 +27,8 @@ import (
 
 func itShouldReturnSpecificError(err error, expected error) {
 	ginkgo.It("Should return error: "+expected.Error(), func() {
-		gomega.Expect(errors.Is(err, expected)).To(gomega.BeTrue())
+		gomega.Expect(errors.Is(err, expected)).To(gomega.BeTrue(),
+			"expected %v, got %v", expected, err)
 	})
 }
 

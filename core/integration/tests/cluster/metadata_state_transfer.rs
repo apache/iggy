@@ -301,21 +301,33 @@ async fn given_election_past_a_node_when_it_rejoins_stale_should_probe_then_stat
     // while the cluster sits at a higher view -- the stale-primary case.
     harness.restart_node_from_clean_slate(0).unwrap();
 
-    // It must first PROBE (its heartbeat-send timer converting, since it has no
-    // heartbeat-receive timer as a "primary"), then complete the transfer. The
-    // probe marker distinguishes this path from the same-view backstop.
+    // It must leave view 0 before it can transfer, and there are two correct
+    // routes off it. Either its heartbeat-SEND timer converts into a probe (it
+    // has no heartbeat-RECEIVE timer while it believes itself primary), or an
+    // unsolicited `StartView` from the live primary reaches it first and it
+    // adopts that. Which one wins is scheduler luck: the probe timer races the
+    // survivors' next StartView broadcast, and on an unloaded box the StartView
+    // lands ~450ms into boot and takes it. Pinning the probe marker alone made
+    // this spec fail whenever the node caught up the faster way. What must hold
+    // either way is that it left the stale view by a legitimate route and then
+    // converged rather than wedging.
     let deadline = Instant::now() + TRANSFER_BUDGET;
-    let mut probed = false;
+    let mut left_stale_view = false;
     loop {
-        probed = probed || harness.node(0).stdout_contains("probing to catch up");
+        left_stale_view = left_stale_view
+            || harness.node(0).stdout_contains("probing to catch up")
+            || harness
+                .node(0)
+                .stdout_contains("adopting view from StartView");
         if harness
             .node(0)
             .stdout_contains("metadata state transfer installed")
         {
             assert!(
-                probed,
-                "the rejoined node transferred without first probing; the \
-                 stale-view path must reach the transfer through a view probe"
+                left_stale_view,
+                "the rejoined node transferred while still believing view 0; it \
+                 must first leave the stale view, by its own probe or by adopting \
+                 a StartView"
             );
             break;
         }

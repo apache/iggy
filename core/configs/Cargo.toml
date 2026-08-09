@@ -28,6 +28,7 @@ cpu_allocation = { workspace = true }
 err_trail = { workspace = true }
 figment = { workspace = true }
 iggy_common = { workspace = true }
+ipnet = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

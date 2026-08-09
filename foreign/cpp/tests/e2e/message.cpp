@@ -47,8 +47,13 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
         messages.push_back(std::move(msg));
     }
 
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+    iggy::ffi::SendMessagesResponse sent;
+    ASSERT_NO_THROW(sent = client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                 "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    ASSERT_TRUE(sent.confirmations.empty())
+        << "The legacy server reports no offsets, so the confirmation list must stay empty, got "
+        << sent.confirmations.size();
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(1), "offset", 0, 100, false);

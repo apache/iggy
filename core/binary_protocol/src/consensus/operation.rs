@@ -186,6 +186,21 @@ impl Operation {
         (*self as u8) >= Self::PARTITION_START
     }
 
+    /// Operations that replicate through the METADATA consensus group and live
+    /// in its WAL.
+    ///
+    /// Wider than [`Self::is_metadata`]: the session ops replicate on the
+    /// metadata plane without being metadata mutations. The single source of
+    /// truth for "does the metadata plane own this op", shared by the plane's
+    /// own applicability predicate and the repair router's legacy-stamp
+    /// acceptance -- the two drifting is how a metadata op ends up offered to
+    /// the partition arm.
+    #[must_use]
+    #[inline]
+    pub const fn is_metadata_plane(&self) -> bool {
+        self.is_metadata() || matches!(self, Self::Register | Self::Logout)
+    }
+
     /// Operations clients are allowed to send directly.
     #[must_use]
     #[inline]

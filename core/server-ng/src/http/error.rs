@@ -25,7 +25,7 @@ use axum::Json;
 use axum::http::header::{LOCATION, RETRY_AFTER};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use configs::ng_cluster::{AdvertisedAddress, ClusterNodeConfig};
+use configs::ng_cluster::ResolvedClusterNode;
 use iggy_binary_protocol::Operation;
 use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
@@ -254,10 +254,10 @@ impl IntoResponse for WriteError {
 /// the `PUT`/`DELETE .../consumer-offsets` writes).
 ///
 /// Split differently from [`WriteError`] because the partition plane replies
-/// carry no committed error code: a pre-dispatch gate failure is an empty
-/// reply distinguishable only by header (see [`classify_partition_reply`]),
-/// and an unanswered write is a distinct outcome the caller must treat as
-/// unknown rather than failed.
+/// carry no committed error code: a pre-dispatch gate failure is an
+/// empty-bodied reply that names itself only in the header (see
+/// [`classify_partition_reply`]), and an unanswered write is a distinct
+/// outcome the caller must treat as unknown rather than failed.
 #[derive(Debug)]
 pub(in crate::http) enum PartitionWriteError {
     /// Caller-side rejection (bad identifier, oversized batch, an authorization
@@ -265,9 +265,12 @@ pub(in crate::http) enum PartitionWriteError {
     /// (`ReplyHeader.status`), or a malformed reply frame, rendered through the
     /// legacy `IggyError -> status` map for SDK-identical bodies.
     Rejected(IggyError),
-    /// The dispatch gates could not route the write: the stream, topic, or
-    /// partition does not resolve (or never materialised within the routable
-    /// budget). Rendered as the legacy 404 body.
+    /// Backstop for a status-0 reply carrying `op` 0: an ack with no commit
+    /// number behind it, for a write that never reached the partition plane.
+    /// Routing failures name themselves through `ReplyHeader.status`, so this
+    /// shape is left to a peer that still answers a non-committing op this
+    /// way. Rendered as the legacy 404 body: the alternative is grading a
+    /// write that never happened as a success.
     NotFound,
     /// The in-process reply slot could not be installed. Transient server
     /// condition -> the shared 503, retryable.
@@ -525,51 +528,61 @@ fn primary_redirect_response(location: &str) -> Response {
 /// Build the `Location` for a 307 redirect of a linearizable read to the VSR
 /// primary: `<scheme>://<host>:<http-port><path_and_query>`. The scheme is the
 /// redirecting node's own listener scheme (uniform cluster HTTP config, same
-/// assumption the forward hop makes). `None` when the primary does not resolve
-/// from the roster, so the caller fails closed to a 503 rather than pointing at
-/// an unreachable target. Pure (no consensus or axum dependency) so the
-/// redirect target is unit-tested in isolation.
+/// assumption the forward hop makes). `client_ip` is the redirected client's
+/// peer address, so the `Location` host comes from the primary's
+/// per-client-network selectors when one matches. `None` when the primary does
+/// not resolve from the roster, so the caller fails closed to a 503 rather
+/// than pointing at an unreachable target. Pure (no consensus or axum
+/// dependency) so the redirect target is unit-tested in isolation.
 pub(in crate::http) fn primary_redirect_location(
     roster: &ClusterRoster,
     primary_index: u8,
     scheme: &str,
     path_and_query: &str,
+    client_ip: Option<IpAddr>,
 ) -> Option<String> {
-    let authority = primary_advertised_http_authority(roster, primary_index)?;
+    let authority = primary_advertised_http_authority(roster, primary_index, client_ip)?;
     Some(format!("{scheme}://{authority}{path_and_query}"))
 }
 
 /// Resolve the VSR primary's HTTP socket from the static roster: the node
-/// whose `replica_id` equals `primary_index`, its `ports.http`, and its private
-/// roster `ip` parsed strictly. Internal replica forwarding uses this address.
+/// whose `replica_id` equals `primary_index`, its `ports.http`, and its
+/// private roster `ip` (parsed once at roster build). Internal replica
+/// forwarding uses this address; it must never route through
+/// [`ResolvedClusterNode::advertised_for`], which picks client-facing hosts.
 pub(in crate::http) fn primary_http_socket(
     roster: &ClusterRoster,
     primary_index: u8,
 ) -> Option<SocketAddr> {
     let (node, http_port) = primary_node(roster, primary_index)?;
-    let ip = node.ip.parse::<IpAddr>().ok()?;
-    Some(SocketAddr::new(ip, http_port))
+    Some(SocketAddr::new(node.replica_ip()?, http_port))
 }
 
-/// Resolve the client-facing HTTP authority (`host:port`) for a redirect. The
-/// advertised address is preferred, with the private roster IP retained as
-/// the compatibility fallback. [`AdvertisedAddress::authority`] brackets IPv6
-/// hosts and passes hostnames through, so the redirect URL stays valid; a
-/// host that is neither a valid IP nor a valid hostname yields `None` so
-/// callers fail closed.
-fn primary_advertised_http_authority(roster: &ClusterRoster, primary_index: u8) -> Option<String> {
+/// Resolve the client-facing HTTP authority (`host:port`) for a redirect
+/// through [`ResolvedClusterNode::advertised_for`]: a client-network selector
+/// match first, then the catch-all advertised address, then the private
+/// roster IP as the compatibility fallback. `AdvertisedAddress::authority`
+/// brackets IPv6 hosts and passes hostnames through, so the redirect URL
+/// stays valid. This is the fail-closed caller: a host that is neither a
+/// valid IP nor a valid hostname yields `None` and the redirect becomes a
+/// 503 rather than a `Location` pointing at an unparsable target (cluster
+/// metadata makes the opposite choice and publishes such a host verbatim).
+fn primary_advertised_http_authority(
+    roster: &ClusterRoster,
+    primary_index: u8,
+    client_ip: Option<IpAddr>,
+) -> Option<String> {
     let (node, http_port) = primary_node(roster, primary_index)?;
-    let host = node.advertised_address.as_deref().unwrap_or(&node.ip);
-    let address = host.parse::<AdvertisedAddress>().ok()?;
+    let address = node.advertised_for(client_ip)?;
     Some(address.authority(http_port))
 }
 
-fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ClusterNodeConfig, u16)> {
+fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ResolvedClusterNode, u16)> {
     let node = roster
         .nodes
         .iter()
-        .find(|node| node.replica_id == primary_index)?;
-    let http_port = node.ports.http?;
+        .find(|node| node.config().replica_id == primary_index)?;
+    let http_port = node.config().ports.http?;
     Some((node, http_port))
 }
 
@@ -577,7 +590,7 @@ fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ClusterNo
 mod tests {
     use super::*;
 
-    use configs::ng_cluster::TransportPorts;
+    use configs::ng_cluster::{ClusterNodeConfig, TransportPorts};
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
@@ -585,6 +598,7 @@ mod tests {
             name: format!("node-{replica_id}"),
             ip: ip.to_owned(),
             advertised_address: None,
+            advertised_addresses: Vec::new(),
             replica_id,
             ports: TransportPorts {
                 tcp: None,
@@ -600,7 +614,7 @@ mod tests {
         ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes,
+            nodes: nodes.into_iter().map(Into::into).collect(),
             self_ip: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -616,7 +630,7 @@ mod tests {
             node(1, "10.0.0.2", Some(8090)),
         ]);
         assert_eq!(
-            primary_redirect_location(&roster, 1, "http", READ_PATH),
+            primary_redirect_location(&roster, 1, "http", READ_PATH, None),
             Some("http://10.0.0.2:8090/streams?consistency=linearizable".to_owned())
         );
     }
@@ -625,7 +639,7 @@ mod tests {
     fn primary_redirect_location_uses_the_listener_scheme() {
         let roster = roster(vec![node(0, "10.0.0.1", Some(8080))]);
         assert_eq!(
-            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            primary_redirect_location(&roster, 0, "https", READ_PATH, None),
             Some("https://10.0.0.1:8080/streams?consistency=linearizable".to_owned())
         );
     }
@@ -634,7 +648,7 @@ mod tests {
     fn primary_redirect_location_is_none_when_no_node_matches_primary_index() {
         let roster = roster(vec![node(0, "10.0.0.1", Some(8080))]);
         assert_eq!(
-            primary_redirect_location(&roster, 2, "http", READ_PATH),
+            primary_redirect_location(&roster, 2, "http", READ_PATH, None),
             None
         );
     }
@@ -643,7 +657,7 @@ mod tests {
     fn primary_redirect_location_is_none_when_primary_has_no_http_port() {
         let roster = roster(vec![node(0, "10.0.0.1", None)]);
         assert_eq!(
-            primary_redirect_location(&roster, 0, "http", READ_PATH),
+            primary_redirect_location(&roster, 0, "http", READ_PATH, None),
             None
         );
     }
@@ -652,7 +666,7 @@ mod tests {
     fn primary_redirect_location_is_none_for_empty_roster() {
         let roster = roster(Vec::new());
         assert_eq!(
-            primary_redirect_location(&roster, 0, "http", READ_PATH),
+            primary_redirect_location(&roster, 0, "http", READ_PATH, None),
             None
         );
     }
@@ -661,7 +675,7 @@ mod tests {
     fn primary_redirect_location_brackets_ipv6_host() {
         let roster = roster(vec![node(0, "::1", Some(8080))]);
         assert_eq!(
-            primary_redirect_location(&roster, 0, "http", READ_PATH),
+            primary_redirect_location(&roster, 0, "http", READ_PATH, None),
             Some("http://[::1]:8080/streams?consistency=linearizable".to_owned())
         );
     }
@@ -673,7 +687,7 @@ mod tests {
         let roster = roster(vec![primary]);
 
         assert_eq!(
-            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            primary_redirect_location(&roster, 0, "https", READ_PATH, None),
             Some("https://[2001:db8::1]:8080/streams?consistency=linearizable".to_owned())
         );
     }
@@ -685,8 +699,42 @@ mod tests {
         let roster = roster(vec![primary]);
 
         assert_eq!(
-            primary_redirect_location(&roster, 0, "https", READ_PATH),
+            primary_redirect_location(&roster, 0, "https", READ_PATH, None),
             Some("https://broker-1.example.com:8080/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_uses_the_selector_address_for_a_matching_client() {
+        let mut primary = node(0, "10.0.0.1", Some(8080));
+        primary.advertised_address = Some("203.0.113.1".to_owned());
+        primary.advertised_addresses = vec![configs::ng_cluster::AdvertisedAddressSelector {
+            client_cidr: "10.0.0.0/16".to_owned(),
+            address: "10.0.0.1".to_owned(),
+        }];
+        let roster = roster(vec![primary]);
+
+        assert_eq!(
+            primary_redirect_location(
+                &roster,
+                0,
+                "https",
+                READ_PATH,
+                Some("10.0.9.9".parse().unwrap())
+            ),
+            Some("https://10.0.0.1:8080/streams?consistency=linearizable".to_owned()),
+            "an in-network client must be redirected to the selector address"
+        );
+        assert_eq!(
+            primary_redirect_location(
+                &roster,
+                0,
+                "https",
+                READ_PATH,
+                Some("198.51.100.7".parse().unwrap())
+            ),
+            Some("https://203.0.113.1:8080/streams?consistency=linearizable".to_owned()),
+            "an out-of-network client must stay on the catch-all address"
         );
     }
 

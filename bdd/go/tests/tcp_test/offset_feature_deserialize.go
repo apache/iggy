@@ -80,7 +80,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			consumer := iggcon.NewSingleConsumer(consumerIdentifier)
 
 			messages := createDefaultMessages()
-			sendErr := client.SendMessages(
+			_, sendErr := client.SendMessages(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,

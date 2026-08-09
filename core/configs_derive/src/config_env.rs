@@ -20,16 +20,18 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{DeriveInput, Generics, Ident, Type};
 
-/// Maximum number of array elements to generate env var mappings for.
+/// Default number of array elements to generate env var mappings for.
 ///
 /// For `Vec<T>` fields, mappings are generated for indices 0 through 255
 /// (e.g., `FIELD_0_NAME`, ..., `FIELD_255_NAME`). Environment variables for
 /// indices beyond this limit are silently ignored.
 ///
-/// The ceiling mirrors `cluster.nodes` (the only known Vec<nested>
-/// configuration surface), which the validator allows up to 255 replicas.
-/// Keeping the two in sync means every node index reachable by the validator
-/// is also reachable by env overrides.
+/// The ceiling mirrors `cluster.nodes`, which the validator allows up to 255
+/// replicas. Keeping the two in sync means every node index reachable by the
+/// validator is also reachable by env overrides. Vecs nested inside another
+/// Vec multiply their ceilings (256 x 256 entries, each `Box::leak`ed at
+/// first use), so nested-vec fields like `cluster.nodes.advertised_addresses`
+/// must lower theirs with `#[config_env(max_elements = N)]`.
 const MAX_ARRAY_ELEMENTS: usize = 256;
 
 /// Container-level attributes for `#[config_env(...)]`
@@ -88,6 +90,11 @@ struct FieldOpts {
     /// Treat this field as a leaf value (not a nested config struct)
     #[darling(default)]
     leaf: bool,
+
+    /// Cap the array-index expansion of a `Vec` field below
+    /// [`MAX_ARRAY_ELEMENTS`]. Ignored on non-Vec fields.
+    #[darling(default)]
+    max_elements: Option<usize>,
 }
 
 /// Represents a single environment variable mapping (leaf field)
@@ -111,6 +118,8 @@ struct NestedFieldInfo {
     field_env_segment: String,
     /// The field name for config path construction
     field_name: String,
+    /// Array-index expansion ceiling for Vec fields
+    max_elements: usize,
 }
 
 pub fn generate_impl(input: &DeriveInput) -> TokenStream2 {
@@ -261,7 +270,7 @@ fn generate_struct_impl(
 
             if info.is_vec {
                 // For Vec fields, expand with array indices
-                let max_elements = MAX_ARRAY_ELEMENTS;
+                let max_elements = info.max_elements;
                 quote! {
                     let nested_mappings = <#ty as configs::ConfigEnvMappings>::env_mappings();
                     for i in 0..#max_elements {
@@ -533,6 +542,7 @@ fn collect_mappings(fields: &[FieldOpts]) -> (Vec<EnvMapping>, Vec<NestedFieldIn
                 is_vec,
                 field_env_segment,
                 field_name,
+                max_elements: field.max_elements.unwrap_or(MAX_ARRAY_ELEMENTS),
             });
         }
     }

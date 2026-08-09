@@ -26,6 +26,17 @@ mod flush_vsr;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 #[cfg(feature = "vsr")]
 mod legacy_login_vsr;
+// Poll addressing + timestamp semantics: typed PartitionNotFound on a bad
+// partition id, at-or-after timestamp polls.
+#[cfg(feature = "vsr")]
+mod poll_semantics_vsr;
+// Create-topic static bounds deny typed before consensus.
+#[cfg(feature = "vsr")]
+mod topic_admission_vsr;
+// Purge durability: applied generation survives restart; journal-resident
+// purged batches stay fenced behind the purge floor.
+#[cfg(feature = "vsr")]
+mod purge_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server-ng suites below.
 #[cfg(feature = "vsr")]
@@ -48,10 +59,10 @@ mod cluster_metadata_vsr;
 // across a replica restart.
 #[cfg(feature = "vsr")]
 mod cluster_view_durability_vsr;
-// A metadata checkpoint must drain the WAL and recover from the snapshot fold plus
-// the WAL suffix across a restart.
+// A partition view change must persist the advanced view in that group's own
+// superblock and recover it from disk across a replica restart.
 #[cfg(feature = "vsr")]
-mod metadata_checkpoint_recovery_vsr;
+mod partition_view_durability_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;

@@ -194,14 +194,21 @@ find_duplicate_license_headers() {
   local path
 
   : > "$output_file"
-  mapfile -t LICENSE_EXCLUDES < <(load_license_excludes)
+  LICENSE_EXCLUDES=()
+  while IFS= read -r _hdr_tmp; do LICENSE_EXCLUDES+=("$_hdr_tmp"); done < <(load_license_excludes)
 
   while IFS= read -r -d '' path; do
     if is_license_excluded "$path"; then
       continue
     fi
 
-    if ! LC_ALL=C grep -Iq . "$path"; then
+    # git tracks a symlink as a blob, so it arrives here as an ordinary path.
+    # HawkEye skips symlinks too, and the target is scanned under its own path.
+    if [ -L "$path" ]; then
+      continue
+    fi
+
+    if [ ! -f "$path" ] || ! LC_ALL=C grep -Iq . "$path"; then
       continue
     fi
 
