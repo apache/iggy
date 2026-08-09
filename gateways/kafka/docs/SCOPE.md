@@ -117,5 +117,5 @@ Items from the [hybrid architecture review](https://github.com/apache/iggy/discu
 
 ### Open questions (ask maintainers before Phase 2)
 
-- [ ] Repo placement: `gateways/kafka/` in [apache/iggy](https://github.com/apache/iggy) vs separate proxy repo (affects workspace deps and CI)
+- [X] Repo placement: `gateways/kafka/` in [apache/iggy](https://github.com/apache/iggy) vs separate proxy repo (affects workspace deps and CI)
 - [ ] Confirm bridge dependency strategy ([Discussion #3081](https://github.com/apache/iggy/discussions/3081), [#3252](https://github.com/apache/iggy/discussions/3252))
