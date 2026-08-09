@@ -171,6 +171,12 @@ pub fn handle_request(
 /// versions before reading `acks` would send an error response the client never expects,
 /// desyncing the next correlation id it reads.
 fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
+    // Above the encoder max there is no response parseable at the client's version, so close
+    // rather than decode (same policy the other APIs apply). Below-min versions still decode so
+    // acks=0 fire-and-forget clients stay silent per the advertised min=0.
+    if api_version > supported_max_version(API_KEY_PRODUCE).unwrap_or(i16::MAX) {
+        return HandleOutcome::Close;
+    }
     match decode_produce_request(api_version, body) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
@@ -260,7 +266,9 @@ fn handle_other_request(
             encode_create_topics_error_response,
             "CreateTopics",
         ),
-        _ => HandleOutcome::RespondAndClose(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
+        // Unknown API key: no api-specific response schema exists, so any body we send is
+        // misparsed by the client against the schema it expected. Close is unambiguous.
+        _ => HandleOutcome::Close,
     }
 }
 
@@ -284,12 +292,12 @@ fn handle_api_versions(api_version: i16, body: &Bytes) -> HandleOutcome {
 
 fn handle_metadata(api_version: i16, body: Bytes, broker: &BrokerAdvertise) -> HandleOutcome {
     if !is_supported_version(API_KEY_METADATA, api_version) {
-        // Clamping the response to MAX_SUPPORTED_METADATA_VERSION leaves a body the
-        // client parses at its own (unsupported) version, so UNSUPPORTED_VERSION never
-        // survives. Clients that skip ApiVersions get a naked close instead.
+        // Clamping the response to the supported max leaves a body the client parses at its own
+        // (unsupported) version, so UNSUPPORTED_VERSION never survives. Clients that skip
+        // ApiVersions get a naked close instead.
         tracing::warn!(
             api_version,
-            max_supported = MAX_SUPPORTED_METADATA_VERSION,
+            max_supported = supported_max_version(API_KEY_METADATA),
             "Metadata version unsupported; closing connection"
         );
         return HandleOutcome::Close;
@@ -512,13 +520,6 @@ fn encode_metadata_response(
         }
     }
 
-    e.freeze()
-}
-
-#[must_use]
-pub fn encode_error_only_response(error_code: i16) -> Bytes {
-    let mut e = Encoder::with_capacity(2);
-    e.write_i16(error_code);
     e.freeze()
 }
 

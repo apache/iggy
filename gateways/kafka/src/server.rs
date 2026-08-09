@@ -349,7 +349,6 @@ async fn dispatch_outcome(
     resp_hdr_ver: i16,
     outcome: HandleOutcome,
 ) -> Result<bool> {
-    let close_after_response = matches!(outcome, HandleOutcome::RespondAndClose(_));
     match outcome {
         HandleOutcome::NoResponse => {
             // Produce with acks=0: the wire protocol forbids a response.
@@ -360,11 +359,11 @@ async fn dispatch_outcome(
                 %peer,
                 api_key = req.api_key,
                 api_version = req.api_version,
-                "closing connection: no parseable error response for this request version"
+                "closing connection: no parseable response for this request"
             );
             Ok(true)
         }
-        HandleOutcome::Respond(body_response) | HandleOutcome::RespondAndClose(body_response) => {
+        HandleOutcome::Respond(body_response) => {
             let resp_header = ResponseHeader {
                 correlation_id: req.correlation_id,
             };
@@ -372,19 +371,11 @@ async fn dispatch_outcome(
                 stream,
                 &resp_header,
                 resp_hdr_ver,
-                &body_response,
+                body_response,
                 config.write_timeout,
             )
             .await?;
-            if close_after_response {
-                warn!(
-                    %peer,
-                    api_key = req.api_key,
-                    api_version = req.api_version,
-                    "closing connection after unsupported-version error response"
-                );
-            }
-            Ok(close_after_response)
+            Ok(false)
         }
     }
 }

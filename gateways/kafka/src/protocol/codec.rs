@@ -188,7 +188,9 @@ impl Decoder {
         if n == 0 {
             return Err(KafkaProtocolError::NullCompactArray);
         }
-        Self::compact_array_count_from_len_plus_one(n)
+        let count = Self::compact_array_count_from_len_plus_one(n)?;
+        self.charge_elements(count)?;
+        Ok(count)
     }
 
     /// Compact array length for a **nullable** field: varint `0` means null/absent and is
@@ -199,7 +201,9 @@ impl Decoder {
         if n == 0 {
             return Ok(0);
         }
-        Self::compact_array_count_from_len_plus_one(n)
+        let count = Self::compact_array_count_from_len_plus_one(n)?;
+        self.charge_elements(count)?;
+        Ok(count)
     }
 
     fn compact_array_count_from_len_plus_one(n: u64) -> Result<usize> {
@@ -213,7 +217,6 @@ impl Decoder {
                 max: MAX_COLLECTION_LEN,
             });
         }
-        self.charge_elements(count)?;
         Ok(count)
     }
 

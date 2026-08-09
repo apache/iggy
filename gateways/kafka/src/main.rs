@@ -109,7 +109,7 @@ fn env_var(key: &str) -> Option<String> {
 }
 
 /// Parse a strictly-positive value, rejecting `0` (which for connection caps and timeouts would
-/// silently disable the listener) and unparseable input.
+/// silently disable the listener) and unparsable input.
 fn parse_positive<T>(key: &str, raw: &str) -> Result<T, String>
 where
     T: FromStr + Default + PartialEq,
