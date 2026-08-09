@@ -46,6 +46,19 @@ pub fn load_fixture_body(api_key: i16, api_name: &str, version: i16) -> Bytes {
 /// generation script so a fresh clone knows how to produce it.
 pub const FIXTURE_SKIP_HINT: &str = "generate with `gateways/kafka/scripts/ci-wire-fixtures.sh generate` (or the kafka-tool `generate` subcommand)";
 
+/// True when the fixtures directory contains at least one `.bin` wire fixture.
+pub fn any_wire_fixture_present() -> bool {
+    let Ok(entries) = std::fs::read_dir(fixtures_dir()) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+    })
+}
+
 /// Set by CI (after `ci-wire-fixtures.sh generate`) to turn missing-fixture skips into hard
 /// failures, so a broken generation step cannot leave these suites green with zero assertions.
 const FIXTURES_REQUIRED_ENV: &str = "KAFKA_FIXTURES_REQUIRED";

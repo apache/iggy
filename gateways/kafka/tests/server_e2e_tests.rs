@@ -61,7 +61,8 @@ async fn e2e_apiversions_v1_preserves_correlation_id() {
 #[tokio::test]
 async fn e2e_apiversions_v3_flexible_preserves_correlation_id() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 3, 42_002, &[]).await;
+    let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
+    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 3, 42_002, &request).await;
     assert_eq!(corr, 42_002);
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
@@ -427,9 +428,10 @@ async fn fetch_v4_through_v12_e2e_preserve_correlation_id() {
 }
 
 #[tokio::test]
-async fn metadata_empty_body_e2e_all_topics_request_returns_broker() {
+async fn metadata_all_topics_null_array_e2e_returns_broker() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(addr, API_KEY_METADATA, 0, 360, &[]).await;
+    let request = wire::build_metadata_all_topics_legacy(0);
+    let (corr, body) = round_trip(addr, API_KEY_METADATA, 0, 360, &request).await;
     assert_eq!(corr, 360);
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1, "one stub broker");
@@ -438,6 +440,19 @@ async fn metadata_empty_body_e2e_all_topics_request_returns_broker() {
     assert!(!host.is_empty());
     let port = d.read_i32().unwrap();
     assert!(port > 0);
+}
+
+#[tokio::test]
+async fn metadata_empty_body_e2e_closes_connection() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let frame = build_request_frame(API_KEY_METADATA, 0, 361, Some("empty-md"), &[]);
+    stream.write_all(&frame).await.expect("write");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "empty Metadata body must close the connection"
+    );
 }
 
 // ── Out-of-scope API keys (SCOPE.md unsupported list) ───────────────────────

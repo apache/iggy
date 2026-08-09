@@ -81,6 +81,13 @@ macro_rules! produce_decode {
     };
 }
 
+fn ensure_body_exhausted(d: &Decoder) -> Result<()> {
+    if d.remaining() != 0 {
+        return Err(KafkaProtocolError::UnexpectedTrailingBytes);
+    }
+    Ok(())
+}
+
 pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult {
     let mut d = Decoder::new(body);
     let flexible = version >= 9;
@@ -161,6 +168,7 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult 
     if flexible {
         produce_decode!(acks_read, d.read_tagged_fields());
     }
+    produce_decode!(acks_read, ensure_body_exhausted(&d));
 
     ProduceDecodeResult::Ok(ProduceRequest {
         transactional_id,
@@ -281,10 +289,11 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
 
     // forgotten_topics_data (v7+) - skip
     if version >= 7 {
+        // forgottenTopicsData is nullable on the wire in practice (null = none forgotten).
         let forgotten_count = if flexible {
-            d.read_compact_array_count()?
+            d.read_compact_array_count_nullable()?
         } else {
-            d.read_i32_array_count()?
+            d.read_i32_array_count_nullable()?
         };
         for _ in 0..forgotten_count {
             if flexible {
@@ -316,6 +325,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
     if flexible {
         d.read_tagged_fields()?;
     }
+    ensure_body_exhausted(&d)?;
 
     Ok(FetchRequest {
         max_wait_ms,
@@ -412,6 +422,7 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
     if flexible {
         d.read_tagged_fields()?;
     }
+    ensure_body_exhausted(&d)?;
 
     Ok(ListOffsetsRequest {
         isolation_level,
@@ -432,6 +443,11 @@ pub struct CreatableTopic {
     pub name: String,
     pub num_partitions: i32,
     pub replication_factor: i16,
+    /// True when the request included a non-empty manual partition assignment.
+    /// KIP-464: on v2/v3, `num_partitions = -1` / `replication_factor = -1` are valid
+    /// only when assignments are present; v4+ allows them as broker-default sentinels
+    /// even without assignments.
+    pub has_assignments: bool,
 }
 
 /// Decodes a raw byte stream into a `CreateTopicsRequest`.
@@ -462,12 +478,13 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
         let num_partitions = d.read_i32()?;
         let replication_factor = d.read_i16()?;
 
-        // assignments (COMPACT_ARRAY or ARRAY) - skip
+        // assignments (COMPACT_ARRAY or ARRAY)
         let assignments_count = if flexible {
             d.read_compact_array_count()?
         } else {
             d.read_i32_array_count()?
         };
+        let has_assignments = assignments_count > 0;
         for _ in 0..assignments_count {
             d.read_i32()?; // partition_index
             let replicas_count = if flexible {
@@ -504,6 +521,7 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
             name,
             num_partitions,
             replication_factor,
+            has_assignments,
         });
 
         if flexible {
@@ -517,6 +535,7 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
     if flexible {
         d.read_tagged_fields()?;
     }
+    ensure_body_exhausted(&d)?;
 
     Ok(CreateTopicsRequest {
         topics,

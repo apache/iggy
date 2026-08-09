@@ -668,6 +668,11 @@ async fn connect(host: &str) -> Result<TcpStream> {
         .with_context(|| format!("Cannot connect to {host}"))
 }
 
+/// Cap on Kafka response frames accepted by the tool. Matches the gateway's default
+/// `max_frame_size` so a misconfigured/malicious endpoint cannot force a multi-GiB alloc
+/// from a forged 4-byte length prefix.
+const MAX_RESPONSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 async fn read_kafka_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut lb = [0u8; 4];
     stream.read_exact(&mut lb).await?;
@@ -678,16 +683,30 @@ async fn read_kafka_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>>
             format!("invalid response frame length: {frame_len}"),
         ));
     }
-    let mut body = vec![
-        0u8;
-        usize::try_from(frame_len).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "response frame length does not fit usize",
-            )
-        })?
-    ];
-    stream.read_exact(&mut body).await?;
+    let frame_len = usize::try_from(frame_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response frame length does not fit usize",
+        )
+    })?;
+    if frame_len > MAX_RESPONSE_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("response frame length {frame_len} exceeds max {MAX_RESPONSE_FRAME_BYTES}"),
+        ));
+    }
+    // Grow incrementally so a large declared length cannot force a full reservation before
+    // any body bytes arrive (same amplification class the gateway `read_frame` avoids).
+    const CHUNK: usize = 65_536;
+    let mut body = Vec::with_capacity(frame_len.min(CHUNK));
+    let mut remaining = frame_len;
+    while remaining > 0 {
+        let chunk = remaining.min(CHUNK);
+        let start = body.len();
+        body.resize(start + chunk, 0);
+        stream.read_exact(&mut body[start..start + chunk]).await?;
+        remaining -= chunk;
+    }
     Ok(body)
 }
 

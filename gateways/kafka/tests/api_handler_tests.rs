@@ -32,15 +32,16 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
     handle_request, is_supported_version, supported_api_ranges,
 };
-use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
+use iggy_gateway_kafka::protocol::codec::Decoder;
 use iggy_gateway_kafka::protocol::requests::{ProduceDecodeResult, decode_produce_request};
 
 use fixtures::load_fixture_body_or_skip;
 use scope::default_broker;
 use tcp::{build_metadata_legacy_request, build_produce_v3_body};
 use wire::{
+    build_api_versions_flexible_request, build_metadata_all_topics_legacy,
     build_metadata_flexible_request, build_metadata_flexible_request_v10,
-    build_produce_legacy_request,
+    build_metadata_legacy_request_for_version, build_produce_legacy_request,
 };
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
@@ -72,8 +73,13 @@ fn api_versions_v1_response_non_flexible_format() {
 
 #[test]
 fn api_versions_v3_response_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
+    let body = handle_request(
+        API_KEY_API_VERSIONS,
+        3,
+        build_api_versions_flexible_request("apache-iggy", "0.1.0"),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -103,8 +109,13 @@ fn api_versions_v3_response_flexible_format() {
 
 #[test]
 fn metadata_response_has_broker_array_and_topic_array() {
-    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        build_metadata_all_topics_legacy(0),
+        &default_broker(),
+    )
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let broker_count = d.read_i32().unwrap();
@@ -118,6 +129,22 @@ fn metadata_response_has_broker_array_and_topic_array() {
 
     let topic_count = d.read_i32().unwrap();
     assert_eq!(topic_count, 0);
+}
+
+#[test]
+fn metadata_empty_body_closes_connection() {
+    assert!(
+        handle_request(API_KEY_METADATA, 0, Bytes::new(), &default_broker()).is_close(),
+        "empty Metadata body is malformed, not all-topics"
+    );
+}
+
+#[test]
+fn api_versions_v3_empty_body_returns_invalid_request() {
+    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker())
+        .expect_response("ApiVersions has a top-level error_code");
+    let mut d = Decoder::new(body);
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
 #[test]
@@ -251,24 +278,20 @@ fn create_topics_malformed_body_returns_invalid_request() {
 }
 
 #[test]
-fn metadata_null_topic_name_yields_zero_topics() {
-    let body = handle_request(
-        API_KEY_METADATA,
-        0,
-        Bytes::from_static(&[
-            0x00, 0x00, 0x00, 0x01, // one topic
-            0xff, 0xff, // null topic name
-        ]),
-        &default_broker(),
-    )
-    .expect_response("metadata request should still return response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    d.read_i32().unwrap();
-    d.read_nullable_string().unwrap();
-    d.read_i32().unwrap();
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.remaining(), 0);
+fn metadata_null_topic_name_closes_connection() {
+    assert!(
+        handle_request(
+            API_KEY_METADATA,
+            0,
+            Bytes::from_static(&[
+                0x00, 0x00, 0x00, 0x01, // one topic
+                0xff, 0xff, // null topic name
+            ]),
+            &default_broker(),
+        )
+        .is_close(),
+        "null topic name cannot be echoed in a Metadata response"
+    );
 }
 
 // ── Full handler regression - every scoped API key x version through `handle_request` ──
@@ -276,10 +299,30 @@ fn metadata_null_topic_name_yields_zero_topics() {
 #[test]
 fn handle_request_succeeds_for_every_supported_version_with_fixture() {
     for &(api_key, name, min_ver, max_ver) in scope::SCOPED_API_KEYS {
-        if api_key == 3 || api_key == 18 {
-            // Metadata / ApiVersions: empty body is valid
+        if api_key == API_KEY_METADATA {
             for version in min_ver..=max_ver {
-                let resp = handle_request(api_key, version, bytes::Bytes::new(), &default_broker())
+                let body = if version >= 9 {
+                    wire::build_metadata_all_topics_flexible(version)
+                } else {
+                    build_metadata_all_topics_legacy(version)
+                };
+                let resp = handle_request(api_key, version, body, &default_broker())
+                    .expect_response("test request has acks != 0 and expects a response");
+                assert!(
+                    !resp.is_empty(),
+                    "{name} v{version} returned empty response"
+                );
+            }
+            continue;
+        }
+        if api_key == API_KEY_API_VERSIONS {
+            for version in min_ver..=max_ver {
+                let body = if version >= 3 {
+                    build_api_versions_flexible_request("iggy-test", "0.1.0")
+                } else {
+                    Bytes::new()
+                };
+                let resp = handle_request(api_key, version, body, &default_broker())
                     .expect_response("test request has acks != 0 and expects a response");
                 assert!(
                     !resp.is_empty(),
@@ -404,24 +447,18 @@ fn synthetic_topic_name(i: i32) -> String {
     format!("topic-{i}")
 }
 
-fn metadata_request_legacy(topic_count: i32) -> Bytes {
-    let mut enc = Encoder::with_capacity(64);
-    enc.write_i32(topic_count);
-    for i in 0..topic_count {
-        enc.write_nullable_string(Some(&synthetic_topic_name(i)))
-            .expect("topic name fits");
-    }
-    enc.freeze()
+fn metadata_request_legacy(version: i16, topic_count: i32) -> Bytes {
+    let names: Vec<String> = (0..topic_count).map(synthetic_topic_name).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    build_metadata_legacy_request_for_version(version, &refs)
 }
 
 fn metadata_request_flexible(topic_count: usize) -> Bytes {
-    let mut enc = Encoder::with_capacity(64);
-    enc.write_varint((topic_count + 1) as u64);
-    for i in 0..topic_count {
-        enc.write_compact_nullable_string(Some(&synthetic_topic_name(i32::try_from(i).unwrap())));
-        enc.write_empty_tagged_fields();
-    }
-    enc.freeze()
+    let names: Vec<String> = (0..topic_count)
+        .map(|i| synthetic_topic_name(i32::try_from(i).unwrap()))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    build_metadata_flexible_request(&refs)
 }
 
 fn read_broker_legacy(d: &mut Decoder) -> (String, i32) {
@@ -445,18 +482,17 @@ fn read_broker_flexible(d: &mut Decoder) -> (String, i32) {
 }
 
 #[test]
-fn metadata_corrupt_partial_body_returns_zero_topics() {
-    let body = handle_request(
-        API_KEY_METADATA,
-        0,
-        Bytes::from_static(&[0x00, 0x00]),
-        &default_broker(),
-    )
-    .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    let _ = read_broker_legacy(&mut d);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.remaining(), 0);
+fn metadata_corrupt_partial_body_closes_connection() {
+    assert!(
+        handle_request(
+            API_KEY_METADATA,
+            0,
+            Bytes::from_static(&[0x00, 0x00]),
+            &default_broker(),
+        )
+        .is_close(),
+        "truncated Metadata body must close; there is no top-level error field"
+    );
 }
 
 #[test]
@@ -464,7 +500,7 @@ fn metadata_v0_empty_topics_stub_broker() {
     let body = handle_request(
         API_KEY_METADATA,
         0,
-        metadata_request_legacy(0),
+        metadata_request_legacy(0, 0),
         &default_broker(),
     )
     .expect_response("test request has acks != 0 and expects a response");
@@ -485,7 +521,7 @@ fn metadata_v0_three_topics_each_unknown() {
     let body = handle_request(
         API_KEY_METADATA,
         0,
-        metadata_request_legacy(3),
+        metadata_request_legacy(0, 3),
         &default_broker(),
     )
     .expect_response("test request has acks != 0 and expects a response");
@@ -507,7 +543,7 @@ fn metadata_v1_includes_controller_id() {
     let body = handle_request(
         API_KEY_METADATA,
         1,
-        metadata_request_legacy(0),
+        metadata_request_legacy(1, 0),
         &default_broker(),
     )
     .expect_response("test request has acks != 0 and expects a response");
@@ -524,7 +560,7 @@ fn metadata_v2_includes_cluster_id_field() {
     let body = handle_request(
         API_KEY_METADATA,
         2,
-        metadata_request_legacy(0),
+        metadata_request_legacy(2, 0),
         &default_broker(),
     )
     .expect_response("test request has acks != 0 and expects a response");
@@ -542,7 +578,7 @@ fn metadata_all_legacy_versions_produce_valid_response() {
         let body = handle_request(
             API_KEY_METADATA,
             version,
-            metadata_request_legacy(1),
+            metadata_request_legacy(version, 1),
             &default_broker(),
         )
         .expect_response("test request has acks != 0 and expects a response");
@@ -607,7 +643,7 @@ fn metadata_v8_includes_authorized_operations_legacy() {
     let body = handle_request(
         API_KEY_METADATA,
         8,
-        metadata_request_legacy(1),
+        metadata_request_legacy(8, 1),
         &default_broker(),
     )
     .expect_response("test request has acks != 0 and expects a response");
@@ -772,10 +808,10 @@ fn metadata_v3_includes_throttle_time_ms_before_brokers() {
     let body = handle_request(
         API_KEY_METADATA,
         3,
-        build_metadata_legacy_request(&[]),
+        build_metadata_legacy_request_for_version(3, &[]),
         &default_broker(),
     )
-    .expect_response("test request has acks != 0 and expects a response");
+    .expect_response("metadata v3 empty topics must succeed");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0, "throttle_time_ms");
 }

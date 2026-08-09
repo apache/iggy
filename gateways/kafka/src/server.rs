@@ -24,6 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::time::{timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
@@ -157,6 +158,9 @@ impl KafkaServer {
 
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
+        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits
+        // until `idle_timeout` (or forever if that is raised).
+        let cancel = CancellationToken::new();
 
         let drain_timeout = self.config.shutdown_drain_timeout;
 
@@ -166,17 +170,17 @@ impl KafkaServer {
                     match result {
                         Ok(()) => {
                             info!("kafka listener shutdown requested");
-                            drain(&tracker, drain_timeout).await;
+                            drain(&tracker, &cancel, drain_timeout).await;
                             break;
                         }
                         // Capacity-1 channel: lagged means a signal was sent before we polled - treat as shutdown.
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             info!("kafka listener shutdown requested (lagged)");
-                            drain(&tracker, drain_timeout).await;
+                            drain(&tracker, &cancel, drain_timeout).await;
                             break;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            drain(&tracker, drain_timeout).await;
+                            drain(&tracker, &cancel, drain_timeout).await;
                             break;
                         }
                     }
@@ -196,9 +200,12 @@ impl KafkaServer {
                             }
                             let cfg = Arc::clone(&self.config);
                             let broker = Arc::clone(&broker);
+                            let conn_cancel = cancel.child_token();
                             tracker.spawn(async move {
                                 let _permit = permit;
-                                if let Err(err) = handle_connection(stream, cfg, peer, broker).await {
+                                if let Err(err) =
+                                    handle_connection(stream, cfg, peer, broker, conn_cancel).await
+                                {
                                     warn!(%peer, "connection closed with error: {err}");
                                 }
                             });
@@ -211,7 +218,7 @@ impl KafkaServer {
                             warn!(%e, "transient accept error, continuing");
                         }
                         Err(e) => {
-                            drain(&tracker, drain_timeout).await;
+                            drain(&tracker, &cancel, drain_timeout).await;
                             return Err(e.into());
                         }
                     }
@@ -223,15 +230,16 @@ impl KafkaServer {
     }
 }
 
-/// Close the tracker to new spawns and wait for in-flight connections to finish, but not past
-/// `deadline` - an idle connection can otherwise hold shutdown open for up to `idle_timeout`
-/// (10 minutes by default), past typical orchestrator grace periods.
-async fn drain(tracker: &TaskTracker, deadline: Duration) {
+/// Cancel in-flight connections, close the tracker to new spawns, and wait for tasks to finish
+/// (bounded by `deadline`). Cancellation is what actually drops idle sockets; `tracker.wait`
+/// alone would leave tasks parked in `read_frame` until `idle_timeout`.
+async fn drain(tracker: &TaskTracker, cancel: &CancellationToken, deadline: Duration) {
+    cancel.cancel();
     tracker.close();
     if timeout(deadline, tracker.wait()).await.is_err() {
         warn!(
             ?deadline,
-            "shutdown drain deadline exceeded; abandoning in-flight connections"
+            "shutdown drain deadline exceeded; remaining connection tasks will be dropped with the runtime"
         );
     }
 }
@@ -258,27 +266,13 @@ async fn handle_connection(
     config: Arc<ServerConfig>,
     peer: SocketAddr,
     broker: Arc<BrokerAdvertise>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     debug!(%peer, "connection accepted");
 
     loop {
-        let frame = match read_frame(
-            &mut stream,
-            config.max_frame_size,
-            config.idle_timeout,
-            config.read_timeout,
-        )
-        .await
-        {
-            Ok(f) => f,
-            Err(KafkaProtocolError::Io(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
-            {
-                info!(%peer, "connection closed by client");
-                return Ok(());
-            }
-            Err(e) => return Err(e),
+        let Some(frame) = read_next_frame(&mut stream, &config, &peer, &cancel).await? else {
+            return Ok(());
         };
 
         if frame.len() < 8 {
@@ -309,41 +303,94 @@ async fn handle_connection(
 
         let body = decoder.read_bytes(decoder.remaining())?;
         let outcome = handle_request(req.api_key, req.api_version, body, &broker);
-        match outcome {
-            HandleOutcome::NoResponse => {
-                // Produce with acks=0: the wire protocol forbids a response.
-            }
-            HandleOutcome::Close => {
-                warn!(
-                    %peer,
-                    api_key = req.api_key,
-                    api_version = req.api_version,
-                    "closing connection: no parseable response for this request"
-                );
-                return Ok(());
-            }
-            HandleOutcome::Respond(body_response) => {
-                let resp_header = ResponseHeader {
-                    correlation_id: req.correlation_id,
-                };
-                send_response(
-                    &mut stream,
-                    &resp_header,
-                    resp_hdr_ver,
-                    body_response,
-                    config.write_timeout,
-                )
-                .await?;
-            }
+        if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
+            return Ok(());
         }
     }
 }
 
-/// Write a single length-prefixed Kafka frame.
-///
-/// The length prefix and header are built in a small buffer, then chained with the already-owned
-/// `body` so `write_all_buf` streams both without copying the body. The whole frame is written
-/// before returning (or the connection errors), so no partial frame ever precedes the next one.
+/// Returns `Ok(None)` when shutdown cancellation wins; `Ok(Some(frame))` on a full frame.
+async fn read_next_frame(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    peer: &SocketAddr,
+    cancel: &CancellationToken,
+) -> Result<Option<bytes::Bytes>> {
+    tokio::select! {
+        () = cancel.cancelled() => {
+            debug!(%peer, "connection cancelled by shutdown");
+            Ok(None)
+        }
+        result = read_frame(
+            stream,
+            config.max_frame_size,
+            config.idle_timeout,
+            config.read_timeout,
+        ) => match result {
+            Ok(frame) => Ok(Some(frame)),
+            Err(KafkaProtocolError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                info!(%peer, "connection closed by client");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Applies a [`HandleOutcome`]. Returns `true` when the connection should close.
+async fn dispatch_outcome(
+    stream: &mut TcpStream,
+    peer: &SocketAddr,
+    config: &ServerConfig,
+    req: &RequestHeader,
+    resp_hdr_ver: i16,
+    outcome: HandleOutcome,
+) -> Result<bool> {
+    let close_after_response = matches!(outcome, HandleOutcome::RespondAndClose(_));
+    match outcome {
+        HandleOutcome::NoResponse => {
+            // Produce with acks=0: the wire protocol forbids a response.
+            Ok(false)
+        }
+        HandleOutcome::Close => {
+            warn!(
+                %peer,
+                api_key = req.api_key,
+                api_version = req.api_version,
+                "closing connection: no parseable error response for this request version"
+            );
+            Ok(true)
+        }
+        HandleOutcome::Respond(body_response) | HandleOutcome::RespondAndClose(body_response) => {
+            let resp_header = ResponseHeader {
+                correlation_id: req.correlation_id,
+            };
+            send_response(
+                stream,
+                &resp_header,
+                resp_hdr_ver,
+                &body_response,
+                config.write_timeout,
+            )
+            .await?;
+            if close_after_response {
+                warn!(
+                    %peer,
+                    api_key = req.api_key,
+                    api_version = req.api_version,
+                    "closing connection after unsupported-version error response"
+                );
+            }
+            Ok(close_after_response)
+        }
+    }
+}
+
+/// Write a single length-prefixed Kafka frame using one allocation.
+/// Avoids the separate header-encode + payload-concat + length-prefix allocations.
 async fn send_response(
     stream: &mut TcpStream,
     header: &ResponseHeader,
@@ -572,17 +619,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
         let server = KafkaServer::new(ServerConfig {
-            // Idle timeout is intentionally long - the drain deadline, not the idle timeout,
-            // must be what bounds shutdown here.
+            // Idle timeout is intentionally long - cancellation + drain deadline, not the
+            // idle timeout, must bound shutdown here.
             idle_timeout: Duration::from_mins(10),
-            shutdown_drain_timeout: Duration::from_millis(100),
+            shutdown_drain_timeout: Duration::from_millis(200),
             ..ServerConfig::default()
         });
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
-        // Held open, never sends a frame: the in-flight connection task is parked in
-        // read_frame's idle wait for the full 600s idle_timeout unless drain cuts it short.
-        let _held = TcpStream::connect(addr).await.unwrap();
+        // Held open, never sends a frame: without cancellation the task would park in
+        // read_frame's idle wait for the full 600s idle_timeout.
+        let mut held = TcpStream::connect(addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         tx.send(()).unwrap();
@@ -591,6 +638,14 @@ mod tests {
             .expect("shutdown must return well within the 600s idle_timeout")
             .unwrap();
         assert!(result.is_ok());
+
+        // Cancellation must close the held socket so the client sees EOF, not a silent stall.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), held.read(&mut buf))
+            .await
+            .expect("held connection must be closed on shutdown")
+            .unwrap();
+        assert_eq!(n, 0, "shutdown must deliver EOF to idle clients");
     }
 
     #[tokio::test]

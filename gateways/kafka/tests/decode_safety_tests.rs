@@ -30,10 +30,31 @@ use iggy_gateway_kafka::protocol::requests::{
 };
 
 #[test]
-fn compact_array_varint_zero_decodes_as_empty_without_panic() {
-    // Per Kafka spec, compact-array varint=0 means null/absent → 0 elements (not an error).
+fn compact_array_varint_zero_rejected_on_non_nullable_array() {
+    // Compact-array varint=0 is Kafka's null encoding; required (non-nullable) arrays reject it.
     let mut d = Decoder::new(Bytes::from_static(&[0x00]));
-    assert_eq!(d.read_compact_array_count().unwrap(), 0);
+    let err = d.read_compact_array_count().unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::NullCompactArray));
+}
+
+#[test]
+fn compact_array_varint_zero_nullable_decodes_as_empty() {
+    let mut d = Decoder::new(Bytes::from_static(&[0x00]));
+    assert_eq!(d.read_compact_array_count_nullable().unwrap(), 0);
+}
+
+#[test]
+fn produce_decoder_rejects_trailing_bytes_after_valid_body() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(-1_i16).to_be_bytes()); // null transactional_id (legacy)
+    body.extend_from_slice(&1_i16.to_be_bytes()); // acks
+    body.extend_from_slice(&1000_i32.to_be_bytes()); // timeout_ms
+    body.extend_from_slice(&0_i32.to_be_bytes()); // empty topics
+    body.push(0xFF); // trailing garbage
+    let err = decode_produce_request(3, Bytes::from(body))
+        .into_request()
+        .unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::UnexpectedTrailingBytes));
 }
 
 #[test]

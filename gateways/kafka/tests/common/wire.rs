@@ -47,32 +47,86 @@ pub const FLEXIBLE_FROM_VERSION: &[(i16, i16)] = &[
     (19, 5), // CreateTopics
 ];
 
-/// Metadata v9+ flexible request listing topic names (compact strings).
+/// Append Metadata request fields that follow the topics array for `version`.
+fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
+    if version >= 4 {
+        enc.write_bool(true); // allow_auto_topic_creation
+    }
+    // include_cluster_authorized_operations exists on v8–v10 only (removed in v11).
+    if (8..=10).contains(&version) {
+        enc.write_bool(false);
+    }
+    if version >= 8 {
+        enc.write_bool(false); // include_topic_authorized_operations
+    }
+    if version >= 9 {
+        enc.write_empty_tagged_fields();
+    }
+}
+
+/// Metadata v9 flexible request listing topic names (compact strings).
 ///
 /// Each topic entry is its own tagged struct per the Kafka protocol schema
 /// (`topics => name TAG_BUFFER`), so the per-topic tag buffer is written
 /// right after each name, not once for the whole array.
 pub fn build_metadata_flexible_request(topic_names: &[&str]) -> Bytes {
-    let mut enc = Encoder::with_capacity(64);
+    build_metadata_flexible_request_for_version(9, topic_names)
+}
+
+/// Metadata flexible request for a specific version (v9+).
+pub fn build_metadata_flexible_request_for_version(version: i16, topic_names: &[&str]) -> Bytes {
+    let mut enc = Encoder::with_capacity(96);
     enc.write_varint((topic_names.len() + 1) as u64);
     for name in topic_names {
+        if version >= 10 {
+            enc.write_bytes(&[0u8; 16]);
+        }
         enc.write_compact_nullable_string(Some(name));
         enc.write_empty_tagged_fields();
     }
-    enc.write_empty_tagged_fields();
+    write_metadata_request_trailer(&mut enc, version);
     enc.freeze()
 }
 
 /// Metadata v10+ flexible request: each topic entry includes a 16-byte `topic_id` before `name`.
 pub fn build_metadata_flexible_request_v10(topic_names: &[&str]) -> Bytes {
-    let mut enc = Encoder::with_capacity(96);
-    enc.write_varint((topic_names.len() + 1) as u64);
-    for name in topic_names {
-        enc.write_bytes(&[0u8; 16]);
-        enc.write_compact_nullable_string(Some(name));
-        enc.write_empty_tagged_fields();
-    }
+    build_metadata_flexible_request_for_version(10, topic_names)
+}
+
+/// `ApiVersions` v3+ flexible body (`ClientSoftwareName`, `ClientSoftwareVersion`, tagged fields).
+pub fn build_api_versions_flexible_request(software_name: &str, software_version: &str) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_compact_nullable_string(Some(software_name));
+    enc.write_compact_nullable_string(Some(software_version));
     enc.write_empty_tagged_fields();
+    enc.freeze()
+}
+
+/// Legacy Metadata request body for a specific version (v0–v8).
+pub fn build_metadata_legacy_request_for_version(version: i16, topic_names: &[&str]) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_i32(i32::try_from(topic_names.len()).expect("topic name count fits i32"));
+    for name in topic_names {
+        enc.write_nullable_string(Some(name))
+            .expect("topic name fits");
+    }
+    write_metadata_request_trailer(&mut enc, version);
+    enc.freeze()
+}
+
+/// Legacy Metadata "all topics" body (`topics = null` / `-1`) for a specific version.
+pub fn build_metadata_all_topics_legacy(version: i16) -> Bytes {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_i32(-1);
+    write_metadata_request_trailer(&mut enc, version);
+    enc.freeze()
+}
+
+/// Flexible Metadata "all topics" body (`topics` compact null / varint `0`).
+pub fn build_metadata_all_topics_flexible(version: i16) -> Bytes {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_varint(0); // null compact array → all topics
+    write_metadata_request_trailer(&mut enc, version);
     enc.freeze()
 }
 

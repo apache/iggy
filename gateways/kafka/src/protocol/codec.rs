@@ -156,8 +156,8 @@ impl Decoder {
 
     /// Legacy nullable array length: signed i32 count, where -1 is the spec-defined null
     /// (`all items`) sentinel - used by Metadata's `topics` field to mean "all topics" - treated
-    /// as empty (0 elements) rather than an error, mirroring how `read_compact_array_count`
-    /// treats a null compact array.
+    /// as empty (0 elements) rather than an error, mirroring
+    /// [`Self::read_compact_array_count_nullable`].
     pub fn read_i32_array_count_nullable(&mut self) -> Result<usize> {
         let n = self.read_i32()?;
         if n == -1 {
@@ -179,14 +179,30 @@ impl Decoder {
         Ok(count)
     }
 
-    /// Compact array length: unsigned varint holding `element_count + 1`.
-    /// Per the Kafka spec, varint=0 encodes a null (absent) array; treat as empty (0 elements)
-    /// so optional fields like `forgotten_topics` are skipped rather than rejected.
+    /// Compact array length for a **non-nullable** field: unsigned varint holding
+    /// `element_count + 1`. Varint `0` is Kafka's null encoding and is rejected here —
+    /// required arrays (Produce/Fetch/ListOffsets/CreateTopics topic data, nested partitions,
+    /// etc.) must use `1` for empty.
     pub fn read_compact_array_count(&mut self) -> Result<usize> {
+        let n = self.read_varint()?;
+        if n == 0 {
+            return Err(KafkaProtocolError::NullCompactArray);
+        }
+        Self::compact_array_count_from_len_plus_one(n)
+    }
+
+    /// Compact array length for a **nullable** field: varint `0` means null/absent and is
+    /// returned as 0 elements (e.g. Metadata topics = "all topics", Fetch forgotten topics
+    /// when a client encodes null).
+    pub fn read_compact_array_count_nullable(&mut self) -> Result<usize> {
         let n = self.read_varint()?;
         if n == 0 {
             return Ok(0);
         }
+        Self::compact_array_count_from_len_plus_one(n)
+    }
+
+    fn compact_array_count_from_len_plus_one(n: u64) -> Result<usize> {
         let count = usize::try_from(n - 1).map_err(|_| KafkaProtocolError::CollectionTooLarge {
             count: MAX_COLLECTION_LEN + 1,
             max: MAX_COLLECTION_LEN,
@@ -242,6 +258,12 @@ impl Decoder {
             .to_owned();
         self.bytes.advance(len);
         Ok(Some(s))
+    }
+
+    /// Non-nullable compact string (flexible versions): varint(len+1), never null.
+    pub fn read_compact_string(&mut self) -> Result<String> {
+        self.read_compact_nullable_string()?
+            .ok_or(KafkaProtocolError::NullCompactString)
     }
 
     /// Legacy nullable bytes: i32 length prefix (-1 = null).

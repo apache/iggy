@@ -37,6 +37,7 @@ fn create_topics_response_flags_non_positive_partition_count_v2() {
             name: "bad-topic".to_string(),
             num_partitions: 0,
             replication_factor: 1,
+            has_assignments: false,
         }],
         timeout_ms: 5_000,
         validate_only: false,
@@ -59,6 +60,7 @@ fn create_topics_v5_broker_default_partitions_is_not_invalid_partitions() {
             name: "default-parts".to_string(),
             num_partitions: -1,
             replication_factor: 2,
+            has_assignments: false,
         }],
         timeout_ms: 5_000,
         validate_only: true,
@@ -84,6 +86,7 @@ fn create_topics_v5_flags_zero_and_below_minus_one_partition_count() {
                 name: "bad-parts".to_string(),
                 num_partitions,
                 replication_factor: 1,
+                has_assignments: false,
             }],
             timeout_ms: 5_000,
             validate_only: false,
@@ -111,6 +114,7 @@ fn create_topics_v5_flags_invalid_replication_factor() {
                 name: "bad-rf".to_string(),
                 num_partitions: 1,
                 replication_factor,
+                has_assignments: false,
             }],
             timeout_ms: 5_000,
             validate_only: false,
@@ -132,12 +136,13 @@ fn create_topics_v5_flags_invalid_replication_factor() {
 
 #[test]
 fn create_topics_v2_rejects_broker_default_sentinel() {
-    // KIP-464 defaults apply from v4; on v2, -1 is still INVALID_PARTITIONS.
+    // KIP-464 defaults apply from v4; on v2 without assignments, -1 is INVALID_PARTITIONS.
     let req = CreateTopicsRequest {
         topics: vec![CreatableTopic {
             name: "legacy".to_string(),
             num_partitions: -1,
             replication_factor: 1,
+            has_assignments: false,
         }],
         timeout_ms: 5_000,
         validate_only: false,
@@ -150,6 +155,29 @@ fn create_topics_v2_rejects_broker_default_sentinel() {
         Some("legacy".to_string())
     );
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_PARTITIONS);
+}
+
+#[test]
+fn create_topics_v2_with_assignments_allows_broker_default_sentinels() {
+    // KIP-464: on v2/v3, -1 partitions/replication are valid when assignments are present.
+    let req = CreateTopicsRequest {
+        topics: vec![CreatableTopic {
+            name: "assigned".to_string(),
+            num_partitions: -1,
+            replication_factor: -1,
+            has_assignments: true,
+        }],
+        timeout_ms: 5_000,
+        validate_only: false,
+    };
+    let mut d = Decoder::new(encode_create_topics_response(2, &req));
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i32().unwrap(), 1);
+    assert_eq!(
+        d.read_nullable_string().unwrap(),
+        Some("assigned".to_string())
+    );
+    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
 }
 
 #[test]

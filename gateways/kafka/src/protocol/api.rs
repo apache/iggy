@@ -177,10 +177,9 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
         ProduceDecodeResult::Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
         ProduceDecodeResult::Ok(req) => {
             if !is_supported_version(API_KEY_PRODUCE, api_version) {
-                return HandleOutcome::Respond(encode_produce_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ));
+                return unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
+                    encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
+                });
             }
             HandleOutcome::Respond(encode_produce_response(api_version, &req))
         }
@@ -211,12 +210,16 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
             error,
         } => {
             tracing::warn!("Failed to decode Produce request: {:?}", error);
-            let code = if is_supported_version(API_KEY_PRODUCE, api_version) {
-                ERROR_INVALID_REQUEST
+            if is_supported_version(API_KEY_PRODUCE, api_version) {
+                HandleOutcome::Respond(encode_produce_error_response(
+                    api_version,
+                    ERROR_INVALID_REQUEST,
+                ))
             } else {
-                ERROR_UNSUPPORTED_VERSION
-            };
-            HandleOutcome::Respond(encode_produce_error_response(api_version, code))
+                unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
+                    encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
+                })
+            }
         }
     }
 }
@@ -228,100 +231,140 @@ fn handle_other_request(
     broker: &BrokerAdvertise,
 ) -> HandleOutcome {
     match api_key {
-        API_KEY_API_VERSIONS => {
-            if is_supported_version(api_key, api_version) {
-                HandleOutcome::Respond(encode_api_versions_response(api_version, ERROR_NONE))
-            } else {
-                // KIP-511: reply with v0 when the requested version is not understood.
-                HandleOutcome::Respond(encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION))
-            }
-        }
-        API_KEY_METADATA => {
-            if is_supported_version(api_key, api_version) {
-                HandleOutcome::Respond(encode_metadata_response(
-                    api_version,
-                    api_version,
-                    body,
-                    broker,
-                    ERROR_NONE,
-                ))
-            } else {
-                // Clamping the response to MAX_SUPPORTED_METADATA_VERSION leaves a body the
-                // client parses at its own (unsupported) version, so UNSUPPORTED_VERSION never
-                // survives. Clients that skip ApiVersions get a naked close instead.
-                tracing::warn!(
-                    api_version,
-                    max_supported = supported_max_version(API_KEY_METADATA),
-                    "Metadata version unsupported; closing connection"
-                );
-                HandleOutcome::Close
-            }
-        }
-        API_KEY_FETCH => {
-            if is_supported_version(api_key, api_version) {
-                match decode_fetch_request(api_version, body) {
-                    Ok(req) => HandleOutcome::Respond(encode_fetch_response(api_version, &req)),
-                    Err(e) => {
-                        tracing::warn!("Failed to decode Fetch request: {:?}", e);
-                        HandleOutcome::Respond(encode_fetch_error_response(
-                            api_version,
-                            ERROR_INVALID_REQUEST,
-                        ))
-                    }
-                }
-            } else {
-                HandleOutcome::Respond(encode_fetch_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
-            }
-        }
-        API_KEY_LIST_OFFSETS => {
-            if is_supported_version(api_key, api_version) {
-                match decode_list_offsets_request(api_version, body) {
-                    Ok(req) => {
-                        HandleOutcome::Respond(encode_list_offsets_response(api_version, &req))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to decode ListOffsets request: {:?}", e);
-                        HandleOutcome::Respond(encode_list_offsets_error_response(
-                            api_version,
-                            ERROR_INVALID_REQUEST,
-                        ))
-                    }
-                }
-            } else {
-                HandleOutcome::Respond(encode_list_offsets_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
-            }
-        }
-        API_KEY_CREATE_TOPICS => {
-            if is_supported_version(api_key, api_version) {
-                match decode_create_topics_request(api_version, body) {
-                    Ok(req) => {
-                        HandleOutcome::Respond(encode_create_topics_response(api_version, &req))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to decode CreateTopics request: {:?}", e);
-                        HandleOutcome::Respond(encode_create_topics_error_response(
-                            api_version,
-                            ERROR_INVALID_REQUEST,
-                        ))
-                    }
-                }
-            } else {
-                HandleOutcome::Respond(encode_create_topics_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
-            }
-        }
-        // Unknown API key: no api-specific response schema exists, so any body we send is
-        // misparsed by the client against the schema it expected. Close is unambiguous.
-        _ => HandleOutcome::Close,
+        API_KEY_API_VERSIONS => handle_api_versions(api_version, &body),
+        API_KEY_METADATA => handle_metadata(api_version, body, broker),
+        API_KEY_FETCH => handle_versioned_request(
+            API_KEY_FETCH,
+            api_version,
+            body,
+            decode_fetch_request,
+            encode_fetch_response,
+            encode_fetch_error_response,
+            "Fetch",
+        ),
+        API_KEY_LIST_OFFSETS => handle_versioned_request(
+            API_KEY_LIST_OFFSETS,
+            api_version,
+            body,
+            decode_list_offsets_request,
+            encode_list_offsets_response,
+            encode_list_offsets_error_response,
+            "ListOffsets",
+        ),
+        API_KEY_CREATE_TOPICS => handle_versioned_request(
+            API_KEY_CREATE_TOPICS,
+            api_version,
+            body,
+            decode_create_topics_request,
+            encode_create_topics_response,
+            encode_create_topics_error_response,
+            "CreateTopics",
+        ),
+        _ => HandleOutcome::RespondAndClose(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
     }
+}
+
+fn handle_api_versions(api_version: i16, body: &Bytes) -> HandleOutcome {
+    if is_supported_version(API_KEY_API_VERSIONS, api_version) {
+        match decode_api_versions_request(api_version, body) {
+            Ok(()) => HandleOutcome::Respond(encode_api_versions_response(api_version, ERROR_NONE)),
+            Err(e) => {
+                tracing::warn!("Failed to decode ApiVersions request: {:?}", e);
+                HandleOutcome::Respond(encode_api_versions_response(
+                    api_version,
+                    ERROR_INVALID_REQUEST,
+                ))
+            }
+        }
+    } else {
+        // KIP-511: reply with v0 when the requested version is not understood.
+        HandleOutcome::Respond(encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION))
+    }
+}
+
+fn handle_metadata(api_version: i16, body: Bytes, broker: &BrokerAdvertise) -> HandleOutcome {
+    if !is_supported_version(API_KEY_METADATA, api_version) {
+        // Clamping the response to MAX_SUPPORTED_METADATA_VERSION leaves a body the
+        // client parses at its own (unsupported) version, so UNSUPPORTED_VERSION never
+        // survives. Clients that skip ApiVersions get a naked close instead.
+        tracing::warn!(
+            api_version,
+            max_supported = MAX_SUPPORTED_METADATA_VERSION,
+            "Metadata version unsupported; closing connection"
+        );
+        return HandleOutcome::Close;
+    }
+    match decode_metadata_request(api_version, body) {
+        Ok(topics) => HandleOutcome::Respond(encode_metadata_response(
+            api_version,
+            &topics,
+            broker,
+            ERROR_NONE,
+        )),
+        Err(e) => {
+            // Metadata has no top-level error field; a malformed body cannot carry
+            // INVALID_REQUEST in a version-correct way for every client. Close.
+            tracing::warn!(
+                ?e,
+                api_version,
+                "Failed to decode Metadata request; closing connection"
+            );
+            HandleOutcome::Close
+        }
+    }
+}
+
+fn handle_versioned_request<T>(
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+    decode: impl FnOnce(i16, Bytes) -> Result<T>,
+    encode_ok: impl FnOnce(i16, &T) -> Bytes,
+    encode_err: impl Fn(i16, i16) -> Bytes,
+    api_name: &str,
+) -> HandleOutcome {
+    if is_supported_version(api_key, api_version) {
+        match decode(api_version, body) {
+            Ok(req) => HandleOutcome::Respond(encode_ok(api_version, &req)),
+            Err(e) => {
+                tracing::warn!("Failed to decode {api_name} request: {:?}", e);
+                HandleOutcome::Respond(encode_err(api_version, ERROR_INVALID_REQUEST))
+            }
+        }
+    } else {
+        unsupported_version_response(api_key, api_version, |version| {
+            encode_err(version, ERROR_UNSUPPORTED_VERSION)
+        })
+    }
+}
+
+/// Unsupported-version policy for APIs whose encoders only implement up to
+/// [`ApiVersionRange::max_version`].
+///
+/// - `api_version > max`: Close. Encoding at the client's raw version would omit later-version
+///   fields (`CreateTopics` v7 `TopicId`, Produce v13 UUID topic, …) and the client could not
+///   parse the intended `UNSUPPORTED_VERSION` body.
+/// - `api_version < min` but still within encoder capability: Respond with an error shaped for
+///   that version (e.g. `ListOffsets` v0 `old_style_offsets`, Produce v0–2).
+fn unsupported_version_response(
+    api_key: i16,
+    api_version: i16,
+    encode: impl FnOnce(i16) -> Bytes,
+) -> HandleOutcome {
+    let max_version = SUPPORTED_RANGES
+        .iter()
+        .find(|r| r.api_key == api_key)
+        .map_or(0, |r| r.max_version);
+    if api_version > max_version {
+        tracing::warn!(
+            api_key,
+            api_version,
+            max_version,
+            "request version above encoder max; closing connection"
+        );
+        return HandleOutcome::Close;
+    }
+    HandleOutcome::Respond(encode(api_version))
 }
 
 #[must_use]
@@ -391,29 +434,18 @@ fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
 
 fn encode_metadata_response(
     response_version: i16,
-    decode_version: i16,
-    body: Bytes,
+    topics: &[String],
     broker: &BrokerAdvertise,
-    top_level_error_code: i16,
+    topic_error_override: i16,
 ) -> Bytes {
     let flexible = response_version >= 9;
-    // Empty body = all-topics request; 0 topics is correct for this stub.
-    // Non-empty body that fails to decode = malformed request; return 0 topics.
-    // Kafka Metadata response has no top-level error code field: errors are per-topic only.
-    // 0 topics is spec-correct and unambiguous for a decode failure.
-    let (topics, effective_error) = if body.is_empty() {
-        (Vec::new(), top_level_error_code)
-    } else {
-        decode_metadata_request_topics(body, decode_version)
-            .map_or((Vec::new(), ERROR_INVALID_REQUEST), |names| {
-                (names, top_level_error_code)
-            })
-    };
     let topics_count = topics.len();
-    let topic_error = if effective_error == ERROR_NONE {
+    // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
+    // or a forced override (unused today; kept for symmetry with other encoders).
+    let topic_error = if topic_error_override == ERROR_NONE {
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     } else {
-        effective_error
+        topic_error_override
     };
 
     let mut e = Encoder::with_capacity(256);
@@ -434,7 +466,7 @@ fn encode_metadata_response(
         e.write_i32(1); // controller_id (v1+)
 
         e.write_varint((topics_count + 1) as u64);
-        for name in &topics {
+        for name in topics {
             e.write_i16(topic_error);
             e.write_compact_nullable_string(Some(name));
             e.write_bool(false); // is_internal (v1+)
@@ -464,7 +496,7 @@ fn encode_metadata_response(
         }
 
         e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));
-        for name in &topics {
+        for name in topics {
             e.write_i16(topic_error);
             e.write_nullable_string_unchecked(Some(name));
             if response_version >= 1 {
@@ -483,17 +515,53 @@ fn encode_metadata_response(
     e.freeze()
 }
 
-/// Decodes the requested topic names from a Metadata request body so the
-/// response can echo them back; clients match metadata by name, not position.
+#[must_use]
+pub fn encode_error_only_response(error_code: i16) -> Bytes {
+    let mut e = Encoder::with_capacity(2);
+    e.write_i16(error_code);
+    e.freeze()
+}
+
+/// Decodes an `ApiVersions` request body.
 ///
-/// A null topics array - `-1` legacy count, or `varint=0` compact count - means "all topics"
-/// per the Kafka spec, not a malformed request; both decode to an empty list here since the
-/// stub doesn't implement real topic listing yet.
-pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> Result<Vec<String>> {
+/// v0–v2 have an empty body. v3+ requires `ClientSoftwareName`, `ClientSoftwareVersion`,
+/// and tagged fields (KIP-511 flexible encoding).
+fn decode_api_versions_request(api_version: i16, body: &Bytes) -> Result<()> {
+    if api_version < 3 {
+        if !body.is_empty() {
+            return Err(KafkaProtocolError::UnexpectedTrailingBytes);
+        }
+        return Ok(());
+    }
+    let mut d = Decoder::new(body.clone());
+    let _client_software_name = d.read_compact_string()?;
+    let _client_software_version = d.read_compact_string()?;
+    d.read_tagged_fields()?;
+    if d.remaining() != 0 {
+        return Err(KafkaProtocolError::UnexpectedTrailingBytes);
+    }
+    Ok(())
+}
+
+/// Decodes a Metadata request body so the response can echo topic names.
+///
+/// Every Metadata version requires at least the topics array count on the wire — an empty
+/// body is malformed, not "all topics". A null topics array (`-1` legacy / `varint=0`
+/// compact) means "all topics" and decodes to an empty list for this stub. Remaining
+/// version-gated fields (`AllowAutoTopicCreation`, authorized-ops flags, tagged fields)
+/// are consumed so truncated flexible bodies are rejected.
+pub(crate) fn decode_metadata_request(api_version: i16, body: Bytes) -> Result<Vec<String>> {
+    if body.is_empty() {
+        return Err(KafkaProtocolError::BufferUnderflow {
+            needed: 1,
+            remaining: 0,
+        });
+    }
     let mut d = Decoder::new(body);
     let flexible = api_version >= 9;
     let topics_count = if flexible {
-        d.read_compact_array_count()?
+        // Metadata topics is a nullable compact array ("all topics" when null).
+        d.read_compact_array_count_nullable()?
     } else {
         d.read_i32_array_count_nullable()?
     };
@@ -517,7 +585,32 @@ pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> R
         }
     }
 
+    // allow_auto_topic_creation (v4+)
+    if api_version >= 4 {
+        let _allow_auto_topic_creation = d.read_bool()?;
+    }
+    // include_cluster_authorized_operations (v8–v10; removed in v11)
+    if (8..=10).contains(&api_version) {
+        let _include_cluster_authorized_operations = d.read_bool()?;
+    }
+    // include_topic_authorized_operations (v8+)
+    if api_version >= 8 {
+        let _include_topic_authorized_operations = d.read_bool()?;
+    }
+    if flexible {
+        d.read_tagged_fields()?;
+    }
+    if d.remaining() != 0 {
+        return Err(KafkaProtocolError::UnexpectedTrailingBytes);
+    }
+
     Ok(topics)
+}
+
+/// Compatibility alias used by existing unit tests.
+#[cfg(test)]
+pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> Result<Vec<String>> {
+    decode_metadata_request(api_version, body)
 }
 
 #[cfg(test)]
@@ -563,13 +656,48 @@ mod tests {
 
     #[test]
     fn decode_metadata_request_topics_flexible_invalid_utf8_fails() {
-        let body = Bytes::from_static(&[
-            0x02, // one topic
-            0x02, // string len = 1
-            0xff, // invalid utf-8
-            0x00, // tagged fields
-        ]);
-        let err = decode_metadata_request_topics(body, 9).unwrap_err();
+        let mut enc = Encoder::with_capacity(16);
+        enc.write_varint(2); // one topic
+        enc.write_varint(2); // string len = 1
+        enc.write_u8(0xff); // invalid utf-8
+        enc.write_empty_tagged_fields(); // per-topic tagged
+        enc.write_bool(true); // allow_auto_topic_creation
+        enc.write_bool(false); // include_cluster_authorized_operations
+        enc.write_bool(false); // include_topic_authorized_operations
+        enc.write_empty_tagged_fields(); // top-level tagged
+        let err = decode_metadata_request_topics(enc.freeze(), 9).unwrap_err();
         assert!(matches!(err, KafkaProtocolError::InvalidUtf8));
+    }
+
+    #[test]
+    fn decode_metadata_request_empty_body_is_malformed() {
+        let err = decode_metadata_request(0, Bytes::new()).unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+    }
+
+    #[test]
+    fn decode_metadata_request_flexible_truncated_after_topics_fails() {
+        // topics = null (all topics) but missing allow_auto / auth flags / tagged fields.
+        let body = Bytes::from_static(&[0x00]);
+        let err = decode_metadata_request(9, body).unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+    }
+
+    #[test]
+    fn decode_api_versions_v3_requires_software_fields() {
+        let err = decode_api_versions_request(3, &Bytes::new()).unwrap_err();
+        assert!(matches!(
+            err,
+            KafkaProtocolError::BufferUnderflow { .. } | KafkaProtocolError::NullCompactString
+        ));
+    }
+
+    #[test]
+    fn decode_api_versions_v3_accepts_valid_body() {
+        let mut enc = Encoder::with_capacity(32);
+        enc.write_compact_nullable_string(Some("iggy-test"));
+        enc.write_compact_nullable_string(Some("0.1.0"));
+        enc.write_empty_tagged_fields();
+        decode_api_versions_request(3, &enc.freeze()).unwrap();
     }
 }
