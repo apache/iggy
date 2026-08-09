@@ -18,7 +18,10 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_ADVERTISED_HOST` | bind IP | Hostname/IP clients use to reach this broker (required when binding to `0.0.0.0`/`::`) |
 | `IGGY_KAFKA_ADVERTISED_PORT` | bind port | Port advertised in Metadata responses |
 | `IGGY_KAFKA_MAX_CONNECTIONS` | `1024` | Maximum concurrent connections before new ones are rejected |
+| `IGGY_KAFKA_MAX_FRAME_SIZE` | `8388608` | Maximum accepted request frame size in bytes |
 | `IGGY_KAFKA_IDLE_TIMEOUT_SECS` | `600` | Seconds a connection may sit idle before the next frame's length prefix arrives |
+| `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
+| `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
 
 ## Test
@@ -27,7 +30,7 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 cargo test -p iggy-gateway-kafka
 ```
 
-235 regression tests across 12 suites — see [docs/TEST_SUITE.md](docs/TEST_SUITE.md) for the full catalog.
+259 regression tests across 12 suites — see [docs/TEST_SUITE.md](docs/TEST_SUITE.md) for the full catalog.
 
 `decode_validation_tests` require wire fixtures under `tools/kafka-tool/kafka_messages/` (gitignored locally; CI generates them via `scripts/ci-wire-fixtures.sh`):
 
