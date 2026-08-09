@@ -33,6 +33,12 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
+        # Only test jobs execute nextest. Avoid downloading it in lint, metadata,
+        # and cross-build jobs.
+        install-nextest: ${{ startsWith(inputs.task, 'test-') }}
+        # These tasks do not compile workspace crates and need no native
+        # libraries. All compiling tasks keep the existing dependency setup.
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.

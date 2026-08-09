@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice},
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -45,6 +45,16 @@ pub struct RetainedBatchMeta {
     pub base_timestamp: u64,
     pub total_size: u64,
     pub message_count: u32,
+}
+
+/// What one pass over the journal headers found for a repair window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairedWindowShape {
+    /// Every op in the window is resident. An EMPTY window is complete: nothing
+    /// left can arrive and change the floor verdict.
+    pub complete: bool,
+    /// At least one resident op in the window is a `SendMessages`.
+    pub holds_messages: bool,
 }
 
 /// Lookup key for querying messages from the journal.
@@ -162,7 +172,7 @@ where
     op_to_storage_offset: UnsafeCell<BTreeMap<u64, usize>>,
     /// Maps message offset -> op (for queryable entries)
     offset_to_op: UnsafeCell<BTreeMap<u64, u64>>,
-    /// Maps `(origin_timestamp, op)` -> op (for queryable entries).
+    /// Maps `(base_timestamp, op)` -> op (for queryable entries).
     ///
     /// Keeping `op` in the key preserves duplicate timestamps while still
     /// letting us seek to the closest batch for timestamp-based polling.
@@ -188,6 +198,13 @@ where
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
+    /// Poll-index seal installed by a partition purge: ops at or below this
+    /// floor never enter `offset_to_op` / `timestamp_to_op`. Without it,
+    /// `evict_prefix` re-appending the retained tail would re-insert
+    /// pre-purge entries the purge just sealed off, and resident polls would
+    /// serve purged bytes. Survives only as long as the journal (in-memory),
+    /// same lifetime argument as the partition's `purge_floor_op`.
+    poll_floor: Cell<u64>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -218,6 +235,7 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
+            poll_floor: Cell::new(0),
         }
     }
 }
@@ -283,9 +301,30 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
-    /// Entry bytes for `op`, from the resident journal or the evicted ring.
-    /// `None` when the op predates the ring (bulk-sync territory) or was
-    /// never journaled here.
+    /// Drop EVERYTHING this journal holds: resident entries, the
+    /// op/offset/timestamp indexes, and the evicted repair ring.
+    ///
+    /// State-transfer install only. The installed segments supersede every
+    /// journaled op at or below the new commit floor, and the stale suffix
+    /// ABOVE it (prepared-but-uncommitted ops from a superseded view) would
+    /// collide with the new view's prepares at the same op numbers. The
+    /// journal is memory-only, so a full clear IS the partition plane's
+    /// suffix truncation; the receiver re-fetches the live tail through
+    /// normal journal repair afterwards. Ring caps and the retention flag
+    /// survive: they are configuration, not content.
+    pub fn clear_all(&self) {
+        {
+            let inner = unsafe { &*self.inner.get() };
+            let _ = inner.storage.drain();
+        }
+        unsafe { &mut *self.op_to_storage_offset.get() }.clear();
+        unsafe { &mut *self.offset_to_op.get() }.clear();
+        unsafe { &mut *self.timestamp_to_op.get() }.clear();
+        unsafe { &mut *self.headers.get() }.clear();
+        unsafe { &mut *self.evicted_ring.get() }.clear();
+        self.evicted_ring_bytes.set(0);
+    }
+
     /// Disable repair retention (single-replica groups: nobody to repair).
     pub fn set_repair_retention(&self, enabled: bool) {
         self.repair_retention.set(enabled);
@@ -311,6 +350,9 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         op_to_storage_offset.len()
     }
 
+    /// Entry bytes for `op`, from the resident journal or the evicted ring.
+    /// `None` when the op predates the ring (bulk-sync territory) or was
+    /// never journaled here.
     pub fn repair_entry(&self, op: u64) -> Option<JournalBuffer> {
         {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
@@ -535,11 +577,17 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
         let op = header.op;
-        // One decode feeds both the offset/timestamp index (keyed on
-        // `origin_timestamp`) and the surfaced accounting meta (`base_timestamp`,
-        // size, count); the two timestamps are distinct fields, do not conflate.
+        // One decode feeds both the offset/timestamp index and the surfaced
+        // accounting meta. Both are keyed on `base_timestamp`, the broker
+        // append time stamped into replies: the seek hint must live on the
+        // same clock as `select_batch_slice`'s filter or timestamp polls seek
+        // to the wrong resident entry.
+        // Trusted (no batch-hash): every entry reaching append was just stamped
+        // by `stamp_prepare_for_persistence` (its checksum recomputed over this
+        // exact blob) or re-appended from an already-validated resident entry,
+        // so re-hashing the ~1 MiB blob here only to read the header is waste.
         let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
-            match decode_prepare_slice(entry.as_slice()) {
+            match decode_prepare_slice_trusted(entry.as_slice()) {
                 Ok(batch) if batch.message_count() != 0 => {
                     let message_count = batch.message_count();
                     let meta = RetainedBatchMeta {
@@ -549,7 +597,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                         message_count,
                     };
                     (
-                        Some((batch.header.base_offset, batch.header.origin_timestamp)),
+                        Some((batch.header.base_offset, batch.header.base_timestamp)),
                         Some(meta),
                     )
                 }
@@ -576,7 +624,13 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             op_to_storage_offset.insert(op, storage_offset);
         }
 
-        if let Some((offset, timestamp)) = index_offset_timestamp {
+        // Poll-index only ops above the purge floor: `op_to_storage_offset`
+        // above stays unconditional (consensus history for the repair and
+        // commit walks), but a fenced pre-purge entry re-appended by
+        // `evict_prefix` must not become poll-resolvable again.
+        if op > self.poll_floor.get()
+            && let Some((offset, timestamp)) = index_offset_timestamp
+        {
             let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
             offset_to_op.insert(offset, op);
 
@@ -592,13 +646,34 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         inner.storage.is_empty()
     }
 
-    /// Owned, op-ascending clones of every resident journal entry. Each clone
-    /// is a `Frozen` refcount bump, not a deep copy. Used to snapshot the
-    /// resident tail at poll-plan time so a disk-tier straddle can be spliced
-    /// off the partition borrow on owned data ([`crate::iggy_partition`]).
+    /// Owned, op-ascending clones of the resident journal entries a poll may
+    /// serve. Each clone is a `Frozen` refcount bump, not a deep copy. Used to
+    /// snapshot the resident tail at poll-plan time so a disk-tier straddle can
+    /// be spliced off the partition borrow on owned data
+    /// ([`crate::iggy_partition`]).
+    ///
+    /// Entries at or below the purge floor are filtered out. They stay resident
+    /// (consensus history for backups, repair and retransmission) but are
+    /// poll-fenced exactly like the offset/timestamp indexes
+    /// [`Self::clear_poll_index`] sealed: the snapshot walk matches on the batch
+    /// contents alone, so an unfiltered list re-exposes purged bytes as soon as
+    /// one post-purge append puts an entry back into the index.
     pub fn resident_entries(&self) -> Vec<JournalBuffer> {
         let inner = unsafe { &*self.inner.get() };
-        inner.storage.entries()
+        let entries = inner.storage.entries();
+        let floor = self.poll_floor.get();
+        if floor == 0 {
+            return entries;
+        }
+        // `headers[i]` pairs with storage index `i` (see the length-lock
+        // invariant on `append_with_meta`), so the op comes from the header
+        // vector rather than a per-entry decode.
+        let headers = unsafe { &*self.headers.get() };
+        headers
+            .iter()
+            .zip(entries)
+            .filter_map(|(header, entry)| (header.op > floor).then_some(entry))
+            .collect()
     }
 }
 
@@ -619,12 +694,75 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
+            poll_floor: Cell::new(0),
         }
     }
 
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().find(|header| header.op == op).copied()
+    }
+
+    /// Presence and message-carrying shape of the repair window `(floor, to_op]`
+    /// in ONE pass over the header vec.
+    ///
+    /// [`Self::header_by_op`] is a linear scan with no index, so asking it
+    /// op-by-op over a window is O(window x headers): on the floor-refusal path
+    /// the replica is gap-stopped, so nothing evicts and the header vec grows
+    /// with the live tail, and the default 4096-op window over ~100k resident
+    /// headers is on the order of 4e8 comparisons -- synchronous, on the shard
+    /// pump, per repair round. Long enough to miss heartbeat and view-change
+    /// deadlines for every group on the core and turn one rejoin into an
+    /// election storm.
+    ///
+    /// The evicted ring is deliberately NOT consulted, matching the op-by-op
+    /// form: consulting it would change the floor-refusal verdict.
+    pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
+        let headers = unsafe { &*self.headers.get() };
+        let expected = to_op.saturating_sub(floor);
+        // More in-window ops than resident headers can never be covered, and
+        // `expected` is unbounded here (`to_op` rides the local `commit_max`),
+        // so this is both the early answer and what keeps the bitset below from
+        // being sized off an arbitrary number.
+        if expected > headers.len() as u64 {
+            return RepairedWindowShape {
+                complete: false,
+                holds_messages: headers.iter().any(|header| {
+                    header.op > floor
+                        && header.op <= to_op
+                        && header.operation == Operation::SendMessages
+                }),
+            };
+        }
+        // Dense window, so a flat presence vector beats a `HashSet`: no hashing
+        // per op and one contiguous allocation. One BYTE per op rather than one
+        // bit -- `expected` is bounded by `headers.len()`, so the 8x over a real
+        // bitset buys simpler indexing at a size the caller already holds in
+        // headers.
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_len = expected as usize;
+        let mut present = vec![false; expected_len];
+        let mut covered = 0usize;
+        let mut holds_messages = false;
+        for header in headers
+            .iter()
+            .filter(|header| header.op > floor && header.op <= to_op)
+        {
+            if header.operation == Operation::SendMessages {
+                holds_messages = true;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (header.op - floor - 1) as usize;
+            if !present[slot] {
+                present[slot] = true;
+                covered += 1;
+            }
+        }
+        RepairedWindowShape {
+            // In-window ops only, deduplicated, so a count match IS coverage.
+            complete: covered == expected_len,
+            holds_messages,
+        }
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
@@ -656,6 +794,25 @@ where
     pub fn oldest_resident_offset(&self) -> Option<u64> {
         let offset_to_op = unsafe { &*self.offset_to_op.get() };
         offset_to_op.keys().next().copied()
+    }
+
+    /// Seal the resident poll tier: clear the offset and timestamp poll
+    /// indexes ONLY, so `oldest_resident_offset` reads `None` and every poll
+    /// falls back to the on-disk segments. Called by a partition purge, which
+    /// wipes the segments but must KEEP the journal entries themselves:
+    /// headers, storage, `op_to_storage_offset` and the evicted ring are
+    /// consensus history that backups, repair and retransmission still walk.
+    /// Clearing those would wedge `commit_min` until a view change.
+    ///
+    /// `floor` (the purge's fence op) makes the seal survive eviction:
+    /// `evict_prefix` re-appends the retained tail, and without the floor
+    /// that re-append would re-index the pre-purge entries just cleared.
+    pub fn clear_poll_index(&self, floor: u64) {
+        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+        offset_to_op.clear();
+        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+        timestamp_to_op.clear();
+        self.poll_floor.set(floor);
     }
 
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
@@ -786,8 +943,12 @@ pub fn select_batch_slice(
                 ..
             } => offset >= query_offset,
             MessageLookup::Timestamp { timestamp, .. } => {
-                batch.header.origin_timestamp + u64::from(record.message.header.timestamp_delta)
-                    >= timestamp
+                // Match on the broker append time: replies stamp every message
+                // with the flat batch `base_timestamp` (the per-message delta
+                // applies to `origin_timestamp` only), so filtering on the
+                // producer clock would skip the message stamped exactly at the
+                // queried timestamp.
+                batch.header.base_timestamp >= timestamp
             }
         };
         if !selected {
@@ -885,7 +1046,10 @@ fn try_push_resident_entry(
     if header.operation != Operation::SendMessages {
         return;
     }
-    let Ok(batch) = decode_prepare_slice(prepare.as_slice()) else {
+    // Resident entries were locally stamped in `append_messages` or validated
+    // at repair ingress, so a validating re-decode would only re-hash our own
+    // write. See the invariant note at the committed-prefix flush walk.
+    let Ok(batch) = decode_prepare_slice_trusted(prepare.as_slice()) else {
         return;
     };
     let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {
@@ -951,9 +1115,14 @@ pub fn select_resident(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use iggy_binary_protocol::{Command2, HEADER_SIZE};
     use journal::Journal;
     use server_common::Message;
+    use server_common::send_messages2::{
+        IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned, decode_batch_slice,
+    };
+    use server_common::sharding::IggyNamespace;
 
     fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
@@ -1110,6 +1279,74 @@ mod tests {
         assert!(
             journal.committed_headers_from(5, 4).is_empty(),
             "from_op past commit_max yields nothing"
+        );
+    }
+
+    /// Three-message batch with the broker append time (`base_timestamp`)
+    /// deliberately AFTER every producer stamp (`origin_timestamp` + deltas),
+    /// the layout every real batch has (the broker stamps later than the
+    /// producer). Timestamp polls filter on the broker time because that is
+    /// the timestamp replies surface per message.
+    fn build_timestamped_batch(base_timestamp: u64, origin_timestamp: u64) -> Vec<u8> {
+        let mut messages = IggyMessages2::with_capacity(3);
+        for index in 0..3u64 {
+            messages.push(IggyMessage2 {
+                header: IggyMessage2Header {
+                    origin_timestamp: origin_timestamp + index,
+                    payload_length: 8,
+                    ..Default::default()
+                },
+                payload: Bytes::from_static(b"abcdefgh"),
+                user_headers: None,
+            });
+        }
+        let mut owned = SendMessages2Owned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+            .expect("build send_messages batch");
+        owned.header.base_timestamp = base_timestamp;
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+
+        let mut record = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
+        owned.header.encode_into(&mut record[..COMMAND_HEADER_SIZE]);
+        record[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
+        record
+    }
+
+    #[test]
+    fn timestamp_poll_at_exact_broker_timestamp_includes_the_batch() {
+        // A client polls with a timestamp read from a previous reply, which is
+        // the batch `base_timestamp`. Filtering on the producer origin clock
+        // (always a little earlier) made `origin >= base` false and silently
+        // skipped the message stamped exactly at the queried time.
+        let record = build_timestamped_batch(1_000, 900);
+        let batch = decode_batch_slice(&record).expect("batch decodes");
+
+        let at_exact = select_batch_slice(
+            &batch,
+            MessageLookup::Timestamp {
+                timestamp: 1_000,
+                count: 10,
+                ceiling: u64::MAX,
+            },
+            0,
+        )
+        .expect("selection at the exact broker timestamp");
+        assert_eq!(
+            at_exact.matched_messages, 3,
+            "poll at the reported timestamp must include the whole batch"
+        );
+
+        assert!(
+            select_batch_slice(
+                &batch,
+                MessageLookup::Timestamp {
+                    timestamp: 1_001,
+                    count: 10,
+                    ceiling: u64::MAX,
+                },
+                0,
+            )
+            .is_none(),
+            "poll past the broker timestamp must match nothing"
         );
     }
 }

@@ -23,6 +23,7 @@ use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
 use Iggy\SendMessage;
+use Iggy\SendMessagesResponse;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -216,6 +217,25 @@ final class IggySdkTest extends TestCase
             $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
             assert_count(count($messages), $polled);
             assert_same($messages, collect_payloads($polled));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('sendMessages against the legacy server reports no commit confirmations')]
+    public function testSendMessagesReportsNoConfirmationFromLegacyServer(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('confirm-stream');
+        $topicName = unique_name('confirm-topic');
+        $partitionId = 0;
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+
+            $response = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-first')]);
+            assert_instance_of(SendMessagesResponse::class, $response);
+            assert_count(0, $response->confirmations, 'the legacy server answers a send with no offsets');
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

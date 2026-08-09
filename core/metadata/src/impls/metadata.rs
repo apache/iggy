@@ -41,7 +41,6 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireC
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
-use iggy_binary_protocol::requests::topics::UpdateTopicRequest as WireUpdateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
@@ -50,7 +49,11 @@ use iggy_common::IggyError;
 use iggy_common::UserId;
 use iggy_common::calculate_checksum;
 use iggy_common::variadic;
-use journal::superblock::DynSuperblockStore;
+use journal::local_gate::LocalGate;
+use journal::superblock::{
+    PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
+    SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT, SuperblockStore,
+};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
@@ -201,17 +204,6 @@ impl IggySnapshot {
         Ok((Self::decode(payload)?, checksum))
     }
 }
-
-/// First retry delay after a failed superblock write, doubling per consecutive
-/// failure. Starts near the 10 ms consensus tick, so a one-off failure costs no
-/// latency, and a persistent one stops re-running `atomic_replace` per tick.
-const SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS: u64 = 10_000;
-/// Ceiling on the retry delay. A replica fenced this long is not coming back without
-/// operator action, but the retry must stay frequent enough to recover on its own the
-/// moment the disk does.
-const SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS: u64 = 1_000_000;
-/// Caps the doubling so the shift cannot overflow before the ceiling clamps it.
-const SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT: u64 = 8;
 
 /// Framing marker for the snapshot integrity trailer, "ISNP". Distinguishes a sealed
 /// snapshot from one written before the trailer existed, so a MISSING trailer can be
@@ -446,81 +438,6 @@ impl<M> SnapshotCoordinator<M> {
 const _: () =
     assert!(SnapshotCoordinator::<()>::CHECKPOINT_MARGIN >= consensus::PIPELINE_PREPARE_QUEUE_MAX);
 
-/// Single-shard async gate serializing the journal-mutation section of
-/// `on_replicate` (forced checkpoint + WAL append).
-///
-/// Many futures can drive `on_replicate` concurrently on one shard (the
-/// pump loop, detached per-client submit tasks, repair). Ungated they race
-/// `SnapshotCoordinator::checkpoint`: every driver crossing the
-/// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
-/// checkpoint, and the concurrent `journal.drain()` calls collide on the
-/// WAL rewrite — shared `wal.tmp`, ENOENT for every rename that loses,
-/// short reads after the winner's reopen. Appends racing a drain are just
-/// as unsound: the drain's live-set partition misses an append landing
-/// mid-rewrite and the rewrite silently discards it.
-///
-/// Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`),
-/// release wakes every waiter and poll order re-races (arrival-order FIFO
-/// under `futures::join!`-style drivers), cancel-safe (dropping the guard
-/// releases; dropping a waiter leaves only a stale waker).
-struct LocalGate {
-    busy: Cell<bool>,
-    waiters: RefCell<Vec<std::task::Waker>>,
-}
-
-impl LocalGate {
-    const fn new() -> Self {
-        Self {
-            busy: Cell::new(false),
-            waiters: RefCell::new(Vec::new()),
-        }
-    }
-
-    const fn acquire(&self) -> LocalGateAcquire<'_> {
-        LocalGateAcquire { gate: self }
-    }
-}
-
-struct LocalGateAcquire<'a> {
-    gate: &'a LocalGate,
-}
-
-impl<'a> std::future::Future for LocalGateAcquire<'a> {
-    type Output = LocalGateGuard<'a>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        if self.gate.busy.get() {
-            // Re-polls while still busy push a duplicate waker; the extra
-            // wake is spurious and harmless at pipeline-queue scale.
-            self.gate.waiters.borrow_mut().push(cx.waker().clone());
-            std::task::Poll::Pending
-        } else {
-            self.gate.busy.set(true);
-            std::task::Poll::Ready(LocalGateGuard { gate: self.gate })
-        }
-    }
-}
-
-struct LocalGateGuard<'a> {
-    gate: &'a LocalGate,
-}
-
-impl Drop for LocalGateGuard<'_> {
-    fn drop(&mut self) {
-        self.gate.busy.set(false);
-        // Move the waiters out before waking: `wake()` only schedules under
-        // compio today, but a waker that ever polled a waiter inline would
-        // re-enter `acquire`'s `waiters.borrow_mut()` and panic the RefCell.
-        let waiters = std::mem::take(&mut *self.gate.waiters.borrow_mut());
-        for waker in waiters {
-            waker.wake();
-        }
-    }
-}
-
 /// Failures shared by the in-process metadata submit helpers.
 ///
 /// Returned by [`IggyMetadata::submit_register_in_process`],
@@ -718,7 +635,7 @@ pub fn apply_committed_prepare<M>(
 /// single-thread invariant keeps access safe without [`Sync`].
 pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
 
-pub struct IggyMetadata<C, J, S, M> {
+pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
     /// holds the invariant: only shard 0 owns the metadata consensus
     /// replica; every other shard reconstructs `mux_stm` from the
@@ -736,10 +653,11 @@ pub struct IggyMetadata<C, J, S, M> {
     /// `Some` on shard 0, `None` on other shards.
     pub snapshot: Option<S>,
     /// Durable VSR-state record (`view`/`log_view`/`commit`). `Some` only on the
-    /// shard owning metadata consensus (shard 0); `None` on peer shards and in the
-    /// partition plane, which is not yet durable. Behind `Rc<dyn ...>` so the
-    /// simulator harness can keep a clone outliving a replica across a restart.
-    pub superblock: Option<Rc<dyn DynSuperblockStore>>,
+    /// shard owning metadata consensus (shard 0); `None` on peer shards. Generic
+    /// (`PingPongSuperblock` in production, `SimSuperblock` in the simulator,
+    /// recording doubles in tests) and behind `Rc` so the simulator harness can
+    /// keep a clone outliving a replica across a restart.
+    pub superblock: Option<Rc<SB>>,
     /// Serializes superblock writes on shard 0 so at most one is in flight.
     /// View-change persists ([`Self::persist_superblock_if_needed`]) and checkpoints
     /// ([`Self::checkpoint_if_needed`]) share the one ping-pong superblock, and
@@ -781,7 +699,15 @@ pub struct IggyMetadata<C, J, S, M> {
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
-    /// checkpoint + WAL append) across concurrent drivers. See [`LocalGate`].
+    /// checkpoint + WAL append) across concurrent drivers (the pump loop,
+    /// detached per-client submit tasks, repair). Ungated they race
+    /// `SnapshotCoordinator::checkpoint`: every driver crossing the
+    /// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
+    /// checkpoint, and the concurrent `journal.drain()` calls collide on the
+    /// WAL rewrite -- shared `wal.tmp`, ENOENT for every rename that loses,
+    /// short reads after the winner's reopen. Appends racing a drain are just
+    /// as unsound: the drain's live-set partition misses an append landing
+    /// mid-rewrite and the rewrite silently discards it. See [`LocalGate`].
     journal_gate: LocalGate,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
@@ -816,7 +742,7 @@ pub struct IggyMetadata<C, J, S, M> {
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
 }
 
-impl<C, J, S, M> IggyMetadata<C, J, S, M>
+impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
 where
     M: StreamsFrontend + FillSnapshot<MetadataSnapshot>,
 {
@@ -829,7 +755,7 @@ where
         consensus: Option<C>,
         journal: Option<J>,
         snapshot: Option<S>,
-        superblock: Option<Rc<dyn DynSuperblockStore>>,
+        superblock: Option<Rc<SB>>,
         mux_stm: M,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
@@ -859,7 +785,7 @@ where
     }
 }
 
-impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// Slot capacity of the LIVE client table, i.e. the largest transferred
     /// table this replica can absorb.
     ///
@@ -947,6 +873,16 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         self.default_max_topic_size.set(max_topic_size_bytes);
     }
 
+    /// Byte value a stored `MaxTopicSize::ServerDefault` resolves to on this
+    /// node. Read by the per-shard segment cleaner, which enforces retention
+    /// locally and so must resolve the sentinel at enforcement time: create
+    /// admission rewrites it before replication, but an UPDATE back to
+    /// `ServerDefault` leaves the sentinel in committed state.
+    #[must_use]
+    pub const fn default_max_topic_size(&self) -> u64 {
+        self.default_max_topic_size.get()
+    }
+
     /// Raise the forced-checkpoint margin to cover a configured
     /// prepare-queue depth (`[metadata] prepare_queue_depth`). Clamped to
     /// the built-in floor by the coordinator; no-op on shards without a
@@ -965,23 +901,11 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         self.client_table.borrow_mut().set_capacity(max_clients);
     }
 
-    /// Resolved byte value for `MaxTopicSize::ServerDefault`.
-    #[must_use]
-    pub const fn default_max_topic_size(&self) -> u64 {
-        self.default_max_topic_size.get()
-    }
-
     /// Install the resolved micros value used for `IggyExpiry::ServerDefault`.
-    /// Server-ng bootstrap calls this with `system.topic.message_expiry` on every
-    /// shard (responses read it too); only shard 0's copy feeds admission.
+    /// Server-ng bootstrap calls this with `system.topic.message_expiry`; only
+    /// shard 0's copy feeds admission.
     pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
         self.default_message_expiry.set(message_expiry_micros);
-    }
-
-    /// Resolved micros value for `IggyExpiry::ServerDefault`.
-    #[must_use]
-    pub const fn default_message_expiry(&self) -> u64 {
-        self.default_message_expiry.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -996,9 +920,10 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
 }
 
 #[allow(clippy::future_not_send)]
-impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
+impl<B, J, S, M, SB> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
@@ -1343,7 +1268,8 @@ where
     }
 }
 
-impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
+impl<B, P, J, S, M, SB> PlaneIdentity<VsrConsensus<B, P>>
+    for IggyMetadata<VsrConsensus<B, P>, J, S, M, SB>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
@@ -1359,8 +1285,7 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        let op = message.header().operation();
-        op.is_metadata() || matches!(op, Operation::Register | Operation::Logout)
+        message.header().operation().is_metadata_plane()
     }
 }
 
@@ -1487,9 +1412,10 @@ pub struct InstallOutcome {
     pub pairing_durable: bool,
 }
 
-impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
+impl<B, J, S, M, SB> IggyMetadata<VsrConsensus<B>, J, S, M, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
@@ -3004,10 +2930,11 @@ where
     }
 }
 
-impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
+impl<B, P, J, S, M, SB> IggyMetadata<VsrConsensus<B, P>, J, S, M, SB>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
+    SB: SuperblockStore,
 {
     /// Persist the current VSR state to the superblock when the view changed since
     /// the last write. The split-brain gate: callers MUST invoke this before
@@ -3084,11 +3011,7 @@ where
     /// from logs. Fail-stopping the process is the TigerBeetle-style answer, but this
     /// layer holds no process-lifecycle handle; wire it where the shard owns shutdown.
     #[allow(clippy::future_not_send)]
-    async fn write_superblock(
-        &self,
-        consensus: &VsrConsensus<B, P>,
-        superblock: &dyn DynSuperblockStore,
-    ) -> bool {
+    async fn write_superblock(&self, consensus: &VsrConsensus<B, P>, superblock: &SB) -> bool {
         // Carry the last durable pairing forward so a view-change write never
         // regresses the `(checkpoint_op, checksum)` a checkpoint recorded. `(0, 0)`
         // with no checkpoint taken, or no coordinator (peer shards, the simulator).
@@ -3097,7 +3020,7 @@ where
             .as_ref()
             .map_or((0, 0), SnapshotCoordinator::last_checkpoint);
         let state = consensus.vsr_state(checkpoint_op, checkpoint_checksum);
-        match superblock.dyn_write(&state.to_bytes()).await {
+        match superblock.write(&state.to_bytes()).await {
             Ok(()) => {
                 consensus.mark_superblock_durable(state.view, state.log_view);
                 self.superblock_write_failures.set(0);
@@ -3141,10 +3064,11 @@ where
     }
 }
 
-impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
+impl<B, P, J, S, M, SB> IggyMetadata<VsrConsensus<B, P>, J, S, M, SB>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
+    SB: SuperblockStore,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
@@ -3394,30 +3318,10 @@ where
                     &body,
                 ))
             }
-            Operation::UpdateTopic => {
-                let mut request = WireUpdateTopicRequest::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
-                // Same `ServerDefault` resolution as `CreateTopic` above; rebuild
-                // the prepare only if a sentinel actually needs stamping, else
-                // project the untouched buffer zero-copy.
-                let needs_rewrite = request.max_topic_size == 0 || request.message_expiry == 0;
-                if request.max_topic_size == 0 {
-                    request.max_topic_size = self.default_max_topic_size.get();
-                }
-                if request.message_expiry == 0 {
-                    request.message_expiry = self.default_message_expiry.get();
-                }
-                if needs_rewrite {
-                    let body = request.to_bytes();
-                    return Ok(build_prepare_message(
-                        consensus,
-                        &header,
-                        Operation::UpdateTopic,
-                        &body,
-                    ));
-                }
-                Ok(message.project(consensus))
-            }
+            // `UpdateTopic` deliberately takes the default arm: unlike create,
+            // an update stores `ServerDefault` sentinels verbatim (legacy
+            // parity), so a later get echoes `ServerDefault` instead of the
+            // node default frozen at update time.
             _ => Ok(message.project(consensus)),
         }
     }
@@ -3808,9 +3712,9 @@ where
     // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
     // in-process callers that bypass `Project::project` build their prepare
     // through this helper directly (the CreateTopic/CreatePartitions
-    // assignment rewrites, the UpdateTopic default-size rewrite, and the
-    // PAT-cleaner delete); the stamp is load-bearing for the creates and inert
-    // for the UpdateTopic rewrite and the delete, whose applies ignore it.
+    // assignment rewrites and the PAT-cleaner delete); the stamp is
+    // load-bearing for the creates and inert for the delete, whose apply
+    // ignores it.
     // Shared `next_monotonic_timestamp` keeps the in-process path on the same
     // monotonic-clock guard as the wire path.
     let timestamp = consensus.next_monotonic_timestamp();
@@ -3829,13 +3733,15 @@ where
         op,
         timestamp,
         operation,
-        namespace: request.namespace,
+        // The group's namespace, never the request's: clients send 0, and a
+        // journaled 0 mis-routes the entry when repair replays it verbatim.
+        namespace: consensus.namespace(),
         // Carry the acting user id so the in-apply RBAC gate sees the same
         // identity on every replica. The default projection copies it (see
         // `Project::project`); this helper builds prepares for the ops it
-        // rewrites (the CreateTopic/CreatePartitions assignment rewrites, the
-        // UpdateTopic default-size rewrite, and the PAT-cleaner delete), which
-        // would otherwise reset it to 0 via `..Default::default()`.
+        // rewrites (the CreateTopic/CreatePartitions assignment rewrites and
+        // the PAT-cleaner delete), which would otherwise reset it to 0 via
+        // `..Default::default()`.
         user_id: request.user_id,
         // Seal the body integrity field over the rewritten body, exactly as
         // `Project::project` does for wire-projected prepares. This helper builds

@@ -20,6 +20,7 @@ use std::ops::{Deref, RangeInclusive};
 use std::rc::Rc;
 
 pub mod file_storage;
+pub mod local_gate;
 pub mod prepare_journal;
 pub mod superblock;
 

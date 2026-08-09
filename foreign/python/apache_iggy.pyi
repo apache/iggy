@@ -32,13 +32,20 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "HeaderKey",
+    "HeaderValue",
     "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
+    "IggyExpiry",
+    "MaxTopicSize",
+    "Partition",
     "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
+    "SendMessagesConfirmation",
+    "SendMessagesResponse",
     "StreamDetails",
     "StreamPermissions",
     "Topic",
@@ -47,6 +54,7 @@ __all__ = [
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
+    "UserHeaders",
 ]
 
 class AutoCommit:
@@ -310,6 +318,356 @@ class ConsumerGroupMember:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
         """
+
+class HeaderKey:
+    r"""
+    Typed key for an Iggy user header.
+
+    Use these constructors when the header key must preserve an explicit
+    wire type instead of using the common string-key dictionary form.
+    """
+    def __hash__(self) -> builtins.int: ...
+    def __richcmp__(self, other: typing.Any, op: int) -> typing.Any: ...
+    def __repr__(self) -> builtins.str: ...
+    @typing.final
+    class Raw(HeaderKey):
+        r"""
+        Raw bytes key. The byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> bytes: ...
+        def __new__(cls, value: bytes) -> HeaderKey.Raw: ...
+
+    @typing.final
+    class String(HeaderKey):
+        r"""
+        UTF-8 string key. The encoded byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.str: ...
+        def __new__(cls, value: builtins.str) -> HeaderKey.String: ...
+
+    @typing.final
+    class Bool(HeaderKey):
+        r"""
+        Boolean key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.bool: ...
+        def __new__(cls, value: builtins.bool) -> HeaderKey.Bool: ...
+
+    @typing.final
+    class Int8(HeaderKey):
+        r"""
+        Signed 8-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int8: ...
+
+    @typing.final
+    class Int16(HeaderKey):
+        r"""
+        Signed 16-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int16: ...
+
+    @typing.final
+    class Int32(HeaderKey):
+        r"""
+        Signed 32-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int32: ...
+
+    @typing.final
+    class Int64(HeaderKey):
+        r"""
+        Signed 64-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int64: ...
+
+    @typing.final
+    class Int128(HeaderKey):
+        r"""
+        Signed 128-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.Int128: ...
+
+    @typing.final
+    class UnsignedInt8(HeaderKey):
+        r"""
+        Unsigned 8-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt8: ...
+
+    @typing.final
+    class UnsignedInt16(HeaderKey):
+        r"""
+        Unsigned 16-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt16: ...
+
+    @typing.final
+    class UnsignedInt32(HeaderKey):
+        r"""
+        Unsigned 32-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt32: ...
+
+    @typing.final
+    class UnsignedInt64(HeaderKey):
+        r"""
+        Unsigned 64-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt64: ...
+
+    @typing.final
+    class UnsignedInt128(HeaderKey):
+        r"""
+        Unsigned 128-bit integer key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderKey.UnsignedInt128: ...
+
+    @typing.final
+    class Float32(HeaderKey):
+        r"""
+        32-bit floating point key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderKey.Float32: ...
+
+    @typing.final
+    class Float64(HeaderKey):
+        r"""
+        64-bit floating point key.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderKey.Float64: ...
+
+class HeaderValue:
+    r"""
+    Typed value for an Iggy user header.
+
+    Use these constructors when the header value must preserve an explicit
+    wire type instead of using the common Python scalar dictionary form.
+    """
+    def __hash__(self) -> builtins.int: ...
+    def __richcmp__(self, other: typing.Any, op: int) -> typing.Any: ...
+    def __repr__(self) -> builtins.str: ...
+    @typing.final
+    class Raw(HeaderValue):
+        r"""
+        Raw bytes value. The byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> bytes: ...
+        def __new__(cls, value: bytes) -> HeaderValue.Raw: ...
+
+    @typing.final
+    class String(HeaderValue):
+        r"""
+        UTF-8 string value. The encoded byte length must be 1..=255.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.str: ...
+        def __new__(cls, value: builtins.str) -> HeaderValue.String: ...
+
+    @typing.final
+    class Bool(HeaderValue):
+        r"""
+        Boolean value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.bool: ...
+        def __new__(cls, value: builtins.bool) -> HeaderValue.Bool: ...
+
+    @typing.final
+    class Int8(HeaderValue):
+        r"""
+        Signed 8-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int8: ...
+
+    @typing.final
+    class Int16(HeaderValue):
+        r"""
+        Signed 16-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int16: ...
+
+    @typing.final
+    class Int32(HeaderValue):
+        r"""
+        Signed 32-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int32: ...
+
+    @typing.final
+    class Int64(HeaderValue):
+        r"""
+        Signed 64-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int64: ...
+
+    @typing.final
+    class Int128(HeaderValue):
+        r"""
+        Signed 128-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.Int128: ...
+
+    @typing.final
+    class UnsignedInt8(HeaderValue):
+        r"""
+        Unsigned 8-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt8: ...
+
+    @typing.final
+    class UnsignedInt16(HeaderValue):
+        r"""
+        Unsigned 16-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt16: ...
+
+    @typing.final
+    class UnsignedInt32(HeaderValue):
+        r"""
+        Unsigned 32-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt32: ...
+
+    @typing.final
+    class UnsignedInt64(HeaderValue):
+        r"""
+        Unsigned 64-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt64: ...
+
+    @typing.final
+    class UnsignedInt128(HeaderValue):
+        r"""
+        Unsigned 128-bit integer value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value: builtins.int) -> HeaderValue.UnsignedInt128: ...
+
+    @typing.final
+    class Float32(HeaderValue):
+        r"""
+        32-bit floating point value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderValue.Float32: ...
+
+    @typing.final
+    class Float64(HeaderValue):
+        r"""
+        64-bit floating point value.
+        """
+
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.float: ...
+        def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
 class GlobalPermissions:
@@ -603,12 +961,27 @@ class IggyClient:
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
         replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            name: Topic name as `str`.
+            partitions_count: Number of partitions as `int`.
+            compression_algorithm: Compression algorithm as `str | None`.
+            replication_factor: Replication factor as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is created.
+
+        Raises:
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def get_topic(
         self,
@@ -641,8 +1014,8 @@ class IggyClient:
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
         replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -656,14 +1029,15 @@ class IggyClient:
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
             replication_factor: Replication factor as `int | None`.
-            message_expiry: Message expiry as `datetime.timedelta | None`.
-            max_topic_size: Maximum topic size in bytes as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -840,10 +1214,13 @@ class IggyClient:
         topic: builtins.str | builtins.int,
         partitioning: builtins.int,
         messages: list[SendMessage],
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+        Returns a SendMessagesResponse carrying the per-partition commit
+        confirmations, or a PyRuntimeError on failure. The confirmation list is
+        empty when the server reports no offsets, and the legacy server never
+        reports any.
         """
     def poll_messages(
         self,
@@ -972,6 +1349,134 @@ class IggyConsumer:
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
+class IggyExpiry:
+    r"""
+    The expiry of the messages in a topic.
+    """
+    @typing.final
+    class ServerDefault(IggyExpiry):
+        r"""
+        Use the message expiry configured on the server for this topic,
+        rather than an explicit value set by the client.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class ExpireDuration(IggyExpiry):
+        r"""
+        Expire messages this long after they are appended to the topic.
+
+        `duration` must be greater than zero and less than the maximum
+        microsecond count a `u64` can hold (about 584,542 years): those two
+        values are reserved on the wire for `ServerDefault` and `NeverExpire`
+        respectively, so a `duration` at either boundary raises `ValueError`
+        when passed to `create_topic`/`update_topic`. A negative `timedelta`
+        also raises `ValueError`.
+        """
+
+        __match_args__ = ("duration",)
+        @property
+        def duration(self) -> datetime.timedelta: ...
+        def __new__(cls, duration: datetime.timedelta) -> IggyExpiry.ExpireDuration: ...
+
+    @typing.final
+    class NeverExpire(IggyExpiry):
+        r"""
+        Retain messages indefinitely; they never expire.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.NeverExpire: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+class MaxTopicSize:
+    r"""
+    The maximum size of a topic.
+    """
+    @typing.final
+    class ServerDefault(MaxTopicSize):
+        r"""
+        Use the maximum topic size configured on the server, rather than an
+        explicit value set by the client.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Custom(MaxTopicSize):
+        r"""
+        Cap the topic at this many bytes; as the topic approaches this size,
+        the server deletes the oldest sealed segments to make room for new
+        messages.
+
+        `bytes` must be greater than zero and less than the maximum value of
+        an unsigned 64-bit integer: those two values are reserved on the wire
+        for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
+        at either boundary raises `ValueError` when passed to
+        `create_topic`/`update_topic`.
+        """
+
+        __match_args__ = ("bytes",)
+        @property
+        def bytes(self) -> builtins.int: ...
+        def __new__(cls, bytes: builtins.int) -> MaxTopicSize.Custom: ...
+
+    @typing.final
+    class Unlimited(MaxTopicSize):
+        r"""
+        Do not cap the topic size; it may grow without bound.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.Unlimited: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+@typing.final
+class Partition:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the partition.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp of the partition creation, in microseconds.
+        """
+    @property
+    def segments_count(self) -> builtins.int:
+        r"""
+        The number of segments in the partition.
+        """
+    @property
+    def current_offset(self) -> builtins.int:
+        r"""
+        The current offset of the partition.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The size of the partition in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The number of messages in the partition.
+        """
+
 @typing.final
 class Permissions:
     r"""
@@ -1058,6 +1563,11 @@ class ReceiveMessage:
         Retrieves the timestamp of the received message.
         The timestamp represents the time of the message within its topic.
         """
+    def origin_timestamp(self) -> builtins.int:
+        r"""
+        Retrieves the origin timestamp of the received message.
+        The origin timestamp represents when the message was originally created.
+        """
     def id(self) -> builtins.int:
         r"""
         Retrieves the id of the received message.
@@ -1077,6 +1587,10 @@ class ReceiveMessage:
         r"""
         Retrieves the partition this message belongs to.
         """
+    def user_headers(self) -> UserHeaders | None:
+        r"""
+        Retrieves user headers attached to the received message.
+        """
 
 @typing.final
 class SendMessage:
@@ -1085,11 +1599,75 @@ class SendMessage:
     This class wraps a Rust message meant for sending, facilitating
     the creation of such messages from Python and their subsequent use in Rust.
     """
-    def __new__(cls, data: builtins.str | bytes) -> SendMessage:
+    def __new__(
+        cls,
+        data: builtins.str | bytes,
+        user_headers: dict | None = None,
+        id: builtins.int | None = None,
+    ) -> SendMessage:
         r"""
         Constructs a new `SendMessage` instance from a string or bytes.
         This method allows for the creation of a `SendMessage` instance
         directly from Python using the provided string or bytes data.
+        """
+
+@typing.final
+class SendMessagesConfirmation:
+    r"""
+    A Python class representing the commit confirmation for one partition
+    written by a send.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the stream the batch was written to.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the topic the batch was written to.
+        """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        Gets the identifier of the partition the batch was written to.
+        """
+    @property
+    def base_offset(self) -> builtins.int:
+        r"""
+        Gets the offset assigned to the first message of the batch in this partition.
+
+        The offset locates the batch, it does not identify it. Delivery is
+        at-least-once, so an earlier retry may already have committed these
+        messages at a lower offset.
+
+        A batch is confirmed once it is committed in memory, not once it is
+        fsynced. A crash-restart can stamp a later batch with an offset a client
+        has already recorded.
+
+        The legacy server confirms nothing, so its confirmation list is empty
+        and this value is never reached.
+        """
+
+@typing.final
+class SendMessagesResponse:
+    r"""
+    A Python class representing the outcome of a successful send.
+    """
+    @property
+    def confirmations(self) -> builtins.list[SendMessagesConfirmation]:
+        r"""
+        Gets the commit confirmations, one per partition the batch was written to.
+
+        The list is empty when the server reports no offsets, and the legacy
+        server never reports any, so branch on it being empty rather than
+        indexing into it.
+
+        A reported `base_offset` never implies uniqueness, because delivery is
+        at-least-once and an earlier retry may already have committed the same
+        messages at a lower offset. A batch is confirmed once it is committed in
+        memory, not once it is fsynced. A crash-restart can stamp a later batch
+        with an offset a client has already recorded.
         """
 
 @typing.final
@@ -1207,6 +1785,36 @@ class Topic:
         r"""
         The total number of partitions in the topic.
         """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
+    def compression_algorithm(self) -> builtins.str:
+        r"""
+        Compression algorithm for the topic.
+        """
+    @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
+    def replication_factor(self) -> builtins.int:
+        r"""
+        Replication factor for the topic.
+        """
 
 @typing.final
 class TopicDetails:
@@ -1231,14 +1839,42 @@ class TopicDetails:
         The total number of partitions in the topic.
         """
     @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
     def compression_algorithm(self) -> builtins.str:
         r"""
         Compression algorithm for the topic.
         """
     @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
     def replication_factor(self) -> builtins.int:
         r"""
         Replication factor for the topic.
+        """
+    @property
+    def partitions(self) -> builtins.list[Partition]:
+        r"""
+        The collection of partitions in the topic.
+
+        Rebuilds the list from scratch on every access; cache the result
+        rather than reading this repeatedly in a loop.
         """
 
 @typing.final
@@ -1362,3 +1998,31 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
+
+class UserHeaders(dict):
+    r"""
+    User headers dictionary returned by `ReceiveMessage.user_headers`.
+
+    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
+    operations work) that additionally exposes `to_scalar_dict` for the convenient
+    scalar form.
+    """
+    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
+        r"""
+        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
+
+        Accepts a dict whose keys and values can each independently be
+        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
+        int | float`). The inherited `dict` initializer copies the provided
+        mapping.
+        """
+    def to_scalar_dict(
+        self,
+    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
+        r"""
+        Converts these headers into the convenient plain dictionary form.
+
+        Returns an error if two distinct typed keys map to the same plain
+        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+        become `int(1)`), or if a stored field cannot be decoded.
+        """
