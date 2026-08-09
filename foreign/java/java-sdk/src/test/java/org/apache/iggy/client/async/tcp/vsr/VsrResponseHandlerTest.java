@@ -243,6 +243,45 @@ class VsrResponseHandlerTest {
         }
     }
 
+    @Test
+    void shouldCorrelateRepliesForServerRewrittenOperations() throws Exception {
+        int[][] rewrittenOperations = {
+            {VsrOperation.CREATE_TOPIC, VsrOperation.CREATE_TOPIC_WITH_ASSIGNMENTS},
+            {VsrOperation.CREATE_PARTITIONS, VsrOperation.CREATE_PARTITIONS_WITH_ASSIGNMENTS},
+            {VsrOperation.DELETE_SEGMENTS, VsrOperation.TRUNCATE_PARTITION}
+        };
+
+        for (int index = 0; index < rewrittenOperations.length; index++) {
+            int requestOperation = rewrittenOperations[index][0];
+            int replyOperation = rewrittenOperations[index][1];
+            long requestId = index + 1;
+            CompletableFuture<ByteBuf> future = enqueue(requestOperation, requestId);
+            ByteBuf body = Unpooled.buffer();
+            body.writeIntLE(0);
+            body.writeIntLE(100 + index);
+
+            channel.writeInbound(replyFrame(replyOperation, requestId, body));
+
+            ByteBuf response = future.get();
+            try {
+                assertThat(response.readIntLE()).isEqualTo(100 + index);
+            } finally {
+                response.release();
+            }
+        }
+    }
+
+    @Test
+    void shouldRejectUnrelatedReplyOperation() {
+        CompletableFuture<ByteBuf> pending = enqueue(VsrOperation.CREATE_TOPIC, 7);
+
+        channel.writeInbound(
+                replyFrame(VsrOperation.DELETE_TOPIC, 7, Unpooled.buffer().writeIntLE(0)));
+
+        assertThat(channel.isActive()).isFalse();
+        assertThat(rawErrorCode(pending)).isEqualTo(VsrHeaders.ERROR_INVALID_COMMAND);
+    }
+
     private CompletableFuture<ByteBuf> enqueue(int operation, long requestId) {
         CompletableFuture<ByteBuf> future = new CompletableFuture<>();
         handler.registerRequest(future, operation, requestId);

@@ -135,13 +135,15 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             handleEviction(ctx, msg);
             return;
         }
-        RequestKey key = new RequestKey(VsrHeaders.readReplyOperation(msg), VsrHeaders.readReplyRequestId(msg));
+        int replyOperation = VsrHeaders.readReplyOperation(msg);
+        RequestKey key =
+                new RequestKey(VsrOperation.correlationOperation(replyOperation), VsrHeaders.readReplyRequestId(msg));
         CompletableFuture<ByteBuf> future = pendingRequests.remove(key);
         if (future == null) {
             closeChannel(
                     ctx.channel(),
                     invalidReply(
-                            "no request was pending for operation " + key.operation() + " and request id " + key.id()));
+                            "no request was pending for operation " + replyOperation + " and request id " + key.id()));
             return;
         }
         ByteBuf body;

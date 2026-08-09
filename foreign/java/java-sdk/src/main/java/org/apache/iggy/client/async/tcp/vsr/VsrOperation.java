@@ -172,4 +172,18 @@ public final class VsrOperation {
     static boolean isKnown(int operation) {
         return operation >= 0 && KNOWN_OPERATIONS.get(operation);
     }
+
+    /**
+     * Maps an internal operation returned by the server to the client
+     * operation that initiated it. The server preserves the request id when
+     * it enriches these commands before replication.
+     */
+    static int correlationOperation(int operation) {
+        return switch (operation) {
+            case CREATE_TOPIC_WITH_ASSIGNMENTS -> CREATE_TOPIC;
+            case CREATE_PARTITIONS_WITH_ASSIGNMENTS -> CREATE_PARTITIONS;
+            case TRUNCATE_PARTITION -> DELETE_SEGMENTS;
+            default -> operation;
+        };
+    }
 }
