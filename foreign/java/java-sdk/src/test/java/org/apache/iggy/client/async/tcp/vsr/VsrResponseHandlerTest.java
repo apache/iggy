@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -38,8 +38,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class VsrResponseHandlerTest {
 
     private final ConsensusSession session = new ConsensusSession();
-    private final AtomicBoolean evicted = new AtomicBoolean();
-    private final VsrResponseHandler handler = new VsrResponseHandler(session, () -> evicted.set(true));
+    private final AtomicInteger evictions = new AtomicInteger();
+    private final VsrResponseHandler handler = new VsrResponseHandler(session, evictions::incrementAndGet);
     private final EmbeddedChannel channel = new EmbeddedChannel(handler);
 
     @AfterEach
@@ -49,8 +49,8 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldFailWithStatusCodeOnDeniedReply() {
-        CompletableFuture<ByteBuf> future = enqueue();
-        ByteBuf frame = replyFrame(VsrOperation.NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.NON_REPLICATED, 7);
+        ByteBuf frame = replyFrame(VsrOperation.NON_REPLICATED, 7, Unpooled.EMPTY_BUFFER);
         frame.setIntLE(VsrHeaders.REPLY_STATUS_OFFSET, 40);
 
         channel.writeInbound(frame);
@@ -60,10 +60,10 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldPassNonReplicatedBodyThrough() throws Exception {
-        CompletableFuture<ByteBuf> future = enqueue();
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.NON_REPLICATED, 7);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(1234);
-        channel.writeInbound(replyFrame(VsrOperation.NON_REPLICATED, body));
+        channel.writeInbound(replyFrame(VsrOperation.NON_REPLICATED, 7, body));
 
         ByteBuf response = future.get();
         try {
@@ -75,10 +75,10 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldReleaseResponseBodyWhenRequestWasCancelled() {
-        CompletableFuture<ByteBuf> future = enqueue();
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.NON_REPLICATED, 7);
         future.cancel(false);
         ByteBuf frame =
-                replyFrame(VsrOperation.NON_REPLICATED, Unpooled.buffer().writeIntLE(1234));
+                replyFrame(VsrOperation.NON_REPLICATED, 7, Unpooled.buffer().writeIntLE(1234));
 
         channel.writeInbound(frame);
 
@@ -87,11 +87,11 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldStripResultSectionFromMetadataReply() throws Exception {
-        CompletableFuture<ByteBuf> future = enqueue();
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.CREATE_STREAM, 7);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0);
         body.writeIntLE(777);
-        channel.writeInbound(replyFrame(VsrOperation.CREATE_STREAM, body));
+        channel.writeInbound(replyFrame(VsrOperation.CREATE_STREAM, 7, body));
 
         ByteBuf response = future.get();
         try {
@@ -103,19 +103,19 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldSurfaceCommittedErrorFromMetadataRejection() {
-        CompletableFuture<ByteBuf> future = enqueue();
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.DELETE_STREAM, 7);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(1);
         body.writeIntLE(0);
         body.writeIntLE(1010);
-        channel.writeInbound(replyFrame(VsrOperation.DELETE_STREAM, body));
+        channel.writeInbound(replyFrame(VsrOperation.DELETE_STREAM, 7, body));
 
         assertThat(rawErrorCode(future)).isEqualTo(1010);
     }
 
     @Test
     void shouldBindSessionOnRegisterReply() throws Exception {
-        CompletableFuture<ByteBuf> future = enqueue();
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.REGISTER, 0);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0); // result section: success
         body.writeIntLE(1); // user id
@@ -123,7 +123,7 @@ class VsrResponseHandlerTest {
         body.writeIntLE(VsrLoginCodec.PROTOCOL_VERSION);
         body.writeByte(3);
         body.writeBytes("0.1".getBytes());
-        channel.writeInbound(replyFrame(VsrOperation.REGISTER, body));
+        channel.writeInbound(replyFrame(VsrOperation.REGISTER, 0, body));
 
         ByteBuf response = future.get();
         try {
@@ -139,8 +139,8 @@ class VsrResponseHandlerTest {
     void shouldResetSessionOnLogoutReply() throws Exception {
         session.beginRegister();
         session.bind(42);
-        CompletableFuture<ByteBuf> future = enqueue();
-        channel.writeInbound(replyFrame(VsrOperation.LOGOUT, Unpooled.EMPTY_BUFFER));
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.LOGOUT, 7);
+        channel.writeInbound(replyFrame(VsrOperation.LOGOUT, 7, Unpooled.EMPTY_BUFFER));
 
         future.get().release();
         assertThat(session.isBound()).isFalse();
@@ -150,7 +150,7 @@ class VsrResponseHandlerTest {
     void shouldMapEvictionReasonAndResetSession() {
         session.beginRegister();
         session.bind(42);
-        CompletableFuture<ByteBuf> future = enqueue();
+        CompletableFuture<ByteBuf> future = enqueue(VsrOperation.NON_REPLICATED, 7);
         ByteBuf frame = emptyFrame();
         frame.setByte(VsrHeaders.COMMAND_OFFSET, VsrHeaders.COMMAND_EVICTION);
         frame.setByte(VsrHeaders.EVICTION_REASON_OFFSET, VsrHeaders.REASON_INVALID_CREDENTIALS);
@@ -158,12 +158,41 @@ class VsrResponseHandlerTest {
 
         assertThat(rawErrorCode(future)).isEqualTo(42);
         assertThat(session.isBound()).isFalse();
-        assertThat(evicted).isTrue();
+        assertThat(evictions).hasValue(1);
+    }
+
+    @Test
+    void shouldCloseChannelOnEvictionWithoutPendingRequest() {
+        session.beginRegister();
+        session.bind(42);
+        ByteBuf frame = evictionFrame(VsrHeaders.REASON_STALE_CLIENT);
+
+        channel.writeInbound(frame);
+
+        assertThat(session.isBound()).isFalse();
+        assertThat(evictions).hasValue(1);
+        assertThat(frame.refCnt()).isZero();
+        assertThat(channel.isActive()).isFalse();
+    }
+
+    @Test
+    void shouldFailEveryPendingRequestOnEviction() {
+        session.beginRegister();
+        session.bind(42);
+        CompletableFuture<ByteBuf> first = enqueue(VsrOperation.NON_REPLICATED, 7);
+        CompletableFuture<ByteBuf> second = enqueue(VsrOperation.CREATE_STREAM, 8);
+
+        channel.writeInbound(evictionFrame(VsrHeaders.REASON_STALE_CLIENT));
+
+        assertThat(rawErrorCode(first)).isEqualTo(VsrHeaders.ERROR_STALE_CLIENT);
+        assertThat(rawErrorCode(second)).isEqualTo(VsrHeaders.ERROR_STALE_CLIENT);
+        assertThat(evictions).hasValue(1);
+        assertThat(channel.isActive()).isFalse();
     }
 
     @Test
     void shouldFailPendingRequestsWhenChannelBecomesInactive() {
-        CompletableFuture<ByteBuf> pending = enqueue();
+        CompletableFuture<ByteBuf> pending = enqueue(VsrOperation.NON_REPLICATED, 7);
 
         channel.close();
 
@@ -173,7 +202,7 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldFailPendingRequestsOnPipelineException() {
-        CompletableFuture<ByteBuf> pending = enqueue();
+        CompletableFuture<ByteBuf> pending = enqueue(VsrOperation.NON_REPLICATED, 7);
 
         var failure = new IllegalStateException("broken pipe");
         channel.pipeline().fireExceptionCaught(failure);
@@ -185,7 +214,9 @@ class VsrResponseHandlerTest {
     @Test
     void shouldCloseChannelWhenResponseDeadlineExpires() {
         CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
-        handler.enqueueRequest(channel, pending, System.nanoTime(), 1);
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, 7);
+        handler.registerRequest(channel, request, pending, System.nanoTime(), 1);
+        request.release();
 
         channel.runScheduledPendingTasks();
 
@@ -193,9 +224,28 @@ class VsrResponseHandlerTest {
         assertThatThrownBy(pending::join).hasCauseInstanceOf(IggyTimeoutException.class);
     }
 
-    private CompletableFuture<ByteBuf> enqueue() {
+    @Test
+    void shouldCorrelateRepliesArrivingInReverseOrder() throws Exception {
+        CompletableFuture<ByteBuf> first = enqueue(VsrOperation.SEND_MESSAGES, 7);
+        CompletableFuture<ByteBuf> second = enqueue(VsrOperation.SEND_MESSAGES, 8);
+
+        channel.writeInbound(replyFrame(VsrOperation.SEND_MESSAGES, 8, Unpooled.wrappedBuffer(new byte[] {2})));
+        channel.writeInbound(replyFrame(VsrOperation.SEND_MESSAGES, 7, Unpooled.wrappedBuffer(new byte[] {1})));
+
+        ByteBuf firstResponse = first.get();
+        ByteBuf secondResponse = second.get();
+        try {
+            assertThat(firstResponse.readByte()).isEqualTo((byte) 1);
+            assertThat(secondResponse.readByte()).isEqualTo((byte) 2);
+        } finally {
+            firstResponse.release();
+            secondResponse.release();
+        }
+    }
+
+    private CompletableFuture<ByteBuf> enqueue(int operation, long requestId) {
         CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-        handler.enqueueRequest(future);
+        handler.registerRequest(future, operation, requestId);
         return future;
     }
 
@@ -206,13 +256,28 @@ class VsrResponseHandlerTest {
         return frame;
     }
 
-    private static ByteBuf replyFrame(int operation, ByteBuf body) {
+    private static ByteBuf requestFrame(int operation, long requestId) {
+        ByteBuf frame = emptyFrame();
+        frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
+        frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
+        return frame;
+    }
+
+    private static ByteBuf replyFrame(int operation, long requestId, ByteBuf body) {
         ByteBuf frame = emptyFrame();
         frame.setByte(VsrHeaders.COMMAND_OFFSET, VsrHeaders.COMMAND_REPLY);
         frame.setByte(VsrHeaders.REPLY_OPERATION_OFFSET, operation);
+        frame.setLongLE(VsrHeaders.REPLY_REQUEST_OFFSET, requestId);
         frame.setIntLE(VsrHeaders.SIZE_OFFSET, VsrHeaders.HEADER_SIZE + body.readableBytes());
         frame.writeBytes(body);
         body.release();
+        return frame;
+    }
+
+    private static ByteBuf evictionFrame(int reason) {
+        ByteBuf frame = emptyFrame();
+        frame.setByte(VsrHeaders.COMMAND_OFFSET, VsrHeaders.COMMAND_EVICTION);
+        frame.setByte(VsrHeaders.EVICTION_REASON_OFFSET, reason);
         return frame;
     }
 

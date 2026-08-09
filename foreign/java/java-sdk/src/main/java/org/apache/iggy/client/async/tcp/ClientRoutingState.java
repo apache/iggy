@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.identifier.ConsumerId;
+import org.apache.iggy.identifier.Identifier;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 
@@ -33,9 +34,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Per-client cache of the routing facts needed to resolve partitioning and
  * consumer-group polling client-side: topic partition counts, balanced
- * round-robin cursors, and consumer-group assignments. Keys are
- * {@code stream|topic[|group]} strings built from the request identifiers,
- * matching the Rust SDK's {@code ConsumerGroupClientState}.
+ * round-robin cursors, and consumer-group assignments. Typed keys retain both
+ * the kind and value of every identifier, so numeric identifiers cannot
+ * collide with same-text named identifiers.
  *
  * <p>Partition counts and balanced cursors survive reconnects; group
  * assignments are bound to the server-side VSR session (the member is keyed
@@ -47,23 +48,23 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 final class ClientRoutingState {
 
-    private final Map<String, CachedPartitionCount> partitionCounts = new ConcurrentHashMap<>();
-    private final Map<String, AtomicInteger> balancedCursors = new ConcurrentHashMap<>();
-    private final Map<String, GroupAssignment> assignments = new ConcurrentHashMap<>();
+    private final Map<TopicKey, CachedPartitionCount> partitionCounts = new ConcurrentHashMap<>();
+    private final Map<TopicKey, AtomicInteger> balancedCursors = new ConcurrentHashMap<>();
+    private final Map<GroupKey, GroupAssignment> assignments = new ConcurrentHashMap<>();
 
-    static String topicKey(StreamId streamId, TopicId topicId) {
-        return streamId + "|" + topicId;
+    static TopicKey topicKey(StreamId streamId, TopicId topicId) {
+        return new TopicKey(IdentifierKey.from(streamId), IdentifierKey.from(topicId));
     }
 
-    static String groupKey(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        return streamId + "|" + topicId + "|" + groupId;
+    static GroupKey groupKey(StreamId streamId, TopicId topicId, ConsumerId groupId) {
+        return new GroupKey(topicKey(streamId, topicId), IdentifierKey.from(groupId));
     }
 
-    Optional<CachedPartitionCount> partitionCount(String topicKey) {
+    Optional<CachedPartitionCount> partitionCount(TopicKey topicKey) {
         return Optional.ofNullable(partitionCounts.get(topicKey));
     }
 
-    void setPartitionCount(String topicKey, long count, long fetchedAtNanos) {
+    void setPartitionCount(TopicKey topicKey, long count, long fetchedAtNanos) {
         partitionCounts.put(topicKey, new CachedPartitionCount(count, fetchedAtNanos));
     }
 
@@ -72,7 +73,7 @@ final class ClientRoutingState {
      * was routed with the cached count is refused with a not-found error,
      * meaning the topic shrank or was recreated and the count is stale.
      */
-    void invalidatePartitionCount(String topicKey) {
+    void invalidatePartitionCount(TopicKey topicKey) {
         partitionCounts.remove(topicKey);
     }
 
@@ -81,7 +82,7 @@ final class ClientRoutingState {
      * A per-topic monotonic counter modulo the partition count, so three
      * partitions yield 0, 1, 2, 0, ...
      */
-    long nextBalancedPartition(String topicKey, long partitionCount) {
+    long nextBalancedPartition(TopicKey topicKey, long partitionCount) {
         if (partitionCount <= 0) {
             return 0;
         }
@@ -95,7 +96,7 @@ final class ClientRoutingState {
      * an unchanged generation keeps the cursor so an assignment refresh does
      * not disturb the polling rotation.
      */
-    void setAssignment(String groupKey, long generation, List<Long> partitions, long syncedAtNanos) {
+    void setAssignment(GroupKey groupKey, long generation, List<Long> partitions, long syncedAtNanos) {
         assignments.compute(groupKey, (ignored, existing) -> {
             var cursor = existing != null && existing.generation() == generation ? existing.cursor() : 0;
             return new GroupAssignment(generation, List.copyOf(partitions), cursor, syncedAtNanos);
@@ -107,7 +108,7 @@ final class ClientRoutingState {
      * round-robin cursor. Empty when the group has no cached assignment or
      * the member currently owns no partitions.
      */
-    OptionalLong nextGroupPartition(String groupKey) {
+    OptionalLong nextGroupPartition(GroupKey groupKey) {
         var next = new long[] {-1};
         assignments.computeIfPresent(groupKey, (ignored, assignment) -> {
             if (assignment.partitions().isEmpty()) {
@@ -125,11 +126,11 @@ final class ClientRoutingState {
         return next[0] < 0 ? OptionalLong.empty() : OptionalLong.of(next[0]);
     }
 
-    Optional<GroupAssignment> assignment(String groupKey) {
+    Optional<GroupAssignment> assignment(GroupKey groupKey) {
         return Optional.ofNullable(assignments.get(groupKey));
     }
 
-    void invalidateAssignment(String groupKey) {
+    void invalidateAssignment(GroupKey groupKey) {
         assignments.remove(groupKey);
     }
 
@@ -141,6 +142,16 @@ final class ClientRoutingState {
     void clearAssignments() {
         assignments.clear();
     }
+
+    record IdentifierKey(int kind, Long id, String name) {
+        static IdentifierKey from(Identifier identifier) {
+            return new IdentifierKey(identifier.getKind(), identifier.getId(), identifier.getName());
+        }
+    }
+
+    record TopicKey(IdentifierKey stream, IdentifierKey topic) {}
+
+    record GroupKey(TopicKey topic, IdentifierKey consumer) {}
 
     record GroupAssignment(long generation, List<Long> partitions, int cursor, long syncedAtNanos) {}
 

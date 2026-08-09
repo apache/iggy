@@ -289,7 +289,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     private CompletableFuture<Void> ensureFreshAssignment(
-            StreamId streamId, TopicId topicId, Consumer consumer, String groupKey) {
+            StreamId streamId, TopicId topicId, Consumer consumer, ClientRoutingState.GroupKey groupKey) {
         var cached = routingState.assignment(groupKey);
         if (cached.isPresent() && System.nanoTime() - cached.get().syncedAtNanos() < ROUTING_CACHE_REFRESH.toNanos()) {
             return CompletableFuture.completedFuture(null);

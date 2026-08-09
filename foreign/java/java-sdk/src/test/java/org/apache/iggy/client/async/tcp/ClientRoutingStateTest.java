@@ -37,17 +37,21 @@ class ClientRoutingStateTest {
     class Keys {
 
         @Test
-        void shouldBuildTopicKeyFromIdentifiers() {
+        void shouldDistinguishNumericAndNamedIdentifiersWithTheSameText() {
             assertThat(ClientRoutingState.topicKey(StreamId.of(1L), TopicId.of(2L)))
-                    .isEqualTo("1|2");
-            assertThat(ClientRoutingState.topicKey(StreamId.of("orders"), TopicId.of("created")))
-                    .isEqualTo("orders|created");
+                    .isNotEqualTo(ClientRoutingState.topicKey(StreamId.of("1"), TopicId.of("2")));
         }
 
         @Test
-        void shouldBuildGroupKeyFromIdentifiers() {
+        void shouldDistinguishIdentifiersContainingTheFormerDelimiter() {
+            assertThat(ClientRoutingState.topicKey(StreamId.of("orders|created"), TopicId.of("events")))
+                    .isNotEqualTo(ClientRoutingState.topicKey(StreamId.of("orders"), TopicId.of("created|events")));
+        }
+
+        @Test
+        void shouldDistinguishConsumerIdentifiersWithTheSameText() {
             assertThat(ClientRoutingState.groupKey(StreamId.of(1L), TopicId.of(2L), ConsumerId.of(3L)))
-                    .isEqualTo("1|2|3");
+                    .isNotEqualTo(ClientRoutingState.groupKey(StreamId.of(1L), TopicId.of(2L), ConsumerId.of("3")));
         }
     }
 
@@ -57,22 +61,37 @@ class ClientRoutingStateTest {
         @Test
         void shouldRoundRobinAcrossPartitions() {
             // pinned to the Rust SDK: 3 partitions give 0, 1, 2, 0
-            assertThat(state.nextBalancedPartition("s|t", 3)).isEqualTo(0);
-            assertThat(state.nextBalancedPartition("s|t", 3)).isEqualTo(1);
-            assertThat(state.nextBalancedPartition("s|t", 3)).isEqualTo(2);
-            assertThat(state.nextBalancedPartition("s|t", 3)).isEqualTo(0);
+            var topic = topic("s", "t");
+
+            assertThat(state.nextBalancedPartition(topic, 3)).isEqualTo(0);
+            assertThat(state.nextBalancedPartition(topic, 3)).isEqualTo(1);
+            assertThat(state.nextBalancedPartition(topic, 3)).isEqualTo(2);
+            assertThat(state.nextBalancedPartition(topic, 3)).isEqualTo(0);
         }
 
         @Test
         void shouldKeepIndependentCursorsPerTopic() {
-            assertThat(state.nextBalancedPartition("s|a", 2)).isEqualTo(0);
-            assertThat(state.nextBalancedPartition("s|b", 2)).isEqualTo(0);
-            assertThat(state.nextBalancedPartition("s|a", 2)).isEqualTo(1);
+            var first = topic("s", "a");
+            var second = topic("s", "b");
+
+            assertThat(state.nextBalancedPartition(first, 2)).isEqualTo(0);
+            assertThat(state.nextBalancedPartition(second, 2)).isEqualTo(0);
+            assertThat(state.nextBalancedPartition(first, 2)).isEqualTo(1);
+        }
+
+        @Test
+        void shouldKeepIndependentCursorsForFormerlyCollidingTopics() {
+            var numeric = ClientRoutingState.topicKey(StreamId.of(1L), TopicId.of(2L));
+            var named = ClientRoutingState.topicKey(StreamId.of("1"), TopicId.of("2"));
+
+            assertThat(state.nextBalancedPartition(numeric, 2)).isEqualTo(0);
+            assertThat(state.nextBalancedPartition(named, 2)).isEqualTo(0);
+            assertThat(state.nextBalancedPartition(numeric, 2)).isEqualTo(1);
         }
 
         @Test
         void shouldFallBackToZeroWithoutPartitions() {
-            assertThat(state.nextBalancedPartition("s|t", 0)).isEqualTo(0);
+            assertThat(state.nextBalancedPartition(topic("s", "t"), 0)).isEqualTo(0);
         }
     }
 
@@ -82,84 +101,103 @@ class ClientRoutingStateTest {
         @Test
         void shouldRoundRobinAcrossAssignedPartitions() {
             // pinned to the Rust SDK: assignment [0, 1, 2] gives 0, 1, 2, 0
-            state.setAssignment("s|t|g", 1, List.of(0L, 1L, 2L), 0);
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(0L, 1L, 2L), 0);
 
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(0);
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(1);
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(2);
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(0);
+            assertThat(state.nextGroupPartition(group)).hasValue(0);
+            assertThat(state.nextGroupPartition(group)).hasValue(1);
+            assertThat(state.nextGroupPartition(group)).hasValue(2);
+            assertThat(state.nextGroupPartition(group)).hasValue(0);
         }
 
         @Test
         void shouldReturnEmptyWithoutAssignment() {
-            assertThat(state.nextGroupPartition("s|t|g")).isEmpty();
+            assertThat(state.nextGroupPartition(group("s", "t", "g"))).isEmpty();
         }
 
         @Test
         void shouldReturnEmptyForMemberOwningNoPartitions() {
-            state.setAssignment("s|t|g", 1, List.of(), 0);
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(), 0);
 
-            assertThat(state.nextGroupPartition("s|t|g")).isEmpty();
+            assertThat(state.nextGroupPartition(group)).isEmpty();
         }
 
         @Test
         void shouldResetCursorWhenGenerationAdvances() {
-            state.setAssignment("s|t|g", 1, List.of(0L, 1L, 2L), 0);
-            state.nextGroupPartition("s|t|g");
-            state.nextGroupPartition("s|t|g");
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(0L, 1L, 2L), 0);
+            state.nextGroupPartition(group);
+            state.nextGroupPartition(group);
 
-            state.setAssignment("s|t|g", 2, List.of(0L, 1L, 2L), 0);
+            state.setAssignment(group, 2, List.of(0L, 1L, 2L), 0);
 
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(0);
+            assertThat(state.nextGroupPartition(group)).hasValue(0);
         }
 
         @Test
         void shouldKeepCursorWhenGenerationIsUnchanged() {
-            state.setAssignment("s|t|g", 1, List.of(0L, 1L, 2L), 0);
-            state.nextGroupPartition("s|t|g");
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(0L, 1L, 2L), 0);
+            state.nextGroupPartition(group);
 
-            state.setAssignment("s|t|g", 1, List.of(0L, 1L, 2L), 100);
+            state.setAssignment(group, 1, List.of(0L, 1L, 2L), 100);
 
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(1);
+            assertThat(state.nextGroupPartition(group)).hasValue(1);
         }
 
         @Test
         void shouldWrapCursorPositionWhenAssignmentShrinks() {
-            state.setAssignment("s|t|g", 1, List.of(0L, 1L, 2L), 0);
-            state.nextGroupPartition("s|t|g");
-            state.nextGroupPartition("s|t|g");
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(0L, 1L, 2L), 0);
+            state.nextGroupPartition(group);
+            state.nextGroupPartition(group);
 
-            state.setAssignment("s|t|g", 1, List.of(5L), 0);
+            state.setAssignment(group, 1, List.of(5L), 0);
 
-            assertThat(state.nextGroupPartition("s|t|g")).hasValue(5);
+            assertThat(state.nextGroupPartition(group)).hasValue(5);
         }
 
         @Test
         void shouldInvalidateSingleAssignment() {
-            state.setAssignment("s|t|g", 1, List.of(0L), 0);
-            state.invalidateAssignment("s|t|g");
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(0L), 0);
+            state.invalidateAssignment(group);
 
-            assertThat(state.assignment("s|t|g")).isEmpty();
+            assertThat(state.assignment(group)).isEmpty();
         }
 
         @Test
         void shouldClearAllAssignments() {
-            state.setAssignment("s|t|g1", 1, List.of(0L), 0);
-            state.setAssignment("s|t|g2", 1, List.of(1L), 0);
+            var first = group("s", "t", "g1");
+            var second = group("s", "t", "g2");
+            state.setAssignment(first, 1, List.of(0L), 0);
+            state.setAssignment(second, 1, List.of(1L), 0);
 
             state.clearAssignments();
 
-            assertThat(state.assignment("s|t|g1")).isEmpty();
-            assertThat(state.assignment("s|t|g2")).isEmpty();
+            assertThat(state.assignment(first)).isEmpty();
+            assertThat(state.assignment(second)).isEmpty();
+        }
+
+        @Test
+        void shouldKeepAssignmentsIndependentForFormerlyCollidingGroups() {
+            var numeric = ClientRoutingState.groupKey(StreamId.of(1L), TopicId.of(2L), ConsumerId.of(3L));
+            var named = ClientRoutingState.groupKey(StreamId.of("1"), TopicId.of("2"), ConsumerId.of("3"));
+            state.setAssignment(numeric, 1, List.of(1L), 0);
+            state.setAssignment(named, 1, List.of(2L), 0);
+
+            assertThat(state.nextGroupPartition(numeric)).hasValue(1);
+            assertThat(state.nextGroupPartition(named)).hasValue(2);
         }
 
         @Test
         void shouldExposeSyncTimestampForStalenessChecks() {
-            state.setAssignment("s|t|g", 1, List.of(0L), 42L);
+            var group = group("s", "t", "g");
+            state.setAssignment(group, 1, List.of(0L), 42L);
 
-            assertThat(state.assignment("s|t|g"))
-                    .hasValueSatisfying(
-                            assignment -> assertThat(assignment.syncedAtNanos()).isEqualTo(42L));
+            assertThat(state.assignment(group)).hasValueSatisfying(assignment -> assertThat(assignment.syncedAtNanos())
+                    .isEqualTo(42L));
         }
     }
 
@@ -168,11 +206,12 @@ class ClientRoutingStateTest {
 
         @Test
         void shouldCachePartitionCountWithFetchTimestamp() {
-            assertThat(state.partitionCount("s|t")).isEmpty();
+            var topic = topic("s", "t");
+            assertThat(state.partitionCount(topic)).isEmpty();
 
-            state.setPartitionCount("s|t", 4L, 42L);
+            state.setPartitionCount(topic, 4L, 42L);
 
-            assertThat(state.partitionCount("s|t")).hasValueSatisfying(cached -> {
+            assertThat(state.partitionCount(topic)).hasValueSatisfying(cached -> {
                 assertThat(cached.count()).isEqualTo(4L);
                 assertThat(cached.fetchedAtNanos()).isEqualTo(42L);
             });
@@ -180,11 +219,33 @@ class ClientRoutingStateTest {
 
         @Test
         void shouldInvalidatePartitionCount() {
-            state.setPartitionCount("s|t", 4L, 0L);
+            var topic = topic("s", "t");
+            state.setPartitionCount(topic, 4L, 0L);
 
-            state.invalidatePartitionCount("s|t");
+            state.invalidatePartitionCount(topic);
 
-            assertThat(state.partitionCount("s|t")).isEmpty();
+            assertThat(state.partitionCount(topic)).isEmpty();
         }
+
+        @Test
+        void shouldKeepCountsIndependentForFormerlyCollidingTopics() {
+            var numeric = ClientRoutingState.topicKey(StreamId.of(1L), TopicId.of(2L));
+            var named = ClientRoutingState.topicKey(StreamId.of("1"), TopicId.of("2"));
+            state.setPartitionCount(numeric, 4L, 0L);
+            state.setPartitionCount(named, 8L, 0L);
+
+            assertThat(state.partitionCount(numeric))
+                    .hasValueSatisfying(cached -> assertThat(cached.count()).isEqualTo(4L));
+            assertThat(state.partitionCount(named))
+                    .hasValueSatisfying(cached -> assertThat(cached.count()).isEqualTo(8L));
+        }
+    }
+
+    private static ClientRoutingState.TopicKey topic(String stream, String topic) {
+        return ClientRoutingState.topicKey(StreamId.of(stream), TopicId.of(topic));
+    }
+
+    private static ClientRoutingState.GroupKey group(String stream, String topic, String consumer) {
+        return ClientRoutingState.groupKey(StreamId.of(stream), TopicId.of(topic), ConsumerId.of(consumer));
     }
 }

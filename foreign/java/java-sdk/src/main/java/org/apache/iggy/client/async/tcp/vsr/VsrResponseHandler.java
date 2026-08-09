@@ -23,24 +23,26 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Correlates in-flight requests with responses in FIFO order, decodes VSR
- * reply frames, and completes the pending request future with the command
- * payload the typed deserializers expect. Mirrors {@code decode_response} in
- * {@code core/sdk/src/vsr.rs}: eviction frames become typed errors, a nonzero
- * header status is a pre-commit deny, and result-framed bodies have their
- * committed result section stripped (or raised as the typed error).
+ * Correlates multiplexed requests by operation and request id, decodes VSR
+ * reply frames, and completes each pending future with the command payload
+ * the typed deserializers expect. Mirrors {@code decode_response} in {@code
+ * core/sdk/src/vsr.rs}: eviction frames become typed errors, a nonzero header
+ * status is a pre-commit deny, and result-framed bodies have their committed
+ * result section stripped (or raised as the typed error).
  */
 public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
@@ -50,47 +52,71 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private static final int RESULT_ENTRY_LEN = 8;
     private static final int REGISTER_BODY_MIN_LEN = 17;
 
-    private final Queue<CompletableFuture<ByteBuf>> responseQueue = new ConcurrentLinkedQueue<>();
+    private final ConcurrentMap<RequestKey, CompletableFuture<ByteBuf>> pendingRequests = new ConcurrentHashMap<>();
     private final ConsensusSession session;
     private final Runnable onEviction;
-    private volatile Throwable closeCause;
+    private final AtomicReference<Throwable> closeCause = new AtomicReference<>();
 
     public VsrResponseHandler(ConsensusSession session, Runnable onEviction) {
         this.session = session;
         this.onEviction = onEviction;
     }
 
-    public void enqueueRequest(CompletableFuture<ByteBuf> future) {
-        responseQueue.add(future);
+    void registerRequest(CompletableFuture<ByteBuf> future, int operation, long requestId) {
+        registerRequest(new RequestKey(operation, requestId), future);
     }
 
-    public void enqueueRequest(
-            Channel channel, CompletableFuture<ByteBuf> future, long deadlineNanos, int commandCode) {
-        responseQueue.add(future);
+    public void registerRequest(
+            Channel channel,
+            ByteBuf requestFrame,
+            CompletableFuture<ByteBuf> future,
+            long deadlineNanos,
+            int commandCode) {
+        RequestKey key =
+                new RequestKey(VsrHeaders.readRequestOperation(requestFrame), VsrHeaders.readRequestId(requestFrame));
+        registerRequest(key, future);
         long timeoutNanos = Math.max(0, deadlineNanos - System.nanoTime());
-        var timeoutFuture = channel.eventLoop()
-                .schedule(
-                        () -> {
-                            if (!future.isDone()) {
-                                closeChannel(
-                                        channel,
-                                        new IggyTimeoutException(
-                                                "Timed out waiting for a response to command code " + commandCode));
-                            }
-                        },
-                        timeoutNanos,
-                        TimeUnit.NANOSECONDS);
-        future.whenComplete((response, error) -> timeoutFuture.cancel(false));
+        ScheduledFuture<?> timeoutFuture;
+        try {
+            timeoutFuture = channel.eventLoop()
+                    .schedule(
+                            () -> {
+                                if (!future.isDone()) {
+                                    closeChannel(
+                                            channel,
+                                            new IggyTimeoutException(
+                                                    "Timed out waiting for a response to command code " + commandCode));
+                                }
+                            },
+                            timeoutNanos,
+                            TimeUnit.NANOSECONDS);
+        } catch (RuntimeException error) {
+            pendingRequests.remove(key, future);
+            throw error;
+        }
+        future.whenComplete((response, error) -> {
+            pendingRequests.remove(key, future);
+            timeoutFuture.cancel(false);
+        });
+    }
+
+    private void registerRequest(RequestKey key, CompletableFuture<ByteBuf> future) {
+        CompletableFuture<ByteBuf> existing = pendingRequests.putIfAbsent(key, future);
+        if (existing != null) {
+            throw new IllegalStateException(
+                    "A request is already pending for operation " + key.operation() + " and request id " + key.id());
+        }
     }
 
     public void closeChannel(Channel channel, Throwable cause) {
-        closeCause = cause;
+        closeCause.compareAndSet(null, cause);
         channel.close();
+        failPendingRequests(closeCause.get());
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        Throwable cause = closeCause;
+        Throwable cause = closeCause.get();
         if (cause == null) {
             cause = new IggyConnectionException("Connection closed before a response arrived");
         }
@@ -100,17 +126,22 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        failPendingRequests(cause);
-        ctx.close();
+        closeChannel(ctx.channel(), cause);
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-        CompletableFuture<ByteBuf> future = responseQueue.poll();
+        if (VsrHeaders.peekCommand(msg) == VsrHeaders.COMMAND_EVICTION) {
+            handleEviction(ctx, msg);
+            return;
+        }
+        RequestKey key = new RequestKey(VsrHeaders.readReplyOperation(msg), VsrHeaders.readReplyRequestId(msg));
+        CompletableFuture<ByteBuf> future = pendingRequests.remove(key);
         if (future == null) {
-            log.error(
-                    "Received response on channel {} but no request was waiting!",
-                    ctx.channel().id());
+            closeChannel(
+                    ctx.channel(),
+                    invalidReply(
+                            "no request was pending for operation " + key.operation() + " and request id " + key.id()));
             return;
         }
         ByteBuf body;
@@ -123,6 +154,20 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (!future.complete(body)) {
             body.release();
         }
+    }
+
+    private void handleEviction(ChannelHandlerContext ctx, ByteBuf frame) {
+        IggyServerException error = VsrHeaders.evictionToException(frame);
+        session.reset();
+        try {
+            onEviction.run();
+        } catch (RuntimeException listenerError) {
+            log.warn("Eviction listener failed: {}", listenerError.getMessage());
+        }
+        // The server has already unbound this transport. Closing it before
+        // completing requests prevents the pool from recycling the channel
+        // and assigning a late reply to a request from the next session.
+        closeChannel(ctx.channel(), error);
     }
 
     private ByteBuf decodeReply(ByteBuf frame) {
@@ -146,12 +191,6 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private int validatedOperation(ByteBuf frame) {
         int command = VsrHeaders.peekCommand(frame);
-        if (command == VsrHeaders.COMMAND_EVICTION) {
-            // The session is terminal server-side; the next login re-registers.
-            session.reset();
-            onEviction.run();
-            throw VsrHeaders.evictionToException(frame);
-        }
         if (command != VsrHeaders.COMMAND_REPLY) {
             throw invalidReply("unexpected consensus command " + command);
         }
@@ -209,9 +248,12 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void failPendingRequests(Throwable cause) {
-        CompletableFuture<ByteBuf> pending;
-        while ((pending = responseQueue.poll()) != null) {
-            pending.completeExceptionally(cause);
-        }
+        pendingRequests.forEach((key, pending) -> {
+            if (pendingRequests.remove(key, pending)) {
+                pending.completeExceptionally(cause);
+            }
+        });
     }
+
+    private record RequestKey(int operation, long id) {}
 }

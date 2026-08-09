@@ -35,6 +35,7 @@ import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
+import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -121,6 +122,8 @@ public class AsyncIggyTcpClient {
     private final Optional<Duration> connectionTimeout;
     private final Optional<Duration> acquireTimeout;
     private final Optional<Duration> requestTimeout;
+    private final Duration heartbeatInterval;
+    private final int maxVsrFrameSize;
     private final Optional<RetryPolicy> retryPolicy;
     private final boolean enableTls;
     private final Optional<File> tlsCertificate;
@@ -150,7 +153,19 @@ public class AsyncIggyTcpClient {
      * @param port the server port
      */
     public AsyncIggyTcpClient(String host, int port) {
-        this(host, port, null, null, null, null, null, null, false, Optional.empty());
+        this(
+                host,
+                port,
+                null,
+                null,
+                null,
+                null,
+                null,
+                Duration.ofSeconds(5),
+                VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
+                null,
+                false,
+                Optional.empty());
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -162,6 +177,8 @@ public class AsyncIggyTcpClient {
             Duration connectionTimeout,
             Duration acquireTimeout,
             Duration requestTimeout,
+            Duration heartbeatInterval,
+            int maxVsrFrameSize,
             RetryPolicy retryPolicy,
             boolean enableTls,
             Optional<File> tlsCertificate) {
@@ -172,6 +189,8 @@ public class AsyncIggyTcpClient {
         this.connectionTimeout = Optional.ofNullable(connectionTimeout);
         this.acquireTimeout = Optional.ofNullable(acquireTimeout);
         this.requestTimeout = Optional.ofNullable(requestTimeout);
+        this.heartbeatInterval = heartbeatInterval;
+        this.maxVsrFrameSize = maxVsrFrameSize;
         this.retryPolicy = Optional.ofNullable(retryPolicy);
         this.enableTls = enableTls;
         this.tlsCertificate = tlsCertificate;
@@ -435,6 +454,8 @@ public class AsyncIggyTcpClient {
                 poolConfig,
                 connectionTimeout,
                 requestTimeout,
+                heartbeatInterval,
+                maxVsrFrameSize,
                 this::retryTransientOnLeader,
                 routingState::clearAssignments,
                 this::onConnectionFailure);

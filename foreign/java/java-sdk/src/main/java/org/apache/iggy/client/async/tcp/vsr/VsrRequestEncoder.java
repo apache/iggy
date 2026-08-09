@@ -71,17 +71,16 @@ public final class VsrRequestEncoder {
             body = payload;
             operation = VsrOperation.operationForCode(commandCode);
             if (operation == VsrOperation.NON_REPLICATED) {
-                // Non-replicated ops bypass dedup: read the counter without
-                // advancing, and stay sessionless before login (bootstrap
-                // ping and cluster metadata work unauthenticated).
-                requestId = session.currentRequestId();
+                // Non-replicated ops bypass dedup but still need a unique
+                // correlation id. Bootstrap ping and cluster metadata remain
+                // sessionless before login.
+                requestId = session.nextCorrelationId();
                 sessionId = session.sessionOrZero();
             } else if (VsrOperation.isPartition(operation)) {
-                // Partition ops replicate in their own group with no client
-                // table dedup; consuming the counter would gap the next
-                // metadata request id.
+                // Partition ops replicate in their own group without client
+                // table dedup, so use the independent correlation sequence.
                 sessionId = session.boundSession();
-                requestId = session.currentRequestId();
+                requestId = session.nextCorrelationId();
             } else {
                 sessionId = session.boundSession();
                 requestId = session.nextRequestId();

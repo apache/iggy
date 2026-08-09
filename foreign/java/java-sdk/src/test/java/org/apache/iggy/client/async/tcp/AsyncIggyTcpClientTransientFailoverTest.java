@@ -46,8 +46,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int HEADER_SIZE = 256;
     private static final int SIZE_OFFSET = 48;
     private static final int COMMAND_OFFSET = 60;
+    private static final int REQUEST_ID_OFFSET = 168;
     private static final int REQUEST_OPERATION_OFFSET = 176;
     private static final int REQUEST_CODE_OFFSET = 204;
+    private static final int REPLY_REQUEST_ID_OFFSET = 200;
     private static final int REPLY_OPERATION_OFFSET = 208;
     private static final int REPLY_STATUS_OFFSET = 224;
     private static final int EVICTION_REASON_OFFSET = 255;
@@ -109,7 +111,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         try (ServerSocket serverSocket = new ServerSocket(0, 1, loopback)) {
             AtomicInteger registrations = new AtomicInteger();
             AtomicInteger mutations = new AtomicInteger();
-            CompletableFuture<Void> server = serve(serverSocket, request -> {
+            CompletableFuture<Void> server = serve(serverSocket, 2, request -> {
                 if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
                 }
@@ -194,13 +196,21 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     private static CompletableFuture<Void> serve(ServerSocket server, RequestHandler handler) {
+        return serve(server, 1, handler);
+    }
+
+    private static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
         return CompletableFuture.runAsync(() -> {
-            try (Socket socket = server.accept()) {
-                InputStream input = socket.getInputStream();
-                OutputStream output = socket.getOutputStream();
-                Request request;
-                while ((request = readRequest(input)) != null) {
-                    writeResponse(output, handler.handle(request));
+            try {
+                for (int connection = 0; connection < connectionCount; connection++) {
+                    try (Socket socket = server.accept()) {
+                        InputStream input = socket.getInputStream();
+                        OutputStream output = socket.getOutputStream();
+                        Request request;
+                        while ((request = readRequest(input)) != null) {
+                            writeResponse(output, request, handler.handle(request));
+                        }
+                    }
                 }
             } catch (IOException error) {
                 throw new IllegalStateException("Mock VSR server failed", error);
@@ -222,10 +232,13 @@ class AsyncIggyTcpClientTransientFailoverTest {
         if (body.length != size - HEADER_SIZE) {
             throw new EOFException("Truncated VSR request body");
         }
-        return new Request(Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]), fields.getInt(REQUEST_CODE_OFFSET));
+        return new Request(
+                Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
+                fields.getInt(REQUEST_CODE_OFFSET),
+                fields.getLong(REQUEST_ID_OFFSET));
     }
 
-    private static void writeResponse(OutputStream output, Response response) throws IOException {
+    private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
         byte[] body = new byte[response.body().readableBytes()];
         response.body().readBytes(body);
         response.body().release();
@@ -236,6 +249,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         if (response.command() == COMMAND_EVICTION) {
             header[EVICTION_REASON_OFFSET] = (byte) response.evictionReason();
         } else {
+            fields.putLong(REPLY_REQUEST_ID_OFFSET, request.requestId());
             header[REPLY_OPERATION_OFFSET] = (byte) response.operation();
             fields.putInt(REPLY_STATUS_OFFSET, response.status());
         }
@@ -296,7 +310,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         body.writeBytes(bytes);
     }
 
-    private record Request(int operation, int commandCode) {
+    private record Request(int operation, int commandCode, long requestId) {
         boolean is(int expectedCode, int expectedOperation) {
             return commandCode == expectedCode && operation == expectedOperation;
         }

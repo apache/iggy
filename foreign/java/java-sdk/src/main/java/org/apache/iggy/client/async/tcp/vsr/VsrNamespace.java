@@ -49,6 +49,7 @@ final class VsrNamespace {
     private static final int DELETE_CONSUMER_OFFSET_CODE = 122;
     private static final int STORE_CONSUMER_OFFSET_2_CODE = 123;
     private static final int DELETE_CONSUMER_OFFSET_2_CODE = 124;
+    private static final int DELETE_SEGMENTS_CODE = 503;
 
     private static final int IDENTIFIER_KIND_NUMERIC = 1;
     private static final int PARTITIONING_KIND_PARTITION_ID = 2;
@@ -68,6 +69,7 @@ final class VsrNamespace {
                     DELETE_CONSUMER_OFFSET_CODE,
                     STORE_CONSUMER_OFFSET_2_CODE,
                     DELETE_CONSUMER_OFFSET_2_CODE -> fromConsumerOffset(payload);
+            case DELETE_SEGMENTS_CODE -> fromDeleteSegments(payload);
             default -> throw IggyServerException.fromTcpResponse(VsrHeaders.ERROR_FEATURE_UNAVAILABLE, new byte[0]);
         };
     }
@@ -88,14 +90,17 @@ final class VsrNamespace {
         if (in.readableBytes() < metadataLength) {
             throw new IggyInvalidArgumentException("Send messages metadata section is truncated");
         }
-        Long streamId = readNumericIdentifier(in);
-        Long topicId = readNumericIdentifier(in);
-        int partitioningKind = in.readUnsignedByte();
-        int partitioningLength = in.readUnsignedByte();
+        ByteBuf metadata = in.readSlice((int) metadataLength);
+        Long streamId = readNumericIdentifier(metadata);
+        Long topicId = readNumericIdentifier(metadata);
+        requireReadable(metadata, 2, "Send messages payload is missing partitioning metadata");
+        int partitioningKind = metadata.readUnsignedByte();
+        int partitioningLength = metadata.readUnsignedByte();
         if (partitioningKind != PARTITIONING_KIND_PARTITION_ID || partitioningLength != 4) {
             throw IggyServerException.fromTcpResponse(VsrHeaders.ERROR_FEATURE_UNAVAILABLE, new byte[0]);
         }
-        long partitionId = in.readUnsignedIntLE();
+        requireReadable(metadata, Integer.BYTES, "Send messages payload is missing its partition id");
+        long partitionId = metadata.readUnsignedIntLE();
         return pack(streamId, topicId, partitionId);
     }
 
@@ -105,15 +110,28 @@ final class VsrNamespace {
      */
     private static long fromConsumerOffset(ByteBuf payload) {
         ByteBuf in = payload.slice();
+        requireReadable(in, 1, "Consumer offset payload is missing its consumer kind");
         in.skipBytes(1);
         skipIdentifier(in);
         Long streamId = readNumericIdentifier(in);
         Long topicId = readNumericIdentifier(in);
+        requireReadable(in, 1, "Consumer offset payload is missing its partition presence flag");
         int hasPartition = in.readUnsignedByte();
+        requireReadable(in, Integer.BYTES, "Consumer offset payload is missing its partition id");
         long partitionId = in.readUnsignedIntLE();
         if (hasPartition == 0) {
             throw new IggyInvalidArgumentException("Consumer offset requests require an explicit partition id");
         }
+        return pack(streamId, topicId, partitionId);
+    }
+
+    /** Payload: {@code [stream id][topic id][partition_id:u32][segments_count:u32]}. */
+    private static long fromDeleteSegments(ByteBuf payload) {
+        ByteBuf in = payload.slice();
+        Long streamId = readNumericIdentifier(in);
+        Long topicId = readNumericIdentifier(in);
+        requireReadable(in, Integer.BYTES * 2, "Delete segments payload is missing its partition id or segments count");
+        long partitionId = in.readUnsignedIntLE();
         return pack(streamId, topicId, partitionId);
     }
 
@@ -136,9 +154,14 @@ final class VsrNamespace {
     }
 
     private static Long readNumericIdentifier(ByteBuf in) {
+        requireReadable(in, 2, "Identifier header is truncated");
         int kind = in.readUnsignedByte();
         int length = in.readUnsignedByte();
-        if (kind == IDENTIFIER_KIND_NUMERIC && length == 4) {
+        requireReadable(in, length, "Identifier value is truncated");
+        if (kind == IDENTIFIER_KIND_NUMERIC) {
+            if (length != Integer.BYTES) {
+                throw new IggyInvalidArgumentException("Numeric identifier must contain a 4-byte value");
+            }
             return in.readUnsignedIntLE();
         }
         in.skipBytes(length);
@@ -146,8 +169,16 @@ final class VsrNamespace {
     }
 
     private static void skipIdentifier(ByteBuf in) {
+        requireReadable(in, 2, "Identifier header is truncated");
         in.skipBytes(1);
         int length = in.readUnsignedByte();
+        requireReadable(in, length, "Identifier value is truncated");
         in.skipBytes(length);
+    }
+
+    private static void requireReadable(ByteBuf in, int length, String message) {
+        if (in.readableBytes() < length) {
+            throw new IggyInvalidArgumentException(message);
+        }
     }
 }

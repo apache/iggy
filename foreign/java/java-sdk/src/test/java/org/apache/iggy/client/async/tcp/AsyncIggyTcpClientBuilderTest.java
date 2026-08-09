@@ -208,6 +208,49 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void shouldAcceptCustomMaximumVsrFrameSize() {
+        client =
+                AsyncIggyTcpClient.builder().maxVsrFrameSize(128L * 1024 * 1024).build();
+
+        assertThat(client).isNotNull();
+    }
+
+    @Test
+    void shouldRejectMaximumVsrFrameSizeBelowHeader() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().maxVsrFrameSize(255);
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectNonPositiveMaximumVsrFrameSize() {
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().maxVsrFrameSize(0).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(
+                        () -> AsyncIggyTcpClient.builder().maxVsrFrameSize(-1).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectMaximumVsrFrameSizeAboveJavaBufferLimit() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().maxVsrFrameSize((long) Integer.MAX_VALUE + 1);
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectNonPositiveHeartbeatInterval() {
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
+                        .heartbeatInterval(Duration.ZERO)
+                        .build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
+                        .heartbeatInterval(Duration.ofMillis(-1))
+                        .build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
         client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());

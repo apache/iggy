@@ -71,13 +71,46 @@ class AsyncTcpConnectionRequestTimeoutTest {
         }
     }
 
-    private static void verifyRequestTimesOutAndClosesSocket(CompletableFuture<?> response, Socket socket)
+    @Test
+    void shouldFailMultiplexedRequestsAndUseReplacementChannelAfterTimeout() throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
+            client = AsyncIggyTcpClient.builder()
+                    .host(server.getInetAddress().getHostAddress())
+                    .port(server.getLocalPort())
+                    .requestTimeout(REQUEST_TIMEOUT)
+                    .build();
+
+            CompletableFuture<Socket> firstAccepted = accept(server);
+            client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            try (Socket firstSocket = firstAccepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                CompletableFuture<String> first = client.system().ping();
+                CompletableFuture<String> second = client.system().ping();
+
+                assertThat(verifyRequestTimesOutAndClosesSocket(first, firstSocket))
+                        .hasSize(2 * 256);
+                assertThatThrownBy(() -> second.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class)
+                        .hasCauseInstanceOf(IggyTimeoutException.class);
+            }
+
+            CompletableFuture<Socket> secondAccepted = accept(server);
+            CompletableFuture<String> third = client.system().ping();
+            try (Socket secondSocket = secondAccepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                assertThat(verifyRequestTimesOutAndClosesSocket(third, secondSocket))
+                        .hasSize(256);
+            }
+        }
+    }
+
+    private static byte[] verifyRequestTimesOutAndClosesSocket(CompletableFuture<?> response, Socket socket)
             throws Exception {
         assertThatThrownBy(() -> response.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
                 .hasCauseInstanceOf(IggyTimeoutException.class);
         socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS));
-        assertThat(socket.getInputStream().readAllBytes()).isNotEmpty();
+        byte[] request = socket.getInputStream().readAllBytes();
+        assertThat(request).isNotEmpty();
+        return request;
     }
 
     private static CompletableFuture<Socket> accept(ServerSocket server) {

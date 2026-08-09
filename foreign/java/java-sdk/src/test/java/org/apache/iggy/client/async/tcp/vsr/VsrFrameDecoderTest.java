@@ -81,4 +81,38 @@ class VsrFrameDecoderTest {
 
         assertThatThrownBy(() -> channel.writeInbound(frame)).isInstanceOf(DecoderException.class);
     }
+
+    @Test
+    void shouldWaitForLargeFrameWhenConfiguredLimitAllowsIt() {
+        int declaredSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE + 1;
+        EmbeddedChannel largeFrameChannel = new EmbeddedChannel(new VsrFrameDecoder(declaredSize));
+        ByteBuf header = Unpooled.buffer(VsrHeaders.HEADER_SIZE);
+        header.writeZero(VsrHeaders.HEADER_SIZE);
+        header.setIntLE(VsrHeaders.SIZE_OFFSET, declaredSize);
+        try {
+            largeFrameChannel.writeInbound(header);
+
+            assertThat((Object) largeFrameChannel.readInbound()).isNull();
+        } finally {
+            largeFrameChannel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldRejectFrameAboveConfiguredLimit() {
+        int configuredLimit = VsrHeaders.HEADER_SIZE + 1;
+        EmbeddedChannel smallFrameChannel = new EmbeddedChannel(new VsrFrameDecoder(configuredLimit));
+        ByteBuf header = Unpooled.buffer(VsrHeaders.HEADER_SIZE);
+        header.writeZero(VsrHeaders.HEADER_SIZE);
+        header.setIntLE(VsrHeaders.SIZE_OFFSET, configuredLimit + 1);
+        try {
+            assertThatThrownBy(() -> smallFrameChannel.writeInbound(header)).isInstanceOf(DecoderException.class);
+        } finally {
+            try {
+                smallFrameChannel.finishAndReleaseAll();
+            } catch (DecoderException ignored) {
+                // Closing a failed decoder can replay its exception.
+            }
+        }
+    }
 }

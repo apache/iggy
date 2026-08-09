@@ -40,6 +40,7 @@ public final class ConsensusSession {
     private long clientIdHigh;
     private Long session;
     private long requestCounter = 1;
+    private long correlationCounter = 1;
     private boolean registerConsumed;
 
     public ConsensusSession() {
@@ -70,17 +71,20 @@ public final class ConsensusSession {
         this.session = sessionEpoch;
     }
 
-    /**
-     * Replicated metadata ops consume the monotonic counter; non-replicated
-     * and partition-plane ops read it without advancing (the server tracks
-     * request ids only for metadata-plane dedup, and a consumed-but-untracked
-     * id would gap the next metadata request).
-     */
+    /** Replicated metadata ops consume the monotonic VSR dedup counter. */
     synchronized long nextRequestId() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
         }
         return requestCounter++;
+    }
+
+    /**
+     * Partition and non-replicated ops use an independent sequence for reply
+     * correlation, so they do not create gaps in the metadata dedup sequence.
+     */
+    synchronized long nextCorrelationId() {
+        return correlationCounter++;
     }
 
     synchronized long currentRequestId() {

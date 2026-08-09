@@ -34,7 +34,21 @@ import java.util.List;
 public class VsrFrameDecoder extends ByteToMessageDecoder {
 
     /** Matches the server's default {@code max_message_size} (64 MB). */
-    static final long MAX_FRAME_SIZE = 64L * 1024 * 1024;
+    public static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024;
+
+    private final int maxFrameSize;
+
+    public VsrFrameDecoder() {
+        this(DEFAULT_MAX_FRAME_SIZE);
+    }
+
+    public VsrFrameDecoder(int maxFrameSize) {
+        if (maxFrameSize < VsrHeaders.HEADER_SIZE) {
+            throw new IllegalArgumentException(
+                    "Maximum VSR frame size must be at least " + VsrHeaders.HEADER_SIZE + " bytes");
+        }
+        this.maxFrameSize = maxFrameSize;
+    }
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
@@ -42,7 +56,7 @@ public class VsrFrameDecoder extends ByteToMessageDecoder {
             return;
         }
         long totalSize = VsrHeaders.readSize(in);
-        if (totalSize < VsrHeaders.HEADER_SIZE || totalSize > MAX_FRAME_SIZE) {
+        if (totalSize < VsrHeaders.HEADER_SIZE || totalSize > maxFrameSize) {
             throw new DecoderException("Invalid VSR frame size " + totalSize + ", connection is desynchronized");
         }
         if (in.readableBytes() < totalSize) {

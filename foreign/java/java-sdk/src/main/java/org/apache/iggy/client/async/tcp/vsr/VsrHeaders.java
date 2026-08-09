@@ -45,6 +45,7 @@ public final class VsrHeaders {
     static final int REQUEST_RESERVED_CODE_OFFSET = 204;
 
     // ReplyHeader
+    static final int REPLY_REQUEST_OFFSET = 200;
     static final int REPLY_OPERATION_OFFSET = 208;
     static final int REPLY_STATUS_OFFSET = 224;
 
@@ -99,6 +100,18 @@ public final class VsrHeaders {
 
     static int readReplyOperation(ByteBuf frame) {
         return frame.getUnsignedByte(frame.readerIndex() + REPLY_OPERATION_OFFSET);
+    }
+
+    static long readReplyRequestId(ByteBuf frame) {
+        return frame.getLongLE(frame.readerIndex() + REPLY_REQUEST_OFFSET);
+    }
+
+    static int readRequestOperation(ByteBuf frame) {
+        return frame.getUnsignedByte(frame.readerIndex() + REQUEST_OPERATION_OFFSET);
+    }
+
+    static long readRequestId(ByteBuf frame) {
+        return frame.getLongLE(frame.readerIndex() + REQUEST_ID_OFFSET);
     }
 
     /**
