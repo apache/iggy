@@ -83,9 +83,8 @@ public class VsrHandshakeTests
     ///     A rejected register is a consumed one on the server, so the failure has to reset the session and
     ///     unwind the connection state. The retry with valid credentials is the assertion that matters: a client
     ///     left in <c>Authenticating</c> with the failed register's session still bound would fence it.
-    ///     Wrong credentials fall through the server's PAT attempt and come back as a MalformedLogin eviction,
-    ///     not as the empty register reply, and an eviction is terminal for the connection: the retry has to
-    ///     reconnect first.
+    ///     Wrong credentials come back as an InvalidCredentials eviction, not as the empty register reply,
+    ///     and an eviction is terminal for the connection: the retry has to reconnect first.
     /// </summary>
     [Test]
     public async Task Login_WithInvalidCredentials_Should_ResetTheSession_And_AllowARetry()
@@ -95,8 +94,8 @@ public class VsrHandshakeTests
         var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
             client.LoginUserAsync("iggy", "not-the-password"));
 
-        exception.StatusCode.ShouldBe(4);
-        exception.Message.ShouldContain("Malformed login body");
+        exception.StatusCode.ShouldBe(42);
+        exception.Message.ShouldContain("Invalid credentials");
 
         await client.ConnectAsync();
         (await client.LoginUserAsync("iggy", "iggy")).ShouldNotBeNull();
