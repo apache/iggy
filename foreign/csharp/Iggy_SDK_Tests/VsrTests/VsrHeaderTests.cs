@@ -33,10 +33,11 @@ public sealed class VsrHeaderTests
         return consensusSession;
     }
 
-    private static byte[] Encode(ConsensusSession session, int code, byte[] payload, out int totalSize)
+    private static byte[] Encode(ConsensusSession session, int code, int bodyLength, out int totalSize,
+        ulong ns = 0)
     {
         var header = new byte[VsrHeader.HEADER_SIZE];
-        totalSize = VsrHeader.EncodeRequestHeader(header, session, code, payload);
+        totalSize = VsrHeader.EncodeRequestHeader(header, session, code, ns, bodyLength);
 
         return header;
     }
@@ -52,27 +53,20 @@ public sealed class VsrHeaderTests
     }
 
     /// <summary>
-    ///     A namespace failure must leave the session exactly as it was. Consuming the request id would gap the
-    ///     next metadata request, and dropping the binding would leave the client unable to send or re-login.
+    ///     The caller resolves the routing namespace from its typed identifiers, but only partition-plane
+    ///     operations carry it: a stray namespace on a metadata or non-replicated request would route it off
+    ///     the metadata consensus group.
     /// </summary>
     [Fact]
-    public void Encode_NamespaceFailureConsumesNothingAndKeepsTheSession()
+    public void Encode_NonPartitionOpsIgnoreTheCallerNamespace()
     {
         var session = BoundSession();
-        var payload = VsrTestPayloads.ConsumerOffset(VsrTestPayloads.NumericIdentifier(4),
-            VsrTestPayloads.NumericIdentifier(5), null);
-        var header = new byte[VsrHeader.HEADER_SIZE];
 
-        var exception = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            VsrHeader.EncodeRequestHeader(header, session, CommandCodes.STORE_CONSUMER_OFFSET_CODE, payload));
+        var metadataHeader = Encode(session, CommandCodes.CREATE_STREAM_CODE, 1, out _, VsrNamespace.Pack(1, 2, 3));
+        var nonReplicatedHeader = Encode(session, CommandCodes.PING_CODE, 0, out _, VsrNamespace.Pack(1, 2, 3));
 
-        Assert.Equal(VsrError.INVALID_IDENTIFIER, exception.StatusCode);
-        Assert.True(session.IsBound);
-        Assert.Equal(1UL, session.RequestCounter);
-
-        VsrHeader.EncodeRequestHeader(header, session, CommandCodes.CREATE_STREAM_CODE, [1]);
-
-        Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
+        Assert.Equal(0UL, ReadUInt64(metadataHeader, VsrHeader.REQUEST_NAMESPACE_OFFSET));
+        Assert.Equal(0UL, ReadUInt64(nonReplicatedHeader, VsrHeader.REQUEST_NAMESPACE_OFFSET));
     }
 
     [Fact]
@@ -81,7 +75,7 @@ public sealed class VsrHeaderTests
         var session = new ConsensusSession(7);
         var payload = LoginRegister.Serialize("admin", "secret");
 
-        var header = Encode(session, CommandCodes.LOGIN_REGISTER_CODE, payload, out var totalSize);
+        var header = Encode(session, CommandCodes.LOGIN_REGISTER_CODE, payload.Length, out var totalSize);
 
         Assert.Equal(VsrHeader.HEADER_SIZE + payload.Length, totalSize);
         Assert.Equal((uint)totalSize, ReadUInt32(header, VsrHeader.SIZE_OFFSET));
@@ -100,7 +94,7 @@ public sealed class VsrHeaderTests
     {
         var session = new ConsensusSession(new UInt128(0xAABB_CCDD_EEFF_0011, 0x1122_3344_5566_7788));
 
-        var header = Encode(session, CommandCodes.PING_CODE, [], out _);
+        var header = Encode(session, CommandCodes.PING_CODE, 0, out _);
 
         Assert.Equal(0x1122_3344_5566_7788UL, ReadUInt64(header, VsrHeader.REQUEST_CLIENT_OFFSET));
         Assert.Equal(0xAABB_CCDD_EEFF_0011UL, ReadUInt64(header, VsrHeader.REQUEST_CLIENT_OFFSET + 8));
@@ -111,7 +105,7 @@ public sealed class VsrHeaderTests
     {
         var session = BoundSession();
 
-        var header = Encode(session, CommandCodes.PING_CODE, [], out _);
+        var header = Encode(session, CommandCodes.PING_CODE, 0, out _);
 
         Assert.Equal((byte)VsrOperation.NonReplicated, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
@@ -126,7 +120,7 @@ public sealed class VsrHeaderTests
     {
         var session = BoundSession();
 
-        var header = Encode(session, 9999, [], out _);
+        var header = Encode(session, 9999, 0, out _);
 
         Assert.Equal((byte)VsrOperation.NonReplicated, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(9999u, ReadUInt32(header, VsrHeader.REQUEST_RESERVED_OFFSET));
@@ -137,7 +131,7 @@ public sealed class VsrHeaderTests
     {
         var session = new ConsensusSession(1);
 
-        var header = Encode(session, CommandCodes.PING_CODE, [], out _);
+        var header = Encode(session, CommandCodes.PING_CODE, 0, out _);
 
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_SESSION_OFFSET));
     }
@@ -147,7 +141,7 @@ public sealed class VsrHeaderTests
     {
         var session = BoundSession();
 
-        var header = Encode(session, CommandCodes.CREATE_STREAM_CODE, [1, 2, 3], out _);
+        var header = Encode(session, CommandCodes.CREATE_STREAM_CODE, 3, out _);
 
         Assert.Equal((byte)VsrOperation.CreateStream, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
@@ -161,7 +155,7 @@ public sealed class VsrHeaderTests
     {
         var session = BoundSession();
 
-        var header = Encode(session, CommandCodes.LOGOUT_USER_CODE, [], out _);
+        var header = Encode(session, CommandCodes.LOGOUT_USER_CODE, 0, out _);
 
         Assert.Equal((byte)VsrOperation.Logout, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
@@ -173,9 +167,8 @@ public sealed class VsrHeaderTests
     public void Encode_PartitionOpDoesNotAdvanceTheCounter()
     {
         var session = BoundSession();
-        var payload = VsrTestPayloads.SendMessagesToPartition(2, 3, 4);
 
-        var header = Encode(session, CommandCodes.SEND_MESSAGES_CODE, payload, out _);
+        var header = Encode(session, CommandCodes.SEND_MESSAGES_CODE, 16, out _, VsrNamespace.Pack(2, 3, 4));
 
         Assert.Equal((byte)VsrOperation.SendMessages, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
@@ -189,7 +182,7 @@ public sealed class VsrHeaderTests
         var session = new ConsensusSession(1);
 
         var exception = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            Encode(session, CommandCodes.CREATE_STREAM_CODE, [1], out _));
+            Encode(session, CommandCodes.CREATE_STREAM_CODE, 1, out _));
 
         Assert.Equal(VsrError.UNAUTHENTICATED, exception.StatusCode);
         Assert.Equal(1UL, session.RequestCounter);
@@ -202,7 +195,7 @@ public sealed class VsrHeaderTests
         Array.Fill(header, (byte)0xFF);
         var session = BoundSession();
 
-        VsrHeader.EncodeRequestHeader(header, session, CommandCodes.CREATE_STREAM_CODE, [1]);
+        VsrHeader.EncodeRequestHeader(header, session, CommandCodes.CREATE_STREAM_CODE, 0, 1);
 
         Assert.Equal(0u, ReadUInt32(header, VsrHeader.REQUEST_RESERVED_OFFSET));
         Assert.All(header[..VsrHeader.SIZE_OFFSET], stale => Assert.Equal(0, stale));
@@ -214,7 +207,8 @@ public sealed class VsrHeaderTests
         var session = BoundSession();
 
         Assert.Throws<ArgumentException>(() =>
-            VsrHeader.EncodeRequestHeader(new byte[VsrHeader.HEADER_SIZE - 1], session, CommandCodes.PING_CODE, []));
+            VsrHeader.EncodeRequestHeader(new byte[VsrHeader.HEADER_SIZE - 1], session, CommandCodes.PING_CODE, 0,
+                0));
     }
 
     [Fact]

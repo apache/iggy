@@ -19,7 +19,7 @@ using System.Buffers;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Tests.UtilityTests;
 
@@ -31,7 +31,7 @@ public class SlicedMemoryOwnerTests
     public void Dispose_ReturnsBufferToPool()
     {
         var owner = ArrayPoolHelper.Rent(BufferSize);
-        byte[] underlying = GetUnderlyingArray(owner);
+        var underlying = GetUnderlyingArray(owner);
         owner.Dispose();
 
         using var second = ArrayPoolHelper.Rent(BufferSize);
@@ -50,10 +50,10 @@ public class SlicedMemoryOwnerTests
     [Fact]
     public void FinalizerIsDeclared()
     {
-        Type sliced = typeof(ArrayPoolHelper)
+        var sliced = typeof(ArrayPoolHelper)
             .GetNestedType("SlicedMemoryOwner", BindingFlags.NonPublic)!;
 
-        MethodInfo? finalizer = sliced.GetMethod("Finalize", BindingFlags.NonPublic | BindingFlags.Instance);
+        var finalizer = sliced.GetMethod("Finalize", BindingFlags.NonPublic | BindingFlags.Instance);
 
         Assert.NotNull(finalizer);
     }
@@ -61,7 +61,7 @@ public class SlicedMemoryOwnerTests
     [Fact]
     public void ForgotDispose_FinalizerRunsAndReclaimsInstance()
     {
-        WeakReference weakRef = RentWeak();
+        var weakRef = RentWeak();
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -70,12 +70,15 @@ public class SlicedMemoryOwnerTests
         Assert.False(weakRef.IsAlive);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        static WeakReference RentWeak() => new(ArrayPoolHelper.Rent(BufferSize));
+        static WeakReference RentWeak()
+        {
+            return new WeakReference(ArrayPoolHelper.Rent(BufferSize));
+        }
     }
 
     private static byte[] GetUnderlyingArray(IMemoryOwner<byte> owner)
     {
-        if (!MemoryMarshal.TryGetArray<byte>(owner.Memory, out var segment) || segment.Array is null)
+        if (!MemoryMarshal.TryGetArray<byte>(owner.Memory, out ArraySegment<byte> segment) || segment.Array is null)
         {
             throw new InvalidOperationException("SlicedMemoryOwner.Memory must be array-backed.");
         }

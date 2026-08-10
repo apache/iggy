@@ -38,6 +38,7 @@ internal sealed class ConsensusSession
     private readonly object _gate = new();
 #endif
     private UInt128 _clientId;
+    private ulong _epoch;
     private bool _registerPending;
     private ulong _requestCounter;
     private ulong? _session;
@@ -85,6 +86,22 @@ internal sealed class ConsensusSession
             lock (_gate)
             {
                 return _session.HasValue;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Generation of the identity, bumped on every re-arm. Anything scoped to a server session - a
+    ///     consumer-group membership, say - compares the epoch it was established under to detect that the
+    ///     session it lived on is gone, without inferring it from connection-state edges.
+    /// </summary>
+    internal ulong Epoch
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _epoch;
             }
         }
     }
@@ -205,6 +222,7 @@ internal sealed class ConsensusSession
         _session = null;
         _requestCounter = 1;
         _registerPending = false;
+        _epoch++;
     }
 
     private static UInt128 GenerateClientId()

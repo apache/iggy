@@ -23,13 +23,13 @@ using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
-using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Shared;
 using Apache.Iggy.Tests.Utils;
 using Apache.Iggy.Tests.Utils.Groups;
 using Apache.Iggy.Tests.Utils.Messages;
 using Apache.Iggy.Tests.Utils.Stats;
 using Apache.Iggy.Tests.Utils.Topics;
+using Apache.Iggy.Vsr;
 using StreamFactory = Apache.Iggy.Tests.Utils.Streams.StreamFactory;
 
 namespace Apache.Iggy.Tests.MapperTests;
@@ -91,7 +91,7 @@ public sealed class BinaryMapper
 
         // Act
         var responses
-            = Mappers.BinaryMapper.MapRentedMessages(combinedPayload, TcpMessageStream.EmptyMemoryOwner.Instance);
+            = Mappers.BinaryMapper.MapRentedMessages(combinedPayload, EmptyMemoryOwner.Instance);
 
         // Assert
         Assert.NotNull(responses);
@@ -366,7 +366,7 @@ public sealed class BinaryMapper
         frame1.CopyTo(combined.AsSpan(16));
         frame2.CopyTo(combined.AsSpan(16 + frame1.Length));
 
-        using var rental = Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance,
+        using var rental = Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance,
             encryptor);
 
         Assert.Equal(7, rental.PartitionId);
@@ -407,7 +407,7 @@ public sealed class BinaryMapper
         frame.CopyTo(combined.AsSpan(16));
 
         Assert.Throws<MalformedResponseException>(() =>
-            Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance, encryptor));
+            Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance, encryptor));
     }
 
     [Fact]
@@ -425,7 +425,7 @@ public sealed class BinaryMapper
         frame.CopyTo(combined.AsSpan(16));
 
         var ex = Assert.Throws<MessageDecryptionException>(() =>
-            Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance, encryptor));
+            Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance, encryptor));
 
         Assert.Equal(42ul, ex.Offset);
         Assert.Equal(7u, ex.PartitionId);

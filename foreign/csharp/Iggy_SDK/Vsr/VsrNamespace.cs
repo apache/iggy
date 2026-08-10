@@ -56,9 +56,38 @@ internal static class VsrNamespace
     private const byte ConsumerGroupKind = 2;
 
     /// <summary>
-    ///     The namespace a request header must carry, peeking into the classic payload for the ops the server
-    ///     routes by partition. Named (string) stream or topic identifiers resolve to 0; the server resolves
-    ///     them itself.
+    ///     The namespace a request header carries for its operation. Register and logout ride the metadata
+    ///     consensus group; non-replicated and metadata operations route by 0; partition-plane operations carry
+    ///     the namespace the caller packed from its typed identifiers.
+    /// </summary>
+    internal static ulong ForOperation(VsrOperation operation, ulong partitionNamespace)
+    {
+        if (operation is VsrOperation.Register or VsrOperation.Logout)
+        {
+            return METADATA_CONSENSUS_NAMESPACE;
+        }
+
+        if (operation == VsrOperation.NonReplicated || operation.IsMetadata())
+        {
+            return 0;
+        }
+
+        return partitionNamespace;
+    }
+
+    /// <summary>
+    ///     Packs the namespace for a partition-plane request from its typed identifiers. Named (string) stream
+    ///     or topic identifiers resolve to 0; the server resolves them itself.
+    /// </summary>
+    internal static ulong ForPartition(Identifier streamId, Identifier topicId, uint partitionId)
+    {
+        return FromPartition(NumericValue(streamId), NumericValue(topicId), partitionId);
+    }
+
+    /// <summary>
+    ///     The namespace for a raw binary request, peeking into the serialized body for the ops the server
+    ///     routes by partition. Only <c>SendBinaryRequestAsync</c> lands here: the typed
+    ///     command surface packs its namespace from typed identifiers instead.
     /// </summary>
     internal static ulong ForRequest(int code, ReadOnlySpan<byte> payload, VsrOperation operation)
     {
@@ -173,6 +202,22 @@ internal static class VsrNamespace
         }
 
         return FromPartition(streamId, topicId, ReadUInt32(payload, position));
+    }
+
+    /// <summary>Numeric identifier value, or <c>null</c> for a named identifier the server has to resolve.</summary>
+    private static uint? NumericValue(Identifier identifier)
+    {
+        if (identifier.Kind != IdKind.Numeric)
+        {
+            return null;
+        }
+
+        if (identifier.Length != 4 || identifier.Value.Length < 4)
+        {
+            throw Malformed();
+        }
+
+        return BinaryPrimitives.ReadUInt32LittleEndian(identifier.Value);
     }
 
     private static ulong FromPartition(uint? streamId, uint? topicId, uint partitionId)

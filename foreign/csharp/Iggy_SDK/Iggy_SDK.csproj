@@ -27,7 +27,7 @@
         <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
-        <Version>0.9.0-edge.1</Version>
+        <Version>0.9.0-edge.2</Version>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
     </PropertyGroup>
 
@@ -68,13 +68,15 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
-        <PackageReference Include="System.IO.Hashing" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions"/>
+        <PackageReference Include="System.IO.Hashing"/>
     </ItemGroup>
 
     <ItemGroup>
-        <InternalsVisibleTo Include="Apache.Iggy.Tests" />
-        <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />
+        <InternalsVisibleTo Include="Apache.Iggy.Tests"/>
+        <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations"/>
+        <!-- Lets the test mocking framework proxy internal interfaces such as ISessionEpochProvider. -->
+        <InternalsVisibleTo Include="DynamicProxyGenAssembly2"/>
     </ItemGroup>
 
 </Project>

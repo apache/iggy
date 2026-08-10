@@ -39,6 +39,57 @@ public sealed class VsrNamespaceTests
         Assert.True(VsrNamespace.METADATA_CONSENSUS_NAMESPACE > packedMax);
     }
 
+    [Fact]
+    public void ForPartition_PacksNumericIdentifiers()
+    {
+        Assert.Equal(VsrNamespace.Pack(2, 3, 4),
+            VsrNamespace.ForPartition(Identifier.Numeric(2), Identifier.Numeric(3), 4));
+    }
+
+    [Fact]
+    public void ForPartition_NamedIdentifierResolvesToZero()
+    {
+        Assert.Equal(0UL, VsrNamespace.ForPartition(Identifier.String("orders"), Identifier.Numeric(3), 4));
+        Assert.Equal(0UL, VsrNamespace.ForPartition(Identifier.Numeric(2), Identifier.String("events"), 4));
+    }
+
+    [Theory]
+    [InlineData((uint)VsrNamespace.MAX_STREAMS, 3u, 4u)]
+    [InlineData(2u, (uint)VsrNamespace.MAX_TOPICS, 4u)]
+    [InlineData(2u, 3u, (uint)VsrNamespace.MAX_PARTITIONS)]
+    public void ForPartition_RejectsIdentifiersOutsideThePackableRange(uint streamId, uint topicId, uint partitionId)
+    {
+        var exception = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            VsrNamespace.ForPartition(Identifier.Numeric(streamId), Identifier.Numeric(topicId), partitionId));
+
+        Assert.Equal(VsrError.INVALID_IDENTIFIER, exception.StatusCode);
+    }
+
+    [Theory]
+    [InlineData((byte)VsrOperation.Register)]
+    [InlineData((byte)VsrOperation.Logout)]
+    public void ForOperation_ControlPlaneOpsTargetTheMetadataReplica(byte operation)
+    {
+        Assert.Equal(VsrNamespace.METADATA_CONSENSUS_NAMESPACE,
+            VsrNamespace.ForOperation((VsrOperation)operation, VsrNamespace.Pack(1, 2, 3)));
+    }
+
+    [Fact]
+    public void ForOperation_MetadataAndNonReplicatedOpsIgnoreThePartitionNamespace()
+    {
+        Assert.Equal(0UL, VsrNamespace.ForOperation(VsrOperation.CreateStream, VsrNamespace.Pack(1, 2, 3)));
+        Assert.Equal(0UL, VsrNamespace.ForOperation(VsrOperation.NonReplicated, VsrNamespace.Pack(1, 2, 3)));
+    }
+
+    [Fact]
+    public void ForOperation_PartitionOpsCarryTheCallerNamespace()
+    {
+        Assert.Equal(VsrNamespace.Pack(1, 2, 3),
+            VsrNamespace.ForOperation(VsrOperation.SendMessages, VsrNamespace.Pack(1, 2, 3)));
+        Assert.Equal(VsrNamespace.Pack(1, 2, 3),
+            VsrNamespace.ForOperation(VsrOperation.StoreConsumerOffset, VsrNamespace.Pack(1, 2, 3)));
+    }
+
     [Theory]
     [InlineData((byte)VsrOperation.Register)]
     [InlineData((byte)VsrOperation.Logout)]
@@ -160,7 +211,7 @@ public sealed class VsrNamespaceTests
     [Fact]
     public void ForRequest_ConsumerOffsetWithoutAPartitionIsRejectedEvenWhenTheBodyEndsThere()
     {
-        byte[] full = VsrTestPayloads.ConsumerOffset(VsrTestPayloads.NumericIdentifier(4),
+        var full = VsrTestPayloads.ConsumerOffset(VsrTestPayloads.NumericIdentifier(4),
             VsrTestPayloads.NumericIdentifier(5), null);
 
         // Drop the four padding bytes that follow the absent-partition flag.

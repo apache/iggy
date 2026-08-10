@@ -49,8 +49,8 @@ internal static class VsrHeader
     internal const int EVICTION_REASON_OFFSET = 255;
 
     /// <summary>
-    ///     Encodes the request header for a classic command code and its body. Returns the total frame size
-    ///     (header plus body).
+    ///     Encodes the request header for a command code, the namespace the caller resolved from its typed
+    ///     identifiers, and the body length. Returns the total frame size (header plus body).
     /// </summary>
     /// <remarks>
     ///     Everything that can fail runs before a request id is consumed. The primary accepts any id above the
@@ -58,7 +58,7 @@ internal static class VsrHeader
     ///     different request would let the client table answer that request from the first one's cached reply.
     /// </remarks>
     internal static int EncodeRequestHeader(Span<byte> header, ConsensusSession session, int code,
-        ReadOnlySpan<byte> payload)
+        ulong partitionNamespace, int bodyLength)
     {
         if (header.Length < HEADER_SIZE)
         {
@@ -69,15 +69,15 @@ internal static class VsrHeader
         header.Clear();
 
         var operation = VsrOperations.ForCode(code);
-        var ns = VsrNamespace.ForRequest(code, payload, operation);
+        var ns = VsrNamespace.ForOperation(operation, partitionNamespace);
 
-        if (payload.Length > int.MaxValue - HEADER_SIZE)
+        if (bodyLength > int.MaxValue - HEADER_SIZE)
         {
             throw VsrError.Exception(VsrError.INVALID_COMMAND, "Request body exceeds the maximum frame size.");
         }
 
         var frame = session.Resolve(operation);
-        var totalSize = HEADER_SIZE + payload.Length;
+        var totalSize = HEADER_SIZE + bodyLength;
 
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);
         header[COMMAND_OFFSET] = (byte)Command2.Request;

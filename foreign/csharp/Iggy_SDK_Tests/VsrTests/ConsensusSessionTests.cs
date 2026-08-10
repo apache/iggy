@@ -215,4 +215,24 @@ public sealed class ConsensusSessionTests
         Assert.Equal(1UL, session.RequestCounter);
         Assert.NotEqual((UInt128)1, session.ClientId);
     }
+
+    [Fact]
+    public void Epoch_AdvancesOnEveryReArmAndNotOnBind()
+    {
+        var session = new ConsensusSession(1);
+        var initialEpoch = session.Epoch;
+
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10);
+        Assert.Equal(initialEpoch, session.Epoch);
+
+        session.Reset();
+        Assert.Equal(initialEpoch + 1, session.Epoch);
+
+        // A register on a previously bound session re-arms the identity, which is a new epoch too.
+        session.Resolve(VsrOperation.Register);
+        session.Bind(11);
+        session.Resolve(VsrOperation.Register);
+        Assert.Equal(initialEpoch + 2, session.Epoch);
+    }
 }

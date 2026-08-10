@@ -23,6 +23,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -46,6 +47,13 @@ public partial class IggyConsumer : IAsyncDisposable
     private int _disposeState;
     private volatile bool _isInitialized;
     private volatile bool _joinedConsumerGroup;
+
+    /// <summary>
+    ///     Consensus session epoch the group membership was established under. A later epoch means the server
+    ///     session that held the membership is gone and the group must be rejoined.
+    /// </summary>
+    private ulong _joinedSessionEpoch;
+
     private long _lastPolledAtMs;
 
     /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
@@ -263,8 +271,13 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
+        // Captured before the join: a session reset racing the join lands the membership on a later epoch, and
+        // the mismatch triggers one redundant (idempotent) rejoin instead of a missed one.
+        var sessionEpoch = (_client as ISessionEpochProvider)?.SessionEpoch ?? 0;
+
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
+            _joinedSessionEpoch = sessionEpoch;
             _joinedConsumerGroup = true;
             return;
         }
@@ -306,6 +319,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
                     Identifier.String(_consumerGroupName), ct);
 
+                _joinedSessionEpoch = sessionEpoch;
                 _joinedConsumerGroup = true;
                 LogConsumerGroupJoined(_consumerGroupName);
             }
@@ -505,6 +519,38 @@ public partial class IggyConsumer : IAsyncDisposable
         await _connectionStateSemaphore.WaitAsync();
         try
         {
+            if (_client is ISessionEpochProvider epochProvider)
+            {
+                // A plain consumer holds no membership, so its flag must never be cleared: nothing would ever
+                // set it again and every later poll would be skipped.
+                if (_config.Consumer.Type == ConsumerType.Consumer)
+                {
+                    return;
+                }
+
+                if (e.CurrentState != ConnectionState.Authenticated)
+                {
+                    // Polling under a dropped session would be refused by the server for as long as the
+                    // reconnect takes to re-authenticate, so the membership is surrendered up front.
+                    if (e.CurrentState == ConnectionState.Disconnected)
+                    {
+                        _joinedConsumerGroup = false;
+                    }
+
+                    return;
+                }
+
+                if (_joinedConsumerGroup && epochProvider.SessionEpoch == _joinedSessionEpoch)
+                {
+                    return;
+                }
+
+                _joinedConsumerGroup = false;
+                await RejoinConsumerGroupOnReconnectionAsync();
+
+                return;
+            }
+
             if (e.CurrentState == ConnectionState.Disconnected)
             {
                 _joinedConsumerGroup = false;
