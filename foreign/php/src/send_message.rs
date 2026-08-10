@@ -99,9 +99,9 @@ impl From<RustSendMessagesResponse> for SendMessagesResponse {
 impl SendMessagesResponse {
     /// One confirmation per partition the batch landed in.
     ///
-    /// The list is empty when the server reports no offsets. The legacy server never
-    /// reports any, and a server that does can still commit a batch it has no offsets
-    /// to describe, so check for an empty array instead of indexing.
+    /// The list is empty when the server reports no offsets. A server can commit a
+    /// batch it has no offsets to describe, so check for an empty array instead of
+    /// indexing.
     ///
     /// The confirmations are rebuilt on each getter call; cache the result in PHP if
     /// they will be read repeatedly.
@@ -154,9 +154,6 @@ impl SendMessagesConfirmation {
     /// A batch is confirmed once it is committed in memory, not once it is fsynced. A
     /// crash-restart can stamp a later batch with an offset a client has already
     /// recorded.
-    ///
-    /// The legacy server returns an empty confirmation list, so it reports no offset
-    /// at all.
     #[php(getter)]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset

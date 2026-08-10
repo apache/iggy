@@ -184,9 +184,8 @@ impl IggyClient {
         })
     }
 
-    /// Sends messages to a topic and returns the commit confirmations.
-    ///
-    /// The list is empty against the legacy server, which reports no offsets.
+    /// Sends messages to a topic and returns the commit confirmations, one per
+    /// partition the batch landed in.
     pub fn send_messages(
         &self,
         stream: PhpIdentifier,
