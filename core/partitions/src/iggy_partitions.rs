@@ -200,6 +200,12 @@ where
 
     /// Insert a new partition and return its local index.
     ///
+    /// Insertion is the moment a build becomes the addressable incarnation,
+    /// so this is also where its offset counter is published into the shared
+    /// `PartitionStats` ([`IggyPartition::publish_current_offset`]). No
+    /// earlier point is safe: a build that is never adopted must leave the
+    /// live incarnation's counters alone.
+    ///
     /// # Safety discipline (compiler cannot enforce)
     ///
     /// Must only be called from the shard's pump task (i.e. inside
@@ -220,6 +226,7 @@ where
             0,
             "IggyPartitions::insert while a with_partition borrow is live"
         );
+        partition.publish_current_offset();
         // Safety: pump-only invariant, caller responsibility.
         let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
