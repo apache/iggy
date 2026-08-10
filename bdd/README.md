@@ -71,9 +71,10 @@ bdd/
 # Run only leader_redirection
 ../scripts/run-bdd-tests.sh all leader_redirection
 
-# Run against iggy-server-ng with VSR. Go and Java always use the VSR
-# overlay. Python and C# are vsr-built, so CI supplies --vsr for their
-# plain lanes. Rust and Node opt in with --vsr. Build the binaries first:
+# Run against iggy-server-ng with VSR. Every foreign SDK speaks only VSR:
+# Go and Java always use the VSR overlay, the rest get --vsr from CI for
+# their plain lanes. Only Rust still has a legacy lane and opts in with
+# --vsr. Build the binaries first:
 #   cargo build --bin iggy-server-ng --bin iggy --features vsr
 # NOTE: `target/debug/iggy` is shared between lanes and the vsr flavour
 # speaks a different wire protocol. When switching back to the legacy
