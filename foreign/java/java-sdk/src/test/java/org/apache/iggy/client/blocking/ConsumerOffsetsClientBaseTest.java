@@ -54,7 +54,9 @@ public abstract class ConsumerOffsetsClientBaseTest extends IntegrationTest {
 
         // when
         var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(1223L));
-        consumerOffsetsClient.storeConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.empty(), consumer, BigInteger.ZERO);
+        // The VSR client routes the store to its partition consensus group, so
+        // the partition id must be explicit.
+        consumerOffsetsClient.storeConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer, BigInteger.ZERO);
         var consumerOffset =
                 consumerOffsetsClient.getConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer);
 

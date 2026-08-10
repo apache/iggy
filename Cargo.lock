@@ -3215,6 +3215,7 @@ dependencies = [
 name = "consensus"
 version = "0.1.0"
 dependencies = [
+ "aligned-vec",
  "bit-set 0.11.1",
  "bytemuck",
  "bytes",
@@ -6842,6 +6843,7 @@ dependencies = [
  "enumset",
  "secrecy",
  "thiserror 2.0.19",
+ "twox-hash",
 ]
 
 [[package]]

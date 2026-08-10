@@ -466,18 +466,29 @@ where
     if let Some(namespace) = streams.namespace_from_partition(stream_id, topic_id, partition_id) {
         return Ok(namespace);
     }
-    // Tell a bad partition id apart from a bad stream/topic: the former is a
-    // typed not-found the client can act on, the latter keeps the generic
-    // rejection every caller already handles.
+    // Name the level that missed - partition, topic, or stream - with the
+    // legacy typed not-found, so a client can tell an addressing typo from an
+    // empty partition. Callers that shape their own reply (empty poll, group
+    // gather) treat every variant the same, so the split is reply-visible only
+    // where a caller denies typed.
     if streams.topic_partition_ids(stream_id, topic_id).is_some() {
-        Err(IggyError::PartitionNotFound(
+        return Err(IggyError::PartitionNotFound(
             partition_id as usize,
             wire_identifier_for_display(topic_id),
             wire_identifier_for_display(stream_id),
-        ))
-    } else {
-        Err(IggyError::InvalidIdentifier)
+        ));
     }
+    Err(streams.read(|inner| {
+        let Some(resolved_stream) = resolve_stream_id(inner, stream_id) else {
+            return stream_not_found(stream_id);
+        };
+        if resolve_topic_id(inner, resolved_stream, topic_id).is_none() {
+            return topic_not_found(stream_id, topic_id);
+        }
+        // Unreachable while `topic_partition_ids` misses only on stream/topic;
+        // kept as the safe generic rejection should that invariant drift.
+        IggyError::InvalidIdentifier
+    }))
 }
 
 /// Best-effort conversion for error payloads only: the wire reply carries just
@@ -496,7 +507,10 @@ fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
 /// stays with the per-transport gates that run before this builder. `client_ip`
 /// is the caller's transport-level peer address, used only by the
 /// cluster-metadata read to pick each node's advertised address; `None`
-/// degrades to the catch-all address.
+/// degrades to the catch-all address. `clients_count` is the cross-shard
+/// connected-client total, used only by the stats read: it comes from the async
+/// `ListClients` scatter-gather, which this sync builder cannot run, so both
+/// transport callers gather it up front (0 for every other opcode).
 pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
@@ -504,6 +518,7 @@ pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
     user_id: Option<u32>,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
+    clients_count: u32,
 ) -> Result<NonReplicatedResponse, IggyError>
 where
     B: ShellBus,
@@ -517,7 +532,7 @@ where
             build_cluster_metadata_response(roster, shard, client_ip).to_bytes(),
         )),
         GET_STATS_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_stats_response(shard)?.to_bytes(),
+            build_stats_response(shard, clients_count)?.to_bytes(),
         )),
         GET_STREAM_CODE => {
             let request =
@@ -680,6 +695,7 @@ where
 
 fn build_stats_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    clients_count: u32,
 ) -> Result<StatsResponse, IggyError>
 where
     B: ShellBus,
@@ -766,12 +782,7 @@ where
         partitions_count,
         segments_count,
         messages_count,
-        // Connected clients are per-shard `SessionManager` state, aggregated
-        // across shards only by the async `ListClients` broadcast (see
-        // `get_clients`). This sync single-shard read can't gather it, and one
-        // shard's local count is a fraction of the total, so report 0 rather
-        // than a misleading partial.
-        clients_count: 0,
+        clients_count,
         consumer_groups_count,
         hostname: system.hostname,
         os_name: system.os_name,

@@ -150,7 +150,7 @@ where
                 // consensus-op additions need a version fence (release_min /
                 // release_max bounds on the replica plane) before this arm is
                 // safe to hit.
-                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+                tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
         };

@@ -30,6 +30,7 @@
 # (initial leader = replica 0), not the legacy mock `--follower` server.
 #
 # Activated by: ./scripts/run-bdd-tests.sh --vsr <sdk> [feature]
+#               (the Go and Java suites apply this override unconditionally)
 # Must be passed LAST so its overrides win over the server/cluster files.
 
 x-server-ng-image: &server-ng-image

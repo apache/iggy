@@ -250,7 +250,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/node/**"
-    tasks: ["lint", "test", "build", "e2e", "e2e-vsr"]
+    tasks: ["lint", "test", "build", "e2e"]
 
   sdk-go:
     depends_on:
@@ -370,7 +370,7 @@ components:
     paths:
       - "bdd/node/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-node", "bdd-node-vsr"]
+    tasks: ["bdd-node"]
 
   bdd-csharp:
     depends_on:

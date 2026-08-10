@@ -33,6 +33,9 @@ mod poll_semantics_vsr;
 // Create-topic static bounds deny typed before consensus.
 #[cfg(feature = "vsr")]
 mod topic_admission_vsr;
+// Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
+#[cfg(feature = "vsr")]
+mod stats_vsr;
 // Purge durability: applied generation survives restart; journal-resident
 // purged batches stay fenced behind the purge floor.
 #[cfg(feature = "vsr")]

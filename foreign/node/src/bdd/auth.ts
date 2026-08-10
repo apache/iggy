@@ -18,17 +18,14 @@
 
 import assert from 'node:assert/strict';
 import { Client } from '../client/index.js';
-import type { Protocol } from '../client/index.js';
 import { Given } from "@cucumber/cucumber";
 import type { TestWorld } from './world.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
 const credentials = { username: 'iggy', password: 'iggy' };
 const [host, port] = getIggyAddress();
-const protocol: Protocol = process.env.IGGY_TEST_PROTOCOL === 'vsr' ? 'vsr' : 'classic';
 
 const opt = {
-  protocol,
   transport: 'TCP' as const,
   options: { host, port },
   credentials

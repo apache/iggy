@@ -400,11 +400,6 @@ fn reject_unsupported_and_warn_inert(config: &ServerNgConfig) -> Result<(), Conf
     if config.tcp.socket_migration != defaults.tcp.socket_migration {
         warn!("tcp.socket_migration is not implemented in server-ng");
     }
-    if config.system.partition.validate_checksum != defaults.system.partition.validate_checksum {
-        warn!(
-            "system.partition.validate_checksum is not applied in server-ng; nothing verifies checksums on load"
-        );
-    }
     if config.system.segment.cache_indexes != defaults.system.segment.cache_indexes {
         warn!("system.segment.cache_indexes is not applied in server-ng");
     }
@@ -698,10 +693,6 @@ mod tests {
         let defaults = ServerNgConfig::default();
 
         assert_eq!(shipped.tcp.socket_migration, defaults.tcp.socket_migration);
-        assert_eq!(
-            shipped.system.partition.validate_checksum,
-            defaults.system.partition.validate_checksum
-        );
         assert_eq!(
             shipped.system.segment.cache_indexes,
             defaults.system.segment.cache_indexes
