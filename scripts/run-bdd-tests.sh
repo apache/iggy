@@ -40,7 +40,7 @@ usage(){
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
   # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust, python, go, node);"
+  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust, python, go, node, csharp);"
   log "           expects IGGY_SERVER_NG_PATH (default: target/debug/iggy-server-ng)"
   log "           and a vsr-built iggy CLI at IGGY_CLI_PATH."
   log "           The go suites imply it: the Go SDK speaks only the VSR protocol."
@@ -56,12 +56,12 @@ usage(){
 
 if [ "$VSR" = "1" ]; then
   case "$SDK" in
-    rust|python|go|go-race|node|clean) ;;
+    rust|python|go|go-race|node|csharp|clean) ;;
     java)
       # Redundant: the Java suite applies the VSR overlay unconditionally.
       VSR=0 ;;
     *)
-      log "❌ --vsr supports only the Rust, Python, Go, Node, and Java SDKs so far"
+      log "❌ --vsr supports only the Rust, Python, Go, Node, C#, and Java SDKs so far"
       usage
       exit 2 ;;
   esac
