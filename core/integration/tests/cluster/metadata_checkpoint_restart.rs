@@ -119,8 +119,10 @@ async fn await_checkpoint_on_all_nodes(harness: &TestHarness, generation: usize)
 // a checkpoint, so the transfer descriptor's `commit_op == snapshot_seq` and
 // the post-install tail repair has nothing to fetch (`commit_min ==
 // commit_max` skips it). The below-floor retry then proves the reply ring
-// rode the transferred table: request 191's reply was minted at op 192, which
-// every node drained out of its WAL at that same checkpoint.
+// rode the transferred table: request 191's reply was minted at op 192, and
+// replay starts at `snapshot_seq + 1`, so no node re-executes it. The
+// checkpoint drain keeps op 192's entry as the commit-point header a
+// `DoViewChange` needs, but never replays it.
 #[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
 async fn given_drained_journal_when_node_restarts_should_install_snapshot_only(
     harness: &mut TestHarness,

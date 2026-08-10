@@ -113,11 +113,11 @@ jobs:
           echo "Building common binaries for all examples tests..."
           echo "Current directory: $(pwd)"
 
-          # The Go SDK speaks only the VSR wire protocol, while the Python
-          # wheels, Java SDK, and .NET SDK are vsr-built, so those lanes need
-          # the VSR server. Every other language still runs against the legacy
-          # one until its own migration lands.
-          if [[ "${{ inputs.task }}" == "examples-go" || "${{ inputs.task }}" == "examples-python" || "${{ inputs.task }}" == "examples-csharp" || "${{ inputs.task }}" == "examples-java" ]]; then
+          # The Go SDK and the Node SDK speak only the VSR wire protocol,
+          # while the Python wheels, Java SDK, and .NET SDK are vsr-built, so
+          # those lanes need the VSR server. Every other language still runs
+          # against the legacy one until its own migration lands.
+          if [[ "${{ inputs.task }}" == "examples-go" || "${{ inputs.task }}" == "examples-python" || "${{ inputs.task }}" == "examples-csharp" || "${{ inputs.task }}" == "examples-java" || "${{ inputs.task }}" == "examples-node" ]]; then
             # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"
             echo "Building ${SERVER_BIN} (--features vsr)..."

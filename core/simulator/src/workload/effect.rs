@@ -42,6 +42,16 @@ pub enum Effect {
         stream: String,
         name: String,
     },
+    AddPartitions {
+        stream: String,
+        topic: String,
+        count: u32,
+    },
+    RemovePartitions {
+        stream: String,
+        topic: String,
+        count: u32,
+    },
     AddUser {
         name: String,
     },

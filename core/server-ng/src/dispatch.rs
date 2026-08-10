@@ -49,7 +49,7 @@ use crate::responses::{
 use crate::session_manager::SessionManager;
 use crate::snapshot;
 use crate::users::maybe_rewrite_user_password_request;
-use crate::wire::{request_body, usize_to_u32};
+use crate::wire::{request_body, usize_to_u32, verify_request_checksum};
 use bytes::Bytes;
 use configs::server_ng::NgSystemConfig;
 use consensus::{
@@ -59,8 +59,9 @@ use consensus::{
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_USER_CODE,
-    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
+    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -861,6 +862,37 @@ async fn handle_client_request<B, MJ, S, SB>(
         }
     };
 
+    // The last point that still sees the body the CLIENT sent; every rewrite below
+    // substitutes server-chosen bytes and carries the stamp through unchanged.
+    if let Err(error) = verify_request_checksum(&request) {
+        warn!(
+            transport_client_id,
+            operation = ?request.header().operation,
+            request = request.header().request,
+            "dropping client request whose body does not match its own checksum"
+        );
+        let commit = current_metadata_commit(shard);
+        let reply = build_deny_reply(
+            request.header(),
+            transport_client_id,
+            0,
+            commit,
+            error.as_code(),
+        );
+        if let Err(send_error) = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await
+        {
+            warn!(
+                transport_client_id,
+                error = %send_error,
+                "failed to send request-checksum deny reply"
+            );
+        }
+        return;
+    }
+
     ensure_transport_connection(shard, sessions, transport_client_id);
 
     // Any request is liveness proof, not just PING: an idle-but-active client
@@ -1513,6 +1545,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
+    // Stats is the one default read with an async input: the cross-shard
+    // connected-client gather. Run it here so the shared builder stays sync.
+    let clients_count = if code == GET_STATS_CODE {
+        u32::try_from(shard.list_all_clients().await.len()).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
     match build_non_replicated_response(
         shard,
         code,
@@ -1520,6 +1559,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         user_id,
         roster,
         client_ip,
+        clients_count,
     ) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
@@ -1912,14 +1952,19 @@ async fn handle_poll_messages<B, MJ, S, SB>(
             }
         }
         Err(error) => {
-            // A partition id that does not exist in a resolvable topic is a
+            // A stream, topic, or partition id that does not resolve is a
             // client addressing error and must surface as a typed rejection,
             // not an empty poll a consumer would read as end-of-partition.
-            if matches!(error, IggyError::PartitionNotFound(..)) {
+            if matches!(
+                error,
+                IggyError::PartitionNotFound(..)
+                    | IggyError::StreamIdNotFound(_)
+                    | IggyError::TopicIdNotFound(..)
+            ) {
                 warn!(
                     transport_client_id,
                     error = %error,
-                    "poll_messages rejected: partition not found"
+                    "poll_messages rejected: target not found"
                 );
                 send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
                     .await;
@@ -3268,12 +3313,13 @@ mod tests {
                 client,
                 request,
                 user_id: 0,
-                checksum: 42,
                 namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
                 ..Default::default()
             };
         }
-        message
+        // A real identity, not a placeholder: `on_replicate` recomputes it before the
+        // prepare reaches the WAL, so an arbitrary value reads as transit corruption.
+        consensus::seal_prepare_checksum(message)
     }
 
     /// Regression test for the production failure chain "CLI stream
@@ -3337,6 +3383,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },
@@ -3455,6 +3502,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },
@@ -3578,6 +3626,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },
@@ -3640,6 +3689,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 encryptor: None,
             },

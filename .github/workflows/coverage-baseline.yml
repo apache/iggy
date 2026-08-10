@@ -447,11 +447,15 @@ jobs:
           cd foreign/node
           npm ci --ignore-scripts
 
+      # TODO(hubcio): change to iggy-server once legacy server is removed
+      # (core/server has VSR support)
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
-        env:
-          IGGY_CLUSTER_ENABLED: true
+        with:
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
+          wait-timeout-seconds: "90"
 
       - name: Run unit tests with coverage
         run: |
@@ -464,9 +468,6 @@ jobs:
           cd foreign/node
           mkdir -p ../../reports/node-coverage/e2e
           npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
-        env:
-          IGGY_SERVER_HOST: 127.0.0.1
-          IGGY_SERVER_TCP_PORT: 8090
 
       - name: Stop Iggy server
         if: always()

@@ -23,10 +23,12 @@ use crate::bootstrap::ServerNgShard;
 use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::codes::GET_STATS_CODE;
 use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{Identifier, IggyError};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+use send_wrapper::SendWrapper;
 use std::rc::Rc;
 
 use crate::http::error::{Consistency, ReadError};
@@ -78,8 +80,9 @@ pub(in crate::http) fn authorize_read(
 /// a TCP read of the same entity return byte-identical bodies.
 ///
 /// Reads never touch consensus or a VSR session: `build_non_replicated_response`
-/// is a pure STM read. It is synchronous, so this helper is too - no submit
-/// await, no gate, no `SendWrapper`. An absent entity surfaces as
+/// is a pure STM read, with one exception - the stats read's cross-shard
+/// connected-client gather, an async broadcast run here (under `SendWrapper`,
+/// same as `/metrics`) before the sync builder. An absent entity surfaces as
 /// [`NonReplicatedResponse::Empty`], mapped to 404 here because every REST read
 /// whose entity can be missing shares that not-found shape.
 pub(in crate::http) async fn read_local(
@@ -92,6 +95,12 @@ pub(in crate::http) async fn read_local(
 ) -> Result<Bytes, ReadError> {
     await_recovery_barrier(&state.shard).await?;
     authorize_read(state, identity, consistency, rule)?;
+    let clients_count = if code == GET_STATS_CODE {
+        u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
+            .unwrap_or(u32::MAX)
+    } else {
+        0
+    };
     match build_non_replicated_response(
         &state.shard,
         code,
@@ -99,6 +108,7 @@ pub(in crate::http) async fn read_local(
         Some(identity.user_id),
         &state.roster,
         identity.client_ip,
+        clients_count,
     )
     .map_err(ReadError::Rejected)?
     {

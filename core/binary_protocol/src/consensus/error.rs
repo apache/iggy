@@ -29,6 +29,23 @@ pub enum ConsensusError {
     #[error("invalid checksum")]
     InvalidChecksum,
 
+    #[error(
+        "{command:?}: header checksum {found:#034x} does not cover the frame (expected \
+         {expected:#034x}){}",
+        if *found == 0 {
+            ". A zeroed checksum is the signature of a peer predating the frame seal, \
+             which is a hard version break: replicas must be upgraded together, with the \
+             cluster down"
+        } else {
+            ""
+        }
+    )]
+    FrameChecksumMismatch {
+        command: Command2,
+        expected: u128,
+        found: u128,
+    },
+
     #[error("invalid cluster ID")]
     InvalidCluster,
 

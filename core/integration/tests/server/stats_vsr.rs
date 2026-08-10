@@ -14,30 +14,26 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
-import assert from 'node:assert/strict';
-import { Client } from '../client/index.js';
-import { Given } from "@cucumber/cucumber";
-import type { TestWorld } from './world.js';
-import { getIggyAddress } from '../tcp.sm.utils.js';
+//! Stats against server-ng (vsr): `clients_count` must report the cross-shard
+//! connected-client total gathered by the `ListClients` broadcast, not the
+//! hardcoded 0 the sync single-shard read used to answer.
 
-const credentials = { username: 'iggy', password: 'iggy' };
-const [host, port] = getIggyAddress();
+use iggy::prelude::*;
+use integration::iggy_harness;
 
-const opt = {
-  transport: 'TCP' as const,
-  options: { host, port },
-  credentials
-};
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn given_connected_clients_when_getting_stats_should_count_clients(harness: &TestHarness) {
+    let clients = harness.tcp_root_clients(2).await.expect("tcp root clients");
 
-Given('I have a running Iggy server', function () {
-  return true;
-});
+    let stats = clients[0].get_stats().await.expect("get stats");
 
-
-Given('I am authenticated as the root user', async function (this: TestWorld) {
-  this.client = new Client(opt);
-  assert.deepEqual({ userId: 0 }, await this.client.session.login(credentials));
-  assert.equal(true, await this.client.system.ping());
-});
+    assert_eq!(
+        stats.clients_count, 2,
+        "stats must count both connected clients, got {}",
+        stats.clients_count
+    );
+}

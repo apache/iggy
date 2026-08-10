@@ -1461,6 +1461,7 @@ mod tests {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
+                validate_checksum: true,
                 segment_size: config.system.segment.size,
                 encryptor: None,
             },
