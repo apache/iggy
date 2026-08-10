@@ -21,8 +21,8 @@
 #               ./scripts/run-bdd-tests.sh <sdk> all
 #
 # Server constraints that shape this file:
-#   - the only CLI arg is `--replica-id <N>`; there is no `--fresh`,
-#     `--with-default-root-credentials` or `--follower`.
+#   - `--replica-id <N>` is the only CLI arg each node needs; there is no
+#     `--follower`, and a new container per run makes `--fresh` redundant.
 #   - root credentials are mandatory once the cluster is enabled and come
 #     from IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD.
 #   - `cluster.nodes[*].ip` is parsed as a strict IpAddr (no hostnames) and

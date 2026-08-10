@@ -46,8 +46,8 @@ use consensus::VsrState;
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::defaults::{
-    DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
-    MIN_USERNAME_LENGTH,
+    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
+    MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
@@ -87,6 +87,7 @@ use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::crypto;
 use server_common::executor::create_shard_executor;
+use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
@@ -555,14 +556,35 @@ struct BoundClientListeners {
     quic: Option<SocketAddr>,
 }
 
-/// Load config, prepare directories, and complete late logging init.
+/// Load the server configuration from the active config provider.
 ///
 /// # Errors
 ///
-/// Returns an error if config loading, directory preparation, or logging
-/// setup fails.
-pub async fn load_config(logging: &mut Logging) -> Result<ServerConfig, ServerError> {
-    let config = ServerConfig::load().await.map_err(ServerError::Config)?;
+/// Returns an error if the configuration cannot be read or parsed.
+pub async fn load_config() -> Result<ServerConfig, ServerError> {
+    ServerConfig::load().await.map_err(ServerError::Config)
+}
+
+/// Prepare the on-disk layout the server boots from and complete late
+/// logging init.
+///
+/// `fresh` wipes the system path first: `late_init` opens a rolling
+/// appender under `{system_path}/logs` and `create_directories`
+/// materialises exactly what the wipe is meant to remove, so both have to
+/// run after it.
+///
+/// # Errors
+///
+/// Returns an error if the wipe, directory preparation, or logging setup
+/// fails.
+pub async fn prepare_runtime_dirs(
+    config: &ServerConfig,
+    logging: &mut Logging,
+    fresh: bool,
+) -> Result<(), ServerError> {
+    if fresh {
+        wipe_system_path(config).await?;
+    }
     create_directories(&config.system).await.map_err(|source| {
         error!(
             system_path = %config.system.get_system_path(),
@@ -579,7 +601,40 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerConfig, ServerEr
         )
         .map_err(ServerError::Logging)?;
 
-    Ok(config)
+    Ok(())
+}
+
+/// Delete the configured system path so the server boots on empty state.
+async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
+    let path = config.system.get_system_path();
+    // `system.path` is relative by default and IGGY_SYSTEM_PATH-overridable,
+    // so report what is actually about to be deleted, not what was configured.
+    let resolved = std::path::absolute(&path).unwrap_or_else(|_| PathBuf::from(&path));
+
+    if config.cluster.enabled {
+        warn!(
+            path = %resolved.display(),
+            "--fresh wipes only this replica, which then refills from the cluster by \
+             state transfer; wiping a quorum at once destroys committed data, and a \
+             service unit file carrying --fresh re-transfers everything on every restart"
+        );
+    }
+
+    if !Path::new(&path).exists() {
+        info!(path = %resolved.display(), "--fresh: system path does not exist, nothing to remove");
+        return Ok(());
+    }
+
+    warn!(path = %resolved.display(), "--fresh: removing the system path, ALL local data will be deleted");
+    // A half-removed directory is worse than no removal at all: the surviving
+    // superblock and snapshot no longer pair up, and boot would report the
+    // leftovers as a durability violation rather than as a failed wipe.
+    remove_dir_all(&path)
+        .await
+        .map_err(|source| ServerError::FreshWipeFailed {
+            path: resolved,
+            source,
+        })
 }
 
 /// Resolve the operator's `cpu_allocation` into concrete shard
@@ -683,6 +738,7 @@ pub fn bootstrap(
     config: ServerConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerError> {
+    validate_root_credentials_env(&config)?;
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
@@ -959,7 +1015,6 @@ async fn shard_main(
             )
             .await
             .map_err(ServerError::MetadataRecovery)?;
-            validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
             ensure_default_root_user(&recovered.mux_stm);
             // The factory bundle hands every peer a read handle over the
             // same `Inner`, so `Arc<TopicStats>` (and the parent
@@ -3026,72 +3081,158 @@ fn ensure_default_root_user(mux_stm: &ServerMuxStateMachine) {
     mux_stm.users().ensure_root_user(&username, &password_hash);
 }
 
+/// Apply `--with-default-root-credentials`.
+///
+/// Fills in whichever of [`IGGY_ROOT_USERNAME_ENV`] /
+/// [`IGGY_ROOT_PASSWORD_ENV`] the operator did not export, so the flag is
+/// exactly the sugar for setting both by hand and the environment keeps
+/// winning over it.
+///
+/// # Safety
+///
+/// Mutates the process environment, so the caller must still be
+/// single-threaded.
+pub unsafe fn apply_default_root_credentials(enabled: bool) {
+    if !enabled {
+        return;
+    }
+
+    let username_set = env::var(IGGY_ROOT_USERNAME_ENV).is_ok();
+    let password_set = env::var(IGGY_ROOT_PASSWORD_ENV).is_ok();
+    if username_set && password_set {
+        warn!(
+            "--with-default-root-credentials ignored: {IGGY_ROOT_USERNAME_ENV} and \
+             {IGGY_ROOT_PASSWORD_ENV} are already set"
+        );
+        return;
+    }
+
+    // SAFETY: single-threaded caller, per this function's contract.
+    unsafe {
+        if !username_set {
+            env::set_var(IGGY_ROOT_USERNAME_ENV, DEFAULT_ROOT_USERNAME);
+        }
+        if !password_set {
+            env::set_var(IGGY_ROOT_PASSWORD_ENV, DEFAULT_ROOT_PASSWORD);
+        }
+    }
+    warn!(
+        "--with-default-root-credentials: a newly created root user will use the \
+         well-known development credentials; INSECURE outside development"
+    );
+}
+
 /// Resolve the root user credentials from `IGGY_ROOT_USERNAME` /
 /// `IGGY_ROOT_PASSWORD`, falling back to the default username with a
-/// generated password (printed to stdout, mirroring the legacy server).
+/// generated password.
 ///
 /// Returns `(username, password_hash)`; the plaintext password never
 /// leaves this function.
 fn create_root_credentials() -> (String, String) {
-    let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
-    let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
-    assert_eq!(
-        username.is_ok(),
-        password.is_ok(),
-        "When providing the custom root user credentials, both username and password must be set."
-    );
-    if username.is_ok() && password.is_ok() {
+    if let Some((username, password)) = root_credentials_from_env() {
         info!("Using the custom root user credentials.");
-    } else {
-        info!("Using the default root user credentials...");
-        username = Ok(DEFAULT_ROOT_USERNAME.to_string());
-        let generated_password = crypto::generate_secret(20..40);
-        println!("Generated root user password: {generated_password}");
-        password = Ok(generated_password);
+        return (username, crypto::hash_password(&password));
     }
 
-    let username = username.expect("Root username is not set.");
-    let password = password.expect("Root password is not set.");
-    assert!(
-        !username.is_empty() && !password.is_empty(),
-        "Root user credentials cannot be empty."
-    );
-    assert!(
-        username.len() >= MIN_USERNAME_LENGTH,
-        "Root username is too short."
-    );
-    assert!(
-        username.len() <= MAX_USERNAME_LENGTH,
-        "Root username is too long."
-    );
-    assert!(
-        password.len() >= MIN_PASSWORD_LENGTH,
-        "Root password is too short."
-    );
-    assert!(
-        password.len() <= MAX_PASSWORD_LENGTH,
-        "Root password is too long."
-    );
-
-    (username, crypto::hash_password(&password))
+    info!("Using the default root user credentials...");
+    let password = crypto::generate_secret(20..40);
+    // Through tracing, not stdout: this is the only time the operator can read
+    // the password, so it has to reach the log file too.
+    warn!("Generated root user password: {password}");
+    (
+        DEFAULT_ROOT_USERNAME.to_string(),
+        crypto::hash_password(&password),
+    )
 }
 
-fn validate_cluster_root_bootstrap(
-    config: &ServerConfig,
-    mux_stm: &ServerMuxStateMachine,
+/// The credentials the operator supplied, `None` when neither variable is
+/// set. A half-set pair never reaches here: [`validate_root_credentials`]
+/// rejects it at boot.
+fn root_credentials_from_env() -> Option<(String, String)> {
+    match (
+        env::var(IGGY_ROOT_USERNAME_ENV),
+        env::var(IGGY_ROOT_PASSWORD_ENV),
+    ) {
+        (Ok(username), Ok(password)) => Some((username, password)),
+        _ => None,
+    }
+}
+
+/// Reject root-credential misconfiguration before any shard thread exists.
+///
+/// Shard 0 seeds the root user from inside `recover`'s baseline closure,
+/// which cannot fail, so every operator-facing check has to run here or it
+/// would have to panic a shard thread instead.
+fn validate_root_credentials_env(config: &ServerConfig) -> Result<(), ServerError> {
+    // `recover` creates the metadata directory, so its absence is what tells a
+    // first cluster boot (root must come out identical on every replica, hence
+    // explicit credentials) apart from a restart that recovers the root user it
+    // already stored. `--fresh` has already wiped by this point, so a wiped
+    // replica is correctly treated as a first boot.
+    let fresh_cluster = config.cluster.enabled
+        && !Path::new(&config.system.path)
+            .join(metadata::impls::METADATA_DIR)
+            .exists();
+
+    validate_root_credentials(
+        fresh_cluster,
+        env::var(IGGY_ROOT_USERNAME_ENV).ok().as_deref(),
+        env::var(IGGY_ROOT_PASSWORD_ENV).ok().as_deref(),
+    )
+}
+
+fn validate_root_credentials(
+    explicit_required: bool,
+    username: Option<&str>,
+    password: Option<&str>,
 ) -> Result<(), ServerError> {
-    if !config.cluster.enabled || !mux_stm.users().read(|users| users.items.is_empty()) {
-        return Ok(());
+    match (username, password) {
+        (Some(username), Some(password)) => {
+            validate_credential_length(
+                IGGY_ROOT_USERNAME_ENV,
+                username,
+                MIN_USERNAME_LENGTH,
+                MAX_USERNAME_LENGTH,
+            )?;
+            validate_credential_length(
+                IGGY_ROOT_PASSWORD_ENV,
+                password,
+                MIN_PASSWORD_LENGTH,
+                MAX_PASSWORD_LENGTH,
+            )
+        }
+        (Some(_), None) => Err(ServerError::RootCredentialsIncomplete {
+            provided_env: IGGY_ROOT_USERNAME_ENV,
+            missing_env: IGGY_ROOT_PASSWORD_ENV,
+        }),
+        (None, Some(_)) => Err(ServerError::RootCredentialsIncomplete {
+            provided_env: IGGY_ROOT_PASSWORD_ENV,
+            missing_env: IGGY_ROOT_USERNAME_ENV,
+        }),
+        (None, None) if explicit_required => Err(ServerError::ClusterRootCredentialsRequired {
+            username_env: IGGY_ROOT_USERNAME_ENV,
+            password_env: IGGY_ROOT_PASSWORD_ENV,
+        }),
+        (None, None) => Ok(()),
     }
+}
 
-    if env::var(IGGY_ROOT_USERNAME_ENV).is_ok() && env::var(IGGY_ROOT_PASSWORD_ENV).is_ok() {
-        return Ok(());
+fn validate_credential_length(
+    env_name: &'static str,
+    value: &str,
+    min: usize,
+    max: usize,
+) -> Result<(), ServerError> {
+    if (min..=max).contains(&value.len()) {
+        Ok(())
+    } else {
+        Err(ServerError::RootCredentialLength {
+            env_name,
+            length: value.len(),
+            min,
+            max,
+        })
     }
-
-    Err(ServerError::ClusterRootCredentialsRequired {
-        username_env: IGGY_ROOT_USERNAME_ENV,
-        password_env: IGGY_ROOT_PASSWORD_ENV,
-    })
 }
 
 /// Replica delegation callbacks for shard 0's listener and connector.
@@ -3670,6 +3811,63 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_cluster_bootstrap_requires_explicit_root_credentials() {
+        assert!(matches!(
+            validate_root_credentials(true, None, None),
+            Err(ServerError::ClusterRootCredentialsRequired {
+                username_env: IGGY_ROOT_USERNAME_ENV,
+                password_env: IGGY_ROOT_PASSWORD_ENV,
+            })
+        ));
+        validate_root_credentials(true, Some("root"), Some("secret"))
+            .expect("both credentials supplied must satisfy the fresh-cluster guard");
+    }
+
+    #[test]
+    fn single_node_bootstrap_generates_root_credentials_when_unset() {
+        validate_root_credentials(false, None, None)
+            .expect("a single node mints its own root password");
+    }
+
+    #[test]
+    fn half_set_root_credentials_are_rejected_in_both_directions() {
+        assert!(matches!(
+            validate_root_credentials(false, Some("root"), None),
+            Err(ServerError::RootCredentialsIncomplete {
+                provided_env: IGGY_ROOT_USERNAME_ENV,
+                missing_env: IGGY_ROOT_PASSWORD_ENV,
+            })
+        ));
+        assert!(matches!(
+            validate_root_credentials(false, None, Some("secret")),
+            Err(ServerError::RootCredentialsIncomplete {
+                provided_env: IGGY_ROOT_PASSWORD_ENV,
+                missing_env: IGGY_ROOT_USERNAME_ENV,
+            })
+        ));
+    }
+
+    #[test]
+    fn out_of_range_root_credentials_are_rejected() {
+        assert!(matches!(
+            validate_root_credentials(false, Some(""), Some("secret")),
+            Err(ServerError::RootCredentialLength {
+                env_name: IGGY_ROOT_USERNAME_ENV,
+                length: 0,
+                ..
+            })
+        ));
+        let too_long = "x".repeat(MAX_PASSWORD_LENGTH + 1);
+        assert!(matches!(
+            validate_root_credentials(false, Some("root"), Some(&too_long)),
+            Err(ServerError::RootCredentialLength {
+                env_name: IGGY_ROOT_PASSWORD_ENV,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn default_cluster_heartbeat_timeout_matches_consensus_constant() {

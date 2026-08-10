@@ -259,8 +259,8 @@ run_go_examples() {
 # shellcheck disable=SC2329
 run_python_examples() {
     # The Python SDK speaks only the VSR wire protocol, so examples run
-    # against the VSR server. It takes no --fresh flag; cleanup_server_state
-    # wiping local_data is the fresh start.
+    # against the VSR server, started fresh by cleanup_server_state wiping
+    # local_data rather than by passing --fresh.
     resolve_server_binary "${TARGET}" iggy-server
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
@@ -311,8 +311,8 @@ run_python_examples() {
 # shellcheck disable=SC2329
 run_php_examples() {
     # The PHP extension speaks only the VSR wire protocol, so examples run
-    # against the VSR server. It takes no --fresh flag; cleanup_server_state
-    # wiping local_data is the fresh start.
+    # against the VSR server, started fresh by cleanup_server_state wiping
+    # local_data rather than by passing --fresh.
     resolve_server_binary "${TARGET}" iggy-server
 
     local php_bin="${PHP:-php}"
@@ -373,8 +373,8 @@ run_java_examples() {
 # shellcheck disable=SC2329
 run_csharp_examples() {
     # The .NET SDK speaks only the VSR wire protocol, so examples run against
-    # the VSR server. It takes no --fresh flag; cleanup_server_state wiping
-    # local_data is the fresh start.
+    # the VSR server, started fresh by cleanup_server_state wiping local_data
+    # rather than by passing --fresh.
     resolve_server_binary "${TARGET}" iggy-server
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 

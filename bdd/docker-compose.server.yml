@@ -20,8 +20,9 @@
 #               ./scripts/run-bdd-tests.sh <sdk> leader_redirection
 #               ./scripts/run-bdd-tests.sh <sdk> all
 #
-# The server takes no `--fresh` / `--with-default-root-credentials` flags, so
-# root credentials arrive through IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD.
+# Each run starts from a new container, so `--fresh` would be redundant; root
+# credentials arrive through IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD rather
+# than through `--with-default-root-credentials`.
 
 x-server-bdd-deps: &server-bdd-deps
   depends_on:

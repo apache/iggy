@@ -208,6 +208,27 @@ pub enum ServerError {
         password_env: &'static str,
     },
     #[error(
+        "{provided_env} is set but {missing_env} is not; the root user credentials must be \
+         provided as a pair"
+    )]
+    RootCredentialsIncomplete {
+        provided_env: &'static str,
+        missing_env: &'static str,
+    },
+    #[error("{env_name} must be {min}..={max} characters long; got {length}")]
+    RootCredentialLength {
+        env_name: &'static str,
+        length: usize,
+        min: usize,
+        max: usize,
+    },
+    #[error("--fresh could not remove the system path at {path}")]
+    FreshWipeFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
         "recovered segment for stream {stream_id}, topic {topic_id}, partition {partition_id} at start_offset {start_offset} has message/index divergence (messages_size={messages_size_bytes}, indexed_size={indexed_size_bytes}, end_offset={end_offset}); recovery aborted before opening listeners. Restore the partition from a healthy replica or snapshot, or move the segment aside for offline repair before restarting."
     )]
     RecoveredSegmentSizeDivergence {
