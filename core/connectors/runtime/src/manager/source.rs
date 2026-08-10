@@ -223,7 +223,8 @@ impl SourceManager {
         let (producer, encoder, transforms) =
             source::setup_source_producer(key, config, iggy_client).await?;
 
-        let callback = container.iggy_source_handle;
+        let handle_callback = container.iggy_source_handle;
+        let batch_result_callback = container.iggy_source_batch_result;
         let handler_tasks = source::spawn_source_handler(
             plugin_id,
             key,
@@ -233,7 +234,8 @@ impl SourceManager {
             encoder,
             transforms,
             state_storage,
-            callback,
+            handle_callback,
+            batch_result_callback,
             context.clone(),
         );
 

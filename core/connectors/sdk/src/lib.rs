@@ -111,6 +111,17 @@ pub trait Source: Send + Sync {
     /// Invoked every time a batch of messages is produced to the configured stream and topic.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 
+    /// Invoked after the runtime has finished processing the most recently polled batch.
+    ///
+    /// Sources that track cursors or perform destructive operations should stage those changes
+    /// in [`Source::poll`] and apply them only after receiving [`source::SourceBatchResult::Ack`].
+    /// A [`source::SourceBatchResult::Nack`] means the staged changes must be discarded so the
+    /// batch can be polled again. The SDK allows only one batch to be in flight at a time and
+    /// stops polling if this method returns an error.
+    async fn on_batch_result(&self, _result: source::SourceBatchResult) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Invoked when the source is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
 }

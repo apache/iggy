@@ -25,7 +25,8 @@ use iggy::prelude::{
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
-    source::HandleCallback, transforms::Transform,
+    source::{BatchResultCallback, HandleCallback, SourceBatchResult},
+    transforms::Transform,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -51,10 +52,16 @@ use prometheus_client::metrics::counter::Counter;
 use tokio::task::JoinHandle;
 
 pub(crate) struct SourceSenderEntry {
-    pub(crate) sender: Sender<ProducedMessages>,
+    pub(crate) sender: Sender<ProducedBatch>,
     // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
     // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
     pub(crate) error_counter: Counter,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProducedBatch {
+    id: u64,
+    messages: ProducedMessages,
 }
 
 pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
@@ -364,7 +371,8 @@ pub(crate) async fn source_forwarding_loop(
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
-    receiver: Receiver<ProducedMessages>,
+    receiver: Receiver<ProducedBatch>,
+    batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
     labels: Arc<SourceLabels>,
 ) {
@@ -390,8 +398,10 @@ pub(crate) async fn source_forwarding_loop(
         topic: producer.topic().to_string(),
     };
 
-    while let Ok(produced_messages) = receiver.recv_async().await {
+    while let Ok(produced_batch) = receiver.recv_async().await {
         let total_start = Instant::now();
+        let batch_id = produced_batch.id;
+        let produced_messages = produced_batch.messages;
         let count = produced_messages.messages.len();
         context
             .metrics
@@ -461,6 +471,7 @@ pub(crate) async fn source_forwarding_loop(
 
         // Total histogram + emit (below) run regardless of send outcome.
         let mut state_save_us: Option<u64> = None;
+        let mut batch_result = SourceBatchResult::Nack;
         if let Err(error) = send_result {
             let error_msg = format!(
                 "Failed to send {sent_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
@@ -489,11 +500,13 @@ pub(crate) async fn source_forwarding_loop(
                 );
             }
 
+            let mut state_saved = true;
             if let Some(state) = produced_messages.state {
                 let state_save_start = Instant::now();
                 match &state_storage {
                     StateStorage::File(file) => {
                         if let Err(error) = file.save(state).await {
+                            state_saved = false;
                             let error_msg = format!(
                                 "Failed to save state for source connector with ID: {plugin_id}. {error}"
                             );
@@ -514,6 +527,20 @@ pub(crate) async fn source_forwarding_loop(
             } else {
                 debug!("No state provided for source connector with ID: {plugin_id}");
             }
+
+            if state_saved {
+                batch_result = SourceBatchResult::Ack;
+            }
+        }
+
+        let result_code = batch_result_callback(plugin_id, batch_id, batch_result as u8);
+        if result_code != 0 {
+            let error_msg = format!(
+                "Failed to deliver {batch_result:?} for source connector with ID: {plugin_id}, batch ID: {batch_id}. Plugin returned: {result_code}"
+            );
+            error!("{error_msg}");
+            context.metrics.inc_errors_with_labels(&labels.counter);
+            context.sources.set_error(&plugin_key, &error_msg).await;
         }
 
         let total_elapsed = total_start.elapsed();
@@ -558,7 +585,8 @@ pub(crate) fn spawn_source_handler(
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
-    callback: HandleCallback,
+    handle_callback: HandleCallback,
+    batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
 ) -> Vec<JoinHandle<()>> {
     let (sender, receiver) = flume::unbounded();
@@ -573,7 +601,7 @@ pub(crate) fn spawn_source_handler(
     );
 
     let blocking_handle = tokio::task::spawn_blocking(move || {
-        callback(plugin_id, handle_produced_messages);
+        handle_callback(plugin_id, handle_produced_messages);
     });
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
@@ -586,6 +614,7 @@ pub(crate) fn spawn_source_handler(
             transforms,
             state_storage,
             receiver,
+            batch_result_callback,
             context,
             labels,
         )
@@ -627,7 +656,8 @@ pub fn handle(
                 producer_wrapper.encoder,
                 plugin.transforms,
                 plugin.state_storage,
-                source.callback,
+                source.handle_callback,
+                source.batch_result_callback,
                 context.clone(),
             );
 
@@ -713,9 +743,10 @@ fn process_messages(
 
 pub(crate) extern "C" fn handle_produced_messages(
     plugin_id: u32,
+    batch_id: u64,
     messages_ptr: *const u8,
     messages_len: usize,
-) {
+) -> i32 {
     unsafe {
         // Entry missing = SOURCE_SENDERS cleaned up at shutdown; benign race
         // expected on stop/restart. No metric (would conflate with real failures).
@@ -724,23 +755,29 @@ pub(crate) extern "C" fn handle_produced_messages(
                 plugin_id,
                 "dropping produced batch: sender already cleaned up"
             );
-            return;
+            return -1;
         };
         let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
         match postcard::from_bytes::<ProducedMessages>(messages) {
             Ok(messages) => {
-                if let Err(send_error) = entry.sender.send(messages) {
+                if let Err(send_error) = entry.sender.send(ProducedBatch {
+                    id: batch_id,
+                    messages,
+                }) {
                     error!(
                         "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
                     );
                     entry.error_counter.inc();
+                    return -1;
                 }
+                0
             }
             Err(err) => {
                 error!(
                     "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
                 );
                 entry.error_counter.inc();
+                -1
             }
         }
     }
@@ -766,5 +803,98 @@ fn build_iggy_message(
             .user_headers(h)
             .build(),
         (None, None) => IggyMessage::builder().payload(payload.into()).build(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
+
+    fn next_plugin_id() -> u32 {
+        TEST_PLUGIN_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn given_serialized_batch_when_callback_runs_should_forward_batch_id() {
+        let plugin_id = next_plugin_id();
+        let batch_id = 73;
+        let (sender, receiver) = flume::unbounded();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                error_counter: Counter::default(),
+            },
+        );
+        let messages = ProducedMessages {
+            schema: Schema::Raw,
+            messages: Vec::new(),
+            state: Some(ConnectorState(vec![1, 2, 3])),
+        };
+        let serialized = postcard::to_allocvec(&messages).expect("failed to serialize batch");
+
+        assert_eq!(
+            handle_produced_messages(plugin_id, batch_id, serialized.as_ptr(), serialized.len()),
+            0
+        );
+        let forwarded = receiver.recv().expect("batch was not forwarded");
+        assert_eq!(forwarded.id, batch_id);
+        assert_eq!(
+            forwarded
+                .messages
+                .state
+                .expect("state should be preserved")
+                .0,
+            vec![1, 2, 3]
+        );
+
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_invalid_payload_when_callback_runs_should_reject_batch() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let error_counter = Counter::default();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                error_counter: error_counter.clone(),
+            },
+        );
+        let invalid_payload = [0xff];
+
+        assert_eq!(
+            handle_produced_messages(
+                plugin_id,
+                1,
+                invalid_payload.as_ptr(),
+                invalid_payload.len(),
+            ),
+            -1
+        );
+        assert_eq!(error_counter.get(), 1);
+
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_missing_sender_when_callback_runs_should_reject_batch() {
+        let plugin_id = next_plugin_id();
+        let serialized = postcard::to_allocvec(&ProducedMessages {
+            schema: Schema::Raw,
+            messages: Vec::new(),
+            state: None,
+        })
+        .expect("failed to serialize batch");
+
+        assert_eq!(
+            handle_produced_messages(plugin_id, 1, serialized.as_ptr(), serialized.len()),
+            -1
+        );
     }
 }
