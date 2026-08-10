@@ -87,7 +87,7 @@ public class PersonalAccessTokenTests
         var name = $"lgn-{Guid.NewGuid():N}"[..20];
         var response = await client.CreatePersonalAccessTokenAsync(name, Expiry);
 
-        var loginClient = await Fixture.CreateClient(protocol);
+        var loginClient = await Fixture.CreateClient(protocol, true);
         var authResponse = await loginClient.LoginWithPersonalAccessTokenAsync(response!.Token);
 
         authResponse.ShouldNotBeNull();
