@@ -179,18 +179,23 @@ run_language_examples() {
 
 # shellcheck disable=SC2329
 run_rust_examples() {
-    resolve_server_binary "${TARGET}"
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
     resolve_cli_binary "${TARGET}"
 
     # The README documents credentials as <iggy_username>/<iggy_password>
-    # placeholders; the test server starts with iggy/iggy.
+    # placeholders; the test server starts with iggy/iggy. The README keeps
+    # plain cargo run commands, but the CLI and examples must be vsr-built
+    # to speak the VSR server's wire protocol, so the feature is injected
+    # here.
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} --features vsr |g"
         }
     else
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --features vsr |g"
         }
     fi
 
