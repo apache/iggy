@@ -308,7 +308,7 @@ public class IggyTypedPublisherTests
                 CancellationToken _) =>
             {
                 recorder.Record(stream, topic, partitioning, messages);
-                return Task.CompletedTask;
+                return Task.FromResult(new SendMessagesResponse { Confirmations = [] });
             });
         mock.Setup(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<Partitioning>(), It.IsAny<Message>(), It.IsAny<CancellationToken>()))
@@ -316,7 +316,7 @@ public class IggyTypedPublisherTests
                 CancellationToken _) =>
             {
                 recorder.Record(stream, topic, partitioning, new[] { message });
-                return Task.CompletedTask;
+                return Task.FromResult(new SendMessagesResponse { Confirmations = [] });
             });
 
         return mock.Object;
