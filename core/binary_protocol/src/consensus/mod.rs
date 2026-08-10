@@ -48,7 +48,8 @@ pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader, EvictionReason,
     GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN,
     RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
-    RequestStartViewHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader, SIZE_FIELD_OFFSET,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
     read_size_field,
 };
 pub use operation::Operation;

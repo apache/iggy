@@ -25,8 +25,8 @@
 mod authz;
 
 use crate::auth::{
-    complete_login_register, send_login_failure_reply, surface_login_failure,
-    verify_login_credentials, verify_pat_credentials,
+    complete_login_register, surface_login_failure, verify_login_credentials,
+    verify_pat_credentials,
 };
 use crate::bootstrap::{ShellBus, ShellShard, ShellShardHandle};
 use crate::cluster_meta::ClusterRoster;
@@ -69,9 +69,13 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     GetConsumerOffsetRequest, StoreConsumerOffset2Request,
 };
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsRequest, DeletePartitionsRequest,
+};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
@@ -80,17 +84,20 @@ use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, Command2, EvictionReason, GenericHeader, HEADER_SIZE,
-    KIND_CONSUMER_GROUP, Operation, ProtocolVersion, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, is_protocol_compatible,
+    KIND_CONSUMER_GROUP, MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader,
+    WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
 };
-use iggy_common::{IggyError, PollingStrategy, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{
+    IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression, SystemSnapshotType,
+};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::client_listener::RequestHandler;
 use message_bus::framing::MAX_MESSAGE_SIZE;
 use message_bus::replica::listener::MessageHandler;
 use metadata::impls::metadata::{
-    MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
+    BoundSession, MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
 };
 use metadata::permissioner::Permissioner;
@@ -105,6 +112,7 @@ use shard::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -112,16 +120,18 @@ use tracing::{debug, warn};
 pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 
-pub(crate) fn make_client_request_handler<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn make_client_request_handler<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> RequestHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard = Rc::clone(shard);
     let sessions = Rc::clone(sessions);
@@ -144,6 +154,7 @@ where
             Rc::clone(&shard),
             Rc::clone(&sessions),
             Arc::clone(&system_config),
+            max_tokens_per_user,
             Rc::clone(&queues),
             Rc::clone(&active),
             client_id,
@@ -174,21 +185,22 @@ pub(crate) fn make_list_clients_handler(
 /// against the local partitions plane and push the result back over the
 /// carried reply sender. The requesting shard bounds the wait with a
 /// timeout, so a dropped reply degrades to a client-visible read failure.
-pub(crate) fn make_partition_read_handler<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+pub(crate) fn make_partition_read_handler<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> PartitionReadHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     // Runs synchronously on the shard pump (see `process_lifecycle` ->
-    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
-    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
-    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
-    // poll replies here without spawning. See the `poll_plan` module docs.
+    // `on_partition_read`). `build_poll_snapshot` takes a pump-only `&mut`
+    // partition borrow (synchronous, so no sibling task can realloc under it) and
+    // returns an owned `PollPlan`; only owned data crosses into `spawn_poll_io`. A
+    // fully-resident poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;
@@ -263,8 +275,8 @@ where
 /// map), then replicate the auto-committed offset and send the reply. Holds no
 /// partition reference across the IO, so it is sound concurrently with the
 /// pump's `&mut` writes; the auto-commit submit re-borrows synchronously after.
-fn spawn_poll_io<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+fn spawn_poll_io<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
     plan: PollPlan,
     reply: shard::Sender<PartitionReadReply>,
@@ -273,6 +285,7 @@ fn spawn_poll_io<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let bus = shard.bus.clone();
     bus.spawn(async move {
@@ -319,8 +332,8 @@ fn spawn_poll_io<B, MJ, S>(
 /// data, hence no log). The gate reads committed state only, so an offset that
 /// merely sits in flight keeps resubmitting until its covering op commits -- a
 /// dropped op self-heals on the next poll instead of being suppressed forever.
-fn submit_auto_commit<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn submit_auto_commit<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
     applied: &AutoCommitApplied,
 ) where
@@ -328,6 +341,7 @@ fn submit_auto_commit<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     enum AutoCommitGate {
         Submit,
@@ -339,7 +353,7 @@ fn submit_auto_commit<B, MJ, S>(
         .partitions()
         .with_partition(&namespace, |partition| {
             let consensus = partition.consensus();
-            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
                 AutoCommitGate::NotPrimary
             } else if partition.is_auto_commit_offset_covered(
                 applied.kind,
@@ -422,14 +436,15 @@ fn build_auto_commit_request(
     }))
 }
 
-pub(crate) fn make_deferred_replica_message_handler<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+pub(crate) fn make_deferred_replica_message_handler<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> MessageHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     Rc::new(move |_replica_id, message| {
@@ -439,17 +454,19 @@ where
     })
 }
 
-pub(crate) fn make_deferred_client_request_handler<B, MJ, S>(
+pub(crate) fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
 ) -> RequestHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
@@ -486,7 +503,16 @@ where
                 active.borrow_mut().remove(&client_id);
                 return;
             };
-            drain_client_requests(shard, sessions, system_config, queues, active, client_id).await;
+            drain_client_requests(
+                shard,
+                sessions,
+                system_config,
+                max_tokens_per_user,
+                queues,
+                active,
+                client_id,
+            )
+            .await;
         });
     })
 }
@@ -497,14 +523,15 @@ where
 /// proposal. Spawns a task so the awaiting peer is woken once the op
 /// commits; replies `None` on transient submit failure so the peer never
 /// blocks forever.
-pub(crate) fn make_metadata_submit_handler<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
+pub(crate) fn make_metadata_submit_handler<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> shard::MetadataSubmitHandler
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let shard_handle = Rc::clone(shard_handle);
     Rc::new(move |submit| {
@@ -519,13 +546,12 @@ where
                     user_id,
                     reply,
                 } => {
-                    let session = shard
+                    let bound = shard
                         .plane
                         .metadata()
                         .submit_register_in_process(vsr_client_id, user_id)
-                        .await
-                        .ok();
-                    let _ = reply.try_send(session);
+                        .await;
+                    let _ = reply.try_send(bound);
                 }
                 shard::MetadataSubmit::Logout {
                     vsr_client_id,
@@ -583,10 +609,50 @@ where
     })
 }
 
-fn enqueue_client_request<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+// Session resume is performed BY THE LOGIN PATH, not by a separate
+// credential-free rebind.
+//
+// A reconnecting client re-authenticates on the new connection and presents
+// its previous `client_id` in the login frame; `submit_register_in_process`
+// finds the existing table entry, verifies the authenticated user owns it,
+// and returns its epoch, so `bind_session` binds the new transport to the
+// old entry with its watermark and reply ring intact. That IS the resume.
+//
+// An earlier revision instead rebound an *unbound* transport straight from
+// the table whenever a replicated frame carried a matching
+// `(client, session)`, treating that pair as a bearer token. That was wrong
+// in four ways, and the combination was a pre-auth session takeover:
+//
+//   - it called `SessionManager::login` itself, so no credential was ever
+//     presented, and the connection was logged in as the entry's cached
+//     `user_id`; authority for replicated ops then resolves from the table
+//     (`resolve_acting_user_id`) and for partition ops from the session
+//     manager, so BOTH planes ran as the original registrant;
+//   - the pair carries far less entropy than "client-generated random
+//     u128" implies: HTTP mints `client_id` from the shard-0 sequential
+//     counter (`mint_shard_zero_client_id`, seeded at 1 per process) and no
+//     live path ever bumps an epoch past 1, so the token was `client=N,
+//     session=1` for small N;
+//   - `ClientEntry` carries no transport or plane tag, so a raw TCP peer
+//     could bind an HTTP-originated session;
+//   - `bind_session` demotes the evicted holder to `Connected`, the one
+//     state `login` accepts, so the loser's next replicated frame
+//     re-resumed and stole the session back, unbounded and with no eviction
+//     frame either way.
+//
+// Routing resume through login also restores the checks that path owns:
+// password / PAT verification, `UserStatus::Active`, PAT expiry, the
+// protocol-version gate, and SDK-info recording.
+//
+// An unbound transport sending a replicated frame therefore gets the typed
+// `Eviction(NoSession)` fail-fast below and must log in.
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_client_request<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -596,6 +662,7 @@ fn enqueue_client_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     queues
         .borrow_mut()
@@ -608,15 +675,25 @@ fn enqueue_client_request<B, MJ, S>(
 
     let bus = shard.bus.clone();
     bus.spawn(async move {
-        drain_client_requests(shard, sessions, system_config, queues, active, client_id).await;
+        drain_client_requests(
+            shard,
+            sessions,
+            system_config,
+            max_tokens_per_user,
+            queues,
+            active,
+            client_id,
+        )
+        .await;
     });
 }
 
 #[allow(clippy::future_not_send)]
-async fn drain_client_requests<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+async fn drain_client_requests<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -625,12 +702,21 @@ async fn drain_client_requests<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     loop {
         let Some(message) = pop_next_client_request(&queues, &active, client_id) else {
             return;
         };
-        handle_client_request(&shard, &sessions, &system_config, client_id, message).await;
+        handle_client_request(
+            &shard,
+            &sessions,
+            &system_config,
+            max_tokens_per_user,
+            client_id,
+            message,
+        )
+        .await;
     }
 }
 
@@ -654,11 +740,106 @@ fn pop_next_client_request(
     message
 }
 
+/// Per-request partitions-count cap, shared by create-topic, create-partitions
+/// and delete-partitions admission. Runs pre-consensus like
+/// [`validate_topic_bounds`]: an oversized count must not burn a replicated
+/// log entry (create-partitions admission would also allocate that many
+/// consensus-group ids before replicating).
+///
+/// Zero passes here because a zero-partition TOPIC is legal (legacy
+/// `create_topic` admits `0..=MAX`); the add/remove requests reject it in
+/// [`validate_partitions_change_count`].
+pub(crate) const fn validate_partitions_count(partitions_count: u32) -> Result<(), IggyError> {
+    if partitions_count > MAX_PARTITIONS_PER_REQUEST {
+        return Err(IggyError::TooManyPartitions);
+    }
+    Ok(())
+}
+
+/// [`validate_partitions_count`] plus the zero rejection that create-partitions
+/// and delete-partitions carry: adding or removing zero partitions is a no-op
+/// that would still burn a replicated log entry, bump `Streams::revision` and
+/// force every shard through a rebalance pass. Legacy rejects it with
+/// `TooManyPartitions` in both handlers (`1..=MAX` on create, `== 0` on
+/// delete), so the code matches rather than inventing a new one.
+pub(crate) const fn validate_partitions_change_count(
+    partitions_count: u32,
+) -> Result<(), IggyError> {
+    if partitions_count == 0 {
+        return Err(IggyError::TooManyPartitions);
+    }
+    validate_partitions_count(partitions_count)
+}
+
+/// Static create-topic bounds shared by the TCP and HTTP ingresses. Runs
+/// pre-consensus: a rejected request must not burn a replicated log entry,
+/// and `prepare_request` errors evict the session instead of denying typed.
+/// `ServerDefault` is exempt from the size floor (it resolves against server
+/// config at admission, matching legacy); `Unlimited` passes numerically.
+pub(crate) fn validate_topic_bounds(
+    system_config: &NgSystemConfig,
+    partitions_count: u32,
+    max_topic_size: MaxTopicSize,
+) -> Result<(), IggyError> {
+    validate_partitions_count(partitions_count)?;
+    if !matches!(max_topic_size, MaxTopicSize::ServerDefault)
+        && max_topic_size.as_bytes_u64() < system_config.segment.size.as_bytes_u64()
+    {
+        return Err(IggyError::InvalidTopicSize(
+            max_topic_size,
+            system_config.segment.size,
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a request before it reaches consensus: warn, then send the typed
+/// deny reply. A silent drop would wedge every later request on the
+/// connection until the socket read timeout. `context` labels the rejection
+/// site in both log lines.
+#[allow(clippy::future_not_send)]
+async fn send_pre_consensus_deny<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    header: &RequestHeader,
+    transport_client_id: u128,
+    error: &IggyError,
+    context: &'static str,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    warn!(
+        transport_client_id,
+        error = %error,
+        operation = ?header.operation,
+        context,
+        "denying request pre-consensus"
+    );
+    let commit = current_metadata_commit(shard);
+    let reply = build_deny_reply(header, transport_client_id, 0, commit, error.as_code());
+    if let Err(send_error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %send_error,
+            context,
+            "failed to send pre-consensus deny reply"
+        );
+    }
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_client_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_client_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<NgSystemConfig>,
+    max_tokens_per_user: u32,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
 ) where
@@ -666,6 +847,7 @@ async fn handle_client_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let request = match message.try_into_typed::<RequestHeader>() {
         Ok(request) => request,
@@ -691,7 +873,10 @@ async fn handle_client_request<B, MJ, S>(
     if header.operation == Operation::NonReplicated {
         // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
         // legitimately pre-auth (liveness probe + connection bootstrap
-        // metadata). Every other non-replicated code (`GET_STREAM*`,
+        // metadata). Pre-auth metadata is a narrow topology oracle: it leaks
+        // only the advertised-address mapping for networks the caller can
+        // already send packets from, and the HTTP mirror of the same read
+        // sits behind `Identity`. Every other non-replicated code (`GET_STREAM*`,
         // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
         // MUST go through Register first, which binds the acting user the
         // per-op authz gates resolve.
@@ -752,32 +937,19 @@ async fn handle_client_request<B, MJ, S>(
         // Replicated request on an unbound transport. Without this short-
         // circuit, the rewrite below overwrites `header.client` with
         // `transport_client_id` and dispatches; the request_preflight then
-        // rejects with `NoSession`/`SessionMismatch` and the failure either
-        // disappears silently or emits an Eviction the SDK previously
-        // could not decode. Either way the SDK blocked until socket
-        // timeout. Emit an empty Reply so the SDK fails fast: the typed
-        // decoder downstream rejects the empty body with `InvalidCommand`
-        // instead of hanging.
-        let commit = current_metadata_commit(shard);
-        let reply = build_empty_reply(&header, transport_client_id, 0, commit);
-        if let Err(error) = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await
-        {
-            warn!(
-                transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "failed to surface unbound-session reply"
-            );
-        } else {
-            warn!(
-                transport_client_id,
-                operation = ?header.operation,
-                "dropping replicated request from unbound transport; replied empty"
-            );
-        }
+        // rejects with `NoSession`/`Fenced` and the failure disappears
+        // silently, wedging the SDK until the socket timeout. Reject with
+        // the same typed `Eviction(NoSession)` the pre-auth read guard
+        // sends: the session is gone, so the client must register again. An
+        // empty status-0 Reply is not safe here, because SendMessages is the
+        // one replicated operation without a result section, and its decoder
+        // would read the empty body as a successful send.
+        warn!(
+            transport_client_id,
+            operation = ?header.operation,
+            "rejecting replicated request from unbound transport with Eviction(NoSession)"
+        );
+        send_unauthenticated_eviction(shard, transport_client_id).await;
         return;
     }
 
@@ -819,19 +991,34 @@ async fn handle_client_request<B, MJ, S>(
             new_header.session = bound_session;
         }
     });
-    let (request, raw_pat_token) =
-        match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
-            Ok(rewritten) => rewritten,
-            Err(error) => {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    operation = ?header.operation,
-                    "dropping request with invalid PAT replication context"
-                );
-                return;
-            }
-        };
+    let (request, raw_pat_token) = match maybe_rewrite_pat_request(
+        sessions,
+        transport_client_id,
+        max_tokens_per_user,
+        |user_id| {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| users.pat_count_of(user_id))
+        },
+        request,
+    ) {
+        Ok(rewritten) => rewritten,
+        Err(error) => {
+            // Token cap reached, malformed body, or a lost session binding.
+            send_pre_consensus_deny(
+                shard,
+                &header,
+                transport_client_id,
+                &error,
+                "personal-access-token",
+            )
+            .await;
+            return;
+        }
+    };
     // Hash raw passwords and, for ChangePassword, verify the current password
     // on the primary before replication; see `crate::users`. Replicas store the
     // hash directly. A wrong current password is not denied here: it rides
@@ -840,31 +1027,42 @@ async fn handle_client_request<B, MJ, S>(
     let request = match maybe_rewrite_user_password_request(shard, request) {
         Ok(rewritten) => rewritten,
         Err(error) => {
-            // Malformed body: deny fast with InvalidCommand. A silent drop
-            // would wedge every later request on the connection until the
-            // socket read timeout.
-            warn!(
-                transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "denying user password request"
-            );
-            let commit = current_metadata_commit(shard);
-            let reply = build_deny_reply(&header, transport_client_id, 0, commit, error.as_code());
-            if let Err(send_error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %send_error,
-                    "failed to send password-deny reply"
-                );
-            }
+            // Malformed body: deny fast with InvalidCommand.
+            send_pre_consensus_deny(shard, &header, transport_client_id, &error, "user-password")
+                .await;
             return;
         }
     };
+    // Static bounds run pre-consensus so a rejected request burns no
+    // replicated log entry; HTTP covers the same bounds via
+    // `command.validate()`. A body that fails to decode denies typed too
+    // (`InvalidCommand`), instead of riding consensus just to fail there.
+    let bounds = match header.operation {
+        Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|create_topic| {
+                validate_topic_bounds(
+                    system_config,
+                    create_topic.partitions_count,
+                    MaxTopicSize::from(create_topic.max_topic_size),
+                )
+            }),
+        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|create_partitions| {
+                validate_partitions_change_count(create_partitions.partitions_count)
+            }),
+        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|delete_partitions| {
+                validate_partitions_change_count(delete_partitions.partitions_count)
+            }),
+        _ => Ok(()),
+    };
+    if let Err(error) = bounds {
+        send_pre_consensus_deny(shard, &header, transport_client_id, &error, "static-bounds").await;
+        return;
+    }
     // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
     // partition count for Join) before replication; see `crate::consumer_group`.
     let request = match maybe_rewrite_consumer_group_request(shard, request).await {
@@ -930,8 +1128,8 @@ async fn handle_client_request<B, MJ, S>(
 /// out of the Users STM. Built here rather than in `build_non_replicated_response`
 /// which has no session context.
 #[allow(clippy::future_not_send)]
-async fn handle_get_personal_access_tokens<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
@@ -940,6 +1138,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let response = build_get_personal_access_tokens_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
@@ -956,8 +1155,8 @@ async fn handle_get_personal_access_tokens<B, MJ, S>(
 /// `SessionManager` (not `IggyMetadata`), so built here rather than in
 /// `build_non_replicated_response`.
 #[allow(clippy::future_not_send)]
-async fn handle_get_me<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_me<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
@@ -966,6 +1165,7 @@ async fn handle_get_me<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let response = build_get_me_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
@@ -988,14 +1188,16 @@ async fn handle_get_me<B, MJ, S>(
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
-/// dispatch replies empty so the client fails fast instead of wedging on a
-/// silent drop.
+/// dispatch replies with a nonzero status -- unresolvable namespace,
+/// authorization denial, exhausted routable wait -- so the client fails fast
+/// instead of wedging on a silent drop or reading a status-0 frame as a
+/// committed write.
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn dispatch_partition_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
     vsr_client_id: u128,
     bound_session: u64,
@@ -1006,6 +1208,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let header = *request.header();
     let namespace = match resolve_partition_request_namespace(
@@ -1016,17 +1219,26 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
-            // A partition op against a stream/topic that no longer
-            // resolves (e.g. a consumer's trailing auto-commit racing a
-            // `delete_stream`). A silent drop wedges the SDK connection
-            // forever; reply empty so the client fails fast instead.
+            // A partition op against a stream/topic that no longer resolves
+            // (e.g. a consumer's trailing auto-commit racing a `delete_stream`,
+            // or an explicit partition id that skipped the client-side
+            // resolve). The op never reached the partition plane, so a status-0
+            // reply would read as a committed ack for work that never happened.
+            // A silent drop is no better: the SDK connection processes replies
+            // in lockstep and would wedge forever.
             warn!(
                 transport_client_id,
                 error = %error,
                 operation = ?header.operation,
-                "partition request with unresolved namespace; replying empty"
+                "partition request with unresolved namespace; replying denied"
             );
-            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            send_partition_deny_reply(
+                shard,
+                transport_client_id,
+                &header,
+                IggyError::ResourceNotFound(String::new()).as_code(),
+            )
+            .await;
             return;
         }
     };
@@ -1061,21 +1273,32 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
         send_partition_deny_reply(shard, transport_client_id, &header, status).await;
         return;
     }
-    // Convergence wait: a CreateTopic commit returns to the client
-    // before the per-shard reconcilers seed routing rows and
-    // materialise the partition (next wake/periodic tick). The SDK
-    // does not replay sends, so an immediately-following partition op
-    // would be dropped as unroutable. Absorb that window here with a
-    // bounded wait; steady-state sends (row present, partition probed
-    // once) skip it entirely.
+    // Convergence wait: a CreateTopic commit returns to the client before the
+    // per-shard reconcilers seed routing rows and materialise the partition
+    // (next wake/periodic tick). An op arriving inside that window is not lost
+    // if it skips this wait -- `router::route_typed` falls back to the hash
+    // assignment, and the owning shard parks it -- so this is an admission
+    // courtesy that keeps the steady state off that park buffer, not a
+    // correctness gate. See `wait_for_partition_routable`, which spells out why
+    // there is no owner-readiness probe here any more.
     if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
+        // The op never reached the partition plane, so it is safe to re-issue
+        // anywhere -- the same contract the plane itself answers for a
+        // non-primary routing artifact. A status-0 empty reply here would
+        // fabricate a success ack for a write that hit no partition at all.
         warn!(
             transport_client_id,
             namespace,
             operation = ?header.operation,
-            "partition request not routable within budget; replying empty"
+            "partition request not routable within budget; replying transient"
         );
-        send_empty_partition_reply(shard, transport_client_id, &header).await;
+        send_partition_deny_reply(
+            shard,
+            transport_client_id,
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
         return;
     }
     // A group consumer-offset op carries the group NAME on the wire; the
@@ -1112,8 +1335,8 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S>(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_non_replicated_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_non_replicated_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
@@ -1123,13 +1346,15 @@ async fn handle_non_replicated_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    // Acting user for the read gates below, resolved once. `None` only on the
-    // pre-auth path (PING / GET_CLUSTER_METADATA), which serves ungated codes;
-    // the gated arms fail closed on it.
-    let user_id = sessions.borrow().get_user_id(transport_client_id);
+    // Acting user and peer address for the read gates below, resolved in one
+    // connection lookup. `user_id` is `None` only on the pre-auth path
+    // (PING / GET_CLUSTER_METADATA), which serves ungated codes; the gated
+    // arms fail closed on it.
+    let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -1243,6 +1468,14 @@ async fn handle_non_replicated_request<B, MJ, S>(
         }
         _ => {
             let roster = sessions.borrow().cluster_roster();
+            let client_ip = client_address.map(|address| address.ip());
+            if client_ip.is_none() {
+                debug!(
+                    transport_client_id,
+                    code,
+                    "no peer address recorded; advertised-address resolution degrades to the catch-all"
+                );
+            }
             handle_default_non_replicated(
                 shard,
                 transport_client_id,
@@ -1250,25 +1483,28 @@ async fn handle_non_replicated_request<B, MJ, S>(
                 &request,
                 user_id,
                 &roster,
+                client_ip,
             )
             .await;
         }
     }
 }
 
-#[allow(clippy::future_not_send)]
-async fn handle_default_non_replicated<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
+async fn handle_default_non_replicated<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     code: u32,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
     roster: &ClusterRoster,
+    client_ip: Option<IpAddr>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Gate by command code before the shared builder runs. The builder stays
     // authz-free (it is byte-shared with the HTTP read path, which gates
@@ -1277,7 +1513,14 @@ async fn handle_default_non_replicated<B, MJ, S>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
-    match build_non_replicated_response(shard, code, request_body(request), user_id, roster) {
+    match build_non_replicated_response(
+        shard,
+        code,
+        request_body(request),
+        user_id,
+        roster,
+        client_ip,
+    ) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
@@ -1320,8 +1563,8 @@ async fn handle_default_non_replicated<B, MJ, S>(
 /// plain authentication must not suffice), then await the off-thread
 /// collection (see `snapshot::collect`) and reply with the raw ZIP bytes.
 #[allow(clippy::future_not_send)]
-async fn handle_get_snapshot<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_snapshot<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
@@ -1331,6 +1574,7 @@ async fn handle_get_snapshot<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot) {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
@@ -1401,8 +1645,8 @@ fn decode_get_snapshot(
 /// metadata commit. Shared by the `get_me` / `get_clients` / `get_client`
 /// arms.
 #[allow(clippy::future_not_send)]
-async fn send_non_replicated_bytes<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_non_replicated_bytes<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RequestHeader>,
     transport_client_id: u128,
     bytes: Bytes,
@@ -1412,6 +1656,7 @@ async fn send_non_replicated_bytes<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     let reply = NonReplicatedResponse::Bytes(bytes).into_reply(
@@ -1437,14 +1682,15 @@ async fn send_non_replicated_bytes<B, MJ, S>(
 /// eviction context is best-effort off the metadata consensus (peer shards
 /// have none; zeroes are cosmetic -- the SDK only reads the reason).
 #[allow(clippy::future_not_send)]
-async fn send_unauthenticated_eviction<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_unauthenticated_eviction<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let ctx = shard.plane.metadata().consensus.as_ref().map_or(
         consensus::EvictionContext {
@@ -1478,8 +1724,8 @@ async fn send_unauthenticated_eviction<B, MJ, S>(
 /// groups + rebalances via the replicated `Logout`) and sends a session-
 /// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     interval: std::time::Duration,
     stop_rx: shard::Receiver<()>,
@@ -1488,6 +1734,7 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Legacy `MAX_THRESHOLD`: a client is stale once it misses ~1.2 intervals.
     let max_age = interval.mul_f64(1.2);
@@ -1528,6 +1775,7 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
                 evict_stale_client(&shard, &sessions, transport_client_id).await;
             }
         }
+
         shard.bus.sleep(interval).await;
     }
 }
@@ -1536,8 +1784,8 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S>(
 /// membership through a replicated `Logout`) and notify the client with a
 /// session-terminal `Eviction(StaleClient)`.
 #[allow(clippy::future_not_send)]
-async fn evict_stale_client<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn evict_stale_client<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) where
@@ -1545,6 +1793,7 @@ async fn evict_stale_client<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let bound = sessions.borrow_mut().remove_connection(transport_client_id);
     if let Some((vsr_client_id, session)) = bound {
@@ -1588,8 +1837,8 @@ async fn evict_stale_client<B, MJ, S>(
 /// Failures reply with an empty body so the SDK fails fast on decode
 /// instead of hanging until its read timeout.
 #[allow(clippy::future_not_send)]
-async fn handle_poll_messages<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_poll_messages<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
@@ -1598,6 +1847,7 @@ async fn handle_poll_messages<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Ok(wire) = PollMessagesRequest::decode_from(request_body(request)) else {
         // Undecodable poll: keep the fail-fast empty-poll shape.
@@ -1662,6 +1912,19 @@ async fn handle_poll_messages<B, MJ, S>(
             }
         }
         Err(error) => {
+            // A partition id that does not exist in a resolvable topic is a
+            // client addressing error and must surface as a typed rejection,
+            // not an empty poll a consumer would read as end-of-partition.
+            if matches!(error, IggyError::PartitionNotFound(..)) {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "poll_messages rejected: partition not found"
+                );
+                send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             // A zero-byte body would panic the SDK's `PolledMessages`
             // decoder; reply the 16-byte empty-poll shape instead. A generation
             // fence (the client's cached assignment is stale after a rebalance)
@@ -1685,9 +1948,13 @@ async fn handle_poll_messages<B, MJ, S>(
 
 /// Serve `get_consumer_offset`. An empty body decodes as `None` on the SDK
 /// side (no offset stored / partition unknown).
+// TODO(hubcio): plain local partition_read with no primary gate, so a
+// follower answers from its own (possibly lagging) offset state. Needs the
+// same is-caught-up-primary gate the auto-commit path has, or an explicit
+// read-from-follower contract.
 #[allow(clippy::future_not_send)]
-async fn handle_get_consumer_offset<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_get_consumer_offset<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,
@@ -1696,6 +1963,7 @@ async fn handle_get_consumer_offset<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Ok(wire) = GetConsumerOffsetRequest::decode_from(request_body(request)) else {
         // Undecodable: an empty body decodes as None (no offset) on the SDK.
@@ -1734,6 +2002,20 @@ async fn handle_get_consumer_offset<B, MJ, S>(
                 _ => Bytes::new(),
             }
         }
+        // A partition id that does not exist in a resolvable topic is a client
+        // addressing error, the same one the poll path denies typed. An empty
+        // body decodes as `None` -- indistinguishable from "this consumer has
+        // no stored offset yet" -- so the caller cannot tell a typo from a
+        // fresh consumer.
+        Err(error @ IggyError::PartitionNotFound(..)) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "get_consumer_offset rejected: partition not found"
+            );
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            return;
+        }
         Err(error) => {
             warn!(
                 transport_client_id,
@@ -1758,8 +2040,8 @@ async fn handle_get_consumer_offset<B, MJ, S>(
 /// The member is keyed by the connection's bound VSR client id
 /// (`header().client`). An empty body decodes as "no assignment" on the SDK.
 #[allow(clippy::future_not_send)]
-async fn handle_sync_consumer_group<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_sync_consumer_group<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
 ) where
@@ -1767,6 +2049,7 @@ async fn handle_sync_consumer_group<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let body = match SyncConsumerGroupRequest::decode_from(request_body(request)) {
         Ok(wire) => shard
@@ -1806,13 +2089,13 @@ async fn handle_sync_consumer_group<B, MJ, S>(
     .await;
 }
 
-/// Ack a partition op that cannot be routed (unresolved or never-
-/// materialised namespace) with an empty Reply. The SDK connection
-/// processes replies in lockstep, so a silent drop wedges every
-/// subsequent request on that connection.
+/// Ack a consumer-offset op whose body could not be rewritten for the
+/// partition plane with an empty Reply. The SDK connection processes replies
+/// in lockstep, so a silent drop wedges every subsequent request on that
+/// connection.
 #[allow(clippy::future_not_send)]
-async fn send_empty_partition_reply<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_empty_partition_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
 ) where
@@ -1820,6 +2103,7 @@ async fn send_empty_partition_reply<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
@@ -1837,16 +2121,29 @@ async fn send_empty_partition_reply<B, MJ, S>(
     }
 }
 
-/// Wait (bounded) until `namespace` is routable: this shard's routing row
-/// exists and the owning shard answers a probe read (partition
-/// materialised). Fast path: row already present -> no probe, no wait.
+/// Wait (bounded) until this shard holds a routing row for `namespace`. Fast
+/// path: row already present -> no wait.
 ///
-/// Covers the post-`CreateTopic` convergence window where the metadata
-/// commit has returned to the client but the per-shard reconcilers have
-/// not yet seeded routing rows / materialised partitions.
+/// Covers the post-`CreateTopic` convergence window where the metadata commit
+/// has returned to the client but the per-shard reconcilers have not yet seeded
+/// routing rows. This is an admission courtesy, not a correctness gate: the row
+/// is a cache of the deterministic hash assignment and may exist before the
+/// owner has materialised anything, so its presence proves only where the
+/// partition belongs. What makes an early arrival safe is the owning shard
+/// itself - `park_if_unmaterialised` holds the frame until its partition lands,
+/// and `serves_committed_incarnation` refuses to serve a mismatched
+/// incarnation. Waiting here simply keeps the steady state off that park
+/// buffer, whose overflow is the one path that still sheds a request without
+/// replying (`frame_drops_total{variant=partition,reason=park_overflow}`).
+///
+/// Deliberately no owner-readiness probe. One used to run here, on the theory
+/// that the table could not be trusted; it could not close the window either,
+/// because the fast path above skipped it in exactly the case it was meant to
+/// cover - a row seeded from the hash by a shard that owns nothing. Readiness
+/// belongs to the owner, which is where it is now enforced.
 #[allow(clippy::future_not_send)]
-async fn wait_for_partition_routable<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn wait_for_partition_routable<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
 ) -> bool
 where
@@ -1854,6 +2151,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     const ATTEMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
     // 3s budget at 50ms per attempt. Counting attempts, not reading a
@@ -1861,9 +2159,6 @@ where
     // bus sleep advances virtual time, whereas `Instant::now` would not.
     const MAX_ATTEMPTS: u32 = 60;
 
-    if shard.shards_table().shard_for(namespace).is_some() {
-        return true;
-    }
     let mut attempts = 0u32;
     while shard.shards_table().shard_for(namespace).is_none() {
         if attempts >= MAX_ATTEMPTS {
@@ -1872,30 +2167,7 @@ where
         attempts += 1;
         shard.bus.sleep(ATTEMPT_DELAY).await;
     }
-    // The local row is seeded by THIS shard's reconciler; the owner
-    // materialises the partition on its own pass. Probe with a cheap read
-    // until the owner answers, so the write below normally clears the
-    // owner's "partition not initialized" guard. Not a hard guarantee: the
-    // partition can de-materialise between this probe and the dispatch, but
-    // the park/tombstone path re-checks and the client retries.
-    while attempts < MAX_ATTEMPTS {
-        match shard
-            .partition_read(
-                namespace,
-                PartitionRead::ConsumerOffset {
-                    consumer: PollingConsumer::Consumer(0, 0),
-                },
-            )
-            .await
-        {
-            Some(PartitionReadReply::NotFound) | None => {
-                attempts += 1;
-                shard.bus.sleep(ATTEMPT_DELAY).await;
-            }
-            Some(_) => return true,
-        }
-    }
-    false
+    true
 }
 
 /// The 16-byte `PolledMessages` body with zero messages
@@ -1917,8 +2189,8 @@ pub(crate) type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, Polli
 /// id = the connection's bound VSR client) and the HTTP route (client id 0,
 /// which fences group polls closed).
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn resolve_poll_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn resolve_poll_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &PollMessagesRequest,
     client_id: u128,
 ) -> Result<DecodedPollRequest, IggyError>
@@ -1927,6 +2199,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
@@ -1983,8 +2256,8 @@ where
 /// namespace, partition, and polling consumer. Shared by the TCP dispatch and
 /// the HTTP route; needs no client id because offset reads are not fenced
 /// (any client may read a group's offset, member or not).
-pub(crate) fn resolve_consumer_offset_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn resolve_consumer_offset_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &GetConsumerOffsetRequest,
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError>
 where
@@ -1992,6 +2265,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Omitted partition reads partition 0, matching the legacy resolver for
     // both consumer kinds (`unwrap_or(0)`).
@@ -2068,16 +2342,17 @@ fn polling_strategy_from_wire(
 /// committed op. A dropped reply (shard-0 inbox full / shutdown) maps to a
 /// transient `Canceled`, which the caller wraps so the SDK replays.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_register_on_owner<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn submit_register_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
-) -> Result<u64, MetadataSubmitError>
+) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
         return shard
@@ -2086,22 +2361,23 @@ where
             .submit_register_in_process(vsr_client_id, user_id)
             .await;
     }
-    let (reply, rx) = shard::channel::<Option<u64>>(1);
+    let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
         reply,
     });
-    match rx.recv().await {
-        Ok(Some(session)) => Ok(session),
-        _ => Err(MetadataSubmitError::Canceled),
-    }
+    // The owner's outcome, verbatim in both directions. `Canceled` is only for a
+    // dropped channel, where nothing came back to classify.
+    rx.recv()
+        .await
+        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
 }
 
 /// Logout counterpart of [`submit_register_on_owner`].
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_logout_on_owner<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn submit_logout_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     session: u64,
     request: u64,
@@ -2111,6 +2387,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
         return shard
@@ -2143,8 +2420,8 @@ where
 /// of mistaking a dropped delete for success. Only a malformed / unresolvable
 /// request is acked empty without a commit.
 #[allow(clippy::future_not_send)]
-async fn handle_delete_segments_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_delete_segments_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     bound: Option<(u128, u64)>,
     request: &Message<RequestHeader>,
@@ -2153,6 +2430,7 @@ async fn handle_delete_segments_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let header = *request.header();
     let body = request_body(request);
@@ -2168,11 +2446,10 @@ async fn handle_delete_segments_request<B, MJ, S>(
     // offset on the owning shard, then replicate a `TruncatePartition(offset)`
     // AS the client's own request through the standard owner path: the commit
     // records (client, session, request) in the `ClientTable` on every replica,
-    // keeping the sequence contiguous. Skipping the commit (or attributing it
-    // to an internal id) leaves a hole that fails the next metadata op's
-    // `request == committed + 1` preflight -> RequestGap -> silent drop -> the
-    // SDK blocks until timeout. A no-op delete still commits `up_to_offset = 0`
-    // (monotonic apply) for the same reason.
+    // advancing the watermark. Skipping the commit (or attributing it to an
+    // internal id) leaves this request id unrecorded, so the SDK's own retry
+    // of it would re-execute instead of deduping. A no-op delete still
+    // commits `up_to_offset = 0` (monotonic apply) for the same reason.
     let truncate = match resolve_delete_segments_truncate(
         shard,
         &header,
@@ -2275,8 +2552,8 @@ async fn handle_delete_segments_request<B, MJ, S>(
 /// the error.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     template: &RequestHeader,
     client_id: u128,
     session: u64,
@@ -2287,6 +2564,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let parsed = DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
     let namespace_raw = match resolve_partition_request_namespace(
@@ -2298,9 +2576,9 @@ where
         Ok(namespace_raw) => namespace_raw,
         // Unresolvable stream/topic: still commit the truncate, against the
         // client's raw identifiers -- the apply rejects it as a committed
-        // result. That keeps the request sequence contiguous (an empty ack
-        // without a commit gaps `request == committed + 1` and silently
-        // drops the NEXT metadata op) while the client gets the typed error.
+        // result, so the failure is recorded against the client's request id
+        // and its retry dedups, while the client gets the typed error an
+        // empty ack would swallow.
         Err(error) => {
             debug!(
                 client_id,
@@ -2369,11 +2647,26 @@ where
     ))
 }
 
-/// Disconnect cleanup: the local `SessionManager` connection is already
-/// dropped by the caller; this submits a session-matched `Logout` so the
-/// committed apply releases the `ClientTable` slot on every replica (shard 0
-/// included, since shard 0 is itself a replica).
+/// Release the client-table slot for a disconnected transport, cluster-wide.
 ///
+/// The local `SessionManager` connection is already dropped by the caller;
+/// this is what drops the replicated entry, so a peer replica does not keep an
+/// orphaned session until it evicts one under capacity pressure.
+///
+/// Unconditional, and deliberately so. Holding the slot open for a grace
+/// window would let a reconnecting client resume onto its entry with its
+/// watermark and reply ring intact, but nothing in tree re-presents a
+/// `client_id` after a disconnect (the Rust SDK mints a fresh one on
+/// re-login), so the window buys nothing today and the slot it holds is not
+/// free: the client table's eviction point moves from concurrent connections
+/// to CUMULATIVE connects, and every capacity eviction silently erases a
+/// dedup watermark.
+///
+/// A resume window becomes worth having once SDK-side identity stability
+/// lands, at which point it needs a timer of its own -- riding the heartbeat
+/// verifier is not an option, since that only runs when `heartbeat.enabled`
+/// is set and `collect_stale` keys off the heartbeat interval, so ungating it
+/// would mass-evict consumer-group members on a deployment that does not ping.
 /// Deliberately does NOT drop the local `ClientTable` slot first:
 /// `submit_logout_*` short-circuits when the slot is already gone, so a
 /// pre-emptive local removal would suppress the `Logout` and leave peer
@@ -2382,8 +2675,8 @@ where
 /// shard 0 and forwards for peer-homed connections; its session guard drops a
 /// stale logout for a reused client id.
 #[allow(clippy::future_not_send)]
-fn submit_disconnect_logout<B, MJ, S>(
-    shard: Rc<ShellShard<B, MJ, S>>,
+fn submit_disconnect_logout<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     session: u64,
 ) where
@@ -2391,12 +2684,14 @@ fn submit_disconnect_logout<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Synthetic request id: header validation rejects `request == 0` for
     // non-register ops, and a disconnect has no client-issued request id.
     // The logout apply keys on (client, session) only, so any non-zero id
     // is valid here.
     const DISCONNECT_LOGOUT_REQUEST_ID: u64 = u64::MAX;
+
     let bus = shard.bus.clone();
     bus.spawn(async move {
         if let Err(error) =
@@ -2422,8 +2717,8 @@ fn submit_disconnect_logout<B, MJ, S>(
 /// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
 /// `None` = transient submit failure (SDK read-timeout replays).
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_client_request_on_owner<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn submit_client_request_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
 ) -> Option<Message<GenericHeader>>
 where
@@ -2431,6 +2726,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
         return shard
@@ -2449,8 +2745,8 @@ where
 }
 
 #[allow(clippy::future_not_send)]
-async fn handle_logout_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_logout_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
@@ -2459,12 +2755,30 @@ async fn handle_logout_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
+        // Logout on an unbound transport: the desired state already holds,
+        // so answer ok. A silent drop would wedge the lockstep SDK on this
+        // connection until its socket read timeout, and the SDK routinely
+        // sends a logout before each re-login.
         warn!(
             transport_client_id,
-            "dropping logout for unbound VSR session"
+            "logout for unbound VSR session; answering ok"
         );
+        let commit = current_metadata_commit(shard);
+        let reply = build_empty_reply(request.header(), transport_client_id, 0, commit);
+        if let Err(error) = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await
+        {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "failed to send unbound logout reply"
+            );
+        }
         return;
     };
 
@@ -2472,7 +2786,29 @@ async fn handle_logout_request<B, MJ, S>(
     let commit = match submit_logout_on_owner(shard, vsr_client_id, session, request_id).await {
         Ok(commit) => commit,
         Err(error) => {
-            warn!(transport_client_id, error = %error, "logout/unregister failed");
+            // Deny as transient instead of dropping the frame: the submit
+            // usually fails because this replica is not the metadata owner
+            // right now, and the SDK replays a transient rejection.
+            warn!(transport_client_id, error = %error, "logout/unregister failed; denying transient");
+            let commit = current_metadata_commit(shard);
+            let reply = build_deny_reply(
+                request.header(),
+                vsr_client_id,
+                session,
+                commit,
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            if let Err(send_error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %send_error,
+                    "failed to send logout deny reply"
+                );
+            }
             return;
         }
     };
@@ -2493,8 +2829,8 @@ async fn handle_logout_request<B, MJ, S>(
     }
 }
 
-fn ensure_transport_connection<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn ensure_transport_connection<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) where
@@ -2502,6 +2838,7 @@ fn ensure_transport_connection<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Some(meta) = shard.bus.client_meta(transport_client_id) else {
         return;
@@ -2512,8 +2849,8 @@ fn ensure_transport_connection<B, MJ, S>(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_login_register_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn handle_login_register_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
@@ -2522,6 +2859,7 @@ async fn handle_login_register_request<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
@@ -2646,9 +2984,15 @@ async fn handle_login_register_request<B, MJ, S>(
 
     warn!(
         transport_client_id,
-        "dropping register request with unsupported payload shape"
+        "rejecting register request with unsupported payload shape"
     );
-    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+    send_login_eviction(
+        shard,
+        transport_client_id,
+        request.header().client,
+        EvictionReason::MalformedLogin,
+    )
+    .await;
 }
 
 /// Best-effort login-rejection eviction. Terminal one-way frame; a gone
@@ -2657,8 +3001,8 @@ async fn handle_login_register_request<B, MJ, S>(
 /// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
 /// plus the protocol window on `IncompatibleProtocol`.
 #[allow(clippy::future_not_send)]
-async fn send_login_eviction<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn send_login_eviction<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     vsr_client_id: u128,
     reason: EvictionReason,
@@ -2667,6 +3011,7 @@ async fn send_login_eviction<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let ctx = shard.plane.metadata().consensus.as_ref().map_or(
         EvictionContext {
@@ -2696,14 +3041,15 @@ async fn send_login_eviction<B, MJ, S>(
     }
 }
 
-pub(crate) fn upgrade_shard_handle<B, MJ, S>(
-    shard_handle: &ShellShardHandle<B, MJ, S>,
-) -> Option<Rc<ShellShard<B, MJ, S>>>
+pub(crate) fn upgrade_shard_handle<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+) -> Option<Rc<ShellShard<B, MJ, S, SB>>>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard_handle
         .borrow()
@@ -2715,8 +3061,12 @@ where
 mod tests {
     use super::*;
     use consensus::{LocalPipeline, Plane as _, PlaneKind, VsrConsensus};
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader};
+    use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
+    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, WireName, WirePartitioning};
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::variadic;
     use journal::prepare_journal::PrepareJournal;
     use message_bus::client_listener::RequestHandler;
@@ -2729,6 +3079,7 @@ mod tests {
         ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
     };
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::StateMachine as _;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -2736,8 +3087,12 @@ mod tests {
     use server_common::iobuf::Frozen;
     use server_common::sharding::ShardId;
     use server_common::{MESSAGE_ALIGN, Message};
+    use shard::metrics::ShardMetrics;
     use shard::shards_table::PapayaShardsTable;
-    use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
+    use shard::{
+        IggyShard, LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology,
+        ShardFrame, ShardIdentity, shard_channel,
+    };
     use std::cell::RefCell;
     use std::future::Future;
     use std::mem::size_of;
@@ -2745,12 +3100,15 @@ mod tests {
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
     type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
+    /// `(target client id, reply frame bytes)` per `send_to_client` call.
+    type RecordedReplies = Rc<RefCell<Vec<(u128, Vec<u8>)>>>;
 
-    /// Records every client-bound reply instead of writing to a socket;
-    /// everything else is a no-op. The two `ShellBus` halves are stubbed.
+    /// Records every client-bound reply (target id + frame bytes) instead of
+    /// writing to a socket; everything else is a no-op. The two `ShellBus`
+    /// halves are stubbed.
     #[derive(Debug, Clone, Default)]
     struct SpyBus {
-        client_replies: Rc<RefCell<Vec<u128>>>,
+        client_replies: RecordedReplies,
     }
 
     #[allow(clippy::future_not_send)]
@@ -2759,9 +3117,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
-            self.client_replies.borrow_mut().push(client_id);
+            self.client_replies
+                .borrow_mut()
+                .push((client_id, data.as_slice().to_vec()));
             Ok(())
         }
         async fn send_to_replica(
@@ -2949,6 +3309,7 @@ mod tests {
             Some(consensus),
             Some(journal),
             None,
+            None,
             TestMux::default(),
             None,
         );
@@ -2979,7 +3340,6 @@ mod tests {
                 client,
                 ACTING_USER,
                 register_reply(client, SESSION),
-                |_| false,
             );
         }
         // A's transport connection, authenticated + bound — the state a
@@ -3041,7 +3401,10 @@ mod tests {
         // left in silence — that silence is what a one-shot CLI reports as
         // "Problem with server logout / Disconnected".
         assert!(
-            bus.client_replies.borrow().contains(&TRANSPORT_A),
+            bus.client_replies
+                .borrow()
+                .iter()
+                .any(|(client, _)| *client == TRANSPORT_A),
             "logout must produce a reply frame to the client even while the \
              catch-up gate is closed (silence = CLI 'Disconnected', exit 1)"
         );
@@ -3050,6 +3413,364 @@ mod tests {
             None,
             "transport session must be unbound by a client-initiated logout; \
              the VSR slot may lapse to the eviction sweep"
+        );
+    }
+
+    /// A partition write whose routable wait exhausts (namespace committed,
+    /// but no reconciler ever seeds this shard's routing row -- the state a
+    /// teardown/rematerialise churn leaves behind) must answer a nonzero
+    /// retriable status. A status-0 empty reply is a fabricated success: the
+    /// SDK grades the send as acknowledged while zero bytes reached any
+    /// partition.
+    #[compio::test]
+    async fn unroutable_partition_send_must_reply_transient_error_not_success() {
+        const VSR_CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const TRANSPORT: u128 = 91;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "unroutable-send-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+        let md = shard.plane.metadata();
+
+        // Committed stream 0 / topic 0 / partition 0, applied straight into
+        // the STM: the namespace resolves and root authorizes, but no
+        // reconciler runs, so the shards table never gains a routing row and
+        // the routable wait exhausts its budget.
+        md.mux_stm.users().ensure_root_user("iggy", "hash");
+        let create_stream = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+        };
+        md.mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                VSR_CLIENT,
+                1,
+                &create_stream.to_bytes(),
+            ))
+            .unwrap();
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                compression_algorithm: 0,
+                message_expiry: 0,
+                max_topic_size: 0,
+                replication_factor: 1,
+                name: WireName::new("topic").unwrap(),
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        md.mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                VSR_CLIENT,
+                2,
+                &create_topic.to_bytes(),
+            ))
+            .unwrap();
+        assert!(
+            md.mux_stm
+                .streams()
+                .namespace_from_partition(
+                    &WireIdentifier::numeric(0),
+                    &WireIdentifier::numeric(0),
+                    0
+                )
+                .is_some(),
+            "seeded namespace must resolve, or the unresolved-namespace path \
+             would reply instead of the exhausted routable wait"
+        );
+
+        let send_header = SendMessagesHeader {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partitioning: WirePartitioning::PartitionId(0),
+            messages_count: 1,
+        };
+        let send_metadata = send_header.to_bytes();
+        let mut send_body = Vec::with_capacity(4 + send_metadata.len());
+        send_body.extend_from_slice(&u32::try_from(send_metadata.len()).unwrap().to_le_bytes());
+        send_body.extend_from_slice(&send_metadata);
+        let request = request_message(Operation::SendMessages, VSR_CLIENT, SESSION, 1, &send_body);
+
+        dispatch_partition_request(
+            &shard,
+            request,
+            VSR_CLIENT,
+            SESSION,
+            TRANSPORT,
+            Some(DEFAULT_ROOT_USER_ID),
+        )
+        .await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "one reply frame for the failed send");
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT, "reply must target the transport id");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::TransientNotAccepted.as_code(),
+            "an unroutable partition write must surface the retriable \
+             transient status; status 0 with an empty body grades as a \
+             successfully acknowledged send"
+        );
+    }
+
+    /// A send that reaches the owning shard while its namespace is
+    /// tombstoned (the teardown fence a delete/recreate churn sets before
+    /// the disk delete) must answer the retriable transient status. The
+    /// partition plane's own tombstone guard drops the frame without any
+    /// reply; the transports decode replies in lockstep, so that silence
+    /// wedges the connection until the SDK's response read-timeout.
+    #[compio::test]
+    async fn tombstoned_partition_send_must_reply_transient_error_not_silence() {
+        const TRANSPORT: u128 = 91;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "tombstoned-send-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.partitions().tombstone(namespace);
+
+        let request = request_message(Operation::SendMessages, TRANSPORT, SESSION, 1, &[])
+            .transmute_header(|header, new_header: &mut RequestHeader| {
+                *new_header = header;
+                new_header.namespace = namespace.inner();
+            });
+        shard.on_message(request.into_generic()).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a send into a tombstoned namespace must produce a reply frame; \
+             silence wedges the connection's lockstep decode"
+        );
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT, "reply must target the request's client");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::TransientNotAccepted.as_code(),
+            "a tombstoned-namespace send must surface the retriable transient \
+             status so the SDK replays it after the partition rematerialises"
+        );
+    }
+
+    /// A send parked for a namespace that is torn down before materialising
+    /// (create -> delete before the reconciler's `InsertOwned`) is discarded
+    /// on `ConfirmRemove`. The discard must stage the same retriable
+    /// transient deny toward the client -- through the shard's own pump as a
+    /// `ForwardClientSend` -- instead of dropping the request without any
+    /// reply.
+    #[compio::test]
+    async fn discarded_parked_partition_send_must_reply_transient_error_not_silence() {
+        const TRANSPORT: u128 = 91;
+        const SESSION: u64 = 1;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        // Real sender ring so the staged deny is observable: the test holds
+        // the receiving end of this shard's own channel.
+        let (sender, pump_rx) = shard_channel(0, 16);
+        let (_inbox_tx, inbox_rx) = shard_channel(0, 1);
+        let shard = TestShard::new(
+            ShardIdentity::new(0, "discarded-parked-send-test".to_string()),
+            bus.clone(),
+            Rc::new(|_, _| {}),
+            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_, _, _| {}),
+            metadata,
+            partitions,
+            vec![sender],
+            inbox_rx,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+            None,
+            ShardMetrics::for_shard(),
+        )
+        .expect("single-sender ring is canonically ordered");
+
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let request = request_message(Operation::SendMessages, TRANSPORT, SESSION, 1, &[])
+            .transmute_header(|header, new_header: &mut RequestHeader| {
+                *new_header = header;
+                new_header.namespace = namespace.inner();
+            });
+        // Namespace neither materialised nor tombstoned: the frame parks.
+        shard.on_message(request.into_generic()).await;
+
+        shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
+        shard.apply_reconcile_ops();
+
+        let mut denies = Vec::new();
+        while let Ok(frame) = pump_rx.try_recv() {
+            if let ShardFrame::Lifecycle(LifecycleFrame::ForwardClientSend { client_id, msg }) =
+                frame
+            {
+                denies.push((client_id, msg.as_slice().to_vec()));
+            }
+        }
+        assert_eq!(
+            denies.len(),
+            1,
+            "discarding a parked client request must stage exactly one deny \
+             reply; silence wedges the connection's lockstep decode"
+        );
+        let (client, frame) = &denies[0];
+        assert_eq!(*client, TRANSPORT, "deny must target the request's client");
+        let status =
+            u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+        assert_eq!(
+            status,
+            IggyError::TransientNotAccepted.as_code(),
+            "a discarded parked send must surface the retriable transient \
+             status so the SDK replays it instead of timing out"
+        );
+    }
+
+    #[test]
+    fn create_topic_bounds_deny_pre_consensus() {
+        let config = NgSystemConfig::default();
+        let segment_size = config.segment.size.as_bytes_u64();
+        assert!(segment_size > 0, "default segment size must be nonzero");
+
+        assert!(
+            validate_topic_bounds(
+                &config,
+                MAX_PARTITIONS_PER_REQUEST,
+                MaxTopicSize::ServerDefault
+            )
+            .is_ok(),
+            "the partition cap itself is admissible"
+        );
+        assert!(
+            matches!(
+                validate_topic_bounds(
+                    &config,
+                    MAX_PARTITIONS_PER_REQUEST + 1,
+                    MaxTopicSize::ServerDefault
+                ),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "one past the partition cap must deny"
+        );
+        // ServerDefault is numerically 0 yet exempt from the segment-size
+        // floor: it resolves against server config, matching legacy.
+        assert!(validate_topic_bounds(&config, 1, MaxTopicSize::ServerDefault).is_ok());
+        assert!(validate_topic_bounds(&config, 1, MaxTopicSize::Unlimited).is_ok());
+        let below_floor = MaxTopicSize::Custom((segment_size - 1).into());
+        assert!(
+            matches!(
+                validate_topic_bounds(&config, 1, below_floor),
+                Err(IggyError::InvalidTopicSize(size, floor))
+                    if size == below_floor && floor == config.segment.size
+            ),
+            "custom size below the segment size must deny with the bounds"
+        );
+        let at_floor = MaxTopicSize::Custom(config.segment.size);
+        assert!(
+            validate_topic_bounds(&config, 1, at_floor).is_ok(),
+            "a topic exactly one segment large is admissible"
+        );
+    }
+
+    #[test]
+    fn partitions_count_cap_denies_pre_consensus() {
+        assert!(
+            validate_partitions_count(MAX_PARTITIONS_PER_REQUEST).is_ok(),
+            "the cap itself is admissible"
+        );
+        assert!(
+            matches!(
+                validate_partitions_count(MAX_PARTITIONS_PER_REQUEST + 1),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "one past the cap must deny"
+        );
+        // Zero passes the shared cap because a zero-partition TOPIC is legal
+        // (legacy `create_topic` admits `0..=MAX`).
+        assert!(validate_partitions_count(0).is_ok());
+    }
+
+    #[test]
+    fn zero_partitions_change_denies_pre_consensus() {
+        // Adding or removing zero partitions is a no-op that would still burn
+        // a replicated log entry and force a rebalance. Legacy rejects it with
+        // `TooManyPartitions` in both handlers, so the code matches.
+        assert!(
+            matches!(
+                validate_partitions_change_count(0),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "adding or removing zero partitions must deny"
+        );
+        assert!(validate_partitions_change_count(1).is_ok());
+        assert!(validate_partitions_change_count(MAX_PARTITIONS_PER_REQUEST).is_ok());
+        assert!(
+            matches!(
+                validate_partitions_change_count(MAX_PARTITIONS_PER_REQUEST + 1),
+                Err(IggyError::TooManyPartitions)
+            ),
+            "the cap still applies"
         );
     }
 }

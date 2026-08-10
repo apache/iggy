@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Requires state transfer: the 5 MB bench fill is thousands of ops while the
-// partition journal's evicted ring retains only the last 4096, so a restarted
-// replica's rejoin window exceeds what journal repair can serve. The commit
-// floor lets recovered segments stand in for the evicted prefix, but the
-// sub-floor stats/offset seeding this test asserts (exact messages_count /
-// size_bytes across the restart) is state transfer's job.
-#[cfg(not(feature = "vsr"))]
+// Partially vsr-gated inside the module: the remaining gates cover
+// `flush_unsaved_buffer`, which server-ng answers `FeatureUnavailable` and
+// which the eager-flush server envs replace under vsr. The bench-fill test
+// itself runs under vsr since PARTITION-plane state transfer landed, but the
+// harness spawns `iggy-bench` off disk with no cargo build-graph edge, so the
+// binary must have been built `--features vsr` or its login hangs on the
+// framing mismatch.
 mod verify_after_server_restart;
 mod verify_user_login_after_restart;
 

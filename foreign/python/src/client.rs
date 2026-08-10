@@ -17,7 +17,8 @@
 
 use bytes::Bytes;
 use iggy::prelude::{
-    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
+    AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
+    IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
@@ -34,10 +35,11 @@ use crate::consumer::{
     IggyConsumer, py_delta_to_iggy_duration,
 };
 use crate::identifier::PyIdentifier;
+use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stream::StreamDetails;
-use crate::topic::{Topic, TopicDetails};
+use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
     UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
 };
@@ -50,6 +52,32 @@ use tokio::sync::Mutex;
 #[pyclass]
 pub struct IggyClient {
     inner: Arc<RustIggyClient>,
+}
+
+/// Resolves the shared `create_topic`/`update_topic` parameters, applying
+/// server defaults where the caller left them unset.
+fn resolve_topic_params(
+    compression_algorithm: Option<String>,
+    message_expiry: Option<&IggyExpiry>,
+    max_topic_size: Option<&MaxTopicSize>,
+) -> PyResult<(CompressionAlgorithm, RustIggyExpiry, RustMaxTopicSize)> {
+    let compression_algorithm = match compression_algorithm {
+        Some(algo) => CompressionAlgorithm::from_str(&algo)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+        None => CompressionAlgorithm::default(),
+    };
+
+    let expiry = message_expiry
+        .map(RustIggyExpiry::try_from)
+        .transpose()?
+        .unwrap_or(RustIggyExpiry::ServerDefault);
+
+    let max_size = max_topic_size
+        .map(RustMaxTopicSize::try_from)
+        .transpose()?
+        .unwrap_or(RustMaxTopicSize::ServerDefault);
+
+    Ok((compression_algorithm, expiry, max_size))
 }
 
 #[gen_stub_pymethods]
@@ -171,19 +199,18 @@ impl IggyClient {
 
     /// Create a new user.
     ///
-    /// The user is created without permissions.
-    ///
     /// Args:
     ///     username: Username as `str`.
     ///     password: Password as `str`.
     ///     status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+    ///     permissions: Permissions as `Permissions | None`; the user has none when `None`.
     ///
     /// Returns:
     ///     An awaitable that resolves to the created `UserInfoDetails`.
     ///
     /// Raises:
     ///     PyRuntimeError: If an argument is invalid or the request fails.
-    #[pyo3(signature = (username, password, status=None))]
+    #[pyo3(signature = (username, password, status=None, permissions=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails]", imports=("collections.abc")))]
     fn create_user<'a>(
         &self,
@@ -191,13 +218,17 @@ impl IggyClient {
         username: String,
         password: String,
         #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let status = status.map_or(UserStatus::Active, UserStatus::from);
+        let permissions = permissions.map(|permissions| permissions.inner);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             let user = inner
-                .create_user(&username, &password, status, None)
+                .create_user(&username, &password, status, permissions)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(PyUserInfoDetails::from(user))
@@ -264,6 +295,97 @@ impl IggyClient {
         })
     }
 
+    /// Update the permissions of a user by unique ID or username.
+    ///
+    /// This is a full replacement: the given permissions overwrite the previous
+    /// ones, and `None` removes them entirely.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     permissions: New permissions as `Permissions | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the permissions are updated.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[pyo3(signature = (user_id, permissions))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_permissions<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let permissions = permissions.map(|permissions| permissions.inner);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_permissions(&user_id, permissions)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Change the password of a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     current_password: Current password as `str`.
+    ///     new_password: New password as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the password is changed.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the current password is wrong or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn change_password<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        current_password: String,
+        new_password: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .change_password(&user_id, &current_password, &new_password)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Log out the currently authenticated user.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is logged out.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn logout_user<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .logout_user()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Connects the IggyClient to its service.
     /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -314,7 +436,22 @@ impl IggyClient {
     }
 
     /// Creates a new topic with the given parameters.
-    /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     name: Topic name as `str`.
+    ///     partitions_count: Number of partitions as `int`.
+    ///     compression_algorithm: Compression algorithm as `str | None`.
+    ///     replication_factor: Replication factor as `int | None`.
+    ///     message_expiry: Message expiry as `IggyExpiry | None`.
+    ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is created.
+    ///
+    /// Raises:
+    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -332,22 +469,15 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
             u8,
         >,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression_algorithm = match compression_algorithm {
-            Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
-            None => CompressionAlgorithm::default(),
-        };
-
-        let expiry = match message_expiry {
-            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
-            None => IggyExpiry::ServerDefault,
-        };
-
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let (compression_algorithm, expiry, max_size) =
+            resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
@@ -430,14 +560,15 @@ impl IggyClient {
     ///     name: New topic name as `str`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
     ///     replication_factor: Replication factor as `int | None`.
-    ///     message_expiry: Message expiry as `datetime.timedelta | None`.
-    ///     max_topic_size: Maximum topic size in bytes as `int | None`.
+    ///     message_expiry: Message expiry as `IggyExpiry | None`.
+    ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
         signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -455,22 +586,15 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
             u8,
         >,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression_algorithm = match compression_algorithm {
-            Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
-            None => CompressionAlgorithm::default(),
-        };
-
-        let expiry = match message_expiry {
-            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
-            None => IggyExpiry::ServerDefault,
-        };
-
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let (compression_algorithm, expiry, max_size) =
+            resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
@@ -774,8 +898,11 @@ impl IggyClient {
     }
 
     /// Sends a list of messages to the specified topic.
-    /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    /// Returns a SendMessagesResponse carrying the per-partition commit
+    /// confirmations, or a PyRuntimeError on failure. The confirmation list is
+    /// empty when the server reports no offsets, and the legacy server never
+    /// reports any.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
         py: Python<'a>,
@@ -802,11 +929,11 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
+            let response = inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(())
+            Ok(PySendMessagesResponse::from(response))
         })
     }
 
@@ -925,16 +1052,16 @@ impl IggyClient {
             builder = builder.batch_length(batch_length)
         };
         if let Some(auto_commit) = auto_commit {
-            builder = builder.auto_commit(auto_commit.into())
+            builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
         };
         if let Some(poll_interval) = poll_interval {
-            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval))
+            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval)?)
         } else {
             builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
             builder =
-                builder.polling_retry_interval(py_delta_to_iggy_duration(&polling_retry_interval))
+                builder.polling_retry_interval(py_delta_to_iggy_duration(&polling_retry_interval)?)
         }
         if init_retries.is_some() && init_retry_interval.is_none() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -950,7 +1077,7 @@ impl IggyClient {
         {
             builder = builder.init_retries(
                 init_retries,
-                py_delta_to_iggy_duration(&init_retry_interval),
+                py_delta_to_iggy_duration(&init_retry_interval)?,
             );
         }
         if allow_replay {

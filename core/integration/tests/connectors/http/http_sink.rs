@@ -106,8 +106,10 @@
 //!
 //! **Seed Data**:
 //! `seeds::connector_stream` creates the stream (`test_stream`) and first topic
-//! (`test_topic`). The multi-topic test creates a second topic inline to avoid
-//! polluting the shared harness with HTTP-sink-specific constants.
+//! (`test_topic`). The JSON array test uses a local seed that also pre-publishes
+//! its messages (see `connector_stream_with_json_array_messages`). The multi-topic
+//! test creates a second topic inline to avoid polluting the shared harness with
+//! HTTP-sink-specific constants.
 //!
 //! **Configuration** (`tests/connectors/http/sink.toml`):
 //! ```toml
@@ -183,6 +185,7 @@ use crate::connectors::fixtures::{
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 use bytes::Bytes;
+use iggy::prelude::IggyClient;
 use iggy_common::{Identifier, IggyMessage, MessageClient, Partitioning};
 use integration::harness::seeds;
 use integration::iggy_harness;
@@ -298,41 +301,36 @@ async fn individual_json_messages_delivered_as_separate_posts(
 // Test 2: NDJSON Batch Mode
 // ============================================================================
 
-/// Validates `batch_mode=ndjson`: all messages in one request as newline-delimited JSON.
-/// Checks single request, line count = message count, per-line envelope, `application/x-ndjson`.
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
-)]
-async fn ndjson_messages_delivered_as_single_request(
-    harness: &TestHarness,
-    fixture: HttpSinkNdjsonFixture,
-) {
-    let client = harness.root_client().await.unwrap();
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+/// Creates the connector stream/topic and pre-publishes the NDJSON test messages.
+///
+/// Same reason as [`connector_stream_with_json_array_messages`]: publishing from the
+/// test body races the sink's poll loop against the server's commit frontier, so a
+/// poll can observe a partial batch and flush it as its own request. Messages at rest
+/// before the first poll always arrive as one batch.
+async fn connector_stream_with_ndjson_messages(
+    client: &IggyClient,
+) -> Result<(), seeds::SeedError> {
+    seeds::connector_stream(client).await?;
 
-    // Step 1: Build 3 JSON event messages
+    let stream_id: Identifier = seeds::names::STREAM.try_into()?;
+    let topic_id: Identifier = seeds::names::TOPIC.try_into()?;
+
     let json_payloads: Vec<serde_json::Value> = vec![
         serde_json::json!({"event": "login", "user": 1}),
         serde_json::json!({"event": "click", "user": 2}),
         serde_json::json!({"event": "logout", "user": 3}),
     ];
 
-    let mut messages: Vec<IggyMessage> = json_payloads
-        .iter()
-        .enumerate()
-        .map(|(i, payload)| {
-            let bytes = serde_json::to_vec(payload).expect("Failed to serialize");
+    let mut messages: Vec<IggyMessage> = Vec::with_capacity(json_payloads.len());
+    for (i, payload) in json_payloads.iter().enumerate() {
+        messages.push(
             IggyMessage::builder()
                 .id((i + 1) as u128)
-                .payload(Bytes::from(bytes))
-                .build()
-                .expect("Failed to build message")
-        })
-        .collect();
+                .payload(Bytes::from(serde_json::to_vec(payload)?))
+                .build()?,
+        );
+    }
 
-    // Step 2: Publish messages to Iggy
     client
         .send_messages(
             &stream_id,
@@ -340,10 +338,20 @@ async fn ndjson_messages_delivered_as_single_request(
             &Partitioning::partition_id(0),
             &mut messages,
         )
-        .await
-        .expect("Failed to send messages");
+        .await?;
 
-    // Step 3: Wait for single NDJSON request (all messages batched into one)
+    Ok(())
+}
+
+/// Validates `batch_mode=ndjson`: all messages in one request as newline-delimited JSON.
+/// Checks single request, line count = message count, per-line envelope, `application/x-ndjson`.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
+    seed = connector_stream_with_ndjson_messages
+)]
+async fn ndjson_messages_delivered_as_single_request(fixture: HttpSinkNdjsonFixture) {
+    // Step 1: Wait for the single NDJSON request. The seed pre-published all
+    // messages, so the sink delivers them in one batch (see the seed docs above).
     let requests = fixture
         .container()
         .wait_for_requests(1)
@@ -354,7 +362,7 @@ async fn ndjson_messages_delivered_as_single_request(
     assert_eq!(req.method, "POST", "Expected POST method");
     assert_eq!(req.url, "/ingest", "Expected /ingest URL");
 
-    // Step 4: Parse NDJSON body — each line is a separate JSON envelope
+    // Step 2: Parse NDJSON body — each line is a separate JSON envelope
     let lines: Vec<&str> = req.body.trim().lines().collect();
     assert_eq!(
         lines.len(),
@@ -376,7 +384,7 @@ async fn ndjson_messages_delivered_as_single_request(
         );
     }
 
-    // Step 5: Verify NDJSON content type
+    // Step 3: Verify NDJSON content type
     let ct = req
         .header("Content-Type")
         .expect("Content-Type header must be present");
@@ -390,41 +398,36 @@ async fn ndjson_messages_delivered_as_single_request(
 // Test 3: JSON Array Batch Mode
 // ============================================================================
 
-/// Validates `batch_mode=json_array`: all messages as a single JSON array in one request.
-/// Checks single request, array length = message count, per-item envelope, `application/json`.
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
-)]
-async fn json_array_messages_delivered_as_single_request(
-    harness: &TestHarness,
-    fixture: HttpSinkJsonArrayFixture,
-) {
-    let client = harness.root_client().await.unwrap();
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+/// Creates the connector stream/topic and pre-publishes the JSON array test messages.
+///
+/// Publishing after the connector runtime starts races the sink's poll loop against
+/// the server's commit frontier: a poll can observe a partial batch, which the runtime
+/// flushes as its own HTTP request. Messages at rest before the first poll always
+/// arrive as one batch, so single-request delivery is guaranteed.
+async fn connector_stream_with_json_array_messages(
+    client: &IggyClient,
+) -> Result<(), seeds::SeedError> {
+    seeds::connector_stream(client).await?;
 
-    // Step 1: Build 3 JSON messages representing different event types
+    let stream_id: Identifier = seeds::names::STREAM.try_into()?;
+    let topic_id: Identifier = seeds::names::TOPIC.try_into()?;
+
     let json_payloads: Vec<serde_json::Value> = vec![
         serde_json::json!({"id": 1, "type": "order"}),
         serde_json::json!({"id": 2, "type": "payment"}),
         serde_json::json!({"id": 3, "type": "refund"}),
     ];
 
-    let mut messages: Vec<IggyMessage> = json_payloads
-        .iter()
-        .enumerate()
-        .map(|(i, payload)| {
-            let bytes = serde_json::to_vec(payload).expect("Failed to serialize");
+    let mut messages: Vec<IggyMessage> = Vec::with_capacity(json_payloads.len());
+    for (i, payload) in json_payloads.iter().enumerate() {
+        messages.push(
             IggyMessage::builder()
                 .id((i + 1) as u128)
-                .payload(Bytes::from(bytes))
-                .build()
-                .expect("Failed to build message")
-        })
-        .collect();
+                .payload(Bytes::from(serde_json::to_vec(payload)?))
+                .build()?,
+        );
+    }
 
-    // Step 2: Publish messages to Iggy
     client
         .send_messages(
             &stream_id,
@@ -432,10 +435,20 @@ async fn json_array_messages_delivered_as_single_request(
             &Partitioning::partition_id(0),
             &mut messages,
         )
-        .await
-        .expect("Failed to send messages");
+        .await?;
 
-    // Step 3: Wait for single JSON array request (all messages in one body)
+    Ok(())
+}
+
+/// Validates `batch_mode=json_array`: all messages as a single JSON array in one request.
+/// Checks single request, array length = message count, per-item envelope, `application/json`.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
+    seed = connector_stream_with_json_array_messages
+)]
+async fn json_array_messages_delivered_as_single_request(fixture: HttpSinkJsonArrayFixture) {
+    // Step 1: Wait for the single JSON array request. The seed pre-published all
+    // messages, so the sink delivers them in one batch (see the seed docs above).
     let requests = fixture
         .container()
         .wait_for_requests(1)
@@ -446,7 +459,7 @@ async fn json_array_messages_delivered_as_single_request(
     assert_eq!(req.method, "POST", "Expected POST method");
     assert_eq!(req.url, "/ingest", "Expected /ingest URL");
 
-    // Step 4: Parse body as JSON array and verify structure
+    // Step 2: Parse body as JSON array and verify structure
     let body = req.body_as_json().expect("Body should be valid JSON");
     assert!(body.is_array(), "Expected JSON array body, got: {body}");
 
@@ -469,7 +482,7 @@ async fn json_array_messages_delivered_as_single_request(
         );
     }
 
-    // Step 5: Verify JSON content type
+    // Step 3: Verify JSON content type
     let ct = req
         .header("Content-Type")
         .expect("Content-Type header must be present");

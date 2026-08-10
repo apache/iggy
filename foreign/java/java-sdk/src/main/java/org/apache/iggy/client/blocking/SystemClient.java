@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
@@ -28,6 +29,8 @@ import java.util.List;
 public interface SystemClient {
 
     Stats getStats();
+
+    ClusterMetadata getClusterMetadata();
 
     ClientInfoDetails getMe();
 

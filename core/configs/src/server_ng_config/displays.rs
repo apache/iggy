@@ -24,6 +24,7 @@
 
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
@@ -35,7 +36,7 @@ impl Display for ServerNgConfig {
             f,
             "{{ consumer_group: {}, data_maintenance: {}, extra: {}, message_saver: {}, \
              heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {} }}",
+             metadata: {}, message_bus: {}, partition: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.extra,
@@ -48,6 +49,23 @@ impl Display for ServerNgConfig {
             self.telemetry,
             self.metadata,
             self.message_bus,
+            self.partition,
+        )
+    }
+}
+
+impl Display for PartitionConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ prepare_queue_depth: {}, evicted_ring_capacity: {}, \
+             evicted_ring_bytes_max: {}, transfer_served_cache_bytes_max: {}, \
+             transfer_artifact_bytes_max: {} }}",
+            self.prepare_queue_depth,
+            self.evicted_ring_capacity,
+            self.evicted_ring_bytes_max,
+            self.transfer_served_cache_bytes_max,
+            self.transfer_artifact_bytes_max,
         )
     }
 }
@@ -56,8 +74,8 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {} }}",
-            self.prepare_queue_depth, self.journal_slots,
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {} }}",
+            self.prepare_queue_depth, self.journal_slots, self.clients_table_max,
         )
     }
 }
@@ -68,9 +86,7 @@ impl Display for MessageBusConfig {
             f,
             "{{ max_batch: {}, max_message_size: {}, peer_queue_capacity: {}, \
              reconnect_period: {}, close_peer_timeout: {}, close_grace: {}, \
-             handshake_grace: {}, ws_max_message_size: {:?}, \
-             ws_max_frame_size: {:?}, ws_write_buffer_size: {:?}, \
-             ws_accept_unmasked_frames: {} }}",
+             handshake_grace: {} }}",
             self.max_batch,
             self.max_message_size,
             self.peer_queue_capacity,
@@ -78,10 +94,6 @@ impl Display for MessageBusConfig {
             self.close_peer_timeout,
             self.close_grace,
             self.handshake_grace,
-            self.ws_max_message_size,
-            self.ws_max_frame_size,
-            self.ws_write_buffer_size,
-            self.ws_accept_unmasked_frames,
         )
     }
 }

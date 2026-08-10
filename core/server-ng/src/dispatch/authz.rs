@@ -40,6 +40,7 @@ use iggy_binary_protocol::requests::streams::GetStreamRequest;
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::{Operation, PrepareHeader, RequestHeader, WireDecode, WireIdentifier};
 use iggy_common::IggyError;
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -56,8 +57,8 @@ use crate::responses::{
 /// namespace already resolved, so the entity exists; a `None` user id (which
 /// the bound-session gate should preclude) fails closed with `Unauthenticated`
 /// rather than allow an unattributed write.
-pub(super) fn authorize_partition_op<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(super) fn authorize_partition_op<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
     user_id: Option<u32>,
     stream_id: usize,
@@ -68,6 +69,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Some(user_id) = user_id else {
         return Some(IggyError::Unauthenticated.as_code());
@@ -127,14 +129,15 @@ where
     decision.err().map(|error| error.as_code())
 }
 
-/// Reply to a denied partition op with the op's frame: empty body + nonzero
-/// `status`. Distinct from `send_empty_partition_reply` (status 0, the
-/// fail-fast "not routable" ack); here the SDK peeks the status and surfaces
-/// the typed authorization error. Same lockstep reasoning: a silent drop would
-/// wedge every later request on the connection.
+/// Reply to a partition op rejected before it reached the plane with the op's
+/// frame: empty body + nonzero `status`. The nonzero status is the whole
+/// point: the SDK peeks it and surfaces the typed error, whereas a status-0
+/// frame reads as a committed ack for work that never happened. Silence is no
+/// better, the connection decodes replies in lockstep and would wedge on every
+/// later request.
 #[allow(clippy::future_not_send)]
-pub(super) async fn send_partition_deny_reply<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(super) async fn send_partition_deny_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
     status: u32,
@@ -143,6 +146,7 @@ pub(super) async fn send_partition_deny_reply<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     let reply = build_deny_reply(request_header, transport_client_id, 0, commit, status);
@@ -163,8 +167,8 @@ pub(super) async fn send_partition_deny_reply<B, MJ, S>(
 
 /// Run an unscoped non-replicated-read rule for the acting user. A `None` user
 /// id (only the pre-auth path, which serves ungated codes) fails closed.
-pub(super) fn authorize_uid<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(super) fn authorize_uid<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: Option<u32>,
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<(), IggyError>
@@ -173,6 +177,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
     shard
@@ -187,8 +192,8 @@ where
 /// (stream, topic). `None` proceeds (allowed, or a resolution miss the caller's
 /// own not-found path handles); `Some(status)` denies. A `None` user id fails
 /// closed.
-pub(super) fn authorize_partition_read<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(super) fn authorize_partition_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     user_id: Option<u32>,
@@ -199,6 +204,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Some(user_id) = user_id else {
         return Some(IggyError::Unauthenticated.as_code());
@@ -224,8 +230,8 @@ where
 /// pre-auth (bootstrap / leader discovery; the dispatch allowlist admits it
 /// unauthenticated) and, like every other code the builder serves, is ungated
 /// here.
-pub(super) fn authorize_default_read<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(super) fn authorize_default_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
     body: &[u8],
     user_id: Option<u32>,
@@ -235,6 +241,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // A `u32` match cannot be exhaustive: every gated code is named explicitly,
     // and the final arm is the ungated set the builder serves without a rule.
@@ -246,35 +253,35 @@ where
         // permissioner rule to run (legacy runs none either).
         GET_PERSONAL_ACCESS_TOKENS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
-        GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _>(
+        GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,
             user_id,
             body,
             |request| &request.stream_id,
             Permissioner::get_stream,
         ),
-        GET_TOPICS_CODE => gate_stream_scoped::<GetTopicsRequest, _, _, _>(
+        GET_TOPICS_CODE => gate_stream_scoped::<GetTopicsRequest, _, _, _, _>(
             shard,
             user_id,
             body,
             |request| &request.stream_id,
             Permissioner::get_topics,
         ),
-        GET_TOPIC_CODE => gate_topic_scoped::<GetTopicRequest, _, _, _>(
+        GET_TOPIC_CODE => gate_topic_scoped::<GetTopicRequest, _, _, _, _>(
             shard,
             user_id,
             body,
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_topic,
         ),
-        GET_CONSUMER_GROUP_CODE => gate_topic_scoped::<GetConsumerGroupRequest, _, _, _>(
+        GET_CONSUMER_GROUP_CODE => gate_topic_scoped::<GetConsumerGroupRequest, _, _, _, _>(
             shard,
             user_id,
             body,
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_group,
         ),
-        GET_CONSUMER_GROUPS_CODE => gate_topic_scoped::<GetConsumerGroupsRequest, _, _, _>(
+        GET_CONSUMER_GROUPS_CODE => gate_topic_scoped::<GetConsumerGroupsRequest, _, _, _, _>(
             shard,
             user_id,
             body,
@@ -290,8 +297,8 @@ where
 /// surfaces the typed error, so a poll denial never reaches the empty-poll
 /// "0 messages" body path.
 #[allow(clippy::future_not_send)]
-pub(super) async fn send_non_replicated_deny<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(super) async fn send_non_replicated_deny<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RequestHeader>,
     transport_client_id: u128,
     status: u32,
@@ -300,6 +307,7 @@ pub(super) async fn send_non_replicated_deny<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     let reply = build_deny_reply(
@@ -327,8 +335,8 @@ pub(super) async fn send_non_replicated_deny<B, MJ, S>(
 /// resolve it to the committed slab id, then run `rule`. A malformed body or a
 /// resolution miss returns `Ok(())` so the builder's own error / not-found
 /// reply is what the client sees (decode-and-notfound-before-permission).
-fn gate_stream_scoped<T: WireDecode, B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn gate_stream_scoped<T: WireDecode, B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: Option<u32>,
     body: &[u8],
     stream_id: impl FnOnce(&T) -> &WireIdentifier,
@@ -339,6 +347,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Ok(request) = T::decode_from(body) else {
         return Ok(());
@@ -355,8 +364,8 @@ where
 /// topic) pair, resolve both to committed slab ids, then run `rule`. A malformed
 /// body or a resolution miss on either returns `Ok(())` so the builder's own
 /// error / not-found reply holds (decode-and-notfound-before-permission).
-fn gate_topic_scoped<T: WireDecode, B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn gate_topic_scoped<T: WireDecode, B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: Option<u32>,
     body: &[u8],
     ids: impl FnOnce(&T) -> (&WireIdentifier, &WireIdentifier),
@@ -367,6 +376,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let Ok(request) = T::decode_from(body) else {
         return Ok(());
@@ -382,8 +392,8 @@ where
 
 /// Resolve a wire stream identifier to its committed slab id, or `None` on a
 /// miss (the gate then falls through to the builder's not-found reply).
-fn resolve_stream_scope<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn resolve_stream_scope<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
 ) -> Option<usize>
 where
@@ -391,6 +401,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard
         .plane
@@ -402,8 +413,8 @@ where
 
 /// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
 /// either misses.
-fn resolve_topic_scope<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+fn resolve_topic_scope<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
 ) -> Option<(usize, usize)>
@@ -412,6 +423,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream_id = resolve_stream_id(inner, stream_id)?;

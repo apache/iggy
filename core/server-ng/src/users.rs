@@ -43,6 +43,7 @@ use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
 use iggy_binary_protocol::{Operation, PrepareHeader, RequestHeader};
 use iggy_common::IggyError;
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::{Message, crypto};
@@ -57,8 +58,8 @@ use std::rc::Rc;
 /// rejection (see [`verify_and_rewrite_change_password`]). Every other operation
 /// passes through unchanged. Returns [`IggyError::InvalidCommand`] only on an
 /// undecodable password body.
-pub(crate) fn maybe_rewrite_user_password_request<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn maybe_rewrite_user_password_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RequestHeader>,
 ) -> Result<Message<RequestHeader>, IggyError>
 where
@@ -66,6 +67,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let operation = request.header().operation;
     let body = request_body(&request);
@@ -97,11 +99,11 @@ where
 ///
 /// When the target resolves (`stored_hash` is `Some`) the supplied
 /// `current_password` is verified against it first. A mismatch does NOT deny
-/// pre-consensus: that would consume the client's request id without advancing
-/// the replicated `ClientTable`, gapping the sequence so the next replicated op
-/// is dropped (`RequestGap`) and the caller stalls. Instead the new password is
-/// emptied, which signals the committed apply to reject with
-/// `InvalidCredentials` (a committed no-op that keeps the sequence contiguous).
+/// pre-consensus: that would consume the client's request id without recording
+/// it in the replicated `ClientTable`, so a retry of that id would re-execute
+/// instead of deduping. Instead the new password is emptied, which signals the
+/// committed apply to reject with `InvalidCredentials` (a committed no-op that
+/// advances the watermark).
 ///
 /// Either way the current password is stripped and the accepted new one hashed,
 /// so no plaintext credential ever enters consensus. An unresolved target keeps

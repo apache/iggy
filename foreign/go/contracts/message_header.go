@@ -74,17 +74,17 @@ func MessageHeaderFromBytes(data []byte) (*MessageHeader, error) {
 }
 
 func (mh *MessageHeader) ToBytes() []byte {
-	bytes := make([]byte, 0, MessageHeaderSize)
-
-	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Checksum)
-	idBytes := mh.Id[:]
-	bytes = append(bytes, idBytes...)
-	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Offset)
-	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Timestamp)
-	bytes = binary.LittleEndian.AppendUint64(bytes, mh.OriginTimestamp)
-	bytes = binary.LittleEndian.AppendUint32(bytes, mh.UserHeaderLength)
-	bytes = binary.LittleEndian.AppendUint32(bytes, mh.PayloadLength)
-	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Reserved)
-
+	bytes, _ := mh.AppendBinary(make([]byte, 0, MessageHeaderSize))
 	return bytes
+}
+
+func (mh *MessageHeader) AppendBinary(b []byte) ([]byte, error) {
+	b = binary.LittleEndian.AppendUint64(b, mh.Checksum)
+	b = append(b, mh.Id[:]...)
+	b = binary.LittleEndian.AppendUint64(b, mh.Offset)
+	b = binary.LittleEndian.AppendUint64(b, mh.Timestamp)
+	b = binary.LittleEndian.AppendUint64(b, mh.OriginTimestamp)
+	b = binary.LittleEndian.AppendUint32(b, mh.UserHeaderLength)
+	b = binary.LittleEndian.AppendUint32(b, mh.PayloadLength)
+	return binary.LittleEndian.AppendUint64(b, mh.Reserved), nil
 }

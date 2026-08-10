@@ -24,7 +24,13 @@ import os
 import socket
 import time
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, TopicDetails
+
+# Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
+MIN_USERNAME_BYTES = 3
+MAX_USERNAME_BYTES = 50
+MIN_PASSWORD_BYTES = 3
+MAX_PASSWORD_BYTES = 100
 
 
 def get_server_config() -> tuple[str, int]:
@@ -107,3 +113,51 @@ async def wait_for_ping(
                     f"Server not responding to ping after {timeout}s"
                 ) from err
             await asyncio.sleep(interval)
+
+
+async def wait_for_purged_topic(
+    client: IggyClient, stream: str, topic: str, timeout: float = 10.0
+) -> TopicDetails:
+    """
+    Poll get_topic until a committed purge is reflected in the stats.
+
+    The VSR server acknowledges a purge once it commits; partition data
+    is pruned asynchronously, so stats can transiently report pre-purge
+    counts.
+
+    Returns:
+        TopicDetails once messages_count and size reach 0
+
+    Raises:
+        TimeoutError: If the purge is not reflected within timeout
+    """
+    deadline = time.time() + timeout
+
+    while True:
+        details = await client.get_topic(stream, topic)
+        assert details is not None, "purged topic must still exist"
+        if details.messages_count == 0 and details.size == 0:
+            return details
+        if time.time() >= deadline:
+            raise TimeoutError(
+                f"purge of {stream}/{topic} not reflected after {timeout}s: "
+                f"messages_count={details.messages_count} size={details.size}"
+            )
+        await asyncio.sleep(0.05)
+
+
+def unique_credentials(unique_name) -> tuple[str, str]:
+    """Return a unique (username, password) pair within the server limits."""
+    username = unique_name(max_bytes=MAX_USERNAME_BYTES)
+    password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
+    return username, password
+
+
+async def login_fresh_client(username: str, password: str) -> IggyClient:
+    """Connect a new client to the configured server and log in."""
+    host, port = get_server_config()
+    client = IggyClient(f"{host}:{port}")
+    await client.connect()
+    await wait_for_ping(client)
+    await client.login_user(username, password)
+    return client

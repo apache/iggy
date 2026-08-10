@@ -59,7 +59,7 @@ COPY foreign/python/NOTICE ./foreign/python/
 COPY core/ /workspace/core/
 
 # Copy Python SDK source (changes more frequently)
-COPY foreign/python/src/ ./src/
+COPY foreign/python/src/ ./foreign/python/src/
 
 # Install dependencies and build extension using native uv workflow
 WORKDIR /workspace/foreign/python

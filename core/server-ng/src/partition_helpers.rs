@@ -28,20 +28,22 @@ use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets}
 use crate::server_error::ServerNgError;
 use compio::fs::create_dir_all;
 use configs::server_ng::ServerNgConfig;
-use consensus::{LocalPipeline, VsrConsensus};
+use consensus::{LocalPipeline, VsrConsensus, VsrState};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats,
 };
+use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
+use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
 use server_common::sharding::IggyNamespace;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Validate that a namespace fits within the static caps declared in
 /// `config.extra.namespace`.
@@ -338,13 +340,26 @@ pub async fn ensure_initial_segment(
         return Ok(());
     }
 
-    let messages_path = config
-        .system
-        .get_messages_file_path(stream_id, topic_id, partition_id, 0);
+    // At the RESTORED FRONTIER, not always 0: after a crash inside the install's
+    // swap window the chain is empty while the recorded frontier is N, and a
+    // segment named 0 would then take the first append's `base_offset = N` --
+    // `rposition(|s| s.start_offset <= offset)` routes every poll for `0..N-1`
+    // into it, the next boot makes that shape durable, and this replica starts
+    // offering peers a segment that claims `[0..N]`.
+    let start_offset = partition.offset_frontier();
+    let messages_path =
+        config
+            .system
+            .get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
     let index_path = config
         .system
-        .get_index_path(stream_id, topic_id, partition_id, 0);
+        .get_index_path(stream_id, topic_id, partition_id, start_offset);
     let enforce_fsync = config.system.partition.enforce_fsync;
+    // `file_exists = false` TRUNCATES both files, which is load-bearing here: a
+    // fenced-and-rebuilt partition (or one whose quarantine failed) can reach
+    // this with a stale `.index` at offset 0 on disk. The `partitions`-side
+    // writers with the same names do NOT truncate, so opening them directly
+    // instead would read index entries from a previous generation.
     let storage = SegmentStorage::new(
         &messages_path,
         &index_path,
@@ -378,7 +393,7 @@ pub async fn ensure_initial_segment(
         .map(|writer| writer.size_counter())
         .unwrap_or_default();
     partition.log.add_persisted_segment(
-        Segment::new(0, config.system.segment.size),
+        Segment::new(start_offset, config.system.segment.size),
         storage,
         Some(Rc::new(
             MessagesWriter::new(
@@ -426,6 +441,117 @@ pub async fn ensure_initial_segment(
     Ok(())
 }
 
+/// Open the durable superblock for one partition's consensus group and read
+/// back the last recorded VSR state.
+///
+/// Mirrors the metadata plane's recovery contract: an EMPTY superblock is a
+/// genuinely fresh group (or one that never changed view) and yields `None`;
+/// a present record must decode and match this replica's identity; a present
+/// but unverifiable record is an error, because treating it as fresh would
+/// let this replica re-enter a view it already acted in. The boot path
+/// tombstones just that partition rather than refusing the whole node.
+///
+/// The returned store is the ONE open instance for this group: the partition
+/// keeps writing through it, and re-opening later would fork the ping-pong
+/// sequence counter.
+///
+/// # Errors
+///
+/// [`ServerNgError::PartitionSuperblockIo`] when the directory or a slot
+/// cannot be read; the `VersionUnknown` / `Unverifiable` / `Undecodable` /
+/// `IdentityMismatch` variants when a record exists but cannot be trusted.
+pub(crate) async fn open_partition_superblock(
+    partition_dir: &str,
+    identity: ReplicaIdentity,
+) -> Result<(Rc<PingPongSuperblock>, Option<VsrState>), ServerNgError> {
+    let io_error = |source| ServerNgError::PartitionSuperblockIo {
+        dir: PathBuf::from(partition_dir),
+        source,
+    };
+    // The load path can reach a partition whose directory was never
+    // materialized on this replica (a committed create it missed); the
+    // superblock lives inside that directory either way.
+    create_dir_all(partition_dir).await.map_err(io_error)?;
+    let (superblock, latest) = PingPongSuperblock::open_with_latest(partition_dir)
+        .await
+        .map_err(io_error)?;
+    let recovered_state = match latest {
+        SuperblockContents::Present(bytes) => {
+            Some(VsrState::try_from(bytes.as_slice()).map_err(|source| {
+                ServerNgError::PartitionSuperblockUndecodable {
+                    dir: PathBuf::from(partition_dir),
+                    source,
+                }
+            })?)
+        }
+        SuperblockContents::Unreadable {
+            version: Some(version),
+        } => {
+            return Err(ServerNgError::PartitionSuperblockVersionUnknown {
+                dir: PathBuf::from(partition_dir),
+                version,
+            });
+        }
+        SuperblockContents::Unreadable { version: None } => {
+            return Err(ServerNgError::PartitionSuperblockUnverifiable {
+                dir: PathBuf::from(partition_dir),
+            });
+        }
+        SuperblockContents::Empty => None,
+    };
+    if let Some(state) = recovered_state.as_ref() {
+        let mismatch = |field, expected: u128, found: u128| {
+            Err(ServerNgError::PartitionSuperblockIdentityMismatch {
+                dir: PathBuf::from(partition_dir),
+                field,
+                expected,
+                found,
+            })
+        };
+        if state.cluster != identity.cluster {
+            return mismatch(IdentityField::Cluster, identity.cluster, state.cluster);
+        }
+        if state.replica_id != identity.replica_id {
+            return mismatch(
+                IdentityField::ReplicaId,
+                identity.replica_id.into(),
+                state.replica_id.into(),
+            );
+        }
+        if state.replica_count != identity.replica_count {
+            return mismatch(
+                IdentityField::ReplicaCount,
+                identity.replica_count.into(),
+                state.replica_count.into(),
+            );
+        }
+    }
+    Ok((Rc::new(superblock), recovered_state))
+}
+
+/// Restore `(view, log_view)` from a recovered superblock record and mark
+/// them durable (read back from disk, durable by definition). Runs BEFORE
+/// `init` / `init_as_backup` so the join path never advertises a view older
+/// than the recorded one.
+pub(crate) fn restore_partition_view(
+    consensus: &mut VsrConsensus<Rc<IggyMessageBus>>,
+    state: &VsrState,
+) {
+    // The one line proving the durable record was READ BACK, not merely written:
+    // the group's whole anti-regression guarantee rests on this call running, and
+    // a replica that came back at view 0 is otherwise indistinguishable from one
+    // that resumed correctly until it votes.
+    info!(
+        namespace_raw = consensus.namespace(),
+        view = state.view,
+        log_view = state.log_view,
+        "restored partition view from its superblock"
+    );
+    consensus.set_view(state.view);
+    consensus.set_log_view(state.log_view);
+    consensus.mark_superblock_durable(state.view, state.log_view);
+}
+
 /// Materialise a brand-new [`IggyPartition`] for a namespace that has no on-disk state yet.
 ///
 /// Counterpart to bootstrap's `load_partition`, which hydrates from
@@ -437,7 +563,7 @@ pub async fn ensure_initial_segment(
 /// Steps performed (all idempotent on retry after a partial failure):
 /// 1. Validate namespace fits within the configured caps.
 /// 2. Create directory hierarchy on disk.
-/// 3. Build per-partition VSR consensus group at view 0.
+/// 3. Build per-partition VSR consensus group, resuming any superblock-recorded view.
 /// 4. Configure empty consumer-offset storage with the on-disk paths set.
 /// 5. Provision the initial segment + writers (offset 0).
 ///
@@ -448,11 +574,13 @@ pub async fn ensure_initial_segment(
 /// # Errors
 ///
 /// Returns [`ServerNgError`] when bounds validation, directory creation,
-/// or segment provisioning fails.
+/// superblock recovery, or segment provisioning fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_partition_fresh(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
+    created_revision: u64,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -487,15 +615,46 @@ pub async fn build_partition_fresh(
             source
         })?;
 
-    let consensus = VsrConsensus::new(
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
+    let mut consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
         bus,
-        LocalPipeline::new(),
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(crate::bootstrap::commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(crate::bootstrap::prepare_retransmit_ticks(config));
+    consensus
+        .set_view_change_retransmit_ticks(crate::bootstrap::view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(crate::bootstrap::view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(crate::bootstrap::request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
+
+    // The hierarchy create above guarantees the directory exists; recover this
+    // group's durable (view, log_view) before choosing how to join, so a
+    // restart materialization resumes from the view it last recorded instead
+    // of re-entering an older one.
+    let partition_dir = config
+        .system
+        .get_partition_path(stream_id, topic_id, partition_id);
+    let (superblock, recovered_state) = open_partition_superblock(
+        &partition_dir,
+        ReplicaIdentity {
+            cluster: cluster_id,
+            replica_id: self_replica_id,
+            replica_count,
+        },
+    )
+    .await?;
+    if let Some(state) = recovered_state.as_ref() {
+        restore_partition_view(&mut consensus, state);
+    }
+
     // A partition directory that already holds segment bytes is a RESTART
     // materialization, not a fresh create: this replica's group state died
     // with the process, so claiming view-0 primaryship would heartbeat
@@ -513,11 +672,24 @@ pub async fn build_partition_fresh(
     }
 
     let mut partition = IggyPartition::new(stats, consensus);
-    partition.set_partition_dir(config.system.get_partition_path(
-        stream_id,
-        topic_id,
-        partition_id,
-    ));
+    partition.set_superblock(superblock, recovered_state.as_ref());
+    // Surface the evicted-ring ceilings from config onto the fresh journal.
+    // IggyPartition::new has already disabled retention for single-replica
+    // groups (nobody to serve), so this only sizes the multi-replica ring; the
+    // caps are inert while retention is off.
+    partition.log.journal().inner.set_ring_caps(
+        config.partition.evicted_ring_capacity,
+        config.partition.evicted_ring_bytes_max.as_bytes_u64(),
+    );
+    partition.set_partition_dir(partition_dir);
+    // Fresh dirs read generation 0; a dir surviving from a crashed process
+    // (this "fresh" build races repair re-materialization) reads the last
+    // durably-applied purge so the reconciler does not re-wipe messages
+    // appended after it. Keyed by incarnation, so a dir left behind by a failed
+    // delete does not fence the recreated partition's purges: set the revision
+    // first.
+    partition.set_created_revision(created_revision);
+    partition.hydrate_applied_purge_generation().await?;
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);
@@ -528,7 +700,24 @@ pub async fn build_partition_fresh(
         "fresh partition must not carry recovered segments"
     );
 
-    configure_consumer_offsets(&mut partition, config, namespace, 0)?;
+    // A "fresh" build is also how a FENCED partition comes back (the shard
+    // tombstones it and the reconciler rebuilds through here), and the fence
+    // deliberately leaves the superblock in place, so the recorded frontier is
+    // the rebuild's only anchor.
+    //
+    // It is a LOWER BOUND, not a guarantee: the record is written on view
+    // changes and transfer installs, so it lags the counter arbitrarily -- a
+    // fresh joiner that adopted a view while empty and then filled via repair
+    // has a record still reading 0, and this rebuild would re-seed at 0. For
+    // ordinary crash recovery that staleness is harmless (segments survive and
+    // win the max); it is the fence paths that promote the stale bound to sole
+    // source of truth. Closing it needs the runtime fence to persist the
+    // frontier before quarantining, and the boot-path chain refusal to carry
+    // the refused chain's max `end_offset` on its error.
+    partition.restore_offset_frontier(recovered_state.as_ref());
+    let current_offset = partition.offset.load(Ordering::Acquire);
+
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     Ok(partition)
@@ -586,6 +775,111 @@ pub async fn delete_partitions_from_disk(
                 stream_id,
                 topic_id,
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use journal::superblock::SuperblockStore;
+
+    const CLUSTER: u128 = 7;
+    const REPLICA: u8 = 1;
+    const REPLICAS: u8 = 3;
+
+    fn recorded_state(view: u32, log_view: u32) -> VsrState {
+        VsrState {
+            cluster: CLUSTER,
+            replica_id: REPLICA,
+            replica_count: REPLICAS,
+            view,
+            log_view,
+            commit_max: 42,
+            checkpoint_op: 0,
+            checkpoint_checksum: 0,
+            offset_frontier: 0,
+        }
+    }
+
+    fn partition_dir(root: &tempfile::TempDir) -> String {
+        root.path().join("partition").to_string_lossy().into_owned()
+    }
+
+    const fn test_identity() -> ReplicaIdentity {
+        ReplicaIdentity {
+            cluster: CLUSTER,
+            replica_id: REPLICA,
+            replica_count: REPLICAS,
+        }
+    }
+
+    #[compio::test]
+    async fn given_fresh_partition_dir_when_superblock_opened_should_yield_no_state() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // A not-yet-materialized directory must open as fresh, not error: the
+        // helper creates it, since a follower can reach load before its first
+        // segment write.
+        let (_store, recovered) = open_partition_superblock(&partition_dir(&root), test_identity())
+            .await
+            .expect("open a fresh partition superblock");
+        assert!(
+            recovered.is_none(),
+            "an empty superblock is a fresh group, never an error"
+        );
+    }
+
+    #[compio::test]
+    async fn given_recorded_view_when_superblock_reopened_should_recover_state() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = partition_dir(&root);
+        let (store, recovered) = open_partition_superblock(&dir, test_identity())
+            .await
+            .expect("first open");
+        assert!(recovered.is_none());
+        let state = recorded_state(3, 2);
+        store
+            .write(&state.to_bytes())
+            .await
+            .expect("record the advanced view");
+        drop(store);
+
+        let (_store, recovered) = open_partition_superblock(&dir, test_identity())
+            .await
+            .expect("reopen after a restart");
+
+        assert_eq!(
+            recovered,
+            Some(state),
+            "a restarted partition must recover exactly the state it recorded"
+        );
+    }
+
+    #[compio::test]
+    async fn given_foreign_cluster_record_when_superblock_opened_should_refuse_boot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = partition_dir(&root);
+        let (store, _) = open_partition_superblock(&dir, test_identity())
+            .await
+            .expect("first open");
+        let foreign = VsrState {
+            cluster: CLUSTER + 1,
+            ..recorded_state(1, 1)
+        };
+        store
+            .write(&foreign.to_bytes())
+            .await
+            .expect("record a foreign identity");
+        drop(store);
+
+        let refused = open_partition_superblock(&dir, test_identity()).await;
+
+        match refused {
+            Err(ServerNgError::PartitionSuperblockIdentityMismatch { field, .. }) => {
+                assert_eq!(field, IdentityField::Cluster);
+            }
+            Err(other) => panic!("expected an identity mismatch, got {other}"),
+            Ok(_) => panic!("a copied or misplaced partition directory must refuse boot"),
         }
     }
 }

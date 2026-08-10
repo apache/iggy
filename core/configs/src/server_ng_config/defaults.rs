@@ -32,6 +32,7 @@ use super::cluster::{
 };
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
@@ -66,6 +67,7 @@ impl Default for ServerNgConfig {
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
             metadata: MetadataConfig::default(),
+            partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
         }
     }
@@ -77,6 +79,38 @@ impl Default for ClusterConfig {
             enabled: SERVER_NG_CONFIG.cluster.enabled,
             name: SERVER_NG_CONFIG.cluster.name.parse().unwrap(),
             heartbeat_timeout: SERVER_NG_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
+            commit_broadcast_interval: SERVER_NG_CONFIG
+                .cluster
+                .commit_broadcast_interval
+                .parse()
+                .unwrap(),
+            prepare_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .prepare_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_change_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .view_change_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_change_status_timeout: SERVER_NG_CONFIG
+                .cluster
+                .view_change_status_timeout
+                .parse()
+                .unwrap(),
+            request_start_view_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .request_start_view_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_probe_attempts_max: SERVER_NG_CONFIG.cluster.view_probe_attempts_max as u32,
+            repair_retry_interval: SERVER_NG_CONFIG
+                .cluster
+                .repair_retry_interval
+                .parse()
+                .unwrap(),
+            repair_chunk_max: SERVER_NG_CONFIG.cluster.repair_chunk_max as usize,
             nodes: SERVER_NG_CONFIG
                 .cluster
                 .nodes
@@ -84,6 +118,8 @@ impl Default for ClusterConfig {
                 .map(|node| ClusterNodeConfig {
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
+                    advertised_address: None,
+                    advertised_addresses: Vec::new(),
                     replica_id: u8::try_from(node.replica_id).expect(
                         "static_toml replica_id must fit in u8 (0..=255); \
                          fix core/server-ng/config.toml",
@@ -126,6 +162,25 @@ impl Default for MetadataConfig {
         MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
+            clients_table_max: metadata.clients_table_max as usize,
+        }
+    }
+}
+
+impl Default for PartitionConfig {
+    fn default() -> PartitionConfig {
+        // Read from the embedded TOML so the Default impl and the on-disk
+        // schema cannot drift (same pattern as MetadataConfig above).
+        let partition = &SERVER_NG_CONFIG.partition;
+        PartitionConfig {
+            prepare_queue_depth: partition.prepare_queue_depth as usize,
+            evicted_ring_capacity: partition.evicted_ring_capacity as usize,
+            evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
+            transfer_served_cache_bytes_max: partition
+                .transfer_served_cache_bytes_max
+                .parse()
+                .unwrap(),
+            transfer_artifact_bytes_max: partition.transfer_artifact_bytes_max.parse().unwrap(),
         }
     }
 }
@@ -232,6 +287,10 @@ impl Default for TcpSocketConfig {
 
 impl Default for WebSocketConfig {
     fn default() -> WebSocketConfig {
+        // The size knobs are optional in the schema (commented-out by
+        // default), so they map to `None` here when absent; every other
+        // field comes from the embedded TOML so the Default impl and
+        // the on-disk schema cannot drift.
         WebSocketConfig {
             enabled: SERVER_NG_CONFIG.websocket.enabled,
             address: SERVER_NG_CONFIG.websocket.address.parse().unwrap(),
@@ -240,7 +299,7 @@ impl Default for WebSocketConfig {
             max_write_buffer_size: None,
             max_message_size: None,
             max_frame_size: None,
-            accept_unmasked_frames: false,
+            accept_unmasked_frames: SERVER_NG_CONFIG.websocket.accept_unmasked_frames,
             tls: WebSocketTlsConfig::default(),
         }
     }
@@ -261,9 +320,7 @@ impl Default for MessageBusConfig {
     fn default() -> MessageBusConfig {
         // Read every field from the embedded TOML so the Default impl
         // and the on-disk schema cannot drift. Sibling impls in this
-        // file follow the same pattern. The `ws_*_size` knobs are
-        // optional in the schema (commented-out by default), so they
-        // map to `None` here when absent.
+        // file follow the same pattern.
         let bus = &SERVER_NG_CONFIG.message_bus;
         MessageBusConfig {
             max_batch: bus.max_batch as usize,
@@ -273,10 +330,6 @@ impl Default for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
             close_grace: bus.close_grace.parse().unwrap(),
             handshake_grace: bus.handshake_grace.parse().unwrap(),
-            ws_max_message_size: None,
-            ws_max_frame_size: None,
-            ws_write_buffer_size: None,
-            ws_accept_unmasked_frames: bus.ws_accept_unmasked_frames,
         }
     }
 }

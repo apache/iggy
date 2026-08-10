@@ -98,8 +98,8 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, Stats, Stream, StreamDetails, TokenInfo,
-    Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
+    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -109,7 +109,9 @@ use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
-use crate::dispatch::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::{
+    resolve_consumer_offset_request, resolve_poll_request, validate_topic_bounds,
+};
 use crate::http::error::{
     ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery, ReadError,
     WriteError,
@@ -121,7 +123,7 @@ use crate::http::reads::{
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
-    decode_topic_details, decode_user_details, login_error_to_iggy,
+    decode_topic_details, decode_user_details, login_error_to_iggy, send_confirmations,
 };
 use crate::http::state::{HttpInner, HttpState};
 use crate::http::submit::{
@@ -176,8 +178,13 @@ pub(in crate::http) async fn login_user(
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
     // recovered WAL suffix (which may carry the user's create/password ops)
-    // re-commits, like every other local read.
-    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
+    // re-commits, like every other local read. On barrier expiry, fail with a
+    // retryable 503 rather than validating against rolled-back credentials:
+    // this route's error currency is `IggyError -> CustomError`, and
+    // `TransientNotCommitted` is the variant `CustomError` renders 503.
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
+        .await
+        .map_err(|_| IggyError::TransientNotCommitted)?;
     let user_id = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -191,7 +198,11 @@ pub(in crate::http) async fn login_with_personal_access_token(
     State(state): State<HttpState>,
     Json(command): Json<LoginWithPersonalAccessToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
+    // Same recovery-barrier wait and retryable-503-on-expiry mapping as
+    // `login_user`.
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
+        .await
+        .map_err(|_| IggyError::TransientNotCommitted)?;
     let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id)
@@ -590,12 +601,13 @@ pub(in crate::http) async fn get_snapshot(
 /// the per-op authorization gate and the consistency gate, and serves from the
 /// roster captured at listener start plus the sync consensus getters, so it
 /// never touches the metadata STM, consensus, or a VSR session and stays fully
-/// synchronous.
+/// synchronous. The caller's peer IP picks each node's advertised address from
+/// its per-client-network selectors.
 pub(in crate::http) async fn get_cluster_metadata(
     State(state): State<HttpState>,
-    _identity: Identity,
+    identity: Identity,
 ) -> Json<ClusterMetadata> {
-    Json(state.build_cluster_metadata())
+    Json(state.build_cluster_metadata(identity.client_ip))
 }
 
 /// `GET /clients`: list every connected client across all shards as the same
@@ -784,6 +796,12 @@ pub(in crate::http) async fn create_topic(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     // Rejects empty/oversized name, partitions_count > MAX, replication_factor == Some(0).
     command.validate().map_err(WriteError::Rejected)?;
+    validate_topic_bounds(
+        &state.system_config,
+        command.partitions_count,
+        command.max_topic_size,
+    )
+    .map_err(WriteError::Rejected)?;
     let request = CreateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
@@ -1017,9 +1035,16 @@ pub(in crate::http) async fn poll_messages(
             Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
                 return Ok(Json(resync_required_polled_messages()));
             }
+            // A partition id the topic does not have is a client addressing
+            // error with its own code; collapsing it into the generic 404 body
+            // told an SDK "no such stream/topic" for a request whose stream and
+            // topic both resolved. TCP parity: the dispatch denies typed here.
+            Err(error @ IggyError::PartitionNotFound(..)) => {
+                return Err(ReadError::Rejected(error));
+            }
             // The remaining resolver failures are STM lookups that came up
-            // empty (unknown stream, topic, partition, or consumer group), so
-            // they render as the legacy 404 body.
+            // empty (unknown stream, topic, or consumer group), so they render
+            // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
     let reply = SendWrapper::new(
@@ -1117,8 +1142,13 @@ pub(in crate::http) async fn get_consumer_offset(
 /// on one credential are legal), and the committed reply comes back through
 /// the session's in-process reply slot rather than a submit return value.
 /// The default answers 201 + `Iggy-Durability: replicated-memory` only
-/// after the quorum commit; `?ack=none` answers 202 + `Iggy-Durability:
-/// none` immediately after dispatch.
+/// after the quorum commit, with the commit's per-partition confirmations as
+/// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
+/// after dispatch and can carry no confirmation, having awaited none.
+///
+/// Every 201 carries a `confirmations` list, empty when the commit reported no
+/// offsets. One shape for one meaning: a caller that had to tell "no body"
+/// apart from "empty list" would be reading the same outcome two ways.
 pub(in crate::http) async fn send_messages(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1145,21 +1175,23 @@ pub(in crate::http) async fn send_messages(
         .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
-            SendWrapper::new(partition_write_replicated(
+            let (reply, header) = SendWrapper::new(partition_write_replicated(
                 &state,
                 &identity.session,
                 Operation::SendMessages,
                 &body,
             ))
             .await?;
-            Ok((
-                StatusCode::CREATED,
-                [(
-                    DURABILITY_HEADER,
-                    HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
-                )],
-            )
-                .into_response())
+            let durability = [(
+                DURABILITY_HEADER,
+                HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
+            )];
+            // An unreadable confirmation still answers 201: the batch committed,
+            // only its offsets did not survive the reply.
+            let confirmations = send_confirmations(&reply, &header)
+                .map(SendMessagesConfirmations::from)
+                .unwrap_or_default();
+            Ok((StatusCode::CREATED, durability, Json(confirmations)).into_response())
         }
         ProduceAck::None => {
             SendWrapper::new(produce_unacked(&state, &identity.session, &body)).await?;
@@ -1411,8 +1443,8 @@ pub(in crate::http) async fn delete_user(
 /// replicated), and verifies `current_password` against the target's stored
 /// hash. A wrong current password is not denied pre-consensus: the op still
 /// commits, carrying an empty new-password hash the replicated apply turns into
-/// an `InvalidCredentials` no-op (surfaced here as 400), so the caller's request
-/// sequence stays contiguous.
+/// an `InvalidCredentials` no-op (surfaced here as 400), so the failure is
+/// recorded against the caller's request id like any other committed outcome.
 pub(in crate::http) async fn change_password(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1569,4 +1601,47 @@ fn issue_identity(inner: &HttpInner, user_id: u32) -> Result<Json<IdentityInfo>,
             expiry: generated.access_token_expiry,
         }),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use iggy_binary_protocol::responses::messages::{
+        SendMessagesConfirmationResponse, SendMessagesResponse,
+    };
+
+    /// Pins the produce response contract the SDKs decode: `snake_case` field
+    /// names and a numeric `base_offset`.
+    #[test]
+    fn confirmation_renders_the_pinned_json_shape() {
+        let response = SendMessagesResponse {
+            confirmations: vec![SendMessagesConfirmationResponse {
+                stream_id: 3,
+                topic_id: 5,
+                partition_id: 7,
+                base_offset: 41,
+            }],
+        };
+        let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
+            .expect("confirmations serialize");
+        assert_eq!(
+            json,
+            r#"{"confirmations":[{"stream_id":3,"topic_id":5,"partition_id":7,"base_offset":41}]}"#
+        );
+    }
+
+    /// A commit that reports no offsets renders the envelope with an empty
+    /// list. Together with [`send_messages`] answering `Json` on every acked
+    /// produce - the unreadable-confirmation path included - that is what makes
+    /// `confirmations` present on every 201 body.
+    #[test]
+    fn empty_confirmations_render_an_empty_list() {
+        let response = SendMessagesResponse {
+            confirmations: Vec::new(),
+        };
+        let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
+            .expect("confirmations serialize");
+        assert_eq!(json, r#"{"confirmations":[]}"#);
+    }
 }

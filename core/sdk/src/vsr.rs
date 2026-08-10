@@ -47,11 +47,20 @@ const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 // the retry from the current ConsensusSession. If disconnect created a fresh VSR
 // client/session, the retried request gets a new (client_id, request_id) tuple, so
 // server-side deduplication cannot match a mutation that may already have committed
-// before the transport failure. TigerBeetle avoids session resume and relies on
-// idempotency for requests retried from a new client session. For Iggy, either stop
-// transparent retries for replicated mutations after VSR session reset, add explicit
-// session resume/rebind semantics, or add a protocol-level idempotency key that is
-// independent of (client_id, request_id).
+// before the transport failure.
+//
+// The fix is to keep the ConsensusSession's client_id and request counter across
+// reconnects and retry replicated writes under the same (client_id, request_id)
+// instead of re-registering fresh. Resume happens through the LOGIN path: the
+// reconnecting client re-authenticates presenting its previous client_id, the
+// server verifies the authenticated user owns that entry, and the rebind commits
+// a Register that adopts the entry with its watermark and reply ring intact. Note
+// the epoch changes -- the rebind moves the fence to the new register's op -- so
+// the session field must be taken from the new login reply, not carried over.
+//
+// There is deliberately no credential-free rebind: presenting (client, session)
+// on an unauthenticated transport is refused, since that pair is a dedup key and
+// never a bearer token.
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,
@@ -79,14 +88,15 @@ pub(crate) fn encode_request_header(
             (Operation::Register, session.begin_register(), 0)
         }
         _ => {
-            let operation = operation_for_code(code)?;
+            let operation = operation_for_code(code);
             // NonReplicated ops (ping, reads) bypass server-side dedup --
-            // `ClientTable` only tracks request_ids for replicated ops. If
-            // they consumed the monotonic counter, the next replicated
-            // request would skip an id and the primary's `request_preflight`
-            // would see a `RequestGap` and silently drop it. Read the
-            // current id without advancing; the server ignores it for
-            // NonReplicated.
+            // `ClientTable` only tracks request_ids for replicated ops, and
+            // the table accepts any id above the watermark with no
+            // contiguity requirement (client_table.rs: "There is no
+            // `RequestGap`"), so consuming the counter would not break the
+            // next metadata op. Read the current id without advancing
+            // because the server ignores it for NonReplicated and burning
+            // ids for requests the table never sees buys nothing.
             //
             // They are also sessionless on the server (routed by transport
             // id; protected codes are auth-gated server-side), so send with
@@ -102,9 +112,11 @@ pub(crate) fn encode_request_header(
             } else if operation.is_partition() {
                 // Partition ops replicate in their own per-partition group,
                 // which is at-least-once with no `ClientTable` dedup -- the
-                // metadata table never records their request ids. Consuming
-                // the counter here would gap the NEXT metadata op's id and
-                // `request_preflight` would silently drop it (`RequestGap`).
+                // metadata table never records their request ids, so there
+                // is nothing for a consumed id to deduplicate against. Every
+                // partition request on a session therefore carries the id
+                // the next metadata op will claim, and a partition-plane
+                // replay is at-least-once.
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.current_request_id(), session_id)
             } else {
@@ -144,20 +156,17 @@ pub(crate) fn encode_request_header(
     Ok((header, total_size))
 }
 
-fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
+/// `COMMAND_TABLE` is a protocol registry, not a per-server capability list, so
+/// an SDK build cannot know which codes a given server implements. The server is
+/// the authority: an unmapped code is forwarded as non-replicated (the code
+/// rides `RequestHeader.reserved`, which that path already stamps) and the
+/// server answers with a proper error if it does not know it.
+fn operation_for_code(code: u32) -> Operation {
     if code == LOGOUT_USER_CODE {
-        return Ok(Operation::Logout);
+        return Operation::Logout;
     }
 
-    if let Some(operation) = Operation::from_command_code(code) {
-        return Ok(operation);
-    }
-
-    match iggy_binary_protocol::dispatch::lookup_command(code) {
-        Some(meta) if !meta.is_replicated() => Ok(Operation::NonReplicated),
-        Some(_) => Err(IggyError::UnknownReplicatedCommand(code)),
-        None => Err(IggyError::InvalidCommand),
-    }
+    Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
@@ -681,6 +690,54 @@ mod tests {
             GET_STREAM_CODE
         );
         assert_eq!(header.session, 99);
+    }
+
+    #[test]
+    fn unknown_code_encodes_as_non_replicated_and_carries_the_code() {
+        // An extended server may implement codes this SDK build has never heard
+        // of. The registry is not a capability list, so the request must reach
+        // the server rather than fail at encode time.
+        const UNKNOWN_CODE: u32 = 60_000;
+        assert!(
+            iggy_binary_protocol::dispatch::lookup_command(UNKNOWN_CODE).is_none(),
+            "test needs a code absent from COMMAND_TABLE"
+        );
+
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let bytes = encode_contiguous_request(&mut session, UNKNOWN_CODE, &Bytes::new()).unwrap();
+        let header = decode_request_header(&bytes);
+
+        assert_eq!(header.operation, Operation::NonReplicated);
+        assert_eq!(
+            u32::from_le_bytes(
+                header.reserved[NON_REPLICATED_CODE_RANGE]
+                    .try_into()
+                    .unwrap()
+            ),
+            UNKNOWN_CODE
+        );
+    }
+
+    #[test]
+    fn no_replicated_command_ever_resolves_to_non_replicated() {
+        // The safety asymmetry that makes forwarding unknown codes acceptable:
+        // an unknown code is the server's business, but a *known* replicated
+        // command sent as non-replicated would apply on one node only and
+        // silently diverge the replicas. Swept over the whole registry so a
+        // future entry cannot regress it.
+        for meta in iggy_binary_protocol::dispatch::COMMAND_TABLE {
+            if !meta.is_replicated() {
+                continue;
+            }
+            assert_ne!(
+                operation_for_code(meta.code),
+                Operation::NonReplicated,
+                "replicated command {} ({}) must never encode as NonReplicated",
+                meta.name,
+                meta.code
+            );
+        }
     }
 
     #[test]

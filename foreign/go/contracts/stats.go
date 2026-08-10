@@ -116,17 +116,17 @@ func (s *Stats) UnmarshalBinary(payload []byte) error {
 	s.KernelVersion = r.U32LenStr()
 	s.IggyServerVersion = r.U32LenStr()
 	s.IggyServerSemver = r.U32()
-	cacheCount := int(r.U32())
+	cacheCount := r.U32()
 	if r.Err() != nil {
 		return r.Err()
 	}
 
-	if cacheCount > r.Remaining()/cacheMetricsWireSize {
+	if uint64(cacheCount) > uint64(r.Remaining()/cacheMetricsWireSize) {
 		return fmt.Errorf("stats: cache metrics count %d exceeds remaining bytes %d", cacheCount, r.Remaining())
 	}
 
 	if cacheCount > 0 {
-		s.CacheMetrics = make([]CacheMetrics, cacheCount)
+		s.CacheMetrics = make([]CacheMetrics, int(cacheCount))
 		for i := range s.CacheMetrics {
 			r.Obj(cacheMetricsWireSize, &s.CacheMetrics[i])
 		}

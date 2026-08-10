@@ -18,7 +18,6 @@
 use iggy::prelude::*;
 use integration::iggy_harness;
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness]
 async fn hello_world(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();

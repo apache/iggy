@@ -237,9 +237,24 @@ pub struct Transcript {
 /// `Option<ReplicaAuth>`; `None` means auth is disabled and the handshake stays
 /// in legacy unauthenticated mode. `Some` means auth is enabled and enforced -
 /// a peer that does not complete the handshake is rejected.
+///
+/// # Key rotation
+///
+/// A second, verify-only subkey ([`Self::with_previous_secret`]) widens
+/// verification to `{current, previous}` while every MAC this node PRODUCES
+/// uses the current key. That makes a rolling PSK rotation possible in two
+/// coordinated rolls with no auth outage:
+///
+/// 1. roll every node to `shared_secret = old, previous_shared_secret = new`
+///    (all nodes still sign with the old key; the new key is pre-trusted);
+/// 2. roll every node to `shared_secret = new, previous_shared_secret = old`
+///    (mid-roll mixes verify because each side trusts the other's signer);
+/// 3. roll every node to `shared_secret = new` alone, closing the window.
 #[derive(Clone)]
 pub struct ReplicaAuth {
     key: Zeroizing<[u8; 32]>,
+    /// Rotation acceptance window: verified against, never signed with.
+    previous_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl ReplicaAuth {
@@ -248,35 +263,63 @@ impl ReplicaAuth {
     pub fn new(secret_material: &[u8]) -> Self {
         Self {
             key: Zeroizing::new(blake3::derive_key(KEY_CONTEXT, secret_material)),
+            previous_key: None,
         }
+    }
+
+    /// Additionally accept MACs keyed by `secret_material` (the retiring
+    /// PSK) during a rotation window. Verification-only: outbound MACs
+    /// always use the key from [`Self::new`]. See the type-level rotation
+    /// procedure.
+    #[must_use]
+    pub fn with_previous_secret(mut self, secret_material: &[u8]) -> Self {
+        self.previous_key = Some(Zeroizing::new(blake3::derive_key(
+            KEY_CONTEXT,
+            secret_material,
+        )));
+        self
     }
 
     /// MAC the acceptor sends in the `ReplicaChallenge` frame.
     #[must_use]
     pub fn acceptor_mac(&self, transcript: &Transcript) -> [u8; MAC_LEN] {
-        *self.mac(DIR_ACCEPTOR, transcript).as_bytes()
+        *Self::mac(&self.key, DIR_ACCEPTOR, transcript).as_bytes()
     }
 
     /// MAC the dialer sends in the finish frame.
     #[must_use]
     pub fn dialer_mac(&self, transcript: &Transcript) -> [u8; MAC_LEN] {
-        *self.mac(DIR_DIALER, transcript).as_bytes()
+        *Self::mac(&self.key, DIR_DIALER, transcript).as_bytes()
     }
 
     /// Verify the acceptor's MAC in constant time.
     #[must_use]
     pub fn verify_acceptor_mac(&self, transcript: &Transcript, received: &[u8; MAC_LEN]) -> bool {
-        self.mac(DIR_ACCEPTOR, transcript) == Hash::from_bytes(*received)
+        self.verify(DIR_ACCEPTOR, transcript, received)
     }
 
     /// Verify the dialer's MAC in constant time.
     #[must_use]
     pub fn verify_dialer_mac(&self, transcript: &Transcript, received: &[u8; MAC_LEN]) -> bool {
-        self.mac(DIR_DIALER, transcript) == Hash::from_bytes(*received)
+        self.verify(DIR_DIALER, transcript, received)
     }
 
-    fn mac(&self, dir: u8, transcript: &Transcript) -> Hash {
-        let mut hasher = blake3::Hasher::new_keyed(&self.key);
+    /// Accept a MAC produced under the current key or, during a rotation
+    /// window, under the previous key. Each comparison is constant-time
+    /// (`blake3::Hash` equality); trying the second key only reveals WHICH
+    /// cluster key signed, which any PSK holder already knows.
+    fn verify(&self, dir: u8, transcript: &Transcript, received: &[u8; MAC_LEN]) -> bool {
+        let received = Hash::from_bytes(*received);
+        if Self::mac(&self.key, dir, transcript) == received {
+            return true;
+        }
+        self.previous_key
+            .as_ref()
+            .is_some_and(|previous_key| Self::mac(previous_key, dir, transcript) == received)
+    }
+
+    fn mac(key: &[u8; 32], dir: u8, transcript: &Transcript) -> Hash {
+        let mut hasher = blake3::Hasher::new_keyed(key);
         hasher.update(DOMAIN_TAG);
         hasher.update(&transcript.cluster_id.to_le_bytes());
         hasher.update(&[transcript.dialer_id, transcript.acceptor_id]);
@@ -320,6 +363,57 @@ mod tests {
         let attacker = ReplicaAuth::new(b"ffffffffffffffffffffffffffffffff");
         let t = transcript();
         assert!(!attacker.verify_dialer_mac(&t, &signer.dialer_mac(&t)));
+    }
+
+    const NEW_SECRET: &[u8] = b"fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn rotation_window_accepts_both_keys_in_both_directions() {
+        // Mid-roll shape: the peer signs with either the retiring or the new
+        // PSK; a node carrying the window must verify both, in both handshake
+        // directions.
+        let old_signer = ReplicaAuth::new(SECRET);
+        let new_signer = ReplicaAuth::new(NEW_SECRET);
+        let window = ReplicaAuth::new(NEW_SECRET).with_previous_secret(SECRET);
+        let t = transcript();
+        assert!(window.verify_dialer_mac(&t, &old_signer.dialer_mac(&t)));
+        assert!(window.verify_dialer_mac(&t, &new_signer.dialer_mac(&t)));
+        assert!(window.verify_acceptor_mac(&t, &old_signer.acceptor_mac(&t)));
+        assert!(window.verify_acceptor_mac(&t, &new_signer.acceptor_mac(&t)));
+    }
+
+    #[test]
+    fn rotation_window_signs_with_current_key_only() {
+        // The previous key must never sign: a window node's MAC verifies
+        // under the current key alone, not under the retiring one.
+        let window = ReplicaAuth::new(NEW_SECRET).with_previous_secret(SECRET);
+        let old_only = ReplicaAuth::new(SECRET);
+        let new_only = ReplicaAuth::new(NEW_SECRET);
+        let t = transcript();
+        let mac = window.dialer_mac(&t);
+        assert!(new_only.verify_dialer_mac(&t, &mac));
+        assert!(!old_only.verify_dialer_mac(&t, &mac));
+    }
+
+    #[test]
+    fn closed_window_rejects_the_retired_key() {
+        // Step 3 of the rotation: dropping previous_shared_secret must stop
+        // accepting MACs keyed by the retired PSK.
+        let old_signer = ReplicaAuth::new(SECRET);
+        let closed = ReplicaAuth::new(NEW_SECRET);
+        let t = transcript();
+        assert!(!closed.verify_dialer_mac(&t, &old_signer.dialer_mac(&t)));
+        assert!(!closed.verify_acceptor_mac(&t, &old_signer.acceptor_mac(&t)));
+    }
+
+    #[test]
+    fn rotation_window_still_rejects_a_third_key() {
+        // The window widens acceptance to exactly {current, previous}; any
+        // other key keeps failing.
+        let window = ReplicaAuth::new(NEW_SECRET).with_previous_secret(SECRET);
+        let attacker = ReplicaAuth::new(b"ffffffffffffffffffffffffffffffff");
+        let t = transcript();
+        assert!(!window.verify_dialer_mac(&t, &attacker.dialer_mac(&t)));
     }
 
     #[test]

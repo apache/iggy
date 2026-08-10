@@ -28,6 +28,7 @@ mod messages_writer;
 mod offset_storage;
 mod poll_plan;
 mod segment;
+pub mod state_transfer;
 mod types;
 
 use iggy_binary_protocol::PrepareHeader;
@@ -35,8 +36,9 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::IggyPartition;
+pub use iggy_partition::{IggyPartition, PurgeError};
 pub use iggy_partitions::IggyPartitions;
+pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use poll_plan::{AutoCommitApplied, PollPlan};
@@ -45,7 +47,8 @@ use server_common::Message;
 pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use types::{
     AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
-    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairSession, SendMessagesResult,
+    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
+    SendMessagesResult,
 };
 
 /// Partition-level data plane operations.

@@ -17,7 +17,7 @@
 
 use crate::Identifier;
 use crate::utils::topic_size::MaxTopicSize;
-use crate::{IggyMessage, utils::byte_size::IggyByteSize};
+use crate::{IggyMessage, SendMessagesConfirmationResponse, utils::byte_size::IggyByteSize};
 use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
@@ -124,6 +124,8 @@ pub enum IggyError {
     TransientNotCommitted = 57,
     #[error("Request transiently not accepted; retry, on any replica")]
     TransientNotAccepted = 58,
+    #[error("Request already applied; its reply is no longer available")]
+    RequestAlreadyApplied = 59,
     #[error("Not connected")]
     NotConnected = 61,
     #[error("Client shutdown")]
@@ -414,6 +416,9 @@ pub enum IggyError {
     ProducerSendFailed {
         cause: Box<IggyError>,
         failed: Arc<Vec<IggyMessage>>,
+        /// Confirmations of the chunks that committed before `cause`; the
+        /// durable prefix of a send that was split into several requests.
+        committed: Arc<Vec<SendMessagesConfirmationResponse>>,
         stream_name: String,
         topic_name: String,
     } = 4056,
@@ -520,8 +525,6 @@ pub enum IggyError {
     AlreadyAuthenticated = 14000,
     #[error("VSR session value {0} is invalid (must be non-zero)")]
     InvalidSession(u64) = 14001,
-    #[error("Replicated command with unknown code {0}")]
-    UnknownReplicatedCommand(u32) = 14002,
     /// Packed protocol versions, see `iggy_binary_protocol::ProtocolVersion`.
     /// Field order: `(client_version, server_min, server_max)`.
     #[error(

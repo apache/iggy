@@ -98,25 +98,25 @@ func (n *ClusterNode) UnmarshalBinary(b []byte) error {
 	if len(b) < pos+4 {
 		return ierror.ErrInvalidNumberEncoding
 	}
-	nameLen := int(binary.LittleEndian.Uint32(b[pos : pos+4]))
+	nameLen := binary.LittleEndian.Uint32(b[pos : pos+4])
 	pos += 4
-	if len(b) < pos+nameLen {
+	if uint64(nameLen) > uint64(len(b)-pos) {
 		return ierror.ErrInvalidCommand
 	}
-	n.Name = string(b[pos : pos+nameLen])
-	pos += nameLen
+	n.Name = string(b[pos : pos+int(nameLen)])
+	pos += int(nameLen)
 
 	// ip length
 	if len(b) < pos+4 {
 		return ierror.ErrInvalidNumberEncoding
 	}
-	ipLen := int(binary.LittleEndian.Uint32(b[pos : pos+4]))
+	ipLen := binary.LittleEndian.Uint32(b[pos : pos+4])
 	pos += 4
-	if len(b) < pos+ipLen {
+	if uint64(ipLen) > uint64(len(b)-pos) {
 		return ierror.ErrInvalidCommand
 	}
-	n.IP = string(b[pos : pos+ipLen])
-	pos += ipLen
+	n.IP = string(b[pos : pos+int(ipLen)])
+	pos += int(ipLen)
 
 	// endpoints: use BufferSize and UnmarshalBinary
 	ep := TransportEndpoints{}

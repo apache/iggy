@@ -17,25 +17,15 @@
 //
 
 import type { CommandResponse } from '../../client/client.type.js';
-import { type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import {
   serializeTargetGroup, deserializeConsumerGroup,
-  type ConsumerGroup
+  type ConsumerGroup, type TargetGroup
 } from './group.utils.js';
 
-/**
- * Parameters for the get consumer group command.
- */
-export type GetGroup = {
-  /** Stream identifier (ID or name) */
-  streamId: Id,
-  /** Topic identifier (ID or name) */
-  topicId: Id,
-  /** Consumer group identifier (ID or name) */
-  groupId: Id
-};
+/** Parameters for the get consumer group command. */
+export type GetGroup = TargetGroup;
 
 /**
  * Get consumer group command definition.

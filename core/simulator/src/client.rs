@@ -72,7 +72,7 @@ pub struct SimClient {
     partition_counter: Cell<u64>,
     /// Deterministic per-message id source for produced messages. The real SDK
     /// sends `id: 0` and lets the server mint a random UUID
-    /// (`SendMessages2::from_legacy_request` -> `random_id::get_uuid`); that
+    /// (`transcode_legacy_request` -> `random_id::get_uuid`); that
     /// mint is unseeded, so under the deterministic executor a produce's
     /// replicated body bytes (and their checksums) would differ run to run,
     /// silently breaking seeded replay. Stamping a deterministic id here keeps
@@ -516,7 +516,7 @@ impl SimClient {
     /// client). VSR clients resolve to an explicit partition before sending, so
     /// the sim always emits `WirePartitioning::PartitionId`: that is the shape
     /// the shell's `resolve_partition_request_namespace` decodes, and the raw
-    /// path converts it to `SendMessages2` via `from_legacy_request`.
+    /// path converts it to `SendMessages2` via `transcode_legacy_request`.
     ///
     /// # Panics
     /// Panics if a namespace id exceeds `u32` or the request buffer is invalid.

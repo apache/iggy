@@ -29,11 +29,7 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config,
     load_metadata, resolve_persister, update_system_info,
 };
-use server::diagnostics::{
-    ASYNCIFY_POOL_DISABLED_PANIC_MSG, print_incomplete_io_uring_ops_info,
-    print_invalid_io_uring_args_info, print_io_uring_permission_info,
-    print_locked_memory_limit_info,
-};
+use server::diagnostics::{ASYNCIFY_POOL_DISABLED_PANIC_MSG, print_incomplete_io_uring_ops_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
 use server::metadata::{Metadata, create_metadata_handles};
@@ -65,10 +61,10 @@ const SHARDS_TABLE_CAPACITY: usize = 16384;
 
 static SHUTDOWN_START_TIME: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
-static SHARD_EXECUTOR_DIAGNOSTIC: std::sync::Once = std::sync::Once::new();
-// Separate latch from SHARD_EXECUTOR_DIAGNOSTIC: a shard that fails ring setup
-// (e.g. partial ENOMEM under a tight RLIMIT_MEMLOCK) must not consume the latch
-// and suppress the unsupported-opcode diagnostic from a sibling shard that did
+// Separate latch from the ring-setup one inside
+// `enrich_runtime_create_error`: a shard that fails ring setup (e.g. partial
+// ENOMEM under a tight RLIMIT_MEMLOCK) must not consume the latch and
+// suppress the unsupported-opcode diagnostic from a sibling shard that did
 // start. Setup vs runtime io_uring failures can co-occur across shards.
 static SHARD_RUNTIME_DIAGNOSTIC: std::sync::Once = std::sync::Once::new();
 
@@ -123,11 +119,7 @@ fn main() -> Result<(), ServerError> {
     let rt = match compio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            match e.kind() {
-                std::io::ErrorKind::OutOfMemory => print_locked_memory_limit_info(),
-                std::io::ErrorKind::PermissionDenied => print_io_uring_permission_info(),
-                _ => {}
-            }
+            let e = server_common::diagnostics::enrich_runtime_create_error(e);
             panic!("Cannot create runtime: {e}");
         }
     };
@@ -417,21 +409,11 @@ fn main() -> Result<(), ServerError> {
                         let rt = match create_shard_executor() {
                             Ok(rt) => rt,
                             Err(e) => {
-                                match e.kind() {
-                                    std::io::ErrorKind::InvalidInput => {
-                                        SHARD_EXECUTOR_DIAGNOSTIC
-                                            .call_once(print_invalid_io_uring_args_info);
-                                    }
-                                    std::io::ErrorKind::OutOfMemory => {
-                                        SHARD_EXECUTOR_DIAGNOSTIC
-                                            .call_once(print_locked_memory_limit_info);
-                                    }
-                                    std::io::ErrorKind::PermissionDenied => {
-                                        SHARD_EXECUTOR_DIAGNOSTIC
-                                            .call_once(print_io_uring_permission_info);
-                                    }
-                                    _ => {}
-                                }
+                                // Prints the verbose remediation once across
+                                // all shard threads; the panic message itself
+                                // carries the one-line fix.
+                                let e =
+                                    server_common::diagnostics::enrich_runtime_create_error(e);
                                 panic!("Cannot create shard-{id} executor: {e}");
                             }
                         };

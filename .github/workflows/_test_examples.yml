@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
 
       - name: Skip noop
         if: inputs.component == 'noop'
@@ -57,13 +57,13 @@ jobs:
 
       - name: Setup Python
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: actions/setup-python@v6.3.0
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.10"
 
       - name: Setup uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install PHP build dependencies
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
@@ -113,9 +113,20 @@ jobs:
           echo "Building common binaries for all examples tests..."
           echo "Current directory: $(pwd)"
 
-          # Build server (needed by both Rust and Go examples)
-          echo "Building iggy-server..."
-          cargo build --locked --bin iggy-server
+          # The Go SDK speaks only the VSR wire protocol and the Python wheels
+          # are vsr-built, so those lanes need the VSR server. Every other
+          # language still runs against the legacy one until its own migration
+          # lands.
+          if [[ "${{ inputs.task }}" == "examples-go" || "${{ inputs.task }}" == "examples-python" ]]; then
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+            SERVER_BIN="iggy-server-ng"
+            echo "Building ${SERVER_BIN} (--features vsr)..."
+            cargo build --locked --bin "${SERVER_BIN}" --features vsr
+          else
+            SERVER_BIN="iggy-server"
+            echo "Building ${SERVER_BIN}..."
+            cargo build --locked --bin "${SERVER_BIN}"
+          fi
 
           # For Rust examples, also build CLI and example binaries
           if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
@@ -125,13 +136,13 @@ jobs:
 
           # Verify server binary was built (needed by all examples)
           echo "Verifying server binary:"
-          if [ -f "target/debug/iggy-server" ]; then
-            echo "✅ Server binary found at target/debug/iggy-server"
-            ls -lh target/debug/iggy-server
+          if [ -f "target/debug/${SERVER_BIN}" ]; then
+            echo "✅ Server binary found at target/debug/${SERVER_BIN}"
+            ls -lh "target/debug/${SERVER_BIN}"
           else
-            echo "❌ Server binary NOT found at target/debug/iggy-server"
+            echo "❌ Server binary NOT found at target/debug/${SERVER_BIN}"
             echo "Checking target directory structure:"
-            find target -name "iggy-server" -type f 2>/dev/null || true
+            find target -name "${SERVER_BIN}" -type f 2>/dev/null || true
             exit 1
           fi
 

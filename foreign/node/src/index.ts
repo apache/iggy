@@ -23,7 +23,15 @@ export {
   Partitioning,
   HeaderValue,
   HeaderKeyFactory,
+  type SendMessagesConfirmation,
+  type SendMessagesResponse,
 } from "./wire/index.js";
 
 export * from "./client/index.js";
 export * from "./stream/index.js";
+export {
+  DeserializeError,
+  ResponseError
+} from './wire/error.utils.js';
+export { ProtocolFrameError } from './client/client.frame.js';
+export { VsrEvictionError } from './wire/vsr/reply.js';

@@ -240,7 +240,7 @@ impl Client {
         partitioning_kind: String,
         partitioning_value: Vec<u8>,
         messages: Vec<ffi::IggyMessageToSend>,
-    ) -> Result<(), String> {
+    ) -> Result<ffi::SendMessagesResponse, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not send messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -285,7 +285,8 @@ impl Client {
             .collect::<Result<Vec<_>, _>>()?;
 
         RUNTIME.block_on(async {
-            self.inner
+            let response = self
+                .inner
                 .send_messages(
                     &rust_stream_id,
                     &rust_topic_id,
@@ -294,7 +295,7 @@ impl Client {
                 )
                 .await
                 .map_err(|error| format!("Could not send messages: {error}"))?;
-            Ok(())
+            Ok(ffi::SendMessagesResponse::from(response))
         })
     }
 

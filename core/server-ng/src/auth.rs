@@ -18,21 +18,23 @@
 //! Local credential verification and login/register completion.
 //!
 //! Verifies password + PAT credentials locally, then runs the consensus
-//! `Register` proposal on the metadata owner; also builds the terminal
-//! login-failure replies.
+//! `Register` proposal on the metadata owner; terminal failures are
+//! surfaced as typed `Eviction` frames, transient ones as
+//! `TransientNotCommitted` replay hints.
 
 use crate::bootstrap::{ShellBus, ShellShard};
-use crate::dispatch::submit_register_on_owner;
+use crate::dispatch::{send_login_eviction, submit_register_on_owner};
 use crate::login_register::LoginRegisterError;
-use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
+use crate::responses::{build_login_register_reply, current_metadata_commit};
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use consensus::{MetadataHandle, build_result_rejection_reply};
 use iggy_binary_protocol::PrepareHeader;
-use iggy_binary_protocol::{ClientVersionInfo, RequestHeader};
+use iggy_binary_protocol::{ClientVersionInfo, EvictionReason, RequestHeader};
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
@@ -59,8 +61,8 @@ pub(crate) fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
-pub(crate) fn verify_login_credentials<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn verify_login_credentials<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
     password: &str,
 ) -> Result<u32, LoginRegisterError>
@@ -69,6 +71,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     // Same bounds the legacy server enforces before any lookup or hashing;
     // also keeps arbitrary-length input out of the password hash. Collapsed
@@ -105,8 +108,8 @@ where
     })
 }
 
-pub(crate) fn verify_pat_credentials<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn verify_pat_credentials<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
 ) -> Result<u32, LoginRegisterError>
 where
@@ -114,6 +117,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
 }
@@ -122,8 +126,8 @@ where
 /// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
 /// per-token VSR session table on this expiry for lazy eviction; the wire and
 /// login paths only need the user id and go through [`verify_pat_credentials`].
-pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
 ) -> Result<(u32, u64), LoginRegisterError>
 where
@@ -131,6 +135,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let token_hash = PersonalAccessToken::hash_token(token);
     // PAT expiry gates the login accept/reject, and that outcome folds into
@@ -173,8 +178,8 @@ where
 }
 
 #[allow(clippy::future_not_send)]
-pub(crate) async fn complete_login_register<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn complete_login_register<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     vsr_client_id: u128,
@@ -187,6 +192,7 @@ where
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let sdk_info = ClientSdkInfo {
         sdk_name: client_version.sdk_name.as_str().to_owned(),
@@ -221,7 +227,10 @@ where
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
     let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
-        Ok(session) => session,
+        // The wire reply carries only the fence epoch; the SDK numbers its
+        // own requests, so the bind watermark is not surfaced (see the
+        // BoundSession doc for who does consume it).
+        Ok(bound) => bound.epoch,
         Err(error) => {
             return Err(LoginRegisterError::Transient(error));
         }
@@ -264,7 +273,8 @@ where
     Ok(())
 }
 
-/// Decide whether a failed login/register gets a terminal reply or silence.
+/// Decide whether a failed login/register gets a terminal eviction or a
+/// transient replay hint.
 ///
 /// A transient consensus failure ([`LoginRegisterError::is_terminal`] is
 /// `false`) means the cluster could not commit *right now* (a freshly booted
@@ -274,12 +284,12 @@ where
 /// break the replay.
 ///
 /// Terminal auth errors (`InvalidCredentials` / `InvalidToken` /
-/// `UserInactive` / `Session`) fast-fail with an empty reply rather than make
-/// the client wait for a timeout. (TODO: ship a typed `Eviction` frame once
-/// the SDK eviction decoder lands on every transport.)
+/// `UserInactive` / `Session`) fast-fail with a typed `Eviction` frame so the
+/// SDK surfaces the real reason (every frame transport decodes
+/// `Command2::Eviction`) instead of a decode error or a timeout.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn surface_login_failure<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
     error: &LoginRegisterError,
@@ -288,9 +298,16 @@ pub(crate) async fn surface_login_failure<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     if error.is_terminal() {
-        send_login_failure_reply(shard, transport_client_id, request_header).await;
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            request_header.client,
+            eviction_reason_for(error),
+        )
+        .await;
     } else {
         // Transient consensus failure (not-caught-up / not-primary / pipeline
         // full): send the explicit `TransientNotCommitted` frame instead of
@@ -306,8 +323,8 @@ pub(crate) async fn surface_login_failure<B, MJ, S>(
 /// same login on the same connection. Only call for transient errors -- see
 /// [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
-async fn send_login_transient_reply<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
+async fn send_login_transient_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
 ) where
@@ -315,6 +332,7 @@ async fn send_login_transient_reply<B, MJ, S>(
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
+    SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
     // `TransientNotAccepted`: a login/register replay is safe under any
@@ -338,32 +356,50 @@ async fn send_login_transient_reply<B, MJ, S>(
     }
 }
 
-/// Empty Reply on a terminal failed Register. The SDK only decodes
-/// `Command2::Reply`; an empty body fails `LoginRegisterResponse` decoding
-/// fast instead of hanging until the socket read timeout. Only call for
-/// terminal errors -- see [`surface_login_failure`].
-#[allow(clippy::future_not_send)]
-pub(crate) async fn send_login_failure_reply<B, MJ, S>(
-    shard: &Rc<ShellShard<B, MJ, S>>,
-    transport_client_id: u128,
-    request_header: &RequestHeader,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-{
-    let commit = current_metadata_commit(shard);
-    let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send login-failure reply"
-        );
+/// Wire reason for a terminal login/register failure. Session-level
+/// rejections (including the non-retryable submit refusal, where the
+/// presented client id belongs to another user) collapse to
+/// `SessionError`; the SDK maps it to `Unauthenticated`.
+const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
+    match error {
+        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
+        LoginRegisterError::UserInactive => EvictionReason::UserInactive,
+        _ => EvictionReason::SessionError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::{IggyError, eviction_reason_to_error};
+
+    /// The reasons this module emits must map back to the credential
+    /// errors the SDK is expected to surface (the shared
+    /// `eviction_reason_to_error` grading both ends).
+    #[test]
+    fn terminal_login_errors_map_to_typed_sdk_errors() {
+        let cases = [
+            (
+                eviction_reason_for(&LoginRegisterError::InvalidCredentials),
+                IggyError::InvalidCredentials,
+            ),
+            (
+                eviction_reason_for(&LoginRegisterError::InvalidToken),
+                IggyError::InvalidPersonalAccessToken,
+            ),
+            (
+                eviction_reason_for(&LoginRegisterError::UserInactive),
+                IggyError::Unauthenticated,
+            ),
+        ];
+        for (reason, expected) in cases {
+            let error = eviction_reason_to_error(reason, 0, 0);
+            assert_eq!(
+                error.as_code(),
+                expected.as_code(),
+                "reason {reason:?} must surface as {expected:?}"
+            );
+        }
     }
 }
