@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -65,4 +66,14 @@ public interface ConsumerGroupsClient {
     }
 
     void leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId);
+
+    default Optional<ConsumerGroupAssignment> syncConsumerGroup(Long streamId, Long topicId, Long groupId) {
+        return syncConsumerGroup(StreamId.of(streamId), TopicId.of(topicId), ConsumerId.of(groupId));
+    }
+
+    /**
+     * Fetches this client's current partition assignment for a consumer group,
+     * or empty when this client is not a member.
+     */
+    Optional<ConsumerGroupAssignment> syncConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId);
 }

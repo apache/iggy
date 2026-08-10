@@ -186,6 +186,7 @@ pub struct ShardMetrics {
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
+    partitions_duplicate_builds_discarded_total: Counter,
     partition_transfer_refusals_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -220,6 +221,7 @@ impl ShardMetrics {
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
+            partitions_duplicate_builds_discarded_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -257,6 +259,16 @@ impl ShardMetrics {
     /// metadata.
     pub fn record_partition_removed(&self) {
         self.partitions_removed_total.inc();
+    }
+
+    /// Bumped when the pump discards a duplicate `InsertOwned` for a namespace
+    /// that is already live. The reconciler's staged-op guard should make this
+    /// unreachable, so a non-zero value is a caught correctness anomaly, not
+    /// routine churn: the discarded build re-planted segment 0 over the live
+    /// incarnation's path and folded its initial segment into the shared stats
+    /// before the pump caught it.
+    pub fn record_duplicate_partition_build_discarded(&self) {
+        self.partitions_duplicate_builds_discarded_total.inc();
     }
 
     /// Bumped each time `build_partition_fresh` or

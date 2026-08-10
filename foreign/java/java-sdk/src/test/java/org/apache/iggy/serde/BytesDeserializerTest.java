@@ -42,6 +42,7 @@ import static org.apache.iggy.serde.BytesDeserializer.readClientInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfoDetails;
 import static org.apache.iggy.serde.BytesDeserializer.readClusterMetadata;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroup;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupAssignment;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupMember;
@@ -53,6 +54,7 @@ import static org.apache.iggy.serde.BytesDeserializer.readPersonalAccessTokenInf
 import static org.apache.iggy.serde.BytesDeserializer.readPolledMessage;
 import static org.apache.iggy.serde.BytesDeserializer.readPolledMessages;
 import static org.apache.iggy.serde.BytesDeserializer.readRawPersonalAccessToken;
+import static org.apache.iggy.serde.BytesDeserializer.readSendMessagesResponse;
 import static org.apache.iggy.serde.BytesDeserializer.readStats;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
@@ -315,6 +317,55 @@ class BytesDeserializerTest {
     }
 
     @Nested
+    class ConsumerGroupAssignmentDeserialization {
+
+        @Test
+        void shouldDeserializeAssignment() {
+            // given — [generation:8][partitions_count:4][partition_id:4]*
+            ByteBuf buffer = Unpooled.buffer();
+            writeU64(buffer, BigInteger.valueOf(7)); // generation
+            buffer.writeIntLE(3); // partitions count
+            buffer.writeIntLE(0);
+            buffer.writeIntLE(1);
+            buffer.writeIntLE(2);
+
+            // when
+            var assignment = readConsumerGroupAssignment(buffer);
+
+            // then
+            assertThat(assignment.generation()).isEqualTo(7L);
+            assertThat(assignment.partitions()).containsExactly(0L, 1L, 2L);
+            assertThat(buffer.isReadable()).isFalse();
+        }
+
+        @Test
+        void shouldDeserializeMemberWithoutPartitions() {
+            // given — distinct from an empty body, which means "not a member"
+            ByteBuf buffer = Unpooled.buffer();
+            writeU64(buffer, BigInteger.valueOf(2)); // generation
+            buffer.writeIntLE(0); // partitions count
+
+            // when
+            var assignment = readConsumerGroupAssignment(buffer);
+
+            // then
+            assertThat(assignment.generation()).isEqualTo(2L);
+            assertThat(assignment.partitions()).isEmpty();
+        }
+
+        @Test
+        void shouldRejectPartitionCountLargerThanPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeLongLE(2);
+            buffer.writeIntLE(Integer.MAX_VALUE);
+
+            assertThatThrownBy(() -> readConsumerGroupAssignment(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("partitions count");
+        }
+    }
+
+    @Nested
     class ConsumerOffsetDeserialization {
 
         @Test
@@ -422,6 +473,101 @@ class BytesDeserializerTest {
             assertThat(polledMessages.currentOffset()).isEqualTo(BigInteger.valueOf(10));
             assertThat(polledMessages.count()).isEqualTo(1L);
             assertThat(polledMessages.messages()).hasSize(1);
+        }
+    }
+
+    @Nested
+    class SendMessagesResponseDeserialization {
+
+        private ByteBuf singleConfirmation() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeIntLE(1); // confirmations count
+            buffer.writeIntLE(3); // stream ID
+            buffer.writeIntLE(5); // topic ID
+            buffer.writeIntLE(7); // partition ID
+            writeU64(buffer, BigInteger.valueOf(41)); // base offset
+            return buffer;
+        }
+
+        @Test
+        void shouldDeserializeSingleConfirmation() {
+            // given
+            ByteBuf buffer = singleConfirmation();
+
+            // when
+            var response = readSendMessagesResponse(buffer);
+
+            // then
+            assertThat(response.confirmations()).hasSize(1);
+            var confirmation = response.confirmations().get(0);
+            assertThat(confirmation.streamId()).isEqualTo(3L);
+            assertThat(confirmation.topicId()).isEqualTo(5L);
+            assertThat(confirmation.partitionId()).isEqualTo(7L);
+            assertThat(confirmation.baseOffset()).isEqualTo(BigInteger.valueOf(41));
+        }
+
+        @Test
+        void shouldDeserializeEmptyBodyAsNoConfirmations() {
+            // given — legacy servers ack a send with an empty body
+            ByteBuf buffer = Unpooled.buffer();
+
+            // when
+            var response = readSendMessagesResponse(buffer);
+
+            // then
+            assertThat(response.confirmations()).isEmpty();
+        }
+
+        @Test
+        void shouldDeserializeZeroCountAsNoConfirmations() {
+            // given — the server sends count = 0 when it could not decode the batch
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeIntLE(0);
+
+            // when
+            var response = readSendMessagesResponse(buffer);
+
+            // then
+            assertThat(response.confirmations()).isEmpty();
+        }
+
+        @Test
+        void shouldRejectConfirmationCountLargerThanPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeIntLE(Integer.MAX_VALUE);
+
+            assertThatThrownBy(() -> readSendMessagesResponse(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("confirmations count");
+        }
+
+        @Test
+        void shouldFailOnTrailingBytes() {
+            // given
+            ByteBuf buffer = singleConfirmation();
+            buffer.writeByte(0xAB);
+
+            // when / then
+            assertThatThrownBy(() -> readSendMessagesResponse(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("trailing");
+        }
+
+        @Test
+        void shouldFailOnTruncationAtEveryByte() {
+            // given
+            ByteBuf complete = singleConfirmation();
+            byte[] bytes = new byte[complete.readableBytes()];
+            complete.getBytes(0, bytes);
+
+            for (int length = 1; length < bytes.length; length++) {
+                ByteBuf truncated = Unpooled.wrappedBuffer(bytes, 0, length);
+
+                // when / then
+                assertThatThrownBy(() -> readSendMessagesResponse(truncated))
+                        .as("truncated at byte %d", length)
+                        .isInstanceOf(RuntimeException.class);
+            }
         }
     }
 

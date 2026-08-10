@@ -39,7 +39,7 @@ bdd/
 ├── docker-compose.server.yml   # Single iggy-server test setup
 ├── docker-compose.cluster.yml  # Leader + follower test setup
 ├── docker-compose.coverage.yml # Coverage collection overlay
-├── docker-compose.vsr.yml      # server-ng (VSR) overlay (rust, python, csharp)
+├── docker-compose.vsr.yml      # server-ng (VSR) overlay
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
 ```
@@ -71,16 +71,17 @@ bdd/
 # Run only leader_redirection
 ../scripts/run-bdd-tests.sh all leader_redirection
 
-# Run against iggy-server-ng with VSR (Rust, Python, and C# SDKs; the
-# other SDKs do not speak the VSR wire protocol yet). Python and C# are
-# vsr-built, so their plain lanes above already run vsr in CI.
-# Build the vsr binaries first:
+# Run against iggy-server-ng with VSR. Go and Java always use the VSR
+# overlay. Python and C# are vsr-built, so CI supplies --vsr for their
+# plain lanes. Rust and Node opt in with --vsr. Build the binaries first:
 #   cargo build --bin iggy-server-ng --bin iggy --features vsr
 # NOTE: `target/debug/iggy` is shared between lanes and the vsr flavour
 # speaks a different wire protocol. When switching back to the legacy
 # lane, rebuild without `--features vsr` first, or the in-container
 # healthcheck ping cannot talk to the legacy server.
 ../scripts/run-bdd-tests.sh --vsr rust
+../scripts/run-bdd-tests.sh --vsr csharp
+../scripts/run-bdd-tests.sh java
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean

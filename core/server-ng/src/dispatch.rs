@@ -2904,6 +2904,7 @@ async fn handle_login_register_request<B, MJ, S, SB>(
     }
 
     let body_tail = &body[prefix_len..];
+    let mut credentials_rejected = false;
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
     {
@@ -2933,8 +2934,10 @@ async fn handle_login_register_request<B, MJ, S, SB>(
             Err(LoginRegisterError::InvalidCredentials) => {
                 // Fall through to PAT attempt so a credential payload that
                 // collides with a valid PAT payload shape still gets a
-                // chance; if PAT also rejects, the final fall-through emits
-                // the empty-reply failure path below.
+                // chance. A password-shaped body rarely parses as a PAT
+                // body, so remember the rejection: the final fall-through
+                // must surface InvalidCredentials, not MalformedLogin.
+                credentials_rejected = true;
             }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
@@ -2980,6 +2983,21 @@ async fn handle_login_register_request<B, MJ, S, SB>(
                 return;
             }
         }
+    }
+
+    if credentials_rejected {
+        warn!(
+            transport_client_id,
+            "rejecting register request: invalid credentials"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            request.header().client,
+            EvictionReason::InvalidCredentials,
+        )
+        .await;
+        return;
     }
 
     warn!(
