@@ -21,35 +21,35 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Tests.Integrations.Helpers;
-using DotNet.Testcontainers.Builders;
-using DotNet.Testcontainers.Containers;
 using TUnit.Core.Interfaces;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
+/// <summary>
+///     Runs the suite against an iggy-server-ng <see cref="VsrCluster" />: a standalone node by default,
+///     or a replicated cluster when IGGY_TEST_CLUSTER_NODES asks for one, so every test commits through
+///     consensus. The SDK frames TCP with the VSR wire protocol, which only server-ng speaks.
+/// </summary>
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
     private readonly string _containerId = Guid.NewGuid().ToString();
-    protected IContainer? IggyContainer;
+    private readonly SemaphoreSlim _startGate = new(1, 1);
+
+    private VsrCluster? _cluster;
 
     /// <summary>
     ///     Docker image to use. Can be overridden via IGGY_SERVER_DOCKER_IMAGE environment variable
-    ///     or by subclasses. Defaults to apache/iggy:edge if not specified.
+    ///     or by subclasses. Defaults to the locally built <c>iggy-server:test</c>; build it with
+    ///     <c>docker build -f core/server-ng/Dockerfile -t iggy-server:test .</c> from the repository root.
     /// </summary>
-    private string DockerImage =>
-        Environment.GetEnvironmentVariable("IGGY_SERVER_DOCKER_IMAGE") ?? "apache/iggy:edge";
+    protected virtual string DockerImage =>
+        Environment.GetEnvironmentVariable("IGGY_SERVER_DOCKER_IMAGE") ?? "iggy-server:test";
 
     /// <summary>
-    ///     Environment variables for the container. Override in subclasses to customize.
+    ///     Names the containers and network of this fixture's cluster, so a `docker ps` during a run
+    ///     shows which fixture owns which node.
     /// </summary>
-    protected virtual Dictionary<string, string> EnvironmentVariables => new()
-    {
-        { "IGGY_ROOT_USERNAME", "iggy" },
-        { "IGGY_ROOT_PASSWORD", "iggy" },
-        { "IGGY_TCP_ADDRESS", "0.0.0.0:8090" },
-        { "IGGY_HTTP_ADDRESS", "0.0.0.0:3000" },
-        { "IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", "10m" }
-    };
+    protected virtual string ClusterName => "general";
 
     /// <summary>
     ///     Enables iggy server trace logs.
@@ -57,159 +57,85 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected bool EnabledServerTraceLogs => true;
 
     /// <summary>
-    ///     Resource mappings (volumes, etc.) for the container. Override in subclasses to add custom mappings.
+    ///     Extra environment variables for every node, layered over the cluster's base configuration.
+    ///     Override in subclasses to customize.
+    /// </summary>
+    protected virtual Dictionary<string, string> EnvironmentVariables => [];
+
+    /// <summary>
+    ///     Resource mappings (certificates, etc.) mounted into every node. Override in subclasses.
     /// </summary>
     protected virtual ResourceMapping[] ResourceMappings => [];
 
     /// <summary>
-    ///     Directory for container log files. Set via IGGY_TEST_LOGS_DIR environment variable.
-    ///     If not set, container logs will not be saved to file.
+    ///     Cluster size, mirroring the Rust integration harness knob of the same name: the
+    ///     IGGY_TEST_CLUSTER_NODES environment variable decides (default 1, a standalone node with
+    ///     clustering disabled; 2 or more, a replicated cluster). A subclass can pin its own size
+    ///     instead, the way the redirection cluster stays three nodes whatever the knob says.
     /// </summary>
-    private static string? LogDirectory =>
-        Environment.GetEnvironmentVariable("IGGY_TEST_LOGS_DIR");
-
-    public IggyServerFixture()
-    {
-        var builder = new ContainerBuilder(DockerImage)
-            .WithPortBinding(3000, true)
-            .WithPortBinding(8090, true)
-            .WithWaitStrategy(Wait.ForUnixContainer()
-                .UntilInternalTcpPortIsAvailable(8090)
-                .UntilHttpRequestIsSucceeded(request => request
-                    .ForPort(3000)
-                    .ForPath("/ping")))
-            .WithName(_containerId)
-            .WithPrivileged(true)
-            .WithCleanUp(true);
-
-        foreach (var (key, value) in EnvironmentVariables)
-        {
-            builder = builder.WithEnvironment(key, value);
-        }
-
-        if (EnabledServerTraceLogs)
-        {
-            builder = builder
-                .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
-                .WithEnvironment("RUST_LOG", "trace");
-        }
-
-        foreach (var mapping in ResourceMappings)
-        {
-            builder = builder.WithResourceMapping(mapping.Source, mapping.Destination);
-        }
-
-        IggyContainer = builder.Build();
-    }
+    protected virtual int NodeCount =>
+        int.TryParse(Environment.GetEnvironmentVariable("IGGY_TEST_CLUSTER_NODES"), out var count) && count >= 1
+            ? count
+            : 1;
 
     public async ValueTask DisposeAsync()
     {
-        if (IggyContainer == null)
+        if (_cluster != null)
         {
-            return;
+            await _cluster.DisposeAsync();
         }
-
-        await SaveContainerLogsAsync();
-        await IggyContainer.StopAsync();
     }
 
-    public virtual async Task InitializeAsync()
+    /// <summary>
+    ///     The cluster starts on first use, so a run that never dials the server does not pay for it.
+    /// </summary>
+    public Task InitializeAsync()
     {
-        await IggyContainer!.StartAsync();
-
-        await CreateTcpClient();
-        await CreateHttpClient();
+        return Task.CompletedTask;
     }
 
-    private async Task SaveContainerLogsAsync()
-    {
-        if (string.IsNullOrEmpty(LogDirectory))
-        {
-            return;
-        }
-
-        try
-        {
-            Directory.CreateDirectory(LogDirectory);
-            var dotnetVersion = $"net{Environment.Version.Major}.{Environment.Version.Minor}";
-            var logFilePath = Path.Combine(LogDirectory, $"iggy-server-{dotnetVersion}-{_containerId}.log");
-
-            var (stdout, stderr) = await IggyContainer!.GetLogsAsync();
-
-            await using var writer = new StreamWriter(logFilePath);
-            if (!string.IsNullOrEmpty(stdout))
-            {
-                await writer.WriteLineAsync("=== STDOUT ===");
-                await writer.WriteLineAsync(stdout);
-            }
-
-            if (!string.IsNullOrEmpty(stderr))
-            {
-                await writer.WriteLineAsync("=== STDERR ===");
-                await writer.WriteLineAsync(stderr);
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to save container logs: {ex.Message}");
-        }
-    }
-
-    public async Task<Dictionary<Protocol, IIggyClient>> CreateClients()
-    {
-        var dictionary = new Dictionary<Protocol, IIggyClient>();
-        dictionary[Protocol.Tcp] = await CreateTcpClient();
-        dictionary[Protocol.Http] = await CreateHttpClient();
-
-        return dictionary;
-    }
-
+    /// <summary>
+    ///     Under VSR the register handshake is the login, so auto-login on top of the explicit one would register
+    ///     twice on the same connection: the server answers the second one by replaying the binding it already
+    ///     holds, and the client then carries a client id the server never bound, which consumer-group
+    ///     membership is keyed by.
+    /// </summary>
     public async Task<IIggyClient> CreateAuthenticatedClient(Protocol protocol, string userName = "iggy",
-        string password = "iggy")
+        string password = "iggy", IMessageEncryptor? encryptor = null)
     {
-        return protocol == Protocol.Tcp
-            ? await CreateTcpClient(userName, password)
-            : await CreateHttpClient(userName, password);
-    }
-
-    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy",
-        bool connect = true, IMessageEncryptor? encryptor = null)
-    {
-        var client = await CreateClient(Protocol.Tcp, connect: connect, encryptor: encryptor);
-
-        if (connect)
-        {
-            await client.LoginUserAsync(userName, password);
-        }
-
-        return client;
-    }
-
-    public async Task<IIggyClient> CreateHttpClient(string userName = "iggy", string password = "iggy",
-        IMessageEncryptor? encryptor = null)
-    {
-        var client = await CreateClient(Protocol.Http, encryptor: encryptor);
-
+        var client = await CreateClient(protocol, protocol == Protocol.Http,
+            encryptor: encryptor, userName: userName, password: password);
         await client.LoginUserAsync(userName, password);
 
         return client;
     }
 
-    public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null,
-        bool connect = true, IMessageEncryptor? encryptor = null)
+    /// <summary>
+    ///     A connected client that has not logged in, so the caller owns the handshake.
+    /// </summary>
+    public async Task<IIggyClient> CreateUnauthenticatedClient(Protocol protocol)
     {
-        var address = GetIggyAddress(protocol);
+        return await CreateClient(protocol);
+    }
 
+    /// <summary>
+    ///     <paramref name="address" /> overrides the cluster address, so a test can dial the server through a
+    ///     proxy while keeping the rest of the configuration identical.
+    /// </summary>
+    public async Task<IIggyClient> CreateClient(Protocol protocol, bool autoLogin = false, bool connect = true,
+        IMessageEncryptor? encryptor = null, string? address = null, string userName = "iggy",
+        string password = "iggy")
+    {
         var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = address,
+            BaseAddress = address ?? await GetIggyAddressAsync(protocol),
             Protocol = protocol,
             ReconnectionSettings = new ReconnectionSettings { Enabled = true },
             AutoLoginSettings = new AutoLoginSettings
             {
-                Enabled = true,
-                Username = "iggy",
-                Password = "iggy"
+                Enabled = autoLogin,
+                Username = userName,
+                Password = password
             },
             MessageEncryptor = encryptor
         });
@@ -222,20 +148,58 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return client;
     }
 
-    public virtual string GetIggyAddress(Protocol protocol)
+    public async Task<string> GetIggyAddressAsync(Protocol protocol)
     {
-        var port = protocol == Protocol.Tcp
-            ? IggyContainer!.GetMappedPublicPort(8090)
-            : IggyContainer!.GetMappedPublicPort(3000);
+        var cluster = await EnsureClusterStartedAsync();
 
-        return protocol == Protocol.Tcp
-            ? $"127.0.0.1:{port}"
-            : $"http://127.0.0.1:{port}";
+        return protocol == Protocol.Tcp ? cluster.LeaderTcpAddress : cluster.LeaderHttpAddress;
+    }
+
+    /// <summary>
+    ///     A backup node of the initial view, for tests that dial a follower and expect the client to be
+    ///     redirected to the primary.
+    /// </summary>
+    public async Task<string> GetFollowerTcpAddressAsync()
+    {
+        var cluster = await EnsureClusterStartedAsync();
+
+        return cluster.FollowerTcpAddress;
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()
     {
-        yield return () => Protocol.Http;
-        yield return () => Protocol.Tcp;
+        return [() => Protocol.Http, () => Protocol.Tcp];
+    }
+
+    private async Task<VsrCluster> EnsureClusterStartedAsync()
+    {
+        await _startGate.WaitAsync();
+        try
+        {
+            if (_cluster == null)
+            {
+                var cluster = new VsrCluster(DockerImage, ClusterName, _containerId,
+                    EnabledServerTraceLogs, NodeCount, EnvironmentVariables, ResourceMappings);
+                try
+                {
+                    await cluster.StartAsync();
+                }
+                catch
+                {
+                    // A later retry rebuilds the cluster under the same name, so a half-started one
+                    // must not leave its network or containers behind.
+                    await cluster.DisposeAsync();
+                    throw;
+                }
+
+                _cluster = cluster;
+            }
+
+            return _cluster;
+        }
+        finally
+        {
+            _startGate.Release();
+        }
     }
 }

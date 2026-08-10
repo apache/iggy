@@ -42,8 +42,7 @@ public class SegmentsTests
 
         // Deleting 0 segments should succeed without error (no-op)
         await Should.NotThrowAsync(() =>
-            client.DeleteSegmentsAsync(
-                Identifier.String(streamName),
+            client.DeleteSegmentsAsync(Identifier.String(streamName),
                 Identifier.String(topicName),
                 0, // partition_id (0-indexed)
                 0)); // segments_count = 0
@@ -62,8 +61,7 @@ public class SegmentsTests
         await client.CreateTopicAsync(Identifier.String(streamName), topicName, 1);
 
         await Should.ThrowAsync<FeatureUnavailableException>(() =>
-            client.DeleteSegmentsAsync(
-                Identifier.String(streamName),
+            client.DeleteSegmentsAsync(Identifier.String(streamName),
                 Identifier.String(topicName),
                 0,
                 0));
@@ -80,8 +78,7 @@ public class SegmentsTests
         await client.CreateStreamAsync(streamName);
 
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            client.DeleteSegmentsAsync(
-                Identifier.String(streamName),
+            client.DeleteSegmentsAsync(Identifier.String(streamName),
                 Identifier.String("non-existent-topic"),
                 0, // partition_id (0-indexed)
                 1)); // segments_count
@@ -95,8 +92,7 @@ public class SegmentsTests
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            client.DeleteSegmentsAsync(
-                Identifier.String($"nonexistent-stream-{Guid.NewGuid():N}"),
+            client.DeleteSegmentsAsync(Identifier.String($"nonexistent-stream-{Guid.NewGuid():N}"),
                 Identifier.String("any-topic"),
                 0, // partition_id (0-indexed)
                 1)); // segments_count
