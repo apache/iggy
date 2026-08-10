@@ -41,7 +41,6 @@ public final class ServerStatsCollector {
     public BenchmarkServerStats collect() {
         try (var client = IggyTcpClient.builder()
                 .credentials(globalCliArgs.username(), globalCliArgs.password())
-                .connectionPoolSize(1)
                 .buildAndLogin()) {
             Stats stats = client.system().getStats();
             Map<BenchmarkCacheMetricsKey, BenchmarkCacheMetrics> cacheMetrics = new HashMap<>();

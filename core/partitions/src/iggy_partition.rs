@@ -770,7 +770,24 @@ where
         self.offset.store(recovered_end, Ordering::Release);
         self.dirty_offset.store(recovered_end, Ordering::Relaxed);
         self.should_increment_offset = true;
-        self.stats.set_current_offset(recovered_end);
+    }
+
+    /// Copy this incarnation's offset counter into the shared
+    /// [`PartitionStats`], making it the value readers (offset validation,
+    /// `get_topic`, `get_stats`) see.
+    ///
+    /// Called from [`IggyPartitions::insert`](crate::IggyPartitions::insert)
+    /// only: when the instance BECOMES the addressable one, never while
+    /// building it. The stats registry keys on the namespace, not the
+    /// incarnation, so every build of a namespace holds the same `Arc` as
+    /// whatever is already serving it -- and a build is not guaranteed to be
+    /// adopted. Seeding from the build instead leaves a zeroed `current_offset`
+    /// on the live incarnation, which then rejects every
+    /// `store_consumer_offset` above 0 with `InvalidOffset` until the next send
+    /// re-seeds it.
+    pub(crate) fn publish_current_offset(&self) {
+        self.stats
+            .set_current_offset(self.offset.load(Ordering::Acquire));
     }
 
     /// The next message offset this replica will mint, `0` while the offset

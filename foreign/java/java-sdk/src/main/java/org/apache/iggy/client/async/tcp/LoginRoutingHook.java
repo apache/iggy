@@ -25,23 +25,20 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 /**
- * Runs after a successful login to redirect the client to the cluster
- * leader when it is connected to a follower.
+ * Routes a login to the cluster leader before executing its Register
+ * operation.
  */
 @FunctionalInterface
-interface LoginRedirectionHook {
+interface LoginRoutingHook {
 
-    LoginRedirectionHook NONE = reLogin -> CompletableFuture.completedFuture(null);
+    LoginRoutingHook NONE = loginAttempt -> loginAttempt.get();
 
     /**
-     * Checks the cluster roster and, while the current node is not the
-     * leader, retargets the connection and re-runs the login.
+     * Discovers and selects the current leader, then executes the supplied
+     * login exactly once against the selected connection.
      *
-     * @param reLogin replays the just-completed login against the current
-     * target; it must not trigger another redirection check itself, since
-     * the hook drives any further hops and serializes concurrent checks
-     * @return the redirected login's identity, or {@code null} when the client
-     * stays on the current node
+     * @param loginAttempt sends Register against the active connection
+     * @return the identity returned by the successful Register response
      */
-    CompletableFuture<IdentityInfo> afterLogin(Supplier<CompletableFuture<IdentityInfo>> reLogin);
+    CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt);
 }

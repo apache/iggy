@@ -27,6 +27,7 @@ import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.apache.iggy.cluster.TransportEndpoints;
 import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
@@ -38,6 +39,8 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.SendConfirmation;
+import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.Partition;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
@@ -74,6 +77,8 @@ import java.util.Optional;
  */
 public final class BytesDeserializer {
 
+    private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
+    private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
     private static final int MIN_CLUSTER_NODE_BYTES = 18;
 
     private BytesDeserializer() {}
@@ -177,11 +182,50 @@ public final class BytesDeserializer {
         return new ConsumerGroup(groupId, name, partitionsCount, membersCount);
     }
 
+    public static ConsumerGroupAssignment readConsumerGroupAssignment(ByteBuf response) {
+        // The generation is a monotonic rebalance counter compared only for
+        // equality, so reading the u64 as a signed long is safe.
+        var generation = response.readLongLE();
+        var partitionsCount = response.readUnsignedIntLE();
+        int capacity = validatedCollectionSize(
+                partitionsCount,
+                response.readableBytes(),
+                CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES,
+                "Consumer group partitions count");
+        List<Long> partitions = new ArrayList<>(capacity);
+        for (long i = 0; i < partitionsCount; i++) {
+            partitions.add(response.readUnsignedIntLE());
+        }
+        return new ConsumerGroupAssignment(generation, partitions);
+    }
+
     public static ConsumerOffsetInfo readConsumerOffsetInfo(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
         var storedOffset = readU64AsBigInteger(response);
         return new ConsumerOffsetInfo(partitionId, currentOffset, storedOffset);
+    }
+
+    public static SendMessagesResponse readSendMessagesResponse(ByteBuf response) {
+        if (!response.isReadable()) {
+            return SendMessagesResponse.empty();
+        }
+        var confirmationsCount = response.readUnsignedIntLE();
+        int capacity = validatedCollectionSize(
+                confirmationsCount, response.readableBytes(), SEND_CONFIRMATION_BYTES, "Send confirmations count");
+        var confirmations = new ArrayList<SendConfirmation>(capacity);
+        for (long i = 0; i < confirmationsCount; i++) {
+            var streamId = response.readUnsignedIntLE();
+            var topicId = response.readUnsignedIntLE();
+            var partitionId = response.readUnsignedIntLE();
+            var baseOffset = readU64AsBigInteger(response);
+            confirmations.add(new SendConfirmation(streamId, topicId, partitionId, baseOffset));
+        }
+        if (response.isReadable()) {
+            throw new IggyMalformedResponseException(
+                    "send messages response has " + response.readableBytes() + " trailing bytes");
+        }
+        return new SendMessagesResponse(confirmations);
     }
 
     public static PolledMessages readPolledMessages(ByteBuf response) {
@@ -493,6 +537,14 @@ public final class BytesDeserializer {
                     + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
         }
         return buffer.readCharSequence(toInt(length), StandardCharsets.UTF_8).toString();
+    }
+
+    private static int validatedCollectionSize(long count, int readableBytes, int entryBytes, String field) {
+        if (count > readableBytes / entryBytes) {
+            throw new IggyMalformedResponseException(
+                    field + " " + count + " exceeds remaining payload of " + readableBytes + " bytes");
+        }
+        return Math.toIntExact(count);
     }
 
     static BigInteger readU64AsBigInteger(ByteBuf buffer) {

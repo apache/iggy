@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Diagnostics;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
@@ -211,7 +212,7 @@ public class SendUnitTests
     public async Task Processor_DrainStaysPending_UntilSendCompletes()
     {
         // Gate the send so the unit is in flight; the drain must not complete mid-flight.
-        var gate = new TaskCompletionSource();
+        var gate = new TaskCompletionSource<SendMessagesResponse>();
         var client = new Mock<IIggyClient>();
         client.Setup(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
@@ -229,7 +230,7 @@ public class SendUnitTests
         await Task.Delay(100, TestContext.Current.CancellationToken);
         Assert.False(drain.IsCompleted);
 
-        gate.SetResult();
+        gate.SetResult(new SendMessagesResponse { Confirmations = [] });
         await drain.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
     }
 
@@ -238,7 +239,7 @@ public class SendUnitTests
         var client = new Mock<IIggyClient>();
         client.Setup(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask)
+            .ReturnsAsync(new SendMessagesResponse { Confirmations = [] })
             .Callback((Identifier _, Identifier _, Partitioning _, IList<Message> messages, CancellationToken _) =>
                 sentCounts.Add(messages.Count));
         return client;

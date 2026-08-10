@@ -84,6 +84,13 @@ runs:
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
+      with:
+        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-java-data
 
     - name: Test
       if: inputs.task == 'test'
@@ -151,9 +158,14 @@ runs:
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
+        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        wait-timeout-seconds: "90"
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-java-tls-data
         IGGY_TCP_TLS_ENABLED: "true"
         IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
         IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem

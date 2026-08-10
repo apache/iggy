@@ -20,6 +20,8 @@
 package org.apache.iggy.client.async.tcp;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
@@ -72,9 +74,10 @@ public final class AsyncIggyTcpClientBuilder {
     private File tlsCertificate;
     private Duration connectionTimeout;
     private Duration requestTimeout;
-    private Integer connectionPoolSize;
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
+    private Duration heartbeatInterval = Duration.ofSeconds(5);
+    private long maxVsrFrameSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE;
 
     public AsyncIggyTcpClientBuilder() {}
 
@@ -169,6 +172,29 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Sets how often the client sends a heartbeat while connected. The value
+     * should not exceed the server's configured heartbeat interval.
+     *
+     * @param heartbeatInterval the heartbeat interval
+     * @return this builder
+     */
+    public AsyncIggyTcpClientBuilder heartbeatInterval(Duration heartbeatInterval) {
+        this.heartbeatInterval = heartbeatInterval;
+        return this;
+    }
+
+    /**
+     * Sets the largest inbound VSR frame the client will buffer.
+     *
+     * @param maxVsrFrameSize maximum frame size in bytes, including the VSR header
+     * @return this builder
+     */
+    public AsyncIggyTcpClientBuilder maxVsrFrameSize(long maxVsrFrameSize) {
+        this.maxVsrFrameSize = maxVsrFrameSize;
+        return this;
+    }
+
+    /**
      * Sets the connection timeout.
      *
      * @param connectionTimeout the connection timeout duration
@@ -187,17 +213,6 @@ public final class AsyncIggyTcpClientBuilder {
      */
     public AsyncIggyTcpClientBuilder requestTimeout(Duration requestTimeout) {
         this.requestTimeout = requestTimeout;
-        return this;
-    }
-
-    /**
-     * Sets the connection pool size.
-     *
-     * @param connectionPoolSize the connection pool size
-     * @return this builder
-     */
-    public AsyncIggyTcpClientBuilder connectionPoolSize(Integer connectionPoolSize) {
-        this.connectionPoolSize = connectionPoolSize;
         return this;
     }
 
@@ -222,9 +237,11 @@ public final class AsyncIggyTcpClientBuilder {
     public AsyncIggyTcpClient build() {
         validateHost();
         validatePort();
-        validateConnectionPoolSize();
         validateConnectionTimeout();
         validateAcquireTimeout();
+        validateRequestTimeout();
+        validateHeartbeatInterval();
+        validateMaxVsrFrameSize();
 
         return new AsyncIggyTcpClient(
                 host,
@@ -234,7 +251,8 @@ public final class AsyncIggyTcpClientBuilder {
                 connectionTimeout,
                 acquireTimeout,
                 requestTimeout,
-                connectionPoolSize,
+                heartbeatInterval,
+                (int) maxVsrFrameSize,
                 retryPolicy,
                 enableTls,
                 Optional.ofNullable(tlsCertificate));
@@ -249,12 +267,6 @@ public final class AsyncIggyTcpClientBuilder {
     private void validatePort() {
         if (port == null || port <= 0) {
             throw new IggyInvalidArgumentException("Port must be a positive integer");
-        }
-    }
-
-    private void validateConnectionPoolSize() {
-        if (connectionPoolSize != null && connectionPoolSize <= 0) {
-            throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
         }
     }
 
@@ -274,6 +286,25 @@ public final class AsyncIggyTcpClientBuilder {
     private void validateAcquireTimeout() {
         if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
             throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
+        }
+    }
+
+    private void validateRequestTimeout() {
+        if (requestTimeout != null && (requestTimeout.equals(Duration.ZERO) || requestTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("RequestTimeout Cannot be 0 or Negative");
+        }
+    }
+
+    private void validateHeartbeatInterval() {
+        if (heartbeatInterval == null || heartbeatInterval.isZero() || heartbeatInterval.isNegative()) {
+            throw new IggyInvalidArgumentException("HeartbeatInterval Cannot be null, 0 or Negative");
+        }
+    }
+
+    private void validateMaxVsrFrameSize() {
+        if (maxVsrFrameSize < VsrHeaders.HEADER_SIZE || maxVsrFrameSize > Integer.MAX_VALUE) {
+            throw new IggyInvalidArgumentException("MaxVsrFrameSize must be between " + VsrHeaders.HEADER_SIZE + " and "
+                    + Integer.MAX_VALUE + " bytes");
         }
     }
 

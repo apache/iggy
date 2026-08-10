@@ -38,6 +38,12 @@ public sealed class IggyClientConfigurator
     public required Protocol Protocol { get; set; }
 
     /// <summary>
+    ///     The largest response frame accepted over <see cref="Enums.Protocol.Tcp" />, in bytes.
+    ///     Default is 64 MiB, minimum is the 256-byte header.
+    /// </summary>
+    public int MaxResponseFrameSize { get; set; } = 64 * 1024 * 1024;
+
+    /// <summary>
     ///     The size of the receive buffer in bytes. Default is 4096.
     /// </summary>
     public int ReceiveBufferSize { get; set; } = 4096;
