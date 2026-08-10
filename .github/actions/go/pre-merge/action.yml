@@ -215,54 +215,11 @@ runs:
         pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
         log-file: ${{ steps.iggy-tls.outputs.log_file }}
 
-    # `replica_count` is the roster length, and a two-replica cluster commits on
-    # two acks, so the shipped two-node roster would leave this lone node
-    # journalling every op and committing none. The roster itself has to stay as
-    # shipped (the Node VSR lane starts both of its replicas against it), so
-    # trim a copy instead: one node means a replication quorum of one.
-    - name: Build a single-node cluster config
-      id: iggy-cluster-config
-      if: inputs.task == 'e2e'
-      shell: bash
-      env:
-        CONFIG_OUT: ${{ runner.temp }}/iggy-go-cluster-config.toml
-      run: |
-        set -euo pipefail
-        python3 - "core/server-ng/config.toml" "$CONFIG_OUT" <<'PY'
-        import sys
-
-        src, dst = sys.argv[1], sys.argv[2]
-        lines = open(src).read().splitlines(keepends=True)
-
-        # A node block runs from its [[cluster.nodes]] line to the line before the
-        # next top-level table.
-        starts = [i for i, line in enumerate(lines) if line.strip() == "[[cluster.nodes]]"]
-        kept, dropped = [], []
-        for start in starts:
-            end = next(
-                (i for i in range(start + 1, len(lines)) if lines[i].startswith("[")),
-                len(lines),
-            )
-            body = "".join(lines[start:end])
-            (kept if "replica_id = 0" in body else dropped).append((start, end))
-
-        # Loud rather than silent: a reshaped roster that quietly matched nothing
-        # would hand the tests back the uncommittable cluster this exists to avoid.
-        if len(kept) != 1 or not dropped:
-            sys.exit(
-                f"{src}: expected one replica_id = 0 node and at least one other, "
-                f"found kept={len(kept)} dropped={len(dropped)}"
-            )
-
-        drop = {i for start, end in dropped for i in range(start, end)}
-        open(dst, "w").write(
-            "".join(line for i, line in enumerate(lines) if i not in drop)
-        )
-        print(f"{dst}: kept 1 node, dropped {len(dropped)}")
-        PY
-        echo "path=$CONFIG_OUT" >> "$GITHUB_OUTPUT"
-
-    - name: Start Iggy VSR cluster node
+    # Both replicas of the roster in `core/server-ng/config.toml`, not just this
+    # one: a two-replica cluster commits on 2 acks (`quorum_replication`), so a
+    # lone node journals every op and commits none, and each client request
+    # blocks until it times out.
+    - name: Start Iggy VSR cluster node 0
       id: iggy-cluster-0
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
@@ -276,8 +233,24 @@ runs:
         wait-timeout-seconds: "90"
       env:
         IGGY_CLUSTER_ENABLED: "true"
-        IGGY_CONFIG_PATH: ${{ steps.iggy-cluster-config.outputs.path }}
         IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-go-cluster-0-data
+
+    - name: Start Iggy VSR cluster node 1
+      id: iggy-cluster-1
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
+        replica-id: "1"
+        tcp_address: 127.0.0.1:8091
+        http_address: 127.0.0.1:3001
+        pid-file: ${{ runner.temp }}/iggy-go-cluster-1.pid
+        log-file: ${{ runner.temp }}/iggy-go-cluster-1.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-go-cluster-1-data
 
     - name: Run cluster e2e tests
       shell: bash
@@ -285,11 +258,18 @@ runs:
       env:
         IGGY_TCP_ADDRESS: 127.0.0.1:8090
       run: |
-        echo "🗳️ Running Go e2e tests against a single-node cluster..."
+        echo "🗳️ Running Go e2e tests against a two-node cluster..."
         cd foreign/go
         go test -v -race ./tests/...
 
-    - name: Stop Iggy VSR cluster node
+    - name: Stop Iggy VSR cluster node 1
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-1.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-1.outputs.log_file }}
+
+    - name: Stop Iggy VSR cluster node 0
       if: always() && inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-stop
       with:
@@ -305,4 +285,5 @@ runs:
           ${{ steps.iggy.outputs.log_file }}
           ${{ steps.iggy-tls.outputs.log_file }}
           ${{ steps.iggy-cluster-0.outputs.log_file }}
+          ${{ steps.iggy-cluster-1.outputs.log_file }}
         if-no-files-found: ignore
