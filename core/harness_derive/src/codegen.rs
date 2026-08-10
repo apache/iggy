@@ -125,8 +125,8 @@ fn generate_variants(attrs: &IggyTestAttrs) -> Vec<TestVariant> {
 }
 
 /// No transport is gated out of the VSR test matrix. Retained as the single
-/// seam where a transport could be excluded from `--features vsr` if one is
-/// ever unsupported by the next-gen server again.
+/// seam where a transport could be excluded from the matrix if the server
+/// ever drops support for one again.
 fn vsr_transport_cfg(_transport: Transport) -> TokenStream {
     quote!()
 }

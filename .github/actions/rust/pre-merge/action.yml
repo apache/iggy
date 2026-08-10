@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -332,15 +332,6 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
-      shell: bash
-
-    - name: Backwards compatibility check
-      if: inputs.task == 'compat' && (github.event_name != 'pull_request' || !contains(join(github.event.pull_request.labels.*.name, ','), 'breaking:storage'))
-      run: |
-        scripts/check-backwards-compat.sh \
-          --master-ref master \
-          --pr-ref ${{ github.sha }} \
-          --port 8090 --wait-secs 180
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /

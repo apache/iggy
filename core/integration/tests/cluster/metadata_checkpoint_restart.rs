@@ -45,8 +45,6 @@
 //! the `forced checkpoint completed` markers below pin it rather than trust
 //! it.
 
-#![cfg(feature = "vsr")]
-
 use super::client_table_restart::{
     commit_request, create_stream_payload, register, resume_request, tcp_addr, tcp_addrs,
 };
@@ -329,7 +327,7 @@ async fn wait_for_stream(harness: &TestHarness, stream: &str) -> IggyClient {
 }
 
 // Metadata checkpoint-fold recovery across a solo restart, over
-// `iggy-server-ng`'s production snapshot and WAL path.
+// `iggy-server`'s production snapshot and WAL path.
 //
 // Between checkpoints a replica recovers its metadata by replaying the WAL. Once the
 // WAL fills, the `SnapshotCoordinator` checkpoints: it persists `snapshot.bin`, pairs

@@ -179,23 +179,19 @@ run_language_examples() {
 
 # shellcheck disable=SC2329
 run_rust_examples() {
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
-    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
+    resolve_server_binary "${TARGET}" "iggy-server"
     resolve_cli_binary "${TARGET}"
 
     # The README documents credentials as <iggy_username>/<iggy_password>
     # placeholders; the test server starts with iggy/iggy. The README keeps
-    # plain cargo run commands, but the CLI and examples must be vsr-built
-    # to speak the VSR server's wire protocol, so the feature is injected
-    # here.
+    # plain cargo run commands, so the cross-compile target is injected here.
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} --features vsr |g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
         }
     else
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --features vsr |g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
         }
     fi
 
@@ -223,9 +219,7 @@ run_rust_examples() {
 # shellcheck disable=SC2329
 run_node_examples() {
     # The Node SDK is vsr-only, so examples run against the vsr server.
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
-    resolve_server_binary "${TARGET}" iggy-server-ng
+    resolve_server_binary "${TARGET}" iggy-server
 
     export DEBUG=iggy:examples
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
@@ -244,8 +238,7 @@ run_node_examples() {
 # shellcheck disable=SC2329
 run_go_examples() {
     # The Go SDK speaks only the VSR wire protocol.
-    # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
+    resolve_server_binary "${TARGET}" "iggy-server"
     # The VSR server logs no startup line, so readiness is a connect poll.
     SERVER_READY_PROBE="tcp"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
@@ -265,12 +258,10 @@ run_go_examples() {
 
 # shellcheck disable=SC2329
 run_python_examples() {
-    # Python wheels are vsr-built, so examples run against the vsr
-    # server. It takes no --fresh flag; cleanup_server_state wiping
-    # local_data is the fresh start.
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
-    resolve_server_binary "${TARGET}" iggy-server-ng
+    # The Python SDK speaks only the VSR wire protocol, so examples run
+    # against the VSR server. It takes no --fresh flag; cleanup_server_state
+    # wiping local_data is the fresh start.
+    resolve_server_binary "${TARGET}" iggy-server
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     echo ""
@@ -319,12 +310,10 @@ run_python_examples() {
 
 # shellcheck disable=SC2329
 run_php_examples() {
-    # The PHP extension is vsr-built, so examples run against the vsr server.
-    # It takes no --fresh flag; cleanup_server_state wiping local_data is the
-    # fresh start.
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
-    resolve_server_binary "${TARGET}" iggy-server-ng
+    # The PHP extension speaks only the VSR wire protocol, so examples run
+    # against the VSR server. It takes no --fresh flag; cleanup_server_state
+    # wiping local_data is the fresh start.
+    resolve_server_binary "${TARGET}" iggy-server
 
     local php_bin="${PHP:-php}"
     if [ -z "${PHP_IGGY_EXTENSION:-}" ]; then
@@ -366,8 +355,7 @@ run_php_examples() {
 # shellcheck disable=SC2329
 run_java_examples() {
     # Java examples run against the VSR server.
-    # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
+    resolve_server_binary "${TARGET}" "iggy-server"
     SERVER_READY_PATTERN="client listeners started"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
@@ -384,12 +372,10 @@ run_java_examples() {
 
 # shellcheck disable=SC2329
 run_csharp_examples() {
-    # The .NET SDK is vsr-built, so examples run against the vsr server.
-    # It takes no --fresh flag; cleanup_server_state wiping local_data is
-    # the fresh start.
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
-    resolve_server_binary "${TARGET}" iggy-server-ng
+    # The .NET SDK speaks only the VSR wire protocol, so examples run against
+    # the VSR server. It takes no --fresh flag; cleanup_server_state wiping
+    # local_data is the fresh start.
+    resolve_server_binary "${TARGET}" iggy-server
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \

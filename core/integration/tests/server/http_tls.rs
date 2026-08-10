@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! End-to-end HTTPS proof for the server-ng shard-0 REST listener. The TLS
-//! accept pump ([`server_ng::http::tls`]) and the `start()` HTTPS branch
+//! End-to-end HTTPS proof for the server shard-0 REST listener. The TLS
+//! accept pump ([`server::http::tls`]) and the `start()` HTTPS branch
 //! unit-test in isolation; this is the only path that drives a live rustls
 //! client over the wire and proves the response was actually served over
 //! HTTP/2, negotiated via ALPN. A failure here (h1 fallback, handshake
@@ -71,7 +71,7 @@ fn cert_asset(file: &str) -> PathBuf {
         .unwrap_or_else(|error| panic!("canonicalize repo cert asset {file}: {error}"))
 }
 
-/// Boot an iggy-server-ng cluster with `[http.tls]` enabled against the repo
+/// Boot an iggy-server cluster with `[http.tls]` enabled against the repo
 /// loopback cert, then prove a real HTTPS request is served over HTTP/2. Two
 /// nodes rather than one because the `/cluster/metadata` assertion below
 /// needs an enabled cluster roster (a single-node harness runs with the
@@ -113,7 +113,7 @@ async fn given_http_tls_enabled_when_pinging_should_serve_https_over_http2() {
     harness
         .start()
         .await
-        .expect("start server-ng cluster with HTTPS enabled");
+        .expect("start the server cluster with HTTPS enabled");
 
     let addr = harness
         .server()

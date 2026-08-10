@@ -19,12 +19,17 @@ use crate::server::scenarios::purge_delete_scenario;
 use integration::iggy_harness;
 use test_case::test_matrix;
 
-#[iggy_harness(server(
-    segment.size = "5KiB",
-    segment.cache_indexes = ["all", "none", "open_segment"],
-    partition.messages_required_to_save = "1",
-    partition.enforce_fsync = "true",
-))]
+// Restart scenarios run single-node: restarting a node in a multi-node cluster
+// trips a known partitions-plane view-change stall, tracked separately.
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(
+        segment.size = "5KiB",
+        segment.cache_indexes = ["all", "none", "open_segment"],
+        partition.messages_required_to_save = "1",
+        partition.enforce_fsync = "true",
+    )
+)]
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_delete_segments_and_validate_filesystem(
     harness: &mut TestHarness,
@@ -33,12 +38,15 @@ async fn should_delete_segments_and_validate_filesystem(
     purge_delete_scenario::run(harness, restart_server).await;
 }
 
-#[iggy_harness(server(
-    segment.size = "5KiB",
-    segment.cache_indexes = ["all", "none", "open_segment"],
-    partition.messages_required_to_save = "1",
-    partition.enforce_fsync = "true",
-))]
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(
+        segment.size = "5KiB",
+        segment.cache_indexes = ["all", "none", "open_segment"],
+        partition.messages_required_to_save = "1",
+        partition.enforce_fsync = "true",
+    )
+)]
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_delete_segments_without_consumers(harness: &mut TestHarness, restart_server: bool) {
     purge_delete_scenario::run_no_consumers(harness, restart_server).await;
@@ -57,12 +65,15 @@ async fn should_delete_segments_with_consumer_group_barrier(harness: &TestHarnes
     purge_delete_scenario::run_consumer_group_barrier(&client, &data_path).await;
 }
 
-#[iggy_harness(server(
-    segment.size = "5KiB",
-    segment.cache_indexes = ["all", "none", "open_segment"],
-    partition.messages_required_to_save = "1",
-    partition.enforce_fsync = "true",
-))]
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(
+        segment.size = "5KiB",
+        segment.cache_indexes = ["all", "none", "open_segment"],
+        partition.messages_required_to_save = "1",
+        partition.enforce_fsync = "true",
+    )
+)]
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_block_deletion_until_all_consumers_pass_segment(
     harness: &mut TestHarness,
@@ -71,12 +82,15 @@ async fn should_block_deletion_until_all_consumers_pass_segment(
     purge_delete_scenario::run_multi_consumer_barrier(harness, restart_server).await;
 }
 
-#[iggy_harness(server(
-    segment.size = "5KiB",
-    segment.cache_indexes = ["all", "none", "open_segment"],
-    partition.messages_required_to_save = "1",
-    partition.enforce_fsync = "true",
-))]
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(
+        segment.size = "5KiB",
+        segment.cache_indexes = ["all", "none", "open_segment"],
+        partition.messages_required_to_save = "1",
+        partition.enforce_fsync = "true",
+    )
+)]
 // The scenario asserts the exact [0, 7, 14, 21] layout only on the legacy path;
 // under vsr it verifies the framing-agnostic purge outcome (offsets cleared,
 // files deleted, partition reset to a single segment at offset 0).

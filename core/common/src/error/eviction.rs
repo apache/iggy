@@ -17,7 +17,7 @@
 
 //! Shared grading of a wire [`EvictionReason`] to the typed [`IggyError`] an
 //! evicted session surfaces. The SDK's binary-transport Eviction-frame decoder
-//! (TCP / QUIC / WebSocket) and the server-ng HTTP write path both call this,
+//! (TCP / QUIC / WebSocket) and the server HTTP write path both call this,
 //! so every transport sees one status per reason.
 
 use iggy_binary_protocol::consensus::EvictionReason;
@@ -32,7 +32,7 @@ use super::iggy_error::IggyError;
 /// zero minimum or an inverted range), which also falls back to
 /// re-authentication.
 ///
-/// The two callers extract the fields differently - server-ng from an aligned
+/// The two callers extract the fields differently - the server from an aligned
 /// `EvictionHeader`, the SDK by wire offset off an unaligned buffer - then grade
 /// through here so the mappings cannot drift apart.
 #[must_use]

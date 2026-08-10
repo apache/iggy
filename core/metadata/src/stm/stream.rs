@@ -183,7 +183,7 @@ pub struct Topic {
     /// key (keyed by group id) can't be inherited by a recreated group.
     ///
     /// Ceiling: the partition-plane offset key is `u32`, so a group id must stay
-    /// within `u32::MAX` (the wire rewrite in `server-ng` clamps past-ceiling
+    /// within `u32::MAX` (the wire rewrite in `the server` clamps past-ceiling
     /// ids to `u32::MAX` rather than panic). ~4 billion group creates on a
     /// single topic is unreachable in practice, but the cap is real -- past it
     /// clamped wire ids all collide on `u32::MAX`, including with a live

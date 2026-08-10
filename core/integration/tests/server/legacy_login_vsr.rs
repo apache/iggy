@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Legacy login codes against server-ng (vsr). server-ng authenticates only
+//! Legacy login codes against the server (vsr). The server authenticates only
 //! through the Register handshake, so the pre-register `LOGIN_USER` (38) and
 //! `LOGIN_WITH_PERSONAL_ACCESS_TOKEN` (44) codes -- which the vsr SDK never
 //! emits (its typed login methods send the register codes, its raw path
@@ -26,8 +26,6 @@
 //! Since the SDK cannot send these codes, the frames are hand-crafted on a raw
 //! TCP socket: a header-only non-replicated frame carrying the code in the
 //! reserved command slot.
-
-#![cfg(feature = "vsr")]
 
 use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::codes::{LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE};

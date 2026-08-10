@@ -15,9 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Iggy leader + follower cluster test setup.
+# Iggy leader + follower cluster test setup: a real 2-node VSR cluster with
+# replica 0 as the initial leader.
 # Activated by: ./scripts/run-bdd-tests.sh <sdk> leader_redirection
 #               ./scripts/run-bdd-tests.sh <sdk> all
+#
+# Server constraints that shape this file:
+#   - the only CLI arg is `--replica-id <N>`; there is no `--fresh`,
+#     `--with-default-root-credentials` or `--follower`.
+#   - root credentials are mandatory once the cluster is enabled and come
+#     from IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD.
+#   - `cluster.nodes[*].ip` is parsed as a strict IpAddr (no hostnames) and
+#     cluster listeners bind to that roster IP, so nodes need static IPs and
+#     healthchecks must ping the roster address rather than loopback.
+#   - replica-to-replica consensus requires `ports.tcp_replica`.
 
 x-cluster-node: &cluster-node
   image: iggy-bdd-server
@@ -39,26 +50,34 @@ x-cluster-node: &cluster-node
     memlock:
       soft: -1
       hard: -1
-  networks:
-    - iggy-bdd-network
 
 x-cluster-topology: &cluster-topology
+  IGGY_ROOT_USERNAME: iggy
+  IGGY_ROOT_PASSWORD: iggy
   IGGY_CLUSTER_ENABLED: "true"
   IGGY_CLUSTER_NAME: test-cluster
   IGGY_CLUSTER_NODES_0_NAME: leader-node
-  IGGY_CLUSTER_NODES_0_IP: iggy-leader
+  IGGY_CLUSTER_NODES_0_IP: 172.28.0.101
   IGGY_CLUSTER_NODES_0_REPLICA_ID: "0"
   IGGY_CLUSTER_NODES_0_PORTS_TCP: "8091"
   IGGY_CLUSTER_NODES_0_PORTS_QUIC: "8081"
   IGGY_CLUSTER_NODES_0_PORTS_HTTP: "3001"
   IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET: "8071"
+  IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA: "8191"
   IGGY_CLUSTER_NODES_1_NAME: follower-node
-  IGGY_CLUSTER_NODES_1_IP: iggy-follower
+  IGGY_CLUSTER_NODES_1_IP: 172.28.0.102
   IGGY_CLUSTER_NODES_1_REPLICA_ID: "1"
   IGGY_CLUSTER_NODES_1_PORTS_TCP: "8092"
   IGGY_CLUSTER_NODES_1_PORTS_QUIC: "8082"
   IGGY_CLUSTER_NODES_1_PORTS_HTTP: "3002"
   IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET: "8072"
+  IGGY_CLUSTER_NODES_1_PORTS_TCP_REPLICA: "8192"
+  # http.enabled with cluster.enabled requires a JWT key every node can
+  # verify; cluster auth provides it (derived from the shared secret).
+  # Enabling auth activates follower-to-primary forwarding, so the config
+  # validator requires ports.http on every roster node.
+  IGGY_CLUSTER_AUTH_ENABLED: "true"
+  IGGY_CLUSTER_AUTH_SHARED_SECRET: "bdd-vsr-cluster-shared-secret-0123456789"
 
 x-cluster-bdd-deps: &cluster-bdd-deps
   depends_on:
@@ -73,9 +92,9 @@ x-cluster-bdd-deps: &cluster-bdd-deps
 services:
   iggy-leader:
     <<: *cluster-node
-    command: [ "--fresh", "--with-default-root-credentials", "--replica-id", "0" ]
+    command: [ "--replica-id", "0" ]
     healthcheck:
-      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8091", "ping" ]
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "172.28.0.101:8091", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -88,14 +107,17 @@ services:
       IGGY_HTTP_ADDRESS: 0.0.0.0:3001
       IGGY_QUIC_ADDRESS: 0.0.0.0:8081
       IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8071
+    networks:
+      iggy-bdd-network:
+        ipv4_address: 172.28.0.101
     volumes:
       - iggy_leader_data:/app/local_data_leader
 
   iggy-follower:
     <<: *cluster-node
-    command: [ "--fresh", "--with-default-root-credentials", "--follower", "--replica-id", "1" ]
+    command: [ "--replica-id", "1" ]
     healthcheck:
-      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8092", "ping" ]
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "172.28.0.102:8092", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -108,6 +130,9 @@ services:
       IGGY_HTTP_ADDRESS: 0.0.0.0:3002
       IGGY_QUIC_ADDRESS: 0.0.0.0:8082
       IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8072
+    networks:
+      iggy-bdd-network:
+        ipv4_address: 172.28.0.102
     volumes:
       - iggy_follower_data:/app/local_data_follower
 
@@ -122,6 +147,13 @@ services:
 
   java-bdd:
     <<: *cluster-bdd-deps
+
+networks:
+  iggy-bdd-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   iggy_leader_data:

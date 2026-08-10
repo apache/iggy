@@ -217,7 +217,7 @@ public class StreamsTests
 
         await Should.NotThrowAsync(() => client.PurgeStreamAsync(Identifier.String(streamName)));
 
-        // server-ng commits the purge by advancing a generation its reconciler acts on a tick later.
+        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
         stream = await Eventually.ReadAsync(() => client.GetStreamByIdAsync(Identifier.String(streamName)),
             purged => purged?.MessagesCount == 0, TimeSpan.FromSeconds(10));
         stream.ShouldNotBeNull();

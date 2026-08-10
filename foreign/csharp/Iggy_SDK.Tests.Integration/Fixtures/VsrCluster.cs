@@ -27,7 +27,7 @@ using DotNet.Testcontainers.Networks;
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 /// <summary>
-///     The iggy-server-ng deployment a run scoped to that server uses. A single node runs with
+///     The iggy-server deployment a run scoped to that server uses. A single node runs with
 ///     clustering disabled, exercising the wire protocol without replication; two or more nodes form
 ///     a real roster that puts every test through consensus.
 /// </summary>
@@ -119,11 +119,11 @@ internal sealed class VsrCluster : IAsyncDisposable
 
             try
             {
-                await SaveContainerLogsAsync(_containers[node]!, $"iggy-server-ng-{node}");
+                await SaveContainerLogsAsync(_containers[node]!, $"iggy-server-{node}");
             }
             catch (Exception e)
             {
-                Console.WriteLine($"Failed to save the logs of iggy-server-ng-{node}: {e}");
+                Console.WriteLine($"Failed to save the logs of iggy-server-{node}: {e}");
             }
         }
 
@@ -140,7 +140,7 @@ internal sealed class VsrCluster : IAsyncDisposable
             }
             catch (Exception e)
             {
-                Console.WriteLine($"Failed to dispose an iggy-server-ng container: {e}");
+                Console.WriteLine($"Failed to dispose an iggy-server container: {e}");
             }
         }
 
@@ -152,7 +152,7 @@ internal sealed class VsrCluster : IAsyncDisposable
             }
             catch (Exception e)
             {
-                Console.WriteLine($"Failed to delete the iggy-server-ng network: {e}");
+                Console.WriteLine($"Failed to delete the iggy-server network: {e}");
             }
         }
     }

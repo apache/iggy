@@ -115,16 +115,13 @@ jobs:
 
           # Every SDK speaks only the VSR wire protocol, so every lane runs
           # against the VSR server.
-          # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-          SERVER_BIN="iggy-server-ng"
-          echo "Building ${SERVER_BIN} (--features vsr)..."
-          cargo build --locked --bin "${SERVER_BIN}" --features vsr
+          SERVER_BIN="iggy-server"
+          echo "Building ${SERVER_BIN}..."
+          cargo build --locked --bin "${SERVER_BIN}"
 
-          # For Rust examples, also build CLI and example binaries; both must
-          # be vsr-built to speak the VSR server's wire protocol.
           if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
             echo "Building additional binaries for Rust examples..."
-            cargo build --locked --bin iggy --examples --features vsr
+            cargo build --locked --bin iggy --examples
           fi
 
           # Verify server binary was built (needed by all examples)

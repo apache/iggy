@@ -12,11 +12,10 @@ Iggy requires valid credentials to authenticate client requests. The examples as
 
 macOS/Linux:
 
-<!-- TODO: change to iggy-server once legacy server is removed (core/server has VSR support) -->
 ```bash
 export IGGY_ROOT_USERNAME=iggy
 export IGGY_ROOT_PASSWORD=iggy
-cargo run --bin iggy-server-ng --features vsr
+cargo run --bin iggy-server
 ```
 
 Windows(Powershell):
@@ -38,10 +37,9 @@ If the server has already been started once and your example returns `Error: Inv
 
 You can also customize the server using environment variables:
 
-<!-- TODO: change to iggy-server once legacy server is removed (core/server has VSR support) -->
 ```bash
 ## Example: set a custom TCP address
-IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server-ng --features vsr
+IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 ```
 
 ## Basic Examples
@@ -167,12 +165,11 @@ Demonstrates secure TLS-encrypted TCP connections:
 
 These examples require a TLS-enabled Iggy server. Start the server with:
 
-<!-- TODO: change to iggy-server once legacy server is removed (core/server has VSR support) -->
 ```bash
 IGGY_TCP_TLS_ENABLED=true \
 IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-cargo run --bin iggy-server-ng --features vsr
+cargo run --bin iggy-server
 ```
 
 Uses `IggyTcpClientBuilder` with TLS options (`enableTls`, `tlsDomain`, `tlsCaCertPath`) to establish TLS-encrypted TCP connections with CA certificate verification.

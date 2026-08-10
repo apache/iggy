@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Poll semantics against server-ng (vsr): a poll aimed at a partition id the
+//! Poll semantics against the server (vsr): a poll aimed at a partition id the
 //! topic does not have must surface a typed `PartitionNotFound`, not an empty
 //! poll a consumer would read as end-of-partition; a poll whose stream or
 //! topic does not resolve must surface the legacy `StreamIdNotFound` /
@@ -154,7 +154,7 @@ async fn given_missing_topic_when_polling_should_reject_topic_not_found(harness:
 /// `get_consumer_offset` answered an unknown partition with an empty body,
 /// which the SDK decodes as `None` - the same value a consumer that simply has
 /// no stored offset yet gets back, so a client could not tell a typo from a
-/// fresh consumer. Legacy swallows this one too; server-ng surfaces the code
+/// fresh consumer. Legacy swallows this one too; the server surfaces the code
 /// the poll path already surfaces for the identical addressing error.
 #[iggy_harness(
     test_client_transport = [Tcp],

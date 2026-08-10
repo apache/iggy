@@ -217,7 +217,7 @@ pub enum MetadataSubmit {
 
 /// Handler shard 0 runs for an inbound [`MetadataSubmit`].
 ///
-/// server-ng wires it to `submit_register_in_process` /
+/// The server wires it to `submit_register_in_process` /
 /// `submit_logout_in_process` / `submit_request_in_process` and sends the
 /// result back over the frame's `reply` sender. A peer shard (no consensus)
 /// must never receive this frame.
@@ -250,7 +250,7 @@ pub struct ConnectedClientInfo {
 }
 
 /// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
-/// server-ng wires it to read the shard's `SessionManager` and push its
+/// The server wires it to read the shard's `SessionManager` and push its
 /// connected clients back over the carried reply sender.
 pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
 
@@ -333,7 +333,7 @@ pub enum PartitionReadReply {
 }
 
 /// Handler the owning shard runs for an inbound
-/// [`LifecycleFrame::PartitionRead`]. server-ng wires it to its partitions
+/// [`LifecycleFrame::PartitionRead`]. The server wires it to its partitions
 /// plane; the handler pushes the result back over the carried reply sender.
 pub type PartitionReadHandler =
     Rc<dyn Fn(IggyNamespace, PartitionRead, Sender<PartitionReadReply>)>;
@@ -729,7 +729,7 @@ impl ShardFrame {
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
 ///
-/// Runtime default; server-ng overrides the live ceiling per shard from
+/// Runtime default; the server overrides the live ceiling per shard from
 /// `[cluster] repair_chunk_max` at bootstrap.
 pub const REPAIR_CHUNK_MAX: u64 = 128;
 
@@ -866,7 +866,7 @@ const SEGMENT_SIZE_CEILING_BYTES: u64 = 1 << 30;
 /// The most one segment can overshoot its size cap: rotation checks the cap
 /// AFTER appending, so a segment closes at most one maximum-size batch past it.
 ///
-/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: server-ng never
+/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: the server never
 /// enforces the latter (its only enforcement sites are the legacy server and the
 /// SDK batch types), so the largest appendable batch is whatever the message bus
 /// will frame. This tracks the shipped `message_bus.max_message_size` default; an
@@ -879,7 +879,7 @@ const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// Mirrors `[partition] transfer_artifact_bytes_max`. Free const so the config
 /// crate's copy can be pinned to it by a `const _: () = assert!(..)` at the
-/// server-ng build edge, the way every other runtime default is.
+/// server build edge, the way every other runtime default is.
 pub const PARTITION_ARTIFACT_LEN_DEFAULT: u64 =
     SEGMENT_SIZE_CEILING_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
 
@@ -1187,13 +1187,13 @@ where
     on_metadata_submit: MetadataSubmitHandler,
 
     /// Handler for inbound [`LifecycleFrame::ListClients`] broadcast
-    /// queries. Every shard receives these (not just shard 0); server-ng
+    /// queries. Every shard receives these (not just shard 0); the server
     /// wires it to its per-shard `SessionManager`. Defaults to a no-op for
     /// the simulator stub ctor.
     on_list_clients: ListClientsHandler,
 
     /// Handler for inbound [`LifecycleFrame::PartitionRead`] queries.
-    /// server-ng wires it to this shard's partitions plane. Defaults to a
+    /// The server wires it to this shard's partitions plane. Defaults to a
     /// no-op for the simulator stub ctor.
     on_partition_read: PartitionReadHandler,
 
@@ -1289,30 +1289,30 @@ where
     shard_park_shedding: Cell<bool>,
 
     /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
-    /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
+    /// to [`REPAIR_CHUNK_MAX`]; the server overrides it from
     /// `[cluster] repair_chunk_max` at bootstrap.
     repair_chunk_max: Cell<u64>,
 
     /// Live stalled-repair retry threshold in consensus ticks. Defaults to
-    /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
+    /// [`partitions::REPAIR_RETRY_TICKS`]; the server overrides it from
     /// `[cluster] repair_retry_interval` at bootstrap.
     repair_retry_ticks: Cell<u32>,
 
     /// Live `[partition] transfer_served_cache_bytes_max`: the byte budget for
     /// segment payloads this shard keeps resident to serve chunk requests.
-    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; server-ng
+    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; the server
     /// overrides it at bootstrap.
     served_segment_cache_bytes_max: Cell<u64>,
 
     /// Live `[partition] transfer_artifact_bytes_max`: the alloc ceiling for one
     /// RECEIVED artifact. Defaults to [`PARTITION_ARTIFACT_LEN_DEFAULT`];
-    /// server-ng overrides it at bootstrap.
+    /// the server overrides it at bootstrap.
     partition_artifact_len_max: Cell<u64>,
 
     /// Live `[message_bus] max_message_size`. Bounds a served state chunk: a
     /// frame above this is rejected by the RECEIVING transport, which tears
     /// down the whole replica connection. Defaults to a value that leaves
-    /// [`STATE_CHUNK_LEN`] usable; server-ng overrides it at bootstrap.
+    /// [`STATE_CHUNK_LEN`] usable; the server overrides it at bootstrap.
     bus_max_message_size: Cell<usize>,
 
     /// Consecutive metadata state-transfer rounds that made no progress.
@@ -3175,7 +3175,7 @@ where
     /// production runtime path; bootstrap recovery uses `load_partition`),
     /// so it must never run in production. VSR replica id comes from
     /// `PartitionConsensusConfig`, not `self.id` (the local shard index). A
-    /// `-p iggy-server-ng` build excludes the `simulator` feature and this
+    /// `-p iggy-server` build excludes the `simulator` feature and this
     /// method; `cargo build --workspace` compiles it in but with no
     /// production caller.
     /// `superblock` is this group's durable `(view, log_view)` store. Passing

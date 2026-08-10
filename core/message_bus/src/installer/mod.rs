@@ -109,7 +109,7 @@ pub trait ConnectionInstaller {
     /// handshake, then installs WS reader / writer tasks via
     /// [`install_client_ws`] on success. On handshake failure
     /// the fd is closed by dropping the wrapping `TcpStream`. No
-    /// subprotocol negotiation: the caller (server-ng) gates command
+    /// subprotocol negotiation: the caller (the server) gates command
     /// access via the LOGIN allowlist.
     fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
 

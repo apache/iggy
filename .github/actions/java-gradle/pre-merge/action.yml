@@ -85,9 +85,7 @@ runs:
       id: iggy
       uses: ./.github/actions/utils/server-start
       with:
-        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         wait-timeout-seconds: "90"
       env:
         IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-java-data
@@ -158,9 +156,7 @@ runs:
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
-        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         wait-timeout-seconds: "90"
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log

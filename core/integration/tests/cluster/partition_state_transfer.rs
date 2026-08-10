@@ -27,8 +27,6 @@
 //! `RangeEvicted`, the repaired window cannot connect to recovered state,
 //! and `complete_repair` returns the `FloorRefused` conversion trigger.
 
-#![cfg(feature = "vsr")]
-
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -40,7 +38,7 @@ use tokio::time::sleep;
 
 const STREAM_NAME: &str = "partition-transfer-stream";
 const TOPIC_NAME: &str = "partition-transfer-topic";
-/// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
+/// Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 /// Enough batches to push the evicted ring (capacity 64) well past the
 /// window a rejoiner could repair from op 1.
