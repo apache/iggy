@@ -31,7 +31,6 @@ runs:
       uses: ./.github/actions/utils/setup-cpp-with-cache
 
     - name: Setup Rust with cache
-      if: inputs.task != 'lint'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Install clang-format
@@ -60,6 +59,13 @@ runs:
 
         printf '%s\n' "${files[@]}" | xargs clang-format-18 --style=file --dry-run --Werror
 
+    - name: Lint (clippy)
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/cpp
+        cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+
     - name: Build
       if: inputs.task == 'build'
       shell: bash
@@ -77,6 +83,12 @@ runs:
     - name: Setup server for e2e tests
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
+      with:
+        # The C++ bindings are vsr-built, so e2e runs against the vsr server.
+        # TODO(hubcio): change to iggy-server once legacy server is removed
+        # (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
 
     - name: Run e2e tests
       if: inputs.task == 'e2e'

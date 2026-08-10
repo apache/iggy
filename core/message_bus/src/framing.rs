@@ -91,8 +91,12 @@ pub async fn write_message<S: AsyncWriteExt>(
 /// contexts (e.g. `select!`) must accept the resulting framing error
 /// and tear the connection down.
 ///
-/// See `tcp_tls::run_pump` rustdoc and TODO for the resumable-framing
-/// fix path.
+/// Every current caller is a non-cancellable context: the plaintext TCP
+/// reader loops with no `select!` (shutdown arrives via the `SHUT_RD`
+/// watchdog), QUIC reads one frame per dedicated bidi stream, and the
+/// replica handshake is sequential. A pump that must `select!` over the
+/// read instead uses its own resumable accumulator; see
+/// `transports::tcp_tls::run_pump` and its `TlsPumpState`.
 ///
 /// # Errors
 ///

@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -449,6 +450,20 @@ func (s leaderSteps) thenConnectWithoutRedirection(ctx context.Context) error {
 	return nil
 }
 
+// isSameEndpoint reports whether two addresses name the same host and port
+// once resolved. A hostname and the roster IP behind it compare equal.
+func isSameEndpoint(left, right string) (bool, error) {
+	resolvedLeft, err := net.ResolveTCPAddr("tcp", left)
+	if err != nil {
+		return false, fmt.Errorf("failed to resolve %s: %w", left, err)
+	}
+	resolvedRight, err := net.ResolveTCPAddr("tcp", right)
+	if err != nil {
+		return false, fmt.Errorf("failed to resolve %s: %w", right, err)
+	}
+	return resolvedLeft.IP.Equal(resolvedRight.IP) && resolvedLeft.Port == resolvedRight.Port, nil
+}
+
 func (s leaderSteps) thenBothUseSameServer(ctx context.Context) error {
 	c := getLeaderContext(ctx)
 
@@ -460,8 +475,17 @@ func (s leaderSteps) thenBothUseSameServer(ctx context.Context) error {
 	if !okB {
 		return errors.New("client B should exist")
 	}
-	if a.GetConnectionInfo().ServerAddress != b.GetConnectionInfo().ServerAddress {
-		return errors.New("both clients should be connected to the same server")
+	// A client that never redirected still holds the address it was given,
+	// while a redirected one holds the roster address the cluster published.
+	// Both name the same node, so they are compared once resolved.
+	sameServer, err := isSameEndpoint(
+		a.GetConnectionInfo().ServerAddress, b.GetConnectionInfo().ServerAddress)
+	if err != nil {
+		return err
+	}
+	if !sameServer {
+		return fmt.Errorf("both clients should be connected to the same server, got %s and %s",
+			a.GetConnectionInfo().ServerAddress, b.GetConnectionInfo().ServerAddress)
 	}
 	if err := a.Ping(ctx); err != nil {
 		return errors.New("client A should be able to ping")

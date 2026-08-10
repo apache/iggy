@@ -23,6 +23,8 @@ export {
   Partitioning,
   HeaderValue,
   HeaderKeyFactory,
+  type SendMessagesConfirmation,
+  type SendMessagesResponse,
 } from "./wire/index.js";
 
 export * from "./client/index.js";

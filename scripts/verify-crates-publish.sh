@@ -60,6 +60,7 @@ cp Cargo.toml "$CARGO_TOML_BACKUP"
 AUTO_INSTALL="${AUTO_INSTALL:-0}"
 
 # Ordered topologically: each crate depends only on the ones before it.
+# MUST be lowercase (crates-index path is derived from the name directly).
 CRATES=(
     iggy_binary_protocol
     iggy_common
@@ -84,6 +85,7 @@ cleanup() {
     if [[ "$CARGO_TOML_PATCHED" == "true" ]]; then
         log "Reverting Cargo.toml patch"
         cp "$CARGO_TOML_BACKUP" Cargo.toml
+        rm -f Cargo.toml.bak
     fi
     rm -f "$CARGO_TOML_BACKUP"
 
@@ -254,12 +256,13 @@ log "Patching workspace.dependencies to target local-dev"
 CARGO_TOML_PATCHED=true
 # Injects `, registry = "local-dev"` before the closing brace of the line.
 # Match by crate name + path + version so we do not touch unrelated entries.
-sed -i -E \
+sed -i.bak -E \
     -e 's|^(iggy_binary_protocol = \{ path = "[^"]+", version = "[^"]+")( \})$|\1, registry = "local-dev"\2|' \
     -e 's|^(iggy_common = \{ path = "[^"]+", version = "[^"]+")( \})$|\1, registry = "local-dev"\2|' \
     -e 's|^(iggy = \{ path = "[^"]+", version = "[^"]+")( \})$|\1, registry = "local-dev"\2|' \
     -e 's|^(iggy-cli = \{ path = "[^"]+", version = "[^"]+")( \})$|\1, registry = "local-dev"\2|' \
     Cargo.toml
+rm -f Cargo.toml.bak
 
 # Sanity check: all four lines must now carry the registry marker. This
 # catches formatting drift in Cargo.toml before it becomes a confusing
@@ -310,7 +313,7 @@ log "Verifying all four crates appear in the local registry"
 # Every published iggy crate is >=4 chars, so the shorter-name buckets
 # (1/, 2/, 3/<c>/) from the full layout are intentionally not handled.
 for crate in "${CRATES[@]}"; do
-    lc="${crate,,}"
+    lc="$crate"  # relies on CRATES entries being lowercase (see definition above)
     rel="${lc:0:2}/${lc:2:2}/$lc"
     if [[ ! -f "$REGISTRY_DIR/$rel" ]]; then
         err "Crate ${crate} missing from local registry (expected at $rel)"

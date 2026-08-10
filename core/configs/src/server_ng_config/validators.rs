@@ -26,6 +26,7 @@
 //! net.
 
 use super::COMPONENT_NG;
+use super::cluster::STATE_CHUNK_HEADER_LEN;
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
@@ -182,6 +183,34 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        // A received segment artifact can be one whole batch larger than the
+        // segment cap (rotation checks the cap AFTER appending), and the real
+        // batch bound is the BUS frame cap -- server-ng never enforces
+        // `MAX_PAYLOAD_SIZE`. An artifact ceiling under that floor refuses a
+        // legal segment, and the manifest check is all-or-nothing, so the
+        // partition livelocks re-requesting the same segment from every peer at
+        // the backoff ceiling. Caught here so it is a boot error rather than one
+        // partition that silently never rejoins.
+        let artifact_floor = self
+            .system
+            .segment
+            .size
+            .as_bytes_u64()
+            .saturating_add(self.message_bus.max_message_size.as_bytes_u64());
+        if self.partition.transfer_artifact_bytes_max.as_bytes_u64() < artifact_floor {
+            eprintln!(
+                "{COMPONENT_NG} partition.transfer_artifact_bytes_max ({} B) must be at least \
+                 system.segment.size ({} B) + message_bus.max_message_size ({} B) = \
+                 {artifact_floor} B: a segment may close one whole batch past its cap, and an \
+                 artifact ceiling below that refuses a legal segment and livelocks the \
+                 partition's rejoin",
+                self.partition.transfer_artifact_bytes_max.as_bytes_u64(),
+                self.system.segment.size.as_bytes_u64(),
+                self.message_bus.max_message_size.as_bytes_u64(),
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         self.message_bus
             .validate()
             .error(|e: &ConfigurationError| {
@@ -198,6 +227,18 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             eprintln!(
                 "{COMPONENT_NG} cluster.repair_chunk_max ({}) must be < message_bus.peer_queue_capacity ({}): repair frames ride the per-peer bus queue, so a chunk that fills or overruns it drops frames and wedges repair",
                 self.cluster.repair_chunk_max, self.message_bus.peer_queue_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // State-transfer chunks ride the same bus. A cap that cannot carry one
+        // header plus a byte of payload makes every rejoin that needs a
+        // transfer impossible, and the failure surfaces only as a replica
+        // connection tearing down when the frame is rejected on the read side.
+        let bus_cap = self.message_bus.max_message_size.as_bytes_u64();
+        if bus_cap <= STATE_CHUNK_HEADER_LEN {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.max_message_size ({bus_cap}) must exceed the {STATE_CHUNK_HEADER_LEN}-byte state-chunk header: state transfer serves artifact chunks over this bus, and a frame above the cap is rejected by the receiving transport, which tears down the whole replica connection"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -358,11 +399,6 @@ fn reject_unsupported_and_warn_inert(config: &ServerNgConfig) -> Result<(), Conf
     }
     if config.tcp.socket_migration != defaults.tcp.socket_migration {
         warn!("tcp.socket_migration is not implemented in server-ng");
-    }
-    if config.system.partition.validate_checksum != defaults.system.partition.validate_checksum {
-        warn!(
-            "system.partition.validate_checksum is not applied in server-ng; nothing verifies checksums on load"
-        );
     }
     if config.system.segment.cache_indexes != defaults.system.segment.cache_indexes {
         warn!("system.segment.cache_indexes is not applied in server-ng");
@@ -658,10 +694,6 @@ mod tests {
 
         assert_eq!(shipped.tcp.socket_migration, defaults.tcp.socket_migration);
         assert_eq!(
-            shipped.system.partition.validate_checksum,
-            defaults.system.partition.validate_checksum
-        );
-        assert_eq!(
             shipped.system.segment.cache_indexes,
             defaults.system.segment.cache_indexes
         );
@@ -732,6 +764,7 @@ mod tests {
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,
+            advertised_addresses: Vec::new(),
             replica_id,
             ports: TransportPorts {
                 tcp: Some(8090 + u16::from(replica_id)),

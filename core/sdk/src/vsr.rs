@@ -38,7 +38,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
-use iggy_common::{IggyError, eviction_reason_to_error};
+use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -90,12 +90,13 @@ pub(crate) fn encode_request_header(
         _ => {
             let operation = operation_for_code(code);
             // NonReplicated ops (ping, reads) bypass server-side dedup --
-            // `ClientTable` only tracks request_ids for replicated ops. If
-            // they consumed the monotonic counter, the next replicated
-            // request would skip an id and the primary's `request_preflight`
-            // would see a `RequestGap` and silently drop it. Read the
-            // current id without advancing; the server ignores it for
-            // NonReplicated.
+            // `ClientTable` only tracks request_ids for replicated ops, and
+            // the table accepts any id above the watermark with no
+            // contiguity requirement (client_table.rs: "There is no
+            // `RequestGap`"), so consuming the counter would not break the
+            // next metadata op. Read the current id without advancing
+            // because the server ignores it for NonReplicated and burning
+            // ids for requests the table never sees buys nothing.
             //
             // They are also sessionless on the server (routed by transport
             // id; protected codes are auth-gated server-side), so send with
@@ -111,9 +112,11 @@ pub(crate) fn encode_request_header(
             } else if operation.is_partition() {
                 // Partition ops replicate in their own per-partition group,
                 // which is at-least-once with no `ClientTable` dedup -- the
-                // metadata table never records their request ids. Consuming
-                // the counter here would gap the NEXT metadata op's id and
-                // `request_preflight` would silently drop it (`RequestGap`).
+                // metadata table never records their request ids, so there
+                // is nothing for a consumed id to deduplicate against. Every
+                // partition request on a session therefore carries the id
+                // the next metadata op will claim, and a partition-plane
+                // replay is at-least-once.
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.current_request_id(), session_id)
             } else {
@@ -121,6 +124,15 @@ pub(crate) fn encode_request_header(
                 (operation, session.next_request_id(), session_id)
             }
         }
+    };
+    // Stamped only for ops the server's `ClientTable` dedups. Partition ops are
+    // at-least-once with no reply cache to poison, and theirs are the large payloads,
+    // already covered client-side by `batch_checksum` over the same bytes.
+    // NonReplicated ops bypass dedup too.
+    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
+        0
+    } else {
+        u128::from(calculate_checksum(payload))
     };
     let namespace = namespace_for_request(code, payload, operation)?;
     let total_size = HEADER_SIZE
@@ -139,6 +151,11 @@ pub(crate) fn encode_request_header(
         request: request_id,
         session: session_id,
         namespace,
+        // Lets the client table tell a genuine retry from a `request` number reused
+        // for different arguments. Zero means unstamped, which is what an SDK
+        // predating this sends. A server that rewrites the body (PAT, password)
+        // carries it through untouched, so it keeps describing what the client sent.
+        request_checksum,
         // Zeroed: the field is "informational" -- the server copies it into
         // `ReplyHeader.timestamp` for RTT but nothing else reads it. Paying
         // a `clock_gettime` syscall per encoded request (formerly held the
@@ -631,6 +648,27 @@ mod tests {
         assert_eq!(decode_request_header(&second).request, 2);
         assert_eq!(decode_request_header(&second).session, 99);
         assert_eq!(decode_request_header(&second).namespace, 0);
+    }
+
+    #[test]
+    fn request_checksum_is_stamped_only_for_deduped_operations() {
+        // The stamp exists to stop a reused `request` number returning the wrong
+        // cached reply, so it is worth its hashing pass only where `ClientTable`
+        // dedups. Partition payloads are the large ones and carry `batch_checksum`
+        // over the same bytes already; hashing them again is pure cost.
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let payload = Bytes::from_static(b"payload");
+
+        let deduped =
+            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        assert_eq!(
+            decode_request_header(&deduped).request_checksum,
+            u128::from(calculate_checksum(&payload)),
+        );
+
+        let ping = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        assert_eq!(decode_request_header(&ping).request_checksum, 0);
     }
 
     #[test]

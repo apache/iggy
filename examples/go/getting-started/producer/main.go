@@ -121,7 +121,7 @@ func produceMessages(ctx context.Context, client iggcon.Client) error {
 
 		streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
 		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
-		if err := client.SendMessages(
+		if _, err := client.SendMessages(
 			ctx,
 			streamIdentifier,
 			topicIdentifier,

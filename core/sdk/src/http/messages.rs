@@ -19,11 +19,12 @@ use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PollMessages, PolledMessages,
-    PollingStrategy, SendMessages,
+    PollingStrategy, SendMessages, SendMessagesResponse,
 };
 use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
+use iggy_common::SendMessagesConfirmations;
 use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
 
 #[async_trait]
@@ -65,20 +66,36 @@ impl MessageClient for HttpClient {
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         let batch = IggyMessagesBatch::from(&*messages);
-        self.post(
-            &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            &SendMessages {
-                metadata_length: 0, // this field is used only for TCP/QUIC
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                partitioning: partitioning.clone(),
-                batch,
-            },
-        )
-        .await?;
-        Ok(())
+        let response = self
+            .post(
+                &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+                &SendMessages {
+                    metadata_length: 0, // this field is used only for TCP/QUIC
+                    stream_id: stream_id.clone(),
+                    topic_id: topic_id.clone(),
+                    partitioning: partitioning.clone(),
+                    batch,
+                },
+            )
+            .await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| IggyError::InvalidBytesResponse)?;
+        // The legacy server answers a successful send with 201 and no content
+        // at all. That is not JSON, and it must not read as a decode failure on
+        // a write that already committed: no body means the batch landed with
+        // no offsets reported, which is an empty list.
+        if body.is_empty() {
+            return Ok(SendMessagesResponse {
+                confirmations: Vec::new(),
+            });
+        }
+        let confirmations: SendMessagesConfirmations =
+            serde_json::from_slice(&body).map_err(|_| IggyError::InvalidJsonResponse)?;
+        Ok(SendMessagesResponse::from(confirmations))
     }
 
     async fn flush_unsaved_buffer(
@@ -117,4 +134,53 @@ fn get_path_flush_unsaved_buffer(
     fsync: bool,
 ) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/messages/flush/{partition_id}/fsync={fsync}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SendMessagesConfirmations, SendMessagesResponse};
+    use crate::prelude::SendMessagesConfirmationResponse;
+
+    fn parse(json: &str) -> SendMessagesResponse {
+        let confirmations: SendMessagesConfirmations =
+            serde_json::from_str(json).expect("contract sample must parse");
+        SendMessagesResponse::from(confirmations)
+    }
+
+    #[test]
+    fn confirmation_converts_all_fields() {
+        let response = parse(
+            r#"{"confirmations":[{"stream_id":1,"topic_id":2,"partition_id":3,"base_offset":42}]}"#,
+        );
+        assert_eq!(
+            response.confirmations,
+            vec![SendMessagesConfirmationResponse {
+                stream_id: 1,
+                topic_id: 2,
+                partition_id: 3,
+                base_offset: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_list_converts_to_empty_confirmations() {
+        let response = parse(r#"{"confirmations":[]}"#);
+        assert!(response.confirmations.is_empty());
+    }
+
+    #[test]
+    fn preserves_order_of_multiple_confirmations() {
+        let response = parse(
+            r#"{"confirmations":[
+                {"stream_id":1,"topic_id":2,"partition_id":7,"base_offset":10},
+                {"stream_id":1,"topic_id":2,"partition_id":3,"base_offset":20}]}"#,
+        );
+        let partitions: Vec<u32> = response
+            .confirmations
+            .iter()
+            .map(|confirmation| confirmation.partition_id)
+            .collect();
+        assert_eq!(partitions, vec![7, 3]);
+    }
 }

@@ -236,7 +236,7 @@ async fn given_live_session_when_unauthenticated_peer_presents_it_should_refuse_
     .await;
 }
 
-fn tcp_addr(harness: &TestHarness) -> SocketAddr {
+pub(super) fn tcp_addr(harness: &TestHarness) -> SocketAddr {
     harness
         .server()
         .tcp_addr()
@@ -247,7 +247,7 @@ fn tcp_addr(harness: &TestHarness) -> SocketAddr {
 /// way a leader-aware SDK re-routes: after a node restart in a cluster the
 /// primary may be any survivor, and only the primary commits (or answers
 /// dedup for) replicated requests.
-fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
+pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
     (0..harness.cluster_size())
         .map(|node| {
             harness
@@ -258,7 +258,7 @@ fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn create_stream_payload(name: &str) -> Bytes {
+pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
     }
@@ -291,7 +291,7 @@ fn request_header(
 /// so the pre-restart request must reuse the returned stream. Replays on
 /// transient rejections: right after boot the single node may not have
 /// elected itself yet.
-async fn register(addr: SocketAddr) -> (TcpStream, u64) {
+pub(super) async fn register(addr: SocketAddr) -> (TcpStream, u64) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
@@ -338,7 +338,7 @@ async fn login_on(stream: &mut TcpStream) -> Option<u64> {
 /// Send one replicated metadata request on the registered connection and
 /// require a committed success within `COMMIT_BUDGET`. Returns the committed
 /// reply so a later replay can be compared against it byte for byte.
-async fn commit_request(
+pub(super) async fn commit_request(
     stream: &mut TcpStream,
     session: u64,
     request: u64,
@@ -373,7 +373,7 @@ async fn commit_request(
 /// Every attempt uses a fresh connection, both because the old one died with
 /// the node and so an unanswered frame cannot desync the next attempt. Panics
 /// with the last observed failure mode when the budget runs out.
-async fn resume_request(
+pub(super) async fn resume_request(
     addrs: &[SocketAddr],
     session: u64,
     request: u64,
@@ -513,7 +513,7 @@ enum Verdict {
 /// The header is boxed to keep it off the stack in `Verdict`/`Exchange`: at
 /// `HEADER_SIZE` inline it dwarfs every other variant.
 #[derive(Debug)]
-struct CommittedReply {
+pub(super) struct CommittedReply {
     header: Box<[u8; HEADER_SIZE]>,
     payload: Bytes,
 }

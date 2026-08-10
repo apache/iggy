@@ -16,17 +16,20 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
-use pyo3::{prelude::*, types::PyBytes};
+use iggy::prelude::{
+    IggyMessage as RustIggyMessage, IggyMessageHeader,
+    SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
+    SendMessagesResponse as RustSendMessagesResponse,
+};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use pyo3_stub_gen::{
     derive::{gen_stub_pyclass, gen_stub_pymethods},
     impl_stub_type,
 };
-use std::str::FromStr;
+
+use crate::user_headers::py_user_headers_to_rust;
 
 /// A Python class representing a message to be sent.
-/// This class wraps a Rust message meant for sending, facilitating
-/// the creation of such messages from Python and their subsequent use in Rust.
 #[pyclass(from_py_object)]
 #[gen_stub_pyclass]
 pub struct SendMessage {
@@ -61,20 +64,34 @@ impl SendMessage {
     /// This method allows for the creation of a `SendMessage` instance
     /// directly from Python using the provided string or bytes data.
     #[new]
-    pub fn new(py: Python, data: PyMessagePayload) -> PyResult<Self> {
-        let inner = match data {
-            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
-            PyMessagePayload::Bytes(data) => {
-                let bytes = Bytes::from(data.extract::<Vec<u8>>(py)?);
-                RustIggyMessage::builder()
-                    .payload(bytes)
-                    .build()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?
-            }
+    #[pyo3(signature = (data, user_headers=None, id=None))]
+    pub fn new(
+        py: Python,
+        data: PyMessagePayload,
+        #[gen_stub(override_type(type_repr = "dict | None"))] user_headers: Option<
+            &Bound<'_, PyAny>,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] id: Option<u128>,
+    ) -> PyResult<Self> {
+        let payload = match data {
+            PyMessagePayload::String(data) => Bytes::from(data),
+            PyMessagePayload::Bytes(data) => Bytes::from(data.extract::<Vec<u8>>(py)?),
         };
+        let user_headers = user_headers
+            .map(|headers| py_user_headers_to_rust(py, headers))
+            .transpose()?;
+        let inner = RustIggyMessage::builder()
+            .maybe_id(id)
+            .payload(payload)
+            .maybe_user_headers(user_headers)
+            .build()
+            .map_err(to_value_error)?;
         Ok(Self { inner })
     }
+}
+
+fn to_value_error(error: impl ToString) -> PyErr {
+    PyValueError::new_err(error.to_string())
 }
 
 #[derive(FromPyObject, IntoPyObject)]
@@ -85,3 +102,95 @@ pub enum PyMessagePayload {
     Bytes(Py<PyBytes>),
 }
 impl_stub_type!(PyMessagePayload = String | PyBytes);
+
+/// A Python class representing the commit confirmation for one partition
+/// written by a send.
+#[pyclass]
+#[gen_stub_pyclass]
+pub struct SendMessagesConfirmation {
+    pub(crate) inner: RustSendMessagesConfirmationResponse,
+}
+
+impl From<&RustSendMessagesConfirmationResponse> for SendMessagesConfirmation {
+    fn from(confirmation: &RustSendMessagesConfirmationResponse) -> Self {
+        Self {
+            inner: confirmation.clone(),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl SendMessagesConfirmation {
+    /// Gets the unique identifier (numeric) of the stream the batch was written to.
+    #[getter]
+    pub fn stream_id(&self) -> u32 {
+        self.inner.stream_id
+    }
+
+    /// Gets the unique identifier (numeric) of the topic the batch was written to.
+    #[getter]
+    pub fn topic_id(&self) -> u32 {
+        self.inner.topic_id
+    }
+
+    /// Gets the identifier of the partition the batch was written to.
+    #[getter]
+    pub fn partition_id(&self) -> u32 {
+        self.inner.partition_id
+    }
+
+    /// Gets the offset assigned to the first message of the batch in this partition.
+    ///
+    /// The offset locates the batch, it does not identify it. Delivery is
+    /// at-least-once, so an earlier retry may already have committed these
+    /// messages at a lower offset.
+    ///
+    /// A batch is confirmed once it is committed in memory, not once it is
+    /// fsynced. A crash-restart can stamp a later batch with an offset a client
+    /// has already recorded.
+    ///
+    /// The legacy server confirms nothing, so its confirmation list is empty
+    /// and this value is never reached.
+    #[getter]
+    pub fn base_offset(&self) -> u64 {
+        self.inner.base_offset
+    }
+}
+
+/// A Python class representing the outcome of a successful send.
+#[pyclass]
+#[gen_stub_pyclass]
+pub struct SendMessagesResponse {
+    pub(crate) inner: RustSendMessagesResponse,
+}
+
+impl From<RustSendMessagesResponse> for SendMessagesResponse {
+    fn from(response: RustSendMessagesResponse) -> Self {
+        Self { inner: response }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl SendMessagesResponse {
+    /// Gets the commit confirmations, one per partition the batch was written to.
+    ///
+    /// The list is empty when the server reports no offsets, and the legacy
+    /// server never reports any, so branch on it being empty rather than
+    /// indexing into it.
+    ///
+    /// A reported `base_offset` never implies uniqueness, because delivery is
+    /// at-least-once and an earlier retry may already have committed the same
+    /// messages at a lower offset. A batch is confirmed once it is committed in
+    /// memory, not once it is fsynced. A crash-restart can stamp a later batch
+    /// with an offset a client has already recorded.
+    #[getter]
+    pub fn confirmations(&self) -> Vec<SendMessagesConfirmation> {
+        self.inner
+            .confirmations
+            .iter()
+            .map(SendMessagesConfirmation::from)
+            .collect()
+    }
+}

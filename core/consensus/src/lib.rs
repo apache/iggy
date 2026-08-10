@@ -114,7 +114,7 @@ pub trait Consensus: Sized {
 
     fn is_follower(&self) -> bool;
     fn is_normal(&self) -> bool;
-    fn is_syncing(&self) -> bool;
+    fn is_transferring(&self) -> bool;
 }
 
 /// Shared consensus lifecycle interface for control/data planes.
@@ -148,7 +148,21 @@ where
 }
 
 pub mod client_table;
-pub use client_table::{CachedReply, ClientTable, CommitReply};
+pub mod le_cursor;
+pub use client_table::{
+    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableSnapshot,
+    ClientTableWireError, CommitReply,
+};
+pub mod state_manifest;
+pub use state_manifest::{
+    StateArtifact, StateArtifactHasher, StateManifestError, artifact_kind, decode_state_manifest,
+    encode_state_manifest, state_artifact_checksum,
+};
+pub mod state_transfer;
+pub use state_transfer::{
+    ArtifactProgress, ChunkProgress, STATE_TRANSFER_MAX_DECODE_RETRIES,
+    STATE_TRANSFER_MAX_STALL_RETRIES, append_chunk, next_pending_chunk, verify_state_artifact,
+};
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
@@ -166,5 +180,10 @@ pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;
+
+mod dvc_merge;
+pub use dvc_merge::*;
+mod vsr_state;
+pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;
 pub use vsr_timeout::TimeoutManager;

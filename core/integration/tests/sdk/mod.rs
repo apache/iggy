@@ -21,11 +21,8 @@ mod consumer_group_membership;
 mod hello_world;
 #[cfg(feature = "vsr")]
 mod http_refresh;
-#[cfg(feature = "vsr")]
-mod mcp_parity;
-#[cfg(feature = "vsr")]
-mod messages;
 mod producer;
 #[cfg(feature = "vsr")]
 mod protocol_version;
 mod raw;
+mod send_confirmation;

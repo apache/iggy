@@ -113,9 +113,20 @@ jobs:
           echo "Building common binaries for all examples tests..."
           echo "Current directory: $(pwd)"
 
-          # Build server (needed by both Rust and Go examples)
-          echo "Building iggy-server..."
-          cargo build --locked --bin iggy-server
+          # The Go SDK and the Node SDK speak only the VSR wire protocol,
+          # while the Python wheels, Java SDK, and .NET SDK are vsr-built, so
+          # those lanes need the VSR server. Every other language still runs
+          # against the legacy one until its own migration lands.
+          if [[ "${{ inputs.task }}" == "examples-go" || "${{ inputs.task }}" == "examples-python" || "${{ inputs.task }}" == "examples-csharp" || "${{ inputs.task }}" == "examples-java" || "${{ inputs.task }}" == "examples-node" ]]; then
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+            SERVER_BIN="iggy-server-ng"
+            echo "Building ${SERVER_BIN} (--features vsr)..."
+            cargo build --locked --bin "${SERVER_BIN}" --features vsr
+          else
+            SERVER_BIN="iggy-server"
+            echo "Building ${SERVER_BIN}..."
+            cargo build --locked --bin "${SERVER_BIN}"
+          fi
 
           # For Rust examples, also build CLI and example binaries
           if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
@@ -125,13 +136,13 @@ jobs:
 
           # Verify server binary was built (needed by all examples)
           echo "Verifying server binary:"
-          if [ -f "target/debug/iggy-server" ]; then
-            echo "✅ Server binary found at target/debug/iggy-server"
-            ls -lh target/debug/iggy-server
+          if [ -f "target/debug/${SERVER_BIN}" ]; then
+            echo "✅ Server binary found at target/debug/${SERVER_BIN}"
+            ls -lh "target/debug/${SERVER_BIN}"
           else
-            echo "❌ Server binary NOT found at target/debug/iggy-server"
+            echo "❌ Server binary NOT found at target/debug/${SERVER_BIN}"
             echo "Checking target directory structure:"
-            find target -name "iggy-server" -type f 2>/dev/null || true
+            find target -name "${SERVER_BIN}" -type f 2>/dev/null || true
             exit 1
           fi
 

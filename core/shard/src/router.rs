@@ -19,15 +19,14 @@ use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
 };
-use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
+use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFrame};
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
+use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
-use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use server_common::{Message, MessageBag};
 
@@ -89,6 +88,22 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
             let h = *m.header();
             (h.operation(), h.namespace, m.into_generic())
         }
+        MessageBag::RequestStateTransfer(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StateTransferTarget(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestStateChunk(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StateChunk(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
     }
 }
 
@@ -98,10 +113,11 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
 /// through the channel into the target shard's message pump.  This ensures
 /// that every mutation on a shard is serialized through a single point (the
 /// pump), preventing concurrent access from independent async tasks.
-impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
     B: MessageBus + ConnectionInstaller + Clone + 'static,
     T: ShardsTable,
+    SB: SuperblockStore,
 {
     /// Network-receive entry point. Classifies the raw
     /// `Message<GenericHeader>` and routes it to the owning shard via
@@ -124,7 +140,17 @@ where
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
             Err(e) => {
-                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+                // TODO(hubcio): this drop is the whole story for a consensus
+                // frame carrying an Operation this build does not know: no
+                // metric, no peer error, no eviction. An old node in a mixed
+                // cluster silently gap-stops the group here (never journals
+                // the op, never PrepareOks, every later prepare dies on the
+                // gap check) while quorum hides it, and repair wraps the same
+                // typed header so it cannot rescue. Rolling upgrades across
+                // consensus-op additions need a version fence (release_min /
+                // release_max bounds on the replica plane) before this arm is
+                // safe to hit.
+                tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
         };
@@ -188,10 +214,13 @@ where
             // assignment (every `InsertOwned`/`InsertRouted` row stores
             // `calculate_shard_assignment`'s result), seeded asynchronously
             // by each shard's reconciler. A miss therefore means "not seeded
-            // yet", not "unroutable": fall back to the hash so replication
-            // frames arriving during the post-commit convergence window are
-            // not dropped (the partition plane re-checks materialisation on
-            // the owning shard).
+            // yet", not "unroutable": fall back to the hash so frames arriving
+            // during the post-commit convergence window still reach the shard
+            // that will own the partition. That shard is where earliness is
+            // resolved -- it parks the frame until its partition materialises
+            // (`park_if_unmaterialised`) and fences a mismatched incarnation
+            // (`serves_committed_incarnation`) -- so neither a hit nor a miss
+            // here carries any claim about readiness.
             let target = self
                 .shards_table
                 .shard_for(partition_namespace)
@@ -222,21 +251,28 @@ where
 
     /// Send `message` into `senders[target]`. Honors the `io_uring` reactor
     /// constraint: never blocks; drops on `Full` / `Disconnected` and
-    /// records the drop in `frame_drops_total{variant=consensus}`. VSR
-    /// retransmit recovers consensus drops. A `target` past the end of
-    /// `senders` (a stored `u16` from `shard_for`, not a trusted index)
-    /// is dropped with `reason=unroutable` rather than panicking.
-    /// Metadata frames always pass `target = 0` here, since `is_metadata`
-    /// operations are owned by shard 0.
+    /// records the drop in `frame_drops_total`, under `variant=partition` for a
+    /// partition-plane operation and `variant=consensus` otherwise -- the two
+    /// have different recovery stories, so folding them into one label hides
+    /// which one is bleeding. VSR retransmit recovers consensus drops. A
+    /// `target` past the end of `senders` (a stored `u16` from `shard_for`, not
+    /// a trusted index) is dropped with `reason=unroutable` rather than
+    /// panicking. Metadata frames always pass `target = 0` here, since
+    /// `is_metadata` operations are owned by shard 0.
     fn try_send_to_target(
         &self,
         target: u16,
         message: Message<GenericHeader>,
         operation: Operation,
     ) {
+        let variant = if operation.is_partition() {
+            frame_drop_variant::PARTITION
+        } else {
+            frame_drop_variant::CONSENSUS
+        };
         let Some(sender) = self.senders.get(target as usize) else {
             self.metrics
-                .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE);
+                .record_frame_drop(variant, frame_drop_reason::UNROUTABLE);
             tracing::error!(
                 shard = self.id,
                 target,
@@ -249,7 +285,7 @@ where
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.metrics
-                    .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+                    .record_frame_drop(variant, frame_drop_reason::FULL);
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -258,10 +294,8 @@ where
                 );
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.metrics.record_frame_drop(
-                    frame_drop_variant::CONSENSUS,
-                    frame_drop_reason::DISCONNECTED,
-                );
+                self.metrics
+                    .record_frame_drop(variant, frame_drop_reason::DISCONNECTED);
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -285,11 +319,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + StreamsFrontend,
+        M: RestorableMetadataStm,
     {
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
@@ -327,6 +357,11 @@ where
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
                     self.tick_partitions().await;
+                    // Runs here, not inside `tick_metadata`: that early-returns
+                    // on shards without metadata consensus, and partition-plane
+                    // offers live on every shard that hosts a serving group --
+                    // parked behind the shard-0 gate they would never expire.
+                    self.expire_idle_state_transfer_offers();
                     // While a cooperative revocation is pending, wake the
                     // reconciler each tick so the handoff completes within ~one
                     // tick of the partition draining, not the periodic pass.
@@ -421,11 +456,7 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + StreamsFrontend,
+        M: RestorableMetadataStm,
     {
         match frame {
             ShardFrame::Consensus { message, .. } => {
@@ -603,6 +634,14 @@ where
                         .clean_expired_segments(now, message_expiry, max_bytes)
                         .await;
                     if segments > 0 {
+                        // Any unlink invalidates what this shard is SERVING:
+                        // the offer names files that are gone and the payload
+                        // cache can answer from RAM without touching disk, so a
+                        // puller would install deleted messages. Neither cache
+                        // can notice on its own -- one is keyed on the
+                        // partition's commit_op, which retention does not move,
+                        // the other on a checksum over the deleted bytes.
+                        self.drop_partition_transfer_state(namespace, partition);
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
@@ -624,6 +663,11 @@ where
                     let (segments, messages) =
                         partition.remove_sealed_segments_up_to(up_to_offset).await;
                     if segments > 0 {
+                        // See the cleaner arm: a truncate commits on the
+                        // METADATA plane, so this partition's commit_op never
+                        // moves and the cached offer stays a hit over unlinked
+                        // files.
+                        self.drop_partition_transfer_state(namespace, partition);
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
@@ -648,19 +692,88 @@ where
                     && partition.applied_purge_generation() < generation
                 {
                     match partition.purge(&config, generation).await {
-                        Ok(()) => tracing::debug!(
-                            shard = self.id,
-                            namespace_raw = namespace.inner(),
-                            generation,
-                            "purge-partition reset partition to empty"
-                        ),
-                        Err(error) => tracing::error!(
-                            shard = self.id,
-                            namespace_raw = namespace.inner(),
-                            generation,
-                            %error,
-                            "purge-partition failed to reset partition"
-                        ),
+                        Ok(()) => {
+                            // The purge unlinked the very bytes this shard is
+                            // serving: the cached offer still advertises the
+                            // pre-purge manifest and the payload cache can
+                            // answer chunk requests for it without touching
+                            // disk, so a puller would install purged data. Both
+                            // are keyed on pre-purge content, so neither can
+                            // notice on its own.
+                            self.drop_partition_transfer_state(namespace, partition);
+                            tracing::debug!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                "purge-partition reset partition to empty"
+                            );
+                        }
+                        Err(partitions::PurgeError::FrontierNotRecorded) => {
+                            // NOT fenced: nothing was mutated, so the chain is
+                            // whole and `applied_purge_generation` is unmoved,
+                            // which means the reconciler's `committed > applied`
+                            // gate still sees this purge as outstanding.
+                            // Fencing here would quarantine live data, and the
+                            // fence's own frontier write would first stamp the
+                            // pre-purge counter the purge was about to reset.
+                            //
+                            // NOT woken: staging a purge counts as work in the
+                            // pass, which keeps the fast-skip disarmed, so the
+                            // ordinary periodic pass re-issues until one lands
+                            // and stops once `applied` catches `committed`. An
+                            // eager wake here closes a loop with no pacing in
+                            // it at all -- pass, stage, defer, wake -- and on a
+                            // disk that refuses instantly that is a full O(N)
+                            // reconcile scan and a real `atomic_replace`
+                            // attempt per turn, holding the partition write
+                            // lock each time.
+                            tracing::warn!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                "purge-partition deferred: could not record the frontier reset; \
+                                 the reconciler re-issues it while the generation stays unapplied"
+                            );
+                        }
+                        Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
+                            // NOT fenced: the wipe ran and a fresh chain is
+                            // planted, so the partition is serviceable; only
+                            // the durable generation record failed, which
+                            // leaves `applied_purge_generation` unmoved and
+                            // the reconciler re-issuing the (now cheap) purge.
+                            // Same pacing argument as the frontier deferral
+                            // above; the caches already describe wiped bytes.
+                            self.drop_partition_transfer_state(namespace, partition);
+                            tracing::warn!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition deferred: reset applied but the generation \
+                                 record failed; the reconciler re-issues it"
+                            );
+                        }
+                        Err(error @ partitions::PurgeError::Unserviceable(_)) => {
+                            // Past the drain, so this group has no serviceable
+                            // chain and the next append panics on
+                            // `active_segment()`. Fence it for rebuild, exactly
+                            // as a failed state-transfer convergence does. The
+                            // counters were already reset to 0 before the
+                            // fallible plant, so the fence's advancing write
+                            // records the post-purge frontier.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition failed to reset partition; fencing it for rebuild"
+                            );
+                            // Fenced, but the caches still describe the
+                            // pre-purge bytes until the rebuild lands.
+                            self.drop_partition_transfer_state(namespace, partition);
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
+                        }
                     }
                 }
             }
