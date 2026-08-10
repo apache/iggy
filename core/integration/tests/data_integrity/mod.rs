@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Partially vsr-gated inside the module: the bench-fill test requires
-// PARTITION-plane state transfer (sub-floor stats/offset seeding), which is
-// not implemented yet; the metadata-only deletion/restart test runs under
-// vsr (metadata journal repair covers its rejoin window).
+// Partially vsr-gated inside the module: the remaining gates cover
+// `flush_unsaved_buffer`, which server-ng answers `FeatureUnavailable` and
+// which the eager-flush server envs replace under vsr. The bench-fill test
+// itself runs under vsr since PARTITION-plane state transfer landed, but the
+// harness spawns `iggy-bench` off disk with no cargo build-graph edge, so the
+// binary must have been built `--features vsr` or its login hangs on the
+// framing mismatch.
 mod verify_after_server_restart;
 mod verify_user_login_after_restart;
 

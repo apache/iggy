@@ -168,7 +168,6 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
                     .retryPolicy(RetryPolicy.fixedDelay(
                             connectionConfig.getMaxRetries(), connectionConfig.getRetryBackoff()))
                     .tls(connectionConfig.isEnableTls())
-                    .connectionPoolSize(4)
                     .buildAndLogin()
                     .join();
 

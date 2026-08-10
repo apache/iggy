@@ -20,12 +20,14 @@
 //! Forked from `server::streaming::partitions::storage` (the legacy
 //! `load_consumer_offsets` / `load_consumer_group_offsets`) so server-ng
 //! owns the loaders for the offset files its own persistence path writes,
-//! without depending on the legacy `server` crate. The on-disk format is
-//! shared with the legacy server today: one file per consumer (numeric
-//! file name = consumer id) holding a single little-endian `u64` offset.
+//! without depending on the legacy `server` crate. One file per consumer (numeric
+//! file name = consumer id) holding a little-endian `u64` offset then a checksum over
+//! it; see [`partitions::offset_storage`]. The legacy server stays compatible both
+//! ways: it reads the first eight bytes and stops, and a file it wrote itself decodes
+//! here as unchecksummed.
 
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
-use std::io::Read;
+use partitions::offset_storage::{OffsetRecord, decode_offset_record};
 use std::sync::atomic::AtomicU64;
 use tracing::{error, trace, warn};
 
@@ -169,23 +171,48 @@ pub fn load_consumer_group_offsets(
 }
 
 fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             warn!(
-                "{COMPONENT} (error: {e}) - failed to open offset file, \
+                "{COMPONENT} (error: {e}) - failed to read offset file, \
                  path: {path}, skipping."
             );
             return None;
         }
     };
-    let mut offset = [0; 8];
-    if let Err(e) = file.read_exact(&mut offset) {
-        warn!(
-            "{COMPONENT} (error: {e}) - failed to read {offset_kind} from file \
-             (truncated or corrupt?), path: {path}, skipping."
-        );
-        return None;
+    match decode_offset_record(&bytes) {
+        OffsetRecord::Value { offset, .. } => Some(AtomicU64::new(offset)),
+        OffsetRecord::Torn => {
+            warn!(
+                "{COMPONENT} - failed to read {offset_kind} from file (truncated), \
+                 path: {path}, skipping."
+            );
+            None
+        }
+        // Skipped rather than loaded: resuming from a cursor provably not the one
+        // written reads as ordinary redelivery or a gap, never as corruption.
+        //
+        // And unlinked, not just skipped: the offset map starts cold every boot, so a
+        // file left behind is re-read by the first auto-commit and trips the commit
+        // path again.
+        OffsetRecord::Corrupt {
+            offset,
+            expected,
+            found,
+        } => {
+            error!(
+                "{COMPONENT} - {offset_kind} file failed its checksum \
+                 (offset: {offset}, expected: {expected}, found: {found}), \
+                 path: {path}, removing it and resuming this consumer from the start."
+            );
+            if let Err(e) = std::fs::remove_file(path) {
+                error!(
+                    "{COMPONENT} (error: {e}) - could not remove the corrupt \
+                     {offset_kind} file, path: {path}; remove it manually."
+                );
+            }
+            None
+        }
     }
-    Some(AtomicU64::new(u64::from_le_bytes(offset)))
 }

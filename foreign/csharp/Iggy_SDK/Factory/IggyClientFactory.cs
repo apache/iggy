@@ -20,6 +20,7 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Factory;
 
@@ -44,14 +45,28 @@ public static class IggyClientFactory
     ///     Thrown when the specified protocol in <paramref name="options" /> is not
     ///     supported.
     /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    ///     Thrown when <see cref="IggyClientConfigurator.MaxResponseFrameSize" /> is below the 256-byte header.
+    /// </exception>
     public static IIggyClient CreateClient(IggyClientConfigurator options)
     {
+        Validate(options);
+
         return options.Protocol switch
         {
             Protocol.Http => CreateIggyHttpClient(options),
             Protocol.Tcp => CreateIggyTcpClient(options),
             _ => throw new InvalidEnumArgumentException()
         };
+    }
+
+    private static void Validate(IggyClientConfigurator options)
+    {
+        if (options.Protocol == Protocol.Tcp && options.MaxResponseFrameSize < VsrHeader.HEADER_SIZE)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.MaxResponseFrameSize,
+                $"MaxResponseFrameSize must be at least {VsrHeader.HEADER_SIZE} bytes.");
+        }
     }
 
     private static IIggyClient CreateIggyTcpClient(IggyClientConfigurator options)
@@ -67,7 +82,7 @@ public static class IggyClientFactory
 
     private static HttpClient CreateHttpClient(IggyClientConfigurator options)
     {
-        var client = new HttpClient();
+        var client = new HttpClient(new TransientHttpRetryHandler(new HttpClientHandler()));
         client.BaseAddress = new Uri(options.BaseAddress);
         return client;
     }

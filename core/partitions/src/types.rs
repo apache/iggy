@@ -269,6 +269,13 @@ pub struct PartitionsConfig {
     pub size_of_messages_required_to_save: IggyByteSize,
     /// Whether to enforce fsync after writes.
     pub enforce_fsync: bool,
+    /// Whether a disk poll verifies each batch's `batch_checksum` against the bytes
+    /// it just read.
+    ///
+    /// Detection only: a mismatch fails the poll closed and is reported, with no
+    /// attempt to repair. The alternative is serving bytes provably not the ones
+    /// written, which reads to a consumer as ordinary data.
+    pub validate_checksum: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
     /// Server-side at-rest encryption. Applied ONCE, on the primary at

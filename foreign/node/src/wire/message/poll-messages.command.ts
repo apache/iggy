@@ -247,8 +247,7 @@ export const pollMessages = (getClient: ClientProvider) =>
     const client = await getClient();
     const release = client.hold?.();
     try {
-      if (client.protocol === 'vsr' &&
-          request.consumer.kind === ConsumerKind.Group &&
+      if (request.consumer.kind === ConsumerKind.Group &&
           request.partitionId === null) {
         const state = getGroupState(client);
         while (true) {

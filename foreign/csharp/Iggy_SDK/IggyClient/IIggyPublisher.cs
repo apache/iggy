@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 
@@ -46,9 +47,11 @@ public interface IIggyPublisher
     /// <param name="partitioning">The partitioning strategy that determines which partition receives the messages.</param>
     /// <param name="messages">The collection of messages to be sent.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
-    /// <returns>A task representing the asynchronous operation.</returns>
-    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
-        CancellationToken token = default);
+    /// <returns>
+    ///     Commit confirmations carrying the partition each batch landed in and its base offset.
+    /// </returns>
+    Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        IList<Message> messages, CancellationToken token = default);
 
     /// <summary>
     ///     Sends a single message to the specified stream and topic. See
@@ -60,19 +63,18 @@ public interface IIggyPublisher
     ///     payload memory (e.g. a pooled <see cref="Messages.RentedMessageBatch" /> buffer) may be released
     ///     once it completes.
     /// </remarks>
-    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, Message message,
-        CancellationToken token = default)
-        => SendMessagesAsync(streamId, topicId, partitioning, new[] { message }, token);
+    Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        Message message, CancellationToken token = default)
+    {
+        return SendMessagesAsync(streamId, topicId, partitioning, new[] { message }, token);
+    }
 
     /// <summary>
     ///     Forces a flush of the unsaved buffer to disk for a specific partition.
     /// </summary>
     /// <remarks>
-    ///     This method ensures that all pending messages in the in-memory buffer for the specified partition are written to
-    ///     disk.
-    ///     If <paramref name="fsync" /> is true, the data is both flushed to disk and synchronized (fsync), ensuring
-    ///     durability.
-    ///     If false, the data is only flushed to disk without synchronization.
+    ///     This feature is not supported by the server. Durability is handled by replication and the journal,
+    ///     so there is no client-flushable in-memory buffer.
     /// </remarks>
     /// <param name="streamId">The stream identifier (numeric ID or name).</param>
     /// <param name="topicId">The topic identifier (numeric ID or name).</param>
@@ -80,6 +82,7 @@ public interface IIggyPublisher
     /// <param name="fsync">If true, the data is flushed and synchronized to disk (fsync). If false, only flushed.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="Exceptions.FeatureUnavailableException">Always thrown; the server does not support this command.</exception>
     Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
         CancellationToken token = default);
 }

@@ -30,13 +30,6 @@ import {
 
 const LIMIT = 1024;
 
-const classicFrame = (body: Buffer): Buffer => {
-  const frame = Buffer.alloc(8 + body.length);
-  frame.writeUInt32LE(body.length, 4);
-  body.copy(frame, 8);
-  return frame;
-};
-
 const vsrFrame = (body: Buffer): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE + body.length);
   frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
@@ -46,83 +39,59 @@ const vsrFrame = (body: Buffer): Buffer => {
 };
 
 describe('extractResponseFrames', () => {
-  for (const protocol of ['classic', 'vsr'] as const) {
-    const makeFrame = protocol === 'classic' ? classicFrame : vsrFrame;
+  it('buffers headers split at every boundary', () => {
+    const frame = vsrFrame(Buffer.from('payload'));
 
-    it(`buffers ${protocol} headers split at every boundary`, () => {
-      const frame = makeFrame(Buffer.from('payload'));
-      const headerSize = protocol === 'classic' ? 8 : HEADER_SIZE;
-
-      for (let split = 0; split < headerSize; split += 1) {
-        const first = extractResponseFrames(
-          protocol,
-          frame.subarray(0, split),
-          LIMIT
-        );
-        assert.equal(first.frames.length, 0);
-        const second = extractResponseFrames(
-          protocol,
-          Buffer.concat([first.remainder, frame.subarray(split)]),
-          LIMIT
-        );
-        assert.deepEqual(second.frames, [frame]);
-        assert.equal(second.remainder.length, 0);
-      }
-    });
-
-    it(`buffers a fragmented ${protocol} body`, () => {
-      const frame = makeFrame(Buffer.from('payload'));
-      const split = frame.length - 2;
-      const first = extractResponseFrames(
-        protocol,
-        frame.subarray(0, split),
-        LIMIT
-      );
+    for (let split = 0; split < HEADER_SIZE; split += 1) {
+      const first = extractResponseFrames(frame.subarray(0, split), LIMIT);
       assert.equal(first.frames.length, 0);
       const second = extractResponseFrames(
-        protocol,
         Buffer.concat([first.remainder, frame.subarray(split)]),
         LIMIT
       );
       assert.deepEqual(second.frames, [frame]);
-    });
+      assert.equal(second.remainder.length, 0);
+    }
+  });
 
-    it(`extracts coalesced ${protocol} frames and a partial tail`, () => {
-      const first = makeFrame(Buffer.from('one'));
-      const second = makeFrame(Buffer.from('two'));
-      const third = makeFrame(Buffer.from('three'));
-      const input = Buffer.concat([first, second, third.subarray(0, 3)]);
-      const extracted = extractResponseFrames(protocol, input, LIMIT);
+  it('buffers a fragmented body', () => {
+    const frame = vsrFrame(Buffer.from('payload'));
+    const split = frame.length - 2;
+    const first = extractResponseFrames(frame.subarray(0, split), LIMIT);
+    assert.equal(first.frames.length, 0);
+    const second = extractResponseFrames(
+      Buffer.concat([first.remainder, frame.subarray(split)]),
+      LIMIT
+    );
+    assert.deepEqual(second.frames, [frame]);
+  });
 
-      assert.deepEqual(extracted.frames, [first, second]);
-      assert.deepEqual(extracted.remainder, third.subarray(0, 3));
-      assert.equal(extracted.remainder.buffer, input.buffer);
-    });
-  }
+  it('extracts coalesced frames and a partial tail', () => {
+    const first = vsrFrame(Buffer.from('one'));
+    const second = vsrFrame(Buffer.from('two'));
+    const third = vsrFrame(Buffer.from('three'));
+    const input = Buffer.concat([first, second, third.subarray(0, 3)]);
+    const extracted = extractResponseFrames(input, LIMIT);
 
-  it('rejects a VSR size below the header', () => {
+    assert.deepEqual(extracted.frames, [first, second]);
+    assert.deepEqual(extracted.remainder, third.subarray(0, 3));
+    assert.equal(extracted.remainder.buffer, input.buffer);
+  });
+
+  it('rejects a size below the header', () => {
     const frame = vsrFrame(Buffer.alloc(0));
     frame.writeUInt32LE(0, REPLY_OFFSET.size);
     assert.throws(
-      () => extractResponseFrames('vsr', frame, LIMIT),
+      () => extractResponseFrames(frame, LIMIT),
       ProtocolFrameError
     );
   });
 
-  it('rejects an oversized VSR frame before buffering its body', () => {
+  it('rejects an oversized frame before buffering its body', () => {
     const header = vsrFrame(Buffer.alloc(0));
     header.writeUInt32LE(LIMIT + 1, REPLY_OFFSET.size);
     assert.throws(
-      () => extractResponseFrames('vsr', header, LIMIT),
-      ProtocolFrameError
-    );
-  });
-
-  it('rejects an oversized classic frame before buffering its body', () => {
-    const header = classicFrame(Buffer.alloc(0));
-    header.writeUInt32LE(LIMIT, 4);
-    assert.throws(
-      () => extractResponseFrames('classic', header, LIMIT),
+      () => extractResponseFrames(header, LIMIT),
       ProtocolFrameError
     );
   });
@@ -130,9 +99,9 @@ describe('extractResponseFrames', () => {
 
 describe('ResponseFrameDecoder', () => {
   it('decodes bytewise input without losing coalesced frames', () => {
-    const decoder = new ResponseFrameDecoder('classic', LIMIT);
-    const first = classicFrame(Buffer.from('first'));
-    const second = classicFrame(Buffer.from('second'));
+    const decoder = new ResponseFrameDecoder(LIMIT);
+    const first = vsrFrame(Buffer.from('first'));
+    const second = vsrFrame(Buffer.from('second'));
     const input = Buffer.concat([first, second]);
     const frames: Buffer[] = [];
 
@@ -144,17 +113,17 @@ describe('ResponseFrameDecoder', () => {
   });
 
   it('clears a partial frame', () => {
-    const decoder = new ResponseFrameDecoder('vsr', LIMIT);
-    decoder.push(vsrFrame(Buffer.from('body')).subarray(0, 100));
+    const decoder = new ResponseFrameDecoder(LIMIT);
+    decoder.push(vsrFrame(Buffer.from('body')).subarray(0, HEADER_SIZE - 2));
     assert.equal(decoder.hasBufferedData, true);
     decoder.clear();
     assert.equal(decoder.hasBufferedData, false);
   });
 
   it('rejects an oversized frame as soon as its header is complete', () => {
-    const decoder = new ResponseFrameDecoder('classic', LIMIT);
-    const header = Buffer.alloc(8);
-    header.writeUInt32LE(LIMIT, 4);
+    const decoder = new ResponseFrameDecoder(LIMIT);
+    const header = vsrFrame(Buffer.alloc(0));
+    header.writeUInt32LE(LIMIT + 1, REPLY_OFFSET.size);
     assert.throws(() => decoder.push(header), ProtocolFrameError);
   });
 });

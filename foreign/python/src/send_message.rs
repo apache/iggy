@@ -30,8 +30,6 @@ use pyo3_stub_gen::{
 use crate::user_headers::py_user_headers_to_rust;
 
 /// A Python class representing a message to be sent.
-/// This class wraps a Rust message meant for sending, facilitating
-/// the creation of such messages from Python and their subsequent use in Rust.
 #[pyclass(from_py_object)]
 #[gen_stub_pyclass]
 pub struct SendMessage {

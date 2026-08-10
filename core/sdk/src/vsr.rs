@@ -24,7 +24,7 @@ use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
     RequestHeader, read_size_field, result_code, result_section_len,
 };
-use iggy_common::{IggyError, eviction_reason_to_error};
+use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -111,6 +111,15 @@ pub(crate) fn encode_request_header(
             }
         }
     };
+    // Stamped only for ops the server's `ClientTable` dedups. Partition ops are
+    // at-least-once with no reply cache to poison, and theirs are the large payloads,
+    // already covered client-side by `batch_checksum` over the same bytes.
+    // NonReplicated ops bypass dedup too.
+    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
+        0
+    } else {
+        u128::from(calculate_checksum(payload))
+    };
     let total_size = HEADER_SIZE
         .checked_add(payload.len())
         .ok_or(IggyError::InvalidConfiguration)?;
@@ -126,6 +135,11 @@ pub(crate) fn encode_request_header(
         client: session.client_id(),
         request: request_id,
         session: session_id,
+        // Lets the client table tell a genuine retry from a `request` number reused
+        // for different arguments. Zero means unstamped, which is what an SDK
+        // predating this sends. A server that rewrites the body (PAT, password)
+        // carries it through untouched, so it keeps describing what the client sent.
+        request_checksum,
         // Zeroed: the field is "informational" -- the server copies it into
         // `ReplyHeader.timestamp` for RTT but nothing else reads it. Paying
         // a `clock_gettime` syscall per encoded request (formerly held the
@@ -333,7 +347,8 @@ fn read_window_field(header_bytes: &[u8; HEADER_SIZE], offset: usize) -> u32 {
 mod tests {
     use super::*;
     use crate::session::ConsensusSession;
-    use iggy_binary_protocol::codes::GET_STREAM_CODE;
+    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE};
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
     use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName};
@@ -450,6 +465,77 @@ mod tests {
         buf.copy_from_slice(bytemuck::bytes_of(&header));
         let out = decode_response_split(&buf, Bytes::from_static(b"abc")).unwrap();
         assert_eq!(&out[..], b"abc");
+    }
+
+    #[test]
+    fn replicated_request_increments_request_counter() {
+        let mut session = ConsensusSession::with_client_id(42);
+        let _ = session.register_request_id();
+        session.bind(99);
+        let payload = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+        }
+        .to_bytes();
+
+        let first = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        let second = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+
+        assert_eq!(decode_request_header(&first).request, 1);
+        assert_eq!(decode_request_header(&second).request, 2);
+        assert_eq!(decode_request_header(&second).session, 99);
+    }
+
+    #[test]
+    fn request_checksum_is_stamped_only_for_deduped_operations() {
+        // The stamp exists to stop a reused `request` number returning the wrong
+        // cached reply, so it is worth its hashing pass only where `ClientTable`
+        // dedups. Partition payloads are the large ones and carry `batch_checksum`
+        // over the same bytes already; hashing them again is pure cost.
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let payload = Bytes::from_static(b"payload");
+
+        let deduped =
+            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        assert_eq!(
+            decode_request_header(&deduped).request_checksum,
+            u128::from(calculate_checksum(&payload)),
+        );
+
+        let ping = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        assert_eq!(decode_request_header(&ping).request_checksum, 0);
+    }
+
+    #[test]
+    fn ping_uses_non_replicated_operation() {
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let bytes = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        let header = decode_request_header(&bytes);
+
+        assert_eq!(header.operation, Operation::NonReplicated);
+        assert_eq!(
+            u32::from_le_bytes(
+                header.reserved[NON_REPLICATED_CODE_RANGE]
+                    .try_into()
+                    .unwrap()
+            ),
+            PING_CODE
+        );
+        assert_eq!(header.session, 99);
+    }
+
+    #[test]
+    fn logout_uses_replicated_logout_operation() {
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let bytes =
+            encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
+        let header = decode_request_header(&bytes);
+
+        assert_eq!(header.operation, Operation::Logout);
+        assert_eq!(header.request, 1);
+        assert_eq!(header.session, 99);
     }
 
     #[test]

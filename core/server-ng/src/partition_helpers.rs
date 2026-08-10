@@ -694,7 +694,6 @@ pub async fn build_partition_fresh(
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);
     partition.should_increment_offset = false;
-    partition.stats.set_current_offset(0);
     debug_assert!(
         !partition.log.has_segments(),
         "fresh partition must not carry recovered segments"

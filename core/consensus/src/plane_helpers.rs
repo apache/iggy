@@ -20,10 +20,12 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::{
-    Command2, PrepareHeader, PrepareOkHeader, ReplyHeader, RoutedRequestHeader,
+    CHECKSUM_UNSEALED, Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
+    RoutedRequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
 use server_common::{Message, iobuf::Owned};
+use std::mem::size_of;
 use std::ops::AsyncFnOnce;
 
 /// Shared pipeline-first request flow (metadata + partitions).
@@ -116,6 +118,35 @@ where
     consensus.message_bus().send_to_replica(next, frozen).await
 }
 
+/// Recompute a prepare's integrity fields and report the first that disagrees.
+///
+/// Everywhere else `checksum` is an opaque token: the pipeline, the merge, and the
+/// repair ingest compare it for equality without asking whether it describes the
+/// bytes it arrived with, so a corrupted frame is admitted whenever its flipped
+/// value satisfies those comparisons, then journaled and re-served to peers.
+///
+/// `frame` is the whole message. The body range comes from [`frame_body`], not the
+/// caller, so no ingress point can verify a different span than the producer sealed.
+/// [`CHECKSUM_UNSEALED`] skips the partition plane, which carries `batch_checksum`
+/// over the same bytes instead.
+///
+/// # Errors
+/// Returns a static description of which field failed.
+pub fn verify_prepare_integrity(header: &PrepareHeader, frame: &[u8]) -> Result<(), &'static str> {
+    if header.checksum != CHECKSUM_UNSEALED && header.identity_checksum() != header.checksum {
+        return Err("prepare header does not match its own checksum");
+    }
+    if header.checksum_body != 0
+        && u128::from(iggy_common::calculate_checksum(frame_body(
+            frame,
+            header.size,
+        ))) != header.checksum_body
+    {
+        return Err("prepare body does not match its checksum");
+    }
+    Ok(())
+}
+
 /// Shared preflight checks for `on_replicate`.
 ///
 /// Returns current op on success.
@@ -169,6 +200,23 @@ where
     }
 
     Ok(current_op)
+}
+
+/// Stamp [`PrepareHeader::identity_checksum`] into a freshly built prepare.
+///
+/// Call once, after every other field is final: the checksum covers them.
+/// `checksum_body` in particular, since that is how the body reaches the value.
+///
+/// # Panics
+/// If the message is shorter than its own header.
+#[must_use]
+pub fn seal_prepare_checksum(mut message: Message<PrepareHeader>) -> Message<PrepareHeader> {
+    let checksum = message.header().identity_checksum();
+    let bytes = &mut message.as_mut_slice()[..size_of::<PrepareHeader>()];
+    let header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(bytes)
+        .expect("a prepare header round-trips its own bit pattern");
+    header.checksum = checksum;
+    message
 }
 
 /// Shared preflight checks for `on_ack`.
@@ -510,7 +558,7 @@ where
 }
 
 /// [`build_deny_reply_from_request`] for layers that hold no consensus group
-/// for the request's namespace (a shard fencing a frame aimed at a torn-down
+/// for the request's group (a shard fencing a frame aimed at a torn-down
 /// or never-materialised partition).
 ///
 /// Replica-stamped fields (`cluster`, `view`, `replica`) echo the request
@@ -623,9 +671,13 @@ pub async fn send_prepare_ok<B, P>(
         ..Default::default()
     };
 
-    let message: Message<PrepareOkHeader> =
-        Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>())
-            .transmute_header(|_, new| *new = prepare_ok_header);
+    let message: Message<PrepareOkHeader> = Message::<PrepareOkHeader>::new(std::mem::size_of::<
+        PrepareOkHeader,
+    >())
+    .transmute_header(|_, new| {
+        *new = prepare_ok_header;
+        new.seal();
+    });
     let primary = consensus.primary_index(consensus.view());
 
     consensus
@@ -637,9 +689,17 @@ pub async fn send_prepare_ok<B, P>(
 mod tests {
     use super::*;
     use crate::{Consensus, LocalPipeline, VsrAction};
+    use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
+    use iggy_common::calculate_checksum;
     use message_bus::SendError;
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
+
+    /// `PrepareHeader`'s alignment, which every suffix body has to satisfy.
+    const BODY_ALIGN: usize = align_of::<PrepareHeader>();
+
+    /// A control-message body, aligned for the headers packed into it.
+    type Body = AVec<u8, ConstAlign<BODY_ALIGN>>;
 
     #[derive(Debug, Default)]
     struct NoopBus;
@@ -814,7 +874,7 @@ mod tests {
             checksum: 0,
             checksum_body: 0,
             cluster: 0,
-            size: 0,
+            size: std::mem::size_of::<DoViewChangeHeader>() as u32,
             view: 1,
             release: 0,
             command: Command2::DoViewChange,
@@ -824,12 +884,69 @@ mod tests {
             commit,
             group: 0,
             log_view: 0,
-            reserved: [0; 100],
+            reserved: [0; 68],
+            nack_bitset: 0,
+            present_bitset: 0,
         };
         assert!(header(dvc_commit).validate().is_ok());
         assert!(
             header(5).validate().is_err(),
             "commit > op must be rejected by the wire gate"
+        );
+    }
+
+    #[test]
+    fn given_restamped_view_when_sealing_should_keep_the_same_identity() {
+        // `restamp_prepare_view` rewrites `view` on retransmission. If the identity
+        // moved with it, one op would carry different checksums per receiving view
+        // and the merge would read them as competing prepares nacking each other.
+        let base = PrepareHeader {
+            command: Command2::Prepare,
+            operation: iggy_binary_protocol::Operation::CreateStream,
+            op: 9,
+            view: 4,
+            client: 11,
+            request: 2,
+            timestamp: 1234,
+            checksum_body: 99,
+            ..Default::default()
+        };
+        let restamped = PrepareHeader { view: 12, ..base };
+        assert_eq!(
+            base.identity_checksum(),
+            restamped.identity_checksum(),
+            "view must not participate in a prepare's identity"
+        );
+    }
+
+    #[test]
+    fn given_different_prepares_at_one_op_when_sealing_should_differ() {
+        // The distinction the merge depends on: two prepares at one op number are
+        // told apart, so a canonical header is distinguishable from a stale one.
+        let first = PrepareHeader {
+            command: Command2::Prepare,
+            operation: iggy_binary_protocol::Operation::CreateStream,
+            op: 5,
+            client: 1,
+            request: 1,
+            timestamp: 100,
+            ..Default::default()
+        };
+        let second = PrepareHeader { client: 2, ..first };
+        assert_ne!(
+            first.identity_checksum(),
+            second.identity_checksum(),
+            "distinct prepares at the same op must not share an identity"
+        );
+
+        let body_differs = PrepareHeader {
+            checksum_body: 7,
+            ..first
+        };
+        assert_ne!(
+            first.identity_checksum(),
+            body_differs.identity_checksum(),
+            "the body reaches the identity through checksum_body"
         );
     }
 
@@ -892,62 +1009,348 @@ mod tests {
         assert_eq!(typed.header().command, Command2::PrepareOk);
     }
 
-    #[test]
-    fn loopback_cleared_on_complete_view_change_as_primary() {
-        use iggy_binary_protocol::{DoViewChangeHeader, StartViewChangeHeader};
+    /// A sender's suffix and matching body bytes for a replica that holds every op
+    /// in `commit..=op` and can serve each body. Checksums derive from `(op, view)`
+    /// so the hash chain connects, which the merge checks.
+    fn dvc_with_full_suffix(
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        commit: u64,
+    ) -> (iggy_binary_protocol::DoViewChangeHeader, Body) {
+        dvc_with_suffix(replica, view, log_view, op, commit, None)
+    }
 
-        // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
-        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
-        consensus.init();
+    /// As [`dvc_with_full_suffix`], but `withhold_body` names one op whose present
+    /// bit is cleared: header held, body unservable. A quorum where every sender
+    /// withholds the same op decides nothing yet.
+    fn dvc_with_suffix(
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        commit: u64,
+        withhold_body: Option<u64>,
+    ) -> (iggy_binary_protocol::DoViewChangeHeader, Body) {
+        use iggy_binary_protocol::DoViewChangeHeader;
 
-        // SVC from replica 1, view 3. Replica 0 advances to view 3
-        // (reset_view_change_state clears loopback), records own SVC+DVC and
-        // replica 1's SVC. DVC quorum needs 2; have 1.
-        let svc = StartViewChangeHeader {
+        let headers = suffix_headers(commit, op, log_view);
+        let body = encode_body(&headers);
+        let mut present = if headers.is_empty() {
+            0
+        } else {
+            (1u128 << headers.len()) - 1
+        };
+        if let Some(withheld) = withhold_body
+            && let Some(index) = headers.iter().position(|header| header.op == withheld)
+        {
+            present &= !(1u128 << index);
+        }
+        let header = DoViewChangeHeader {
             checksum: 0,
             checksum_body: 0,
             cluster: 0,
-            size: 0,
-            view: 3,
+            size: u32::try_from(std::mem::size_of::<DoViewChangeHeader>() + body.len())
+                .expect("synthetic DVC frame fits u32"),
+            view,
+            release: 0,
+            command: Command2::DoViewChange,
+            replica,
+            reserved_frame: [0; 66],
+            op,
+            commit,
+            group: 0,
+            log_view,
+            reserved: [0; 68],
+            nack_bitset: 0,
+            present_bitset: present,
+        };
+        (header, body)
+    }
+
+    /// Headers for `low..=high`, high-to-low as a suffix requires, sealed and
+    /// chained the way a real producer writes them.
+    ///
+    /// Built ascending so each `parent` is the previous entry's real identity, then
+    /// reversed. The decoder recomputes both, so fabricated checksums are rejected
+    /// before the code under test sees them.
+    fn suffix_headers(low: u64, high: u64, view: u32) -> Vec<PrepareHeader> {
+        if high == 0 {
+            return Vec::new();
+        }
+        let mut parent = 0u128;
+        let mut ascending = Vec::new();
+        for op in low.max(1)..=high {
+            let mut header = PrepareHeader {
+                command: Command2::Prepare,
+                operation: iggy_binary_protocol::Operation::CreateStream,
+                op,
+                view,
+                parent,
+                // Strictly increasing with op, so the suffix reads decreasing.
+                timestamp: op,
+                // Zero so the DVC's own commit drives `commit_max`.
+                commit: 0,
+                ..Default::default()
+            };
+            header.checksum = header.identity_checksum();
+            parent = header.checksum;
+            ascending.push(header);
+        }
+        ascending.reverse();
+        ascending
+    }
+
+    fn svc_header(replica: u8, view: u32) -> iggy_binary_protocol::StartViewChangeHeader {
+        iggy_binary_protocol::StartViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: u32::try_from(std::mem::size_of::<
+                iggy_binary_protocol::StartViewChangeHeader,
+            >())
+            .expect("header fits u32"),
+            view,
             release: 0,
             command: Command2::StartViewChange,
-            replica: 1,
+            replica,
             reserved_frame: [0; 66],
             group: 0,
             reserved: [0; 120],
+        }
+    }
+
+    /// Install the suffix this replica would read from its own journal.
+    fn install_local_suffix(
+        consensus: &VsrConsensus<NoopBus, LocalPipeline>,
+        op: u64,
+        commit: u64,
+        log_view: u32,
+    ) {
+        let headers = suffix_headers(commit, op, log_view);
+        consensus.set_local_dvc_suffix(crate::dvc_merge::suffix_all_present(headers));
+    }
+
+    #[test]
+    fn given_an_undecidable_quorum_when_a_later_dvc_decides_it_should_start_the_view() {
+        // Reaching a view-change quorum is not the same as deciding a log. Latching
+        // `do_view_change_quorum` at the quorum makes every non-Ready outcome
+        // terminal: later DoViewChanges are recorded, but the guard that calls the
+        // merge is already false, so the view burns its status timeout for nothing.
+        //
+        // 5 replicas, view_change quorum 3, replica 0 is primary for view 5.
+        let consensus = VsrConsensus::new(1, 0, 5, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        // This replica holds op 4's header but cannot serve its body. Suffix entries
+        // run high-to-low, so bit 0 is op 4: clearing it offers ops 3 and 2 only.
+        let local = suffix_headers(2, 4, 0);
+        consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(local, 0, 0b110));
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 5));
+
+        // Two peers report, reaching the quorum of 3. All three hold op 4's header,
+        // none can serve its body, and two replicas have yet to report.
+        for replica in [1u8, 2] {
+            let (dvc, body) = dvc_with_suffix(replica, 5, 0, 4, 2, Some(4));
+            let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+            assert!(actions.is_empty());
+        }
+        assert!(
+            consensus.pending_view_log().is_none(),
+            "op 4 is neither servable nor provably dead, so nothing may be parked yet"
+        );
+
+        // Replica 3 arrives holding the body: the deciding message, still merged.
+        let (dvc, body) = dvc_with_full_suffix(3, 5, 0, 4, 2);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        let pending = consensus
+            .pending_view_log()
+            .expect("the DVC that supplies the missing body must complete the merge");
+        assert_eq!(pending.op_head, 4);
+        assert_eq!(pending.commit_max, 2);
+    }
+
+    #[test]
+    fn given_a_sealed_prepare_when_verifying_integrity_should_accept() {
+        let message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command2::Prepare;
+                header.op = 7;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).expect("header fits u32");
+            },
+        );
+        let sealed = seal_prepare_checksum(message);
+        assert_eq!(verify_prepare_integrity(sealed.header(), &[]), Ok(()));
+    }
+
+    #[test]
+    fn given_a_prepare_whose_header_was_altered_when_verifying_should_reject() {
+        // Downstream compares `checksum` as an opaque token, so without this a frame
+        // corrupted in transit is journaled and then re-served to peers from the WAL.
+        let message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command2::Prepare;
+                header.op = 7;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).expect("header fits u32");
+            },
+        );
+        let mut sealed = seal_prepare_checksum(message);
+        let bytes = &mut sealed.as_mut_slice()[..size_of::<PrepareHeader>()];
+        let header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(bytes)
+            .expect("a prepare header round-trips its own bit pattern");
+        header.op = 8;
+        assert!(verify_prepare_integrity(&header.clone(), &[]).is_err());
+    }
+
+    #[test]
+    fn given_an_unsealed_prepare_when_verifying_should_abstain() {
+        // The partition plane leaves `checksum` at `CHECKSUM_UNSEALED` and carries a
+        // verified `batch_checksum` over the same bytes instead.
+        let header = PrepareHeader {
+            command: Command2::Prepare,
+            op: 7,
+            ..Default::default()
         };
-        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc);
+        assert_eq!(header.checksum, CHECKSUM_UNSEALED);
+        assert_eq!(verify_prepare_integrity(&header, &[]), Ok(()));
+    }
+
+    /// A frame carrying `body`, with `size` covering exactly header + body and
+    /// `checksum_body` sealed over it, as the metadata projection does.
+    /// `trailing` bytes of garbage past the sealed frame, which `size` does not
+    /// cover. The buffer is `MESSAGE_ALIGN`ed: `PrepareHeader` holds `u128`s, so a
+    /// `Vec<u8>` would only be 16-aligned by the allocator's good graces and miri
+    /// rejects the cast.
+    fn sealed_frame(body: &[u8], trailing: usize) -> Owned<MESSAGE_ALIGN> {
+        let size = size_of::<PrepareHeader>() + body.len();
+        let mut frame = Owned::<MESSAGE_ALIGN>::zeroed(size + trailing);
+        let bytes = frame.as_mut_slice();
+        bytes[size_of::<PrepareHeader>()..size].copy_from_slice(body);
+        bytes[size..].fill(0xAA);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut bytes[..size_of::<PrepareHeader>()],
+        );
+        header.command = Command2::Prepare;
+        header.op = 7;
+        header.size = u32::try_from(size).expect("fits u32");
+        header.checksum_body = u128::from(calculate_checksum(body));
+        frame
+    }
+
+    fn frame_header(frame: &Owned<MESSAGE_ALIGN>) -> PrepareHeader {
+        *bytemuck::checked::from_bytes::<PrepareHeader>(
+            &frame.as_slice()[..size_of::<PrepareHeader>()],
+        )
+    }
+
+    #[test]
+    fn given_a_prepare_whose_body_was_altered_when_verifying_should_reject() {
+        let mut frame = sealed_frame(b"body", 0);
+        let header = frame_header(&frame);
+        assert_eq!(verify_prepare_integrity(&header, frame.as_slice()), Ok(()));
+
+        *frame
+            .as_mut_slice()
+            .last_mut()
+            .expect("the frame has a body") ^= 1;
+        assert!(verify_prepare_integrity(&header, frame.as_slice()).is_err());
+    }
+
+    #[test]
+    fn given_bytes_past_the_frame_size_when_verifying_should_ignore_them() {
+        // `try_from` accepts a buffer longer than `size` without trimming; hashing to
+        // the end would reject a correctly sealed prepare and disagree with the WAL scan.
+        let padded = sealed_frame(b"body", 16);
+        let header = frame_header(&padded);
+        assert_eq!(
+            verify_prepare_integrity(&header, padded.as_slice()),
+            Ok(()),
+            "only the bytes `size` covers are the body"
+        );
+    }
+
+    #[test]
+    fn given_a_size_that_overruns_the_buffer_when_verifying_should_reject() {
+        // Truncated frame, header still claims the full length: the body it names is
+        // not there to hash.
+        let frame = sealed_frame(b"body", 0);
+        let header = frame_header(&frame);
+
+        let truncated = &frame.as_slice()[..frame.as_slice().len() - 1];
+        assert!(verify_prepare_integrity(&header, truncated).is_err());
+    }
+
+    #[test]
+    fn given_a_parked_merge_when_not_yet_started_should_not_advance_log_view() {
+        // `log_view` claims "my log IS the log this view decided", which is what
+        // makes a sender canonical next time. Raising it when the merge parks, before
+        // the merged head is installed, lets a primary-elect that never finishes
+        // repair vote as canonical carrying its own stale head, and ops the merge
+        // kept then fall outside the next scan range, dropped with no nack.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(3);
+        install_local_suffix(&consensus, 3, 2, 0);
+        assert_eq!(consensus.log_view(), 0);
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, 3, 2);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        assert!(consensus.pending_view_log().is_some(), "the merge parks");
+        assert_eq!(
+            consensus.log_view(),
+            0,
+            "a parked merge has installed nothing, so log_view must still \
+             describe the log this replica actually holds"
+        );
+        assert_eq!(consensus.view(), 3, "the view itself did advance");
+
+        let _ = consensus.start_pending_view(PlaneKind::Metadata);
+        assert_eq!(
+            consensus.log_view(),
+            3,
+            "installing the merged head is what earns the log_view claim"
+        );
+    }
+
+    #[test]
+    fn loopback_cleared_on_complete_view_change_as_primary() {
+        // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(3);
+        install_local_suffix(&consensus, 3, 2, 0);
+
+        // SVC from replica 1, view 3. Replica 0 advances, records own SVC+DVC and
+        // replica 1's SVC. DVC quorum needs 2; have 1.
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
 
         // Stale loopback queued between SVC and DVC quorum.
         let stale_msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
         consensus.push_loopback(stale_msg.into_generic());
 
-        // DVC from replica 2, view 3, quorum, complete_view_change_as_primary fires.
-        let dvc = DoViewChangeHeader {
-            checksum: 0,
-            checksum_body: 0,
-            cluster: 0,
-            size: 0,
-            view: 3,
-            release: 0,
-            command: Command2::DoViewChange,
-            replica: 2,
-            reserved_frame: [0; 66],
-            op: 0,
-            commit: 0,
-            group: 0,
-            log_view: 0,
-            reserved: [0; 100],
-        };
-        let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc);
+        // DVC from replica 2 forms the quorum and the merge settles the log.
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, 3, 2);
+        let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
 
-        // View change complete → SendStartView action.
+        // Parked: nothing is announced until the journal can serve it.
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, crate::VsrAction::SendStartView { .. })),
-            "expected SendStartView after DVC quorum"
+            actions.is_empty(),
+            "a merged view change must announce nothing until repair completes"
         );
+        let pending = consensus
+            .pending_view_log()
+            .expect("a decidable quorum must park a merged log");
+        assert_eq!(pending.op_head, 3);
+        assert_eq!(pending.commit_max, 2);
+        assert_eq!(consensus.status(), Status::ViewChange);
 
         // Stale loopback must be cleared.
         let mut buf = Vec::new();
@@ -956,17 +1359,240 @@ mod tests {
             buf.is_empty(),
             "loopback queue must be empty after view change completion"
         );
+
+        // Journal now covers the merged log, so the view starts and announces.
+        let actions = consensus.start_pending_view(PlaneKind::Metadata);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, crate::VsrAction::SendStartView { .. })),
+            "expected SendStartView once the view starts"
+        );
+        assert_eq!(consensus.status(), Status::Normal);
+        assert!(
+            consensus.pending_view_log().is_none(),
+            "starting the view must consume the parked log"
+        );
     }
 
-    /// A DVC winner may claim an uncommitted range up to the *configured*
+    /// Refusing to start a view must not be terminal.
+    ///
+    /// A parked merge leaves the replica in `ViewChange` announcing nothing if the
+    /// bodies never arrive, which is the intended trade against losing data but has
+    /// to stay recoverable: the status timeout fires, escalates, and drops the parked
+    /// log. Reusing a log merged for a superseded view would leak a truncation
+    /// decided there into a view that never voted for it.
+    /// A `StartView` from the view's primary, optionally carrying the view's
+    /// canonical headers.
+    fn start_view_with_suffix(
+        replica: u8,
+        view: u32,
+        op: u64,
+        commit: u64,
+        with_suffix: bool,
+    ) -> (iggy_binary_protocol::StartViewHeader, Body) {
+        use iggy_binary_protocol::StartViewHeader;
+
+        let body = if with_suffix {
+            encode_body(&suffix_headers(commit, op, view))
+        } else {
+            Body::new(BODY_ALIGN)
+        };
+        let header = StartViewHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: u32::try_from(std::mem::size_of::<StartViewHeader>() + body.len())
+                .expect("synthetic StartView fits u32"),
+            view,
+            release: 0,
+            command: Command2::StartView,
+            replica,
+            reserved_frame: [0; 66],
+            op,
+            commit,
+            group: 0,
+            reserved: [0; 88],
+            incarnation: 0,
+        };
+        (header, body)
+    }
+
+    /// Encode headers as a control-message body.
+    ///
+    /// Aligned, because `dvc_suffix_decode` uses a checked `bytemuck` cast per
+    /// 256-byte chunk: a `Vec<u8>` body reports `MalformedHeader` for entry 0
+    /// instead of the failure under test. glibc over-aligns these; Miri does not.
+    fn encode_body(headers: &[PrepareHeader]) -> Body {
+        let mut body = Body::with_capacity(BODY_ALIGN, std::mem::size_of_val(headers));
+        for header in headers {
+            body.extend_from_slice(bytemuck::bytes_of(header));
+        }
+        body
+    }
+
+    #[test]
+    fn given_a_corrupted_suffix_entry_when_decoding_should_reject_the_frame() {
+        // The worst failure mode: a flipped bit in a canonical sender's header makes
+        // it canonical for the view, so honest senders read as disagreeing and can
+        // reach a nack quorum against a committed op. Recomputing keeps that out.
+        let mut headers = suffix_headers(2, 4, 1);
+        headers[0].timestamp ^= 0xFF;
+        let body = encode_body(&headers);
+
+        let error = crate::dvc_suffix_decode(&body, 4, 0, 0)
+            .expect_err("a header that does not match its own checksum must be rejected");
+        assert_eq!(error, crate::DvcSuffixError::ChecksumMismatch { index: 0 });
+    }
+
+    #[test]
+    fn given_a_broken_suffix_chain_when_decoding_should_reject_the_frame() {
+        // Well-sealed entries that do not link: a log, not a bag of records.
+        let mut headers = suffix_headers(2, 4, 1);
+        headers[0].parent ^= 0xFF;
+        headers[0].checksum = headers[0].identity_checksum();
+        let body = encode_body(&headers);
+
+        let error = crate::dvc_suffix_decode(&body, 4, 0, 0)
+            .expect_err("a suffix whose entries do not chain must be rejected");
+        assert_eq!(error, crate::DvcSuffixError::ChainBreak { index: 1 });
+    }
+
+    #[test]
+    fn given_a_suffix_with_mixed_view_stamps_when_decoding_should_be_accepted() {
+        // A stitched suffix: a held op keeps the view that delivered it, a repaired
+        // neighbour carries the view that decided it. Rejecting drops the sender's
+        // vote forever (the retransmit is byte-identical) and the cluster can fail to
+        // elect. No re-seal: `identity_checksum` excludes `view`.
+        let mut headers = suffix_headers(2, 4, 2);
+        headers[1].view = 1;
+        let body = encode_body(&headers);
+
+        let suffix = crate::dvc_suffix_decode(&body, 4, 0, 0)
+            .expect("a stitched suffix with mixed view stamps must decode");
+        assert_eq!(suffix.len(), 3);
+    }
+
+    #[test]
+    fn given_an_unsealed_suffix_when_decoding_should_be_accepted() {
+        // The on-disk sentinel: suffixes are read out of the journal, which may hold
+        // pre-seal entries, and partition-plane prepares are unsealed by construction.
+        let headers: Vec<PrepareHeader> = suffix_headers(2, 4, 1)
+            .into_iter()
+            .map(|mut header| {
+                header.checksum = 0;
+                header.parent = 0;
+                header
+            })
+            .collect();
+        let body = encode_body(&headers);
+
+        let suffix =
+            crate::dvc_suffix_decode(&body, 4, 0, 0).expect("an unsealed suffix must still decode");
+        assert_eq!(suffix.len(), 3);
+    }
+
+    #[test]
+    fn given_start_view_with_suffix_when_adopted_should_record_the_canonical_headers() {
+        // The backup keeps the view's headers so its repair ingest can reject a body
+        // that disagrees with the view's decision, and so a disagreeing local entry
+        // is reported rather than silently blocking its own repair forever.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        // Replica 1 is primary for view 1 (1 % 3).
+        let (header, body) = start_view_with_suffix(1, 1, 5, 3, true);
+        let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, &body);
+
+        assert!(!actions.is_empty(), "a valid StartView must be adopted");
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.sequencer().current_sequence(), 5);
+
+        let recorded = consensus
+            .pending_view_log()
+            .expect("an adopted StartView carrying a suffix must record its headers");
+        assert_eq!(recorded.op_head, 5);
+        assert_eq!(recorded.commit_max, 3);
+        assert_eq!(
+            recorded.headers.iter().map(|h| h.op).collect::<Vec<_>>(),
+            vec![5, 4, 3],
+            "headers run high-to-low from the head down to the announced commit"
+        );
+    }
+
+    #[test]
+    fn given_start_view_without_suffix_when_adopted_should_trust_the_announced_op() {
+        // Probe answers and stale-view corrections carry numbers only: a backup must
+        // still adopt, and record nothing it could mistake for the view's decision.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let (header, body) = start_view_with_suffix(1, 1, 5, 3, false);
+        assert!(body.is_empty());
+        let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, &body);
+
+        assert!(
+            !actions.is_empty(),
+            "a numbers-only StartView must still adopt"
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 5);
+        assert!(
+            consensus.pending_view_log().is_none(),
+            "no suffix means no canonical headers to verify against"
+        );
+    }
+
+    #[test]
+    fn given_parked_view_change_when_status_timeout_fires_should_escalate_and_drop_merged_log() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(3);
+        install_local_suffix(&consensus, 3, 2, 0);
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, 3, 2);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        // Parked: no shard here reports coverage, so the view never starts.
+        assert!(consensus.pending_view_log().is_some());
+        assert_eq!(consensus.status(), Status::ViewChange);
+        let parked_view = consensus.view();
+
+        // `VIEW_CHANGE_STATUS_TICKS` is 500; tick past it. Escalation shows as the
+        // view advancing, since the 50-tick SVC retransmit also emits a send.
+        let mut escalated = false;
+        for _ in 0..600 {
+            let _ = consensus.tick(PlaneKind::Metadata);
+            if consensus.view() > parked_view {
+                escalated = true;
+                break;
+            }
+        }
+
+        assert!(
+            escalated,
+            "a parked view change must still escalate on the status timeout"
+        );
+        assert!(
+            consensus.view() > parked_view,
+            "escalation must advance the view past {parked_view}, got {}",
+            consensus.view()
+        );
+        assert!(
+            consensus.pending_view_log().is_none(),
+            "the superseded merged log must be dropped, not carried into the next view"
+        );
+        assert_eq!(consensus.status(), Status::ViewChange);
+    }
+
+    /// A merged log may claim an uncommitted range up to the *configured*
     /// prepare depth. With a pipeline deeper than the default const, the new
     /// primary schedules the rebuild rather than panicking on the old
     /// `PIPELINE_PREPARE_QUEUE_MAX` bound.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
-    fn given_view_change_range_above_default_when_complete_as_primary_should_rebuild() {
-        use iggy_binary_protocol::{DoViewChangeHeader, StartViewChangeHeader};
-
+    fn given_view_change_range_above_default_when_starting_view_should_rebuild() {
         let depth = crate::PIPELINE_PREPARE_QUEUE_MAX * 2;
         // Strictly above the default const, still within the configured depth.
         let winner_op = (crate::PIPELINE_PREPARE_QUEUE_MAX + 8) as u64;
@@ -981,48 +1607,23 @@ mod tests {
             LocalPipeline::with_capacities(depth, depth * 2),
         );
         consensus.init();
+        consensus.sequencer().set_sequence(winner_op);
+        install_local_suffix(&consensus, winner_op, 1, 0);
 
         // SVC from replica 1 moves replica 0 into view 3 and records its own DVC.
-        let svc = StartViewChangeHeader {
-            checksum: 0,
-            checksum_body: 0,
-            cluster: 0,
-            size: 0,
-            view: 3,
-            release: 0,
-            command: Command2::StartViewChange,
-            replica: 1,
-            reserved_frame: [0; 66],
-            group: 0,
-            reserved: [0; 120],
-        };
-        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc);
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
 
-        // DVC from replica 2 claims a log head far past commit, forming quorum.
-        let dvc = DoViewChangeHeader {
-            checksum: 0,
-            checksum_body: 0,
-            cluster: 0,
-            size: 0,
-            view: 3,
-            release: 0,
-            command: Command2::DoViewChange,
-            replica: 2,
-            reserved_frame: [0; 66],
-            op: winner_op,
-            commit: 0,
-            group: 0,
-            log_view: 0,
-            reserved: [0; 100],
-        };
-        let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc);
+        // DVC from replica 2 claims the same deep log, forming quorum.
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, winner_op, 1);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
 
+        let actions = consensus.start_pending_view(PlaneKind::Metadata);
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                VsrAction::RebuildPipeline { from_op: 1, to_op } if *to_op == winner_op
+                VsrAction::RebuildPipeline { from_op: 2, to_op } if *to_op == winner_op
             )),
-            "expected RebuildPipeline over the full uncommitted range"
+            "expected RebuildPipeline over the uncommitted range, got {actions:?}"
         );
     }
 

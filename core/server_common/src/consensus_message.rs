@@ -237,6 +237,9 @@ where
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
+        // Before `validate`: a header that did not survive the link intact cannot
+        // have any of its fields believed, and `validate` reads them.
+        typed.verify_frame()?;
         typed.validate()?;
 
         Ok(Message {
@@ -273,6 +276,9 @@ where
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
+        // Before `validate`: a header that did not survive the link intact cannot
+        // have any of its fields believed, and `validate` reads them.
+        typed.verify_frame()?;
         typed.validate()?;
 
         let typed_message = unsafe { &*std::ptr::from_ref(self).cast::<Message<T, B>>() };
@@ -656,7 +662,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Operation, ReplyHeader, RequestHeader};
+    use iggy_binary_protocol::{
+        HEADER_SIZE, Operation, ReplyHeader, RequestHeader, frame_checksum_bytes,
+    };
     use smallvec::smallvec;
 
     // Field offsets via `offset_of!`: a field reorder fails to compile here
@@ -686,8 +694,66 @@ mod tests {
             // `Register` needs session 0 and request 0, which zeroed bytes
             // already satisfy.
             buf[REQUEST_OPERATION_OFF] = Operation::Register as u8;
+            seal_header_bytes(buf);
         }
         o
+    }
+
+    /// Seal a hand-built frame the way a real sender does.
+    ///
+    /// Control headers are rejected on the typed parse unless `checksum` covers the
+    /// rest of the header, so a fixture that skips this tests the rejection path.
+    fn seal_header_bytes(buf: &mut [u8]) {
+        let header: &[u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().expect("frame is a header");
+        let checksum = frame_checksum_bytes(header);
+        buf[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    /// A `DoViewChange` frame carrying a one-entry suffix, sealed.
+    ///
+    /// One entry rather than none because a bitset bit is only legal within the
+    /// suffix, so an empty frame cannot express the attack this seals against.
+    fn sealed_do_view_change() -> Owned<MESSAGE_ALIGN> {
+        const DVC_SIZE: usize = HEADER_SIZE * 2;
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(DVC_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(DVC_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command2::DoViewChange as u8;
+            seal_header_bytes(buf);
+        }
+        owned
+    }
+
+    #[test]
+    fn given_a_sealed_do_view_change_when_dispatching_should_accept() {
+        let generic = Message::<GenericHeader>::try_from(sealed_do_view_change())
+            .expect("a sealed DoViewChange frames correctly");
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Ok(MessageBag::DoViewChange(_))
+        ));
+    }
+
+    #[test]
+    fn given_a_flipped_nack_bit_when_dispatching_should_reject_the_frame() {
+        // Why the header seal exists. `validate` accepts this frame: the bit sits
+        // inside the one-entry suffix, where a legitimate nack lives. Downstream the
+        // bitset goes to the merge unchanged and authorises truncating a committed op.
+        const NACK_OFF: usize = std::mem::offset_of!(DoViewChangeHeader, nack_bitset);
+
+        let mut owned = sealed_do_view_change();
+        owned.as_mut_slice()[NACK_OFF] ^= 0x01;
+
+        let generic =
+            Message::<GenericHeader>::try_from(owned).expect("framing does not inspect the bitset");
+        assert!(
+            matches!(
+                MessageBag::try_from(generic),
+                Err(ConsensusError::FrameChecksumMismatch { .. })
+            ),
+            "a manufactured nack must not reach the merge"
+        );
     }
 
     // MessageBag round-trip for the probe + repair command family. Locks
@@ -714,6 +780,8 @@ mod tests {
                 let buf = owned.as_mut_slice();
                 buf[FROM_OP_OFF..FROM_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
                 buf[TO_OP_OFF..TO_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+                // Re-seal: the range was written after `header_bytes` sealed.
+                seal_header_bytes(buf);
             }
             let generic = Message::<GenericHeader>::try_from(owned)
                 .unwrap_or_else(|e| panic!("{command:?} failed generic framing: {e}"));

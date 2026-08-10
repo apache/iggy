@@ -3097,3 +3097,162 @@ mod tests {
         assert_no_frame_drops(&sim);
     }
 }
+
+#[cfg(test)]
+mod view_change_data_loss_tests {
+    //! A committed, client-acknowledged op must survive a view change even when
+    //! the replica that becomes primary is the one missing it.
+    //!
+    //! Without the sender's log suffix on the `DoViewChange`, the new primary adopts
+    //! the winner's op NUMBER, rebuilds its pipeline from its OWN journal, hits the
+    //! hole, and truncates the range as "decided lost" -- discarding an op journaled
+    //! on a quorum and already replied to. The next client op then reuses the number
+    //! and collides with the stale entry on the up-to-date backup.
+    //!
+    //! The hole here is punched at the commit point, so the assertion that catches a
+    //! regression is "the op came back", not "the head did not regress": with nothing
+    //! uncommitted there is no pipeline rebuild to truncate. The `dvc_merge` unit
+    //! tests cover the sequencer-truncation path directly.
+
+    use super::*;
+    use consensus::{Sequencer, Status};
+    use journal::Journal;
+
+    /// Whether a replica's shard-0 metadata consensus is a settled primary in a
+    /// view past the one that crashed.
+    fn is_new_metadata_primary(sim: &Simulator, replica: u8) -> bool {
+        sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|consensus| {
+                consensus.view() > 0
+                    && consensus.status() == Status::Normal
+                    && consensus.is_primary()
+            })
+    }
+
+    /// `(head op, commit_max)` of a replica's shard-0 metadata consensus.
+    fn metadata_progress(sim: &Simulator, replica: u8) -> (u64, u64) {
+        let consensus = sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus");
+        (
+            consensus.sequencer().current_sequence(),
+            consensus.commit_max(),
+        )
+    }
+
+    /// Whether a replica's metadata journal holds `op`.
+    fn metadata_holds(sim: &Simulator, replica: u8, op: u64) -> bool {
+        let journal = sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the metadata journal");
+        let slot = usize::try_from(op).expect("op fits usize");
+        Journal::header(journal.as_ref(), slot).is_some()
+    }
+
+    /// Drop `op` from a replica's metadata journal, leaving a hole.
+    fn metadata_forget(sim: &Simulator, replica: u8, op: u64) -> bool {
+        sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the metadata journal")
+            .forget_op(op)
+    }
+
+    #[test]
+    fn given_committed_op_missing_on_next_primary_when_primary_crashes_should_survive_view_change()
+    {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+
+        // Commit some metadata ops so there is a log to lose. Registering binds
+        // a session, and seeding a stream/topic/partition commits several more.
+        sim.register_client_with_primary(&client);
+        sim.seed_stream_topic_partition(IggyNamespace::new(1, 1, 0));
+        for _ in 0..200 {
+            sim.step();
+        }
+
+        // Replica 0 is primary for view 0, so replica 1 is primary-elect for view 1
+        // (view % replica_count): the replica whose hole decides the outcome.
+        let next_primary: u8 = 1;
+        let (_, committed) = metadata_progress(&sim, next_primary);
+        assert!(
+            committed > 0,
+            "the test needs committed metadata ops to be able to lose one"
+        );
+
+        // Every replica must hold the op: the point is that it IS recoverable, and
+        // only the incoming primary lacks it.
+        for replica in 0..replica_count {
+            assert!(
+                metadata_holds(&sim, replica, committed),
+                "replica {replica} must hold op {committed} before the hole is punched"
+            );
+        }
+
+        // Punch the hole: the incoming primary forgets an op its peers still hold.
+        assert!(
+            metadata_forget(&sim, next_primary, committed),
+            "op {committed} must have been present to forget"
+        );
+
+        sim.replica_crash(0);
+        for _ in 0..1500 {
+            sim.step();
+        }
+
+        // A primary must emerge among the survivors.
+        let primary = (1..replica_count)
+            .find(|&replica| is_new_metadata_primary(&sim, replica))
+            .expect("a metadata primary must be elected after the old one crashes");
+
+        let (head, commit_max) = metadata_progress(&sim, primary);
+
+        // The committed op must not have been discarded.
+        assert!(
+            head >= committed,
+            "the new primary's head ({head}) regressed below the committed op ({committed}); \
+             a committed, acknowledged op was discarded by the view change"
+        );
+        assert!(
+            commit_max >= committed,
+            "commit_max ({commit_max}) regressed below the committed op ({committed})"
+        );
+
+        // And back in the new primary's journal: the view change repaired the hole
+        // from a peer that offered the body, rather than declaring the op lost.
+        assert!(
+            metadata_holds(&sim, primary, committed),
+            "op {committed} must be repaired back into the new primary's journal"
+        );
+    }
+}
