@@ -4018,7 +4018,18 @@ where
             guard.clear();
             paths
         };
-        for path in consumer_paths.into_iter().chain(group_paths) {
+        // Sweep the directories too, not just the map-derived paths: a purge is a
+        // full reset, and an offset file the live map never held -- a pre-purge
+        // op re-persisted by journal repair on a restarted replica -- would
+        // otherwise survive for boot to hydrate back.
+        let strayed =
+            crate::state_transfer::strayed_offset_files(self.consumer_offsets_path.as_deref(), &[])
+                .into_iter()
+                .chain(crate::state_transfer::strayed_offset_files(
+                    self.consumer_group_offsets_path.as_deref(),
+                    &[],
+                ));
+        for path in consumer_paths.into_iter().chain(group_paths).chain(strayed) {
             let _ = delete_persisted_offset(&path).await;
         }
         // Directory fsync so those unlinks stick, mirroring the install path: a
@@ -6546,6 +6557,50 @@ mod tests {
             ),
             "an offer that merely matches the committed generation is not a purge \
              advancing past it, so the rewind fence must hold: got {refused:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&partition_dir);
+    }
+
+    /// A replica that missed the purge entirely: the metadata plane has it
+    /// committed, this replica never applied it, so its frontier still measures
+    /// the PRE-purge offset space. The reset offer is the only thing that can
+    /// converge it, and journal repair cannot bridge the floor the purge moved,
+    /// so refusing it strands the replica on pre-purge data for good.
+    ///
+    /// Distinguished from the lagging-origin case above by `next_offset == 0`:
+    /// nothing has been appended since the purge, so there is no post-purge
+    /// data for the offer to rewind.
+    #[compio::test]
+    async fn given_replica_that_missed_the_purge_when_offered_the_reset_should_install() {
+        let partition_dir = transfer_fence_dir("missed-purge-reset").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.should_increment_offset = true;
+        partition.offset.store(99, Ordering::Release);
+        assert_eq!(
+            partition.applied_purge_generation(),
+            0,
+            "a replica that missed the purge has not recorded its generation"
+        );
+
+        let reset = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 1,
+            next_offset: 0,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+        };
+        let installed = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &reset.encode(), 1)
+            .await;
+
+        assert!(
+            !matches!(
+                installed,
+                Err(crate::state_transfer::PartitionInstallError::OfferRewindsDurableData { .. })
+            ),
+            "the reset for a purge this replica never applied must pass the rewind \
+             fence, got {installed:?}"
         );
 
         let _ = std::fs::remove_dir_all(&partition_dir);
