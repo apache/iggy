@@ -17,14 +17,19 @@
 
 services:
   iggy-server:
-    image: apache/iggy:latest
+    # The SDK is vsr-only, so build the vsr server from the repo instead
+    # of pulling the legacy apache/iggy image.
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    build:
+      context: ../..
+      dockerfile: core/server-ng/Dockerfile
     container_name: iggy-server
     restart: unless-stopped
     networks:
       - iggy
     ports:
       - 3000:3000
-      - 8080:8080
       - 8090:8090
     volumes:
       - iggy-server:/local_data

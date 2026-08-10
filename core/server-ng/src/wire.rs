@@ -30,6 +30,23 @@ pub(crate) fn request_body(request: &Message<RequestHeader>) -> &[u8] {
     &request.as_slice()[std::mem::size_of::<RequestHeader>()..request.header().size as usize]
 }
 
+/// Check a client's `request_checksum` against the body it stamps.
+///
+/// Must run BEFORE any body rewrite: PAT / password / consumer-group paths
+/// substitute server-chosen bytes. Zero is "unstamped" and skips the check, so an
+/// SDK predating the stamp still works.
+///
+/// # Errors
+/// [`IggyError::InvalidFormat`] when the stamp disagrees with the body.
+pub(crate) fn verify_request_checksum(request: &Message<RequestHeader>) -> Result<(), IggyError> {
+    let stamped = request.header().request_checksum;
+    if stamped == 0 || u128::from(iggy_common::calculate_checksum(request_body(request))) == stamped
+    {
+        return Ok(());
+    }
+    Err(IggyError::InvalidFormat)
+}
+
 /// Map the transport kind to the legacy wire discriminant
 /// (`1=TCP, 2=QUIC, 4=WebSocket`); TLS variants report their base
 /// transport. `ClientTransportKind` is `#[non_exhaustive]`, so any other
@@ -65,11 +82,78 @@ pub(crate) fn rewrite_request_body(
     .expect("zeroed bytes are a valid request header");
     *header = *request.header();
     header.size = size;
+    // Both describe the body just replaced, and nothing recomputes them for a
+    // `RequestHeader` -- the prepare projection derives its own `checksum_body`
+    // downstream. Clear rather than recompute; carrying them forward is a stale claim.
+    header.checksum = 0;
+    header.checksum_body = 0;
+    // `request_checksum` is deliberately NOT touched: it stamps what the CLIENT sent,
+    // already validated at admission. Re-stamping it over the substituted body would
+    // make the client-table reuse check compare a value no client ever produced.
     rewritten.as_mut_slice()[std::mem::size_of::<RequestHeader>()..].copy_from_slice(body);
-    // TODO(vsr): the body changed but `request_checksum` / `checksum` /
-    // `checksum_body` were copied verbatim from the original header. Safe
-    // today because the SDK initializes `request_checksum` to 0 and the
-    // server does not validate it; the moment integrity checking lands,
-    // recompute these here (or zero them and re-sign in a follow-up step).
     Ok(rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{request_body, rewrite_request_body};
+    use bytes::Bytes;
+    use iggy_binary_protocol::{Command2, Operation, RequestHeader};
+    use server_common::Message;
+    use std::mem::size_of;
+
+    fn request(body: &[u8], request_checksum: u128) -> Message<RequestHeader> {
+        let total_size = size_of::<RequestHeader>() + body.len();
+        let mut message = Message::<RequestHeader>::new(total_size).transmute_header(
+            |_, header: &mut RequestHeader| {
+                header.command = Command2::Request;
+                header.operation = Operation::CreateStream;
+                header.client = 1;
+                header.session = 1;
+                header.request = 9;
+                header.size = u32::try_from(total_size).expect("fits u32");
+                header.request_checksum = request_checksum;
+                header.checksum = 0xdead;
+                header.checksum_body = 0xbeef;
+            },
+        );
+        message.as_mut_slice()[size_of::<RequestHeader>()..].copy_from_slice(body);
+        message
+    }
+
+    #[test]
+    fn given_a_body_rewrite_should_keep_the_client_stamp_and_clear_the_stale_seals() {
+        // The secret-bearing wire body is swapped for the hash-carrying replicated
+        // one. `request_checksum` describes what the client sent and admission has
+        // already checked it, so it must survive; the other two describe the body
+        // that just went away.
+        let original = request(b"plaintext-secret", 0x1234);
+        let rewritten = rewrite_request_body(&original, &Bytes::from_static(b"argon2-hash"))
+            .expect("the rewritten body fits a request message");
+
+        assert_eq!(
+            rewritten.header().request_checksum,
+            0x1234,
+            "the client's stamp must not be re-signed over server-substituted bytes"
+        );
+        assert_eq!(rewritten.header().checksum, 0);
+        assert_eq!(rewritten.header().checksum_body, 0);
+        assert_eq!(request_body(&rewritten), b"argon2-hash");
+        assert_eq!(
+            rewritten.header().size as usize,
+            size_of::<RequestHeader>() + b"argon2-hash".len(),
+            "`size` follows the new body, so `request_body` bounds it correctly"
+        );
+    }
+
+    #[test]
+    fn given_an_unstamped_request_when_rewriting_should_stay_unstamped() {
+        // Zero means "unstamped" all the way through the client table, so a rewrite
+        // must not manufacture a stamp for a client that sent none.
+        let original = request(b"plaintext-secret", 0);
+        let rewritten = rewrite_request_body(&original, &Bytes::from_static(b"argon2-hash"))
+            .expect("the rewritten body fits a request message");
+
+        assert_eq!(rewritten.header().request_checksum, 0);
+    }
 }

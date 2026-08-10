@@ -183,7 +183,8 @@ public interface CommandCode {
         CREATE(602),
         DELETE(603),
         JOIN(604),
-        LEAVE(605);
+        LEAVE(605),
+        SYNC(606);
 
         private final int value;
 

@@ -156,10 +156,12 @@ class IggyErrorCodeTest {
         "1, ERROR",
         "3, INVALID_COMMAND",
         "4, INVALID_FORMAT",
-        "6, FEATURE_UNAVAILABLE",
+        "5, FEATURE_UNAVAILABLE",
+        "6, INVALID_IDENTIFIER",
         "7, CANNOT_PARSE_INT",
         "8, CANNOT_PARSE_SLICE",
         "9, CANNOT_PARSE_UTF8",
+        "30, STALE_CLIENT",
 
         // Resource errors
         "20, RESOURCE_NOT_FOUND",
@@ -181,6 +183,8 @@ class IggyErrorCodeTest {
         "52, CLIENT_NOT_FOUND",
         "53, INVALID_PAT_TOKEN",
         "54, PAT_NAME_ALREADY_EXISTS",
+        "57, TRANSIENT_NOT_COMMITTED",
+        "58, TRANSIENT_NOT_ACCEPTED",
         "77, PASSWORD_DOES_NOT_MATCH",
         "78, PASSWORD_HASH_INTERNAL_ERROR",
 
@@ -223,6 +227,9 @@ class IggyErrorCodeTest {
         "7002, TOO_BIG_MESSAGE",
         "7003, INVALID_MESSAGE_CHECKSUM",
         "7004, MESSAGE_NOT_FOUND",
+
+        // VSR protocol errors
+        "14003, INCOMPATIBLE_PROTOCOL_VERSION",
     })
     void fromCodeReturnsExpectedIggyErrorCodeWhenCodeIsValid(int code, IggyErrorCode expected) {
         var iggyErrorCode = IggyErrorCode.fromCode(code);

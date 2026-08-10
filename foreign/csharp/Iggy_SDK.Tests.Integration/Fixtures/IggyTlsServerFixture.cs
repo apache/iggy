@@ -25,6 +25,8 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 /// </summary>
 public class IggyTlsServerFixture : IggyServerFixture
 {
+    protected override string ClusterName => "tls";
+
     /// <summary>
     ///     Environment variables with TLS configuration enabled.
     /// </summary>
@@ -43,8 +45,5 @@ public class IggyTlsServerFixture : IggyServerFixture
         new("Certs", "/app/certs/")
     ];
 
-    public override async Task InitializeAsync()
-    {
-        await IggyContainer!.StartAsync();
-    }
+    protected override int NodeCount => 1;
 }

@@ -42,6 +42,7 @@ use consensus::{
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
     emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, replicate_preflight,
     replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
+    verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -770,7 +771,24 @@ where
         self.offset.store(recovered_end, Ordering::Release);
         self.dirty_offset.store(recovered_end, Ordering::Relaxed);
         self.should_increment_offset = true;
-        self.stats.set_current_offset(recovered_end);
+    }
+
+    /// Copy this incarnation's offset counter into the shared
+    /// [`PartitionStats`], making it the value readers (offset validation,
+    /// `get_topic`, `get_stats`) see.
+    ///
+    /// Called from [`IggyPartitions::insert`](crate::IggyPartitions::insert)
+    /// only: when the instance BECOMES the addressable one, never while
+    /// building it. The stats registry keys on the namespace, not the
+    /// incarnation, so every build of a namespace holds the same `Arc` as
+    /// whatever is already serving it -- and a build is not guaranteed to be
+    /// adopted. Seeding from the build instead leaves a zeroed `current_offset`
+    /// on the live incarnation, which then rejects every
+    /// `store_consumer_offset` above 0 with `InvalidOffset` until the next send
+    /// re-seeds it.
+    pub(crate) fn publish_current_offset(&self) {
+        self.stats
+            .set_current_offset(self.offset.load(Ordering::Acquire));
     }
 
     /// The next message offset this replica will mint, `0` while the offset
@@ -1416,6 +1434,7 @@ where
         &mut self,
         consumer: PollingConsumer,
         args: &PollingArgs,
+        validate_checksum: bool,
     ) -> PollPlan {
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
@@ -1527,6 +1546,7 @@ where
             segments,
             start_position,
             namespace_raw: self.namespace().inner(),
+            validate_checksum,
         };
         // Snapshot the resident journal tail now (on the pump, under the
         // borrow) so the straddle splice runs off-task on owned data with no
@@ -2096,6 +2116,22 @@ where
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
+        // Same reason as the metadata plane: `checksum` is compared as an opaque token
+        // downstream, so a corrupted frame passes whenever its flipped value satisfies
+        // those comparisons.
+        if let Err(reason) = verify_prepare_integrity(&header, message.as_slice()) {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    ReplicaLogContext::from_consensus(self.consensus(), PlaneKind::Partitions),
+                    "discarding prepare that failed its own integrity check",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op)
+                .with_reason(reason),
+            );
+            return;
+        }
         let current_op = {
             let consensus = self.consensus();
             match replicate_preflight(consensus, &header) {
@@ -3982,7 +4018,18 @@ where
             guard.clear();
             paths
         };
-        for path in consumer_paths.into_iter().chain(group_paths) {
+        // Sweep the directories too, not just the map-derived paths: a purge is a
+        // full reset, and an offset file the live map never held -- a pre-purge
+        // op re-persisted by journal repair on a restarted replica -- would
+        // otherwise survive for boot to hydrate back.
+        let strayed =
+            crate::state_transfer::strayed_offset_files(self.consumer_offsets_path.as_deref(), &[])
+                .into_iter()
+                .chain(crate::state_transfer::strayed_offset_files(
+                    self.consumer_group_offsets_path.as_deref(),
+                    &[],
+                ));
+        for path in consumer_paths.into_iter().chain(group_paths).chain(strayed) {
             let _ = delete_persisted_offset(&path).await;
         }
         // Directory fsync so those unlinks stick, mirroring the install path: a
@@ -5187,7 +5234,10 @@ mod tests {
         let path = format!("{dir}/{consumer_id}");
         let read_disk = |p: &str| -> u64 {
             let bytes = std::fs::read(p).expect("offset file exists");
-            u64::from_le_bytes(bytes.try_into().expect("offset file is 8 bytes"))
+            match crate::offset_storage::decode_offset_record(&bytes) {
+                crate::offset_storage::OffsetRecord::Value { offset, .. } => offset,
+                other => panic!("offset file must hold a readable value, got {other:?}"),
+            }
         };
 
         // Reordered auto-commits: the later op (109) trails the earlier (114).
@@ -5270,7 +5320,10 @@ mod tests {
         let path = format!("{dir}/{consumer_id}");
         let read_disk = |p: &str| -> u64 {
             let bytes = std::fs::read(p).expect("offset file exists");
-            u64::from_le_bytes(bytes.try_into().expect("offset file is 8 bytes"))
+            match crate::offset_storage::decode_offset_record(&bytes) {
+                crate::offset_storage::OffsetRecord::Value { offset, .. } => offset,
+                other => panic!("offset file must hold a readable value, got {other:?}"),
+            }
         };
 
         // Simulate the previous process run: the file already holds 114.
@@ -5433,6 +5486,7 @@ mod tests {
         // open exhausts retries -> the walk must fault-close before segment two.
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
+            validate_checksum: true,
             segments: vec![
                 DiskSegment {
                     start_offset: 0,
@@ -5518,6 +5572,7 @@ mod tests {
 
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
+            validate_checksum: true,
             segments: vec![
                 DiskSegment {
                     start_offset: 0,
@@ -5550,6 +5605,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A segment whose bytes decode cleanly but do not match their own
+    /// `batch_checksum`: bit rot at rest, not a torn write. Unverified, the batch is
+    /// served and a consumer reads data provably not what was written.
+    ///
+    /// Detection only, per the operator knob: the poll fails closed and reports, with
+    /// no attempt to repair.
+    #[compio::test]
+    async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-bitrot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        // Structurally valid with one payload byte flipped, so every length and
+        // offset still decodes and only the checksum disagrees.
+        let mut record = build_segment_record(namespace, 0);
+        let last = record.len() - 1;
+        record[last] ^= 0x01;
+        let record_len = record.len() as u64;
+        let path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&path)
+                .await
+                .expect("create segment file");
+            let (written, _) = file.write_all_at(record, 0).await.into();
+            written.expect("write segment record");
+            file.sync_all().await.expect("flush segment file");
+        }
+
+        let plan = |validate_checksum| DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum,
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: None,
+            }],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+        let query = MessageLookup::Offset {
+            offset: 0,
+            count: 10,
+            ceiling: u64::MAX,
+        };
+
+        let outcome = plan(true).read_disk(query).await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Faulted),
+            "a batch that fails its own checksum must fault-close"
+        );
+
+        // What the opt-out costs. The shipped default is `true` because of it.
+        let outcome = plan(false).read_disk(query).await;
+        assert!(
+            matches!(outcome, DiskReadOutcome::Matched { .. }),
+            "verification off is an explicit opt-out: the corrupt batch is served"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A simulated (file-less) partition has no segment files by design, so a
     /// disk poll with no dir must stay `Empty`: the caller then serves the
     /// resident journal tier, the sim's only tier.
@@ -5564,6 +5690,7 @@ mod tests {
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
+            validate_checksum: true,
         };
 
         let outcome = plan
@@ -5594,6 +5721,7 @@ mod tests {
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
+            validate_checksum: true,
         };
 
         let outcome = plan
@@ -5652,6 +5780,7 @@ mod tests {
 
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
@@ -5682,6 +5811,7 @@ mod tests {
 
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
@@ -5741,6 +5871,7 @@ mod tests {
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
@@ -5824,6 +5955,7 @@ mod tests {
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: log_len,
@@ -5922,6 +6054,7 @@ mod tests {
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: log_len,
@@ -5999,6 +6132,7 @@ mod tests {
         let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
@@ -6046,6 +6180,7 @@ mod tests {
         // unlinked pre-purge inode.
         let resumed = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            validate_checksum: true,
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
@@ -6074,6 +6209,7 @@ mod tests {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
             enforce_fsync: false,
+            validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024),
             encryptor: None,
         }
@@ -6421,6 +6557,50 @@ mod tests {
             ),
             "an offer that merely matches the committed generation is not a purge \
              advancing past it, so the rewind fence must hold: got {refused:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&partition_dir);
+    }
+
+    /// A replica that missed the purge entirely: the metadata plane has it
+    /// committed, this replica never applied it, so its frontier still measures
+    /// the PRE-purge offset space. The reset offer is the only thing that can
+    /// converge it, and journal repair cannot bridge the floor the purge moved,
+    /// so refusing it strands the replica on pre-purge data for good.
+    ///
+    /// Distinguished from the lagging-origin case above by `next_offset == 0`:
+    /// nothing has been appended since the purge, so there is no post-purge
+    /// data for the offer to rewind.
+    #[compio::test]
+    async fn given_replica_that_missed_the_purge_when_offered_the_reset_should_install() {
+        let partition_dir = transfer_fence_dir("missed-purge-reset").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.should_increment_offset = true;
+        partition.offset.store(99, Ordering::Release);
+        assert_eq!(
+            partition.applied_purge_generation(),
+            0,
+            "a replica that missed the purge has not recorded its generation"
+        );
+
+        let reset = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 1,
+            next_offset: 0,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+        };
+        let installed = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &reset.encode(), 1)
+            .await;
+
+        assert!(
+            !matches!(
+                installed,
+                Err(crate::state_transfer::PartitionInstallError::OfferRewindsDurableData { .. })
+            ),
+            "the reset for a purge this replica never applied must pass the rewind \
+             fence, got {installed:?}"
         );
 
         let _ = std::fs::remove_dir_all(&partition_dir);

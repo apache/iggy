@@ -25,10 +25,18 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// <summary>
     ///     Status code returned by the server.
     /// </summary>
-    public int StatusCode { get; init; }
+    public int StatusCode { get; }
 
-    internal IggyInvalidStatusCodeException(int statusCode, string message) : base(message)
+    /// <summary>
+    ///     Whether the status code was reported by the server rather than raised by the client. The two share one
+    ///     code space, and only a server verdict may drive retry or failover: a locally raised code says nothing
+    ///     about what the cluster did with the request.
+    /// </summary>
+    public bool FromServer { get; }
+
+    internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false) : base(message)
     {
         StatusCode = statusCode;
+        FromServer = fromServer;
     }
 }

@@ -46,6 +46,11 @@ pub struct Shadow {
     pub stream_names: IndexSet<String>,
     /// Live topics by `(stream, topic)`. Only added if parent stream lives.
     pub topic_names: IndexSet<(String, String)>,
+    /// Partition count per live topic, keyed like `topic_names`. Lets
+    /// `create/delete_partitions` sample in-bounds vs over-count deliberately
+    /// (the server rejects an over-count delete with a committed
+    /// `InvalidPartitionsCount`, so the count must be known at sample time).
+    pub topic_partitions: HashMap<(String, String), u32>,
     pub user_names: IndexSet<String>,
     pub pat_names: IndexSet<String>,
     pub consumer_group_names: IndexSet<(String, String, String)>,
@@ -80,6 +85,7 @@ impl Shadow {
             namespaces_live,
             stream_names: IndexSet::new(),
             topic_names: IndexSet::new(),
+            topic_partitions: HashMap::new(),
             user_names: IndexSet::new(),
             pat_names: IndexSet::new(),
             consumer_group_names: IndexSet::new(),
@@ -191,31 +197,23 @@ impl Shadow {
         let applied = match e {
             Effect::None => true,
             Effect::AddStream { name } => self.stream_names.insert(name),
-            Effect::RemoveStream { name } => {
-                let removed = self.stream_names.shift_remove(&name);
-                self.topic_names.retain(|(s, _)| s != &name);
-                self.consumer_group_names.retain(|(s, _, _)| s != &name);
-                removed
-            }
+            Effect::RemoveStream { name } => self.remove_stream(&name),
             Effect::AddTopic {
                 stream,
                 name,
-                partitions: _,
-            } => {
-                if self.stream_names.contains(&stream) {
-                    self.topic_names.insert((stream, name))
-                } else {
-                    false
-                }
-            }
-            Effect::RemoveTopic { stream, name } => {
-                let removed = self
-                    .topic_names
-                    .shift_remove(&(stream.clone(), name.clone()));
-                self.consumer_group_names
-                    .retain(|(s, t, _)| !(s == &stream && t == &name));
-                removed
-            }
+                partitions,
+            } => self.add_topic(stream, name, partitions),
+            Effect::RemoveTopic { stream, name } => self.remove_topic(&stream, &name),
+            Effect::AddPartitions {
+                stream,
+                topic,
+                count,
+            } => self.add_partitions(stream, topic, count),
+            Effect::RemovePartitions {
+                stream,
+                topic,
+                count,
+            } => self.remove_partitions(stream, topic, count),
             Effect::AddUser { name } => {
                 // Matches `create_user::sample`'s pw-{name} baseline.
                 let password = format!("pw-{name}");
@@ -286,6 +284,60 @@ impl Shadow {
         }
     }
 
+    fn remove_stream(&mut self, name: &str) -> bool {
+        let removed = self.stream_names.shift_remove(name);
+        self.topic_names.retain(|(s, _)| s != name);
+        self.topic_partitions.retain(|(s, _), _| s != name);
+        self.consumer_group_names.retain(|(s, _, _)| s != name);
+        removed
+    }
+
+    fn add_topic(&mut self, stream: String, name: String, partitions: u32) -> bool {
+        if self.stream_names.contains(&stream) {
+            self.topic_partitions
+                .insert((stream.clone(), name.clone()), partitions);
+            self.topic_names.insert((stream, name))
+        } else {
+            false
+        }
+    }
+
+    fn remove_topic(&mut self, stream: &str, name: &str) -> bool {
+        let removed = self
+            .topic_names
+            .shift_remove(&(stream.to_string(), name.to_string()));
+        self.topic_partitions
+            .remove(&(stream.to_string(), name.to_string()));
+        self.consumer_group_names
+            .retain(|(s, t, _)| !(s == stream && t == name));
+        removed
+    }
+
+    fn add_partitions(&mut self, stream: String, topic: String, count: u32) -> bool {
+        self.topic_partitions
+            .get_mut(&(stream, topic))
+            .is_some_and(|partitions| {
+                *partitions = partitions.saturating_add(count);
+                true
+            })
+    }
+
+    /// The committed delete was in bounds on the server; a shadow count below
+    /// it means a concurrent commit defeated the sample-time precondition,
+    /// same as the other `applied = false` paths.
+    fn remove_partitions(&mut self, stream: String, topic: String, count: u32) -> bool {
+        self.topic_partitions
+            .get_mut(&(stream, topic))
+            .is_some_and(|partitions| {
+                if *partitions >= count {
+                    *partitions -= count;
+                    true
+                } else {
+                    false
+                }
+            })
+    }
+
     fn rename_stream(&mut self, old: &str, new: &str) -> bool {
         if !self.stream_names.shift_remove(old) {
             return false;
@@ -301,6 +353,16 @@ impl Shadow {
                     (new_owned.clone(), t)
                 } else {
                     (s, t)
+                }
+            })
+            .collect();
+        self.topic_partitions = std::mem::take(&mut self.topic_partitions)
+            .into_iter()
+            .map(|((s, t), partitions)| {
+                if s == old {
+                    ((new_owned.clone(), t), partitions)
+                } else {
+                    ((s, t), partitions)
                 }
             })
             .collect();
@@ -326,6 +388,13 @@ impl Shadow {
         }
         self.topic_names
             .insert((stream.to_string(), new.to_string()));
+        if let Some(partitions) = self
+            .topic_partitions
+            .remove(&(stream.to_string(), old.to_string()))
+        {
+            self.topic_partitions
+                .insert((stream.to_string(), new.to_string()), partitions);
+        }
         let new_owned = new.to_string();
         self.consumer_group_names = std::mem::take(&mut self.consumer_group_names)
             .into_iter()

@@ -22,11 +22,13 @@
 // To run them locally:
 //
 //   1. Start the server with TLS:
+//      TODO(hubcio): change to iggy-server once legacy server is removed
+//      (core/server has VSR support)
 //        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
 //        IGGY_TCP_TLS_ENABLED=true \
 //        IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //        IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//        cargo r --bin iggy-server
+//        cargo r --bin iggy-server-ng --features vsr
 //
 //   2. Run the tests:
 //        cd foreign/node
@@ -51,14 +53,10 @@ const caCertPath = process.env.E2E_ROOT_CA_CERT
 const getTlsClient = () => {
   const [, port] = getIggyAddress();
   const caCert = readFileSync(caCertPath);
-  const protocol = process.env.IGGY_TEST_PROTOCOL === 'vsr'
-    ? 'vsr'
-    : 'classic';
 
   // The server certificate SAN is DNS:localhost, so we connect via 'localhost'
   // for proper hostname verification (consistent with Python and C# TLS tests).
   return new Client({
-    protocol,
     transport: 'TLS',
     options: {
       port,

@@ -139,6 +139,42 @@ running prek / committing / pushing. This list is not exhaustive and other hook 
    ./scripts/ci/markdownlint.sh --fix foreign/python/README.md # read the diff after applying this, sometimes it gives unwanted results, e.g. messing up enumerations
    ```
 
+## Client Configuration
+
+`IggyClient` takes either a server address or a `TcpConfig`:
+
+```python
+import asyncio
+from datetime import timedelta
+
+from apache_iggy import AutoLogin, IggyClient, TcpConfig, TcpReconnectionConfig
+
+
+async def main():
+    client = IggyClient(
+        TcpConfig(
+            server_address="127.0.0.1:8090",
+            auto_login=AutoLogin.username_password("iggy", "iggy"),
+            reconnection=TcpReconnectionConfig(
+                enabled=True,
+                max_retries=10,
+                interval=timedelta(seconds=2),
+                reestablish_after=timedelta(seconds=30),
+            ),
+            heartbeat_interval=timedelta(seconds=5),
+            # tls_enabled=True,
+            # tls_domain="localhost",
+            # tls_ca_file="../../core/certs/iggy_ca_cert.pem",
+            # tls_validate_certificate=True,
+            # nodelay=True,
+        )
+    )
+    await client.connect()
+
+
+asyncio.run(main())
+```
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.

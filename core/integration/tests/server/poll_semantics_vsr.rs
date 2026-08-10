@@ -17,8 +17,10 @@
 
 //! Poll semantics against server-ng (vsr): a poll aimed at a partition id the
 //! topic does not have must surface a typed `PartitionNotFound`, not an empty
-//! poll a consumer would read as end-of-partition; the same addressing error
-//! on `get_consumer_offset` must not decode as "no offset stored"; and a
+//! poll a consumer would read as end-of-partition; a poll whose stream or
+//! topic does not resolve must surface the legacy `StreamIdNotFound` /
+//! `TopicIdNotFound` the same way; the partition addressing error on
+//! `get_consumer_offset` must not decode as "no offset stored"; and a
 //! timestamp poll must be at-or-after, including the message stamped exactly at
 //! the queried timestamp (the timestamp replies report per message).
 
@@ -85,6 +87,68 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
         .await
         .expect("poll on the existing partition still succeeds");
     assert_eq!(valid.messages.len(), 0, "empty topic polls empty");
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn given_missing_stream_when_polling_should_reject_stream_not_found(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream_id = Identifier::from_str_value("no-such-stream").expect("stream identifier");
+    let topic_id = Identifier::from_str_value("no-such-topic").expect("topic identifier");
+
+    let result = client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+        )
+        .await;
+
+    let expected = IggyError::StreamIdNotFound(Identifier::default()).as_code();
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == expected),
+        "polling a missing stream must surface Err(StreamIdNotFound), got {result:?}"
+    );
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn given_missing_topic_when_polling_should_reject_topic_not_found(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("topicless-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("topicless-stream").expect("stream identifier");
+    let topic_id = Identifier::from_str_value("no-such-topic").expect("topic identifier");
+
+    let result = client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+        )
+        .await;
+
+    let expected =
+        IggyError::TopicIdNotFound(Identifier::default(), Identifier::default()).as_code();
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == expected),
+        "polling a missing topic of an existing stream must surface Err(TopicIdNotFound), \
+         got {result:?}"
+    );
 }
 
 /// `get_consumer_offset` answered an unknown partition with an empty body,
