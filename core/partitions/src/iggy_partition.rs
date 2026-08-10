@@ -776,7 +776,8 @@ where
     /// [`PartitionStats`], making it the value readers (offset validation,
     /// `get_topic`, `get_stats`) see.
     ///
-    /// Call it when the instance BECOMES the addressable one, never while
+    /// Called from [`IggyPartitions::insert`](crate::IggyPartitions::insert)
+    /// only: when the instance BECOMES the addressable one, never while
     /// building it. The stats registry keys on the namespace, not the
     /// incarnation, so every build of a namespace holds the same `Arc` as
     /// whatever is already serving it -- and a build is not guaranteed to be
@@ -784,7 +785,7 @@ where
     /// on the live incarnation, which then rejects every
     /// `store_consumer_offset` above 0 with `InvalidOffset` until the next send
     /// re-seeds it.
-    pub fn publish_current_offset(&self) {
+    pub(crate) fn publish_current_offset(&self) {
         self.stats
             .set_current_offset(self.offset.load(Ordering::Acquire));
     }

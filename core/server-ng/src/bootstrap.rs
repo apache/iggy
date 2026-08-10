@@ -1838,7 +1838,6 @@ async fn build_shard_for_thread(
             }
             Err(error) => return Err(error),
         };
-        partition.publish_current_offset();
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,

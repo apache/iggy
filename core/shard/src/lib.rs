@@ -1925,11 +1925,18 @@ where
                     // incarnation's path and folded that into the namespace's
                     // shared stats.
                     if partitions.contains(&namespace) {
+                        tracing::error!(
+                            shard = self_shard_id,
+                            ns_raw = namespace.inner(),
+                            epoch,
+                            "discarding duplicate InsertOwned for a live namespace: the \
+                             staged-op guard was bypassed and the build re-planted segment 0 \
+                             over the live incarnation's path"
+                        );
+                        self.metrics.record_duplicate_partition_build_discarded();
                         drop(partition);
                         continue;
                     }
-                    // Only the adopted incarnation may seed the shared stats.
-                    partition.publish_current_offset();
                     partitions.insert(namespace, *partition);
                     self.shards_table.insert(
                         namespace,
@@ -3230,7 +3237,6 @@ where
         // the restore at all, a simulator replica rebuilt against a retained
         // store resumes minting at 0 while its group is at N.
         partition.restore_offset_frontier(recovered_state.as_ref());
-        partition.publish_current_offset();
         partitions.insert(namespace, partition);
     }
 

@@ -481,9 +481,9 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     let target_set: AHashSet<IggyNamespace> = target.iter().map(|(ns, _)| *ns).collect();
     let mut counters = PassCounters::default();
 
-    let staged = reconcile_additions(ctx, target, &mut counters).await;
+    reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
-    reconcile_parked_frames(ctx, &staged, &mut counters);
+    reconcile_parked_frames(ctx, &mut counters);
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
     reconcile_segment_truncations(ctx, &mut counters);
     reconcile_partition_purges(ctx, &mut counters);
@@ -527,20 +527,14 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     true
 }
 
-/// Returns the namespaces carrying a staged, unapplied `ReconcileOp::InsertOwned`
-/// once this pass is done: the ones it built plus the ones an earlier pass built
-/// and the pump has not drained. The pump applies on its own task, so none of
-/// them are in `IggyPartitions` yet and [`reconcile_parked_frames`] would read
-/// them as un-materialised, aging frames for a partition that is on its way.
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
     target: Vec<(IggyNamespace, u64)>,
     counters: &mut PassCounters,
-) -> AHashSet<IggyNamespace> {
+) {
     let shard_id = ctx.shard.id;
     let partitions = ctx.shard.plane.partitions();
     let total_shards = u32::from(ctx.total_shards);
-    let mut staged = AHashSet::new();
 
     for (ns, epoch) in target {
         if partitions.contains(&ns) {
@@ -590,7 +584,7 @@ async fn reconcile_additions(
             // means the local partition is a prior incarnation carrying
             // stale segments/offsets/log. Tear it down; the
             // post-ConfirmRemove wake rebuilds it fresh next pass.
-            if ctx.shard.shards_table().epoch_for(ns) == Some(epoch) {
+            if shards_table_has_epoch(ctx, ns, epoch) {
                 continue;
             }
             trace!(
@@ -606,20 +600,34 @@ async fn reconcile_additions(
 
         let owning_shard = calculate_shard_assignment(&ns, total_shards);
         if owning_shard != shard_id {
-            stage_routing_row(ctx, ns, epoch, owning_shard, counters);
+            // Compare the epoch, not just presence: a delete + recreate
+            // recycles the slab keys, so the row survives with the DEAD
+            // incarnation's `created_revision`. A presence-only gate never
+            // refreshes it, and nothing else writes a non-owner's row.
+            //
+            // No mirror of the staged-`InsertOwned` guard below, deliberately:
+            // a lagging pump costs one duplicate `InsertRouted` per pass, and
+            // the apply is an idempotent row overwrite, while scanning the op
+            // queue per routed namespace would go quadratic.
+            if !shards_table_has_epoch(ctx, ns, epoch) {
+                ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertRouted {
+                    namespace: ns,
+                    owner: ShardId::new(owning_shard),
+                    epoch,
+                });
+                counters.routed += 1;
+            }
             continue;
         }
 
         // An earlier pass already built this one and the pump has not applied it
         // yet, so the `contains` test above reads false for finished work.
-        // Rebuilding is not a wasted-effort question: the second incarnation
-        // shares the namespace's `PartitionStats` with the live one and re-opens
-        // segment 0 with `file_exists = false`, which truncates. It joins
-        // `staged` so the parked-frame sweep still reads the namespace as
-        // building instead of aging its frames.
+        // Rebuilding is not a wasted-effort question: the second build shares
+        // the namespace's `PartitionStats` with the queued sibling and re-opens
+        // segment 0 with `file_exists = false`, truncating the file that
+        // sibling is about to serve.
         if ctx.shard.has_staged_insert_owned(ns) {
             counters.already_staged += 1;
-            staged.insert(ns);
             continue;
         }
 
@@ -657,7 +665,6 @@ async fn reconcile_additions(
                 });
                 ctx.record_success(ns, FailureCause::Add);
                 counters.materialised += 1;
-                staged.insert(ns);
             }
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
@@ -673,8 +680,6 @@ async fn reconcile_additions(
             }
         }
     }
-
-    staged
 }
 
 /// Retire parked frames the shard cannot serve, age the ones it might.
@@ -714,15 +719,15 @@ async fn reconcile_additions(
 /// timeout and no committed op dies on a local-convergence signal. Residency
 /// only; see `ParkedFrame::passes`.
 ///
-/// `staged_unapplied` is exempt: its `InsertOwned` is queued but not applied, so
-/// it reads as un-materialised here. It spans passes, not just the one that
-/// built the namespace, so the exemption covers arbitrary pump lag; dropping it
-/// ages frames on every commit-driven pass the pump falls behind.
-fn reconcile_parked_frames(
-    ctx: &ReconcilerCtx,
-    staged_unapplied: &AHashSet<IggyNamespace>,
-    counters: &mut PassCounters,
-) {
+/// A namespace with a staged, unapplied `InsertOwned` is exempt: its partition
+/// is on the way but reads as un-materialised here. The queue is asked per
+/// parked namespace ([`shard::IggyShard::has_staged_insert_owned`]) rather than
+/// carrying a set over from the additions pass, so the answer cannot go stale
+/// across `reconcile_removals`' awaits; `parked` is empty on the steady path,
+/// so the scan costs nothing there. The exemption spans passes, not just the
+/// one that built the namespace, covering arbitrary pump lag; dropping it ages
+/// frames on every commit-driven pass the pump falls behind.
+fn reconcile_parked_frames(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let parked = ctx.shard.parked_namespaces();
     if parked.is_empty() {
         return;
@@ -730,7 +735,7 @@ fn reconcile_parked_frames(
     let partitions = ctx.shard.plane.partitions();
     let total_shards = u32::from(ctx.total_shards);
     for ns in parked {
-        if staged_unapplied.contains(&ns) {
+        if ctx.shard.has_staged_insert_owned(ns) {
             continue;
         }
         // Tombstoned namespaces are still in the map, so `contains` below reads
@@ -1059,31 +1064,6 @@ fn fetch_partition_stats(
     })
 }
 
-/// Point this shard's routing row for `ns` at its owner, so a frame that lands
-/// here reaches the shard holding the partition.
-///
-/// Compares the epoch, not just presence: a delete + recreate recycles the slab
-/// keys, so the row survives with the DEAD incarnation's `created_revision`. A
-/// presence-only gate never refreshes it, and nothing else writes a non-owner's
-/// row.
-fn stage_routing_row(
-    ctx: &ReconcilerCtx,
-    ns: IggyNamespace,
-    epoch: u64,
-    owning_shard: u16,
-    counters: &mut PassCounters,
-) {
-    if shards_table_has_epoch(ctx, ns, epoch) {
-        return;
-    }
-    ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertRouted {
-        namespace: ns,
-        owner: ShardId::new(owning_shard),
-        epoch,
-    });
-    counters.routed += 1;
-}
-
 /// `true` when this shard's routing row for `ns` already records `epoch`. A row
 /// carrying any other epoch (or none) is stale and must be rewritten, since the
 /// namespace is byte-identical across incarnations.
@@ -1213,6 +1193,7 @@ mod tests {
     use std::mem::size_of;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -1629,8 +1610,8 @@ mod tests {
 
     /// The cross-pass guard: a pass must not rebuild a namespace an earlier pass
     /// already built and left queued. Rebuilding is not merely wasted work --
-    /// the second incarnation shares the namespace's `PartitionStats` with the
-    /// live one and re-opens segment 0 truncating -- so a pass has to recognise
+    /// the second build shares the namespace's `PartitionStats` with the queued
+    /// sibling and re-opens segment 0 truncating -- so a pass has to recognise
     /// the staged op, not just `partitions.contains`.
     #[compio::test]
     async fn second_pass_does_not_rebuild_a_namespace_already_staged() {
@@ -1675,15 +1656,23 @@ mod tests {
         );
     }
 
-    /// The stats registry keys on the namespace, not the incarnation, so a build
-    /// that never becomes addressable must leave those counters alone. Seeding
-    /// `current_offset` from the build instead zeroed it under the live
+    /// The stats registry keys on the namespace, not the incarnation, so
+    /// `current_offset` moves on adoption only: the pump seeds it from the
+    /// incarnation it inserts, and a build that never becomes addressable
+    /// leaves it alone. Seeding from the build instead zeroed it under the live
     /// incarnation, after which the partition plane's admission check read an
     /// empty offset space and answered every `store_consumer_offset` above 0
     /// with `InvalidOffset` (error 4100) until the next send re-seeded it.
+    ///
+    /// Both incarnations are built and staged by hand: the adopted one so its
+    /// counter is non-zero BEFORE insertion (a reconciler build always adopts
+    /// at 0, where the publish is indistinguishable from a no-op), and the
+    /// redundant one because `has_staged_insert_owned` now stops a pass from
+    /// producing it.
     #[compio::test]
     async fn discarded_build_leaves_live_partition_offset_intact() {
         const COMMITTED_OFFSET: u64 = 3;
+        const LIVE_EPOCH: u64 = 1;
 
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
@@ -1695,23 +1684,40 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
-        reconcile_pass(&ctx).await;
-        let stats = fetch_partition_stats(&ctx, ns).expect("materialised namespace has stats");
+        let stats = fetch_partition_stats(&ctx, ns).expect("committed namespace has stats");
+        let live = build_partition_fresh(
+            &config,
+            ns,
+            Arc::clone(&stats),
+            LIVE_EPOCH,
+            CLUSTER_ID,
+            0,
+            1,
+            Rc::clone(&ctx.shard.bus),
+        )
+        .await
+        .expect("live build succeeds");
+        // What a recovery leaves behind: an incarnation whose own counter is
+        // ahead of the zeroed shared stats until adoption publishes it.
+        live.offset.store(COMMITTED_OFFSET, Ordering::Release);
+        ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
+            namespace: ns,
+            partition: Box::new(live),
+            epoch: LIVE_EPOCH,
+        });
+        ctx.shard.apply_reconcile_ops();
 
-        // What a committed send leaves behind: `commit_partition_entry`
-        // advances the visible offset on this same shared `Arc`.
-        stats.set_current_offset(COMMITTED_OFFSET);
+        assert_eq!(
+            stats.current_offset(),
+            COMMITTED_OFFSET,
+            "adoption must publish the incarnation's offset into the shared stats"
+        );
 
-        // Built and staged by hand rather than by a second `reconcile_once`:
-        // `has_staged_insert_owned` now stops a pass from getting here, and the
-        // invariant under test is the one that has to hold anyway -- a build
-        // that does not become the addressable incarnation leaves the
-        // namespace's counters untouched.
         let redundant = build_partition_fresh(
             &config,
             ns,
             Arc::clone(&stats),
-            2,
+            LIVE_EPOCH + 1,
             CLUSTER_ID,
             0,
             1,
@@ -1722,7 +1728,7 @@ mod tests {
         ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
             namespace: ns,
             partition: Box::new(redundant),
-            epoch: 2,
+            epoch: LIVE_EPOCH + 1,
         });
         ctx.shard.apply_reconcile_ops();
 
@@ -1733,10 +1739,12 @@ mod tests {
              overwrites the ns -> idx entry and orphans the first partition, \
              leaking its VSR group and segment writers"
         );
+        // The epoch, not `shard_for`: on a single shard an adopt would write
+        // `ShardId::new(0)` too, but it would stamp the redundant op's epoch.
         assert_eq!(
-            shard.shards_table().shard_for(ns),
-            Some(0),
-            "the discarded op must not repoint the routing row"
+            shard.shards_table().epoch_for(ns),
+            Some(LIVE_EPOCH),
+            "the discarded op must not rewrite the routing row"
         );
         assert_eq!(
             stats.current_offset(),
