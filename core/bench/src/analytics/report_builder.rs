@@ -35,8 +35,8 @@ use iggy::prelude::{
 };
 use tracing::warn;
 
-/// Both the legacy server and server-ng synthesize exactly this cluster name
-/// for a non-clustered instance, so it is the single-node sentinel.
+/// The server synthesizes exactly this cluster name for a non-clustered
+/// instance, so it is the single-node sentinel.
 const SINGLE_NODE_CLUSTER_NAME: &str = "single-node";
 
 pub struct BenchmarkReportBuilder;

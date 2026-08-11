@@ -22,8 +22,6 @@
 //! frame carrying `IncompatibleProtocol` plus the accepted window; a body
 //! without a decodable prefix with `MalformedLogin` and a zero window.
 
-#![cfg(feature = "vsr")]
-
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{Command2, Operation, RequestHeader};

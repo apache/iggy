@@ -437,7 +437,7 @@ impl ClientTable {
 
     /// Resize the table to `max_clients` slots. Boot-only: reallocating a
     /// populated table would silently drop live sessions, so this must run
-    /// before any client registers (server-ng bootstrap applies the configured
+    /// before any client registers (the server bootstrap applies the configured
     /// `[metadata] clients_table_max` here).
     ///
     /// # Panics

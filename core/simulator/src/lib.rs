@@ -164,7 +164,7 @@ impl Simulator {
     }
 
     /// [`Simulator::new`] with `shards_per_replica` shards on every replica,
-    /// meshed exactly like server-ng bootstrap: metadata plane on shard 0,
+    /// meshed exactly like the server bootstrap: metadata plane on shard 0,
     /// partitions hash-assigned, one pump task per shard.
     ///
     /// # Panics
@@ -186,7 +186,7 @@ impl Simulator {
     }
 
     /// [`Simulator::with_shards`] with the deterministic dispatch shell on:
-    /// every shard wires server-ng's real dispatch handlers, so a client
+    /// every shard wires the server's real dispatch handlers, so a client
     /// request runs as a task the seeded executor interleaves with the
     /// pump. Off (the default) keeps the raw-`on_message` fast path.
     ///
@@ -276,7 +276,7 @@ impl Simulator {
             let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
             let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
             let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
-            // Single-writer metadata (mirrors server-ng bootstrap): shard 0
+            // Single-writer metadata (mirrors the server bootstrap): shard 0
             // builds the writable STM and mints a factory bundle; every peer
             // shard rebuilds a reader-mode mirror from it and sees committed
             // metadata through the shared read handle. Shards are built in index
@@ -317,7 +317,7 @@ impl Simulator {
                     );
                 }
 
-                // Same wiring as server-ng bootstrap: one pump task per
+                // Same wiring as the server bootstrap: one pump task per
                 // shard, stopped only by the (held) stop channel or a
                 // crash abort.
                 let (stop_tx, stop_rx) = shard::channel::<()>(1);
@@ -743,7 +743,7 @@ impl Simulator {
         let metadata_incarnation = self.replicas[idx].metadata_incarnation + 1;
         // Partition superblocks carry forward too: a group re-materialised after
         // the restart must recover its recorded view from the same store, exactly
-        // as a rebooted server-ng partition reads the record in its directory.
+        // as a rebooted server partition reads the record in its directory.
         let partition_superblocks =
             std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
 
@@ -814,7 +814,7 @@ impl Simulator {
         };
 
         // Re-materialise every group this replica had before the crash, as a
-        // rebooted server-ng re-opens every partition directory it owns. This
+        // rebooted the server re-opens every partition directory it owns. This
         // is what makes the carried-forward superblock load-bearing: the group
         // recovers the `(view, log_view)` it recorded instead of re-entering
         // view 0.
@@ -945,7 +945,7 @@ impl Simulator {
 /// the routing row on every shard of that replica.
 ///
 /// Shared by [`SimCluster::init_partition`] and the restart path: a rebooted
-/// server-ng re-opens every partition directory it owns, so the sim has to
+/// server re-opens every partition directory it owns, so the sim has to
 /// re-materialise too, otherwise the superblock a restart carries forward is
 /// never read back and the recovered-view branch is dead code.
 fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
@@ -2613,7 +2613,7 @@ mod tests {
         sim.schedule_hash()
     }
 
-    /// Turning the dispatch shell on wires server-ng's real deferred
+    /// Turning the dispatch shell on wires the server's real deferred
     /// handlers on every shard. With no client traffic none of them is
     /// reached, so the consensus plane both replays deterministically and
     /// matches the shell-off schedule: the toggle is genuinely off the

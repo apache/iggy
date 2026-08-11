@@ -71,8 +71,6 @@
 //! work later settles on an explicit resume handshake, adjust `resume_request`
 //! to speak it -- but it must stay credential-bearing.
 
-#![cfg(feature = "vsr")]
-
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};

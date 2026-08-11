@@ -128,7 +128,7 @@ impl Sequencer for LocalSequencer {
 
 /// Default in-flight prepare-queue depth.
 ///
-/// [`LocalPipeline::new`] uses it, and the server-ng config default
+/// [`LocalPipeline::new`] uses it, and the server config default
 /// (`DEFAULT_METADATA_PREPARE_QUEUE_DEPTH`) is static-asserted equal to it at
 /// bootstrap. Operators raise the running bound via `[metadata]
 /// prepare_queue_depth`; the pipeline then carries its own capacity (see
@@ -318,7 +318,7 @@ pub struct LocalPipeline {
     /// Requests awaiting a prepare slot; cap [`Self::request_queue_max`].
     request_queue: VecDeque<RequestEntry>,
     /// Depth bound for `prepare_queue`; [`PIPELINE_PREPARE_QUEUE_MAX`]
-    /// unless the operator overrode it (`[metadata]` in the server-ng
+    /// unless the operator overrode it (`[metadata]` in the server
     /// config).
     prepare_queue_max: usize,
     /// Depth bound for `request_queue`; [`PIPELINE_REQUEST_QUEUE_MAX`]

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! server-ng purge durability: the applied purge generation survives a
+//! Server purge durability: the applied purge generation survives a
 //! restart (`purge.gen`), and purged journal-resident batches stay fenced
 //! behind the purge floor instead of resurfacing through the shutdown flush.
 //! Plus read-your-purge: the counters a purge acks are visible to the very

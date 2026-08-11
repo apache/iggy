@@ -17,9 +17,7 @@
 
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
-#[cfg(feature = "vsr")]
 use crate::session::ConsensusSession;
-#[cfg(feature = "vsr")]
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
@@ -28,7 +26,6 @@ use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_common::{
     ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
@@ -41,17 +38,12 @@ use secrecy::ExposeSecret;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(feature = "vsr")]
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
 
-#[cfg(not(feature = "vsr"))]
-const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
-#[cfg(not(feature = "vsr"))]
-const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 
 /// Bound on how long a single QUIC request waits for its response, mirroring the
@@ -68,7 +60,6 @@ const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// view-change cancel). Unlike a silent timeout, this reply arrives promptly, so
 /// a short pause keeps the replay from spinning while the primary catches up.
 /// Bounded overall by `RESPONSE_READ_TIMEOUT`.
-#[cfg(feature = "vsr")]
 const NOT_READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// QUIC client for interacting with the Iggy API.
@@ -82,13 +73,10 @@ pub struct QuicClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
-    #[cfg(feature = "vsr")]
     // See `core/sdk/src/tcp/tcp_client.rs` for the `tokio::sync::Mutex` ->
     // `std::sync::Mutex` rationale (pure-CPU critical section).
     consensus_session: Arc<StdMutex<ConsensusSession>>,
-    #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
-    #[cfg(feature = "vsr")]
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
@@ -160,7 +148,6 @@ impl BinaryTransport for QuicClient {
             return Err(IggyError::Disconnected);
         }
 
-        #[cfg(feature = "vsr")]
         if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
             // Without auto-login a reconnect cannot re-establish the session, so
             // non-login requests are not recovered here - their transient replay
@@ -172,9 +159,7 @@ impl BinaryTransport for QuicClient {
         }
 
         self.disconnect().await?;
-        #[cfg(feature = "vsr")]
         let skip_auto_login = is_login_register_code(code);
-        #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
         }
@@ -184,7 +169,6 @@ impl BinaryTransport for QuicClient {
             server_address, self.config.client_address
         );
         let reconnect = self.connect().await;
-        #[cfg(feature = "vsr")]
         if skip_auto_login && reconnect.is_err() {
             *self.skip_auto_login_once.lock().await = false;
         }
@@ -196,16 +180,13 @@ impl BinaryTransport for QuicClient {
         self.config.heartbeat_interval
     }
 
-    #[cfg(feature = "vsr")]
     fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
         Arc::clone(&self.consumer_group_state)
     }
 }
 
-#[cfg(feature = "vsr")]
 impl iggy_common::VsrSessionSealed for QuicClient {}
 
-#[cfg(feature = "vsr")]
 #[async_trait::async_trait]
 impl iggy_common::VsrSessionControl for QuicClient {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
@@ -302,11 +283,8 @@ impl QuicClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
-            #[cfg(feature = "vsr")]
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
-            #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
-            #[cfg(feature = "vsr")]
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
@@ -341,43 +319,7 @@ impl QuicClient {
             return Err(IggyError::EmptyResponse);
         }
 
-        #[cfg(feature = "vsr")]
-        {
-            crate::vsr::decode_response(Bytes::from(buffer))
-        }
-
-        #[cfg(not(feature = "vsr"))]
-        {
-            let status = u32::from_le_bytes(
-                buffer[..4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            if status != 0 {
-                error!(
-                    "Received an invalid response with status: {} ({}).",
-                    status,
-                    IggyError::from_code_as_string(status)
-                );
-
-                return Err(IggyError::from_code(status));
-            }
-
-            let length = u32::from_le_bytes(
-                buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            trace!("Status: OK. Response length: {}", length);
-            if length <= 1 {
-                return Ok(Bytes::new());
-            }
-
-            Ok(Bytes::copy_from_slice(
-                &buffer[RESPONSE_INITIAL_BYTES_LENGTH
-                    ..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
-            ))
-        }
+        crate::vsr::decode_response(Bytes::from(buffer))
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
@@ -492,7 +434,6 @@ impl QuicClient {
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
 
-            #[cfg(feature = "vsr")]
             let skip_auto_login = {
                 let mut guard = self.skip_auto_login_once.lock().await;
                 std::mem::take(&mut *guard)
@@ -505,20 +446,11 @@ impl QuicClient {
                     // Leadership still matters without auto-login: the caller
                     // signs in manually, and a login against a non-leader
                     // replays for its whole read timeout. `GetClusterMetadata`
-                    // is sessionless and pre-auth on server-ng, so the check
-                    // works on the unauthenticated connection. vsr-only: the
-                    // legacy server auth-gates cluster metadata, so this check
-                    // would bounce `Unauthenticated` into the reconnect path
-                    // and recurse back into `connect`.
-                    #[cfg(feature = "vsr")]
-                    {
-                        self.handle_leader_redirection().await?
-                    }
-                    #[cfg(not(feature = "vsr"))]
-                    false
+                    // is sessionless and pre-auth, so the check works on the
+                    // unauthenticated connection.
+                    self.handle_leader_redirection().await?
                 }
                 AutoLogin::Enabled(credentials) => {
-                    #[cfg(feature = "vsr")]
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
@@ -532,35 +464,6 @@ impl QuicClient {
                         // connection.
                         true
                     } else {
-                        info!(
-                            "{NAME} client: {} is signing in...",
-                            self.config.client_address
-                        );
-                        self.set_state(ClientState::Authenticating).await;
-                        match credentials {
-                            Credentials::UsernamePassword(username, password) => {
-                                self.login_user(username, password.expose_secret()).await?;
-                                self.publish_event(DiagnosticEvent::SignedIn).await;
-                                info!(
-                                    "{NAME} client: {} has signed in with the user credentials, username: {username}",
-                                    self.config.client_address
-                                );
-                            }
-                            Credentials::PersonalAccessToken(token) => {
-                                self.login_with_personal_access_token(token.expose_secret())
-                                    .await?;
-                                self.publish_event(DiagnosticEvent::SignedIn).await;
-                                info!(
-                                    "{NAME} client: {} has signed in with a personal access token.",
-                                    self.config.client_address
-                                );
-                            }
-                        }
-
-                        self.handle_leader_redirection().await?
-                    }
-                    #[cfg(not(feature = "vsr"))]
-                    {
                         info!(
                             "{NAME} client: {} is signing in...",
                             self.config.client_address
@@ -648,7 +551,6 @@ impl QuicClient {
         }
 
         self.endpoint.wait_idle().await;
-        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
@@ -668,7 +570,6 @@ impl QuicClient {
         self.set_state(ClientState::Disconnected).await;
         self.connection.lock().await.take();
         self.endpoint.wait_idle().await;
-        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -704,7 +605,6 @@ impl QuicClient {
 
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
-        #[cfg(feature = "vsr")]
         let consensus_session = self.consensus_session.clone();
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
@@ -714,9 +614,7 @@ impl QuicClient {
                 return Err(IggyError::NotConnected);
             };
 
-            #[cfg(feature = "vsr")]
-            {
-                let (request_header, request_size) = {
+            let (request_header, request_size) = {
                     let mut consensus_session = consensus_session
                         .lock()
                         .expect("consensus session mutex poisoned");
@@ -794,42 +692,6 @@ impl QuicClient {
                         Err(error) => return Err(error),
                     }
                 }
-            }
-
-            #[cfg(not(feature = "vsr"))]
-            {
-                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-                let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
-                    error!("Failed to open a bidirectional stream: {error}");
-                    IggyError::QuicError
-                })?;
-                trace!("Sending a QUIC request with code: {code}");
-                send.write_all(&(payload_length as u32).to_le_bytes())
-                    .await
-                    .map_err(|error| {
-                        error!("Failed to write payload length: {error}");
-                        IggyError::QuicError
-                    })?;
-                send.write_all(&code.to_le_bytes()).await.map_err(|error| {
-                    error!("Failed to write payload code: {error}");
-                    IggyError::QuicError
-                })?;
-                send.write_all(&payload).await.map_err(|error| {
-                    error!("Failed to write payload: {error}");
-                    IggyError::QuicError
-                })?;
-                send.finish().map_err(|error| {
-                    error!("Failed to finish sending data: {error}");
-                    IggyError::QuicError
-                })?;
-                trace!("Sent a QUIC request with code: {code}, waiting for a response...");
-                QuicClient::handle_response(
-                    &mut recv,
-                    response_buffer_size as usize,
-                    RESPONSE_READ_TIMEOUT,
-                )
-                .await
-            }
         })
         .await
         .map_err(|e| {
@@ -839,7 +701,6 @@ impl QuicClient {
     }
 }
 
-#[cfg(feature = "vsr")]
 const fn is_login_register_code(code: u32) -> bool {
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }

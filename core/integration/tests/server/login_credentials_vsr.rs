@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Credential rejections on the register handshake against server-ng (vsr).
+//! Credential rejections on the register handshake against the server (vsr).
 //!
 //! A username/password body that fails verification falls through to the PAT
 //! decode attempt, so the terminal rejection has to carry the credential
 //! failure that actually happened. Reporting the payload shape instead
 //! (`MalformedLogin` -> `InvalidFormat`) tells a client its request was
 //! malformed when the request was fine and the password was not.
-
-#![cfg(feature = "vsr")]
 
 use iggy::prelude::*;
 use integration::iggy_harness;

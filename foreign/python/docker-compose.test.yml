@@ -22,7 +22,8 @@ services:
       dockerfile: core/server/Dockerfile
       args:
         PROFILE: debug
-    command: ["--fresh", "--with-default-root-credentials"]
+    # The server takes only --replica-id; root credentials come from the env.
+    command: []
     container_name: iggy-server-python-test
     security_opt:
       - seccomp:unconfined
@@ -36,8 +37,11 @@ services:
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
     healthcheck:
-      test: [ "CMD", "iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
       interval: 5s
       timeout: 5s
       retries: 12

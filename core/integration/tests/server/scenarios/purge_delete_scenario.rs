@@ -31,44 +31,22 @@ const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
 
-/// Payload chosen so IGGY_MESSAGE_HEADER_SIZE + payload = 1000B per message on disk.
-///
-/// Rotation mechanics (with segment.size = 5KiB = 5120B, messages_required_to_save = 1):
-///   `is_full()` checks `size >= 5120` BEFORE persisting the current message.
-///   After 6 persisted messages (6000B >= 5120) the next arrival sees is_full=true,
-///   gets persisted into the same segment, then rotation fires.
-///   Result: 7 messages per sealed segment (7000B on disk).
+/// The server persists the actual `SendMessages2` batch framing: a 256-byte
+/// command header per append (each send below is a single-message batch) plus
+/// a 48-byte per-message header, and a 24-byte sparse index entry per flush
+/// (one per message with messages_required_to_save = 1). See
+/// `server_common::send_messages2` and `stream_size_validation_scenario`.
 const PAYLOAD_SIZE: usize = 936;
-#[cfg(not(feature = "vsr"))]
-const MESSAGE_ON_DISK_SIZE: u64 = IGGY_MESSAGE_HEADER_SIZE as u64 + PAYLOAD_SIZE as u64;
-#[cfg(not(feature = "vsr"))]
-const INDEX_SIZE_PER_MSG: u64 = INDEX_SIZE as u64;
-// server-ng persists the actual `SendMessages2` batch framing: a 256-byte
-// command header per append (each send below is a single-message batch) plus
-// a 48-byte per-message header, and a 24-byte sparse index entry per flush
-// (one per message with messages_required_to_save = 1). See
-// `server_common::send_messages2` and `stream_size_validation_scenario`.
-#[cfg(feature = "vsr")]
 const NG_BATCH_HEADER_SIZE: u64 = 256;
-#[cfg(feature = "vsr")]
 const NG_MESSAGE_HEADER_SIZE: u64 = 48;
-#[cfg(feature = "vsr")]
 const MESSAGE_ON_DISK_SIZE: u64 =
     NG_BATCH_HEADER_SIZE + NG_MESSAGE_HEADER_SIZE + PAYLOAD_SIZE as u64;
-#[cfg(feature = "vsr")]
 const INDEX_SIZE_PER_MSG: u64 = 24;
 const TOTAL_MESSAGES: u32 = 25;
 
-/// 3 sealed segments (7 msgs each) + 1 active (4 msgs at offsets 21-24).
-#[cfg(not(feature = "vsr"))]
-const EXPECTED_SEGMENT_OFFSETS: &[u64] = &[0, 7, 14, 21];
-#[cfg(not(feature = "vsr"))]
-const MSGS_PER_SEALED_SEGMENT: u64 = 7;
 /// 5 sealed segments (5 msgs each at 1240B on disk; the post-append size
 /// check seals at 6200B >= 5KiB) + 1 empty active segment at offset 25.
-#[cfg(feature = "vsr")]
 const EXPECTED_SEGMENT_OFFSETS: &[u64] = &[0, 5, 10, 15, 20, 25];
-#[cfg(feature = "vsr")]
 const MSGS_PER_SEALED_SEGMENT: u64 = 5;
 
 /// Single consumer barrier: oldest-first deletion, barrier advancement, and edge cases.
@@ -392,18 +370,9 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
 
     let partition_path = partition_path(&data_path, stream_id, topic_id);
 
-    // server-ng's per-message on-disk framing differs from legacy, so the
-    // segment boundaries are not hardcodable. Capture the real layout once;
-    // legacy still verifies it matches the calculated offsets + file sizes.
+    // Capture the real layout rather than hardcoding boundaries: this path
+    // only needs a sealed segment plus the active one.
     let layout = get_sorted_segment_offsets(&partition_path);
-    #[cfg(not(feature = "vsr"))]
-    {
-        assert_eq!(
-            layout, EXPECTED_SEGMENT_OFFSETS,
-            "Segment layout must match calculated offsets"
-        );
-        assert_segment_file_sizes(&partition_path, EXPECTED_SEGMENT_OFFSETS);
-    }
     assert!(
         layout.len() >= 2,
         "expected at least one sealed segment plus the active one, got {layout:?}"
@@ -423,11 +392,9 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         maybe_restart(harness, restart_server).await;
 
         let first_surviving = layout[i + 1];
-        // server-ng deletes asynchronously (metadata commit -> reconciler);
-        // legacy deletes synchronously. Converge before asserting.
+        // Deletion is asynchronous (metadata commit -> reconciler), so
+        // converge before asserting.
         await_segment_layout(&partition_path, &layout[i + 1..]).await;
-        #[cfg(not(feature = "vsr"))]
-        assert_segment_file_sizes(&partition_path, &layout[i + 1..]);
         await_polled_offsets(
             &client,
             &stream_ident,
@@ -449,8 +416,6 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         .unwrap();
 
     await_segment_layout(&partition_path, std::slice::from_ref(&active)).await;
-    #[cfg(not(feature = "vsr"))]
-    assert_segment_file_sizes(&partition_path, std::slice::from_ref(&active));
     await_polled_offsets(
         &client,
         &stream_ident,
@@ -883,15 +848,6 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
 
     let partition_path = partition_path(&data_path, stream_id, topic_id);
 
-    // Exact layout is legacy-framing-specific; the purge outcome asserted below
-    // (offsets cleared, files deleted, partition reset to a single empty segment
-    // at offset 0, new messages from offset 0) is framing-agnostic.
-    #[cfg(not(feature = "vsr"))]
-    assert_eq!(
-        get_sorted_segment_offsets(&partition_path),
-        EXPECTED_SEGMENT_OFFSETS
-    );
-
     // --- Store individual consumer offset at 13 ---
     let consumer = Consumer {
         kind: ConsumerKind::Consumer,
@@ -1000,16 +956,15 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     let drained_before_restart = is_dir_empty(&consumers_dir) && is_dir_empty(&groups_dir);
     maybe_restart(harness, restart_server).await;
 
-    // server-ng purges asynchronously (metadata commit -> reconciler -> pump);
-    // legacy purges synchronously. The pump's purge resets the partition to a
-    // single segment at offset 0 and clears consumer offsets + files in the
-    // same frame, so converging on the [0] layout means the whole purge landed.
-    #[cfg(feature = "vsr")]
+    // Purge is asynchronous (metadata commit -> reconciler -> pump). The
+    // pump's purge resets the partition to a single segment at offset 0 and
+    // clears consumer offsets + files in the same frame, so converging on the
+    // [0] layout means the whole purge landed.
     await_segment_layout(&partition_path, &[0]).await;
 
     // --- Verify consumer offsets cleared (memory + disk) ---
-    // ZERO tolerance everywhere except one cell: vsr + restart where the kill
-    // landed mid-purge. There boot plants the [0] layout itself (fencing a torn
+    // ZERO tolerance everywhere except one cell: restart where the kill landed
+    // mid-purge. There boot plants the [0] layout itself (fencing a torn
     // chain, or recovering an already-drained directory) with the offset files
     // still present, so the layout gate above is satisfied BEFORE the
     // reconciler's re-purge clears them (the kill preceded the purge.gen
@@ -1025,7 +980,7 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     // tick of slack, so metadata repair under load pushed it over. Still a
     // bounded window on purpose: widen only with a measurement, and if this
     // starts needing more, the wake is missing rather than the budget too small.
-    let poll_window = if cfg!(feature = "vsr") && restart_server && !drained_before_restart {
+    let poll_window = if restart_server && !drained_before_restart {
         std::time::Duration::from_secs(5)
     } else {
         std::time::Duration::ZERO
@@ -1123,7 +1078,6 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
 /// post-purge data. Without that file a restart re-reads applied=0 against
 /// the replayed committed generation and silently wipes the new messages on
 /// its first pass.
-#[cfg(feature = "vsr")]
 pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
     let client = build_root_client(harness);
     client.connect().await.unwrap();
@@ -1181,7 +1135,6 @@ pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
 /// in-memory journal as consensus history, and the graceful-shutdown flush
 /// walks them again. The purge floor must fence them out of the segment so
 /// the restart recovers only the post-purge appends.
-#[cfg(feature = "vsr")]
 pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
     let client = build_root_client(harness);
     client.connect().await.unwrap();
@@ -1237,7 +1190,6 @@ pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
 /// messages are served, so an extra resurfaced message fails the count
 /// instead of being cropped by the poll size. Panics after
 /// [`POLL_CONVERGENCE_TIMEOUT`] with the last observed count.
-#[cfg(feature = "vsr")]
 async fn poll_exactly(
     client: &IggyClient,
     stream_ident: &Identifier,
@@ -1298,11 +1250,9 @@ async fn await_stored_offset(
 
 /// Wait for the partition's on-disk segment layout to converge to `expected`.
 ///
-/// server-ng's `DeleteSegments` is eventually-consistent: the client call
-/// returns after the metadata `TruncatePartition` commit, and the partition
-/// reconciler performs the on-disk deletion on its next pass. Legacy deletes
-/// synchronously, so it asserts immediately.
-#[cfg(feature = "vsr")]
+/// `DeleteSegments` is eventually-consistent: the client call returns after
+/// the metadata `TruncatePartition` commit, and the partition reconciler
+/// performs the on-disk deletion on its next pass.
 async fn await_segment_layout(partition_path: &str, expected: &[u64]) {
     for _ in 0..200 {
         if get_sorted_segment_offsets(partition_path).as_slice() == expected {
@@ -1319,24 +1269,14 @@ async fn await_segment_layout(partition_path: &str, expected: &[u64]) {
 
 /// Assert the layout stays at `expected` when no deletion must happen.
 ///
-/// The vsr side sleeps past a reconciler pass first, since an erroneous
-/// deletion would land asynchronously; legacy deletes synchronously, so an
-/// immediate assert suffices.
+/// Sleeps past a reconciler pass first, since an erroneous deletion would
+/// land asynchronously.
 async fn assert_layout_stable(partition_path: &str, expected: &[u64]) {
-    #[cfg(feature = "vsr")]
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert_eq!(
         get_sorted_segment_offsets(partition_path).as_slice(),
         expected,
         "segment layout must remain unchanged"
-    );
-}
-
-#[cfg(not(feature = "vsr"))]
-async fn await_segment_layout(partition_path: &str, expected: &[u64]) {
-    assert_eq!(
-        get_sorted_segment_offsets(partition_path).as_slice(),
-        expected
     );
 }
 
@@ -1565,7 +1505,7 @@ async fn assert_fresh_empty_partition(partition_path: &str) {
 ///
 /// `get_sorted_segment_offsets` only checks .log files -- this additionally
 /// verifies that the .index file count matches, catching stale .index files
-/// left behind. server-ng unlinks a segment's .log and .index files across
+/// left behind. The server unlinks a segment's .log and .index files across
 /// separate awaits, so a layout that already converged on .log files can
 /// transiently show one extra .index file.
 async fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: usize) {

@@ -36,21 +36,14 @@ const T1_NAME: &str = "test-topic-1";
 const S2_NAME: &str = "test-stream-2";
 const T2_NAME: &str = "test-topic-2";
 const MESSAGE_PAYLOAD_SIZE_BYTES: u64 = 57;
-#[cfg(not(feature = "vsr"))]
-const MSG_SIZE: u64 = IGGY_MESSAGE_HEADER_SIZE as u64 + MESSAGE_PAYLOAD_SIZE_BYTES; // number of bytes in a single message
 const MSGS_COUNT: u64 = 117; // number of messages in a single topic after one pass of appending
-#[cfg(not(feature = "vsr"))]
-const MSGS_SIZE: u64 = MSG_SIZE * MSGS_COUNT; // number of bytes in a single topic after one pass of appending
-// server-ng accounts the actual on-disk batch framing: one 256-byte
+// The server accounts the actual on-disk batch framing: one 256-byte
 // `SendMessages2` command header per append pass plus a 48-byte per-message
 // header (`server_common::send_messages2::{COMMAND_HEADER_SIZE,
-// MESSAGE_HEADER_SIZE}`), instead of the legacy 64-byte per-message header.
-// Each pass below sends all `MSGS_COUNT` messages in one batch.
-#[cfg(feature = "vsr")]
+// MESSAGE_HEADER_SIZE}`). Each pass below sends all `MSGS_COUNT` messages in
+// one batch.
 const NG_BATCH_HEADER_SIZE: u64 = 256;
-#[cfg(feature = "vsr")]
 const NG_MESSAGE_HEADER_SIZE: u64 = 48;
-#[cfg(feature = "vsr")]
 const MSGS_SIZE: u64 =
     NG_BATCH_HEADER_SIZE + (NG_MESSAGE_HEADER_SIZE + MESSAGE_PAYLOAD_SIZE_BYTES) * MSGS_COUNT;
 
