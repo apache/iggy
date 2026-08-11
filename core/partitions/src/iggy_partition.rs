@@ -5613,10 +5613,14 @@ mod tests {
     /// leaving live groups untouched. The returned `Vec<String>` is what the
     /// reconciler unlinks off-borrow, so it carries no partition reference.
     ///
-    /// TODO: a true cross-task interleave (pump reallocs the partitions vec
-    /// while the reconciler awaits the unlink) needs a two-future sim oracle
-    /// that does not exist yet; this covers the synchronous removal contract
-    /// the off-borrow split relies on.
+    /// Scope: the synchronous removal contract the off-borrow split relies on.
+    /// The cross-task interleave it enables -- a pump mutating the partitions vec
+    /// while a sibling task is parked mid-await -- is covered on the simulator's
+    /// deterministic executor, against the debug borrow tripwire, by
+    /// `simulator::tests::shell_detects_partition_borrow_held_across_await`
+    /// (`swap_remove`) and
+    /// `shell_detects_partition_borrow_held_across_a_pump_realloc` (a growing
+    /// `push`, which relocates every element).
     #[compio::test]
     async fn reclaim_dead_group_offsets_drops_dead_keeps_live() {
         let mut partition = test_partition();

@@ -301,6 +301,22 @@ where
         suspend.await;
     }
 
+    /// TEST / SIMULATOR ONLY. Address of the partitions vec's heap buffer.
+    ///
+    /// Lets a test prove that an [`Self::insert`] actually REALLOCATED rather
+    /// than landing in spare capacity. The distinction is the whole point of the
+    /// realloc half of PR #3557: `swap_remove` invalidates one slot's reference,
+    /// while a growing `push` moves every element and invalidates all of them. A
+    /// test that only checked "insert happened" would pass on a push into spare
+    /// capacity, which moves nothing and proves nothing.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn buffer_addr(&self) -> usize {
+        // Safety: read-only reborrow of the same pump-only vec every accessor
+        // here goes through; nothing is handed out past this statement.
+        unsafe { (*self.partitions.get()).as_ptr() as usize }
+    }
+
     /// Get mutable partition by namespace directly. Tombstone-gated like
     /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
