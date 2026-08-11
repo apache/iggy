@@ -44,7 +44,8 @@ use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopi
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireName,
+    PrepareOkHeader, ProtocolVersion, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode,
+    WireName,
 };
 use iggy_common::IggyError;
 use iggy_common::UserId;
@@ -190,15 +191,17 @@ impl IggySnapshot {
     ///
     /// The checksum comes from the file's bytes, never from re-encoding what was
     /// decoded: the pairing must survive a schema change. Adding a trailing
-    /// `#[serde(default)]` field is the repo's forward-compatible migration, and an
-    /// older file re-encodes with one MORE msgpack array element after it, so a
-    /// re-encode checksum would diverge on the first boot of the new build and refuse
-    /// every checkpointed node with its WAL prefix already drained.
+    /// `#[serde(default)]` field is the repo's forward-compatible migration (see
+    /// [`SNAPSHOT_FORMAT_VERSION`](crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION) for
+    /// the rules), and an older file re-encodes with one MORE msgpack array element
+    /// after it, so a re-encode checksum would diverge on the first boot of the new
+    /// build and refuse every checkpointed node with its WAL prefix already drained.
     ///
     /// # Errors
     /// `SnapshotError::ChecksumMismatch` if the file carries an integrity trailer that
-    /// does not match its payload, or `SnapshotError` if the file cannot be read or
-    /// deserialized.
+    /// does not match its payload, `SnapshotError::UnsupportedFormatVersion` if it was
+    /// written in a format version this build does not read, or `SnapshotError` if the
+    /// file cannot be read or deserialized.
     pub fn load(path: &Path) -> Result<(Self, u128), SnapshotError> {
         let data = std::fs::read(path)?;
         let (payload, checksum) = split_trailer(&data, path)?;
@@ -1590,7 +1593,7 @@ where
     /// # Panics
     /// If called on a shard without consensus (state transfer is a shard-0
     /// concern).
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn install_state_transfer(
         &self,
         snapshot_bytes: &[u8],
@@ -1606,8 +1609,19 @@ where
             .as_ref()
             .expect("install_state_transfer: consensus only exists on shard 0");
 
+        // Refuses a format version this build does not read, ahead of every frontier
+        // move below: the bytes come from a peer, so its build picked the shape.
         let snapshot = IggySnapshot::decode(snapshot_bytes)?;
         let snapshot_seq = snapshot.sequence_number();
+
+        // The one place a snapshot crosses builds, so the only place the release
+        // stamp answers a question the local logs cannot.
+        tracing::info!(
+            snapshot_seq,
+            format_version = snapshot.snapshot().version,
+            release_format = %ProtocolVersion(snapshot.snapshot().release_format),
+            "decoded a transferred metadata snapshot"
+        );
 
         // Manifest coherence. `commit_op` and `table_frontier` arrive from the
         // serving peer and are applied to THIS replica's frontiers, so a
