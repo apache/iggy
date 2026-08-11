@@ -19,10 +19,12 @@ namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     Exposes the consensus session generation of a transport, so session-scoped state - a consumer-group
-///     membership - can detect the session it was established under is gone. Transports without a consensus
-///     session (HTTP) do not implement it and their consumers fall back to connection-state edges.
+///     membership - can detect the session it was established under is gone. A client that does not implement
+///     it gets edge-based group rejoin from the connection-state events it publishes; a transport that
+///     publishes no such events (the built-in HTTP client) gets neither and keeps its membership as-is.
 /// </summary>
-internal interface ISessionEpochProvider
+public interface ISessionEpochProvider
 {
+    /// <summary>Generation of the transport's consensus session, bumped on every session re-arm.</summary>
     ulong SessionEpoch { get; }
 }

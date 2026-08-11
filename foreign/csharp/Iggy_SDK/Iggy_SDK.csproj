@@ -75,8 +75,6 @@
     <ItemGroup>
         <InternalsVisibleTo Include="Apache.Iggy.Tests"/>
         <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations"/>
-        <!-- Lets the test mocking framework proxy internal interfaces such as ISessionEpochProvider. -->
-        <InternalsVisibleTo Include="DynamicProxyGenAssembly2"/>
     </ItemGroup>
 
 </Project>

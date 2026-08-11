@@ -130,7 +130,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             try
             {
                 using IMemoryOwner<byte> responseBuffer =
-                    await SendWithResponseAsync(code, message, token, false);
+                    await SendWithResponseAsync(code, message, token, autoLoginOnReconnect: false);
 
                 response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
                 _consensusSession.Bind(response.Session);
@@ -161,16 +161,21 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             {
                 _logger.LogWarning("Maximum leader redirections reached while registering, staying on {Address}",
                     _currentAddress);
-
-                return authResponse;
             }
-
-            if (!await RedirectAsync(token))
+            else if (await RedirectAsync(token))
             {
-                return authResponse;
+                await ConnectAsync(false, token);
+                continue;
             }
 
-            await ConnectAsync(false, token);
+            // The redirect probe can tear the connection down without throwing, and success on a client that is
+            // no longer bound would leave the caller unauthenticated with nothing left to re-authenticate it.
+            if (_state != ConnectionState.Authenticated)
+            {
+                throw new NotConnectedException();
+            }
+
+            return authResponse;
         }
     }
 
@@ -433,7 +438,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
         {
             return null;
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e) when (e is not OperationCanceledException && !VsrConnection.IsConnectionException(e))
         {
             _logger.LogWarning(e, "Failed to read the cluster metadata, continuing on {Address}", _currentAddress);
 
@@ -449,7 +454,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     private async Task<ClusterMetadata?> ReadClusterMetadataNoRedirectAsync(CancellationToken token)
     {
         using IMemoryOwner<byte> responseBuffer = await SendRawAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
-            ReadOnlyMemory<byte>.Empty, token, false);
+            ReadOnlyMemory<byte>.Empty, token, allowRedirect: false);
 
         if (responseBuffer.Memory.Length == 0)
         {
@@ -480,10 +485,9 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
 
         var isLoginRegister = code is CommandCodes.LOGIN_REGISTER_CODE or CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE;
         var overallDeadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-        var headerBuffer = ArrayPool<byte>.Shared.Rent(VsrHeader.HEADER_SIZE);
-        Memory<byte> header = headerBuffer.AsMemory(0, VsrHeader.HEADER_SIZE);
         var requestEncoded = false;
         var redirects = 0;
+        var redirectBudgetLogged = false;
         VsrConnection? lastConnection = null;
 
         try
@@ -494,7 +498,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
                     ? overallDeadline
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
-                var attempt = await SendVsrAttemptAsync(code, body, header, transientDeadline, overallDeadline,
+                var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
                     token);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
@@ -516,6 +520,12 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
                     {
                         redirects++;
                         await ConnectAsync(token);
+                    }
+                    else if (redirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
+                    {
+                        redirectBudgetLogged = true;
+                        _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}",
+                            _currentAddress);
                     }
 
                     continue;
@@ -550,10 +560,6 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
 
             throw;
         }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(headerBuffer);
-        }
     }
 
     /// <summary>
@@ -576,7 +582,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        Memory<byte> header, long transientDeadline, long readDeadline, CancellationToken token)
+        long transientDeadline, long readDeadline, CancellationToken token)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -587,7 +593,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
                 return VsrAttempt.Failed(false, new NotConnectedException(), false, null);
             }
 
-            return await connection.SendAttemptAsync(code, body, header, transientDeadline, readDeadline,
+            return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
                 token);
         }
         finally
@@ -666,8 +672,9 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
         }
 
         ResetConsensusSession();
-        connection.Close();
+        _connection = null;
         SetConnectionStateAsync(ConnectionState.Disconnected);
+        connection.Dispose();
     }
 
     /// <summary>Drops the connection on behalf of a caller that no longer holds the sending lock.</summary>

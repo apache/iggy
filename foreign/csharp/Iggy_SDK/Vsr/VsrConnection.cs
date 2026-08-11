@@ -44,17 +44,19 @@ internal sealed class VsrConnection : IDisposable
     private readonly Action<VsrConnection> _onDropped;
 
     private readonly byte[] _replyHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
+    private readonly byte[] _requestHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
     private readonly int _requestTimeoutMs;
-    private readonly Stream _stream;
 
     /// <summary>The session identity requests on this connection encode from.</summary>
-    internal ConsensusSession Session { get; }
+    private readonly ConsensusSession _session;
+
+    private readonly Stream _stream;
 
     internal VsrConnection(Stream stream, ConsensusSession session, long maxResponseFrameSize, int requestTimeoutMs,
         Action<VsrConnection> onDropped, ILogger logger)
     {
         _stream = stream;
-        Session = session;
+        _session = session;
         _maxResponseFrameSize = maxResponseFrameSize;
         _requestTimeoutMs = requestTimeoutMs;
         _onDropped = onDropped;
@@ -64,11 +66,6 @@ internal sealed class VsrConnection : IDisposable
     public void Dispose()
     {
         _stream.Dispose();
-    }
-
-    internal void Close()
-    {
-        _stream.Close();
     }
 
     internal static bool IsConnectionException(Exception ex)
@@ -81,19 +78,19 @@ internal sealed class VsrConnection : IDisposable
     }
 
     /// <summary>
-    ///     One attempt on this connection: encode the header into <paramref name="header" />, write the frame,
-    ///     and replay it - same session, same request id - while the server answers transiently. The caller
-    ///     must hold the sending lock.
+    ///     One attempt on this connection: encode the header, write the frame, and replay it - same session,
+    ///     same request id - while the server answers transiently. The caller must hold the sending lock,
+    ///     which also guards the reuse of the per-connection header buffer.
     /// </summary>
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        Memory<byte> header, long transientDeadline, long readDeadline, CancellationToken token)
+        long transientDeadline, long readDeadline, CancellationToken token)
     {
         var encoded = false;
         var requestStarted = false;
 
         try
         {
-            VsrHeader.EncodeRequestHeader(header.Span, Session, code, body.Span);
+            VsrHeader.EncodeRequestHeader(_requestHeaderBuffer, _session, code, body.Span);
 
             encoded = true;
 
@@ -111,7 +108,7 @@ internal sealed class VsrConnection : IDisposable
                     // no frame-sized rent and no copy. The server frames by the announced size, and the
                     // lockstep protocol already pays a full round trip per request, so the extra segment a
                     // small request costs (with Nagle disabled) is noise against the reply wait.
-                    await _stream.WriteAsync(header, token);
+                    await _stream.WriteAsync(_requestHeaderBuffer, token);
                     if (!body.IsEmpty)
                     {
                         await _stream.WriteAsync(body, token);

@@ -277,7 +277,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
-            _joinedSessionEpoch = sessionEpoch;
+            Interlocked.Exchange(ref _joinedSessionEpoch, sessionEpoch);
             _joinedConsumerGroup = true;
             return;
         }
@@ -319,7 +319,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
                     Identifier.String(_consumerGroupName), ct);
 
-                _joinedSessionEpoch = sessionEpoch;
+                Interlocked.Exchange(ref _joinedSessionEpoch, sessionEpoch);
                 _joinedConsumerGroup = true;
                 LogConsumerGroupJoined(_consumerGroupName);
             }
@@ -378,7 +378,7 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
-        if (!_joinedConsumerGroup)
+        if (!_joinedConsumerGroup || !IsGroupMembershipEpochCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
             return;
@@ -467,6 +467,24 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
+    ///     Whether the session epoch the group membership was stamped under is still the transport's current
+    ///     one. Gating the poll here instead of clearing the joined flag on a Disconnected event survives a
+    ///     late event landing after a rejoin already re-stamped the epoch: state events are published outside
+    ///     the state lock, so their order is not guaranteed. Runs outside <see cref="_connectionStateSemaphore" />,
+    ///     hence the interlocked read.
+    /// </summary>
+    private bool IsGroupMembershipEpochCurrent()
+    {
+        if (_config.Consumer.Type != ConsumerType.ConsumerGroup
+            || _client is not ISessionEpochProvider epochProvider)
+        {
+            return true;
+        }
+
+        return epochProvider.SessionEpoch == Interlocked.Read(ref _joinedSessionEpoch);
+    }
+
+    /// <summary>
     ///     Implements polling interval throttling to avoid excessive server requests.
     ///     Uses monotonic time tracking to ensure proper intervals even with clock adjustments.
     /// </summary>
@@ -515,32 +533,24 @@ public partial class IggyConsumer : IAsyncDisposable
     private async Task OnClientConnectionStateChangedAsync(ConnectionStateChangedEventArgs e)
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
+        
+        if (_config.Consumer.Type == ConsumerType.Consumer)
+        {
+            return;
+        }
 
         await _connectionStateSemaphore.WaitAsync();
         try
         {
             if (_client is ISessionEpochProvider epochProvider)
             {
-                // A plain consumer holds no membership, so its flag must never be cleared: nothing would ever
-                // set it again and every later poll would be skipped.
-                if (_config.Consumer.Type == ConsumerType.Consumer)
-                {
-                    return;
-                }
-
                 if (e.CurrentState != ConnectionState.Authenticated)
                 {
-                    // Polling under a dropped session would be refused by the server for as long as the
-                    // reconnect takes to re-authenticate, so the membership is surrendered up front.
-                    if (e.CurrentState == ConnectionState.Disconnected)
-                    {
-                        _joinedConsumerGroup = false;
-                    }
-
                     return;
                 }
 
-                if (_joinedConsumerGroup && epochProvider.SessionEpoch == _joinedSessionEpoch)
+                if (_joinedConsumerGroup
+                    && epochProvider.SessionEpoch == Interlocked.Read(ref _joinedSessionEpoch))
                 {
                     return;
                 }

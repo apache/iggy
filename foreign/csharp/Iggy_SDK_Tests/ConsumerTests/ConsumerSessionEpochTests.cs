@@ -61,12 +61,19 @@ public sealed class ConsumerSessionEpochTests
         await client.RaiseAsync(ConnectionState.Connected, ConnectionState.Authenticated);
 
         Assert.Equal(2, client.JoinCount);
+
+        // The rejoin must re-stamp the membership epoch: without it every later event would rejoin again,
+        // triggering a group-wide rebalance per reconnect.
+        await client.RaiseAsync(ConnectionState.Connected, ConnectionState.Authenticated);
+
+        Assert.Equal(2, client.JoinCount);
         await consumer.DisposeAsync();
     }
 
     /// <summary>
-    ///     A disconnect surrenders the membership even though the epoch has not moved yet. Holding it would let
-    ///     the poll loop keep issuing requests the server refuses for as long as the reconnect takes.
+    ///     A disconnect re-arms the transport's session, so the epoch moves and the reconnect rejoins. The
+    ///     membership is not cleared on the Disconnected event itself: the poll gate compares epochs instead,
+    ///     which survives state events arriving out of order.
     /// </summary>
     [Fact]
     public async Task given_group_consumer_when_disconnected_should_surrender_membership_and_rejoin_on_reconnect()
@@ -77,6 +84,8 @@ public sealed class ConsumerSessionEpochTests
         Assert.Equal(1, client.JoinCount);
 
         await client.RaiseAsync(ConnectionState.Authenticated, ConnectionState.Disconnected);
+        // The transport re-arms the consensus session when the connection drops.
+        client.SessionEpoch++;
         await client.RaiseAsync(ConnectionState.Connecting, ConnectionState.Authenticated);
 
         Assert.Equal(2, client.JoinCount);

@@ -85,8 +85,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     public void Dispose()
     {
         _disposed = true;
-        _connection?.Close();
         _connection?.Dispose();
+        _connection = null;
 
         SetConnectionStateAsync(ConnectionState.Disconnected);
         _sendingSemaphore.Dispose();
@@ -883,6 +883,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             try
             {
                 _connection?.Dispose();
+                _connection = null;
 
                 ResetConsensusSession();
             }
