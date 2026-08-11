@@ -41,7 +41,7 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
-use iggy_binary_protocol::{Operation, PrepareHeader, RequestHeader};
+use iggy_binary_protocol::{Operation, PrepareHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -60,8 +60,8 @@ use std::rc::Rc;
 /// undecodable password body.
 pub(crate) fn maybe_rewrite_user_password_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: Message<RequestHeader>,
-) -> Result<Message<RequestHeader>, IggyError>
+    request: Message<RoutedRequestHeader>,
+) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,

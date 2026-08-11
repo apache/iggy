@@ -542,7 +542,7 @@ pub(crate) fn restore_partition_view(
     // a replica that came back at view 0 is otherwise indistinguishable from one
     // that resumed correctly until it votes.
     info!(
-        namespace_raw = consensus.namespace(),
+        namespace_raw = consensus.group(),
         view = state.view,
         log_view = state.log_view,
         "restored partition view from its superblock"

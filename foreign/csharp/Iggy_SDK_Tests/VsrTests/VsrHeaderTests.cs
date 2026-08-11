@@ -52,31 +52,27 @@ public sealed class VsrHeaderTests
     }
 
     /// <summary>
-    ///     A namespace failure must leave the session exactly as it was. Consuming the request id would gap the
-    ///     next metadata request, and dropping the binding would leave the client unable to send or re-login.
+    ///     The client no longer inspects a payload to route, so a partition-plane body it cannot interpret is
+    ///     passed through for the server to resolve instead of failing at encode time.
     /// </summary>
     [Fact]
-    public void Encode_NamespaceFailureConsumesNothingAndKeepsTheSession()
+    public void Encode_UnroutablePartitionPayloadIsPassedThroughToTheServer()
     {
         var session = BoundSession();
         var payload = VsrTestPayloads.ConsumerOffset(VsrTestPayloads.NumericIdentifier(4),
             VsrTestPayloads.NumericIdentifier(5), null);
         var header = new byte[VsrHeader.HEADER_SIZE];
 
-        var exception = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            VsrHeader.EncodeRequestHeader(header, session, CommandCodes.STORE_CONSUMER_OFFSET_CODE, payload));
+        var totalSize = VsrHeader.EncodeRequestHeader(header, session,
+            CommandCodes.STORE_CONSUMER_OFFSET_CODE, payload);
 
-        Assert.Equal(VsrError.INVALID_IDENTIFIER, exception.StatusCode);
+        Assert.Equal(VsrHeader.HEADER_SIZE + payload.Length, totalSize);
+        Assert.Equal((byte)VsrOperation.StoreConsumerOffset, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.True(session.IsBound);
-        Assert.Equal(1UL, session.RequestCounter);
-
-        VsrHeader.EncodeRequestHeader(header, session, CommandCodes.CREATE_STREAM_CODE, [1]);
-
-        Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
     }
 
     [Fact]
-    public void Encode_RegisterUsesZeroRequestAndSessionOnMetadataNamespace()
+    public void Encode_RegisterUsesZeroRequestAndSession()
     {
         var session = new ConsensusSession(7);
         var payload = LoginRegister.Serialize("admin", "secret");
@@ -90,7 +86,6 @@ public sealed class VsrHeaderTests
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_SESSION_OFFSET));
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_TIMESTAMP_OFFSET));
-        Assert.Equal(VsrNamespace.METADATA_CONSENSUS_NAMESPACE, ReadUInt64(header, VsrHeader.REQUEST_NAMESPACE_OFFSET));
         Assert.Equal(7UL, ReadUInt64(header, VsrHeader.REQUEST_CLIENT_OFFSET));
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_CLIENT_OFFSET + 8));
     }
@@ -117,7 +112,6 @@ public sealed class VsrHeaderTests
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(1UL, session.RequestCounter);
         Assert.Equal(5UL, ReadUInt64(header, VsrHeader.REQUEST_SESSION_OFFSET));
-        Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_NAMESPACE_OFFSET));
         Assert.Equal((uint)CommandCodes.PING_CODE, ReadUInt32(header, VsrHeader.REQUEST_RESERVED_OFFSET));
     }
 
@@ -152,12 +146,11 @@ public sealed class VsrHeaderTests
         Assert.Equal((byte)VsrOperation.CreateStream, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(2UL, session.RequestCounter);
-        Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_NAMESPACE_OFFSET));
         Assert.Equal(0u, ReadUInt32(header, VsrHeader.REQUEST_RESERVED_OFFSET));
     }
 
     [Fact]
-    public void Encode_LogoutAdvancesTheCounterOnMetadataNamespace()
+    public void Encode_LogoutAdvancesTheCounter()
     {
         var session = BoundSession();
 
@@ -166,7 +159,6 @@ public sealed class VsrHeaderTests
         Assert.Equal((byte)VsrOperation.Logout, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(2UL, session.RequestCounter);
-        Assert.Equal(VsrNamespace.METADATA_CONSENSUS_NAMESPACE, ReadUInt64(header, VsrHeader.REQUEST_NAMESPACE_OFFSET));
     }
 
     [Fact]
@@ -180,7 +172,6 @@ public sealed class VsrHeaderTests
         Assert.Equal((byte)VsrOperation.SendMessages, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(1UL, session.RequestCounter);
-        Assert.Equal(VsrNamespace.Pack(2, 3, 4), ReadUInt64(header, VsrHeader.REQUEST_NAMESPACE_OFFSET));
     }
 
     [Fact]

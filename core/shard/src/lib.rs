@@ -41,9 +41,9 @@ use futures::FutureExt;
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
     Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader,
 };
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
@@ -2288,7 +2288,7 @@ where
     {
         match MessageBag::try_from(message) {
             Ok(MessageBag::Request(request)) => {
-                let routing = (request.header().operation, request.header().namespace);
+                let routing = (request.header().operation, request.header().group);
                 match self.park_if_unmaterialised(request, routing.0, routing.1) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
@@ -2313,7 +2313,7 @@ where
                 }
             }
             Ok(MessageBag::Prepare(prepare)) => {
-                let routing = (prepare.header().operation, prepare.header().namespace);
+                let routing = (prepare.header().operation, prepare.header().group);
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -2749,7 +2749,7 @@ where
     /// `frame_drops_total{variant=partition,reason=park_dropped}`.
     fn deny_parked_client_request(&self, frame: ParkedFrame) -> bool {
         if frame.message.header().command == Command2::Request
-            && let Ok(request) = frame.message.try_into_typed::<RequestHeader>()
+            && let Ok(request) = frame.message.try_into_typed::<RoutedRequestHeader>()
         {
             return self.stage_transient_deny(request.header());
         }
@@ -2954,7 +2954,7 @@ where
     /// budget. Sent directly over the bus; delivery failure is terminal for
     /// this reply (the client recovers via its own read-timeout).
     #[allow(clippy::future_not_send)]
-    async fn deny_partition_request_transient(&self, request_header: &RequestHeader) {
+    async fn deny_partition_request_transient(&self, request_header: &RoutedRequestHeader) {
         let reply = build_deny_reply_from_request_header(
             request_header,
             IggyError::TransientNotAccepted.as_code(),
@@ -2991,7 +2991,7 @@ where
     ///
     /// Returns whether the pump took it. A shard with no sender stages nothing,
     /// so assuming success logs an answer for a request destroyed unanswered.
-    fn stage_transient_deny(&self, request_header: &RequestHeader) -> bool {
+    fn stage_transient_deny(&self, request_header: &RoutedRequestHeader) -> bool {
         let reply = build_deny_reply_from_request_header(
             request_header,
             IggyError::TransientNotAccepted.as_code(),
@@ -3024,7 +3024,7 @@ where
     }
 
     #[allow(clippy::future_not_send)]
-    pub async fn on_request(&self, request: Message<RequestHeader>)
+    pub async fn on_request(&self, request: Message<RoutedRequestHeader>)
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -3242,7 +3242,7 @@ where
     }
 
     /// Resolve the single partition a VSR control frame addresses, keyed by
-    /// `header.namespace`. Warns and returns `None` when the namespace matches
+    /// `header.group`. Warns and returns `None` when the namespace matches
     /// neither metadata nor a live partition consensus. Returns `&mut` because
     /// `on_do_view_change` / `on_commit` need it for `commit_journal`; the read-
     /// only callers reborrow `&`. Pump-only (sole mutator), so the `&mut` formed
@@ -3271,7 +3271,7 @@ where
             return None;
         };
         debug_assert_eq!(
-            partition.consensus().namespace(),
+            partition.consensus().group(),
             namespace,
             "keyed partition lookup must match the frame namespace"
         );
@@ -3296,7 +3296,7 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             refresh_metadata_dvc_suffix(consensus, planes.0.journal.as_ref());
             let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
@@ -3310,7 +3310,7 @@ where
 
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "StartViewChange",
@@ -3347,7 +3347,7 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             refresh_metadata_dvc_suffix(consensus, planes.0.journal.as_ref());
             let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
@@ -3381,7 +3381,7 @@ where
         let config = planes.1.0.config();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "DoViewChange",
@@ -3437,7 +3437,7 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
                 tracing::warn!(
@@ -3539,15 +3539,14 @@ where
         // entirely, but `IggyPartition::transfer` is `pub` and cleared inside the
         // partitions crate, so an externally maintained count would drift; that
         // refactor is a prerequisite, not a detail.)
-        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.namespace)
-        {
+        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.group) {
             self.partition_transfers_inflight()
         } else {
             0
         };
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "StartView",
@@ -3592,7 +3591,7 @@ where
         {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 "adopted a live view while awaiting transfer; requesting partition state transfer"
             );
@@ -3646,7 +3645,7 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             match consensus.handle_commit(&header) {
                 CommitOutcome::Advanced => {
@@ -3694,7 +3693,7 @@ where
         let config = planes.1.0.config();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "Commit",
@@ -3748,7 +3747,7 @@ where
         let header = *msg.header();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &header);
             let (local_actions, wire_actions) = split_local_actions(actions);
@@ -3761,7 +3760,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -3805,7 +3804,7 @@ where
         let repair_chunk_max = self.repair_chunk_max.get();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             // Served in `ViewChange` too: the replicas holding a missing body are
             // exactly those in `ViewChange`, so refusing would deadlock the repair
@@ -3854,7 +3853,7 @@ where
                     Command2::RangeEvicted,
                     header.nonce,
                     from_op,
-                    header.namespace,
+                    header.group,
                 )
                 .await;
                 self.send_repair_range_reply(
@@ -3864,7 +3863,7 @@ where
                     Command2::RepairDone,
                     header.nonce,
                     header.from_op.saturating_sub(1),
-                    header.namespace,
+                    header.group,
                 )
                 .await;
                 return;
@@ -3877,7 +3876,7 @@ where
                     Command2::RangeEvicted,
                     header.nonce,
                     from_op,
-                    header.namespace,
+                    header.group,
                 )
                 .await;
             }
@@ -3906,16 +3905,13 @@ where
                 Command2::RepairDone,
                 header.nonce,
                 served_through,
-                header.namespace,
+                header.group,
             )
             .await;
             return;
         }
-        let Some(partition) = planes
-            .1
-            .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
-        else {
+        let namespace = IggyNamespace::from_raw(header.group);
+        let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
         if !partition.consensus().is_normal() {
@@ -3930,7 +3926,6 @@ where
         // Defer instead: no RepairDone is sent, the rejoiner's stall retry
         // re-asks, and the local purge (one reconciler wake away) installs
         // the floor the fence below serves behind.
-        let namespace = IggyNamespace::from_raw(header.namespace);
         let committed_purge = self
             .plane
             .metadata()
@@ -3945,7 +3940,7 @@ where
             self.metrics.record_partition_repair_serve_deferred();
             tracing::debug!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 committed_purge,
                 applied_purge = partition.applied_purge_generation(),
                 "deferring repair serve until the committed purge applies locally"
@@ -3989,7 +3984,7 @@ where
                 Command2::RangeEvicted,
                 header.nonce,
                 retained_from,
-                header.namespace,
+                header.group,
             )
             .await;
             from_op = retained_from;
@@ -4012,12 +4007,12 @@ where
             Command2::RepairDone,
             header.nonce,
             served_through,
-            header.namespace,
+            header.group,
         )
         .await;
         tracing::info!(
             shard = self.id,
-            namespace_raw = header.namespace,
+            namespace_raw = header.group,
             target,
             from_op = header.from_op,
             to_op,
@@ -4043,7 +4038,7 @@ where
         tracing::debug!(
             shard = self.id,
             op = msg.header().0.op,
-            namespace_raw = msg.header().0.namespace,
+            namespace_raw = msg.header().0.group,
             "repair prepare received"
         );
         // Convert to a live-prepare frame exactly once, here at the apply
@@ -4059,7 +4054,7 @@ where
         let header = *msg.header();
         let planes = self.plane.inner();
         // Legacy acceptance: pre-upgrade metadata WAL entries were journaled
-        // before prepares stamped `consensus.namespace()`, and repair ships
+        // before prepares stamped `consensus.group()`, and repair ships
         // stored bytes verbatim, so without it a mixed-version metadata repair
         // re-ships the same 0-stamped entries forever.
         //
@@ -4073,9 +4068,9 @@ where
         // being metadata mutations, so `is_metadata` alone is too narrow), which
         // is why both sites share it rather than re-deriving the set.
         let metadata_plane_op = header.operation.is_metadata_plane();
-        let legacy_metadata_claim = header.namespace == 0 && metadata_plane_op;
+        let legacy_metadata_claim = header.group == 0 && metadata_plane_op;
         if let Some(ref consensus) = planes.0.consensus
-            && (consensus.namespace() == header.namespace || legacy_metadata_claim)
+            && (consensus.group() == header.group || legacy_metadata_claim)
         {
             let session = *self.metadata_repair.borrow();
             let Some(session) = session else {
@@ -4173,7 +4168,7 @@ where
                 shard = self.id,
                 op = header.op,
                 operation = ?header.operation,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 "dropping a metadata-plane repair prepare this shard cannot journal"
             );
             return;
@@ -4181,7 +4176,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -4192,7 +4187,7 @@ where
             tracing::warn!(
                 shard = self.id,
                 op = header.op,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 "discarding repaired partition prepare: {reason}"
             );
             return;
@@ -4218,7 +4213,7 @@ where
         let header = *msg.header();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             let session = *self.metadata_repair.borrow();
             let Some(session) = session else {
@@ -4258,7 +4253,7 @@ where
                             session.nonce,
                             commit_min + 1,
                             session.to_op,
-                            header.namespace,
+                            header.group,
                         )
                         .await;
                     }
@@ -4311,14 +4306,13 @@ where
         // Counted BEFORE the `&mut partition` below exists, and only when an arm
         // is possible at all: see the StartView site for why the scan is gated
         // rather than replaced with a counter.
-        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.namespace)
-        {
+        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.group) {
             self.partition_transfers_inflight()
         } else {
             0
         };
         let config = planes.1.0.config().clone();
-        let namespace = IggyNamespace::from_raw(header.namespace);
+        let namespace = IggyNamespace::from_raw(header.group);
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
@@ -4356,7 +4350,7 @@ where
             self.metrics.record_partition_repair_serve_deferred();
             tracing::debug!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 committed_purge,
                 applied_purge = partition.applied_purge_generation(),
                 command = ?header.command,
@@ -4395,7 +4389,7 @@ where
                         // arming here would defeat its backoff.
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             floor,
                             to_op,
                             peer = header.replica,
@@ -4421,7 +4415,7 @@ where
                         // the scheduled re-arm) owns recovery from here.
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             floor,
                             to_op,
                             "partition repair floor refused; transfer in flight or scheduled"
@@ -4432,7 +4426,7 @@ where
                 if partition.repair.is_none() {
                     tracing::info!(
                         shard = self.id,
-                        namespace_raw = header.namespace,
+                        namespace_raw = header.group,
                         through_op = header.op,
                         "partition journal repair complete"
                     );
@@ -4451,7 +4445,7 @@ where
                             nonce,
                             commit_min + 1,
                             to_op,
-                            header.namespace,
+                            header.group,
                         )
                         .await;
                     }
@@ -4487,7 +4481,7 @@ where
                 h.nonce = nonce;
                 h.from_op = from_op;
                 h.to_op = to_op;
-                h.namespace = namespace;
+                h.group = namespace;
                 h.size = size_of::<RequestPreparesHeader>() as u32;
                 h.seal();
             });
@@ -4562,7 +4556,7 @@ where
                 h.replica = self_id;
                 h.nonce = nonce;
                 h.op = op;
-                h.namespace = namespace;
+                h.group = namespace;
                 h.size = size_of::<RepairRangeReplyHeader>() as u32;
                 h.seal();
             });
@@ -4708,7 +4702,7 @@ where
                     nonce,
                     from_op,
                     to_op,
-                    consensus.namespace(),
+                    consensus.group(),
                 )
                 .await;
             }
@@ -4965,7 +4959,7 @@ where
             nonce,
             missing_op,
             pending.op_head,
-            consensus.namespace(),
+            consensus.group(),
         )
         .await;
     }
@@ -5006,7 +5000,7 @@ where
                 nonce,
                 from_op,
                 to_op,
-                consensus.namespace(),
+                consensus.group(),
             )
             .await;
         }
@@ -5029,7 +5023,7 @@ where
                     h.cluster = consensus.cluster();
                     h.replica = consensus.replica();
                     h.nonce = nonce;
-                    h.namespace = consensus.namespace();
+                    h.group = consensus.group();
                     h.size = size_of::<RequestStateTransferHeader>() as u32;
                     h.seal();
                 });
@@ -5073,7 +5067,7 @@ where
             h.cluster = cluster;
             h.replica = self_id;
             h.nonce = nonce;
-            h.namespace = namespace;
+            h.group = namespace;
             h.size = total_size as u32;
             // The serving replica's own progress travels with every descriptor,
             // available or not: it is what lets a receiver refuse an offer from
@@ -5117,7 +5111,7 @@ where
                 h.cluster = cluster;
                 h.replica = self_id;
                 h.nonce = nonce;
-                h.namespace = namespace;
+                h.group = namespace;
                 h.artifact = artifact;
                 h.offset = offset;
                 h.len = len;
@@ -5150,7 +5144,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_request_state_transfer(msg).await;
         }
@@ -5170,7 +5164,7 @@ where
         let cached = self
             .state_transfer_offers
             .borrow_mut()
-            .get_mut(&(header.namespace, header.replica))
+            .get_mut(&(header.group, header.replica))
             .filter(|served| served.nonce == header.nonce)
             .and_then(|served| {
                 let ServedOffer::Metadata(offer) = &served.offer else {
@@ -5194,7 +5188,7 @@ where
                 self_id,
                 header.replica,
                 header.nonce,
-                header.namespace,
+                header.group,
                 TransferDescriptor::available(
                     &offer.manifest(),
                     offer.commit_op,
@@ -5222,7 +5216,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::available(
                         &offer.manifest(),
                         offer.commit_op,
@@ -5232,7 +5226,7 @@ where
                 )
                 .await;
                 self.state_transfer_offers.borrow_mut().insert(
-                    (header.namespace, header.replica),
+                    (header.group, header.replica),
                     ServedStateTransfer {
                         nonce: header.nonce,
                         offer: ServedOffer::Metadata(offer),
@@ -5257,7 +5251,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::unavailable(
                         false,
                         consensus.view(),
@@ -5302,7 +5296,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_state_transfer_target(msg).await;
         }
@@ -5480,7 +5474,7 @@ where
                 consensus.replica(),
                 peer,
                 nonce,
-                consensus.namespace(),
+                consensus.group(),
                 artifact,
                 offset,
                 len,
@@ -5593,7 +5587,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_request_state_chunk(msg).await;
         }
@@ -5615,7 +5609,7 @@ where
         let reply = {
             let mut offers = self.state_transfer_offers.borrow_mut();
             let served = offers
-                .get_mut(&(header.namespace, header.replica))
+                .get_mut(&(header.group, header.replica))
                 .filter(|served| served.nonce == header.nonce);
             served.map_or(
                 Some(ChunkReply::Unavailable { transient: true }),
@@ -5665,7 +5659,7 @@ where
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.nonce = header.nonce;
-                            h.namespace = header.namespace;
+                            h.group = header.group;
                             h.artifact = header.artifact;
                             h.offset = header.offset;
                             h.size = total_size as u32;
@@ -5694,7 +5688,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::unavailable(
                         transient,
                         consensus.view(),
@@ -5736,7 +5730,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_state_chunk(msg).await;
         }
@@ -6372,7 +6366,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -6386,7 +6380,7 @@ where
         let cached = self
             .state_transfer_offers
             .borrow_mut()
-            .get_mut(&(header.namespace, header.replica))
+            .get_mut(&(header.group, header.replica))
             .filter(|served| served.nonce == header.nonce)
             .and_then(|served| {
                 let ServedOffer::Partition(offer) = &served.offer else {
@@ -6403,14 +6397,14 @@ where
             Some(offer) => {
                 tracing::debug!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     "re-answering a partition state transfer request from the offer \
                      already served"
                 );
                 Some(offer)
             }
-            None if !self.may_serve_another_partition_transfer(header.namespace) => {
+            None if !self.may_serve_another_partition_transfer(header.group) => {
                 // Admission control, because the served-payload budget is a
                 // BYTE budget and the pulls that overrun it do not degrade
                 // gracefully. Each concurrent pull holds a different segment
@@ -6423,7 +6417,7 @@ where
                 // Refusing the surplus is what makes the admitted ones finish.
                 tracing::info!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     "already serving as many partition transfers as the served-payload \
                      budget holds; refusing until one completes"
@@ -6434,7 +6428,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::unavailable(true, view, commit_max),
                 )
                 .await;
@@ -6446,15 +6440,15 @@ where
                 // and holds nothing in the offers map meanwhile.
                 self.partition_offer_builds
                     .borrow_mut()
-                    .insert(header.namespace, 0);
+                    .insert(header.group, 0);
                 match partition.state_transfer_offer(&config).await {
                     Ok(offer) => {
                         self.partition_offer_builds
                             .borrow_mut()
-                            .remove(&header.namespace);
+                            .remove(&header.group);
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             requester = header.replica,
                             commit_op = offer.commit_op,
                             artifacts = offer.artifact_count(),
@@ -6462,7 +6456,7 @@ where
                             "serving partition state transfer"
                         );
                         self.state_transfer_offers.borrow_mut().insert(
-                            (header.namespace, header.replica),
+                            (header.group, header.replica),
                             ServedStateTransfer {
                                 nonce: header.nonce,
                                 offer: ServedOffer::Partition(Rc::clone(&offer)),
@@ -6490,12 +6484,12 @@ where
                         if !building {
                             self.partition_offer_builds
                                 .borrow_mut()
-                                .remove(&header.namespace);
+                                .remove(&header.group);
                         }
                         let transient = reason.transient();
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             requester = header.replica,
                             transient,
                             %reason,
@@ -6507,7 +6501,7 @@ where
                             self_id,
                             header.replica,
                             header.nonce,
-                            header.namespace,
+                            header.group,
                             TransferDescriptor::unavailable(transient, view, commit_max),
                         )
                         .await;
@@ -6531,7 +6525,7 @@ where
             self_id,
             header.replica,
             header.nonce,
-            header.namespace,
+            header.group,
             TransferDescriptor::available(&offer.manifest(), offer.commit_op, view, commit_max),
         )
         .await;
@@ -6570,11 +6564,7 @@ where
             return;
         }
         let planes = self.plane.inner();
-        let Some(partition) = planes
-            .1
-            .0
-            .get_by_ns(&IggyNamespace::from_raw(header.namespace))
-        else {
+        let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group)) else {
             return;
         };
         let cluster = partition.consensus().cluster();
@@ -6586,7 +6576,7 @@ where
             let attempt = 'attempt: {
                 let mut offers = self.state_transfer_offers.borrow_mut();
                 let served = offers
-                    .get_mut(&(header.namespace, header.replica))
+                    .get_mut(&(header.group, header.replica))
                     .filter(|served| served.nonce == header.nonce);
                 let Some(served) = served else {
                     break 'attempt ChunkAttempt::Reply(Some(ChunkReply::Unavailable {
@@ -6610,7 +6600,7 @@ where
                         match self
                             .served_segment_cache
                             .borrow_mut()
-                            .get(header.namespace, source.entry.checksum)
+                            .get(header.group, source.entry.checksum)
                         {
                             Some(payload) => {
                                 segment_payload = payload;
@@ -6647,7 +6637,7 @@ where
                     // the serving side's proof that the pull ran to completion.
                     tracing::info!(
                         shard = self.id,
-                        namespace_raw = header.namespace,
+                        namespace_raw = header.group,
                         requester = header.replica,
                         "partition state transfer fully served"
                     );
@@ -6662,7 +6652,7 @@ where
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.nonce = header.nonce;
-                        h.namespace = header.namespace;
+                        h.group = header.group;
                         h.artifact = header.artifact;
                         h.offset = header.offset;
                         h.size = total_size as u32;
@@ -6685,7 +6675,7 @@ where
                     let reason = match loaded {
                         Ok(bytes) => {
                             self.served_segment_cache.borrow_mut().insert(
-                                header.namespace,
+                                header.group,
                                 entry.checksum,
                                 Rc::new(bytes),
                                 self.served_segment_cache_bytes_max.get(),
@@ -6701,7 +6691,7 @@ where
                     let transient = reason.transient();
                     tracing::warn!(
                         shard = self.id,
-                        namespace_raw = header.namespace,
+                        namespace_raw = header.group,
                         artifact = header.artifact,
                         path = %log_path,
                         transient,
@@ -6710,7 +6700,7 @@ where
                     );
                     self.state_transfer_offers
                         .borrow_mut()
-                        .remove(&(header.namespace, header.replica));
+                        .remove(&(header.group, header.replica));
                     // The builder cache too: it is keyed by commit_op alone,
                     // and GC unlinks files WITHOUT a commit, so the restarted
                     // requester would otherwise be handed the same offer with
@@ -6730,7 +6720,7 @@ where
             Some(ChunkReply::Unavailable { transient }) => {
                 tracing::info!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     transient,
                     "partition chunk request for an unknown offer; telling requester to restart"
@@ -6740,7 +6730,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     // Usually TRANSIENT -- retention GC'd a served segment, or
                     // the offer aged out between two chunks, and the restarted
                     // session converges -- but a load that failed on a local
@@ -6753,7 +6743,7 @@ where
             None => {
                 tracing::warn!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     artifact = header.artifact,
                     offset = header.offset,
@@ -6999,7 +6989,7 @@ where
         {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 cap = Self::PARTITION_TRANSFERS_INFLIGHT_MAX,
                 "partition transfer slots exhausted; deferring this arm"
             );
@@ -7052,7 +7042,7 @@ where
         let to_op = consensus.commit_max();
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
-        let namespace = consensus.namespace();
+        let namespace = consensus.group();
         partition.repair = Some(partitions::RepairSession {
             nonce,
             to_op,
@@ -7092,7 +7082,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -7115,7 +7105,7 @@ where
             let transient = header.unavailable_transient == 1;
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 transient,
                 "partition transfer peer cannot serve; backing off before re-arming"
@@ -7161,7 +7151,7 @@ where
         if header.commit_op > header.commit_max {
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 serving_commit_op = header.commit_op,
                 serving_commit_max = header.commit_max,
@@ -7175,7 +7165,7 @@ where
         if header.view < local_view || header.commit_max < local_commit_max {
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 serving_view = header.view,
                 serving_commit_max = header.commit_max,
@@ -7196,7 +7186,7 @@ where
             Err(error) => {
                 tracing::warn!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     %error,
                     "partition transfer manifest rejected"
                 );
@@ -7225,7 +7215,7 @@ where
         if !kind_capped || total_len > Self::PARTITION_TRANSFER_TOTAL_LEN_MAX {
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 total_len,
                 "partition transfer manifest exceeds artifact caps; refusing descriptor"
             );
@@ -7245,7 +7235,7 @@ where
         if !reused.is_empty() {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 adopted = reused.len(),
                 artifacts = entries.len(),
@@ -7292,7 +7282,7 @@ where
         if consensus.state_transfer_stage() == consensus::StateTransferStage::AwaitingTarget {
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Fetching);
         }
-        self.on_partition_transfer_progress(header.namespace).await;
+        self.on_partition_transfer_progress(header.group).await;
     }
 
     /// Receive one partition chunk; spill a completed segment artifact, and
@@ -7309,7 +7299,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -7343,7 +7333,7 @@ where
             session.idle_ticks = 0;
         }
         partition.note_transfer_progress();
-        self.on_partition_transfer_progress(header.namespace).await;
+        self.on_partition_transfer_progress(header.group).await;
     }
 
     /// Drive an in-flight partition transfer: spill newly completed segment
@@ -7706,7 +7696,7 @@ where
             // cannot tell the two apart; the serving node's own logs can.
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 peer,
                 refusals,
                 "partition state transfer has been refused {refusals} times in a row; the peer \
@@ -7754,7 +7744,7 @@ where
         };
         tracing::info!(
             shard = self.id,
-            namespace_raw = partition.consensus().namespace(),
+            namespace_raw = partition.consensus().group(),
             failures,
             next_peer,
             after_ticks,
@@ -7900,7 +7890,7 @@ where
         let metadata_served = metadata.consensus.as_ref().is_some_and(|consensus| {
             offers
                 .keys()
-                .any(|(namespace, _)| *namespace == consensus.namespace())
+                .any(|(namespace, _)| *namespace == consensus.group())
         });
         if !metadata_served {
             metadata.clear_state_transfer_offer_cache();
@@ -8052,7 +8042,7 @@ where
         view = consensus.view(),
         op = consensus.sequencer().current_sequence(),
         commit = consensus.commit_max(),
-        namespace = consensus.namespace(),
+        namespace = consensus.group(),
         "answering stale-view heartbeat with StartView"
     );
     // Unsolicited, answering a stale-view heartbeat rather than a probe, so there is
@@ -8065,7 +8055,7 @@ where
         commit: consensus.commit_max(),
         incarnation: 0,
         target: None,
-        namespace: consensus.namespace(),
+        group: consensus.group(),
         // Correcting a peer on a stale view, not concluding a view change: this
         // publishes the settled frontier, which the peer reaches by repair.
         suffix: Vec::new(),
@@ -8497,7 +8487,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
         if canonical.op <= applied_floor {
             tracing::error!(
                 shard,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 op = canonical.op,
                 view = partition.consensus().view(),
                 commit_max = pending.commit_max,
@@ -8533,7 +8523,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
         Ok(removed) => {
             tracing::warn!(
                 shard,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 from_op,
                 removed,
                 op_head = pending.op_head,
@@ -8545,7 +8535,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
         Err(error) => {
             tracing::error!(
                 shard,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 from_op,
                 %error,
                 "could not drop the diverging uncommitted partition entries from op \
@@ -8700,21 +8690,21 @@ async fn dispatch_vsr_actions<B, P, J>(
             !advertises_view || !consensus.needs_superblock_persist(),
             "durable-before-send violated: dispatching a view-scoped action for \
              namespace {} while the superblock is behind the in-memory view {}",
-            consensus.namespace(),
+            consensus.group(),
             consensus.view(),
         );
     }
 
     for action in actions {
         match action {
-            VsrAction::SendStartViewChange { view, namespace } => {
+            VsrAction::SendStartViewChange { view, group } => {
                 let msg = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
                     .transmute_header(|_, h: &mut StartViewChangeHeader| {
                         h.command = Command2::StartViewChange;
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.view = *view;
-                        h.namespace = *namespace;
+                        h.group = *group;
                         h.size = size_of::<StartViewChangeHeader>() as u32;
                         h.seal();
                     });
@@ -8726,7 +8716,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 log_view,
                 op,
                 commit,
-                namespace,
+                group,
                 suffix,
             } => {
                 let header_size = size_of::<DoViewChangeHeader>();
@@ -8746,7 +8736,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                     h.log_view = *log_view;
                     h.op = *op;
                     h.commit = *commit;
-                    h.namespace = *namespace;
+                    h.group = *group;
                     h.nack_bitset = nack_bitset;
                     h.present_bitset = present_bitset;
                     h.checksum_body = body_checksum;
@@ -8760,7 +8750,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 let _ = target;
                 broadcast(msg.into_generic().into_frozen()).await;
             }
-            VsrAction::SendRequestStartView { view, namespace } => {
+            VsrAction::SendRequestStartView { view, group } => {
                 // Stamp this replica's incarnation so the answering StartView can
                 // echo it, proving to us the reply post-dates our restart.
                 let incarnation = consensus.incarnation();
@@ -8772,7 +8762,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                             h.replica = self_id;
                             h.view = *view;
                             h.incarnation = incarnation;
-                            h.namespace = *namespace;
+                            h.group = *group;
                             h.size = size_of::<RequestStartViewHeader>() as u32;
                             h.seal();
                         });
@@ -8784,7 +8774,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 commit,
                 incarnation,
                 target,
-                namespace,
+                group,
                 suffix,
             } => {
                 let header_size = size_of::<StartViewHeader>();
@@ -8802,7 +8792,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                     h.op = *op;
                     h.commit = *commit;
                     h.incarnation = *incarnation;
-                    h.namespace = *namespace;
+                    h.group = *group;
                     h.size = total_size as u32;
                     h.seal();
                 });
@@ -8821,7 +8811,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 from_op,
                 to_op,
                 target,
-                namespace,
+                group,
             } => {
                 let Some(journal) = journal else {
                     continue;
@@ -8844,7 +8834,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                             h.prepare_checksum = prepare_header.checksum;
                             h.request = prepare_header.request;
                             h.operation = prepare_header.operation;
-                            h.namespace = *namespace;
+                            h.group = *group;
                             h.size = size_of::<PrepareOkHeader>() as u32;
                             h.seal();
                         });
@@ -8888,7 +8878,7 @@ async fn dispatch_vsr_actions<B, P, J>(
             VsrAction::SendCommit {
                 view,
                 commit,
-                namespace,
+                group,
                 timestamp_monotonic,
             } => {
                 let msg = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
@@ -8898,7 +8888,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                         h.replica = self_id;
                         h.view = *view;
                         h.commit = *commit;
-                        h.namespace = *namespace;
+                        h.group = *group;
                         h.timestamp_monotonic = *timestamp_monotonic;
                         h.size = size_of::<CommitHeader>() as u32;
                         h.seal();
@@ -8947,7 +8937,7 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 || !consensus.needs_superblock_persist(),
             "durable-before-send violated: dispatching a view-scoped action for \
              namespace {} while the superblock is behind the in-memory view {}",
-            consensus.namespace(),
+            consensus.group(),
             consensus.view(),
         );
     }
@@ -8959,7 +8949,7 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 from_op,
                 to_op,
                 target,
-                namespace,
+                group,
             } => {
                 for op in *from_op..=*to_op {
                     let Some(prepare_header) = journal.header_by_op(op) else {
@@ -8978,7 +8968,7 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                             h.prepare_checksum = prepare_header.checksum;
                             h.request = prepare_header.request;
                             h.operation = prepare_header.operation;
-                            h.namespace = *namespace;
+                            h.group = *group;
                             h.size = size_of::<PrepareOkHeader>() as u32;
                             h.seal();
                         });
@@ -9051,7 +9041,7 @@ mod persist_gate_tests {
                 commit: 3,
                 incarnation: 0,
                 target: None,
-                namespace: 7,
+                group: 7,
                 suffix: Vec::new(),
             },
             VsrAction::CommitJournal,
@@ -9072,10 +9062,7 @@ mod persist_gate_tests {
 
     #[test]
     fn given_send_only_actions_when_split_should_leave_locals_empty() {
-        let actions = vec![VsrAction::SendStartViewChange {
-            view: 2,
-            namespace: 7,
-        }];
+        let actions = vec![VsrAction::SendStartViewChange { view: 2, group: 7 }];
         let (local, wire) = split_local_actions(actions);
         assert!(local.is_empty());
         assert_eq!(wire.len(), 1);

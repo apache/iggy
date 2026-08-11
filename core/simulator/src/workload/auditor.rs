@@ -148,16 +148,11 @@ impl ServerAuditor {
             return OnReply::Unknown;
         };
 
-        // Reply's namespace must match the namespace the request was
-        // submitted to. A mismatch means the reply landed in the wrong
-        // VSR group's bookkeeping; refuse to apply effects against the
-        // wrong shadow bucket. Entry already consumed.
-        if entry.request_namespace != header.namespace {
-            self.stats.replies_unknown += 1;
-            return OnReply::NsMismatch;
-        }
-
-        let ns_key = (header.client, header.namespace);
+        // Replies no longer echo a group id (the client wire has no
+        // namespace field at all), so correlation rests entirely on the
+        // (client, request) key that fetched `entry`; the group the request
+        // was submitted to comes from the sim's own bookkeeping.
+        let ns_key = (header.client, entry.request_namespace);
         let last_commit = self
             .last_commit_watermark_per_client_ns
             .entry(ns_key)

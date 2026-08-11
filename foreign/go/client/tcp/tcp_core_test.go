@@ -389,7 +389,7 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 	recorded := server.recorded()
 	require.Len(t, recorded, 1)
 	assert.Equal(t, vsr.OperationSendMessages, recorded[0].operation())
-	assert.Equal(t, uint64(3)<<32|uint64(2)<<20|1, recorded[0].namespace())
+	assert.Equal(t, uint32(1), recorded[0].partitionID(t))
 	assert.Equal(t, uint64(1), recorded[0].requestID(),
 		"a partition request reads the watermark without consuming it")
 }
@@ -471,7 +471,7 @@ func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T)
 	require.Len(t, recorded, 2)
 	assert.Equal(t, uint32(command.GetTopicCode), recorded[0].code())
 	// 0x0D3FE0E1 modulo four partitions.
-	assert.Equal(t, uint64(1)<<32|uint64(1)<<20|1, recorded[1].namespace())
+	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
 }
 
 func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
@@ -492,13 +492,13 @@ func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	var partitions []uint64
+	var partitions []uint32
 	for _, recorded := range server.recorded() {
 		if recorded.operation() == vsr.OperationSendMessages {
-			partitions = append(partitions, recorded.namespace()&0xFFFFF)
+			partitions = append(partitions, recorded.partitionID(t))
 		}
 	}
-	assert.Equal(t, []uint64{0, 1, 2, 0}, partitions)
+	assert.Equal(t, []uint32{0, 1, 2, 0}, partitions)
 
 	metadataRequests := 0
 	for _, recorded := range server.recorded() {

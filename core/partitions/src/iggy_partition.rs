@@ -54,7 +54,7 @@ use iggy_binary_protocol::responses::messages::{
 use iggy_binary_protocol::{
     AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier,
 };
-use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
+use iggy_binary_protocol::{PrepareOkHeader, RoutedRequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
@@ -279,7 +279,7 @@ where
     // are the ones diagnostics actually key on.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IggyPartition")
-            .field("namespace", &self.consensus.namespace())
+            .field("namespace", &self.consensus.group())
             .field("offset", &self.offset)
             .field("dirty_offset", &self.dirty_offset)
             .field("should_increment_offset", &self.should_increment_offset)
@@ -293,12 +293,12 @@ where
 }
 
 /// Post-preflight dispatch in `on_request`: replicate via VSR or take the
-/// `NoAck` leader-local fast path. `RequestHeader` is boxed to avoid the
+/// `NoAck` leader-local fast path. `RoutedRequestHeader` is boxed to avoid the
 /// 277-byte inline variant tripping clippy's `large_enum_variant`.
 enum Disposition {
     Replicate(Message<PrepareHeader>),
     NoAck {
-        request_header: Box<RequestHeader>,
+        request_header: Box<RoutedRequestHeader>,
         kind: ConsumerKind,
         consumer_id: u32,
         offset: Option<u64>,
@@ -719,7 +719,7 @@ where
                         target: "iggy.partitions.diag",
                         plane = "partitions",
                         replica_id = self.consensus.replica(),
-                        namespace_raw = self.consensus.namespace(),
+                        namespace_raw = self.consensus.group(),
                         view = state.view,
                         log_view = state.log_view,
                         superblock_write_failures = failures,
@@ -764,7 +764,7 @@ where
             return;
         }
         tracing::info!(
-            namespace_raw = self.consensus().namespace(),
+            namespace_raw = self.consensus().group(),
             offset_frontier = frontier,
             "restored partition offset frontier from its superblock"
         );
@@ -1316,7 +1316,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn apply_consumer_offset_no_ack(
         &self,
-        request_header: Box<RequestHeader>,
+        request_header: Box<RoutedRequestHeader>,
         kind: ConsumerKind,
         consumer_id: u32,
         offset: Option<u64>,
@@ -1710,7 +1710,7 @@ where
     }
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
-        IggyNamespace::from_raw(self.consensus.namespace())
+        IggyNamespace::from_raw(self.consensus.group())
     }
 
     fn partition_dir(&self) -> Option<String> {
@@ -1812,9 +1812,9 @@ where
     /// Panics if called when this partition's consensus instance is not the
     /// primary, is not in normal status, or is currently syncing.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    pub async fn on_request(&mut self, message: Message<RequestHeader>) {
+    pub async fn on_request(&mut self, message: Message<RoutedRequestHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
+        let namespace = IggyNamespace::from_raw(message.header().group);
         let client_id = message.header().client;
         let request = message.header().request;
 
@@ -2460,7 +2460,7 @@ where
     ) -> Result<Frozen<4096>, IggyError> {
         let header = *message.header();
         let replica_id = self.consensus.replica();
-        let namespace_raw = self.consensus.namespace();
+        let namespace_raw = self.consensus.group();
 
         match header.operation {
             Operation::SendMessages => {
@@ -3065,7 +3065,7 @@ where
         send_client_replies: bool,
     ) {
         let replica_id = self.consensus.replica();
-        let namespace_raw = self.consensus.namespace();
+        let namespace_raw = self.consensus.group();
         let drained_count = drained.len();
         if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
             debug!(
@@ -3147,7 +3147,7 @@ where
             if send_client_replies && !is_auto_commit_client(prepare_header.client) {
                 let body = match prepare_header.operation {
                     Operation::SendMessages => {
-                        send_messages_reply_body(prepare_header.namespace, batch_stats)
+                        send_messages_reply_body(prepare_header.group, batch_stats)
                     }
                     operation => committed_reply_body(operation),
                 };
@@ -3365,13 +3365,13 @@ where
 
     fn parse_consumer_offset_request(
         operation: Operation,
-        message: &Message<RequestHeader>,
+        message: &Message<RoutedRequestHeader>,
     ) -> Result<(ConsumerKind, u32, Option<u64>, AckLevel), IggyError> {
         let total_size =
             usize::try_from(message.header().size).map_err(|_| IggyError::InvalidCommand)?;
         let body = message
             .as_slice()
-            .get(std::mem::size_of::<RequestHeader>()..total_size)
+            .get(std::mem::size_of::<RoutedRequestHeader>()..total_size)
             .ok_or(IggyError::InvalidCommand)?;
         Self::parse_consumer_offset_payload(operation, body)
     }
@@ -3382,7 +3382,7 @@ where
     /// so nothing replicates.
     async fn send_partition_deny_or_log(
         consensus: &VsrConsensus<B>,
-        header: &RequestHeader,
+        header: &RoutedRequestHeader,
         status: u32,
         send_fail_label: &'static str,
     ) {
@@ -5334,7 +5334,7 @@ mod tests {
         client_id: u128,
         request_id: u64,
         consumer_id: u32,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let body = DeleteConsumerOffset2Request {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
@@ -5343,17 +5343,17 @@ mod tests {
             ack: AckLevel::Quorum,
         }
         .to_bytes();
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total = header_size + body.len();
-        let mut message = Message::<RequestHeader>::new(total);
+        let mut message = Message::<RoutedRequestHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
-        message.transmute_header(|_, header: &mut RequestHeader| {
+        message.transmute_header(|_, header: &mut RoutedRequestHeader| {
             header.command = Command2::Request;
             header.operation = Operation::DeleteConsumerOffset2;
             header.client = client_id;
             header.session = 1;
             header.request = request_id;
-            header.namespace = IggyNamespace::new(1, 1, 0).inner();
+            header.group = IggyNamespace::new(1, 1, 0).inner();
             header.size = u32::try_from(total).expect("request size fits u32");
         })
     }
@@ -7065,7 +7065,7 @@ mod purge_floor_tests {
             header.operation = Operation::SendMessages;
             header.op = op;
             header.timestamp = op;
-            header.namespace = namespace.inner();
+            header.group = namespace.inner();
             header.size = u32::try_from(total).expect("prepare size fits u32");
         });
         partition
@@ -7100,7 +7100,7 @@ mod purge_floor_tests {
             header.command = Command2::Prepare;
             header.operation = Operation::StoreConsumerOffset2;
             header.op = op;
-            header.namespace = IggyNamespace::new(1, 1, 0).inner();
+            header.group = IggyNamespace::new(1, 1, 0).inner();
             header.size = u32::try_from(total).expect("prepare size fits u32");
         });
         partition
@@ -7430,7 +7430,7 @@ mod purge_floor_tests {
             header.command = Command2::Prepare;
             header.operation = Operation::SendMessages;
             header.op = 1;
-            header.namespace = namespace.inner();
+            header.group = namespace.inner();
             header.size = u32::try_from(total).expect("prepare size fits u32");
         });
 

@@ -1667,13 +1667,16 @@ mod tests {
         // shifts the trace. Re-lock on intentional changes; expect re-locks until
         // error discriminants and reply bodies stabilize the wire format.
         //
-        // Re-locked when the sim adopted METADATA_CONSENSUS_NAMESPACE (1<<63)
+        // Re-locked when the sim adopted METADATA_GROUP (1<<63)
         // for metadata requests and the metadata consensus group, replacing
         // the sim-only 0: reply headers and the per-group timeout-jitter seed
         // (replica_id ^ namespace) both changed. The old 0 only ever routed
         // correctly because `hash % 1 == 0` at one shard per replica.
+        // Re-locked again when replies stopped echoing a group id (the
+        // client wire lost its namespace field): the reply-hash tuple
+        // dropped that component.
         assert_eq!(
-            h1, 0x530D_499C_5DBE_A2BE,
+            h1, 0xCF1F_BC79_B44A_65F7,
             "workload reply hash drifted from locked baseline"
         );
     }
@@ -2319,15 +2322,7 @@ mod tests {
             }
             for reply in sim.step() {
                 let h = reply.header();
-                (
-                    h.client,
-                    h.request,
-                    h.op,
-                    h.commit,
-                    h.namespace,
-                    h.operation as u8,
-                )
-                    .hash(&mut hasher);
+                (h.client, h.request, h.op, h.commit, h.operation as u8).hash(&mut hasher);
                 let cmds = wl.on_reply(&reply);
                 apply_sim_commands(&mut sim, &cmds);
                 replies_seen += 1;
@@ -2951,7 +2946,7 @@ mod tests {
             let header: &PrepareOkHeader = bytemuck::checked::from_bytes(
                 &packet.message.as_slice()[..std::mem::size_of::<PrepareOkHeader>()],
             );
-            header.namespace == BLOCKED_NS.load(Ordering::Relaxed)
+            header.group == BLOCKED_NS.load(Ordering::Relaxed)
         }
 
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
@@ -3007,13 +3002,16 @@ mod tests {
         // ns_b shares the client, the replicas, and the shard, but has its
         // own consensus group: it must commit while ns_a stays wedged.
         let msg = client.send_messages(ns_b, &[Bytes::from_static(b"independent")]);
+        // Replies no longer carry a group id; correlate by the request id
+        // this send was stamped with.
+        let ns_b_request = msg.header().request;
         sim.submit_request(client_id, 0, msg.into_generic());
         let mut independent_replies = 0usize;
         for _ in 0..100 {
             for reply in sim.step() {
                 assert_eq!(
-                    reply.header().namespace,
-                    ns_b.inner(),
+                    reply.header().request,
+                    ns_b_request,
                     "only ns_b may commit while ns_a's acks are blocked"
                 );
                 independent_replies += 1;
@@ -3032,7 +3030,9 @@ mod tests {
         let mut drained_replies = 0usize;
         for _ in 0..800 {
             for reply in sim.step() {
-                if reply.header().namespace == ns_a.inner() {
+                // Only ns_a replies are outstanding once ns_b committed
+                // above, so every reply counts toward the drain.
+                if reply.header().request != ns_b_request {
                     drained_replies += 1;
                 }
             }

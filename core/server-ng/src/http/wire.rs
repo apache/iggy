@@ -16,7 +16,7 @@
 // under the License.
 
 //! HTTP -> wire request mappers: produce/poll/consumer-offset encoders and
-//! the control-plane [`Message<RequestHeader>`] builder shared by the write path.
+//! the control-plane [`Message<RoutedRequestHeader>`] builder shared by the write path.
 
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::consensus::{Command2, HEADER_SIZE};
@@ -28,7 +28,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::{
     PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
-use iggy_binary_protocol::{AckLevel, Operation, RequestHeader};
+use iggy_binary_protocol::{AckLevel, Operation, RoutedRequestHeader};
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
@@ -179,7 +179,7 @@ pub(in crate::http) const fn resync_required_polled_messages() -> PolledMessages
     }
 }
 
-/// Build a `Message<RequestHeader>` for a control-plane write by filling a zeroed
+/// Build a `Message<RoutedRequestHeader>` for a control-plane write by filling a zeroed
 /// `#[repr(C)]` header, mirroring `wire::rewrite_request_body` and the partition
 /// reconciler's prepare builder. `body` is the already-encoded wire request,
 /// copied in after the header.
@@ -189,14 +189,14 @@ pub(in crate::http) fn build_request_message(
     session_id: u64,
     request_id: u64,
     body: &[u8],
-) -> Message<RequestHeader> {
+) -> Message<RoutedRequestHeader> {
     let total = HEADER_SIZE + body.len();
-    let mut message = Message::<RequestHeader>::new(total);
+    let mut message = Message::<RoutedRequestHeader>::new(total);
     message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(body);
-    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+    let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
         &mut message.as_mut_slice()[..HEADER_SIZE],
     )
-    .expect("zeroed bytes form a valid RequestHeader");
+    .expect("zeroed bytes form a valid RoutedRequestHeader");
     header.command = Command2::Request;
     header.operation = operation;
     header.client = client_id;
