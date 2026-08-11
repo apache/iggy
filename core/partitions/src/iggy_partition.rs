@@ -40,9 +40,9 @@ use consensus::{
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, replicate_preflight,
-    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit,
+    replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
+    send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -70,8 +70,8 @@ use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
     send_messages2::{
-        ChecksumMode, convert_request_message, decode_prepare_slice, decode_prepare_slice_trusted,
-        stamp_prepare_for_persistence, verify_received_send_messages,
+        ChecksumMode, SendMessages2Header, convert_request_message, decode_prepare_slice,
+        decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
 };
@@ -1633,68 +1633,9 @@ where
         &mut self,
         message: Message<PrepareHeader>,
     ) -> Result<AppendResult, IggyError> {
-        let header = *message.header();
-        if header.operation != Operation::SendMessages {
-            return Err(IggyError::CannotAppendMessage);
-        }
-
-        let dirty_offset = if self.should_increment_offset {
-            self.dirty_offset.load(Ordering::Relaxed) + 1
-        } else {
-            0
-        };
-
-        // Reuse the prepare's monotonic timestamp, assigned once by the primary
-        // in `project()` (`next_monotonic_timestamp`) and replicated verbatim to
-        // every backup. Sourcing it here instead of a fresh local `now()` makes
-        // the persisted `base_timestamp` (and the `batch_checksum` derived from
-        // it) byte-identical across replicas; a local `now()` diverges per node.
-        let batch_timestamp = header.timestamp;
-        let (message, batch, batch_messages_count) =
-            stamp_prepare_for_persistence(message, dirty_offset, batch_timestamp)
-                .map_err(|_| IggyError::CannotAppendMessage)?;
-
-        if batch_messages_count == 0 {
-            return Ok(AppendResult::new(0, 0, 0));
-        }
-
-        let batch_messages_size =
-            u64::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
-
-        let last_dirty_offset = dirty_offset + u64::from(batch_messages_count) - 1;
-
-        if !self.should_increment_offset {
-            self.should_increment_offset = true;
-        }
-        self.dirty_offset
-            .store(last_dirty_offset, Ordering::Relaxed);
-
-        let segment_index = self.log.segments().len() - 1;
-        let current_position = self.log.segments()[segment_index].current_position;
-        self.log.segments_mut()[segment_index].current_position = current_position
-            .checked_add(batch_messages_size)
-            .ok_or(IggyError::CannotAppendMessage)?;
-
-        let journal = self.log.journal_mut();
-        journal.info.messages_count += batch_messages_count;
-        journal.info.size += IggyByteSize::from(batch_messages_size);
-        journal.info.current_offset = last_dirty_offset;
-        if journal.info.first_timestamp == 0 {
-            journal.info.first_timestamp = batch.base_timestamp;
-        }
-        journal.info.end_timestamp = batch.base_timestamp;
-        journal.info.max_timestamp = journal.info.max_timestamp.max(batch.base_timestamp);
-        journal
-            .inner
-            .append(message.into_frozen())
+        self.stamp_and_append_messages(message)
             .await
-            .map_err(|_| IggyError::CannotAppendMessage)?;
-
-        Ok(AppendResult::new(
-            dirty_offset,
-            last_dirty_offset,
-            batch_messages_count,
-        ))
+            .map(|journaled| journaled.result)
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1736,6 +1677,37 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    async fn stamp_and_append_messages(
+        &mut self,
+        message: Message<PrepareHeader>,
+    ) -> Result<JournaledMessages, IggyError> {
+        let header = *message.header();
+        if header.operation != Operation::SendMessages {
+            return Err(IggyError::CannotAppendMessage);
+        }
+
+        let dirty_offset = if self.should_increment_offset {
+            self.dirty_offset
+                .load(Ordering::Relaxed)
+                .checked_add(1)
+                .ok_or(IggyError::CannotAppendMessage)?
+        } else {
+            0
+        };
+
+        // Reuse the prepare's monotonic timestamp, assigned once by the primary
+        // in `project()` (`next_monotonic_timestamp`) and replicated verbatim to
+        // every backup. Sourcing it here instead of a fresh local `now()` makes
+        // the persisted `base_timestamp` (and the `batch_checksum` derived from
+        // it) byte-identical across replicas. A local `now()` diverges per node.
+        let batch_timestamp = header.timestamp;
+        let (message, batch, batch_messages_count) =
+            stamp_prepare_for_persistence(message, dirty_offset, batch_timestamp)
+                .map_err(|_| IggyError::CannotAppendMessage)?;
+
+        debug_assert_eq!(batch.message_count, batch_messages_count);
+        self.append_stamped_messages(message, batch).await
+    }
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
         IggyNamespace::from_raw(self.consensus.namespace())
@@ -2183,9 +2155,46 @@ where
                 .with_operation(header.operation)
                 .with_op(header.op),
             );
-            let clone_for_forward = message.clone();
+            let Some(journaled) = self.log.journal().inner.repair_entry(header.op) else {
+                emit_partition_diag(
+                    tracing::Level::ERROR,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "journal header exists without matching prepare bytes",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op),
+                );
+                return;
+            };
+            if !journaled_prepare_matches_retransmit(&journaled, &message) {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "rejecting retransmitted prepare that differs from the journaled entry",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op),
+                );
+                return;
+            }
+            let Some(frozen_for_forward) = restamp_prepare_view(journaled, header.view) else {
+                emit_partition_diag(
+                    tracing::Level::ERROR,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "failed to restamp journaled prepare for retransmission",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op),
+                );
+                return;
+            };
             let consensus = self.consensus();
-            if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
+            if let Err(error) =
+                replicate_frozen_to_next_in_chain(consensus, frozen_for_forward).await
+            {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
@@ -2271,78 +2280,55 @@ where
                 );
             }
         }
-        // First blob-integrity check on the replicated path. The consensus
-        // layer never validates the body (PrepareHeader integrity fields are
-        // inert zeros) and the batch checksum is recomputed locally at stamp,
-        // so a follower must verify each message's stamp-invariant per-message
-        // checksum before journaling transit bytes. Follower-only: the primary
-        // (and single-node self-replicate) produced these bytes and already
-        // checked the client batch at ingest, so they must not pay this pass.
-        // Fail closed on mismatch - drop without journaling, forwarding, or
-        // acking; the primary retransmits on prepare-timeout.
-        if is_backup
-            && header.operation == Operation::SendMessages
-            && let Err(error) = verify_received_send_messages(message.as_slice())
-        {
-            emit_partition_diag(
-                tracing::Level::WARN,
-                &PartitionDiagEvent::new(
-                    self.diag_ctx(),
-                    "rejecting replicated send_messages: per-message checksum mismatch",
-                )
-                .with_operation(header.operation)
-                .with_op(header.op)
-                .with_error(error.to_string()),
-            );
-            return;
-        }
-
-        // Durability-before-ack: clone for chain-replicate, forward only
-        // AFTER apply_replicated_operation persists. Forward-first would
-        // give downstream an op whose WAL entry we never wrote, that violates
-        // tail-ahead-of-head. Clone is cheap (Arc bumps in common case).
-        let clone_for_forward = message.clone();
-        let replicated_result = self.apply_replicated_operation(message).await;
-        if replicated_result.is_ok() {
-            let consensus = self.consensus();
-            // Backup only: advance sequencer + checksum after journal append.
-            // Pre-advance on failing apply would leave consensus claiming op N
-            // while journal has nothing; retransmit of N would silently drop
-            // as is_old_prepare (header.op <= current_sequence). Primary must
-            // NOT re-set here: push_prepare_entry already advanced, and a
-            // sibling request pipelined during the apply await would be
-            // rewound to a stale op + parent, projecting a duplicate next.
-            if is_backup {
-                consensus.sequencer().set_sequence(header.op);
-                consensus.set_last_prepare_checksum(header.checksum);
-                consensus.observe_prepare_timestamp(header.timestamp);
-            }
-            if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
+        // Forward only after apply_replicated_operation journals the prepare.
+        // The journal and network share the frozen allocation, so the bytes
+        // retained for repair are exactly the bytes sent downstream.
+        let replicated_result = if is_backup && header.operation == Operation::SendMessages {
+            self.append_received_send_messages_to_journal(message).await
+        } else {
+            self.apply_replicated_operation(message).await
+        };
+        let frozen_for_forward = match replicated_result {
+            Ok(frozen) => frozen,
+            Err(error) => {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
                         self.diag_ctx(),
-                        "failed to replicate prepare to next in chain",
+                        "failed to apply replicated partition operation",
                     )
                     .with_operation(header.operation)
                     .with_op(header.op)
                     .with_error(error.to_string()),
                 );
+                return;
             }
-        }
+        };
 
-        if let Err(error) = replicated_result {
+        let consensus = self.consensus();
+        // Backup only: advance sequencer + checksum after journal append.
+        // Pre-advance on failing apply would leave consensus claiming op N
+        // while the journal has nothing. Retransmit of N would silently drop
+        // as is_old_prepare (header.op <= current_sequence). The primary does
+        // not re-set here because push_prepare_entry already advanced it. A
+        // sibling request pipelined during the apply await would otherwise be
+        // rewound to a stale op + parent, projecting a duplicate next.
+        if is_backup {
+            consensus.sequencer().set_sequence(header.op);
+            consensus.set_last_prepare_checksum(header.checksum);
+            consensus.observe_prepare_timestamp(header.timestamp);
+        }
+        if let Err(error) = replicate_frozen_to_next_in_chain(consensus, frozen_for_forward).await {
             emit_partition_diag(
                 tracing::Level::WARN,
                 &PartitionDiagEvent::new(
                     self.diag_ctx(),
-                    "failed to apply replicated partition operation",
+                    "failed to replicate prepare to next in chain",
                 )
                 .with_operation(header.operation)
                 .with_op(header.op)
                 .with_error(error.to_string()),
             );
-            return;
         }
 
         {
@@ -2471,14 +2457,14 @@ where
     async fn apply_replicated_operation(
         &mut self,
         message: Message<PrepareHeader>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Frozen<4096>, IggyError> {
         let header = *message.header();
         let replica_id = self.consensus.replica();
         let namespace_raw = self.consensus.namespace();
 
         match header.operation {
             Operation::SendMessages => {
-                self.append_send_messages_to_journal(message).await?;
+                let frozen = self.append_send_messages_to_journal(message).await?;
                 debug!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
@@ -2488,7 +2474,7 @@ where
                     operation = ?header.operation,
                     "replicated send_messages appended to partition journal"
                 );
-                Ok(())
+                Ok(frozen)
             }
             Operation::StoreConsumerOffset
             | Operation::DeleteConsumerOffset
@@ -2509,10 +2495,11 @@ where
                 // the `journal.info` accounting: it counts SendMessages
                 // batches for segment-commit thresholds, which do not
                 // apply to offset ops.
+                let frozen = message.into_frozen();
                 self.log
                     .journal()
                     .inner
-                    .append(message.clone().into_frozen())
+                    .append(frozen.clone())
                     .await
                     .map_err(|_| IggyError::CannotAppendMessage)?;
 
@@ -2544,7 +2531,7 @@ where
                     offset = ?offset,
                     "replicated consumer offset journaled and staged"
                 );
-                Ok(())
+                Ok(frozen)
             }
             _ => {
                 warn!(
@@ -2556,7 +2543,7 @@ where
                     operation = ?header.operation,
                     "unexpected replicated partition operation"
                 );
-                Ok(())
+                Err(IggyError::InvalidCommand)
             }
         }
     }
@@ -2564,10 +2551,190 @@ where
     async fn append_send_messages_to_journal(
         &mut self,
         message: Message<PrepareHeader>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Frozen<4096>, IggyError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
-        self.append_messages(message).await.map(|_| ())
+        self.stamp_and_append_messages(message)
+            .await
+            .map(|journaled| journaled.prepare)
+    }
+
+    async fn append_received_send_messages_to_journal(
+        &mut self,
+        message: Message<PrepareHeader>,
+    ) -> Result<Frozen<4096>, IggyError> {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+        let header = *message.header();
+        if header.operation != Operation::SendMessages {
+            return Err(IggyError::CannotAppendMessage);
+        }
+        let validated = decode_prepare_slice(message.as_slice())?.header;
+        if validated.message_count == 0 {
+            return Err(IggyError::InvalidCommand);
+        }
+        let expected_offset = if self.should_increment_offset {
+            self.dirty_offset
+                .load(Ordering::Relaxed)
+                .checked_add(1)
+                .ok_or(IggyError::CannotAppendMessage)?
+        } else {
+            0
+        };
+        if (validated.base_offset, validated.base_timestamp) != (expected_offset, header.timestamp)
+        {
+            return Err(IggyError::CannotAppendMessage);
+        }
+        self.append_stamped_messages(message, validated)
+            .await
+            .map(|journaled| journaled.prepare)
+    }
+
+    async fn append_stamped_messages(
+        &mut self,
+        message: Message<PrepareHeader>,
+        batch: SendMessages2Header,
+    ) -> Result<JournaledMessages, IggyError> {
+        let batch_messages_count = batch.message_count;
+        if batch_messages_count == 0 {
+            return Err(IggyError::CannotAppendMessage);
+        }
+
+        let batch_messages_size =
+            u64::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
+        let last_dirty_offset = batch
+            .base_offset
+            .checked_add(u64::from(batch_messages_count) - 1)
+            .ok_or(IggyError::CannotAppendMessage)?;
+
+        let segment_index = self.log.segments().len() - 1;
+        let current_position = self.log.segments()[segment_index].current_position;
+        let next_position = current_position
+            .checked_add(batch_messages_size)
+            .ok_or(IggyError::CannotAppendMessage)?;
+
+        let mut journal_info = self.log.journal().info;
+        journal_info.messages_count = journal_info
+            .messages_count
+            .checked_add(batch_messages_count)
+            .ok_or(IggyError::CannotAppendMessage)?;
+        journal_info.size = IggyByteSize::from(
+            journal_info
+                .size
+                .as_bytes_u64()
+                .checked_add(batch_messages_size)
+                .ok_or(IggyError::CannotAppendMessage)?,
+        );
+        journal_info.current_offset = last_dirty_offset;
+        if journal_info.first_timestamp == 0 {
+            journal_info.first_timestamp = batch.base_timestamp;
+        }
+        journal_info.end_timestamp = batch.base_timestamp;
+        journal_info.max_timestamp = journal_info.max_timestamp.max(batch.base_timestamp);
+
+        let frozen = message.into_frozen();
+        self.log
+            .journal()
+            .inner
+            .append(frozen.clone())
+            .await
+            .map_err(|_| IggyError::CannotAppendMessage)?;
+
+        self.should_increment_offset = true;
+        self.dirty_offset
+            .store(last_dirty_offset, Ordering::Relaxed);
+        self.log.segments_mut()[segment_index].current_position = next_position;
+        self.log.journal_mut().info = journal_info;
+
+        Ok(JournaledMessages {
+            result: AppendResult::new(batch.base_offset, last_dirty_offset, batch_messages_count),
+            prepare: frozen,
+        })
+    }
+
+    /// Drop an uncommitted view-divergent suffix and restore every append cursor
+    /// from the retained prefix as one write-locked operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a retained batch is invalid, the restored segment
+    /// position overflows, or the journal cannot truncate the suffix.
+    pub async fn truncate_uncommitted_from(&mut self, from_op: u64) -> Result<usize, IggyError> {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let mut entries = self.log.journal().inner.resident_entries();
+        entries.sort_unstable_by_key(peek_op);
+        let mut retained_info = JournalInfo::default();
+        let mut retained_next_offset = 0;
+        let mut rewind_next_offset = None;
+        for entry in &entries {
+            if peek_operation(entry) != Operation::SendMessages {
+                continue;
+            }
+            let batch = decode_prepare_slice_trusted(entry.as_slice())
+                .map_err(|_| IggyError::InvalidCommand)?;
+            if batch.message_count() == 0 {
+                continue;
+            }
+            if peek_op(entry) >= from_op {
+                rewind_next_offset = Some(
+                    rewind_next_offset.map_or(batch.header.base_offset, |offset: u64| {
+                        offset.min(batch.header.base_offset)
+                    }),
+                );
+                continue;
+            }
+            accumulate_committed_info(
+                &mut retained_info,
+                batch.header.base_offset,
+                batch.header.base_timestamp,
+                batch.header.total_size() as u64,
+                batch.message_count(),
+            );
+            retained_next_offset = retained_next_offset.max(
+                batch
+                    .header
+                    .base_offset
+                    .saturating_add(u64::from(batch.message_count())),
+            );
+        }
+
+        let active = self.log.active_segment();
+        let active_size = active.size.as_bytes_u64();
+        let durable_next_offset = if active_size == 0 {
+            active.start_offset
+        } else {
+            active.end_offset.saturating_add(1)
+        };
+        let minimum_next_offset = durable_next_offset
+            .max(retained_next_offset)
+            .max(
+                self.recovered_durable_offset
+                    .map_or(0, |offset| offset.saturating_add(1)),
+            )
+            .max(self.installed_frontier.unwrap_or(0));
+        let restored_position = active_size
+            .checked_add(retained_info.size.as_bytes_u64())
+            .ok_or(IggyError::CannotAppendMessage)?;
+        let removed = self
+            .log
+            .journal()
+            .inner
+            .truncate_from(from_op)
+            .await
+            .map_err(|_| IggyError::CannotAppendMessage)?;
+
+        self.log.journal_mut().info = retained_info;
+        self.log.active_segment_mut().current_position = restored_position;
+        if let Some(next_offset) = rewind_next_offset {
+            let next_offset = next_offset.max(minimum_next_offset);
+            self.dirty_offset
+                .store(next_offset.saturating_sub(1), Ordering::Relaxed);
+            self.should_increment_offset = next_offset > 0;
+        }
+        self.consensus.invalidate_local_dvc_suffix();
+        Ok(removed)
     }
 
     async fn commit_messages(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
@@ -4202,7 +4369,7 @@ where
                 Err(error) => Err(error),
             }
         } else {
-            self.apply_replicated_operation(message).await
+            self.apply_replicated_operation(message).await.map(|_| ())
         };
         if let Err(error) = applied {
             warn!(
@@ -4391,8 +4558,7 @@ where
 
         let op = message.header().op;
         let (base_offset, base_timestamp, total_size, message_count) = {
-            let batch =
-                decode_prepare_slice(message.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
+            let batch = decode_prepare_slice(message.as_slice())?;
             (
                 batch.header.base_offset,
                 batch.header.base_timestamp,
@@ -4401,7 +4567,7 @@ where
             )
         };
         if message_count == 0 {
-            return Ok(None);
+            return Err(IggyError::InvalidCommand);
         }
 
         // Purge floor: the same fence every other journal-apply path honors. A
@@ -4421,33 +4587,49 @@ where
             return Ok(None);
         }
 
-        let last_offset = base_offset + u64::from(message_count) - 1;
-
-        self.should_increment_offset = true;
+        let last_offset = base_offset
+            .checked_add(u64::from(message_count) - 1)
+            .ok_or(IggyError::CannotAppendMessage)?;
         let dirty = self.dirty_offset.load(Ordering::Relaxed);
-        self.dirty_offset
-            .store(dirty.max(last_offset), Ordering::Relaxed);
 
         let segment_index = self.log.segments().len() - 1;
         let current_position = self.log.segments()[segment_index].current_position;
-        self.log.segments_mut()[segment_index].current_position = current_position
+        let next_position = current_position
             .checked_add(total_size)
             .ok_or(IggyError::CannotAppendMessage)?;
 
-        let journal = self.log.journal_mut();
-        journal.info.messages_count += message_count;
-        journal.info.size += IggyByteSize::from(total_size);
-        journal.info.current_offset = last_offset;
-        if journal.info.first_timestamp == 0 {
-            journal.info.first_timestamp = base_timestamp;
+        let mut journal_info = self.log.journal().info;
+        journal_info.messages_count = journal_info
+            .messages_count
+            .checked_add(message_count)
+            .ok_or(IggyError::CannotAppendMessage)?;
+        journal_info.size = IggyByteSize::from(
+            journal_info
+                .size
+                .as_bytes_u64()
+                .checked_add(total_size)
+                .ok_or(IggyError::CannotAppendMessage)?,
+        );
+        journal_info.current_offset = last_offset;
+        if journal_info.first_timestamp == 0 {
+            journal_info.first_timestamp = base_timestamp;
         }
-        journal.info.end_timestamp = base_timestamp;
-        journal.info.max_timestamp = journal.info.max_timestamp.max(base_timestamp);
-        journal
+        journal_info.end_timestamp = base_timestamp;
+        journal_info.max_timestamp = journal_info.max_timestamp.max(base_timestamp);
+
+        let frozen = message.into_frozen();
+        self.log
+            .journal()
             .inner
-            .append(message.into_frozen())
+            .append(frozen)
             .await
             .map_err(|_| IggyError::CannotAppendMessage)?;
+
+        self.should_increment_offset = true;
+        self.dirty_offset
+            .store(dirty.max(last_offset), Ordering::Relaxed);
+        self.log.segments_mut()[segment_index].current_position = next_position;
+        self.log.journal_mut().info = journal_info;
         Ok(Some(base_offset))
     }
 
@@ -4524,6 +4706,30 @@ fn peek_op(entry: &Frozen<4096>) -> u64 {
     .op
 }
 
+/// Match a retransmit against immutable, validated journal bytes. Only the view
+/// may change, so exact body equality replaces another checksum pass.
+fn journaled_prepare_matches_retransmit(
+    journaled: &Frozen<4096>,
+    incoming: &Message<PrepareHeader>,
+) -> bool {
+    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
+
+    let stored = journaled.as_slice();
+    let received = incoming.as_slice();
+    let header_size = std::mem::size_of::<PrepareHeader>();
+    if stored.len() != received.len() || stored.len() < header_size {
+        return false;
+    }
+
+    let view_end = VIEW_OFFSET + std::mem::size_of::<u32>();
+    if stored[..VIEW_OFFSET] != received[..VIEW_OFFSET]
+        || stored[view_end..header_size] != received[view_end..header_size]
+    {
+        return false;
+    }
+    stored[header_size..] == received[header_size..]
+}
+
 /// Success reply body for a committed partition op other than `SendMessages`
 /// (which confirms its offsets through [`send_messages_reply_body`]).
 ///
@@ -4586,6 +4792,11 @@ struct CommittedBatchStats {
     base_offset: u64,
     message_count: u32,
     size_bytes: u64,
+}
+
+struct JournaledMessages {
+    result: AppendResult,
+    prepare: Frozen<4096>,
 }
 
 impl CommittedBatchStats {

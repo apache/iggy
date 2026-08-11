@@ -20,11 +20,14 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
-    RequestHeader, frame_body,
+    CHECKSUM_UNSEALED, Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
-use server_common::{Message, iobuf::Owned};
+use server_common::{
+    MESSAGE_ALIGN, Message,
+    iobuf::{Frozen, Owned},
+};
 use std::mem::size_of;
 use std::ops::AsyncFnOnce;
 
@@ -95,8 +98,48 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let header = *message.header();
+    let Some(next) = replication_target(consensus, message.header()) else {
+        return Ok(());
+    };
+    let frozen = message.deep_copy().into_generic().into_frozen();
+    consensus.message_bus().send_to_replica(next, frozen).await
+}
 
+/// Forward an already validated frozen prepare to the next replica without
+/// copying its payload.
+///
+/// # Errors
+///
+/// Returns `SendError` if the bus fails to deliver to the next replica.
+///
+/// # Panics
+///
+/// Panics if the buffer does not contain a valid prepare header, the command is
+/// not `Prepare`, the operation is already committed, or chain routing selects
+/// this replica.
+#[allow(clippy::future_not_send)]
+pub async fn replicate_frozen_to_next_in_chain<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    message: Frozen<MESSAGE_ALIGN>,
+) -> Result<(), SendError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header =
+        *bytemuck::checked::try_from_bytes::<PrepareHeader>(&message[..size_of::<PrepareHeader>()])
+            .expect("validated prepare must begin with a valid prepare header");
+    let Some(next) = replication_target(consensus, &header) else {
+        return Ok(());
+    };
+    consensus.message_bus().send_to_replica(next, message).await
+}
+
+fn replication_target<B, P>(consensus: &VsrConsensus<B, P>, header: &PrepareHeader) -> Option<u8>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
     assert_eq!(header.command, Command2::Prepare);
     assert!(header.op > consensus.commit_min());
 
@@ -104,18 +147,37 @@ where
     let primary = consensus.primary_index(header.view);
 
     if next == primary {
-        return Ok(());
+        return None;
     }
 
     assert_ne!(next, consensus.replica());
+    Some(next)
+}
 
-    // Chain replication to the next replica is N=1, so the freeze-once
-    // trick does not apply: the caller has already appended `message` to
-    // its local journal (durability-before-ack) and kept a reference for
-    // this forward, so we deep_copy a fresh Frozen here. Future refactor
-    // could freeze once and share the backing with the journal path.
-    let frozen = message.deep_copy().into_generic().into_frozen();
-    consensus.message_bus().send_to_replica(next, frozen).await
+/// Re-stamp a stored prepare with the current view before retransmission.
+/// The prepare identity excludes `view`, so the payload and operation identity
+/// remain unchanged.
+#[must_use]
+pub fn restamp_prepare_view(
+    stored: Frozen<MESSAGE_ALIGN>,
+    view: u32,
+) -> Option<Frozen<MESSAGE_ALIGN>> {
+    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
+
+    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+        stored.as_slice().get(..size_of::<PrepareHeader>())?,
+    )
+    .ok()?;
+    if header.view == view {
+        return Some(stored);
+    }
+
+    let mut owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(stored.as_slice());
+    owned.as_mut_slice()[VIEW_OFFSET..VIEW_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&view.to_ne_bytes());
+    Message::<GenericHeader>::try_from(owned)
+        .ok()
+        .map(Message::into_frozen)
 }
 
 /// Recompute a prepare's integrity fields and report the first that disagrees.
