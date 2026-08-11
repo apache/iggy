@@ -29,9 +29,9 @@ use std::rc::Rc;
 
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -131,14 +131,14 @@ where
     decision.err().map(|error| error.as_code())
 }
 
-/// Reply to a partition op rejected before it reached the plane with the op's
-/// frame: empty body + nonzero `status`. The nonzero status is the whole
+/// Reply to a request rejected before it reached its plane with the request's
+/// own frame: empty body + nonzero `status`. The nonzero status is the whole
 /// point: the SDK peeks it and surfaces the typed error, whereas a status-0
 /// frame reads as a committed ack for work that never happened. Silence is no
 /// better, the connection decodes replies in lockstep and would wedge on every
 /// later request.
 #[allow(clippy::future_not_send)]
-pub(super) async fn send_partition_deny_reply<B, MJ, S, SB>(
+pub(super) async fn send_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RoutedRequestHeader,
@@ -162,7 +162,7 @@ pub(super) async fn send_partition_deny_reply<B, MJ, S, SB>(
             status,
             error = %error,
             operation = ?request_header.operation,
-            "failed to surface partition authz denial"
+            "failed to surface request denial"
         );
     }
 }
@@ -228,10 +228,8 @@ where
 /// notfound-before-permission ordering holds. `Err` denies with that code.
 /// Unscoped rules gate directly; identifier-scoped rules resolve (stream[,
 /// topic]) against committed state first. The PAT list is self-scoped, so
-/// authentication is its whole rule. `GET_CLUSTER_METADATA` is deliberately
-/// pre-auth (bootstrap / leader discovery; the dispatch allowlist admits it
-/// unauthenticated) and, like every other code the builder serves, is ungated
-/// here.
+/// authentication is its whole rule, and `GET_CLUSTER_METADATA` -- which
+/// describes the private replica network -- is gated the same way.
 pub(super) fn authorize_default_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
@@ -254,6 +252,10 @@ where
         // Self-scoped: lists only the caller's own tokens, so there is no
         // permissioner rule to run (legacy runs none either).
         GET_PERSONAL_ACCESS_TOKENS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
+        // Defence in depth: `handle_client_request` already denies an unbound
+        // transport with an `Unauthenticated` Reply before it reaches the
+        // builder, so this arm only ever fires if that gate is bypassed.
+        GET_CLUSTER_METADATA_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
         GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,

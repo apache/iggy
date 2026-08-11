@@ -330,26 +330,27 @@ impl HttpInner {
                     // The Register never entered the pipeline, so re-issuing
                     // it anywhere is safe; the transient-not-accepted body
                     // tells a forwarding peer to retry against the current
-                    // primary. `Canceled` / `InProgress` mean a prepare may
-                    // still commit cluster-wide, so they stay the plain
-                    // unavailable 503.
+                    // primary. `PrimaryUnreachable` qualifies too: a forwarded
+                    // register never left this node, nothing was proposed.
                     MetadataSubmitError::NotPrimary
                     | MetadataSubmitError::NotCaughtUp
-                    | MetadataSubmitError::PipelineFull => AuthError::SessionNotAccepted,
+                    | MetadataSubmitError::PipelineFull
+                    | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
                     // Terminal, and the only variant here that is: retrying
                     // anywhere cannot make the id free. Kept off the 503 path
                     // so the caller's HTTP stack does not auto-retry forever.
                     MetadataSubmitError::ClientIdOwnedByAnotherUser => {
                         AuthError::SessionIdOwnedByAnotherUser
                     }
-                    // `InProgress` / `Canceled` mean a prepare may still
-                    // commit cluster-wide, so the outcome is unknown rather
-                    // than terminal. A future variant lands here too: 503 is
-                    // the safe default, since it never asserts a refusal the
-                    // server did not make.
-                    MetadataSubmitError::InProgress | MetadataSubmitError::Canceled | _ => {
-                        AuthError::SessionUnavailable
-                    }
+                    // `InProgress` / `Canceled` / `ForwardTimedOut` mean a
+                    // prepare may still commit cluster-wide, so the outcome
+                    // is unknown rather than terminal. A future variant lands
+                    // here too: 503 is the safe default, since it never
+                    // asserts a refusal the server did not make.
+                    MetadataSubmitError::InProgress
+                    | MetadataSubmitError::Canceled
+                    | MetadataSubmitError::ForwardTimedOut
+                    | _ => AuthError::SessionUnavailable,
                 }
             })?;
         // A fresh mint must land on a fresh entry, so a watermark it did not

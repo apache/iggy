@@ -39,11 +39,11 @@ use crossfire::AsyncRxTrait;
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader,
+    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader,
+    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
+    RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
 };
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
@@ -183,6 +183,23 @@ pub enum MetadataSubmit {
         /// into "no reply" makes the login look transient, which costs the
         /// client a retry storm of full password verifications.
         reply: Sender<Result<BoundSession, MetadataSubmitError>>,
+    },
+    /// A backup node authenticated a login and asks this node -- which it
+    /// believes is the primary -- to run only the `Register` proposal. The
+    /// verdict travels back over the replica interconnect as a
+    /// `ForwardRegisterResult`, not over a channel: the awaiting login lives
+    /// in another process.
+    ///
+    /// Handled by proposing IN PROCESS, never by forwarding again. That is
+    /// what bounds a forward at one hop: a node that has since lost
+    /// primaryship answers `NotPrimary`, and the client's SDK replays.
+    ForwardedRegister {
+        vsr_client_id: u128,
+        user_id: u32,
+        /// Correlation the origin minted; echoed verbatim in the result.
+        nonce: u128,
+        /// Replica the result frame goes back to.
+        origin_replica: u8,
     },
     Logout {
         vsr_client_id: u128,
@@ -350,13 +367,14 @@ pub type PartitionReadHandler =
 /// deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Race `future` against a bus timer: `Some` if it finishes within `budget`,
-/// `None` if the timer fires first. Uses [`MessageBus::sleep`] (virtual under
-/// the simulator, wall-clock in production) rather than `compio::time::timeout`,
-/// which panics outside a compio runtime and so cannot run under the
-/// deterministic executor.
+/// Race `future` against a bus timer.
+///
+/// `Some` if it finishes within `budget`, `None` if the timer fires first.
+/// Uses [`MessageBus::sleep`] (virtual under the simulator, wall-clock in
+/// production) rather than `compio::time::timeout`, which panics outside a
+/// compio runtime and so cannot run under the deterministic executor.
 #[allow(clippy::future_not_send)]
-async fn bus_timeout<B, F>(bus: &B, budget: std::time::Duration, future: F) -> Option<F::Output>
+pub async fn bus_timeout<B, F>(bus: &B, budget: std::time::Duration, future: F) -> Option<F::Output>
 where
     B: MessageBus,
     F: Future,
@@ -500,6 +518,23 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Starting point for [`IggyShard::next_register_forward_nonce`]: the low half
+/// of this boot's consensus incarnation.
+///
+/// Forward nonces are node-local and never persisted, so a counter that starts
+/// at zero every boot re-mints the exact sequence the previous boot used. A
+/// forward answer still in flight across a restart would then match a nonce a
+/// DIFFERENT login now holds and confirm a login that never committed. The
+/// incarnation is fresh per boot, which moves the whole sequence.
+///
+/// Zero on shards owning no metadata consensus (they never forward) and
+/// wherever nothing set an incarnation, which degenerates to the unseeded
+/// sequence: no worse than before, and the shards that take it are test ones.
+#[allow(clippy::cast_possible_truncation)]
+fn register_forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
+    consensus.map_or(0, VsrConsensus::incarnation) as u64
 }
 
 /// Lifecycle frame variants.
@@ -1180,6 +1215,25 @@ where
     /// See [`ServedSegmentCache`].
     served_segment_cache: RefCell<ServedSegmentCache>,
 
+    /// Logins this node forwarded to the primary and is still waiting on, keyed
+    /// by the `(nonce, client)` pair stamped into the `ForwardRegister` frame.
+    /// Shard 0 only, since that is where the forward is issued and where the
+    /// result routes back to. Entries are removed at exactly three points --
+    /// result delivery, forward timeout, and a failed send -- so an abandoned
+    /// login cannot leak one.
+    ///
+    /// The client id is part of the key rather than payload the ingest compares:
+    /// an answer echoing a client the nonce was never parked for is then exactly
+    /// as unroutable as one carrying an unknown nonce, and the miss leaves the
+    /// legitimate entry parked instead of evicting it.
+    register_forwards: RefCell<HashMap<(u128, u128), Sender<ForwardRegisterResultHeader>>>,
+
+    /// Monotonic source of [`Self::register_forwards`] nonces. Node-local: the
+    /// nonce only has to distinguish this node's own in-flight forwards, across
+    /// its restarts as well as within one boot. Seeded by
+    /// [`register_forward_nonce_seed`].
+    register_forward_nonce: Cell<u64>,
+
     /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
     /// these (it owns the metadata consensus group); peers send them here
     /// via [`Self::forward_metadata_submit`]. Defaults to a no-op for the
@@ -1406,6 +1460,7 @@ where
             u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
+        let nonce_seed = register_forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         Ok(Self {
@@ -1436,6 +1491,8 @@ where
             state_transfer_offers: RefCell::new(HashMap::new()),
             partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
+            register_forwards: RefCell::new(HashMap::new()),
+            register_forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
@@ -1477,6 +1534,39 @@ where
     /// the simulator and tests keep the compile-time default.
     pub fn set_bus_max_message_size(&self, max_message_size: usize) {
         self.bus_max_message_size.set(max_message_size);
+    }
+
+    /// Mint a fresh, never-zero nonce for [`Self::park_register_forward`].
+    ///
+    /// `replica` rides the high half, which separates the nonce spaces of
+    /// different NODES: a result frame that somehow arrives from the wrong node
+    /// cannot collide with a live entry. Successive boots of THIS node are
+    /// separated by the counter's incarnation seed instead.
+    ///
+    /// The counter skips zero on wrap: both forwarding headers reject a zero
+    /// nonce in `validate`, so a wrapped counter would have the origin build a
+    /// frame the primary drops.
+    pub fn next_register_forward_nonce(&self, replica: u8) -> u128 {
+        let counter = self.register_forward_nonce.get().wrapping_add(1).max(1);
+        self.register_forward_nonce.set(counter);
+        (u128::from(replica) << 64) | u128::from(counter)
+    }
+
+    /// Park a forwarded login under `(nonce, client)` until the primary answers.
+    pub fn park_register_forward(
+        &self,
+        nonce: u128,
+        client: u128,
+        reply: Sender<ForwardRegisterResultHeader>,
+    ) {
+        self.register_forwards
+            .borrow_mut()
+            .insert((nonce, client), reply);
+    }
+
+    /// Drop a parked login (timeout, or a forward that never left the node).
+    pub fn cancel_register_forward(&self, nonce: u128, client: u128) {
+        self.register_forwards.borrow_mut().remove(&(nonce, client));
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1654,6 +1744,7 @@ where
         // with the current type setup; revisit when crossfire grows an
         // unbounded variant or we replace it.
         let (_tx, inbox) = channel(1);
+        let nonce_seed = register_forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         Self {
@@ -1690,6 +1781,8 @@ where
             state_transfer_offers: RefCell::new(HashMap::new()),
             partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
+            register_forwards: RefCell::new(HashMap::new()),
+            register_forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
@@ -2369,6 +2462,52 @@ where
             }
             Ok(MessageBag::RequestStateChunk(ref msg)) => self.on_request_state_chunk(msg).await,
             Ok(MessageBag::StateChunk(ref msg)) => self.on_state_chunk(msg).await,
+            // The proposal must not run on the pump (it awaits a commit that
+            // this very pump has to drive), so it goes through the same
+            // handler seam a peer shard's login uses, which spawns it.
+            Ok(MessageBag::ForwardRegister(ref msg)) => {
+                let header = *msg.header();
+                // The result frame is addressed by this id; bound it at ingress
+                // like every other off-wire replica id, instead of committing a
+                // register whose answer can never route.
+                if !self.peer_is_known(header.replica, "ForwardRegister") {
+                    return;
+                }
+                debug_assert_eq!(
+                    self.id, 0,
+                    "ForwardRegister routes to the metadata consensus owner"
+                );
+                (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
+                    vsr_client_id: header.client,
+                    user_id: header.user_id,
+                    nonce: header.nonce,
+                    origin_replica: header.replica,
+                });
+            }
+            Ok(MessageBag::ForwardRegisterResult(ref msg)) => {
+                let header = *msg.header();
+                // The whole header travels: every field on it is wire
+                // vocabulary the server layer owns, and nothing here has to
+                // learn what an outcome means.
+                let waiter = self
+                    .register_forwards
+                    .borrow_mut()
+                    .remove(&(header.nonce, header.client));
+                if let Some(waiter) = waiter {
+                    let _ = waiter.try_send(header);
+                } else {
+                    // Either the login gave up (timed out, or its connection
+                    // died) and removed its own entry, or the answer names a
+                    // client this nonce was never parked for. Nothing to
+                    // answer, and the parked entry of any other login stands.
+                    tracing::debug!(
+                        shard = self.id,
+                        nonce = header.nonce,
+                        client = header.client,
+                        "dropping forward-register result with no parked login"
+                    );
+                }
+            }
             Err(e) => {
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
             }
@@ -4913,6 +5052,7 @@ where
 
         let Some(missing_op) = missing else {
             let actions = consensus.start_pending_view(PlaneKind::Metadata);
+            let (local_actions, wire_actions) = split_local_actions(actions);
             tracing::info!(
                 shard = self.id,
                 view = consensus.view(),
@@ -4920,10 +5060,17 @@ where
                 commit_max = pending.commit_max,
                 "merged log is locally serveable; starting the view"
             );
+            // Locals run BEFORE the persist await. `start_pending_view` has
+            // already flipped this replica into a Normal primary, so yielding
+            // with a still-empty pipeline lets a concurrent client submit mint
+            // the next op below the inherited suffix, and the later rebuild
+            // then pushes out of sequence. The locals must also survive a
+            // failed persist, which fences only the wire sends.
+            dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &local_actions).await;
             if metadata.persist_superblock_if_needed(consensus).await {
-                dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+                dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &wire_actions).await;
             }
-            if actions
+            if local_actions
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
                 && !consensus.is_transferring()

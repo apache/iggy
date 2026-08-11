@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
+use crate::leader_aware::{
+    LeaderRedirectionState, check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
+};
 use crate::session::ConsensusSession;
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
@@ -146,6 +148,10 @@ impl BinaryTransport for WebSocketClient {
         }
 
         if matches!(self.config.auto_login, AutoLogin::Disabled) {
+            return Err(error);
+        }
+
+        if is_unauthenticated_metadata_probe(code, &error) {
             return Err(error);
         }
 
@@ -507,21 +513,17 @@ impl WebSocketClient {
 
     async fn check_and_maybe_redirect(&self) -> Result<bool, IggyError> {
         match &self.config.auto_login {
-            // Leadership still matters without auto-login: the caller signs in
-            // manually, and a login against a non-leader replays for its whole
-            // read timeout. `GetClusterMetadata` is sessionless and pre-auth,
-            // so the check works on the unauthenticated connection.
-            AutoLogin::Disabled => self.handle_leader_redirection().await,
+            // Only `IggyClient` redirects after a manual sign-in, so a raw
+            // transport can stay on a backup, and nothing on the send path
+            // redirects either: its replicated writes replay on the live
+            // connection, then surface the transient failure to the caller.
+            AutoLogin::Disabled => Ok(false),
             AutoLogin::Enabled(_) => {
-                // Check leadership BEFORE signing in: register/login are
-                // consensus ops a backup answers with a transient frame, so
-                // signing in against a non-leader replays for the whole read
-                // timeout instead of failing over. `GetClusterMetadata` is
-                // sessionless and pre-auth.
-                if self.handle_leader_redirection().await? {
-                    return Ok(true);
-                }
                 self.auto_login().await?;
+                // The sole leader settlement, and it runs authenticated. Any
+                // node completes a login now -- a backup forwards the register
+                // to the primary -- so this decides where later ops land, not
+                // whether sign-in works.
                 self.handle_leader_redirection().await
             }
         }

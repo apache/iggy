@@ -114,7 +114,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         let name = entry.name;
 
         // ================================================================
-        // SKIPPED COMMANDS (11 total)
+        // SKIPPED COMMANDS
         // ================================================================
         // No auth required
         if matches!(
@@ -125,12 +125,6 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 | LOGIN_REGISTER_CODE
                 | LOGIN_REGISTER_WITH_PAT_CODE
         ) {
-            continue;
-        }
-        // The server serves `GetClusterMetadata` pre-auth so a client can
-        // locate the cluster leader before signing in; the legacy server
-        // still auth-gates it.
-        if code == GET_CLUSTER_METADATA_CODE {
             continue;
         }
         // Stateful - not supported on HTTP. `SYNC_CONSUMER_GROUP` is
@@ -170,6 +164,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_ME_CODE => client.get_me().await.map(|_| ()),
             GET_CLIENT_CODE => client.get_client(1).await.map(|_| ()),
             GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
+
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
 
             // Users

@@ -2234,13 +2234,250 @@ impl ConsensusHeader for StateChunkHeader {
     }
 }
 
+// ForwardRegisterHeader - backup shard 0 -> primary shard 0
+
+/// A backup relays a login it has already authenticated.
+///
+/// Credential verification runs on the node the client dialed, against the
+/// replicated users table, so neither the client's frame nor its credentials
+/// travel: this header carries the VERIFIED identity and nothing else. The
+/// backup keeps the session bind, the reply build, and the connection.
+///
+/// The trust boundary is the replica interconnect's network placement: by
+/// default the replica port trusts any peer that reaches it (the PSK
+/// handshake and TLS ship disabled and are what upgrade the boundary), and
+/// the seal is an unkeyed integrity check, not a MAC. Trusting `user_id`
+/// here adds no capability the port did not already expose, since that same
+/// peer could inject a `Request` + `Register` directly. Clients cannot
+/// reach this command, because every client frame is typed through
+/// [`RequestHeader`], whose `validate` rejects any command but
+/// [`Command2::Request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardRegisterHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The login frame's consensus client id, proposed verbatim by the primary.
+    pub client: u128,
+    /// Correlation minted by the backup, echoed verbatim in the result. Unique
+    /// per in-flight forward on the originating node, across its restarts as
+    /// well: an answer that outlives the login it was minted for must not match
+    /// the one holding that nonce next.
+    pub nonce: u128,
+    /// The acting user the backup authenticated. The trust payload: the primary
+    /// proposes the register under this id without re-verifying credentials.
+    pub user_id: u32,
+    pub reserved: [u8; 92],
+}
+const _: () = {
+    assert!(size_of::<ForwardRegisterHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardRegisterHeader, client)
+            == offset_of!(ForwardRegisterHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardRegisterHeader, nonce) == 144);
+    assert!(offset_of!(ForwardRegisterHeader, user_id) == 160);
+    assert!(offset_of!(ForwardRegisterHeader, reserved) + size_of::<[u8; 92]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for ForwardRegisterHeader {
+    // The seal covers `user_id`, which is the whole reason this frame is
+    // believed: a flipped bit there would commit a register under another user.
+    const FRAME_SEALED: bool = true;
+
+    const COMMAND: Command2 = Command2::ForwardRegister;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardRegister {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardRegister,
+                found: self.command,
+            });
+        }
+        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)
+    }
+}
+
+// ForwardRegisterResultHeader - primary shard 0 -> backup shard 0
+
+/// The primary's verdict on a [`ForwardRegisterHeader`].
+///
+/// Header-only: the backup owns the client connection and builds the wire
+/// reply itself, so only the committed bind (or the refusal) crosses the
+/// interconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardRegisterResultHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// Echo of [`ForwardRegisterHeader::nonce`]; with `client`, the backup's
+    /// routing key.
+    pub nonce: u128,
+    /// Echo of [`ForwardRegisterHeader::client`]. Half of the routing key, not a
+    /// diagnostic: the backup drops an answer whose client disagrees with the
+    /// login it parked under `nonce`.
+    pub client: u128,
+    /// The committed register's op number, which fences the session. Zero
+    /// unless `outcome` is [`ForwardRegisterOutcome::Ok`].
+    pub epoch: u64,
+    /// The client-table entry's highest committed request number, for a caller
+    /// that must resume numbering. Zero unless `outcome` is
+    /// [`ForwardRegisterOutcome::Ok`].
+    pub watermark: u64,
+    pub reserved: [u8; 79],
+    pub outcome: ForwardRegisterOutcome,
+}
+const _: () = {
+    assert!(size_of::<ForwardRegisterResultHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardRegisterResultHeader, nonce)
+            == offset_of!(ForwardRegisterResultHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardRegisterResultHeader, client) == 144);
+    assert!(offset_of!(ForwardRegisterResultHeader, epoch) == 160);
+    assert!(offset_of!(ForwardRegisterResultHeader, watermark) == 168);
+    assert!(
+        offset_of!(ForwardRegisterResultHeader, outcome) + size_of::<ForwardRegisterOutcome>()
+            == HEADER_SIZE
+    );
+};
+
+/// Wire verdict on a forwarded register.
+///
+/// Mirrors the server-side submit error one-for-one so the backup can surface
+/// the primary's exact answer: every variant but
+/// [`Self::ClientIdOwnedByAnotherUser`] is transient and replayable.
+///
+/// **Wire-version pinned**, like [`EvictionReason`]: reordering or reusing a
+/// discriminant silently reinterprets a live cluster's frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum ForwardRegisterOutcome {
+    /// Committed; `epoch` and `watermark` carry the bind.
+    Ok = 0,
+    NotPrimary = 1,
+    /// Reserved: the register submit parks instead of bouncing when the
+    /// primary is not caught up, so nothing produces this today. Wire-pinned,
+    /// so it must keep its discriminant either way.
+    NotCaughtUp = 2,
+    PipelineFull = 3,
+    InProgress = 4,
+    Canceled = 5,
+    /// Terminal: the presented client id belongs to another user.
+    ClientIdOwnedByAnotherUser = 6,
+}
+
+impl ConsensusHeader for ForwardRegisterResultHeader {
+    const FRAME_SEALED: bool = true;
+
+    const COMMAND: Command2 = Command2::ForwardRegisterResult;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardRegisterResult {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardRegisterResult,
+                found: self.command,
+            });
+        }
+        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)
+    }
+}
+
+/// Shared field rules of the two register-forwarding headers.
+///
+/// Reserved bytes are strict-zero rather than ignored: this pair only ever
+/// travels between replicas of one release (see the wire-compatibility note at
+/// the top of this module), so there is no forward-compatibility to preserve
+/// and a nonzero byte can only mean a builder bug or a mangled frame.
+#[allow(clippy::cast_possible_truncation)]
+fn validate_forward_register_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    if size as usize != HEADER_SIZE {
+        return Err(ConsensusError::InvalidSize {
+            expected: HEADER_SIZE as u32,
+            found: size,
+        });
+    }
+    if client == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward register client must be non-zero".to_string(),
+        ));
+    }
+    if nonce == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward register nonce must be non-zero".to_string(),
+        ));
+    }
+    if reserved.iter().any(|&byte| byte != 0) {
+        return Err(ConsensusError::InvalidField(
+            "forward register reserved bytes must be zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::{
         Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-        EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+        EvictionHeader, EvictionReason, ForwardRegisterHeader, ForwardRegisterOutcome,
+        ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
         PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
         RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
         RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
@@ -2316,6 +2553,8 @@ mod tests {
             StateTransferTargetHeader,
             RequestStateChunkHeader,
             StateChunkHeader,
+            ForwardRegisterHeader,
+            ForwardRegisterResultHeader,
         );
     }
 
@@ -2682,5 +2921,176 @@ mod tests {
     #[test]
     fn eviction_header_is_256_bytes() {
         assert_eq!(size_of::<EvictionHeader>(), 256);
+    }
+
+    /// A sealed, well-formed `ForwardRegister` ready to be mutated per test.
+    fn forward_register() -> ForwardRegisterHeader {
+        let mut header = ForwardRegisterHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardRegister,
+            replica: 2,
+            reserved_frame: [0; 66],
+            client: 0xCAFE,
+            nonce: 0xF00D,
+            user_id: 41,
+            reserved: [0; 92],
+        };
+        header.seal();
+        header
+    }
+
+    /// A sealed, well-formed `ForwardRegisterResult` ready to be mutated.
+    fn forward_register_result(outcome: ForwardRegisterOutcome) -> ForwardRegisterResultHeader {
+        let mut header = ForwardRegisterResultHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardRegisterResult,
+            replica: 0,
+            reserved_frame: [0; 66],
+            nonce: 0xF00D,
+            client: 0xCAFE,
+            epoch: 91,
+            watermark: 12,
+            reserved: [0; 79],
+            outcome,
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn forward_register_round_trips_through_generic_bytes() {
+        for (command, bytes) in [
+            (
+                Command2::ForwardRegister,
+                bytemuck::bytes_of(&forward_register()).to_vec(),
+            ),
+            (
+                Command2::ForwardRegisterResult,
+                bytemuck::bytes_of(&forward_register_result(ForwardRegisterOutcome::Ok)).to_vec(),
+            ),
+        ] {
+            // 16-byte alignment: `Vec<u8>` requests align=1 and fails Miri.
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(&bytes);
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf)
+                .expect("a forward-register frame is a valid generic header");
+            assert_eq!(generic.command, command);
+            assert_eq!(generic.size as usize, HEADER_SIZE);
+        }
+
+        let buf = {
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(bytemuck::bytes_of(&forward_register()));
+            buf
+        };
+        let typed = bytemuck::checked::try_from_bytes::<ForwardRegisterHeader>(&buf)
+            .expect("round-trips into its own type");
+        assert_eq!(typed.verify_frame(), Ok(()));
+        assert_eq!(typed.validate(), Ok(()));
+        assert_eq!(typed.user_id, 41);
+        assert_eq!(typed.nonce, 0xF00D);
+
+        let buf = {
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
+                ForwardRegisterOutcome::ClientIdOwnedByAnotherUser,
+            )));
+            buf
+        };
+        let typed = bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf)
+            .expect("round-trips into its own type");
+        assert_eq!(typed.verify_frame(), Ok(()));
+        assert_eq!(typed.validate(), Ok(()));
+        assert_eq!(
+            typed.outcome,
+            ForwardRegisterOutcome::ClientIdOwnedByAnotherUser
+        );
+    }
+
+    // The seal is the whole trust story for `user_id`: the primary proposes a
+    // register under it without re-verifying credentials, so a flipped bit
+    // must not reach the proposal.
+    #[test]
+    fn forward_register_tampered_user_id_fails_the_seal() {
+        const USER_ID_OFFSET: usize = std::mem::offset_of!(ForwardRegisterHeader, user_id);
+
+        assert!(matches!(
+            tamper(forward_register(), USER_ID_OFFSET),
+            Err(ConsensusError::FrameChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn forward_register_validate_rejects_malformed_frames() {
+        let mut zero_client = forward_register();
+        zero_client.client = 0;
+        assert!(matches!(
+            zero_client.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut zero_nonce = forward_register();
+        zero_nonce.nonce = 0;
+        assert!(matches!(
+            zero_nonce.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut dirty_reserved = forward_register();
+        dirty_reserved.reserved[0] = 1;
+        assert!(matches!(
+            dirty_reserved.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut wrong_size = forward_register();
+        wrong_size.size = 512;
+        assert!(matches!(
+            wrong_size.validate(),
+            Err(ConsensusError::InvalidSize { .. })
+        ));
+
+        let mut result_zero_nonce = forward_register_result(ForwardRegisterOutcome::Ok);
+        result_zero_nonce.nonce = 0;
+        assert!(matches!(
+            result_zero_nonce.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+    }
+
+    // An unknown outcome is rejected by the bit-pattern check, one layer
+    // before `validate` ever runs.
+    #[test]
+    fn forward_register_result_rejects_unknown_outcome() {
+        const OUTCOME_OFFSET: usize = std::mem::offset_of!(ForwardRegisterResultHeader, outcome);
+
+        let mut buf = aligned_zeroed(HEADER_SIZE);
+        buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
+            ForwardRegisterOutcome::Ok,
+        )));
+        buf[OUTCOME_OFFSET] = 7;
+        assert!(bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf).is_err());
+    }
+
+    // Wire-discriminant pin: reordering reinterprets a live cluster's frames.
+    #[test]
+    fn forward_register_outcome_discriminants_pinned() {
+        assert_eq!(ForwardRegisterOutcome::Ok as u8, 0);
+        assert_eq!(ForwardRegisterOutcome::NotPrimary as u8, 1);
+        assert_eq!(ForwardRegisterOutcome::NotCaughtUp as u8, 2);
+        assert_eq!(ForwardRegisterOutcome::PipelineFull as u8, 3);
+        assert_eq!(ForwardRegisterOutcome::InProgress as u8, 4);
+        assert_eq!(ForwardRegisterOutcome::Canceled as u8, 5);
+        assert_eq!(ForwardRegisterOutcome::ClientIdOwnedByAnotherUser as u8, 6);
     }
 }

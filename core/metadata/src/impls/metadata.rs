@@ -493,6 +493,12 @@ pub enum MetadataSubmitError {
     /// the pipeline). The caller retries; the SDK read-timeout replay reaches
     /// the new primary.
     Canceled,
+    /// The node this view names primary is not reachable from this shard, so
+    /// a forwarded register never left. Nothing was proposed.
+    PrimaryUnreachable,
+    /// A forwarded register left but no verdict came back within the forward
+    /// timeout. The proposal's outcome is unknown.
+    ForwardTimedOut,
     /// The presented `client_id` already has a table entry owned by a
     /// DIFFERENT user. TERMINAL, unlike every sibling: retrying cannot help,
     /// and admitting it would run the caller's replicated ops under the
@@ -511,6 +517,8 @@ pub enum MetadataSubmitError {
 impl MetadataSubmitError {
     /// Whether a retry (here, or against another replica) could succeed.
     /// Every variant is transient by contract except the ownership refusal.
+    /// Deliberately a deny-list: a new variant is transient by default, so
+    /// adding one cannot silently surface a terminal error to clients.
     #[must_use]
     pub const fn is_transient(&self) -> bool {
         !matches!(self, Self::ClientIdOwnedByAnotherUser)
@@ -525,6 +533,10 @@ impl std::fmt::Display for MetadataSubmitError {
             Self::PipelineFull => f.write_str("metadata prepare queue is full"),
             Self::InProgress => f.write_str("another in-flight prepare from this client"),
             Self::Canceled => f.write_str("view change canceled the pending prepare"),
+            Self::PrimaryUnreachable => f.write_str("no route to the metadata primary"),
+            Self::ForwardTimedOut => {
+                f.write_str("the metadata primary did not answer the forwarded register")
+            }
             Self::ClientIdOwnedByAnotherUser => {
                 f.write_str("client id already registered to a different user")
             }
@@ -1821,9 +1833,10 @@ where
     /// # Errors
     /// [`MetadataSubmitError`]. All transient except
     /// `ClientIdOwnedByAnotherUser`, which is terminal: `NotPrimary`,
-    /// `NotCaughtUp`, `PipelineFull`, `InProgress`, `Canceled`. `Canceled`
-    /// dominates on view change; the new primary inherits via
-    /// `commit_journal` and the SDK retries.
+    /// `PipelineFull`, `InProgress`, `Canceled`. Never `NotCaughtUp`: a
+    /// not-caught-up primary parks the register in the request queue instead
+    /// of bouncing it. `Canceled` dominates on view change; the new primary
+    /// inherits via `commit_journal` and the SDK retries.
     ///
     /// # Panics
     /// On `client_id == 0` or shard without consensus.

@@ -651,10 +651,13 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * One authentication-independent discovery hop. When the roster names a
-     * healthy leader elsewhere, reconnect to it and re-check from the new
-     * node, since mid-election metadata can point at a node that is itself not
-     * the leader. Register is sent only after this bounded process settles.
+     * One discovery hop. When the roster names a healthy leader elsewhere,
+     * reconnect to it and re-check from the new node, since mid-election
+     * metadata can point at a node that is itself not the leader. Register is
+     * sent only after this bounded process settles. Reading the roster needs a
+     * bound session, so a connection that has none fails the fetch locally and
+     * stays where it is; the hop redirects for a relogin or a transient
+     * failover recheck, which run on a session.
      */
     private CompletableFuture<Void> redirectToLeader(LeaderRedirectionState redirectionState) {
         ConnectionInfo currentTarget = connectionInfo;

@@ -180,7 +180,7 @@ func singleNodeHandler(t *testing.T, address func() string) func(int, int, reque
 	}
 }
 
-func TestConnect_DiscoversTheLeaderAndSignsIn(t *testing.T) {
+func TestConnect_SignsInAndThenSettlesLeadership(t *testing.T) {
 	var server *testListener
 	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
 
@@ -190,14 +190,15 @@ func TestConnect_DiscoversTheLeaderAndSignsIn(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 2)
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[0].code(),
-		"leadership is settled before the sign-in")
-	assert.Equal(t, uint64(0), recorded[0].sessionID(), "metadata works unauthenticated")
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation(),
+		"the roster read is auth-gated, so the sign-in comes first")
+	assert.Zero(t, recorded[0].code(), "only a non-replicated frame carries the code")
+	assert.Zero(t, recorded[0].requestID(), "a register is always request zero")
+	assert.Zero(t, recorded[0].sessionID())
 
-	assert.Equal(t, vsr.OperationRegister, recorded[1].operation())
-	assert.Zero(t, recorded[1].code(), "only a non-replicated frame carries the code")
-	assert.Zero(t, recorded[1].requestID(), "a register is always request zero")
-	assert.Zero(t, recorded[1].sessionID())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code(),
+		"leadership is settled after the sign-in")
+	assert.Equal(t, uint64(128), recorded[1].sessionID(), "the roster read is authenticated")
 
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(128), client.session.SessionID())
@@ -214,48 +215,57 @@ func TestConnect_SignsInWithAPersonalAccessToken(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 2)
-	assert.Equal(t, vsr.OperationRegister, recorded[1].operation())
-	assert.Contains(t, string(recorded[1].payload), "token-value")
-	assert.Contains(t, string(recorded[1].payload), vsr.SDKName)
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation())
+	assert.Contains(t, string(recorded[0].payload), "token-value")
+	assert.Contains(t, string(recorded[0].payload), vsr.SDKName)
 }
 
-func TestConnect_ChecksLeadershipEvenWithoutAutoLogin(t *testing.T) {
+func TestConnect_SendsNothingWithoutAutoLogin(t *testing.T) {
 	var server *testListener
 	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
 
 	client := newDialingClient(t, server.address())
 	require.NoError(t, client.Connect(context.Background()))
 
-	recorded := server.recorded()
-	require.Len(t, recorded, 1)
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[0].code())
+	// The roster read is auth-gated, so an unauthenticated connection has
+	// nothing to settle leadership with; the caller's sign-in does it later.
+	assert.Empty(t, server.recorded())
 	assert.False(t, client.session.Bound(), "no sign-in happened")
 }
 
-func TestConnect_RedirectsToTheLeaderBeforeSigningIn(t *testing.T) {
+func TestConnect_RedirectsToTheLeaderAfterSigningIn(t *testing.T) {
 	var leader *testListener
 	leader = listenVSR(t, nil, singleNodeHandler(t, func() string { return leader.address() }))
 
-	// The follower reports the leader elsewhere, so the client reconnects
-	// before it registers anywhere.
+	// The follower completes the sign-in (the server forwards the register to
+	// the primary) and only then reports the leader elsewhere.
 	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
-		if read.code() == uint32(command.GetClusterMetadataCode) {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
 			return clusterMetadataFrame(t, 1, "127.0.0.1:1", leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 512)
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
-		return replyFrame(vsr.OperationNonReplicated, nil)
 	})
 
 	client := newDialingClient(t, follower.address(),
 		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
 	require.NoError(t, client.Connect(context.Background()))
 
-	assert.Len(t, follower.recorded(), 1, "the follower only answered the roster")
+	onFollower := follower.recorded()
+	require.Len(t, onFollower, 2, "the follower answered the sign-in and the roster")
+	assert.Equal(t, vsr.OperationRegister, onFollower[0].operation())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), onFollower[1].code())
 	assert.Equal(t, leader.address(), client.currentServerAddress)
 
 	onLeader := leader.recorded()
-	require.Len(t, onLeader, 2)
-	assert.Equal(t, vsr.OperationRegister, onLeader[1].operation())
+	require.Len(t, onLeader, 1, "the sign-in replay is the only frame the leader saw")
+	assert.Equal(t, vsr.OperationRegister, onLeader[0].operation())
 	assert.True(t, client.session.Bound())
+	assert.Equal(t, uint64(128), client.session.SessionID(),
+		"the leader's session superseded the follower's")
 }
 
 func TestConnect_KeepsTheConnectionWhenTheRosterHasOneNode(t *testing.T) {
@@ -296,9 +306,9 @@ func TestExchange_ReSignsInBeforeReplayingANonReplicatedRequest(t *testing.T) {
 	require.Len(t, recorded, 6)
 
 	assert.Equal(t, uint32(command.PingCode), recorded[2].code(), "the dropped attempt")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].code())
-	assert.Equal(t, vsr.OperationRegister, recorded[4].operation(),
+	assert.Equal(t, vsr.OperationRegister, recorded[3].operation(),
 		"the replay signs in again before it repeats the request")
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[4].code())
 	assert.Equal(t, uint32(command.PingCode), recorded[5].code())
 
 	assert.NotEqual(t, recorded[2].clientID(), recorded[5].clientID(),
@@ -377,10 +387,14 @@ func TestExchange_ReconnectsThroughAKnownFollowerAfterTheLeaderDies(t *testing.T
 	assert.Equal(t, follower.address(), client.currentServerAddress)
 	assert.True(t, client.session.Bound())
 	recorded := follower.recorded()
-	require.Len(t, recorded, 4)
+	require.Len(t, recorded, 5)
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation(),
+		"the dialed follower completed the initial sign-in")
 	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
-	assert.Equal(t, vsr.OperationRegister, recorded[2].operation())
-	assert.Equal(t, uint32(command.PingCode), recorded[3].code())
+	assert.Equal(t, vsr.OperationRegister, recorded[2].operation(),
+		"the reconnect signed in again on the surviving node")
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].code())
+	assert.Equal(t, uint32(command.PingCode), recorded[4].code())
 }
 
 func TestConnect_DropsTheConnectionWhenAutomaticSignInFails(t *testing.T) {
@@ -445,12 +459,8 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 }
 
 func TestExchange_FailsFastWhenAutoLoginIsOff(t *testing.T) {
-	var server *testListener
-	server = listenVSR(t, nil, func(_, index int, read request) []byte {
-		if read.code() == uint32(command.GetClusterMetadataCode) {
-			return clusterMetadataFrame(t, 0, server.address())
-		}
-		if index == 1 {
+	server := listenVSR(t, nil, func(_, index int, read request) []byte {
+		if index == 0 {
 			return nil
 		}
 		return replyFrame(vsr.OperationNonReplicated, nil)
@@ -490,7 +500,7 @@ func TestLogoutUser_ResetsTheSessionSoTheNextSignInIsANewIdentity(t *testing.T) 
 	require.NoError(t, err)
 
 	recorded := server.recorded()
-	require.Len(t, recorded, 4)
+	require.Len(t, recorded, 5)
 	assert.Equal(t, vsr.OperationLogout, recorded[2].operation(),
 		"a re-login logs the live session out first")
 	assert.Equal(t, vsr.OperationRegister, recorded[3].operation())
@@ -567,7 +577,8 @@ func TestConnect_ExchangesOverTLS(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 3)
-	assert.Equal(t, vsr.OperationRegister, recorded[1].operation())
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
 	assert.Equal(t, uint32(command.PingCode), recorded[2].code())
 	assert.True(t, client.session.Bound())
 }

@@ -35,7 +35,7 @@ use crate::consumer_group::{
 };
 use crate::dispatch::authz::{
     authorize_default_read, authorize_partition_op, authorize_partition_read, authorize_uid,
-    send_non_replicated_deny, send_partition_deny_reply,
+    send_deny_reply, send_non_replicated_deny,
 };
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
@@ -84,7 +84,8 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
-    AckLevel, ClientVersionInfo, Command2, EvictionReason, GenericHeader, HEADER_SIZE,
+    AckLevel, ClientVersionInfo, Command2, ConsensusHeader, EvictionReason, ForwardRegisterHeader,
+    ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE,
     KIND_CONSUMER_GROUP, MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader,
     RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
 };
@@ -116,6 +117,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
@@ -549,12 +551,24 @@ where
                     user_id,
                     reply,
                 } => {
-                    let bound = shard
-                        .plane
-                        .metadata()
-                        .submit_register_in_process(vsr_client_id, user_id)
-                        .await;
+                    let bound =
+                        submit_register_local_or_forward(&shard, vsr_client_id, user_id).await;
                     let _ = reply.try_send(bound);
+                }
+                shard::MetadataSubmit::ForwardedRegister {
+                    vsr_client_id,
+                    user_id,
+                    nonce,
+                    origin_replica,
+                } => {
+                    answer_forwarded_register(
+                        &shard,
+                        vsr_client_id,
+                        user_id,
+                        nonce,
+                        origin_replica,
+                    )
+                    .await;
                 }
                 shard::MetadataSubmit::Logout {
                     vsr_client_id,
@@ -878,25 +892,13 @@ async fn handle_client_request<B, MJ, S, SB>(
             request = request.header().request,
             "dropping client request whose body does not match its own checksum"
         );
-        let commit = current_metadata_commit(shard);
-        let reply = build_deny_reply(
-            request.header(),
+        send_deny_reply(
+            shard,
             transport_client_id,
-            0,
-            commit,
+            request.header(),
             error.as_code(),
-        );
-        if let Err(send_error) = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await
-        {
-            warn!(
-                transport_client_id,
-                error = %send_error,
-                "failed to send request-checksum deny reply"
-            );
-        }
+        )
+        .await;
         return;
     }
 
@@ -910,23 +912,23 @@ async fn handle_client_request<B, MJ, S, SB>(
 
     let header = *request.header();
     if header.operation == Operation::NonReplicated {
-        // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
-        // legitimately pre-auth (liveness probe + connection bootstrap
-        // metadata). Pre-auth metadata is a narrow topology oracle: it leaks
-        // only the advertised-address mapping for networks the caller can
-        // already send packets from, and the HTTP mirror of the same read
-        // sits behind `Identity`. Every other non-replicated code (`GET_STREAM*`,
-        // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
-        // MUST go through Register first, which binds the acting user the
-        // per-op authz gates resolve.
+        // Auth bypass guard: `PING`, the liveness probe, is the only pre-auth
+        // code, on every roster shape. `GET_CLUSTER_METADATA` describes the
+        // private replica network and is not something an unauthenticated
+        // caller gets to read; a client that dialed a backup no longer needs
+        // it to find the leader, because the backup authenticates the login
+        // locally and forwards only the consensus proposal
+        // (`submit_register_local_or_forward`). Every other non-replicated
+        // code MUST go through Register first, which binds the acting user
+        // the per-op authz gates resolve.
         let nr_code = u32::from_le_bytes(request.header().reserved[..4].try_into().unwrap());
         // Legacy (pre-register) login codes. The server authenticates only via
         // the Register handshake (LOGIN_REGISTER / LOGIN_REGISTER_WITH_PAT,
         // Operation::Register); the vsr SDK funnels both logins there and never
         // emits these. Reject them uniformly with a typed MalformedLogin (the
         // SDK maps it to InvalidFormat) before the session gate, so a legacy or
-        // foreign client fails fast instead of getting the misleading
-        // NoSession eviction the pre-auth guard would send unbound, or the
+        // foreign client fails fast instead of getting the generic
+        // Unauthenticated deny the pre-auth guard would send unbound, or the
         // silent empty-ok Reply the bound non-replicated path would send.
         if matches!(
             nr_code,
@@ -946,14 +948,35 @@ async fn handle_client_request<B, MJ, S, SB>(
             .await;
             return;
         }
-        let allowed_pre_auth = matches!(nr_code, PING_CODE | GET_CLUSTER_METADATA_CODE);
+        let allowed_pre_auth = nr_code == PING_CODE;
         if !allowed_pre_auth && sessions.borrow().get_session(transport_client_id).is_none() {
-            warn!(
+            // Foreign SDKs still probe `GET_CLUSTER_METADATA` before login
+            // until they are fixed, so that rejection is routine traffic and
+            // logs at debug rather than warn.
+            if nr_code == GET_CLUSTER_METADATA_CODE {
+                debug!(
+                    transport_client_id,
+                    "denying pre-auth cluster-metadata read with Unauthenticated"
+                );
+            } else {
+                warn!(
+                    transport_client_id,
+                    code = nr_code,
+                    "denying pre-auth non-replicated read with Unauthenticated"
+                );
+            }
+            // A plain deny Reply, not an Eviction: there is no session to
+            // evict, and an Eviction is session-terminal by wire contract,
+            // so SDKs would tear down the very connection their login is
+            // about to use. The status channel carries the error the same
+            // way the request-checksum denial above does.
+            send_deny_reply(
+                shard,
                 transport_client_id,
-                code = nr_code,
-                "rejecting pre-auth non-replicated read with Eviction(NoSession)"
-            );
-            send_unauthenticated_eviction(shard, transport_client_id).await;
+                request.header(),
+                IggyError::Unauthenticated.as_code(),
+            )
+            .await;
             return;
         }
         handle_non_replicated_request(shard, sessions, system_config, transport_client_id, request)
@@ -977,12 +1000,14 @@ async fn handle_client_request<B, MJ, S, SB>(
         // circuit, the rewrite below overwrites `header.client` with
         // `transport_client_id` and dispatches; the request_preflight then
         // rejects with `NoSession`/`Fenced` and the failure disappears
-        // silently, wedging the SDK until the socket timeout. Reject with
-        // the same typed `Eviction(NoSession)` the pre-auth read guard
-        // sends: the session is gone, so the client must register again. An
-        // empty status-0 Reply is not safe here, because SendMessages is the
-        // one replicated operation without a result section, and its decoder
-        // would read the empty body as a successful send.
+        // silently, wedging the SDK until the socket timeout. A typed
+        // `Eviction(NoSession)` is right here, unlike the pre-auth read
+        // guard above: a replicated request implies the client believes it
+        // has a session, and that session is gone, so it must register
+        // again. An empty status-0 Reply is not safe here, because
+        // SendMessages is the one replicated operation without a result
+        // section, and its decoder would read the empty body as a
+        // successful send.
         warn!(
             transport_client_id,
             operation = ?header.operation,
@@ -1273,7 +1298,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
                 operation = ?header.operation,
                 "partition request with unresolved namespace; replying denied"
             );
-            send_partition_deny_reply(
+            send_deny_reply(
                 shard,
                 transport_client_id,
                 &header,
@@ -1311,7 +1336,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
             operation = ?header.operation,
             "partition request denied by authorization; replying with status"
         );
-        send_partition_deny_reply(shard, transport_client_id, &header, status).await;
+        send_deny_reply(shard, transport_client_id, &header, status).await;
         return;
     }
     // Convergence wait: a CreateTopic commit returns to the client before the
@@ -1333,7 +1358,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
             operation = ?header.operation,
             "partition request not routable within budget; replying transient"
         );
-        send_partition_deny_reply(
+        send_deny_reply(
             shard,
             transport_client_id,
             &header,
@@ -1393,8 +1418,7 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     // Acting user and peer address for the read gates below, resolved in one
     // connection lookup. `user_id` is `None` only on the pre-auth path
-    // (PING / GET_CLUSTER_METADATA), which serves ungated codes; the gated
-    // arms fail closed on it.
+    // (PING), which serves ungated codes; the gated arms fail closed on it.
     let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
@@ -1723,7 +1747,10 @@ async fn send_non_replicated_bytes<B, MJ, S, SB>(
     }
 }
 
-/// Reject a pre-auth request with a typed `Eviction(NoSession)` frame.
+/// Reject a replicated request from an unbound transport with a typed
+/// `Eviction(NoSession)` frame: the session the client believes it has is
+/// gone, so it must register again. Pre-auth non-replicated reads get a
+/// deny Reply instead (no session exists, so nothing is evicted).
 ///
 /// The SDK's reply decoder maps eviction reasons to typed errors
 /// (`NoSession` -> `Unauthenticated`), so clients fail fast with the same
@@ -2386,15 +2413,267 @@ fn polling_strategy_from_wire(
     Ok(mapped)
 }
 
+/// Answer a backup's forwarded `Register` from the node it named primary.
+///
+/// Proposes in process, never through [`submit_register_local_or_forward`]:
+/// that is what bounds a forward at one hop. A node that has since lost
+/// primaryship answers `NotPrimary`, and the origin's client replays against
+/// whichever node it names next.
+#[allow(clippy::future_not_send)]
+async fn answer_forwarded_register<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    vsr_client_id: u128,
+    user_id: u32,
+    nonce: u128,
+    origin_replica: u8,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some((cluster, view, replica)) = shard
+        .plane
+        .metadata()
+        .consensus
+        .as_ref()
+        .map(|consensus| (consensus.cluster(), consensus.view(), consensus.replica()))
+    else {
+        warn!("ForwardedRegister submit reached a shard without metadata consensus");
+        return;
+    };
+    let bound = shard
+        .plane
+        .metadata()
+        .submit_register_in_process(vsr_client_id, user_id)
+        .await;
+    // `view` predates the await above, which parks with no deadline, so the
+    // sealed value can be stale by send time. The origin routes the result by
+    // `(nonce, client)` alone; this field must never become a freshness fence.
+    let result =
+        build_forward_register_result_message(cluster, view, replica, vsr_client_id, nonce, &bound);
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(origin_replica, result.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            origin_replica,
+            error = %error,
+            "failed to answer a forwarded register"
+        );
+    }
+}
+
+/// How long a login waits for the primary's verdict on a forwarded register.
+///
+/// Expiry does NOT prove the peer or the frame was lost. The primary answers
+/// only once the proposal resolves, and its own submit parks with no deadline:
+/// a primary that is not caught up, or whose pipeline is full, absorbs the
+/// register into its request queue and answers when that drains. So a slow but
+/// healthy primary commits the register after this node has stopped waiting,
+/// which is why expiry surfaces as `TransientNotCommitted` rather than the
+/// not-accepted flavor.
+///
+/// The budget stays well under the SDK's response-read timeout on purpose: the
+/// client only replays a login while it is still reading, so a longer wait
+/// here turns a transient into a torn-down socket.
+const FORWARD_REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run the `Register` proposal for a login this node has already
+/// authenticated, wherever the metadata primary currently is. Shard 0 only.
+///
+/// A client may dial any node in the cluster. Credentials verify against the
+/// replicated users table, which every node holds, so the whole login except
+/// the consensus proposal already works on a backup. Only the verified
+/// identity crosses the replica interconnect -- never the client's frame and
+/// never its credentials -- and the session bind, the reply, and the
+/// connection all stay on the node the client dialed.
+///
+/// The hop does not move any credential decision:
+/// - `verify_login_credentials` reads replicated user state, so it is
+///   equally valid here.
+/// - `verify_pat_credentials` reads the same state, so a PAT minted on the
+///   primary that has not replicated here yet is refused until it does.
+///   Fail-closed on purpose, the same parity the HTTP forward keeps: it too
+///   answers 401 until replication catches up rather than relaying an
+///   unverified bearer.
+/// - `ClientIdOwnedByAnotherUser` stays a decision of the caught-up primary
+///   and round-trips as a terminal refusal.
+///
+/// The session binds here before this node applies the commit locally. That
+/// is the window a primary-side login already has against every other node's
+/// apply lag, not a new one.
+#[allow(clippy::future_not_send)]
+async fn submit_register_local_or_forward<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    vsr_client_id: u128,
+    user_id: u32,
+) -> Result<BoundSession, MetadataSubmitError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
+        return Err(MetadataSubmitError::NotPrimary);
+    };
+    let (cluster, view, self_replica) =
+        (consensus.cluster(), consensus.view(), consensus.replica());
+    let target = consensus.primary_index(view);
+    // Forward only as a healthy backup. Everything else answers locally: the
+    // in-process submit proposes when this node is the serving primary and
+    // re-derives `NotPrimary` otherwise -- mid view change there is nobody to
+    // forward to (the node the view names has not finished taking over, the
+    // SDK replays once it settles), and the view's own primary under state
+    // transfer has nowhere to forward to and nothing to commit yet.
+    if target == self_replica || !consensus.is_normal() {
+        return shard
+            .plane
+            .metadata()
+            .submit_register_in_process(vsr_client_id, user_id)
+            .await;
+    }
+
+    let nonce = shard.next_register_forward_nonce(self_replica);
+    let (reply, outcome) = shard::channel::<ForwardRegisterResultHeader>(1);
+    shard.park_register_forward(nonce, vsr_client_id, reply);
+    let forward =
+        build_forward_register_message(cluster, view, self_replica, vsr_client_id, nonce, user_id);
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(target, forward.into_generic().into_frozen())
+        .await
+    {
+        shard.cancel_register_forward(nonce, vsr_client_id);
+        warn!(
+            target,
+            error = %error,
+            "failed to forward register to the metadata primary"
+        );
+        return Err(MetadataSubmitError::PrimaryUnreachable);
+    }
+
+    match shard::bus_timeout(&shard.bus, FORWARD_REGISTER_TIMEOUT, outcome.recv()).await {
+        Some(Ok(result)) => forward_register_result(&result),
+        // Shard-0 teardown dropped the sender without answering.
+        Some(Err(_)) => Err(MetadataSubmitError::Canceled),
+        None => {
+            shard.cancel_register_forward(nonce, vsr_client_id);
+            warn!(target, "forwarded register timed out");
+            Err(MetadataSubmitError::ForwardTimedOut)
+        }
+    }
+}
+
+/// The primary's verdict, back in the vocabulary the login path speaks.
+const fn forward_register_result(
+    result: &ForwardRegisterResultHeader,
+) -> Result<BoundSession, MetadataSubmitError> {
+    match result.outcome {
+        ForwardRegisterOutcome::Ok => Ok(BoundSession {
+            epoch: result.epoch,
+            watermark: result.watermark,
+        }),
+        ForwardRegisterOutcome::NotPrimary => Err(MetadataSubmitError::NotPrimary),
+        ForwardRegisterOutcome::NotCaughtUp => Err(MetadataSubmitError::NotCaughtUp),
+        ForwardRegisterOutcome::PipelineFull => Err(MetadataSubmitError::PipelineFull),
+        ForwardRegisterOutcome::InProgress => Err(MetadataSubmitError::InProgress),
+        ForwardRegisterOutcome::Canceled => Err(MetadataSubmitError::Canceled),
+        ForwardRegisterOutcome::ClientIdOwnedByAnotherUser => {
+            Err(MetadataSubmitError::ClientIdOwnedByAnotherUser)
+        }
+    }
+}
+
+/// Inverse of [`forward_register_result`], for the answering primary.
+const fn forward_register_outcome(
+    bound: &Result<BoundSession, MetadataSubmitError>,
+) -> (BoundSession, ForwardRegisterOutcome) {
+    let zero = BoundSession {
+        epoch: 0,
+        watermark: 0,
+    };
+    match bound {
+        Ok(bound) => (*bound, ForwardRegisterOutcome::Ok),
+        Err(MetadataSubmitError::NotPrimary) => (zero, ForwardRegisterOutcome::NotPrimary),
+        Err(MetadataSubmitError::NotCaughtUp) => (zero, ForwardRegisterOutcome::NotCaughtUp),
+        Err(MetadataSubmitError::PipelineFull) => (zero, ForwardRegisterOutcome::PipelineFull),
+        Err(MetadataSubmitError::InProgress) => (zero, ForwardRegisterOutcome::InProgress),
+        Err(MetadataSubmitError::ClientIdOwnedByAnotherUser) => {
+            (zero, ForwardRegisterOutcome::ClientIdOwnedByAnotherUser)
+        }
+        // `MetadataSubmitError` is `#[non_exhaustive]`. Every variant but the
+        // ownership refusal is transient by contract, and `Canceled` is the
+        // transient answer that claims nothing beyond "retry".
+        Err(_) => (zero, ForwardRegisterOutcome::Canceled),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn build_forward_register_message(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    client: u128,
+    nonce: u128,
+    user_id: u32,
+) -> Message<ForwardRegisterHeader> {
+    Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
+        |_, header: &mut ForwardRegisterHeader| {
+            header.command = Command2::ForwardRegister;
+            header.cluster = cluster;
+            header.view = view;
+            header.replica = replica;
+            header.client = client;
+            header.nonce = nonce;
+            header.user_id = user_id;
+            header.size = HEADER_SIZE as u32;
+            header.seal();
+        },
+    )
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn build_forward_register_result_message(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    client: u128,
+    nonce: u128,
+    bound: &Result<BoundSession, MetadataSubmitError>,
+) -> Message<ForwardRegisterResultHeader> {
+    let (session, outcome) = forward_register_outcome(bound);
+    Message::<ForwardRegisterResultHeader>::new(HEADER_SIZE).transmute_header(
+        |_, header: &mut ForwardRegisterResultHeader| {
+            header.command = Command2::ForwardRegisterResult;
+            header.cluster = cluster;
+            header.view = view;
+            header.replica = replica;
+            header.client = client;
+            header.nonce = nonce;
+            header.epoch = session.epoch;
+            header.watermark = session.watermark;
+            header.outcome = outcome;
+            header.size = HEADER_SIZE as u32;
+            header.seal();
+        },
+    )
+}
+
 /// Run the consensus `Register` proposal on the metadata owner (shard 0)
 /// and return the committed session.
 ///
 /// Credential verification and session binding stay on the calling (home)
 /// shard -- only this consensus step must execute where the metadata
-/// consensus group lives. On shard 0 it calls in-process directly; on a
-/// peer it forwards a [`shard::MetadataSubmit`] to shard 0 and awaits the
-/// committed op. A dropped reply (shard-0 inbox full / shutdown) maps to a
-/// transient `Canceled`, which the caller wraps so the SDK replays.
+/// consensus group lives. On shard 0 it goes straight to
+/// [`submit_register_local_or_forward`]; on a peer it forwards a
+/// [`shard::MetadataSubmit`] to shard 0 and awaits the committed op. A dropped
+/// reply (shard-0 inbox full / shutdown) maps to a transient `Canceled`, which
+/// the caller wraps so the SDK replays.
 #[allow(clippy::future_not_send)]
 pub(crate) async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -2409,11 +2688,7 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return shard
-            .plane
-            .metadata()
-            .submit_register_in_process(vsr_client_id, user_id)
-            .await;
+        return submit_register_local_or_forward(shard, vsr_client_id, user_id).await;
     }
     let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
@@ -3165,7 +3440,7 @@ mod tests {
         IggyShard, LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology,
         ShardFrame, ShardIdentity, shard_channel,
     };
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::future::Future;
     use std::mem::size_of;
     use std::rc::Rc;
@@ -3174,13 +3449,36 @@ mod tests {
     type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
     /// `(target client id, reply frame bytes)` per `send_to_client` call.
     type RecordedReplies = Rc<RefCell<Vec<(u128, Vec<u8>)>>>;
+    /// `(target replica id, frame bytes)` per `send_to_replica` call.
+    type RecordedReplicaSends = Rc<RefCell<Vec<(u8, Vec<u8>)>>>;
 
-    /// Records every client-bound reply (target id + frame bytes) instead of
-    /// writing to a socket; everything else is a no-op. The two `ShellBus`
-    /// halves are stubbed.
+    /// Records every client-bound reply and replica-bound frame (target +
+    /// bytes) instead of writing to a socket; everything else is a no-op. The
+    /// two `ShellBus` halves are stubbed.
     #[derive(Debug, Clone, Default)]
     struct SpyBus {
         client_replies: RecordedReplies,
+        replica_sends: RecordedReplicaSends,
+        /// Resolve [`MessageBus::sleep`] immediately instead of arming a real
+        /// timer. The register forward is the only path here that races a
+        /// timer, and its budget is five seconds -- too long to wait for in a
+        /// unit test, and too long to shorten in production for one.
+        instant_timers: Rc<Cell<bool>>,
+    }
+
+    impl SpyBus {
+        /// Decode the single frame this bus sent to a replica.
+        fn sole_replica_send<H: iggy_binary_protocol::ConsensusHeader>(&self) -> (u8, H) {
+            let sends = self.replica_sends.borrow();
+            assert_eq!(sends.len(), 1, "expected exactly one replica-bound frame");
+            let (target, frame) = &sends[0];
+            let mut aligned = server_common::iobuf::Owned::<MESSAGE_ALIGN>::zeroed(frame.len());
+            aligned.as_mut_slice().copy_from_slice(frame);
+            let header =
+                *bytemuck::checked::try_from_bytes::<H>(&aligned.as_slice()[..size_of::<H>()])
+                    .expect("replica frame decodes into the expected header");
+            (*target, header)
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -3198,10 +3496,18 @@ mod tests {
         }
         async fn send_to_replica(
             &self,
-            _replica: u8,
-            _data: Frozen<MESSAGE_ALIGN>,
+            replica: u8,
+            data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
+            self.replica_sends
+                .borrow_mut()
+                .push((replica, data.as_slice().to_vec()));
             Ok(())
+        }
+        async fn sleep(&self, duration: std::time::Duration) {
+            if !self.instant_timers.get() {
+                compio::time::sleep(duration).await;
+            }
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
@@ -3244,6 +3550,57 @@ mod tests {
             None
         }
         fn set_client_connection_lost_fn(&self, _f: ClientConnectionLostFn) {}
+    }
+
+    /// Consensus incarnations standing for two successive boots of one node, as
+    /// far apart as the random draw at bootstrap makes them.
+    const FIRST_BOOT: u128 = 0x5EED_0001;
+    const SECOND_BOOT: u128 = 0x9E37_79B9_7F4A_7C15;
+
+    /// Shard 0 carrying a metadata consensus group of `replica_count`
+    /// replicas in which this node is `replica`. No journal: every test using
+    /// it either never proposes, or is a backup that cannot.
+    ///
+    /// `incarnation` stands for one boot of this node: the shard seeds its
+    /// forward-nonce counter from it, so passing a different value models a
+    /// restart.
+    fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u128) -> TestShard {
+        let consensus = VsrConsensus::new(
+            1,
+            replica,
+            replica_count,
+            server_common::sharding::METADATA_GROUP,
+            bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.set_incarnation(incarnation);
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, IggySnapshot, TestMux> =
+            IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+            },
+        );
+        TestShard::without_inbox(
+            ShardIdentity::new(0, "dispatch-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(
+                1,
+                ReplicaTopology::new(replica, replica_count),
+                bus.clone(),
+            ),
+        )
     }
 
     /// Minimal committed `Register` reply for `ClientTable::commit_register`
@@ -3766,6 +4123,399 @@ mod tests {
             "a discarded parked send must surface the retriable transient \
              status so the SDK replays it instead of timing out"
         );
+    }
+
+    /// A backup's login: it forwards the register it authenticated to the
+    /// view's primary and completes on the primary's verdict, with the whole
+    /// round trip going through the real shard ingest arm.
+    #[compio::test]
+    async fn backup_forwards_register_and_completes_on_the_primary_verdict() {
+        const CLIENT: u128 = 0xCAFE;
+        const USER: u32 = 7;
+        const EPOCH: u64 = 41;
+        const WATERMARK: u64 = 9;
+
+        let bus = SpyBus::default();
+        // Replica 1 of 3, view 0: `primary_index(0)` is replica 0.
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        let login = {
+            let shard = Rc::clone(&shard);
+            compio::runtime::spawn(async move {
+                submit_register_local_or_forward(&shard, CLIENT, USER).await
+            })
+        };
+        await_forward(&bus).await;
+        let (target, forward) = bus.sole_replica_send::<ForwardRegisterHeader>();
+        assert_eq!(target, 0, "forward must address the view's primary");
+        assert_eq!(forward.command, Command2::ForwardRegister);
+        assert_eq!(forward.client, CLIENT);
+        assert_eq!(
+            forward.user_id, USER,
+            "the forwarded identity is the payload"
+        );
+        assert_eq!(forward.replica, 1, "the origin names itself for the answer");
+        assert_ne!(forward.nonce, 0);
+        assert_eq!(forward.verify_frame(), Ok(()), "the frame must be sealed");
+        assert_eq!(forward.validate(), Ok(()));
+
+        shard
+            .on_message(forward_register_result(
+                &forward,
+                ForwardRegisterOutcome::Ok,
+                EPOCH,
+                WATERMARK,
+            ))
+            .await;
+        assert_eq!(
+            login.await.expect("the login task ran to completion"),
+            Ok(BoundSession {
+                epoch: EPOCH,
+                watermark: WATERMARK,
+            })
+        );
+    }
+
+    /// The ownership refusal is the one terminal verdict, and it has to stay
+    /// terminal across the hop or the SDK replays a login that cannot succeed.
+    #[compio::test]
+    async fn forwarded_register_keeps_the_ownership_refusal_terminal() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        let login = {
+            let shard = Rc::clone(&shard);
+            compio::runtime::spawn(async move {
+                submit_register_local_or_forward(&shard, 0xCAFE, 7).await
+            })
+        };
+        await_forward(&bus).await;
+        let (_, forward) = bus.sole_replica_send::<ForwardRegisterHeader>();
+        shard
+            .on_message(forward_register_result(
+                &forward,
+                ForwardRegisterOutcome::ClientIdOwnedByAnotherUser,
+                0,
+                0,
+            ))
+            .await;
+        let error = login
+            .await
+            .expect("the login task ran to completion")
+            .expect_err("the refusal must surface");
+        assert_eq!(error, MetadataSubmitError::ClientIdOwnedByAnotherUser);
+        assert!(!error.is_transient(), "the refusal must stay terminal");
+    }
+
+    /// A primary that never answers must not strand the login or leak its
+    /// parked entry; the client gets a transient failure and replays.
+    #[compio::test]
+    async fn unanswered_forward_times_out_and_clears_the_parked_login() {
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
+        assert!(
+            outcome.unwrap_err().is_transient(),
+            "a lost answer is replayable"
+        );
+
+        // The parked entry is gone: the answer that arrives late finds nothing
+        // and is dropped rather than completing a login nobody is waiting on.
+        let (_, forward) = bus.sole_replica_send::<ForwardRegisterHeader>();
+        shard
+            .on_message(forward_register_result(
+                &forward,
+                ForwardRegisterOutcome::Ok,
+                41,
+                0,
+            ))
+            .await;
+    }
+
+    /// The reply frame is where an unknown outcome has to be told apart from a
+    /// refusal: a forward that timed out may still commit, so the client must
+    /// replay under the same client id instead of failing over under a fresh
+    /// one. A verdict that refused the register carries no such doubt.
+    #[compio::test]
+    async fn transient_login_reply_marks_a_timed_out_forward_not_committed() {
+        const TRANSPORT: u128 = 91;
+        const VSR_CLIENT: u128 = 0xCAFE;
+        const RESULT_OFFSET: usize = size_of::<ReplyHeader>() + 8;
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        let request = request_message(Operation::Register, VSR_CLIENT, 0, 0, &[]);
+
+        for (submit_error, expected) in [
+            (
+                MetadataSubmitError::ForwardTimedOut,
+                IggyError::TransientNotCommitted,
+            ),
+            (
+                MetadataSubmitError::NotPrimary,
+                IggyError::TransientNotAccepted,
+            ),
+        ] {
+            let error = LoginRegisterError::Transient(submit_error);
+            surface_login_failure(&shard, TRANSPORT, request.header(), &error).await;
+
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "a transient login must answer a frame");
+            let (client, frame) = &replies[0];
+            assert_eq!(*client, TRANSPORT, "reply must target the transport id");
+            let result =
+                u32::from_le_bytes(frame[RESULT_OFFSET..RESULT_OFFSET + 4].try_into().unwrap());
+            assert_eq!(result, expected.as_code(), "{error} must reply {expected}");
+            drop(replies);
+            bus.client_replies.borrow_mut().clear();
+        }
+    }
+
+    /// A restart must not re-mint the nonce sequence of the boot before it. The
+    /// nonce is never persisted, and an answer to a pre-restart forward can
+    /// still be in flight: routed by a repeated nonce it would confirm a login
+    /// the cluster never committed, with another client's epoch.
+    #[compio::test]
+    async fn a_restart_moves_the_forward_nonce_sequence() {
+        assert_ne!(
+            first_forward_nonce(FIRST_BOOT).await,
+            first_forward_nonce(SECOND_BOOT).await,
+            "each boot must start its nonce sequence somewhere the other did not"
+        );
+    }
+
+    /// Seeding the counter from the incarnation means it can start one step
+    /// short of wrapping, and a zero nonce is a frame every replica rejects.
+    #[compio::test]
+    async fn wrapping_forward_nonce_counter_skips_zero() {
+        let nonce = first_forward_nonce(u128::from(u64::MAX)).await;
+        assert_ne!(
+            nonce & u128::from(u64::MAX),
+            0,
+            "a counter that wrapped must not contribute a zero nonce half"
+        );
+    }
+
+    /// An answer echoing a client the nonce was never parked for must neither
+    /// complete that login nor evict it, since a repeated nonce is exactly what
+    /// a late cross-boot answer carries.
+    #[compio::test]
+    async fn forward_result_for_another_client_leaves_the_login_parked() {
+        const CLIENT: u128 = 0xCAFE;
+        const EPOCH: u64 = 41;
+        const WATERMARK: u64 = 9;
+        const FOREIGN_EPOCH: u64 = 77;
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        let login = {
+            let shard = Rc::clone(&shard);
+            compio::runtime::spawn(async move {
+                submit_register_local_or_forward(&shard, CLIENT, 7).await
+            })
+        };
+        await_forward(&bus).await;
+        let (_, forward) = bus.sole_replica_send::<ForwardRegisterHeader>();
+
+        let mut foreign = forward;
+        foreign.client = CLIENT + 1;
+        shard
+            .on_message(forward_register_result(
+                &foreign,
+                ForwardRegisterOutcome::Ok,
+                FOREIGN_EPOCH,
+                0,
+            ))
+            .await;
+        shard
+            .on_message(forward_register_result(
+                &forward,
+                ForwardRegisterOutcome::Ok,
+                EPOCH,
+                WATERMARK,
+            ))
+            .await;
+        assert_eq!(
+            login.await.expect("the login task ran to completion"),
+            Ok(BoundSession {
+                epoch: EPOCH,
+                watermark: WATERMARK,
+            }),
+            "the login must bind the epoch addressed to it, and must still be \
+             parked to receive it"
+        );
+    }
+
+    /// A node that is primary itself never forwards -- that is what bounds a
+    /// forward at one hop.
+    #[compio::test]
+    async fn primary_proposes_locally_instead_of_forwarding() {
+        let bus = SpyBus::default();
+        // Replica 0 of 3, view 0: this node IS the primary.
+        let shard = Rc::new(test_shard(&bus, 0, 3, FIRST_BOOT));
+
+        // No journal on the test shard, so the proposal cannot commit; what
+        // matters is that nothing left over the interconnect.
+        let _ = compio::time::timeout(
+            Duration::from_millis(50),
+            submit_register_local_or_forward(&shard, 0xCAFE, 7),
+        )
+        .await;
+        assert!(
+            bus.replica_sends.borrow().is_empty(),
+            "a primary must propose in process"
+        );
+    }
+
+    /// The nonce a shard booted at `incarnation` stamps on its first forward.
+    /// Nobody answers, so the login abandons on the instant timer; the frame it
+    /// left on the bus is what the caller is after.
+    async fn first_forward_nonce(incarnation: u128) -> u128 {
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 1, 3, incarnation));
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
+        bus.sole_replica_send::<ForwardRegisterHeader>().1.nonce
+    }
+
+    /// Let a spawned login run until it has parked on the primary's answer.
+    async fn await_forward(bus: &SpyBus) {
+        for _ in 0..1000 {
+            if !bus.replica_sends.borrow().is_empty() {
+                return;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the login never forwarded a register");
+    }
+
+    /// A sealed `ForwardRegisterResult` addressed to `forward`'s nonce.
+    fn forward_register_result(
+        forward: &ForwardRegisterHeader,
+        outcome: ForwardRegisterOutcome,
+        epoch: u64,
+        watermark: u64,
+    ) -> Message<GenericHeader> {
+        let bound = match outcome {
+            ForwardRegisterOutcome::Ok => Ok(BoundSession { epoch, watermark }),
+            ForwardRegisterOutcome::ClientIdOwnedByAnotherUser => {
+                Err(MetadataSubmitError::ClientIdOwnedByAnotherUser)
+            }
+            _ => Err(MetadataSubmitError::NotPrimary),
+        };
+        build_forward_register_result_message(
+            forward.cluster,
+            forward.view,
+            0,
+            forward.client,
+            forward.nonce,
+            &bound,
+        )
+        .into_generic()
+    }
+
+    /// The `GET_CLUSTER_METADATA` auth gate holds on every roster shape: it
+    /// describes the private replica network, and a client that dialed a
+    /// backup reaches the cluster by logging in there (the backup forwards
+    /// the register), not by reading the topology first.
+    ///
+    /// The denial must be a plain Reply on the status channel, not an
+    /// Eviction: no session exists yet, and a session-terminal frame makes
+    /// SDKs drop the connection their login is about to use.
+    #[compio::test]
+    async fn pre_auth_cluster_metadata_denied_on_every_roster() {
+        use configs::cluster::{ClusterNodeConfig, TransportPorts};
+        use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
+        use iggy_binary_protocol::{GenericHeader, ReplyHeader};
+
+        const TRANSPORT: u128 = 91;
+        const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+        const OP_OFFSET: usize = std::mem::offset_of!(ReplyHeader, op);
+
+        fn metadata_read() -> Message<GenericHeader> {
+            let header_size = size_of::<RequestHeader>();
+            let mut message = Message::<RequestHeader>::new(header_size);
+            {
+                let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                    &mut message.as_mut_slice()[..header_size],
+                );
+                *header = RequestHeader {
+                    command: Command2::Request,
+                    operation: Operation::NonReplicated,
+                    size: u32::try_from(header_size).expect("header fits u32"),
+                    client: TRANSPORT,
+                    ..Default::default()
+                };
+                header.reserved[..4].copy_from_slice(&GET_CLUSTER_METADATA_CODE.to_le_bytes());
+            }
+            message.into_generic()
+        }
+
+        fn roster_node(name: &str) -> ClusterNodeConfig {
+            ClusterNodeConfig {
+                name: name.to_owned(),
+                ip: "127.0.0.1".to_owned(),
+                advertised_address: None,
+                advertised_addresses: Vec::new(),
+                replica_id: 0,
+                ports: TransportPorts::default(),
+            }
+        }
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let system_config = Arc::new(ServerSystemConfig::default());
+
+        let multi_node = Rc::new(ClusterRoster {
+            enabled: true,
+            name: "test-cluster".to_owned(),
+            nodes: vec![roster_node("node-0").into(), roster_node("node-1").into()],
+            self_ip: "127.0.0.1".to_owned(),
+            self_ports: TransportPorts::default(),
+            metadata_view: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::cluster_meta::METADATA_VIEW_UNKNOWN,
+            )),
+        });
+        // Default roster is disabled / single node; the installed one is a
+        // real cluster. Neither serves an unbound caller.
+        for roster in [None, Some(multi_node)] {
+            if let Some(roster) = roster {
+                sessions.borrow_mut().set_cluster_roster(roster);
+            }
+            handle_client_request(
+                &shard,
+                &sessions,
+                &system_config,
+                1,
+                TRANSPORT,
+                metadata_read(),
+            )
+            .await;
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "gated read must still produce a frame");
+            let (client, frame) = &replies[0];
+            assert_eq!(*client, TRANSPORT);
+            assert_eq!(
+                frame[COMMAND_OFFSET],
+                Command2::Reply as u8,
+                "an unbound cluster-metadata read must be denied with a Reply, not evicted"
+            );
+            let status =
+                u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+            assert_eq!(
+                status,
+                IggyError::Unauthenticated.as_code(),
+                "deny reply status must be Unauthenticated"
+            );
+            let op = u64::from_le_bytes(frame[OP_OFFSET..OP_OFFSET + 8].try_into().unwrap());
+            assert_eq!(op, 0, "pre-auth deny carries no session, so op must be 0");
+            drop(replies);
+            bus.client_replies.borrow_mut().clear();
+        }
     }
 
     #[test]

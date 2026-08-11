@@ -620,9 +620,9 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Ping and cluster metadata are the only sessionless bootstrap commands.
-     * Cluster metadata must be available before Register so a VSR client can
-     * select the leader; every other non-login command requires a bound
+     * Ping is the only command the server answers without a bound session. The
+     * cluster roster is auth-gated as well, so an unauthenticated caller cannot
+     * enumerate the topology and leader selection can only run on a bound
      * session.
      */
     private static boolean requiresAuthentication(int commandCode) {
@@ -630,8 +630,7 @@ public class AsyncTcpConnection {
     }
 
     private static boolean isAllowedBeforeAuthentication(int commandCode) {
-        return commandCode == CommandCode.System.PING.getValue()
-                || commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue();
+        return commandCode == CommandCode.System.PING.getValue();
     }
 
     private void sendFrame(

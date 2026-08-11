@@ -20,9 +20,9 @@
 //! `LOGIN_WITH_PERSONAL_ACCESS_TOKEN` (44) codes -- which the vsr SDK never
 //! emits (its typed login methods send the register codes, its raw path
 //! rejects session-control codes) -- must be rejected with a typed
-//! `MalformedLogin` eviction, instead of the misleading `NoSession` eviction
-//! the pre-auth guard would send unbound, or the silent empty-ok reply the
-//! bound non-replicated path would send.
+//! `MalformedLogin` eviction, instead of the generic `Unauthenticated` deny
+//! reply the pre-auth guard would send unbound, or the silent empty-ok reply
+//! the bound non-replicated path would send.
 //! Since the SDK cannot send these codes, the frames are hand-crafted on a raw
 //! TCP socket: a header-only non-replicated frame carrying the code in the
 //! reserved command slot.
