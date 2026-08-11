@@ -19,12 +19,15 @@ use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
     Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
     StateChunkHeader, StateTransferTargetHeader,
 };
 use smallvec::SmallVec;
-use std::{marker::PhantomData, mem::size_of};
+use std::{
+    marker::PhantomData,
+    mem::{offset_of, size_of},
+};
 
 pub const MESSAGE_ALIGN: usize = 4096;
 
@@ -375,6 +378,31 @@ where
         f(old_header, new_header);
 
         Message::try_from(owned).expect("transmuted request message must stay valid")
+    }
+}
+
+impl Message<RequestHeader> {
+    /// Retype the client-wire request into the server-internal
+    /// [`RoutedRequestHeader`] shape in place, with `group` starting unset.
+    ///
+    /// The two layouts share every field offset (const-asserted where they
+    /// are declared) and `group` claims the client header's reserved tail,
+    /// so the promotion zeroes those eight bytes instead of rebuilding the
+    /// whole 256-byte header. This is the only sanctioned crossing between
+    /// the two layouts: transmute-based reads across them would alias
+    /// `group` with reserved bytes a client may have sent nonzero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the retyped header fails [`RoutedRequestHeader`] validation;
+    /// unreachable when `self` already passed [`RequestHeader`] validation,
+    /// which enforces the same field rules.
+    #[must_use]
+    pub fn into_routed(self) -> Message<RoutedRequestHeader> {
+        let group_offset = offset_of!(RoutedRequestHeader, group);
+        let mut owned = self.into_owned();
+        owned.as_mut_slice()[group_offset..group_offset + size_of::<u64>()].fill(0);
+        Message::try_from(owned).expect("retyped request message must stay valid")
     }
 }
 
@@ -889,9 +917,7 @@ mod tests {
     #[test]
     fn try_as_typed_invalid_validation_returns_err() {
         // `RequestHeader::validate` rejects operation=Register with non-zero
-        // session. The client-wire header is the one carrying the field rules;
-        // `RoutedRequestHeader` is the post-resolution shape and gates on the
-        // command alone.
+        // session; the routed shape shares the same field rules.
         let mut owned = header_bytes(Command2::Request, 256);
         {
             let buf = owned.as_mut_slice();
@@ -975,9 +1001,6 @@ mod tests {
     #[test]
     fn client_wire_decode_of_request_with_invalid_register_session_returns_err() {
         // `RequestHeader::validate` rejects Register with non-zero session.
-        // Not routed through `MessageBag`: that path decodes the already-routed
-        // `RoutedRequestHeader` for replica-to-replica frames, and the field
-        // rules are the client boundary's job.
         let mut owned = header_bytes(Command2::Request, 256);
         {
             let buf = owned.as_mut_slice();
@@ -1077,6 +1100,71 @@ mod tests {
                 new.size = 256;
             });
         assert_eq!(prepared.header().command, Command2::Prepare);
+    }
+
+    // into_routed: in-place client-wire -> routed retype
+
+    // Promotion must carry the data-bearing reserved prefix verbatim (the
+    // non-replicated op code lives in `reserved[0..4]`) and unset only the
+    // `group` tail, whatever junk the client sent in those eight bytes.
+    #[test]
+    fn into_routed_keeps_reserved_prefix_and_unsets_group() {
+        const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
+
+        let mut owned = header_bytes(Command2::Request, 256);
+        {
+            let buf = owned.as_mut_slice();
+            for (index, byte) in buf[RESERVED_OFF..RESERVED_OFF + 60].iter_mut().enumerate() {
+                *byte = u8::try_from(index).expect("60 fits u8") + 1;
+            }
+        }
+        let request = Message::<RequestHeader>::try_from(owned).expect("valid client frame");
+        let client_header = *request.header();
+
+        let routed = request.into_routed();
+        let header = routed.header();
+        assert_eq!(
+            header.reserved[..],
+            client_header.reserved[..52],
+            "the reserved prefix carries data and must survive promotion"
+        );
+        assert_eq!(
+            header.group, 0,
+            "the client-sent reserved tail must not leak into `group`"
+        );
+        assert_eq!(header.client, client_header.client);
+        assert_eq!(header.operation, client_header.operation);
+        assert_eq!(header.session, client_header.session);
+        assert_eq!(header.request, client_header.request);
+        assert_eq!(header.user_id, client_header.user_id);
+    }
+
+    // A peer-wire `Command2::Request` decodes as `RoutedRequestHeader`, so its
+    // validate must enforce the client-boundary field rules: a forged
+    // `client = 0` frame would otherwise reach the client table's hard assert
+    // and abort the metadata primary, and a `Reserved` operation would replay
+    // that client's cached register reply.
+    #[test]
+    fn messagebag_dispatch_rejects_request_with_zero_client() {
+        let mut owned = header_bytes(Command2::Request, 256);
+        owned.as_mut_slice()[REQUEST_CLIENT_OFF..REQUEST_CLIENT_OFF + 16]
+            .copy_from_slice(&0u128.to_le_bytes());
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::InvalidField(_))
+        ));
+    }
+
+    #[test]
+    fn messagebag_dispatch_rejects_request_with_reserved_operation() {
+        let mut owned = header_bytes(Command2::Request, 256);
+        owned.as_mut_slice()[REQUEST_OPERATION_OFF] = Operation::Reserved as u8;
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::InvalidField(_))
+        ));
     }
 
     // ResponseBacking via SmallVec<Frozen>

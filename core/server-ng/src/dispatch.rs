@@ -867,9 +867,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     // client wire carries no group (it is derived -- plane from `operation`,
     // partition target from the payload), so it starts unset here and the
     // resolution sites below stamp it before anything routes on it.
-    let request = request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
-        *new_header = RoutedRequestHeader::from_request(&header, 0);
-    });
+    let request = request.into_routed();
 
     // The last point that still sees the body the CLIENT sent; every rewrite below
     // substitutes server-chosen bytes and carries the stamp through unchanged.

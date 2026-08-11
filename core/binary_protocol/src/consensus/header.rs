@@ -315,9 +315,9 @@ const _: () = {
 /// (it is derived: plane from `operation`, partition group from the body),
 /// so this is where the derivation result lives for the internal hop.
 ///
-/// Layout: identical to [`RequestHeader`] with `group` claiming the first
-/// eight reserved bytes, so the in-place `transmute_header` rewrite stays a
-/// same-size copy.
+/// Layout: identical to [`RequestHeader`] with `group` claiming the LAST
+/// eight reserved bytes (the tail, bytes 248..256); the leading 52 reserved
+/// bytes keep their client-wire meaning, so promotion is a same-size copy.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RoutedRequestHeader {
@@ -368,7 +368,7 @@ impl Default for RoutedRequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Request,
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -410,44 +410,64 @@ impl Default for RequestHeader {
     }
 }
 
-impl RoutedRequestHeader {
-    /// Promote a client-wire [`RequestHeader`] to the server-internal routed
-    /// shape, stamping the resolved consensus `group`. Every shared field is
-    /// copied verbatim; this is the ONLY sanctioned crossing between the two
-    /// layouts (transmute-based reads across them would alias `group` with
-    /// reserved bytes).
-    #[must_use]
-    pub const fn from_request(header: &RequestHeader, group: u64) -> Self {
-        Self {
-            checksum: header.checksum,
-            checksum_body: header.checksum_body,
-            cluster: header.cluster,
-            size: header.size,
-            view: header.view,
-            release: header.release,
-            command: header.command,
-            replica: header.replica,
-            reserved_frame: header.reserved_frame,
-            client: header.client,
-            request_checksum: header.request_checksum,
-            timestamp: header.timestamp,
-            request: header.request,
-            operation: header.operation,
-            operation_padding: header.operation_padding,
-            session: header.session,
-            user_id: header.user_id,
-            reserved: {
-                let mut reserved = [0u8; 52];
-                let mut i = 0;
-                while i < 52 {
-                    reserved[i] = header.reserved[i];
-                    i += 1;
-                }
-                reserved
-            },
-            group,
+/// Field rules shared by the client-wire [`RequestHeader`] and the
+/// server-internal [`RoutedRequestHeader`]. The routed shape is decoded
+/// straight off the peer wire (`MessageBag`), so it must reject everything
+/// the client boundary rejects; validating only the command byte there
+/// would let a peer frame carry `client = 0` into the client table's hard
+/// assert, or `operation = Reserved` into a cached-register replay.
+fn validate_request_fields(
+    client: u128,
+    operation: Operation,
+    session: u64,
+    request: u64,
+) -> Result<(), ConsensusError> {
+    if client == 0 {
+        return Err(ConsensusError::InvalidField(
+            "request: client must be != 0".to_string(),
+        ));
+    }
+    // Reserved is the zero value, never a real client op
+    // (`is_client_allowed` rejects it). Refusing it here rather than after
+    // the dedup preflight matters: a bound client sending
+    // `Reserved, request = 0` used to pass validation, reach
+    // `request_preflight`, hit its own watermark and get its register
+    // reply replayed before the operation gate ever ran.
+    if operation == Operation::Reserved {
+        return Err(ConsensusError::InvalidField(
+            "operation must not be Reserved".to_string(),
+        ));
+    }
+    // Register: session must be 0, request must be 0.
+    // NonReplicated: sessionless by design (the `ClientTable` ignores
+    // these ops and the server routes/auth-gates them by transport id),
+    // so a pre-register client may legitimately send session 0 --
+    // ping must work before authentication.
+    // Other non-register ops: session must be > 0, request must be > 0.
+    if operation == Operation::Register {
+        if session != 0 {
+            return Err(ConsensusError::InvalidField(
+                "register: session must be 0".to_string(),
+            ));
+        }
+        if request != 0 {
+            return Err(ConsensusError::InvalidField(
+                "register: request must be 0".to_string(),
+            ));
+        }
+    } else if operation != Operation::NonReplicated {
+        if session == 0 {
+            return Err(ConsensusError::InvalidField(
+                "non-register: session must be > 0".to_string(),
+            ));
+        }
+        if request == 0 {
+            return Err(ConsensusError::InvalidField(
+                "non-register: request must be > 0".to_string(),
+            ));
         }
     }
+    Ok(())
 }
 
 impl ConsensusHeader for RoutedRequestHeader {
@@ -480,7 +500,7 @@ impl ConsensusHeader for RoutedRequestHeader {
                 found: self.command,
             });
         }
-        Ok(())
+        validate_request_fields(self.client, self.operation, self.session, self.request)
     }
 }
 
@@ -512,52 +532,7 @@ impl ConsensusHeader for RequestHeader {
                 found: self.command,
             });
         }
-        if self.client == 0 {
-            return Err(ConsensusError::InvalidField(
-                "request: client must be != 0".to_string(),
-            ));
-        }
-        // Reserved is the zero value, never a real client op
-        // (`is_client_allowed` rejects it). Refusing it here rather than after
-        // the dedup preflight matters: a bound client sending
-        // `Reserved, request = 0` used to pass validation, reach
-        // `request_preflight`, hit its own watermark and get its register
-        // reply replayed before the operation gate ever ran.
-        if self.operation == Operation::Reserved {
-            return Err(ConsensusError::InvalidField(
-                "operation must not be Reserved".to_string(),
-            ));
-        }
-        // Register: session must be 0, request must be 0.
-        // NonReplicated: sessionless by design (the `ClientTable` ignores
-        // these ops and the server routes/auth-gates them by transport id),
-        // so a pre-register client may legitimately send session 0 --
-        // ping must work before authentication.
-        // Other non-register ops: session must be > 0, request must be > 0.
-        if self.operation == Operation::Register {
-            if self.session != 0 {
-                return Err(ConsensusError::InvalidField(
-                    "register: session must be 0".to_string(),
-                ));
-            }
-            if self.request != 0 {
-                return Err(ConsensusError::InvalidField(
-                    "register: request must be 0".to_string(),
-                ));
-            }
-        } else if self.operation != Operation::NonReplicated {
-            if self.session == 0 {
-                return Err(ConsensusError::InvalidField(
-                    "non-register: session must be > 0".to_string(),
-                ));
-            }
-            if self.request == 0 {
-                return Err(ConsensusError::InvalidField(
-                    "non-register: request must be > 0".to_string(),
-                ));
-            }
-        }
-        Ok(())
+        validate_request_fields(self.client, self.operation, self.session, self.request)
     }
 }
 
@@ -2268,8 +2243,8 @@ mod tests {
         EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
         PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
         RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-        RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-        StateTransferTargetHeader,
+        RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+        StateChunkHeader, StateTransferTargetHeader,
     };
     use aligned_vec::{AVec, ConstAlign};
 
@@ -2533,15 +2508,86 @@ mod tests {
     }
 
     // `status` is carved from the reserved tail; the SDK reply funnel peeks it
-    // at this offset before any body decode, so a layout drift must trip here.
+    // at this offset before any body decode, and four foreign SDKs hardcode
+    // it, so a layout drift must trip here.
     #[test]
     fn reply_header_status_offset_and_size_pinned() {
         use std::mem::offset_of;
         assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
+        assert_eq!(offset_of!(ReplyHeader, status), 216);
         assert_eq!(
             offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>(),
             HEADER_SIZE
         );
+    }
+
+    // `group` claims the TAIL of the client header's reserved area; the
+    // leading 52 reserved bytes carry data (the non-replicated op code lives
+    // in `reserved[0..4]`), so a reshuffle of the carve must trip here rather
+    // than silently move the code range.
+    #[test]
+    fn routed_request_group_claims_reserved_tail() {
+        use std::mem::offset_of;
+        assert_eq!(
+            offset_of!(RoutedRequestHeader, reserved),
+            offset_of!(RequestHeader, reserved)
+        );
+        assert_eq!(
+            offset_of!(RoutedRequestHeader, group),
+            offset_of!(RequestHeader, reserved) + 52
+        );
+        assert_eq!(offset_of!(RoutedRequestHeader, group), 248);
+        assert_eq!(
+            offset_of!(RoutedRequestHeader, group) + size_of::<u64>(),
+            HEADER_SIZE
+        );
+    }
+
+    // The routed shape is decoded straight off the peer wire, so it must
+    // enforce the same field rules as the client boundary; a command-only
+    // validate lets a forged `client = 0` frame reach the client table's
+    // hard assert.
+    #[test]
+    fn routed_request_zero_client_rejected() {
+        let header = RoutedRequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            session: 10,
+            request: 1,
+            ..RoutedRequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn routed_request_reserved_operation_rejected() {
+        let header = RoutedRequestHeader {
+            command: Command2::Request,
+            client: 0xCAFE,
+            session: 10,
+            request: 1,
+            ..RoutedRequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn routed_request_default_fails_validate() {
+        assert!(RoutedRequestHeader::default().validate().is_err());
+    }
+
+    #[test]
+    fn routed_request_valid_fields_accepted() {
+        let header = RoutedRequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            client: 0xCAFE,
+            session: 10,
+            request: 1,
+            group: 7,
+            ..RoutedRequestHeader::default()
+        };
+        assert!(header.validate().is_ok());
     }
 
     // A nonzero status rides the reserved region, which reply `validate` does
