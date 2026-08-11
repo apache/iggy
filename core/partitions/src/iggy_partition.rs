@@ -2195,8 +2195,13 @@ where
             if let Err(error) =
                 replicate_frozen_to_next_in_chain(consensus, frozen_for_forward).await
             {
+                let is_transport_error = error.is_transport();
                 emit_partition_diag(
-                    tracing::Level::WARN,
+                    if is_transport_error {
+                        tracing::Level::WARN
+                    } else {
+                        tracing::Level::ERROR
+                    },
                     &PartitionDiagEvent::new(
                         self.diag_ctx(),
                         "failed to re-forward retransmitted prepare to next in chain",
@@ -2205,6 +2210,9 @@ where
                     .with_op(header.op)
                     .with_error(error.to_string()),
                 );
+                if !is_transport_error {
+                    return;
+                }
             }
             self.send_prepare_ok(&header).await;
             return;
@@ -2319,8 +2327,13 @@ where
             consensus.observe_prepare_timestamp(header.timestamp);
         }
         if let Err(error) = replicate_frozen_to_next_in_chain(consensus, frozen_for_forward).await {
+            let is_transport_error = error.is_transport();
             emit_partition_diag(
-                tracing::Level::WARN,
+                if is_transport_error {
+                    tracing::Level::WARN
+                } else {
+                    tracing::Level::ERROR
+                },
                 &PartitionDiagEvent::new(
                     self.diag_ctx(),
                     "failed to replicate prepare to next in chain",
@@ -2329,6 +2342,9 @@ where
                 .with_op(header.op)
                 .with_error(error.to_string()),
             );
+            if !is_transport_error {
+                return;
+            }
         }
 
         {
