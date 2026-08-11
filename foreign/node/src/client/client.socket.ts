@@ -40,6 +40,8 @@ import { normalizeClientConfig } from './client.config.js';
 
 const VSR_RESPONSE_TIMEOUT_MS = 30_000;
 const VSR_RETRY_INTERVAL_MS = 50;
+const LEADERLESS_WAIT_BUDGET_MS = 5_000;
+const LEADERLESS_POLL_INTERVAL_MS = 250;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 
@@ -95,6 +97,12 @@ export class CommandResponseStream extends EventEmitter {
   private vsrSession: VsrSession;
   /** Shared authentication attempt for concurrent callers */
   private authenticationPromise?: Promise<boolean>;
+  /** Whether a login is already being moved to the leader */
+  private settlingLeader: boolean;
+  /** How long a leaderless roster is polled before settling in place */
+  private leaderlessWaitBudget: number;
+  /** Delay between roster reads while the cluster elects */
+  private leaderlessPollInterval: number;
   /** Calls that have acquired this stream but have not fully settled */
   private pendingSubmissions: number;
   /** Whether the stream is currently processing a command */
@@ -123,6 +131,9 @@ export class CommandResponseStream extends EventEmitter {
     this._execQueue = [];
     this.vsrSession = new VsrSession();
     this.authenticationPromise = undefined;
+    this.settlingLeader = false;
+    this.leaderlessWaitBudget = LEADERLESS_WAIT_BUDGET_MS;
+    this.leaderlessPollInterval = LEADERLESS_POLL_INTERVAL_MS;
     this.pendingSubmissions = 0;
     this.heartbeatInFlight = false;
     this._init();
@@ -150,7 +161,7 @@ export class CommandResponseStream extends EventEmitter {
 
   /**
    * Sends a command to the server.
-   * Automatically handles connection and authentication if needed.
+   * Automatically handles connection, authentication and leader settlement.
    *
    * @param command - Command code to send
    * @param payload - Command payload buffer
@@ -172,26 +183,33 @@ export class CommandResponseStream extends EventEmitter {
       if (!this.connection.connected)
         await this.connection.connect()
 
-      if (isLoginCommand(command))
-        await this._ensureVsrLeader();
-
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
         await this.authenticate(this.options.credentials);
 
-      return await new Promise((resolve, reject) => {
-        const job = {
-          command,
-          payload,
-          handleResponse,
-          resolve,
-          reject
-        };
-        if (last)
-          this._execQueue.push(job);
-        else
-          this._execQueue.unshift(job);
-        this._processQueue();
-      });
+      const response = await new Promise<CommandResponse>(
+        (resolve, reject) => {
+          const job = {
+            command,
+            payload,
+            handleResponse,
+            resolve,
+            reject
+          };
+          if (last)
+            this._execQueue.push(job);
+          else
+            this._execQueue.unshift(job);
+          this._processQueue();
+        });
+      if (!isLoginCommand(command) || this.settlingLeader)
+        return response;
+      this.settlingLeader = true;
+      try {
+        const settled = await this._settleOnLeader(command, payload);
+        return settled ?? response;
+      } finally {
+        this.settlingLeader = false;
+      }
     } finally {
       this.pendingSubmissions -= 1;
       this._emitFinishQueue();
@@ -385,38 +403,88 @@ export class CommandResponseStream extends EventEmitter {
     });
   }
 
+  // `GetClusterMetadata` is deliberately absent: the server auth-gates it,
+  // so the client authenticates before reading the topology. A login dialed
+  // at a backup still succeeds because the server forwards the register to
+  // the primary.
   private isUnloggedCommand(command: number): boolean {
-    return UNLOGGED_COMMAND_CODE.includes(command) ||
-      command === COMMAND_CODE.GetClusterMetadata;
+    return UNLOGGED_COMMAND_CODE.includes(command);
   }
 
-  private async _ensureVsrLeader(): Promise<void> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      // Queue the metadata fetch instead of writing directly: a bare write
-      // would race an in-flight exchange and both would wake on the same
-      // response event.
-      const response = await this.sendCommand(
-        GET_CLUSTER_METADATA.code,
-        GET_CLUSTER_METADATA.serialize(),
-        { last: false }
-      );
-      const metadata = GET_CLUSTER_METADATA.deserialize(response);
-      if (metadata.nodes.length <= 1)
-        return;
-      const leader = metadata.nodes.find(
-        (node) => node.role === 'Leader' && node.status === 'Healthy'
-      );
-      if (!leader) {
-        await delay(100);
-        continue;
+  /**
+   * Moves a freshly authenticated session to the cluster leader.
+   *
+   * Only the leader accepts replicated commands, and the roster read is
+   * auth-gated, so the topology cannot be inspected before a login binds a
+   * session. The redirect drops that session along with the socket, so the
+   * login is replayed on the leader and its answer supersedes the one from the
+   * node the client dialed. One hop is enough: the leader admits logins
+   * locally.
+   *
+   * @returns The leader's login response, or undefined when the client stays
+   */
+  private async _settleOnLeader(
+    loginCommand: number,
+    loginPayload: Buffer
+  ): Promise<CommandResponse | undefined> {
+    const leader = await this._readLeaderEndpoint();
+    if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+      return undefined;
+    await this.connection.redirect(leader.host, leader.port);
+    return this.sendCommand(loginCommand, loginPayload, { last: false });
+  }
+
+  /**
+   * Reads the cluster roster and picks the endpoint to settle on.
+   *
+   * Best effort: an unreadable roster, `Unauthenticated` included (the session
+   * died between the login and this read), keeps the client on its current
+   * node instead of failing a login that already succeeded.
+   */
+  private async _readLeaderEndpoint():
+    Promise<{ host: string, port: number } | undefined> {
+    // A cluster can be transiently leaderless: a restarted node cedes the
+    // primaryship its stale view assigns it, and the roster reports no leader
+    // until the peers' election completes. That window is roughly one heartbeat
+    // timeout, so poll through it rather than settling on a replica that denies
+    // every replicated command for its whole retry budget.
+    const deadline = Date.now() + this.leaderlessWaitBudget;
+    while (true) {
+      // Reading without a session would re-enter authentication, which awaits
+      // the very login this settlement runs inside of. The session can also die
+      // between polls, so this holds for every pass, not just the first.
+      if (!this.isAuthenticated)
+        return undefined;
+      try {
+        // Queue the metadata fetch instead of writing directly: a bare write
+        // would race an in-flight exchange and both would wake on the same
+        // response event.
+        const response = await this.sendCommand(
+          GET_CLUSTER_METADATA.code,
+          GET_CLUSTER_METADATA.serialize(),
+          { last: false }
+        );
+        const metadata = GET_CLUSTER_METADATA.deserialize(response);
+        if (metadata.nodes.length <= 1)
+          return undefined;
+        const leader = metadata.nodes.find(
+          (node) => node.role === 'Leader' && node.status === 'Healthy'
+        );
+        if (leader)
+          return { host: leader.ip, port: leader.endpoints.tcp };
+      } catch (error) {
+        debug('cluster metadata is unreadable, staying on this node', error);
+        return undefined;
       }
-      if (!this.connection.isConnectedTo(leader.ip, leader.endpoints.tcp)) {
-        await this.connection.redirect(leader.ip, leader.endpoints.tcp);
-        continue;
+      if (Date.now() >= deadline) {
+        debug(
+          'cluster metadata named no healthy leader within ' +
+          `${this.leaderlessWaitBudget} ms, staying on this node`
+        );
+        return undefined;
       }
-      return;
+      await delay(this.leaderlessPollInterval);
     }
-    throw new Error('VSR cluster has no healthy leader');
   }
 
   /**

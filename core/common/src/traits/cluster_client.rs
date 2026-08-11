@@ -23,7 +23,6 @@ use async_trait::async_trait;
 pub trait ClusterClient {
     /// Get the metadata of the cluster including node information, roles, and status.
     ///
-    /// Served pre-auth so an unauthenticated client can locate the cluster
-    /// leader before signing in; the server applies its own policy.
+    /// Requires authentication; leader placement happens after login.
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError>;
 }

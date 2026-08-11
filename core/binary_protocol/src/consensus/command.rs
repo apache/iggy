@@ -70,6 +70,13 @@ pub enum Command2 {
     StateTransferTarget = 23,
     RequestStateChunk = 24,
     StateChunk = 25,
+
+    // Register forwarding: a client that dialed a backup authenticates
+    // there, and only the consensus proposal travels to the primary. The
+    // backup forwards the verified identity and parks the login on the
+    // matching `ForwardRegisterResult`.
+    ForwardRegister = 26,
+    ForwardRegisterResult = 27,
 }
 
 // SAFETY: Command2 is #[repr(u8)] with no padding bytes.
@@ -80,7 +87,7 @@ unsafe impl CheckedBitPattern for Command2 {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= Self::StateChunk as u8
+        *bits <= Self::ForwardRegisterResult as u8
     }
 }
 
@@ -101,8 +108,8 @@ mod tests {
 
     #[test]
     fn replica_auth_commands_are_valid_bit_patterns() {
-        // Locks the is_valid_bit_pattern bump: 14..=25 parse, 26 still rejects.
-        for command in 14u8..=25 {
+        // Locks the is_valid_bit_pattern bump: 14..=27 parse, 28 still rejects.
+        for command in 14u8..=27 {
             let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
             buf.resize(256, 0);
             buf[60] = command;
@@ -110,7 +117,7 @@ mod tests {
         }
         let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
         buf.resize(256, 0);
-        buf[60] = 26;
+        buf[60] = 28;
         assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

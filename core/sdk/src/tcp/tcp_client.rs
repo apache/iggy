@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
+use crate::leader_aware::{
+    LeaderRedirectionState, check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
+};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
 use crate::session::ConsensusSession;
@@ -159,6 +161,10 @@ impl BinaryTransport for TcpClient {
             // exception: the server stays deliberately silent on transient
             // register failures (the server `surface_login_failure`) and
             // relies on the client timing out and replaying the request.
+            return Err(error);
+        }
+
+        if is_unauthenticated_metadata_probe(code, &error) {
             return Err(error);
         }
 
@@ -482,26 +488,17 @@ impl TcpClient {
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
                     info!("Automatic sign-in is disabled.");
-                    // Leadership still matters without auto-login: the caller
-                    // signs in manually, and a login against a non-leader
-                    // replays for its whole read timeout. `GetClusterMetadata`
-                    // is sessionless and pre-auth, so the check works on the
-                    // unauthenticated connection.
-                    self.handle_leader_redirection().await?
+                    // Only `IggyClient` redirects after a manual sign-in, so
+                    // a raw transport can stay on a backup: its first
+                    // replicated write gets `TransientNotAccepted`, the
+                    // redirect drops the session, and the retry fails
+                    // `Unauthenticated` until the caller signs in again.
+                    false
                 }
                 AutoLogin::Enabled(credentials) => {
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
-                    } else if self.handle_leader_redirection().await? {
-                        // Check leadership BEFORE signing in: register/login are
-                        // consensus ops a backup answers with
-                        // `TransientNotCommitted`, so signing in against a
-                        // non-leader replays for the whole read timeout instead
-                        // of failing over. `GetClusterMetadata` is sessionless
-                        // and pre-auth, so it works on the unauthenticated
-                        // connection.
-                        true
                     } else {
                         info!("{NAME} client: {client_address} is signing in...");
                         self.set_state(ClientState::Authenticating).await;
@@ -521,6 +518,11 @@ impl TcpClient {
                             }
                         }
 
+                        // The sole leader settlement, and it runs
+                        // authenticated. Any node completes a login now -- a
+                        // backup forwards the register to the primary -- so
+                        // this decides where later ops land, not whether
+                        // sign-in works.
                         self.handle_leader_redirection().await?
                     }
                 }

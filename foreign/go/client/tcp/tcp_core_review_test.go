@@ -130,27 +130,19 @@ func TestLoginUser_ClearsTheExplicitLogoutSuppression(t *testing.T) {
 	require.NoError(t, client.Ping(context.Background()))
 }
 
-func TestConnect_RedirectDuringAReplayedLoginDoesNotAutoSignIn(t *testing.T) {
-	var leader *testListener
-	leader = listenVSR(t, nil, singleNodeHandler(t, func() string { return leader.address() }))
-	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
-		if read.code() == uint32(command.GetClusterMetadataCode) {
-			return clusterMetadataFrame(t, 1, "127.0.0.1:1", leader.address())
-		}
-		return replyFrame(vsr.OperationNonReplicated, nil)
-	})
+func TestConnect_SuppressedSignInSendsNothing(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
 
-	client := newDialingClient(t, follower.address(),
+	client := newDialingClient(t, server.address(),
 		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
 	// The state a replayed login leaves behind before its reconnect.
 	client.skipAutoLoginOnce = true
 
 	require.NoError(t, client.Connect(context.Background()))
 
-	for _, read := range leader.recorded() {
-		assert.NotEqual(t, vsr.OperationRegister, read.operation(),
-			"the redirected Connect must keep suppressing the automatic sign-in")
-	}
+	assert.Empty(t, server.recorded(),
+		"the replayed login owns the sign-in; Connect must not preempt it")
 	assert.False(t, client.skipAutoLoginOnce, "the suppression is consumed exactly once")
 }
 

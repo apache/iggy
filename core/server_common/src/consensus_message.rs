@@ -17,9 +17,10 @@
 
 use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
-    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
+    ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
     StateChunkHeader, StateTransferTargetHeader,
 };
@@ -552,6 +553,11 @@ pub enum MessageBag {
     RequestStateChunk(Message<RequestStateChunkHeader>),
     /// Artifact bytes ride the body (`size` spans header + payload).
     StateChunk(Message<StateChunkHeader>),
+    /// A backup relays a login it authenticated locally to the primary, which
+    /// owns the `Register` proposal.
+    ForwardRegister(Message<ForwardRegisterHeader>),
+    /// The primary's verdict, routed back to the parked login by nonce.
+    ForwardRegisterResult(Message<ForwardRegisterResultHeader>),
 }
 
 impl MessageBag {
@@ -573,6 +579,8 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.header().command,
             Self::RequestStateChunk(message) => message.header().command,
             Self::StateChunk(message) => message.header().command,
+            Self::ForwardRegister(message) => message.header().command,
+            Self::ForwardRegisterResult(message) => message.header().command,
         }
     }
 
@@ -594,6 +602,8 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.header().size(),
             Self::RequestStateChunk(message) => message.header().size(),
             Self::StateChunk(message) => message.header().size(),
+            Self::ForwardRegister(message) => message.header().size(),
+            Self::ForwardRegisterResult(message) => message.header().size(),
         }
     }
 
@@ -615,6 +625,8 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.header().operation(),
             Self::RequestStateChunk(message) => message.header().operation(),
             Self::StateChunk(message) => message.header().operation(),
+            Self::ForwardRegister(message) => message.header().operation(),
+            Self::ForwardRegisterResult(message) => message.header().operation(),
         }
     }
 }
@@ -673,6 +685,12 @@ where
             )),
             Command2::StateChunk => Ok(Self::StateChunk(
                 value.try_into_typed::<StateChunkHeader>()?,
+            )),
+            Command2::ForwardRegister => Ok(Self::ForwardRegister(
+                value.try_into_typed::<ForwardRegisterHeader>()?,
+            )),
+            Command2::ForwardRegisterResult => Ok(Self::ForwardRegisterResult(
+                value.try_into_typed::<ForwardRegisterResultHeader>()?,
             )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
