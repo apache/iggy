@@ -330,9 +330,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
         uint? partitionId, CancellationToken token = default)
     {
-        var ns = ConsumerOffsetNamespace(streamId, topicId, partitionId);
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
-        await SendAckAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, ns, message, token);
+        await SendAckAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, token);
     }
 
     /// <inheritdoc />
@@ -355,9 +354,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default)
     {
-        var ns = ConsumerOffsetNamespace(streamId, topicId, partitionId);
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
-        await SendAckAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, ns, message, token);
+        await SendAckAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message, token);
     }
 
     /// <inheritdoc />
@@ -461,9 +459,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     public async Task DeleteSegmentsAsync(Identifier streamId, Identifier topicId, uint partitionId,
         uint segmentsCount, CancellationToken token = default)
     {
-        var ns = VsrNamespace.ForPartition(streamId, topicId, partitionId);
         var message = TcpContracts.DeleteSegments(streamId, topicId, partitionId, segmentsCount);
-        await SendAckAsync(CommandCodes.DELETE_SEGMENTS_CODE, ns, message, token);
+        await SendAckAsync(CommandCodes.DELETE_SEGMENTS_CODE, message, token);
     }
 
     /// <inheritdoc />
@@ -538,8 +535,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 $"Command {code} cannot be sent as a raw binary request.");
         }
 
-        var ns = VsrNamespace.ForRequest((int)code, payload, VsrOperations.ForCode((int)code));
-        using IMemoryOwner<byte> result = await SendWithResponseAsync((int)code, ns, payload, token);
+        using IMemoryOwner<byte> result = await SendWithResponseAsync((int)code, payload, token);
 
         return result.Memory.Length <= 1 ? [] : result.Memory.Span.ToArray();
     }
@@ -833,7 +829,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         var maxMessageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages, encryptor)
                                    + metadataLength;
 
-        var ns = SendMessagesNamespace(streamId, topicId, partitioning);
         IMemoryOwner<byte> payloadBuffer = MemoryPool<byte>.Shared.Rent(maxMessageBufferSize);
         int bodySize;
         try
@@ -847,16 +842,16 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw;
         }
 
-        return SendConfirmedAndDisposeAsync(ns, payloadBuffer, bodySize, token);
+        return SendConfirmedAndDisposeAsync(payloadBuffer, bodySize, token);
     }
 
-    private async Task<SendMessagesResponse> SendConfirmedAndDisposeAsync(ulong ns, IMemoryOwner<byte> payloadBuffer,
+    private async Task<SendMessagesResponse> SendConfirmedAndDisposeAsync(IMemoryOwner<byte> payloadBuffer,
         int bodySize, CancellationToken token)
     {
         try
         {
             using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(CommandCodes.SEND_MESSAGES_CODE,
-                ns, payloadBuffer.Memory[..bodySize], token);
+                payloadBuffer.Memory[..bodySize], token);
             return BinaryMapper.MapSendMessages(responseBuffer.Memory.Span);
         }
         finally
@@ -873,44 +868,6 @@ public sealed partial class TcpMessageStream : IIggyClient
             List<Message> list => CollectionsMarshal.AsSpan(list),
             _ => messages.ToArray()
         };
-    }
-
-    /// <summary>
-    ///     The routing namespace for a send: callers resolve balanced and message-key partitioning to an
-    ///     explicit partition before framing, so anything else reaching this point is a bug surfaced as the
-    ///     same error the server-side router would raise.
-    /// </summary>
-    private static ulong SendMessagesNamespace(Identifier streamId, Identifier topicId, Partitioning partitioning)
-    {
-        if (partitioning.Kind != Enums.Partitioning.PartitionId)
-        {
-            throw VsrError.Exception(VsrError.FEATURE_UNAVAILABLE,
-                "Under VSR the partition must be resolved by the client; balanced and message-key partitioning cannot be sent on the wire.");
-        }
-
-        if (partitioning.Value.Length < 4)
-        {
-            throw VsrError.Exception(VsrError.INVALID_COMMAND,
-                $"Partition id is {partitioning.Value.Length} bytes, expected 4.");
-        }
-
-        return VsrNamespace.ForPartition(streamId, topicId,
-            BinaryPrimitives.ReadUInt32LittleEndian(partitioning.Value));
-    }
-
-    /// <summary>
-    ///     The routing namespace for a consumer-offset write. The broker routes explicit partitions only, so a
-    ///     missing partition id fails client-side before a request id is consumed.
-    /// </summary>
-    private static ulong ConsumerOffsetNamespace(Identifier streamId, Identifier topicId, uint? partitionId)
-    {
-        if (partitionId is null)
-        {
-            throw VsrError.Exception(VsrError.INVALID_IDENTIFIER,
-                "Under VSR a consumer-offset request must carry an explicit partition id.");
-        }
-
-        return VsrNamespace.ForPartition(streamId, topicId, partitionId.Value);
     }
 
     private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token)
@@ -1075,23 +1032,12 @@ public sealed partial class TcpMessageStream : IIggyClient
         using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, body, token);
     }
 
-    private async Task SendAckAsync(int code, ulong ns, ReadOnlyMemory<byte> body, CancellationToken token)
-    {
-        using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, ns, body, token);
-    }
-
-    private Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
-        CancellationToken token)
-    {
-        return SendWithResponseAsync(code, 0, body, token);
-    }
-
-    private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ulong ns, ReadOnlyMemory<byte> body,
+    private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
         CancellationToken token, bool autoLoginOnReconnect = true)
     {
         try
         {
-            return await SendRawAsync(code, ns, body, token);
+            return await SendRawAsync(code, body, token);
         }
         catch (Exception e) when (VsrConnection.IsConnectionException(e) && !IsConnecting && !_disposed)
         {
@@ -1103,11 +1049,11 @@ public sealed partial class TcpMessageStream : IIggyClient
                 throw;
             }
 
-            return await HandleReconnectionAsync(code, ns, body, autoLoginOnReconnect, token);
+            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token);
         }
     }
 
-    private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ulong ns, ReadOnlyMemory<byte> body,
+    private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
         bool autoLogin, CancellationToken token)
     {
         var currentTime = DateTimeOffset.UtcNow;
@@ -1119,7 +1065,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 && _lastConnectionTime > currentTime)
             {
                 _logger.LogInformation("Connection already established, sending payload");
-                return await SendRawAsync(code, ns, body, token);
+                return await SendRawAsync(code, body, token);
             }
 
             SetConnectionStateAsync(ConnectionState.Disconnected);
@@ -1130,7 +1076,7 @@ public sealed partial class TcpMessageStream : IIggyClient
 
             await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
 
-            return await SendRawAsync(code, ns, body, token);
+            return await SendRawAsync(code, body, token);
         }
         finally
         {

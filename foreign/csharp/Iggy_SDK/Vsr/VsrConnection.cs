@@ -85,7 +85,7 @@ internal sealed class VsrConnection : IDisposable
     ///     and replay it - same session, same request id - while the server answers transiently. The caller
     ///     must hold the sending lock.
     /// </summary>
-    internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ulong ns, ReadOnlyMemory<byte> body,
+    internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         Memory<byte> header, long transientDeadline, long readDeadline, CancellationToken token)
     {
         var encoded = false;
@@ -93,7 +93,7 @@ internal sealed class VsrConnection : IDisposable
 
         try
         {
-            VsrHeader.EncodeRequestHeader(header.Span, Session, code, ns, body.Length);
+            VsrHeader.EncodeRequestHeader(header.Span, Session, code, body.Span);
 
             encoded = true;
 

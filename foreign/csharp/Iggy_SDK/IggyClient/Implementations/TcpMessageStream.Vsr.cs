@@ -130,7 +130,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             try
             {
                 using IMemoryOwner<byte> responseBuffer =
-                    await SendWithResponseAsync(code, 0, message, token, false);
+                    await SendWithResponseAsync(code, message, token, false);
 
                 response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
                 _consensusSession.Bind(response.Session);
@@ -448,7 +448,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     /// </summary>
     private async Task<ClusterMetadata?> ReadClusterMetadataNoRedirectAsync(CancellationToken token)
     {
-        using IMemoryOwner<byte> responseBuffer = await SendRawAsync(CommandCodes.GET_CLUSTER_METADATA_CODE, 0,
+        using IMemoryOwner<byte> responseBuffer = await SendRawAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
             ReadOnlyMemory<byte>.Empty, token, false);
 
         if (responseBuffer.Memory.Length == 0)
@@ -468,7 +468,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     ///     register replay on this connection for the whole budget instead: the connect flow owns leader
     ///     redirection for the handshake, and reconnecting from underneath it would recurse.
     /// </remarks>
-    private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ulong ns, ReadOnlyMemory<byte> body,
+    private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
         CancellationToken token, bool allowRedirect = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -494,7 +494,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
                     ? overallDeadline
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
-                var attempt = await SendVsrAttemptAsync(code, ns, body, header, transientDeadline, overallDeadline,
+                var attempt = await SendVsrAttemptAsync(code, body, header, transientDeadline, overallDeadline,
                     token);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
@@ -575,7 +575,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     ///     cannot be split across two sockets, and so a teardown after the lock is gone can tell this
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
-    private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ulong ns, ReadOnlyMemory<byte> body,
+    private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
         Memory<byte> header, long transientDeadline, long readDeadline, CancellationToken token)
     {
         await _sendingSemaphore.WaitAsync(token);
@@ -587,7 +587,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
                 return VsrAttempt.Failed(false, new NotConnectedException(), false, null);
             }
 
-            return await connection.SendAttemptAsync(code, ns, body, header, transientDeadline, readDeadline,
+            return await connection.SendAttemptAsync(code, body, header, transientDeadline, readDeadline,
                 token);
         }
         finally
