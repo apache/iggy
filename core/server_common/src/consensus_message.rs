@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::iobuf::{Frozen, Owned};
+use crate::sharding::METADATA_GROUP;
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
@@ -584,6 +585,87 @@ pub enum MessageBag {
 }
 
 impl MessageBag {
+    /// `(operation, group)`: everything the shard router needs to pick a
+    /// target, read off the already-typed header without consuming the bag.
+    ///
+    /// `group` is a plain field on every consensus header rather than a
+    /// [`ConsensusHeader`] method, which is why this is a match and not a trait
+    /// call. `RepairPrepare` reads through its wrapped prepare.
+    #[must_use]
+    pub fn routing(&self) -> (Operation, u64) {
+        match self {
+            Self::Request(message) => (message.header().operation, message.header().group),
+            Self::Prepare(message) => (message.header().operation, message.header().group),
+            Self::PrepareOk(message) => (message.header().operation, message.header().group),
+            Self::StartViewChange(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::DoViewChange(message) => (message.header().operation(), message.header().group),
+            Self::StartView(message) => (message.header().operation(), message.header().group),
+            Self::Commit(message) => (message.header().operation(), message.header().group),
+            Self::RequestStartView(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::RequestPrepares(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::RepairPrepare(message) => {
+                (message.header().0.operation, message.header().0.group)
+            }
+            Self::RepairRangeReply(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::RequestStateTransfer(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::StateTransferTarget(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::RequestStateChunk(message) => {
+                (message.header().operation(), message.header().group)
+            }
+            Self::StateChunk(message) => (message.header().operation(), message.header().group),
+            // Register forwarding is a metadata-plane errand, and the metadata
+            // consensus group lives on shard 0 on every node; the headers carry
+            // no group field because there is nothing else they could address.
+            Self::ForwardRegister(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardRegisterResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardLogout(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
+        }
+    }
+
+    /// Discard the classification and hand back the underlying frame.
+    ///
+    /// Type-erasure only: the backing bytes are untouched, so a later
+    /// [`MessageBag::try_from`] reclassifies to the same variant. Callers that
+    /// need the frame in a generic container (the parked-frame buffer) use this;
+    /// the dispatch path keeps the bag so it never re-parses.
+    #[must_use]
+    pub fn into_generic(self) -> Message<GenericHeader> {
+        match self {
+            Self::Request(message) => message.into_generic(),
+            Self::Prepare(message) => message.into_generic(),
+            Self::PrepareOk(message) => message.into_generic(),
+            Self::StartViewChange(message) => message.into_generic(),
+            Self::DoViewChange(message) => message.into_generic(),
+            Self::StartView(message) => message.into_generic(),
+            Self::Commit(message) => message.into_generic(),
+            Self::RequestStartView(message) => message.into_generic(),
+            Self::RequestPrepares(message) => message.into_generic(),
+            Self::RepairPrepare(message) => message.into_generic(),
+            Self::RepairRangeReply(message) => message.into_generic(),
+            Self::RequestStateTransfer(message) => message.into_generic(),
+            Self::StateTransferTarget(message) => message.into_generic(),
+            Self::RequestStateChunk(message) => message.into_generic(),
+            Self::StateChunk(message) => message.into_generic(),
+            Self::ForwardRegister(message) => message.into_generic(),
+            Self::ForwardRegisterResult(message) => message.into_generic(),
+            Self::ForwardLogout(message) => message.into_generic(),
+            Self::ForwardLogoutResult(message) => message.into_generic(),
+        }
+    }
+
     #[must_use]
     pub fn command(&self) -> Command2 {
         match self {

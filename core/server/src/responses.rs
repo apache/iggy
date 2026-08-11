@@ -1313,7 +1313,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// without the prefix and broke SDK decoding. This is the only way to emit a
 /// success reply with a body, so the prefix cannot be forgotten again.
 fn build_result_framed_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,

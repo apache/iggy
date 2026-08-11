@@ -5413,7 +5413,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            server_common::sharding::METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
         );
