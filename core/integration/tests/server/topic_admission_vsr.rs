@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Topic admission and echo semantics against server-ng (vsr). Create bounds
+//! Topic admission and echo semantics against the server (vsr). Create bounds
 //! must be rejected with typed errors before consensus: partitions count above
 //! `MAX_PARTITIONS_PER_REQUEST` denies with `TooManyPartitions` (for create
 //! topic, create partitions and delete partitions alike); a custom

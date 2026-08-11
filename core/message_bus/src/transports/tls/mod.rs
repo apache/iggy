@@ -29,7 +29,7 @@
 //! `ServerConfig::builder()` / `ClientConfig::builder()` call. The
 //! workspace pins `rustls = { features = ["ring"] }`, so the
 //! provider is `rustls::crypto::ring::default_provider()`. Multiple
-//! call sites (transports, tests, server-ng bootstrap) may attempt to
+//! call sites (transports, tests, the server bootstrap) may attempt to
 //! install it; the wrapper here is idempotent and safe under races
 //! between concurrent first-use sites.
 
@@ -245,7 +245,7 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 /// rustls 0.23 requires a default provider before any
 /// `ServerConfig::builder()` or `ClientConfig::builder()` call. This
 /// helper centralises the install so transports, tests, and
-/// server-ng bootstrap converge on the same provider without
+/// the server bootstrap converge on the same provider without
 /// per-call-site `let _ = ...install_default()`.
 pub fn install_default_crypto_provider() {
     // Race-safe: rustls's `install_default` returns Err if a provider

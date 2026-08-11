@@ -23,7 +23,7 @@ public static class Eventually
 
     /// <summary>
     ///     Polls until the read satisfies the condition. Some server work commits ahead of the state it changes -
-    ///     server-ng applies a purge by advancing a generation that its reconciler acts on a tick later - so the
+    ///     the server applies a purge by advancing a generation that its reconciler acts on a tick later - so the
     ///     first read after an acknowledged command can still show the old value.
     /// </summary>
     public static async Task<T> ReadAsync<T>(Func<Task<T>> read, Func<T, bool> condition, TimeSpan timeout)

@@ -16,16 +16,14 @@
 # under the License.
 
 services:
-  # The PHP extension is vsr-built, so it can only talk to server-ng.
-  # TODO(hubcio): change to core/server/Dockerfile once the legacy server is
-  # removed (core/server has VSR support)
+  # The PHP extension frames TCP with the VSR wire protocol only.
   iggy-server:
     build:
       context: ../..
-      dockerfile: core/server-ng/Dockerfile
+      dockerfile: core/server/Dockerfile
       args:
         PROFILE: debug
-    # server-ng takes only --replica-id; root credentials come from the env.
+    # The server takes only --replica-id; root credentials come from the env.
     command: []
     container_name: iggy-server-php-test
     security_opt:

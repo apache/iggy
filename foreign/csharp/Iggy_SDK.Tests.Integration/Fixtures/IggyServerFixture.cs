@@ -26,9 +26,9 @@ using TUnit.Core.Interfaces;
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 /// <summary>
-///     Runs the suite against an iggy-server-ng <see cref="VsrCluster" />: a standalone node by default,
+///     Runs the suite against an iggy-server <see cref="VsrCluster" />: a standalone node by default,
 ///     or a replicated cluster when IGGY_TEST_CLUSTER_NODES asks for one, so every test commits through
-///     consensus. The SDK frames TCP with the VSR wire protocol, which only server-ng speaks.
+///     consensus. The SDK frames TCP with the VSR wire protocol.
 /// </summary>
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
@@ -40,7 +40,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     /// <summary>
     ///     Docker image to use. Can be overridden via IGGY_SERVER_DOCKER_IMAGE environment variable
     ///     or by subclasses. Defaults to the locally built <c>iggy-server:test</c>; build it with
-    ///     <c>docker build -f core/server-ng/Dockerfile -t iggy-server:test .</c> from the repository root.
+    ///     <c>docker build -f core/server/Dockerfile -t iggy-server:test .</c> from the repository root.
     /// </summary>
     protected virtual string DockerImage =>
         Environment.GetEnvironmentVariable("IGGY_SERVER_DOCKER_IMAGE") ?? "iggy-server:test";

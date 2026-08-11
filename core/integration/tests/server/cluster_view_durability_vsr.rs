@@ -16,7 +16,7 @@
 // under the License.
 
 //! Metadata-plane view durability across a real view change and process restarts,
-//! over `iggy-server-ng`'s production superblock path.
+//! over `iggy-server`'s production superblock path.
 //!
 //! The superblock exists so a replica recovers a view it already acted in from its
 //! OWN disk after a crash, instead of inferring a stale view from the WAL or
@@ -41,7 +41,7 @@
 //! so recovery is exercised without wedging the cluster below quorum.
 //!
 //! vsr-only: a metadata view change has no analog on the single-process legacy
-//! server, and the superblock is server-ng's durable consensus record.
+//! server, and the superblock is the server's durable consensus record.
 
 use std::path::Path;
 use std::time::{Duration, Instant};

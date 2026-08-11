@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "vsr")]
 pub mod consumer_group_client_state;
 mod error;
 pub mod http;
@@ -31,7 +30,6 @@ pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-#[cfg(feature = "vsr")]
 pub use consumer_group_client_state::ConsumerGroupClientState;
 
 /// Sentinel `partition_id` in an otherwise-empty poll reply that tells the
@@ -57,7 +55,6 @@ pub use iggy_binary_protocol::responses::messages::{
 };
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
-#[cfg(feature = "vsr")]
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed};
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;

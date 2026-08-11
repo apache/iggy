@@ -26,7 +26,7 @@
 //! server's `bus.send_to_client` reply lands on the client's reader.
 //! Verifies the full bidirectional plane through the reader / writer
 //! two-task split. Pre-LOGIN command gating is the caller's
-//! responsibility (server-ng) and is not exercised here.
+//! responsibility (the server) and is not exercised here.
 
 mod common;
 
@@ -123,7 +123,7 @@ async fn handshake_succeeds_and_round_trip_completes() {
 async fn handshake_succeeds_without_subprotocol_header() {
     // Without the subprotocol gate, a client that sends NO
     // Sec-WebSocket-Protocol header must still complete the upgrade.
-    // Pre-LOGIN command gating is enforced by the caller (server-ng),
+    // Pre-LOGIN command gating is enforced by the caller (the server),
     // not at the bus layer.
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});

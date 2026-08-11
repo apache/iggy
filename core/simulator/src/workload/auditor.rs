@@ -122,7 +122,7 @@ impl ServerAuditor {
     ///   classifies, applies effects, decrements the counter.
     /// - [`OnReply::NsMismatch`]: entry consumed but reply namespace
     ///   diverged from the request namespace. Caller decrements but
-    ///   skips effects + `note_committed`. Unreachable today (server-ng
+    ///   skips effects + `note_committed`. Unreachable today (the server
     ///   echoes the request namespace); guards future routing/dedup
     ///   bugs from wedging a client at `CLIENT_REQUEST_QUEUE_MAX = 1`.
     /// - [`OnReply::Unknown`]: no matching entry (duplicate cached

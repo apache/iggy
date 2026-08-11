@@ -48,8 +48,6 @@
 //! owner, a park queue that never drains, or a fence that denies forever --
 //! since every one of those surfaces as a failed send or a short poll.
 
-#![cfg(feature = "vsr")]
-
 use iggy::prelude::*;
 use integration::harness::TestHarness;
 use integration::iggy_harness;
