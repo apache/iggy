@@ -27,6 +27,7 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
 import java.util.Optional;
@@ -53,7 +54,8 @@ final class MessagesTcpClient implements MessagesClient {
     }
 
     @Override
-    public void sendMessages(StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
-        FutureUtil.resolve(delegate.sendMessages(streamId, topicId, partitioning, messages));
+    public SendMessagesResponse sendMessages(
+            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
+        return FutureUtil.resolve(delegate.sendMessages(streamId, topicId, partitioning, messages));
     }
 }

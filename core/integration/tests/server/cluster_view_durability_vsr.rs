@@ -73,7 +73,10 @@ async fn given_advanced_metadata_view_when_survivor_restarts_should_recover_view
     // the primary of view 0 is replica 0). Commit a stream through it, so the
     // metadata group has committed state to recover later and exactly one leader
     // is visible.
-    let client = connect(harness, 0).await;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
     client
         .create_stream(STREAM_NAME)
         .await
@@ -153,18 +156,6 @@ async fn given_advanced_metadata_view_when_survivor_restarts_should_recover_view
         "the durable view must survive node 2's restart without regressing: \
          before={view_before:?}, after={view_after:?}"
     );
-}
-
-/// Connect a root-authenticated TCP client to a specific node.
-async fn connect(harness: &TestHarness, node: usize) -> IggyClient {
-    harness
-        .node(node)
-        .tcp_client()
-        .expect("tcp client builder")
-        .with_root_login()
-        .connect()
-        .await
-        .unwrap_or_else(|e| panic!("connect to node {node}: {e}"))
 }
 
 /// Connect to the first node in `nodes` that accepts a connection, `None` when none

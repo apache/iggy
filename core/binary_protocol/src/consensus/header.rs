@@ -18,6 +18,23 @@
 //! All consensus headers are exactly 256 bytes with `#[repr(C)]` layout.
 //! Size and field offsets are enforced at compile time. Deserialization
 //! is a pointer cast (zero-copy) via `bytemuck::try_from_bytes`.
+//!
+//! # Wire compatibility
+//!
+//! The replica-to-replica control headers are a BREAKING, non-negotiable change
+//! against any build predating [`ConsensusHeader::FRAME_SEALED`]: `checksum` went
+//! from a field nobody wrote to one every receiver verifies, so each side reads the
+//! other's frames as corrupt. `release` must be zero on every header, so there is no
+//! version channel to gate on and no way for the two to detect each other.
+//!
+//! Replicas must therefore be upgraded together, with the cluster down. A rolling
+//! upgrade does not degrade, it stops the cluster: every control frame between a
+//! mixed pair is dropped, so no view change reaches a quorum. Nothing enforces this,
+//! because there is nothing left to enforce it with; this note is the declaration.
+//!
+//! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
+//! `checksum` as their view-independent identity, and the three client-facing
+//! headers are sealed on neither side, so SDKs are untouched.
 
 use super::{Command2, ConsensusError, Operation};
 use bytemuck::{CheckedBitPattern, NoUninit};
@@ -54,6 +71,16 @@ pub fn read_size_field(header: &[u8]) -> Option<u32> {
         .map(u32::from_le_bytes)
 }
 
+/// Frame checksum over a raw header: every byte past `checksum` itself.
+///
+/// Byte-level twin of [`ConsensusHeader::frame_checksum`], which delegates here so
+/// the typed and raw seals cannot disagree. For callers that do not know the
+/// concrete header type statically, such as a wire-level test fixture.
+#[must_use]
+pub fn frame_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
+    u128::from(twox_hash::XxHash3_64::oneshot(&header[size_of::<u128>()..]))
+}
+
 /// Trait implemented by all consensus header types.
 ///
 /// Every header is exactly [`HEADER_SIZE`] bytes, `#[repr(C)]`, and supports
@@ -78,12 +105,86 @@ pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
         command == Self::COMMAND
     }
 
+    /// Whether this header's `checksum` field seals the frame.
+    ///
+    /// True for replica-to-replica control frames, whose header carries every
+    /// decision field: view number, commit point, and the nack bitset that
+    /// authorises truncation. TCP's 16-bit checksum does not reliably catch a
+    /// flipped bit on a plaintext replica link.
+    ///
+    /// False for three groups: [`PrepareHeader`] / [`RepairPrepareHeader`] spend
+    /// `checksum` on [`PrepareHeader::identity_checksum`], which excludes `view` so
+    /// a re-stamped prepare keeps one identity, and a seal cannot share the field;
+    /// [`RequestHeader`] / [`ReplyHeader`] / [`EvictionHeader`] cross the client
+    /// boundary, so sealing them is an SDK change on both ends; [`GenericHeader`] is
+    /// the type-erased pre-dispatch view and defers to the typed parse, where
+    /// [`Self::verify_frame`] runs.
+    ///
+    /// Required, not defaulted: [`Self::seal`] on an unsealed type overwrites the
+    /// identity checksum with a frame checksum, and in release only a `debug_assert`
+    /// stands in the way.
+    const FRAME_SEALED: bool;
+
     /// # Errors
     /// Returns `ConsensusError` if the header fields are inconsistent.
     fn validate(&self) -> Result<(), ConsensusError>;
     fn operation(&self) -> Operation;
     fn command(&self) -> Command2;
     fn size(&self) -> u32;
+
+    /// The `checksum` field, whatever this header spends it on.
+    fn checksum(&self) -> u128;
+
+    /// Overwrite the `checksum` field.
+    fn set_checksum(&mut self, checksum: u128);
+
+    /// Checksum over every byte of the header past `checksum` itself.
+    ///
+    /// `checksum_body` sits inside that range, so sealing the header also
+    /// pins the body seal, and the two together cover the whole frame.
+    #[must_use]
+    fn frame_checksum(&self) -> u128 {
+        let bytes: &[u8; HEADER_SIZE] = bytemuck::bytes_of(self)
+            .try_into()
+            .expect("every consensus header is HEADER_SIZE bytes");
+        frame_checksum_bytes(bytes)
+    }
+
+    /// Stamp [`Self::frame_checksum`]. Call last when building a frame: it covers
+    /// every other field, `checksum_body` included, so later writes are uncovered.
+    fn seal(&mut self) {
+        debug_assert!(
+            Self::FRAME_SEALED,
+            "sealing a header whose checksum field means something else",
+        );
+        let checksum = self.frame_checksum();
+        self.set_checksum(checksum);
+    }
+
+    /// Reject a frame whose header does not match its own checksum.
+    ///
+    /// Runs before [`Self::validate`] on every typed parse: a header that did not
+    /// arrive intact cannot have any field believed, `validate`'s included.
+    ///
+    /// # Errors
+    /// [`ConsensusError::FrameChecksumMismatch`] on a bad seal. Unsealed header
+    /// types return `Ok` unconditionally.
+    fn verify_frame(&self) -> Result<(), ConsensusError> {
+        if !Self::FRAME_SEALED {
+            return Ok(());
+        }
+        let expected = self.frame_checksum();
+        let found = self.checksum();
+        if found == expected {
+            Ok(())
+        } else {
+            Err(ConsensusError::FrameChecksumMismatch {
+                command: self.command(),
+                expected,
+                found,
+            })
+        }
+    }
 }
 
 // GenericHeader - type-erased dispatch
@@ -121,6 +222,15 @@ const _: () = {
 
 impl ConsensusHeader for GenericHeader {
     const COMMAND: Command2 = Command2::Reserved;
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -225,6 +335,15 @@ impl Default for RequestHeader {
 
 impl ConsensusHeader for RequestHeader {
     const COMMAND: Command2 = Command2::Request;
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         self.operation
     }
@@ -376,6 +495,15 @@ impl Default for ReplyHeader {
 
 impl ConsensusHeader for ReplyHeader {
     const COMMAND: Command2 = Command2::Reply;
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         self.operation
     }
@@ -558,6 +686,15 @@ impl EvictionHeader {
 
 impl ConsensusHeader for EvictionHeader {
     const COMMAND: Command2 = Command2::Eviction;
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     /// Session-level (not per-op): always `Reserved`.
     fn operation(&self) -> Operation {
         Operation::Reserved
@@ -633,7 +770,7 @@ impl ConsensusHeader for EvictionHeader {
 
 /// Primary -> replicas: replicate this operation.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 pub struct PrepareHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -704,6 +841,15 @@ impl Default for PrepareHeader {
 
 impl ConsensusHeader for PrepareHeader {
     const COMMAND: Command2 = Command2::Prepare;
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         self.operation
     }
@@ -721,7 +867,60 @@ impl ConsensusHeader for PrepareHeader {
                 found: self.command,
             });
         }
+        // Both reserved regions must be zero. They sit inside
+        // [`Self::identity_checksum`], so a peer that fills them changes the op's
+        // identity while changing nothing the merge can see; and `dvc_blank`
+        // classifies a slot by exact struct equality, so a non-zero reserved byte
+        // turns a blank into a `Valid` header the merge then indexes.
+        if self.reserved_frame.iter().any(|&byte| byte != 0) {
+            return Err(ConsensusError::InvalidField(
+                "prepare: reserved_frame bytes must be zero".to_string(),
+            ));
+        }
+        if self.reserved.iter().any(|&byte| byte != 0) {
+            return Err(ConsensusError::InvalidField(
+                "prepare: reserved bytes must be zero".to_string(),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// `checksum` of a prepare no producer sealed.
+///
+/// Written by a build predating the identity seal, or by the partition plane.
+/// Verification skips such entries so an older build's WAL still replays.
+pub const CHECKSUM_UNSEALED: u128 = 0;
+
+/// The frame's body, bounded by `size`. What `checksum_body` covers.
+///
+/// Not `&frame[HEADER_SIZE..]`: `Message::try_from` accepts a buffer longer than
+/// `size` without trimming, while the WAL scan reads exactly `size`, so slicing to
+/// the end makes the two disagree. Empty when `size` overruns the buffer.
+#[must_use]
+pub fn frame_body(frame: &[u8], size: u32) -> &[u8] {
+    let end = size as usize;
+    if end <= HEADER_SIZE || end > frame.len() {
+        return &[];
+    }
+    &frame[HEADER_SIZE..end]
+}
+
+impl PrepareHeader {
+    /// Which prepare this is, independent of which view re-sent it.
+    ///
+    /// Covers the whole 256-byte header except `checksum` (a field cannot hash
+    /// itself) and `view`, so a retransmission that re-stamps `view` stays valid.
+    /// The body reaches the value through the covered `checksum_body`.
+    ///
+    /// Lives here, not in the consensus crate, because the WAL scan verifies it too
+    /// and the two must agree byte for byte: it hashes this struct's layout.
+    #[must_use]
+    pub fn identity_checksum(&self) -> u128 {
+        let mut covered = *self;
+        covered.checksum = 0;
+        covered.view = 0;
+        u128::from(twox_hash::XxHash3_64::oneshot(bytemuck::bytes_of(&covered)))
     }
 }
 
@@ -740,6 +939,15 @@ pub struct RepairPrepareHeader(pub PrepareHeader);
 
 impl ConsensusHeader for RepairPrepareHeader {
     const COMMAND: Command2 = Command2::RepairPrepare;
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.0.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.0.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         self.0.operation
     }
@@ -756,6 +964,21 @@ impl ConsensusHeader for RepairPrepareHeader {
                 expected: Command2::RepairPrepare,
                 found: self.0.command,
             });
+        }
+        // Same rule as `PrepareHeader::validate`, same reason: the regions sit inside
+        // `identity_checksum`, and a repaired prepare is journaled and later re-read
+        // as a DVC suffix entry, where `dvc_blank`'s exact-equality classification is
+        // what a dirty byte defeats. Not delegated, so the command check above stays
+        // `RepairPrepare`.
+        if self.0.reserved_frame.iter().any(|&byte| byte != 0) {
+            return Err(ConsensusError::InvalidField(
+                "repair_prepare: reserved_frame bytes must be zero".to_string(),
+            ));
+        }
+        if self.0.reserved.iter().any(|&byte| byte != 0) {
+            return Err(ConsensusError::InvalidField(
+                "repair_prepare: reserved bytes must be zero".to_string(),
+            ));
         }
         Ok(())
     }
@@ -824,7 +1047,17 @@ impl Default for PrepareOkHeader {
 }
 
 impl ConsensusHeader for PrepareOkHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::PrepareOk;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         self.operation
     }
@@ -879,7 +1112,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for CommitHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::Commit;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -930,7 +1173,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for StartViewChangeHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StartViewChange;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -978,7 +1231,28 @@ pub struct DoViewChangeHeader {
     pub namespace: u64,
     /// View when status was last normal (key for log selection).
     pub log_view: u32,
-    pub reserved: [u8; 100],
+    pub reserved: [u8; 68],
+    /// Bit `i` set means the sender proves it never prepared suffix entry `i`, so
+    /// that entry never reached a replication quorum through this replica. A new
+    /// primary may truncate only once `quorum_nack_prepare` senders nack an entry;
+    /// short of that it might be committed and must be preserved.
+    ///
+    /// A corrupt local entry is deliberately NOT nacked: the sender cannot tell a
+    /// prepare it never saw from one it saw and lost, and only the former is proof.
+    /// Silence costs availability; a false nack costs data.
+    ///
+    /// Carved from the tail of the former `reserved` region, with `present_bitset`
+    /// LAST so both land 16-aligned with no padding and `op`/`commit`/`namespace`/
+    /// `log_view` keep their offsets. A sender with nothing to nack sends zeros,
+    /// decoding as "nacks nothing": safe, since that can only slow a view change.
+    pub nack_bitset: u128,
+    /// Bit `i` set means the sender can serve the BODY of suffix entry `i`, not just
+    /// its header. The new primary needs one such sender per surviving entry, since
+    /// a header whose body it cannot fetch is an entry it can never commit.
+    ///
+    /// Zero from a sender offering nothing, reading as "offers no bodies": safe,
+    /// since the new primary waits rather than adopting an entry it cannot complete.
+    pub present_bitset: u128,
 }
 const _: () = {
     assert!(size_of::<DoViewChangeHeader>() == HEADER_SIZE);
@@ -986,11 +1260,38 @@ const _: () = {
         offset_of!(DoViewChangeHeader, op)
             == offset_of!(DoViewChangeHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(DoViewChangeHeader, reserved) + size_of::<[u8; 100]>() == HEADER_SIZE);
+    // op/commit/namespace/log_view keep their pre-bitset offsets.
+    assert!(offset_of!(DoViewChangeHeader, reserved) == 156);
+    // Both bitsets are last and 16-aligned, so the struct has no padding
+    // (`NoUninit` would reject any).
+    assert!(offset_of!(DoViewChangeHeader, nack_bitset) % 16 == 0);
+    assert!(offset_of!(DoViewChangeHeader, present_bitset) % 16 == 0);
+    assert!(
+        offset_of!(DoViewChangeHeader, nack_bitset)
+            == offset_of!(DoViewChangeHeader, reserved) + size_of::<[u8; 68]>()
+    );
+    assert!(offset_of!(DoViewChangeHeader, present_bitset) + size_of::<u128>() == HEADER_SIZE);
 };
 
+/// Suffix headers a `DoViewChange` may carry: one bit per entry in each of the two
+/// `u128` bitsets.
+///
+/// Mirrors `consensus::DVC_HEADERS_MAX` as a literal so this crate need not depend
+/// on the consensus crate, as with `REPLICAS_MAX` in [`EvictionHeader::new`].
+pub const DVC_HEADERS_MAX: usize = 128;
+
 impl ConsensusHeader for DoViewChangeHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::DoViewChange;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1023,8 +1324,62 @@ impl ConsensusHeader for DoViewChangeHeader {
                 "commit cannot exceed op".to_string(),
             ));
         }
+        let suffix_len = self.suffix_len()?;
+        // Bits past the suffix describe entries never sent: unchecked, a peer could
+        // smuggle a nack for an op the new primary would then truncate.
+        if suffix_len < DVC_HEADERS_MAX {
+            let beyond = !((1u128 << suffix_len) - 1);
+            if self.nack_bitset & beyond != 0 || self.present_bitset & beyond != 0 {
+                return Err(ConsensusError::InvalidField(format!(
+                    "do_view_change: bitset bits set past the {suffix_len}-entry suffix"
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+impl DoViewChangeHeader {
+    /// Number of `PrepareHeader`s in the body.
+    ///
+    /// Zero is valid and means "no suffix": a replica with nothing uncommitted
+    /// contributes numbers only.
+    ///
+    /// # Errors
+    /// [`ConsensusError::InvalidField`] when `size` is short of the header, is not a
+    /// whole number of headers, or exceeds what the bitsets can address.
+    pub fn suffix_len(&self) -> Result<usize, ConsensusError> {
+        suffix_len_of("do_view_change", self.size)
+    }
+}
+
+/// Body length of a suffix-carrying control frame, in whole [`PrepareHeader`]s.
+///
+/// Shared by `DoViewChange` and `StartView`: same layout, same `DVC_HEADERS_MAX`
+/// bound. `frame` only names the sender in the error text.
+///
+/// # Errors
+/// [`ConsensusError::InvalidField`] when `size` is short of the header, is not a
+/// whole number of headers, or exceeds what a view change can address.
+fn suffix_len_of(frame: &str, size: u32) -> Result<usize, ConsensusError> {
+    let size = size as usize;
+    let Some(body_len) = size.checked_sub(HEADER_SIZE) else {
+        return Err(ConsensusError::InvalidField(format!(
+            "{frame}: size {size} is shorter than the {HEADER_SIZE}-byte header"
+        )));
+    };
+    if body_len % HEADER_SIZE != 0 {
+        return Err(ConsensusError::InvalidField(format!(
+            "{frame}: body of {body_len} bytes is not a whole number of headers"
+        )));
+    }
+    let suffix_len = body_len / HEADER_SIZE;
+    if suffix_len > DVC_HEADERS_MAX {
+        return Err(ConsensusError::InvalidField(format!(
+            "{frame}: {suffix_len} suffix entries exceeds the maximum {DVC_HEADERS_MAX}"
+        )));
+    }
+    Ok(suffix_len)
 }
 
 // StartViewHeader - new view announcement (header-only)
@@ -1056,10 +1411,9 @@ pub struct StartViewHeader {
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
     /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
-    /// A peer that predates it sends zeros, decoding as `incarnation == 0`, which
-    /// the `handle_start_view` guard treats as no claim rather than as a foreign
-    /// one, so a mixed-version rolling upgrade is wire-compatible: the pre-upgrade
-    /// peer's `StartView` is judged by the view checks alone, as before the field.
+    /// Zero is "no claim", which is what `handle_start_view` keys on and what the
+    /// unsolicited completion path sends. NOT mixed-version tolerance: the frame seal
+    /// drops a pre-seal peer before any field is read (see this module's header).
     pub incarnation: u128,
 }
 const _: () = {
@@ -1075,7 +1429,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for StartViewHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StartView;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1103,7 +1467,23 @@ impl ConsensusHeader for StartViewHeader {
                 "commit cannot exceed op".to_string(),
             ));
         }
+        self.suffix_len()?;
         Ok(())
+    }
+}
+
+impl StartViewHeader {
+    /// Number of `PrepareHeader`s in the body: the view's suffix, high-to-low op
+    /// from `op` down toward `commit`.
+    ///
+    /// Zero means numbers only, which is what the probe-answer path sends. A backup
+    /// then falls back to trusting `op`.
+    ///
+    /// # Errors
+    /// [`ConsensusError::InvalidField`] when `size` is short of the header, is not a
+    /// whole number of headers, or exceeds what a view change can address.
+    pub fn suffix_len(&self) -> Result<usize, ConsensusError> {
+        suffix_len_of("start_view", self.size)
     }
 }
 
@@ -1136,9 +1516,9 @@ pub struct RequestStartViewHeader {
     /// `StartView` so a reply from a previous incarnation is detectable.
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
-    /// lands 16-aligned with no padding WITHOUT moving `namespace`. A peer that
-    /// predates it sends zeros, decoding as `incarnation == 0`, so a mixed-version
-    /// rolling upgrade is wire-compatible.
+    /// lands 16-aligned with no padding WITHOUT moving `namespace`. Zero is "no claim
+    /// to echo"; see [`StartViewHeader::incarnation`] on why that is not
+    /// mixed-version tolerance.
     pub incarnation: u128,
 }
 const _: () = {
@@ -1154,7 +1534,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestStartViewHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestStartView;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1218,7 +1608,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestPreparesHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestPrepares;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1281,7 +1681,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for RepairRangeReplyHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RepairDone;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     // One layout, two commands: `RepairDone` terminates a stream,
     // `RangeEvicted` prefixes it. Without this widening, `try_into_typed`
     // rejects `RangeEvicted` frames before `validate` ever sees them.
@@ -1353,7 +1763,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestStateTransferHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestStateTransfer;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1415,7 +1835,40 @@ pub struct StateTransferTargetHeader {
     pub commit_op: u64,
     pub namespace: u64,
     pub available: u8,
-    pub reserved: [u8; 95],
+    /// Set on an `available == 0` refusal that means "not right now" rather than
+    /// "this node is broken".
+    ///
+    /// PARTITION arm only: it is the only side with a consecutive-failure count
+    /// to charge. The requester then re-arms on a flat interval instead of
+    /// charging that count, whose exponential backoff climbs to 1024x the retry
+    /// interval and is reset only by a completed install. A serving primary
+    /// momentarily behind its own frontier is the common case under produce
+    /// load.
+    ///
+    /// This and `commit_max` below claim the HEAD of what used to be the
+    /// reserved tail, so every pre-existing field keeps its published offset.
+    /// Layout compatibility only: the size assert cannot catch an equal-size
+    /// reshuffle, so a mid-struct insertion would silently move every field
+    /// after it. It says nothing about the semantics of these two -- an older
+    /// peer presents zeros here and serves no partition transfers at all.
+    pub unavailable_transient: u8,
+    /// Explicit padding so `commit_max` sits 8-aligned without the implicit
+    /// padding `NoUninit` forbids.
+    pub reserved_alignment: [u8; 6],
+    /// Serving replica's `commit_max` when the descriptor was built.
+    ///
+    /// Read by the PARTITION receiver only; the metadata arm branches on
+    /// `available` and falls back to journal repair without a refusal.
+    ///
+    /// A partition receiver refuses an offer from a replica that knows LESS
+    /// than it does:
+    /// without this the descriptor carried no proof of the sender's own
+    /// progress, and a phantom view-0 primary (a group whose directory vanished
+    /// boots `init()` rather than `init_as_backup()`, comes up Normal at view 0,
+    /// and an empty log is trivially caught up) could hand a data-holding
+    /// rejoiner an empty offer that unlinks its chain.
+    pub commit_max: u64,
+    pub reserved: [u8; 80],
 }
 const _: () = {
     assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
@@ -1423,11 +1876,28 @@ const _: () = {
         offset_of!(StateTransferTargetHeader, nonce)
             == offset_of!(StateTransferTargetHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 95]>() == HEADER_SIZE);
+    // The pre-existing published offsets. New fields grow into the reserved
+    // tail only; a change that moves one of these is a wire break.
+    assert!(offset_of!(StateTransferTargetHeader, commit_op) == 144);
+    assert!(offset_of!(StateTransferTargetHeader, namespace) == 152);
+    assert!(offset_of!(StateTransferTargetHeader, available) == 160);
+    assert!(offset_of!(StateTransferTargetHeader, unavailable_transient) == 161);
+    assert!(offset_of!(StateTransferTargetHeader, commit_max) == 168);
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StateTransferTarget;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1448,6 +1918,20 @@ impl ConsensusHeader for StateTransferTargetHeader {
         if self.available > 1 {
             return Err(ConsensusError::InvalidField(
                 "available must be 0 or 1".to_string(),
+            ));
+        }
+        if self.unavailable_transient > 1 {
+            return Err(ConsensusError::InvalidField(
+                "unavailable_transient must be 0 or 1".to_string(),
+            ));
+        }
+        // The flag qualifies a refusal, so it is meaningless on an offer. Inert
+        // today (the receiver reads it only inside the `available == 0` arm),
+        // rejected anyway because a self-contradictory descriptor says the
+        // sender is not the build this field was designed for.
+        if self.available == 1 && self.unavailable_transient == 1 {
+            return Err(ConsensusError::InvalidField(
+                "unavailable_transient must be 0 on an available offer".to_string(),
             ));
         }
         // Unavailable is a bare refusal; a manifest body on it would be
@@ -1504,7 +1988,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for RequestStateChunkHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::RequestStateChunk;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1578,7 +2072,17 @@ const _: () = {
 };
 
 impl ConsensusHeader for StateChunkHeader {
+    const FRAME_SEALED: bool = true;
+
     const COMMAND: Command2 = Command2::StateChunk;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
@@ -1610,9 +2114,12 @@ impl ConsensusHeader for StateChunkHeader {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
-        EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
-        ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+        Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
+        EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+        PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
+        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+        RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+        StateTransferTargetHeader,
     };
     use aligned_vec::{AVec, ConstAlign};
 
@@ -1622,6 +2129,128 @@ mod tests {
         let mut v: AVec<u8, ConstAlign<16>> = AVec::new(16);
         v.resize(size, 0);
         v
+    }
+
+    /// A header-sized frame that satisfies `bytemuck`'s 16-byte alignment.
+    #[repr(C, align(16))]
+    struct AlignedFrame([u8; HEADER_SIZE]);
+
+    /// A minimal well-formed header of type `H`: own command and size, everything
+    /// else zero. Enough for the seal, which reads bytes rather than fields.
+    fn control_header<H: ConsensusHeader>() -> H {
+        const COMMAND_OFF: usize = std::mem::offset_of!(GenericHeader, command);
+        const SIZE_OFF: usize = std::mem::offset_of!(GenericHeader, size);
+
+        let frame_len = u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32");
+        let mut frame = AlignedFrame([0u8; HEADER_SIZE]);
+        frame.0[COMMAND_OFF] = H::COMMAND as u8;
+        frame.0[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&frame_len.to_le_bytes());
+        *bytemuck::checked::try_from_bytes::<H>(&frame.0).expect("a zeroed frame is a valid header")
+    }
+
+    /// Seal a header, flip one bit at `offset`, and report `verify_frame`'s verdict.
+    fn tamper<H: ConsensusHeader>(mut header: H, offset: usize) -> Result<(), ConsensusError> {
+        header.seal();
+        let mut frame = AlignedFrame([0u8; HEADER_SIZE]);
+        frame.0.copy_from_slice(bytemuck::bytes_of(&header));
+        frame.0[offset] ^= 0x01;
+        let tampered = bytemuck::checked::try_from_bytes::<H>(&frame.0)
+            .expect("a single flipped bit stays a valid bit pattern here");
+        tampered.verify_frame()
+    }
+
+    #[test]
+    fn given_a_sealed_control_header_when_verifying_should_accept() {
+        macro_rules! seals {
+            ($($header:ty),+ $(,)?) => {$({
+                assert!(
+                    <$header>::FRAME_SEALED,
+                    "{} is a replica-to-replica control header and must seal",
+                    stringify!($header),
+                );
+                let mut header = control_header::<$header>();
+                header.seal();
+                assert_eq!(
+                    header.verify_frame(),
+                    Ok(()),
+                    "{} must accept its own seal",
+                    stringify!($header),
+                );
+            })+};
+        }
+        seals!(
+            PrepareOkHeader,
+            CommitHeader,
+            StartViewChangeHeader,
+            DoViewChangeHeader,
+            StartViewHeader,
+            RequestStartViewHeader,
+            RequestPreparesHeader,
+            RepairRangeReplyHeader,
+            RequestStateTransferHeader,
+            StateTransferTargetHeader,
+            RequestStateChunkHeader,
+            StateChunkHeader,
+        );
+    }
+
+    #[test]
+    fn given_any_covered_byte_when_flipped_should_reject() {
+        // Why this seal exists. A `DoViewChange` nack bitset is a new primary's
+        // authority to truncate: two nacks on three replicas reach
+        // `quorum_nack_prepare` and discard a committed, client-acked op. The bitsets
+        // ride the header, and TCP's checksum will not reliably catch one bit.
+        // Every byte past `checksum` is covered, `checksum_body` included.
+        for offset in size_of::<u128>()..HEADER_SIZE {
+            let header = control_header::<DoViewChangeHeader>();
+            // Skip offsets where the flipped bit is an invalid bit pattern, which
+            // `try_from_bytes` rejects one layer earlier.
+            if offset == std::mem::offset_of!(DoViewChangeHeader, command) {
+                continue;
+            }
+            assert!(
+                matches!(
+                    tamper(header, offset),
+                    Err(ConsensusError::FrameChecksumMismatch { .. })
+                ),
+                "byte {offset} is inside the seal and must be covered"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_unsealed_control_header_when_verifying_should_reject() {
+        // No presence-keying: a zero checksum is a corrupt frame, not an old one.
+        // Keying on "does this look sealed" leaves the layer bypassable by zeroing
+        // the one field that decides whether anything is checked.
+        let header = control_header::<DoViewChangeHeader>();
+        assert_eq!(header.checksum, 0);
+        assert!(matches!(
+            header.verify_frame(),
+            Err(ConsensusError::FrameChecksumMismatch { found: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn given_an_identity_or_client_header_when_verifying_should_abstain() {
+        // `PrepareHeader` spends `checksum` on `identity_checksum`, which excludes
+        // `view` so a re-stamped prepare keeps one identity; the client-facing three
+        // are sealed on neither side yet. All must parse unchanged.
+        const {
+            assert!(!PrepareHeader::FRAME_SEALED);
+            assert!(!RepairPrepareHeader::FRAME_SEALED);
+            assert!(!RequestHeader::FRAME_SEALED);
+            assert!(!ReplyHeader::FRAME_SEALED);
+            assert!(!EvictionHeader::FRAME_SEALED);
+            assert!(!GenericHeader::FRAME_SEALED);
+        }
+
+        let prepare = PrepareHeader {
+            command: Command2::Prepare,
+            checksum: 0xdead_beef,
+            ..Default::default()
+        };
+        assert_eq!(prepare.verify_frame(), Ok(()));
     }
 
     #[test]

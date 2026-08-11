@@ -69,6 +69,47 @@ class TestMessageOperations:
         )
 
     @pytest.mark.asyncio
+    async def test_send_messages_reports_committed_confirmation(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the send response reports the committed partition and offset."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        payloads = [f"Confirmation test {i}" for i in range(3)]
+        response = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(payload) for payload in payloads],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.First(),
+            count=10,
+            auto_commit=True,
+        )
+
+        assert [message.payload().decode() for message in polled_messages] == payloads
+
+        # The server confirms committed sends with the partition and the base
+        # offset of the batch; the whole send targeted one partition, so a
+        # single confirmation covers it.
+        assert len(response.confirmations) == 1
+        confirmation = response.confirmations[0]
+        assert confirmation.partition_id == partition_id
+        assert confirmation.base_offset == polled_messages[0].offset()
+
+    @pytest.mark.asyncio
     async def test_send_and_poll_messages_as_bytes(
         self, iggy_client: IggyClient, unique_name
     ):

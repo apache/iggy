@@ -27,5 +27,9 @@ pub use impls::metadata::{
     apply_committed_prepare,
 };
 
+// Recovery vocabulary other crates name in their own signatures and error
+// enums, so they do not have to spell the `impls::` path.
+pub use impls::recovery::{IdentityField, RecoveryError, ReplicaIdentity};
+
 // Re-export MuxStateMachine for use in other modules
 pub use stm::mux::MuxStateMachine;

@@ -39,8 +39,9 @@ use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::spawn;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::log::warn;
 use tracing::{debug, error, info};
@@ -64,6 +65,7 @@ pub struct IggyClient {
     pub(crate) client: IggyRwLock<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
+    heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Default for IggyClient {
@@ -92,6 +94,7 @@ impl IggyClient {
             client,
             partitioner: None,
             encryptor: None,
+            heartbeat_handle: Mutex::new(None),
         }
     }
 
@@ -131,6 +134,7 @@ impl IggyClient {
             client,
             partitioner,
             encryptor,
+            heartbeat_handle: Mutex::new(None),
         }
     }
 
@@ -236,6 +240,19 @@ impl IggyClient {
     }
 }
 
+impl Drop for IggyClient {
+    fn drop(&mut self) {
+        let heartbeat_handle = self
+            .heartbeat_handle
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(handle) = heartbeat_handle {
+            handle.abort();
+        }
+    }
+}
+
 #[async_trait]
 impl Client for IggyClient {
     async fn connect(&self) -> Result<(), IggyError> {
@@ -246,8 +263,20 @@ impl Client for IggyClient {
             heartbeat_interval = client.heartbeat_interval().await;
         }
 
+        let mut heartbeat_handle = self
+            .heartbeat_handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if heartbeat_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Ok(());
+        }
+
+        drop(heartbeat_handle.take());
         let client = self.client.clone();
-        spawn(async move {
+        *heartbeat_handle = Some(spawn(async move {
             loop {
                 debug!("Sending the heartbeat...");
                 if let Err(error) = client.read().await.ping().await {
@@ -268,7 +297,7 @@ impl Client for IggyClient {
                 }
                 sleep(heartbeat_interval.get_duration()).await
             }
-        });
+        }));
         Ok(())
     }
 

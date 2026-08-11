@@ -15,29 +15,73 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Full coverage baseline for all 7 languages (Rust, Java, C#, Python,
-# PHP, Node, Go). Runs on every push to master so Codecov has complete data
-# for carryforward on PR builds where only a subset of SDKs is tested.
+# Coverage baseline for all 7 languages (Rust, Java, C#, Python, PHP,
+# Node, Go). Runs on push to master so Codecov has data on master SHAs for
+# carryforward on PR builds where only a subset of SDKs is tested.
+#
+# Jobs are path-gated: a language job runs only when the paths feeding its
+# Codecov flag changed in the push (scripts/ci/coverage-baseline-affected.sh).
+# Untouched flags carry forward their previous master report, which stays
+# accurate because their sources did not change. workflow_dispatch forces a
+# full run (manual backfill).
 
 name: Coverage baseline
 
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Per-event groups so a manual backfill run is not cancelled by the next
+# merge push (and vice versa).
 concurrency:
-  group: coverage-baseline-${{ github.ref }}
+  group: coverage-baseline-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   IGGY_CI_BUILD: true
 
 jobs:
+  detect:
+    name: Detect affected coverage jobs
+    # workflow_dispatch offers a branch picker, but baseline uploads and
+    # cache warms only make sense for master. Skipping detect skips every
+    # downstream job.
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.affected.outputs.rust }}
+      java: ${{ steps.affected.outputs.java }}
+      csharp: ${{ steps.affected.outputs.csharp }}
+      python: ${{ steps.affected.outputs.python }}
+      php: ${{ steps.affected.outputs.php }}
+      node: ${{ steps.affected.outputs.node }}
+      go: ${{ steps.affected.outputs.go }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The gate diffs against the pre-push tip, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+
+      - name: Compute affected gates
+        id: affected
+        # github.event.before is empty on workflow_dispatch; the script
+        # fails open to all-true there.
+        run: >-
+          scripts/ci/coverage-baseline-affected.sh
+          "${{ github.event.before }}" "${{ github.sha }}"
+          >> "$GITHUB_OUTPUT"
+        shell: bash
+
   rust-coverage:
     name: Rust coverage baseline
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -61,7 +105,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.84.0
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-llvm-cov
 
@@ -108,6 +152,8 @@ jobs:
 
   java-coverage:
     name: Java coverage baseline
+    needs: detect
+    if: needs.detect.outputs.java == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -151,6 +197,8 @@ jobs:
 
   csharp-coverage:
     name: C# coverage baseline
+    needs: detect
+    if: needs.detect.outputs.csharp == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -168,11 +216,18 @@ jobs:
 
       - name: Build Iggy server Docker image
         id: docker_build
-        uses: ./.github/actions/utils/docker-build-test-server
-        with:
-          image-tag: "iggy-server:test"
-          libc: "glibc"
-          profile: "debug"
+        run: |
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo build --locked --features vsr --bin iggy-server-ng --bin iggy
+          docker build \
+            -f core/server-ng/Dockerfile \
+            --target runtime-prebuilt \
+            -t iggy-server:test \
+            --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
+            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+            .
+          echo "docker_image=iggy-server:test" >> "$GITHUB_OUTPUT"
 
       - name: Restore and build
         working-directory: foreign/csharp
@@ -223,6 +278,8 @@ jobs:
 
   python-coverage:
     name: Python coverage baseline
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -239,7 +296,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.84.0
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-llvm-cov
 
@@ -265,15 +322,36 @@ jobs:
           uv run --no-sync maturin develop
         shell: bash
 
+      - name: Build server Docker image for TLS tests
+        run: |
+          # test_tls.py spawns the server in a container; build it from the
+          # same vsr binaries the plain-TCP tests run against.
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
+          docker build \
+            -f core/server-ng/Dockerfile \
+            --target runtime-prebuilt \
+            --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
+            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+            -t iggy-server:local .
+        shell: bash
+
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
+        with:
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
 
       - name: Run tests
         run: |
           cd foreign/python
           IGGY_SERVER_HOST=127.0.0.1 \
           IGGY_SERVER_TCP_PORT=8090 \
+          IGGY_SERVER_DOCKER_IMAGE=iggy-server:local \
             uv run --no-sync pytest tests/ -v \
               --junitxml=../../reports/python-junit.xml \
               --tb=short \
@@ -316,6 +394,8 @@ jobs:
 
   php-coverage:
     name: PHP coverage baseline
+    needs: detect
+    if: needs.detect.outputs.php == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -337,6 +417,8 @@ jobs:
 
   node-coverage:
     name: Node coverage baseline
+    needs: detect
+    if: needs.detect.outputs.node == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -365,11 +447,15 @@ jobs:
           cd foreign/node
           npm ci --ignore-scripts
 
+      # TODO(hubcio): change to iggy-server once legacy server is removed
+      # (core/server has VSR support)
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
-        env:
-          IGGY_CLUSTER_ENABLED: true
+        with:
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
+          wait-timeout-seconds: "90"
 
       - name: Run unit tests with coverage
         run: |
@@ -382,9 +468,6 @@ jobs:
           cd foreign/node
           mkdir -p ../../reports/node-coverage/e2e
           npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
-        env:
-          IGGY_SERVER_HOST: 127.0.0.1
-          IGGY_SERVER_TCP_PORT: 8090
 
       - name: Stop Iggy server
         if: always()
@@ -404,6 +487,8 @@ jobs:
 
   go-coverage:
     name: Go coverage baseline
+    needs: detect
+    if: needs.detect.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -417,11 +502,21 @@ jobs:
         with:
           save-cache: "false"
 
+      # The Go SDK speaks the VSR wire protocol, so its coverage run needs the
+      # VSR server rather than the legacy one.
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
+        with:
+          # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
+          replica-id: "0"
+          wait-timeout-seconds: "90"
 
       - name: Run unit tests with coverage
+        env:
+          IGGY_TCP_ADDRESS: 127.0.0.1:8090
         run: |
           cd foreign/go
           mkdir -p ../../reports
@@ -478,6 +573,11 @@ jobs:
 
   warm-cache-macos:
     name: Warm macOS cache
+    needs: detect
+    # Gated on the rust key: the cache goes stale only when Rust sources
+    # change, and the Swatinem key is Cargo.lock-based, so skipping the save
+    # on non-Rust pushes leaves the previous cache valid.
+    if: needs.detect.outputs.rust == 'true'
     runs-on: macos-14
     timeout-minutes: 30
     steps:

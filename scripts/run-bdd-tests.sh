@@ -39,9 +39,13 @@ usage(){
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
-  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust only);"
+  # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+  log "  --vsr:   run against iggy-server-ng built with --features vsr (every SDK);"
   log "           expects IGGY_SERVER_NG_PATH (default: target/debug/iggy-server-ng)"
-  log "           and a vsr-built iggy CLI at IGGY_CLI_PATH"
+  log "           and a vsr-built iggy CLI at IGGY_CLI_PATH."
+  log "           Every foreign SDK speaks only VSR; the go suites imply the"
+  log "           flag and the java suite always applies the VSR overlay."
+  log "           Only rust still has a legacy (no --vsr) lane."
   log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
@@ -53,9 +57,12 @@ usage(){
 
 if [ "$VSR" = "1" ]; then
   case "$SDK" in
-    rust|clean) ;;
+    rust|python|php|go|go-race|node|csharp|cpp|clean) ;;
+    java)
+      # Redundant: the Java suite applies the VSR overlay unconditionally.
+      VSR=0 ;;
     *)
-      log "❌ --vsr supports only the Rust SDK (server-ng speaks the VSR wire protocol)"
+      log "❌ unknown sdk for --vsr: ${SDK}"
       usage
       exit 2 ;;
   esac
@@ -108,7 +115,8 @@ trap cleanup EXIT INT TERM
 
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
-if [ "$VSR" = "1" ]; then
+if [ "$VSR" = "1" ] || [ "$SDK" = "go" ] || [ "$SDK" = "go-race" ] || [ "$SDK" = "java" ]; then
+  # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
   log "🗳️ Server: iggy-server-ng (--features vsr)"
 fi
 if [ "$COVERAGE" = "1" ]; then
@@ -119,7 +127,7 @@ run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
-      rust-bdd|go-bdd|csharp-bdd) ;;
+      rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
         if [ "$SDK" = "all" ]; then
           log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
@@ -132,12 +140,21 @@ run_suite(){
     esac
   fi
 
+  # The Go SDK speaks only the VSR wire protocol and the Java suite always
+  # runs against the VSR server overlay, so both run against the VSR server
+  # even when the caller did not ask for it. Each suite tears its own stack
+  # down, so an `all` run can mix the two servers.
+  local files=("${COMPOSE_FILES[@]}")
+  if { [ "$svc" = "go-bdd" ] || [ "$svc" = "java-bdd" ]; } && [ "$VSR" != "1" ]; then
+    files+=(-f docker-compose.vsr.yml)
+  fi
+
   log "${emoji} ${label}..."
   local code=0
-  docker compose "${COMPOSE_FILES[@]}" \
+  docker compose "${files[@]}" \
     up --build --exit-code-from "$svc" "$svc" \
     || code=$?
-  docker compose "${COMPOSE_FILES[@]}" \
+  docker compose "${files[@]}" \
     down -v --remove-orphans >/dev/null 2>&1 || true
   return "$code"
 }

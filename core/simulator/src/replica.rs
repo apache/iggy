@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::bus::{SharedSimOutbox, SimOutbox};
+use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server_ng::NgSystemConfig;
 use consensus::{ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
-use journal::superblock::DynSuperblockStore;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
@@ -63,6 +63,7 @@ pub type Replica = shard::IggyShard<
     SimSnapshot,
     SimMuxStateMachine,
     PapayaShardsTable,
+    SimSuperblock,
 >;
 
 /// Read-side handoff bundle for the metadata STM.
@@ -120,7 +121,7 @@ pub fn new_shard(
     clock: ConsensusClock,
     shell: bool,
     reader_bundle: Option<SimMetadataBundle>,
-    superblock: Option<Rc<dyn DynSuperblockStore>>,
+    superblock: Option<Rc<SimSuperblock>>,
     metadata_journal: Option<Rc<SimJournal<MemStorage>>>,
     recovered_state: Option<VsrState>,
     incarnation: u128,
@@ -282,6 +283,7 @@ pub fn new_shard(
         messages_required_to_save: 1000,
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
         enforce_fsync: false, //Disable fsync for simulation
+        validate_checksum: true,
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
         encryptor: None,
     };
@@ -295,8 +297,12 @@ pub fn new_shard(
 
     // The deferred handlers upgrade this weak self-reference per frame; it
     // stays `None` until the shard is built and downgraded into it below.
-    let shard_handle: ShellShardHandle<SharedSimOutbox, Rc<SimJournal<MemStorage>>, SimSnapshot> =
-        Rc::new(RefCell::new(None));
+    let shard_handle: ShellShardHandle<
+        SharedSimOutbox,
+        Rc<SimJournal<MemStorage>>,
+        SimSnapshot,
+        SimSuperblock,
+    > = Rc::new(RefCell::new(None));
     let ShellHandlers {
         on_replica_message,
         on_client_request,

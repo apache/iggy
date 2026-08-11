@@ -21,6 +21,7 @@ package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.ConsumerId;
@@ -71,6 +72,11 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
     @Override
     public void leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
         throw new IggyOperationNotSupportedException("leaveConsumerGroup", "HTTP");
+    }
+
+    @Override
+    public Optional<ConsumerGroupAssignment> syncConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
+        throw new IggyOperationNotSupportedException("syncConsumerGroup", "HTTP");
     }
 
     private static String path(StreamId streamId, TopicId topicId) {

@@ -19,7 +19,6 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Apache.Iggy.Consumers;
@@ -95,7 +94,11 @@ public class IggyConsumerBuilder<T> : IggyConsumerBuilder
                 Protocol = Config.Protocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
-                SendBufferSize = Config.SendBufferSize
+                SendBufferSize = Config.SendBufferSize,
+                ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
+                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
+                MessageEncryptor = _encryptor
             });
         }
 
@@ -133,8 +136,7 @@ public class IggyConsumerBuilder<T> : IggyConsumerBuilder
         }
         else
         {
-            throw new InvalidOperationException(
-                $"Config must be of type IggyConsumerConfig<{typeof(T).Name}>.");
+            throw new InvalidOperationException($"Config must be of type IggyConsumerConfig<{typeof(T).Name}>.");
         }
     }
 }
