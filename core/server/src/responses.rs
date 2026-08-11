@@ -27,7 +27,7 @@ use crate::bootstrap::{ShellBus, ShellShard};
 use crate::cluster_meta::ClusterRoster;
 use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
@@ -1303,6 +1303,38 @@ pub(crate) fn build_deny_reply(
 /// Server build version advertised in the login-register response.
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Build a metadata reply carrying `payload` behind a success result section.
+///
+/// Every metadata reply is result-framed, and the SDK strips that section off
+/// unconditionally (`split_metadata_result`) before decoding what follows. A
+/// payload written without the leading zero count therefore has its first four
+/// bytes eaten as a result count, and the decode fails or, worse, succeeds on the
+/// shifted remainder. That is not hypothetical: the raw-PAT reply shipped once
+/// without the prefix and broke SDK decoding. This is the only way to emit a
+/// success reply with a body, so the prefix cannot be forgotten again.
+fn build_result_framed_reply(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    payload: &impl WireEncode,
+) -> Message<ReplyHeader> {
+    let mut encoded = BytesMut::with_capacity(payload.encoded_size());
+    payload.encode(&mut encoded);
+    build_reply_with_body(
+        request_header,
+        client_id,
+        session,
+        commit,
+        RESULT_COUNT_LEN + encoded.len(),
+        |out| {
+            let (count, body) = out.split_at_mut(RESULT_COUNT_LEN);
+            count.copy_from_slice(&0u32.to_le_bytes());
+            body.copy_from_slice(&encoded);
+        },
+    )
+}
+
 pub(crate) fn build_login_register_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
@@ -1310,28 +1342,16 @@ pub(crate) fn build_login_register_reply(
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    // Result-framed like every metadata reply: a zero result-count (success)
-    // followed by the `LoginRegisterResponse` payload. A transient Register
-    // instead ships a `[count=1][index=0][TransientNotCommitted]` frame
-    // (`build_transient_reply`), which the SDK decodes and replays. The matching
-    // strip is in the SDK `split_metadata_result` (Register is result-framed).
+    // A transient Register instead ships a `[count=1][index=0]
+    // [TransientNotCommitted]` frame (`build_transient_reply`), which the SDK
+    // decodes and replays.
     let payload = LoginRegisterResponse {
         user_id,
         session,
         server_protocol_version: IGGY_PROTOCOL_VERSION,
         server_version: WireName::new(SERVER_VERSION).expect("SERVER_VERSION is 1-255 bytes"),
-    }
-    .to_bytes();
-    let mut body = Vec::with_capacity(RESULT_COUNT_LEN + payload.len());
-    body.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
-    body.extend_from_slice(&payload);
-    build_reply_from_bytes(
-        request_header,
-        client_id,
-        session,
-        commit,
-        &Bytes::from(body),
-    )
+    };
+    build_result_framed_reply(request_header, client_id, session, commit, &payload)
 }
 
 pub(crate) fn build_reply_from_bytes(
@@ -1401,19 +1421,12 @@ pub(crate) fn build_raw_pat_reply(
     }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
     let response = RawPersonalAccessTokenResponse { token };
-    // The SDK strips a leading result section from every metadata reply
-    // (`split_metadata_result`), so the spliced body must carry the success
-    // section like any committed metadata reply; a bare token body would be
-    // read as a garbage result code.
-    let mut body = BytesMut::with_capacity(RESULT_COUNT_LEN + response.encoded_size());
-    body.put_u32_le(0);
-    response.encode(&mut body);
-    let reply = build_reply_from_bytes(
+    let reply = build_result_framed_reply(
         request_header,
         request_header.client,
         request_header.session,
         commit,
-        &body.freeze(),
+        &response,
     );
     Ok(reply.into_generic())
 }
@@ -1649,6 +1662,27 @@ mod tests {
         header.session = 7;
         header.request = 3;
         header
+    }
+
+    #[test]
+    fn login_register_reply_carries_the_success_result_prefix() {
+        // The other `build_result_framed_reply` caller. The SDK strips the result
+        // section off every metadata reply, so a payload emitted without the prefix
+        // loses its first four bytes to a phantom result count -- the decode break
+        // the raw-PAT reply shipped once. Pin it on both callers, not just the one
+        // that regressed.
+        let mut header = pat_request_header();
+        header.operation = Operation::Register;
+        let reply = build_login_register_reply(&header, 42, 7, 9, 5);
+
+        let header_len = std::mem::size_of::<ReplyHeader>();
+        let body = &reply.as_slice()[header_len..reply.header().size as usize];
+        assert_eq!(result_code(body), Some(0));
+
+        let payload = LoginRegisterResponse::decode_from(&body[RESULT_COUNT_LEN..])
+            .expect("login-register payload decodes past the result section");
+        assert_eq!(payload.user_id, 5);
+        assert_eq!(payload.session, 7);
     }
 
     /// A committed metadata reply whose body is the given result section
