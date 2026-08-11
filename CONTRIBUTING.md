@@ -84,6 +84,28 @@ cargo install prek
 prek install
 ```
 
+The hooks require **bash >= 4.2** and refuse to run on anything older. Every current
+Linux distribution already satisfies this.
+
+#### macOS
+
+macOS ships bash 3.2 and never updates it, so this is the one platform that needs a
+step:
+
+```bash
+brew install bash
+```
+
+Homebrew's bash has to precede `/bin` on `PATH`, which is the default for a Homebrew
+install but not guaranteed. Check with:
+
+```bash
+bash --version
+```
+
+Git GUIs launched from the Dock get a minimal `PATH` where `/bin` wins, so the hook can
+still find bash 3.2 after the install. Committing from a terminal avoids this.
+
 ## Code Style
 
 ### Comments: WHY, Not WHAT

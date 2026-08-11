@@ -23,7 +23,7 @@
 //! 4. `offset` range draw
 //! 5. `ack` ratio draw
 
-use iggy_binary_protocol::{AckLevel, RequestHeader};
+use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -86,7 +86,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.store_consumer_offset_2(
         input.ns,
         input.consumer_kind,

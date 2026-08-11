@@ -17,7 +17,7 @@
 
 //! `DeleteConsumerOffset` op. Live namespace via shadow.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -63,7 +63,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.delete_consumer_offset(input.ns, input.consumer_kind, input.consumer_id)
 }
 

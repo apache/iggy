@@ -86,7 +86,7 @@ use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, Command2, EvictionReason, GenericHeader, HEADER_SIZE,
     KIND_CONSUMER_GROUP, MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader,
-    WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
+    RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
 };
 use iggy_common::{
     IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression, SystemSnapshotType,
@@ -402,7 +402,7 @@ fn submit_auto_commit<B, MJ, S, SB>(
 fn build_auto_commit_request(
     namespace: IggyNamespace,
     applied: &AutoCommitApplied,
-) -> Result<Message<RequestHeader>, IggyError> {
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let request = StoreConsumerOffset2Request {
         consumer: WireConsumer {
             kind: applied.kind.as_code(),
@@ -415,26 +415,28 @@ fn build_auto_commit_request(
         ack: AckLevel::Quorum,
     };
     let body = request.to_bytes();
-    let header_size = std::mem::size_of::<RequestHeader>();
+    let header_size = std::mem::size_of::<RoutedRequestHeader>();
     let total_size = header_size + body.len();
     let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut message = Message::<RequestHeader>::new(total_size);
+    let mut message = Message::<RoutedRequestHeader>::new(total_size);
     message.as_mut_slice()[header_size..].copy_from_slice(&body);
-    Ok(message.transmute_header(|_, header: &mut RequestHeader| {
-        *header = RequestHeader {
-            command: Command2::Request,
-            operation: Operation::StoreConsumerOffset2,
-            size,
-            client: AUTO_COMMIT_CLIENT_ID,
-            // The partition plane is sessionless (no `ClientTable` dedup); a
-            // nonzero session + request just satisfy the wire header
-            // validation.
-            session: 1,
-            request: 1,
-            namespace: namespace.inner(),
-            ..Default::default()
-        };
-    }))
+    Ok(
+        message.transmute_header(|_, header: &mut RoutedRequestHeader| {
+            *header = RoutedRequestHeader {
+                command: Command2::Request,
+                operation: Operation::StoreConsumerOffset2,
+                size,
+                client: AUTO_COMMIT_CLIENT_ID,
+                // The partition plane is sessionless (no `ClientTable` dedup); a
+                // nonzero session + request just satisfy the wire header
+                // validation.
+                session: 1,
+                request: 1,
+                group: namespace.inner(),
+                ..Default::default()
+            };
+        }),
+    )
 }
 
 pub(crate) fn make_deferred_replica_message_handler<B, MJ, S, SB>(
@@ -569,7 +571,7 @@ where
                     let _ = reply.try_send(commit);
                 }
                 shard::MetadataSubmit::ClientRequest { request, reply } => {
-                    let committed = match request.try_into_typed::<RequestHeader>() {
+                    let committed = match request.try_into_typed::<RoutedRequestHeader>() {
                         Ok(typed) => shard
                             .plane
                             .metadata()
@@ -801,7 +803,7 @@ pub(crate) fn validate_topic_bounds(
 #[allow(clippy::future_not_send)]
 async fn send_pre_consensus_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    header: &RequestHeader,
+    header: &RoutedRequestHeader,
     transport_client_id: u128,
     error: &IggyError,
     context: &'static str,
@@ -861,6 +863,11 @@ async fn handle_client_request<B, MJ, S, SB>(
             return;
         }
     };
+    // Promote to the server-internal routed shape at the boundary: the
+    // client wire carries no group (it is derived -- plane from `operation`,
+    // partition target from the payload), so it starts unset here and the
+    // resolution sites below stamp it before anything routes on it.
+    let request = request.into_routed();
 
     // The last point that still sees the body the CLIENT sent; every rewrite below
     // substitutes server-chosen bytes and carries the stamp through unchanged.
@@ -1014,8 +1021,10 @@ async fn handle_client_request<B, MJ, S, SB>(
         return;
     }
 
-    let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
+    let request = request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
         *new_header = header;
+        // Metadata-plane ops route by operation: stamp the sentinel group.
+        new_header.group = server_common::sharding::METADATA_GROUP;
         // `bound` is always Some here (unbound transports early-return above);
         // this sets the consensus client id + session for the replicated op.
         if let Some((bound_client_id, bound_session)) = bound {
@@ -1164,7 +1173,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1191,7 +1200,7 @@ async fn handle_get_me<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1230,7 +1239,7 @@ async fn handle_get_me<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: Message<RequestHeader>,
+    request: Message<RoutedRequestHeader>,
     vsr_client_id: u128,
     bound_session: u64,
     transport_client_id: u128,
@@ -1351,9 +1360,9 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
             return;
         }
     };
-    let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
+    let request = request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
         *new_header = header;
-        new_header.namespace = namespace;
+        new_header.group = namespace;
         new_header.client = transport_client_id;
         // Header validation requires `session > 0 && request > 0` for
         // non-register ops. The partition plane itself is sessionless
@@ -1372,7 +1381,7 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
-    request: Message<RequestHeader>,
+    request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1527,7 +1536,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     code: u32,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
@@ -1607,7 +1616,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
 ) where
     B: ShellBus,
@@ -1687,7 +1696,7 @@ fn decode_get_snapshot(
 #[allow(clippy::future_not_send)]
 async fn send_non_replicated_bytes<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     transport_client_id: u128,
     bytes: Bytes,
     label: &'static str,
@@ -1880,7 +1889,7 @@ async fn evict_stale_client<B, MJ, S, SB>(
 async fn handle_poll_messages<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
 ) where
     B: ShellBus,
@@ -2001,7 +2010,7 @@ async fn handle_poll_messages<B, MJ, S, SB>(
 async fn handle_get_consumer_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
 ) where
     B: ShellBus,
@@ -2088,7 +2097,7 @@ async fn handle_get_consumer_offset<B, MJ, S, SB>(
 async fn handle_sync_consumer_group<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -2142,7 +2151,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 async fn send_empty_partition_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -2469,7 +2478,7 @@ async fn handle_delete_segments_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     bound: Option<(u128, u64)>,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -2599,11 +2608,11 @@ async fn handle_delete_segments_request<B, MJ, S, SB>(
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    template: &RequestHeader,
+    template: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     body: &[u8],
-) -> Result<Message<RequestHeader>, IggyError>
+) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -2764,7 +2773,7 @@ fn submit_disconnect_logout<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(crate) async fn submit_client_request_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: Message<RequestHeader>,
+    request: Message<RoutedRequestHeader>,
 ) -> Option<Message<GenericHeader>>
 where
     B: ShellBus,
@@ -2794,7 +2803,7 @@ async fn handle_logout_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-    request: Message<RequestHeader>,
+    request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -2898,7 +2907,7 @@ async fn handle_login_register_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-    request: Message<RequestHeader>,
+    request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -3263,16 +3272,16 @@ mod tests {
         session: u64,
         request: u64,
         body: &[u8],
-    ) -> Message<RequestHeader> {
-        let header_size = size_of::<RequestHeader>();
+    ) -> Message<RoutedRequestHeader> {
+        let header_size = size_of::<RoutedRequestHeader>();
         let total = header_size + body.len();
-        let mut message = Message::<RequestHeader>::new(total);
+        let mut message = Message::<RoutedRequestHeader>::new(total);
         {
             let slice = message.as_mut_slice();
             slice[header_size..total].copy_from_slice(body);
             let header =
-                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
-            *header = RequestHeader {
+                bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
+            *header = RoutedRequestHeader {
                 command: Command2::Request,
                 operation,
                 size: u32::try_from(total).expect("test request fits u32"),
@@ -3280,7 +3289,7 @@ mod tests {
                 session,
                 request,
                 user_id: 0,
-                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+                group: server_common::sharding::METADATA_GROUP,
                 ..Default::default()
             };
         }
@@ -3313,7 +3322,7 @@ mod tests {
                 client,
                 request,
                 user_id: 0,
-                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+                group: server_common::sharding::METADATA_GROUP,
                 ..Default::default()
             };
         }
@@ -3364,7 +3373,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            server_common::sharding::METADATA_GROUP,
             bus.clone(),
             LocalPipeline::new(),
         );
@@ -3644,9 +3653,9 @@ mod tests {
         shard.plane.partitions().tombstone(namespace);
 
         let request = request_message(Operation::SendMessages, TRANSPORT, SESSION, 1, &[])
-            .transmute_header(|header, new_header: &mut RequestHeader| {
+            .transmute_header(|header, new_header: &mut RoutedRequestHeader| {
                 *new_header = header;
-                new_header.namespace = namespace.inner();
+                new_header.group = namespace.inner();
             });
         shard.on_message(request.into_generic()).await;
 
@@ -3719,9 +3728,9 @@ mod tests {
 
         let namespace = IggyNamespace::new(0, 0, 0);
         let request = request_message(Operation::SendMessages, TRANSPORT, SESSION, 1, &[])
-            .transmute_header(|header, new_header: &mut RequestHeader| {
+            .transmute_header(|header, new_header: &mut RoutedRequestHeader| {
                 *new_header = header;
-                new_header.namespace = namespace.inner();
+                new_header.group = namespace.inner();
             });
         // Namespace neither materialised nor tombstoned: the frame parks.
         shard.on_message(request.into_generic()).await;

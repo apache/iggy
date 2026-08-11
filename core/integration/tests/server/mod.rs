@@ -26,6 +26,10 @@ mod flush_vsr;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 #[cfg(feature = "vsr")]
 mod legacy_login_vsr;
+// A failed credential login must report the credential failure, not the
+// payload shape it fell through to.
+#[cfg(feature = "vsr")]
+mod login_credentials_vsr;
 // Poll addressing + timestamp semantics: typed PartitionNotFound on a bad
 // partition id, at-or-after timestamp polls.
 #[cfg(feature = "vsr")]

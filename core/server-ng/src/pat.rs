@@ -27,7 +27,7 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
     DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
 };
-use iggy_binary_protocol::{Operation, RequestHeader, WireDecode, WireEncode};
+use iggy_binary_protocol::{Operation, RoutedRequestHeader, WireDecode, WireEncode};
 use iggy_common::IggyError;
 use metadata::stm::user::{
     CreatePersonalAccessTokenRequest as ReplicatedCreatePersonalAccessTokenRequest,
@@ -42,8 +42,8 @@ pub(crate) fn maybe_rewrite_pat_request(
     transport_client_id: u128,
     max_tokens_per_user: u32,
     pat_count_of: impl FnOnce(u32) -> usize,
-    request: Message<RequestHeader>,
-) -> Result<(Message<RequestHeader>, Option<String>), IggyError> {
+    request: Message<RoutedRequestHeader>,
+) -> Result<(Message<RoutedRequestHeader>, Option<String>), IggyError> {
     let user_id = match request.header().operation {
         Operation::CreatePersonalAccessToken | Operation::DeletePersonalAccessToken => sessions
             .borrow()
@@ -69,8 +69,8 @@ pub(crate) fn rewrite_pat_request_for_user(
     user_id: u32,
     max_tokens_per_user: u32,
     pat_count_of: impl FnOnce(u32) -> usize,
-    request: Message<RequestHeader>,
-) -> Result<(Message<RequestHeader>, Option<String>), IggyError> {
+    request: Message<RoutedRequestHeader>,
+) -> Result<(Message<RoutedRequestHeader>, Option<String>), IggyError> {
     let body = request_body(&request);
     let mut raw_token = None;
     let rewritten = match request.header().operation {
@@ -151,10 +151,10 @@ mod tests {
     const MAX_TOKENS: u32 = 3;
     const AT_LIMIT_TOKENS: [(&str, u8); 3] = [("one", b'a'), ("two", b'b'), ("three", b'c')];
 
-    fn create_pat_request(name: &str) -> Message<RequestHeader> {
-        let header_len = std::mem::size_of::<RequestHeader>();
-        let mut template = Message::<RequestHeader>::new(header_len);
-        let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+    fn create_pat_request(name: &str) -> Message<RoutedRequestHeader> {
+        let header_len = std::mem::size_of::<RoutedRequestHeader>();
+        let mut template = Message::<RoutedRequestHeader>::new(header_len);
+        let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
             &mut template.as_mut_slice()[..header_len],
         )
         .expect("zeroed bytes are a valid request header");
@@ -266,9 +266,9 @@ mod tests {
 
     #[test]
     fn given_delete_op_when_at_limit_should_pass_the_gate() {
-        let header_len = std::mem::size_of::<RequestHeader>();
-        let mut template = Message::<RequestHeader>::new(header_len);
-        let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+        let header_len = std::mem::size_of::<RoutedRequestHeader>();
+        let mut template = Message::<RoutedRequestHeader>::new(header_len);
+        let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
             &mut template.as_mut_slice()[..header_len],
         )
         .expect("zeroed bytes are a valid request header");

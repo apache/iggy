@@ -53,11 +53,11 @@ jobs:
         run: |
           # The VSR lanes need the vsr feature on both the server and the CLI,
           # otherwise the CLI cannot frame requests for the VSR wire protocol
-          # and the healthcheck ping fails. The Go SDK and the Node SDK speak
-          # only VSR, while the Python wheels, Java SDK, .NET SDK, and C++
-          # bindings are vsr-built, so those suites are always on this branch.
+          # and the healthcheck ping fails. Every foreign SDK speaks only VSR,
+          # so all of their suites are on this branch; only the legacy Rust
+          # lane still builds the legacy server.
           case "${{ inputs.task }}" in
-          bdd-rust-vsr|bdd-go|bdd-go-race|bdd-python|bdd-node|bdd-csharp|bdd-java|bdd-cpp)
+          bdd-rust-vsr|bdd-go|bdd-go-race|bdd-python|bdd-node|bdd-csharp|bdd-java|bdd-cpp|bdd-php)
             # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             SERVER_BIN="iggy-server-ng"
             echo "Building the VSR server binary and CLI (--features vsr) for BDD tests..."
@@ -91,12 +91,12 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
           # Extract SDK name from task (format: bdd-<sdk>, or bdd-<sdk>-vsr
-          # for an explicit vsr lane). Python, Node, C#, Java, and C++ have
-          # no legacy lane, so their plain task names run vsr.
+          # for an explicit vsr lane). Rust is the only SDK with a legacy
+          # lane left; every other plain task name runs vsr.
           SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//; s/-vsr$//')
           EXTRA_FLAGS=()
           case "${{ inputs.task }}" in
-          bdd-rust-vsr|bdd-python|bdd-node|bdd-csharp|bdd-cpp)
+          bdd-rust-vsr|bdd-python|bdd-node|bdd-csharp|bdd-cpp|bdd-php)
             EXTRA_FLAGS+=(--vsr)
             # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
             export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"

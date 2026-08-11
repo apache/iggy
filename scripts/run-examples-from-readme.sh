@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -179,18 +179,23 @@ run_language_examples() {
 
 # shellcheck disable=SC2329
 run_rust_examples() {
-    resolve_server_binary "${TARGET}"
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    resolve_server_binary "${TARGET}" "iggy-server-ng" "vsr"
     resolve_cli_binary "${TARGET}"
 
     # The README documents credentials as <iggy_username>/<iggy_password>
-    # placeholders; the test server starts with iggy/iggy.
+    # placeholders; the test server starts with iggy/iggy. The README keeps
+    # plain cargo run commands, but the CLI and examples must be vsr-built
+    # to speak the VSR server's wire protocol, so the feature is injected
+    # here.
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} --features vsr |g"
         }
     else
         TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
+            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --features vsr |g"
         }
     fi
 
@@ -314,7 +319,12 @@ run_python_examples() {
 
 # shellcheck disable=SC2329
 run_php_examples() {
-    resolve_server_binary "${TARGET}"
+    # The PHP extension is vsr-built, so examples run against the vsr server.
+    # It takes no --fresh flag; cleanup_server_state wiping local_data is the
+    # fresh start.
+    # TODO(hubcio): change to iggy-server once legacy server is removed
+    # (core/server has VSR support)
+    resolve_server_binary "${TARGET}" iggy-server-ng
 
     local php_bin="${PHP:-php}"
     if [ -z "${PHP_IGGY_EXTENSION:-}" ]; then
@@ -350,7 +360,7 @@ run_php_examples() {
         "" \
         "" \
         0 \
-        "--fresh"
+        ""
 }
 
 # shellcheck disable=SC2329

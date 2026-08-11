@@ -50,10 +50,10 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int COMMAND_OFFSET = 60;
     private static final int REQUEST_ID_OFFSET = 168;
     private static final int REQUEST_OPERATION_OFFSET = 176;
-    private static final int REQUEST_CODE_OFFSET = 204;
+    private static final int REQUEST_CODE_OFFSET = 196;
     private static final int REPLY_REQUEST_ID_OFFSET = 200;
     private static final int REPLY_OPERATION_OFFSET = 208;
-    private static final int REPLY_STATUS_OFFSET = 224;
+    private static final int REPLY_STATUS_OFFSET = 216;
 
     private static final int COMMAND_REPLY = 8;
     private static final int OPERATION_REGISTER = 1;

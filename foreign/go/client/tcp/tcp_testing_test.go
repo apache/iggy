@@ -38,13 +38,12 @@ const (
 	frameOffsetClient    = 128
 	frameOffsetRequest   = 168
 	frameOffsetOperation = 176
-	frameOffsetNamespace = 184
-	frameOffsetSession   = 192
-	frameOffsetReserved  = 204
+	frameOffsetSession   = 184
+	frameOffsetReserved  = 196
 
 	replyFrameOffsetRequest   = 200
 	replyFrameOffsetOperation = 208
-	replyFrameOffsetStatus    = 224
+	replyFrameOffsetStatus    = 216
 
 	evictionFrameOffsetVersion    = 144
 	evictionFrameOffsetVersionMin = 148
@@ -67,14 +66,32 @@ func (r request) requestID() uint64 {
 func (r request) sessionID() uint64 {
 	return binary.LittleEndian.Uint64(r.header[frameOffsetSession:])
 }
-func (r request) namespace() uint64 {
-	return binary.LittleEndian.Uint64(r.header[frameOffsetNamespace:])
-}
 func (r request) clientID() vsr.ClientID {
 	return vsr.ClientID{
 		Lo: binary.LittleEndian.Uint64(r.header[frameOffsetClient:]),
 		Hi: binary.LittleEndian.Uint64(r.header[frameOffsetClient+8:]),
 	}
+}
+
+// partitionID reads the resolved partition out of a recorded SendMessages
+// payload: [metadata length u32][stream id][topic id][partitioning], where the
+// identifiers and the partitioning are each [kind u8][length u8][value]. The
+// frame carries no routing namespace, so the payload is the only place the
+// client's partitioning decision is observable.
+func (r request) partitionID(t *testing.T) uint32 {
+	t.Helper()
+
+	cursor := 4
+	for range 2 {
+		require.Greater(t, len(r.payload), cursor+1)
+		cursor += 2 + int(r.payload[cursor+1])
+	}
+	require.Greater(t, len(r.payload), cursor+1)
+	require.Equal(t, byte(iggcon.PartitionIdKind), r.payload[cursor],
+		"the client resolves every strategy to an explicit partition")
+	require.Equal(t, byte(4), r.payload[cursor+1])
+	require.GreaterOrEqual(t, len(r.payload), cursor+6)
+	return binary.LittleEndian.Uint32(r.payload[cursor+2:])
 }
 
 // replyFrame builds a committed reply carrying body.

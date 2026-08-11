@@ -21,7 +21,7 @@
 //! (a fabricated parent stream), `TopicNotFound` (a live stream with a
 //! fabricated topic), or `NameAlreadyExists` (an existing group name).
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -87,7 +87,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.create_consumer_group(&input.stream, &input.topic, &input.name)
 }
 
