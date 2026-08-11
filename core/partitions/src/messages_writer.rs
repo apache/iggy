@@ -25,7 +25,10 @@ use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tracing::error;
+use tracing::{error, warn};
+
+#[cfg(target_os = "linux")]
+use nix::fcntl::{FallocateFlags, fallocate};
 
 const MAX_IOV_COUNT: usize = 1024;
 
@@ -48,6 +51,7 @@ impl MessagesWriter {
         messages_size_bytes: Rc<AtomicU64>,
         fsync: bool,
         file_exists: bool,
+        preallocate_size: Option<IggyByteSize>,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
         opts.write(true);
@@ -58,6 +62,10 @@ impl MessagesWriter {
             .open(file_path)
             .await
             .map_err(|_| IggyError::CannotReadFile)?;
+
+        if let Some(preallocate_size) = preallocate_size {
+            preallocate_file(&file, file_path, preallocate_size.as_bytes_u64());
+        }
 
         if file_exists {
             file.sync_all()
@@ -148,6 +156,39 @@ impl MessagesWriter {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn preallocate_file(file: &File, file_path: &str, len: u64) {
+    let Ok(len) = i64::try_from(len) else {
+        warn!(
+            target: "iggy.partitions.storage",
+            file = file_path,
+            preallocate_len = len,
+            "file preallocation size is unsupported, using buffered allocation"
+        );
+        return;
+    };
+
+    // KEEP_SIZE reserves extents without changing recovery-visible file length.
+    if let Err(error) = fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len) {
+        warn!(
+            target: "iggy.partitions.storage",
+            file = file_path,
+            preallocate_len = len,
+            %error,
+            "file preallocation failed, using buffered allocation"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preallocate_file(_file: &File, file_path: &str, _len: u64) {
+    warn!(
+        target: "iggy.partitions.storage",
+        file = file_path,
+        "file preallocation is unavailable on this platform, using buffered allocation"
+    );
+}
+
 async fn write_frozen_chunked<const ALIGN: usize>(
     file: &File,
     file_path: &str,
@@ -177,4 +218,26 @@ async fn write_frozen_chunked<const ALIGN: usize>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[compio::test]
+    async fn preallocated_file_keeps_logical_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("segment.log");
+        let writer = MessagesWriter::new(
+            path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            false,
+            false,
+            Some(IggyByteSize::from(1024 * 1024_u64)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writer.file.metadata().await.unwrap().len(), 0);
+    }
 }

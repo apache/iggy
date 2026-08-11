@@ -3705,6 +3705,7 @@ where
                 messages_size_bytes,
                 config.enforce_fsync,
                 false,
+                config.preallocate_segments.then_some(config.segment_size),
             )
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
@@ -3956,6 +3957,7 @@ where
                 messages_size_bytes,
                 config.enforce_fsync,
                 false,
+                config.preallocate_segments.then_some(config.segment_size),
             )
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
@@ -6422,6 +6424,7 @@ mod tests {
             enforce_fsync: false,
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024),
+            preallocate_segments: false,
             encryptor: None,
         }
     }

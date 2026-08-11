@@ -552,6 +552,8 @@ size_of_messages_required_to_save = "1 MiB"
 # Example: if `size` is set "1GiB", the actual segment size may be 1GiB + the size of remaining messages in received batch.
 # Maximum size is 1 GiB. Size has to be a multiple of 512 B.
 size = "1 GiB"
+# Reserves segment space in advance when supported by the local filesystem.
+preallocate = true
 
 # Configures whether expired segments are archived (boolean) or just deleted without archiving.
 # Unsupported in server-ng: setting this to `true` aborts boot.

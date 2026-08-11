@@ -1392,6 +1392,29 @@ mod tests {
     }
 
     #[test]
+    fn convert_request_message_rejects_empty_canonical_and_legacy_batches() {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let messages = IggyMessages2::with_capacity(0);
+        let canonical = SendMessages2Owned::from_messages(namespace, &messages)
+            .expect("build empty canonical batch");
+        let mut canonical_body = vec![0; canonical.header.total_size()];
+        canonical
+            .header
+            .encode_into(&mut canonical_body[..COMMAND_HEADER_SIZE]);
+        let legacy_body = legacy_send_messages_body(&messages);
+
+        for mode in [ChecksumMode::Compute, ChecksumMode::Skip] {
+            let canonical_result =
+                convert_request_message(namespace, legacy_request_message(&canonical_body), mode);
+            assert!(matches!(canonical_result, Err(IggyError::InvalidCommand)));
+
+            let legacy_result =
+                convert_request_message(namespace, legacy_request_message(&legacy_body), mode);
+            assert!(matches!(legacy_result, Err(IggyError::InvalidCommand)));
+        }
+    }
+
+    #[test]
     fn convert_request_message_transcodes_legacy_to_canonical_bytes() {
         // Golden: the fused legacy transcode must emit the exact canonical batch
         // the native builder (`from_messages`) produces for the same messages -

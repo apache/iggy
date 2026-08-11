@@ -401,6 +401,11 @@ pub async fn ensure_initial_segment(
                 messages_size_counter,
                 config.system.partition.enforce_fsync,
                 false,
+                config
+                    .system
+                    .segment
+                    .preallocate
+                    .then_some(config.system.segment.size),
             )
             .await
             .map_err(|source| {

@@ -285,6 +285,7 @@ pub fn new_shard(
         enforce_fsync: false, //Disable fsync for simulation
         validate_checksum: true,
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        preallocate_segments: false,
         encryptor: None,
     };
 

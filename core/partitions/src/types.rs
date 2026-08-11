@@ -278,6 +278,8 @@ pub struct PartitionsConfig {
     pub validate_checksum: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
+    /// Whether local message files reserve the configured segment size on open.
+    pub preallocate_segments: bool,
     /// Server-side at-rest encryption. Applied ONCE, on the primary at
     /// ingestion, so the ciphertext replicates verbatim: every replica
     /// journals, acks, and persists identical bytes (checksums and the

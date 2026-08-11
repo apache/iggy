@@ -982,6 +982,58 @@ mod tests {
     }
 
     #[test]
+    fn given_matching_view_when_restamping_should_reuse_frozen_prepare() {
+        let message = prepare_message(9, 7, 11).transmute_header(|old, new: &mut PrepareHeader| {
+            *new = old;
+            new.view = 4;
+        });
+        let frozen = message.into_frozen();
+        let original_ptr = frozen.as_slice().as_ptr();
+
+        let restamped = restamp_prepare_view(frozen, 4).expect("valid prepare");
+        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &restamped[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+
+        assert_eq!(restamped.as_slice().as_ptr(), original_ptr);
+        assert_eq!(header.view, 4);
+    }
+
+    #[test]
+    fn given_new_view_when_restamping_should_only_change_view() {
+        let message = prepare_message(9, 7, 11).transmute_header(|old, new: &mut PrepareHeader| {
+            *new = old;
+            new.view = 4;
+            new.client = 17;
+            new.request = 23;
+        });
+        let expected_identity = message.header().identity_checksum();
+        let expected_op = message.header().op;
+        let expected_client = message.header().client;
+        let expected_request = message.header().request;
+
+        let restamped = restamp_prepare_view(message.into_frozen(), 12).expect("valid prepare");
+        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &restamped[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+
+        assert_eq!(header.view, 12);
+        assert_eq!(header.identity_checksum(), expected_identity);
+        assert_eq!(header.op, expected_op);
+        assert_eq!(header.client, expected_client);
+        assert_eq!(header.request, expected_request);
+    }
+
+    #[test]
+    fn given_truncated_buffer_when_restamping_should_reject() {
+        let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
+
+        assert!(restamp_prepare_view(malformed, 1).is_none());
+    }
+
+    #[test]
     fn given_different_prepares_at_one_op_when_sealing_should_differ() {
         // The distinction the merge depends on: two prepares at one op number are
         // told apart, so a canonical header is distinguishable from a stale one.
