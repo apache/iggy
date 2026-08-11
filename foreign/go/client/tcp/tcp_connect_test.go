@@ -198,7 +198,6 @@ func TestConnect_DiscoversTheLeaderAndSignsIn(t *testing.T) {
 	assert.Zero(t, recorded[1].code(), "only a non-replicated frame carries the code")
 	assert.Zero(t, recorded[1].requestID(), "a register is always request zero")
 	assert.Zero(t, recorded[1].sessionID())
-	assert.Equal(t, uint64(1)<<63, recorded[1].namespace())
 
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(128), client.session.SessionID())

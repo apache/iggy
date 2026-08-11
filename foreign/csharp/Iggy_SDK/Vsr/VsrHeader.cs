@@ -31,17 +31,19 @@ internal static class VsrHeader
     internal const int SIZE_OFFSET = 48;
     internal const int COMMAND_OFFSET = 60;
 
+    // The client wire carries no routing group: the server derives it (plane from
+    // the operation, partition target from the payload) and stamps it into its own
+    // internal header. Every field past the operation therefore sits eight bytes
+    // earlier than it did while the client header still carried one.
     internal const int REQUEST_CLIENT_OFFSET = 128;
     internal const int REQUEST_TIMESTAMP_OFFSET = 160;
     internal const int REQUEST_ID_OFFSET = 168;
     internal const int REQUEST_OPERATION_OFFSET = 176;
-    internal const int REQUEST_NAMESPACE_OFFSET = 184;
-    internal const int REQUEST_SESSION_OFFSET = 192;
-    internal const int REQUEST_RESERVED_OFFSET = 204;
+    internal const int REQUEST_SESSION_OFFSET = 184;
+    internal const int REQUEST_RESERVED_OFFSET = 196;
 
     internal const int REPLY_OPERATION_OFFSET = 208;
-    internal const int REPLY_NAMESPACE_OFFSET = 216;
-    internal const int REPLY_STATUS_OFFSET = 224;
+    internal const int REPLY_STATUS_OFFSET = 216;
 
     internal const int EVICTION_CLIENT_OFFSET = 128;
     internal const int EVICTION_PROTOCOL_VERSION_OFFSET = 144;
@@ -49,8 +51,8 @@ internal static class VsrHeader
     internal const int EVICTION_REASON_OFFSET = 255;
 
     /// <summary>
-    ///     Encodes the request header for a command code, the namespace the caller resolved from its typed
-    ///     identifiers, and the body length. Returns the total frame size (header plus body).
+    ///     Encodes the request header for a classic command code and its body. Returns the total frame size
+    ///     (header plus body).
     /// </summary>
     /// <remarks>
     ///     Everything that can fail runs before a request id is consumed. The primary accepts any id above the
@@ -58,7 +60,7 @@ internal static class VsrHeader
     ///     different request would let the client table answer that request from the first one's cached reply.
     /// </remarks>
     internal static int EncodeRequestHeader(Span<byte> header, ConsensusSession session, int code,
-        ulong partitionNamespace, int bodyLength)
+        ReadOnlySpan<byte> payload)
     {
         if (header.Length < HEADER_SIZE)
         {
@@ -69,15 +71,14 @@ internal static class VsrHeader
         header.Clear();
 
         var operation = VsrOperations.ForCode(code);
-        var ns = VsrNamespace.ForOperation(operation, partitionNamespace);
 
-        if (bodyLength > int.MaxValue - HEADER_SIZE)
+        if (payload.Length > int.MaxValue - HEADER_SIZE)
         {
             throw VsrError.Exception(VsrError.INVALID_COMMAND, "Request body exceeds the maximum frame size.");
         }
 
         var frame = session.Resolve(operation);
-        var totalSize = HEADER_SIZE + bodyLength;
+        var totalSize = HEADER_SIZE + payload.Length;
 
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);
         header[COMMAND_OFFSET] = (byte)Command2.Request;
@@ -85,7 +86,6 @@ internal static class VsrHeader
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_TIMESTAMP_OFFSET..], 0);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_ID_OFFSET..], frame.RequestId);
         header[REQUEST_OPERATION_OFFSET] = (byte)operation;
-        BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_NAMESPACE_OFFSET..], ns);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_SESSION_OFFSET..], frame.SessionId);
 
         if (operation == VsrOperation.NonReplicated)

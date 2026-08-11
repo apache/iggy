@@ -24,7 +24,7 @@
 //! rejection instead of acking a silent no-op). A committed `Ok` shrinks the
 //! shadow's per-topic partition count.
 
-use iggy_binary_protocol::{MAX_PARTITIONS_PER_REQUEST, RequestHeader};
+use iggy_binary_protocol::{MAX_PARTITIONS_PER_REQUEST, RoutedRequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -116,7 +116,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.delete_partitions(&input.stream, &input.topic, input.partitions_count)
 }
 

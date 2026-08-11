@@ -22,17 +22,13 @@ package org.apache.iggy.client.async.tcp.vsr;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
-import org.apache.iggy.exception.IggyErrorCode;
-import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
-import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 class VsrRequestEncoderTest {
 
@@ -41,7 +37,6 @@ class VsrRequestEncoderTest {
     private static final int GET_CLUSTER_METADATA_CODE = 12;
     private static final int CREATE_STREAM_CODE = 202;
     private static final int SEND_MESSAGES_CODE = 101;
-    private static final int DELETE_SEGMENTS_CODE = 503;
 
     private final ConsensusSession session = new ConsensusSession();
     private final VsrRequestEncoder encoder = new VsrRequestEncoder(session);
@@ -59,8 +54,6 @@ class VsrRequestEncoderTest {
                     .isEqualTo((short) VsrOperation.REGISTER);
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isZero();
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isZero();
-            assertThat(frame.getLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET))
-                    .isEqualTo(VsrNamespace.METADATA_CONSENSUS_NAMESPACE);
             assertThat(frame.getUnsignedIntLE(VsrHeaders.SIZE_OFFSET)).isEqualTo(frame.readableBytes());
 
             // Body starts with the ClientVersionInfo prefix.
@@ -83,7 +76,6 @@ class VsrRequestEncoderTest {
                     .isEqualTo((short) VsrOperation.NON_REPLICATED);
             assertThat(frame.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET)).isEqualTo(PING_CODE);
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isZero();
-            assertThat(frame.getLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET)).isZero();
         } finally {
             frame.release();
         }
@@ -121,7 +113,6 @@ class VsrRequestEncoderTest {
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
-            assertThat(second.getLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET)).isZero();
         } finally {
             first.release();
             second.release();
@@ -129,7 +120,9 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldPackNamespaceForSendMessagesWithPartitionId() {
+    void shouldCorrelatePartitionOpsWithoutAdvancingTheDedupRequestId() {
+        // Partition ops replicate in their own group with no client-table dedup, so
+        // they take a correlation id and leave the dedup counter where it was.
         session.beginRegister();
         session.bind(42);
 
@@ -140,10 +133,6 @@ class VsrRequestEncoderTest {
         firstPayload.release();
         secondPayload.release();
         try {
-            long namespace = first.getLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET);
-            assertThat(namespace >> VsrNamespace.STREAM_SHIFT).isEqualTo(2);
-            assertThat((namespace >> VsrNamespace.TOPIC_SHIFT) & 0xFFF).isEqualTo(3);
-            assertThat(namespace & 0xFFFFF).isEqualTo(4);
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
             assertThat(session.currentRequestId()).isEqualTo(1);
@@ -154,87 +143,23 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldRejectBalancedPartitioningAsUnavailable() {
+    void shouldPassPartitioningThroughForTheServerToResolve() {
+        // The client no longer inspects the payload to route: balanced partitioning
+        // reaches the server byte-identical instead of failing at encode time.
         session.beginRegister();
         session.bind(42);
 
         ByteBuf payload = balancedSendMessagesPayload(2, 3);
+        ByteBuf frame = encoder.encode(alloc, SEND_MESSAGES_CODE, payload);
         try {
-            IggyServerException error = catchThrowableOfType(
-                    IggyServerException.class, () -> encoder.encode(alloc, SEND_MESSAGES_CODE, payload));
-            assertThat(error.getRawErrorCode()).isEqualTo(5);
-            assertThat(error.getErrorCode()).isEqualTo(IggyErrorCode.FEATURE_UNAVAILABLE);
-        } finally {
-            payload.release();
-        }
-    }
-
-    @Test
-    void shouldPackNamespaceForDeleteSegments() {
-        session.beginRegister();
-        session.bind(42);
-
-        ByteBuf payload = deleteSegmentsPayload(2, 3, 4);
-        ByteBuf frame = encoder.encode(alloc, DELETE_SEGMENTS_CODE, payload);
-        payload.release();
-        try {
-            long namespace = frame.getLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET);
-            assertThat(namespace >> VsrNamespace.STREAM_SHIFT).isEqualTo(2);
-            assertThat((namespace >> VsrNamespace.TOPIC_SHIFT) & 0xFFF).isEqualTo(3);
-            assertThat(namespace & 0xFFFFF).isEqualTo(4);
+            assertThat(frame.getUnsignedIntLE(VsrHeaders.SIZE_OFFSET)).isEqualTo(frame.readableBytes());
+            byte[] encodedBody = new byte[payload.readableBytes()];
+            frame.getBytes(VsrHeaders.HEADER_SIZE, encodedBody);
+            byte[] originalBody = new byte[payload.readableBytes()];
+            payload.getBytes(payload.readerIndex(), originalBody);
+            assertThat(encodedBody).isEqualTo(originalBody);
         } finally {
             frame.release();
-        }
-    }
-
-    @Test
-    void shouldUseZeroNamespaceForNamedDeleteSegmentsIdentifier() {
-        session.beginRegister();
-        session.bind(42);
-
-        ByteBuf payload = Unpooled.buffer();
-        writeNamedIdentifier(payload, "stream");
-        writeNumericIdentifier(payload, 3);
-        payload.writeIntLE(4);
-        payload.writeIntLE(1);
-        ByteBuf frame = encoder.encode(alloc, DELETE_SEGMENTS_CODE, payload);
-        payload.release();
-        try {
-            assertThat(frame.getLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET)).isZero();
-        } finally {
-            frame.release();
-        }
-    }
-
-    @Test
-    void shouldRejectTruncatedDeleteSegmentsIdentifierWithTypedError() {
-        session.beginRegister();
-        session.bind(42);
-
-        ByteBuf payload = Unpooled.buffer();
-        payload.writeByte(1);
-        payload.writeByte(4);
-        payload.writeShortLE(2);
-        try {
-            assertThatThrownBy(() -> encoder.encode(alloc, DELETE_SEGMENTS_CODE, payload))
-                    .isInstanceOf(IggyInvalidArgumentException.class);
-        } finally {
-            payload.release();
-        }
-    }
-
-    @Test
-    void shouldRejectDeleteSegmentsWithoutPartitionWithTypedError() {
-        session.beginRegister();
-        session.bind(42);
-
-        ByteBuf payload = Unpooled.buffer();
-        writeNumericIdentifier(payload, 2);
-        writeNumericIdentifier(payload, 3);
-        try {
-            assertThatThrownBy(() -> encoder.encode(alloc, DELETE_SEGMENTS_CODE, payload))
-                    .isInstanceOf(IggyInvalidArgumentException.class);
-        } finally {
             payload.release();
         }
     }
@@ -292,25 +217,9 @@ class VsrRequestEncoderTest {
         return payload;
     }
 
-    private static ByteBuf deleteSegmentsPayload(long streamId, long topicId, long partitionId) {
-        ByteBuf payload = Unpooled.buffer();
-        writeNumericIdentifier(payload, streamId);
-        writeNumericIdentifier(payload, topicId);
-        payload.writeIntLE((int) partitionId);
-        payload.writeIntLE(1);
-        return payload;
-    }
-
     private static void writeNumericIdentifier(ByteBuf payload, long id) {
         payload.writeByte(1);
         payload.writeByte(4);
         payload.writeIntLE((int) id);
-    }
-
-    private static void writeNamedIdentifier(ByteBuf payload, String name) {
-        byte[] bytes = name.getBytes(StandardCharsets.UTF_8);
-        payload.writeByte(2);
-        payload.writeByte(bytes.length);
-        payload.writeBytes(bytes);
     }
 }

@@ -23,7 +23,7 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
@@ -359,7 +359,7 @@ where
             // by the moved partition's namespace key in O(1); the previous
             // linear value-scan turned bulk DeleteStream into O(K²) on the
             // pump task, stalling client traffic for ~10k-partition topics.
-            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().namespace());
+            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().group());
             let entry = self.namespace_map_mut().get_mut(&moved_ns).expect(
                 "IggyPartitions invariant: swapped-in partition missing namespace_to_local entry",
             );
@@ -505,8 +505,11 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        let namespace = IggyNamespace::from_raw(message.header().group);
         if self.is_tombstoned(&namespace) {
             warn!(
                 target: "iggy.partitions.diag",
@@ -559,20 +562,20 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare: namespace tombstoned"
             );
             return;
         }
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 operation = ?message.header().operation,
                 "partition not initialized for namespace"
@@ -584,21 +587,21 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare-ok: namespace tombstoned"
             );
             return;
         }
         let config = self.config.clone();
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 "partition not initialized for namespace"
             );
