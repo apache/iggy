@@ -43,12 +43,12 @@ use iggy_binary_protocol::requests::users::{
     UpdatePermissionsRequest, UpdateUserRequest,
 };
 use iggy_binary_protocol::{
-    AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RequestHeader, WireEncode,
+    AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
 use secrecy::SecretString;
-use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
 use std::cell::Cell;
 
@@ -130,7 +130,7 @@ impl SimClient {
     /// offset into a disjoint range ([`PARTITION_ID_BASE`]). A partition id can
     /// therefore never equal a metadata id, so a delayed or duplicated partition
     /// reply is never misattributed to a metadata entry in the auditor's
-    /// `(client, request)` map (which would trip the namespace guard and drop a
+    /// `(client, request)` map (which would trip the group guard and drop a
     /// live metadata op). This holds regardless of reply duplication, not only
     /// while clients are one-in-flight.
     fn request_id_for(&self, operation: Operation) -> u64 {
@@ -162,9 +162,9 @@ impl SimClient {
     /// # Panics
     /// Panics if the register request buffer is invalid.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn register(&self) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
-        let header = RequestHeader {
+    pub fn register(&self) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command2::Request,
             operation: Operation::Register,
             size: header_size as u32,
@@ -173,8 +173,8 @@ impl SimClient {
             request: 0,
             // Register is a vsr-reserved op: the shard router picks its
             // target by comparing this against the metadata consensus
-            // namespace, not by op class.
-            namespace: METADATA_CONSENSUS_NAMESPACE,
+            // group, not by op class.
+            group: METADATA_GROUP,
             ..Default::default()
         };
 
@@ -198,7 +198,7 @@ impl SimClient {
     /// Panics if a credential exceeds the wire name/secret bounds or the
     /// request buffer is invalid.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn login(&self, username: &str, password: &str) -> Message<RequestHeader> {
+    pub fn login(&self, username: &str, password: &str) -> Message<RoutedRequestHeader> {
         let body = LoginRegisterRequest {
             version_info: ClientVersionInfo {
                 protocol_version: IGGY_PROTOCOL_VERSION,
@@ -211,16 +211,16 @@ impl SimClient {
         }
         .to_bytes();
 
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
-        let header = RequestHeader {
+        let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command2::Request,
             operation: Operation::Register,
             size: total_size as u32,
             client: self.client_id,
             session: 0,
             request: 0,
-            namespace: METADATA_CONSENSUS_NAMESPACE,
+            group: METADATA_GROUP,
             ..Default::default()
         };
 
@@ -233,7 +233,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if the stream name is not a valid wire name.
-    pub fn create_stream(&self, name: &str) -> Message<RequestHeader> {
+    pub fn create_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
         let wire = CreateStreamRequest {
             name: WireName::new(name).expect("stream name must be valid"),
         };
@@ -244,7 +244,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if the stream name cannot be converted to a `WireIdentifier`.
-    pub fn delete_stream(&self, name: &str) -> Message<RequestHeader> {
+    pub fn delete_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
         let wire = DeleteStreamRequest {
             stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
         };
@@ -256,7 +256,7 @@ impl SimClient {
     /// # Panics
     /// Panics if the new name or the existing stream name is not a valid
     /// `WireName`.
-    pub fn update_stream(&self, stream: &str, new_name: &str) -> Message<RequestHeader> {
+    pub fn update_stream(&self, stream: &str, new_name: &str) -> Message<RoutedRequestHeader> {
         let wire = UpdateStreamRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             name: WireName::new(new_name).expect("stream name must be valid"),
@@ -266,7 +266,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `stream` is not a valid `WireName`.
-    pub fn purge_stream(&self, stream: &str) -> Message<RequestHeader> {
+    pub fn purge_stream(&self, stream: &str) -> Message<RoutedRequestHeader> {
         let wire = PurgeStreamRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
         };
@@ -280,7 +280,7 @@ impl SimClient {
         stream: &str,
         name: &str,
         partitions_count: u32,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
@@ -300,7 +300,7 @@ impl SimClient {
         stream: &str,
         topic: &str,
         new_name: &str,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = UpdateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -315,7 +315,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `stream` or `topic` is not a valid `WireName`.
-    pub fn delete_topic(&self, stream: &str, topic: &str) -> Message<RequestHeader> {
+    pub fn delete_topic(&self, stream: &str, topic: &str) -> Message<RoutedRequestHeader> {
         let wire = DeleteTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -325,7 +325,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `stream` or `topic` is not a valid `WireName`.
-    pub fn purge_topic(&self, stream: &str, topic: &str) -> Message<RequestHeader> {
+    pub fn purge_topic(&self, stream: &str, topic: &str) -> Message<RoutedRequestHeader> {
         let wire = PurgeTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -340,7 +340,7 @@ impl SimClient {
         stream: &str,
         topic: &str,
         partitions_count: u32,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreatePartitionsRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -356,7 +356,7 @@ impl SimClient {
         stream: &str,
         topic: &str,
         partitions_count: u32,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = DeletePartitionsRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -373,7 +373,7 @@ impl SimClient {
         topic: &str,
         partition_id: u32,
         segments_count: u32,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = DeleteSegmentsRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -390,7 +390,7 @@ impl SimClient {
         stream: &str,
         topic: &str,
         name: &str,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateConsumerGroupRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -406,7 +406,7 @@ impl SimClient {
         stream: &str,
         topic: &str,
         group: &str,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = DeleteConsumerGroupRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
@@ -422,7 +422,7 @@ impl SimClient {
         username: &str,
         password: &str,
         status: u8,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateUserRequest {
             username: WireName::new(username).expect("username must be valid"),
             password: password.to_string(),
@@ -440,7 +440,7 @@ impl SimClient {
         user: &str,
         new_username: Option<&str>,
         status: Option<u8>,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = UpdateUserRequest {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
             username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
@@ -451,7 +451,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `user` is not a valid `WireName`.
-    pub fn delete_user(&self, user: &str) -> Message<RequestHeader> {
+    pub fn delete_user(&self, user: &str) -> Message<RoutedRequestHeader> {
         let wire = DeleteUserRequest {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
         };
@@ -465,7 +465,7 @@ impl SimClient {
         user: &str,
         current_password: &str,
         new_password: &str,
-    ) -> Message<RequestHeader> {
+    ) -> Message<RoutedRequestHeader> {
         let wire = ChangePasswordRequest {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
             current_password: current_password.to_string(),
@@ -476,7 +476,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `user` is not a valid `WireName`.
-    pub fn update_permissions(&self, user: &str) -> Message<RequestHeader> {
+    pub fn update_permissions(&self, user: &str) -> Message<RoutedRequestHeader> {
         let wire = UpdatePermissionsRequest {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
             permissions: None,
@@ -486,7 +486,11 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `name` is not a valid `WireName`.
-    pub fn create_personal_access_token(&self, name: &str, expiry: u64) -> Message<RequestHeader> {
+    pub fn create_personal_access_token(
+        &self,
+        name: &str,
+        expiry: u64,
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreatePersonalAccessTokenRequest {
             user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
@@ -502,7 +506,7 @@ impl SimClient {
 
     /// # Panics
     /// Panics if `name` is not a valid `WireName`.
-    pub fn delete_personal_access_token(&self, name: &str) -> Message<RequestHeader> {
+    pub fn delete_personal_access_token(&self, name: &str) -> Message<RoutedRequestHeader> {
         let wire = DeletePersonalAccessTokenRequest {
             user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
@@ -519,16 +523,16 @@ impl SimClient {
     /// path converts it to `SendMessages2` via `transcode_legacy_request`.
     ///
     /// # Panics
-    /// Panics if a namespace id exceeds `u32` or the request buffer is invalid.
+    /// Panics if a group id exceeds `u32` or the request buffer is invalid.
     pub fn send_messages(
         &self,
-        namespace: IggyNamespace,
+        group: IggyNamespace,
         messages: &[Bytes],
-    ) -> Message<RequestHeader> {
-        let to_u32 = |v: usize| u32::try_from(v).expect("namespace id fits u32");
-        let stream_id = WireIdentifier::Numeric(to_u32(namespace.stream_id()));
-        let topic_id = WireIdentifier::Numeric(to_u32(namespace.topic_id()));
-        let partitioning = WirePartitioning::PartitionId(to_u32(namespace.partition_id()));
+    ) -> Message<RoutedRequestHeader> {
+        let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
+        let stream_id = WireIdentifier::Numeric(to_u32(group.stream_id()));
+        let topic_id = WireIdentifier::Numeric(to_u32(group.topic_id()));
+        let partitioning = WirePartitioning::PartitionId(to_u32(group.partition_id()));
 
         // Stamp a deterministic, non-zero id per message. `id: 0` (the real
         // SDK's server-assigned path) would make the server mint an unseeded
@@ -549,11 +553,11 @@ impl SimClient {
         let mut buf = BytesMut::with_capacity(size);
         SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw);
 
-        self.build_request_with_namespace(Operation::SendMessages, &buf, namespace)
+        self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }
 
     /// Build a `POLL_MESSAGES` request for an individual consumer, reading
-    /// `count` messages from offset 0 of `namespace`'s partition.
+    /// `count` messages from offset 0 of `group`'s partition.
     ///
     /// A `NonReplicated` read: the command code sits in the header's
     /// `reserved` prefix, and the request id ECHOES the current metadata
@@ -564,8 +568,8 @@ impl SimClient {
     /// # Panics
     /// Panics if the session is unbound or the request buffer is invalid.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn poll_messages(&self, namespace: IggyNamespace, count: u32) -> Message<RequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+    pub fn poll_messages(&self, group: IggyNamespace, count: u32) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
         let body = PollMessagesRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(self.client_id as u32)),
             stream_id,
@@ -577,11 +581,11 @@ impl SimClient {
         }
         .to_bytes();
 
-        let header_size = std::mem::size_of::<RequestHeader>();
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
         let mut reserved = [0u8; 52];
         reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
-        let header = RequestHeader {
+        let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command2::Request,
             operation: Operation::NonReplicated,
             size: total_size as u32,
@@ -589,7 +593,7 @@ impl SimClient {
             session: self.session_id(),
             request: self.request_counter.get(),
             reserved,
-            namespace: namespace.inner(),
+            group: group.inner(),
             ..Default::default()
         };
 
@@ -602,12 +606,12 @@ impl SimClient {
 
     pub fn store_consumer_offset(
         &self,
-        namespace: IggyNamespace,
+        group: IggyNamespace,
         consumer_kind: u8,
         consumer_id: u32,
         offset: u64,
-    ) -> Message<RequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
         let request = StoreConsumerOffsetRequest {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
@@ -618,17 +622,17 @@ impl SimClient {
         self.build_request_with_namespace(
             Operation::StoreConsumerOffset,
             &request.to_bytes(),
-            namespace,
+            group,
         )
     }
 
     pub fn delete_consumer_offset(
         &self,
-        namespace: IggyNamespace,
+        group: IggyNamespace,
         consumer_kind: u8,
         consumer_id: u32,
-    ) -> Message<RequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
         let request = DeleteConsumerOffsetRequest {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
@@ -638,7 +642,7 @@ impl SimClient {
         self.build_request_with_namespace(
             Operation::DeleteConsumerOffset,
             &request.to_bytes(),
-            namespace,
+            group,
         )
     }
 
@@ -647,16 +651,16 @@ impl SimClient {
     ///
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
-    /// `Message<RequestHeader>` parse; both are simulator misconfig.
+    /// `Message<RoutedRequestHeader>` parse; both are simulator misconfig.
     pub fn store_consumer_offset_2(
         &self,
-        namespace: IggyNamespace,
+        group: IggyNamespace,
         consumer_kind: u8,
         consumer_id: u32,
         offset: u64,
         ack: AckLevel,
-    ) -> Message<RequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
         let request = StoreConsumerOffset2Request {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
@@ -668,7 +672,7 @@ impl SimClient {
         self.build_request_with_namespace(
             Operation::StoreConsumerOffset2,
             &request.to_bytes(),
-            namespace,
+            group,
         )
     }
 
@@ -676,15 +680,15 @@ impl SimClient {
     ///
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
-    /// `Message<RequestHeader>` parse; both are simulator misconfig.
+    /// `Message<RoutedRequestHeader>` parse; both are simulator misconfig.
     pub fn delete_consumer_offset_2(
         &self,
-        namespace: IggyNamespace,
+        group: IggyNamespace,
         consumer_kind: u8,
         consumer_id: u32,
         ack: AckLevel,
-    ) -> Message<RequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
         let request = DeleteConsumerOffset2Request {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
@@ -695,7 +699,7 @@ impl SimClient {
         self.build_request_with_namespace(
             Operation::DeleteConsumerOffset2,
             &request.to_bytes(),
-            namespace,
+            group,
         )
     }
 
@@ -703,12 +707,12 @@ impl SimClient {
         &self,
         operation: Operation,
         payload: &[u8],
-        namespace: IggyNamespace,
-    ) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
+        group: IggyNamespace,
+    ) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = self.header(operation, namespace.inner(), total_size);
+        let header = self.header(operation, group.inner(), total_size);
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -719,14 +723,14 @@ impl SimClient {
             .expect("request buffer must contain a valid request message")
     }
 
-    fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
+    fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + payload.len();
 
         // Every `build_request` caller is a metadata-plane op (partition
         // ops go through `build_request_with_namespace`), and metadata
-        // requests carry the metadata consensus namespace on the wire.
-        let header = self.header(operation, METADATA_CONSENSUS_NAMESPACE, total_size);
+        // requests carry the metadata consensus group on the wire.
+        let header = self.header(operation, METADATA_GROUP, total_size);
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -738,8 +742,8 @@ impl SimClient {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn header(&self, operation: Operation, namespace: u64, total_size: usize) -> RequestHeader {
-        RequestHeader {
+    fn header(&self, operation: Operation, group: u64, total_size: usize) -> RoutedRequestHeader {
+        RoutedRequestHeader {
             command: iggy_binary_protocol::Command2::Request,
             operation,
             size: total_size as u32,
@@ -755,7 +759,7 @@ impl SimClient {
             timestamp: 0, // TODO: Use actual timestamp
             session: self.session_id(),
             request: self.request_id_for(operation),
-            namespace,
+            group,
             ..Default::default()
         }
     }
@@ -772,11 +776,11 @@ const fn namespace_consumer(kind: u8, consumer_id: u32) -> WireConsumer {
     }
 }
 
-/// Decompose a namespace into the `(stream_id, topic_id, partition_id)` wire
+/// Decompose a group into the `(stream_id, topic_id, partition_id)` wire
 /// identifiers the consumer-offset requests carry. Namespace ids are small
 /// test values that always fit `u32`.
 fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u32>) {
-    let to_u32 = |v: usize| u32::try_from(v).expect("namespace id fits u32");
+    let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
     (
         WireIdentifier::Numeric(to_u32(ns.stream_id())),
         WireIdentifier::Numeric(to_u32(ns.topic_id())),

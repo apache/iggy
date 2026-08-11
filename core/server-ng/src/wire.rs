@@ -21,13 +21,13 @@
 //! transport-kind discriminant mapping.
 
 use bytes::Bytes;
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use server_common::Message;
 
-pub(crate) fn request_body(request: &Message<RequestHeader>) -> &[u8] {
-    &request.as_slice()[std::mem::size_of::<RequestHeader>()..request.header().size as usize]
+pub(crate) fn request_body(request: &Message<RoutedRequestHeader>) -> &[u8] {
+    &request.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..request.header().size as usize]
 }
 
 /// Check a client's `request_checksum` against the body it stamps.
@@ -38,7 +38,9 @@ pub(crate) fn request_body(request: &Message<RequestHeader>) -> &[u8] {
 ///
 /// # Errors
 /// [`IggyError::InvalidFormat`] when the stamp disagrees with the body.
-pub(crate) fn verify_request_checksum(request: &Message<RequestHeader>) -> Result<(), IggyError> {
+pub(crate) fn verify_request_checksum(
+    request: &Message<RoutedRequestHeader>,
+) -> Result<(), IggyError> {
     let stamped = request.header().request_checksum;
     if stamped == 0 || u128::from(iggy_common::calculate_checksum(request_body(request))) == stamped
     {
@@ -68,29 +70,29 @@ pub(crate) fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
 /// request rewrites that swap a secret-bearing wire body for the
 /// hash-carrying replicated body before consensus.
 pub(crate) fn rewrite_request_body(
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     body: &Bytes,
-) -> Result<Message<RequestHeader>, IggyError> {
-    let total_size = std::mem::size_of::<RequestHeader>()
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
+    let total_size = std::mem::size_of::<RoutedRequestHeader>()
         .checked_add(body.len())
         .ok_or(IggyError::InvalidConfiguration)?;
     let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut rewritten = Message::<RequestHeader>::new(total_size);
-    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
-        &mut rewritten.as_mut_slice()[..std::mem::size_of::<RequestHeader>()],
+    let mut rewritten = Message::<RoutedRequestHeader>::new(total_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+        &mut rewritten.as_mut_slice()[..std::mem::size_of::<RoutedRequestHeader>()],
     )
     .expect("zeroed bytes are a valid request header");
     *header = *request.header();
     header.size = size;
     // Both describe the body just replaced, and nothing recomputes them for a
-    // `RequestHeader` -- the prepare projection derives its own `checksum_body`
+    // `RoutedRequestHeader` -- the prepare projection derives its own `checksum_body`
     // downstream. Clear rather than recompute; carrying them forward is a stale claim.
     header.checksum = 0;
     header.checksum_body = 0;
     // `request_checksum` is deliberately NOT touched: it stamps what the CLIENT sent,
     // already validated at admission. Re-stamping it over the substituted body would
     // make the client-table reuse check compare a value no client ever produced.
-    rewritten.as_mut_slice()[std::mem::size_of::<RequestHeader>()..].copy_from_slice(body);
+    rewritten.as_mut_slice()[std::mem::size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
     Ok(rewritten)
 }
 
@@ -98,14 +100,14 @@ pub(crate) fn rewrite_request_body(
 mod tests {
     use super::{request_body, rewrite_request_body};
     use bytes::Bytes;
-    use iggy_binary_protocol::{Command2, Operation, RequestHeader};
+    use iggy_binary_protocol::{Command2, Operation, RoutedRequestHeader};
     use server_common::Message;
     use std::mem::size_of;
 
-    fn request(body: &[u8], request_checksum: u128) -> Message<RequestHeader> {
-        let total_size = size_of::<RequestHeader>() + body.len();
-        let mut message = Message::<RequestHeader>::new(total_size).transmute_header(
-            |_, header: &mut RequestHeader| {
+    fn request(body: &[u8], request_checksum: u128) -> Message<RoutedRequestHeader> {
+        let total_size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut message = Message::<RoutedRequestHeader>::new(total_size).transmute_header(
+            |_, header: &mut RoutedRequestHeader| {
                 header.command = Command2::Request;
                 header.operation = Operation::CreateStream;
                 header.client = 1;
@@ -117,7 +119,7 @@ mod tests {
                 header.checksum_body = 0xbeef;
             },
         );
-        message.as_mut_slice()[size_of::<RequestHeader>()..].copy_from_slice(body);
+        message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
         message
     }
 
@@ -141,7 +143,7 @@ mod tests {
         assert_eq!(request_body(&rewritten), b"argon2-hash");
         assert_eq!(
             rewritten.header().size as usize,
-            size_of::<RequestHeader>() + b"argon2-hash".len(),
+            size_of::<RoutedRequestHeader>() + b"argon2-hash".len(),
             "`size` follows the new body, so `request_body` bounds it correctly"
         );
     }

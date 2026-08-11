@@ -36,18 +36,20 @@ public final class VsrHeaders {
     static final int SIZE_OFFSET = 48;
     static final int COMMAND_OFFSET = 60;
 
-    // RequestHeader
+    // RequestHeader. The client wire carries no routing group: the server
+    // derives it (plane from the operation, partition target from the payload),
+    // so every field past the operation sits eight bytes earlier than it did
+    // while the header still carried one.
     static final int REQUEST_CLIENT_OFFSET = 128;
     static final int REQUEST_ID_OFFSET = 168;
     static final int REQUEST_OPERATION_OFFSET = 176;
-    static final int REQUEST_NAMESPACE_OFFSET = 184;
-    static final int REQUEST_SESSION_OFFSET = 192;
-    static final int REQUEST_RESERVED_CODE_OFFSET = 204;
+    static final int REQUEST_SESSION_OFFSET = 184;
+    static final int REQUEST_RESERVED_CODE_OFFSET = 196;
 
     // ReplyHeader
     static final int REPLY_REQUEST_OFFSET = 200;
     static final int REPLY_OPERATION_OFFSET = 208;
-    static final int REPLY_STATUS_OFFSET = 224;
+    static final int REPLY_STATUS_OFFSET = 216;
 
     // EvictionHeader
     static final int EVICTION_PROTOCOL_VERSION_OFFSET = 144;
@@ -75,7 +77,6 @@ public final class VsrHeaders {
     // core/common/src/error/eviction.rs.
     static final int ERROR_INVALID_COMMAND = 3;
     static final int ERROR_INVALID_FORMAT = 4;
-    static final int ERROR_FEATURE_UNAVAILABLE = 5;
     static final int ERROR_STALE_CLIENT = 30;
     static final int ERROR_UNAUTHENTICATED = 40;
     static final int ERROR_INVALID_CREDENTIALS = 42;

@@ -59,11 +59,10 @@ func createClient() iggcon.Client {
 	return cli
 }
 
-// maxRoutableId is the highest stream or topic id the wire namespace can
-// address. A larger id cannot be routed at all, so the SDK rejects it before
-// it reaches the server. Specs that want an id the server has never seen must
-// stay inside this range to get the server's answer rather than a local
-// rejection.
+// maxRoutableId is the highest stream or topic id the server's routing
+// namespace can address. A larger id cannot be routed at all, so specs that
+// want an id the server has never seen must stay inside this range to get the
+// server's answer rather than a routing failure.
 const maxRoutableId = 4095
 
 func createRandomUInt32() uint32 {

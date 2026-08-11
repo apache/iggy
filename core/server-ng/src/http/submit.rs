@@ -26,7 +26,7 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command2;
-use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
 use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
@@ -98,7 +98,7 @@ pub(in crate::http) async fn submit_committed(
     session: &Rc<HttpSession>,
     operation: Operation,
     body: &[u8],
-) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
+) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     // Control writes are authorized in-apply on the metadata STM: a denial
     // comes back as `Unauthorized` in the committed result section, which
     // `committed_payload` maps to a 403. No pre-submit gate here, so the
@@ -183,7 +183,7 @@ async fn submit_gated(
     operation: Operation,
     max_tokens_per_user: u32,
     body: &[u8],
-) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
+) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
     // Burn the id at stamp time: every exit below (rewrite rejection,
     // unresolved delete-segments, unanswered submit, exhausted transient
@@ -464,7 +464,7 @@ pub(in crate::http) async fn produce_unacked(
 /// Install this session's in-process reply target on first data-plane use.
 ///
 /// The registry key is the session's shard-0 client id - the same id stamped
-/// into `RequestHeader.client` - so a partition reply routed through
+/// into `RoutedRequestHeader.client` - so a partition reply routed through
 /// `send_to_client` lands on this entry and resolves the request-keyed slot.
 /// `None` from the registry means the key is already occupied; treat it as
 /// installed but leave the token unset so this session never tears down an

@@ -23,7 +23,7 @@
 //! `Ok` grows the shadow's per-topic partition count, which
 //! `delete_partitions` samples against.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -87,7 +87,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.create_partitions(&input.stream, &input.topic, input.partitions_count)
 }
 

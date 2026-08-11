@@ -88,7 +88,6 @@ public final class VsrRequestEncoder {
         }
 
         try {
-            long namespace = VsrNamespace.namespaceFor(operation, commandCode, body);
             int totalSize = VsrHeaders.HEADER_SIZE + body.readableBytes();
             ByteBuf frame = alloc.buffer(totalSize);
             frame.writeZero(VsrHeaders.HEADER_SIZE);
@@ -98,7 +97,6 @@ public final class VsrRequestEncoder {
             frame.setLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET + 8, session.clientIdHigh());
             frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
             frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
-            frame.setLongLE(VsrHeaders.REQUEST_NAMESPACE_OFFSET, namespace);
             frame.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
             if (operation == VsrOperation.NON_REPLICATED) {
                 frame.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, commandCode);

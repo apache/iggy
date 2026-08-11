@@ -21,7 +21,7 @@ use crate::{
 };
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
-    RequestHeader, frame_body,
+    RoutedRequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
 use server_common::{Message, iobuf::Owned};
@@ -399,7 +399,6 @@ where
         timestamp: prepare_header.timestamp,
         request: prepare_header.request,
         operation: prepare_header.operation,
-        namespace: prepare_header.namespace,
         ..Default::default()
     };
     // `BytesMut` makes no alignment guarantee, so never cast into it.
@@ -434,7 +433,7 @@ where
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn build_result_rejection_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     commit: u64,
     code: u32,
 ) -> Message<ReplyHeader> {
@@ -462,7 +461,6 @@ pub fn build_result_rejection_reply(
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
@@ -486,7 +484,7 @@ pub fn build_result_rejection_reply(
 #[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 pub fn build_reply_from_request<B, P>(
     consensus: &VsrConsensus<B, P>,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     body: bytes::Bytes,
 ) -> Message<ReplyHeader>
 where
@@ -516,7 +514,6 @@ where
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
@@ -542,7 +539,7 @@ where
 /// If the constructed message buffer is not valid.
 pub fn build_deny_reply_from_request<B, P>(
     consensus: &VsrConsensus<B, P>,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     status: u32,
 ) -> Message<ReplyHeader>
 where
@@ -561,7 +558,7 @@ where
 }
 
 /// [`build_deny_reply_from_request`] for layers that hold no consensus group
-/// for the request's namespace (a shard fencing a frame aimed at a torn-down
+/// for the request's group (a shard fencing a frame aimed at a torn-down
 /// or never-materialised partition).
 ///
 /// Replica-stamped fields (`cluster`, `view`, `replica`) echo the request
@@ -574,7 +571,7 @@ where
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn build_deny_reply_from_request_header(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     status: u32,
 ) -> Message<ReplyHeader> {
     let header_size = std::mem::size_of::<ReplyHeader>();
@@ -593,7 +590,6 @@ pub fn build_deny_reply_from_request_header(
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
@@ -670,7 +666,7 @@ pub async fn send_prepare_ok<B, P>(
         prepare_checksum: header.checksum,
         request: header.request,
         operation: header.operation,
-        namespace: header.namespace,
+        group: header.group,
         size: std::mem::size_of::<PrepareOkHeader>() as u32,
         ..Default::default()
     };
@@ -815,7 +811,7 @@ mod tests {
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
-                    new.namespace = 0;
+                    new.group = 0;
                 });
         let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
 
@@ -855,7 +851,7 @@ mod tests {
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
-                    new.namespace = 0;
+                    new.group = 0;
                 });
         let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
 
@@ -886,7 +882,7 @@ mod tests {
             reserved_frame: [0; 66],
             op: dvc_op,
             commit,
-            namespace: 0,
+            group: 0,
             log_view: 0,
             reserved: [0; 68],
             nack_bitset: 0,
@@ -1064,7 +1060,7 @@ mod tests {
             reserved_frame: [0; 66],
             op,
             commit,
-            namespace: 0,
+            group: 0,
             log_view,
             reserved: [0; 68],
             nack_bitset: 0,
@@ -1120,7 +1116,7 @@ mod tests {
             command: Command2::StartViewChange,
             replica,
             reserved_frame: [0; 66],
-            namespace: 0,
+            group: 0,
             reserved: [0; 120],
         }
     }
@@ -1415,7 +1411,7 @@ mod tests {
             reserved_frame: [0; 66],
             op,
             commit,
-            namespace: 0,
+            group: 0,
             reserved: [0; 88],
             incarnation: 0,
         };
@@ -1766,12 +1762,11 @@ mod tests {
         consensus.init();
         consensus.advance_commit_max(4);
 
-        let request = RequestHeader {
+        let request = RoutedRequestHeader {
             command: Command2::Request,
             operation: Operation::DeleteConsumerOffset2,
             client: 42,
             request: 7,
-            namespace: 9,
             ..Default::default()
         };
         let status = 3021;
@@ -1784,7 +1779,6 @@ mod tests {
         assert_eq!(header.commit, 4);
         assert_eq!(header.client, 42);
         assert_eq!(header.request, 7);
-        assert_eq!(header.namespace, 9);
         assert_eq!(header.operation, Operation::DeleteConsumerOffset2);
         assert_eq!(
             header.size as usize,

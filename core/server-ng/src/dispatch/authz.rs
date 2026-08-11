@@ -38,7 +38,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
 };
 use iggy_binary_protocol::requests::streams::GetStreamRequest;
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
-use iggy_binary_protocol::{Operation, PrepareHeader, RequestHeader, WireDecode, WireIdentifier};
+use iggy_binary_protocol::{
+    Operation, PrepareHeader, RoutedRequestHeader, WireDecode, WireIdentifier,
+};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -139,7 +141,7 @@ where
 pub(super) async fn send_partition_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     status: u32,
 ) where
     B: ShellBus,
@@ -299,7 +301,7 @@ where
 #[allow(clippy::future_not_send)]
 pub(super) async fn send_non_replicated_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: &Message<RequestHeader>,
+    request: &Message<RoutedRequestHeader>,
     transport_client_id: u128,
     status: u32,
 ) where
