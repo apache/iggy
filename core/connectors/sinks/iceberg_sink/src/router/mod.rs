@@ -20,15 +20,15 @@ use crate::slice_user_table;
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 use iceberg::TableIdent;
-use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
     Catalog,
@@ -140,13 +140,10 @@ async fn write_data(
     let partition_spec = table.metadata().default_partition_spec();
 
     let data_files = if partition_spec.is_unpartitioned() {
-        let mut writer = data_file_writer_builder
-            .build(None)
-            .await
-            .map_err(|err| {
-                error!("Error while constructing data file writer: {}", err);
-                Error::InitError(err.to_string())
-            })?;
+        let mut writer = data_file_writer_builder.build(None).await.map_err(|err| {
+            error!("Error while constructing data file writer: {}", err);
+            Error::InitError(err.to_string())
+        })?;
 
         let write_result: Result<(), Error> = async {
             for batch in reader {
