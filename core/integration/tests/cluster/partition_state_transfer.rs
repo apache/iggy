@@ -125,7 +125,8 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
     await_marker(harness, 2, INSTALL_MARKER).await;
 
     // Disk proof on the rejoined node: transferred segment bytes and a
-    // persisted consumer-offset file (a single LE u64).
+    // persisted consumer-offset file (leading LE u64 offset, trailing
+    // checksum; see `partitions::offset_storage::encode_offset_record`).
     let data_path = harness.node(2).data_path();
     // Each transferred batch is at least its 256-byte header; anything below
     // this floor is a truncated install, not the seeded 200 batches.
@@ -145,8 +146,11 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
     let offsets_file = find_consumer_offset_file(&data_path)
         .expect("transferred consumer offset file exists on node 2");
     let bytes = std::fs::read(&offsets_file).expect("read transferred consumer offset");
+    let offset_bytes = bytes
+        .first_chunk::<8>()
+        .expect("offset file starts with a u64 offset");
     assert_eq!(
-        u64::from_le_bytes(bytes.as_slice().try_into().expect("offset file is one u64")),
+        u64::from_le_bytes(*offset_bytes),
         STORED_CONSUMER_OFFSET,
         "the stored consumer offset must survive the transfer"
     );
@@ -608,7 +612,7 @@ fn find_consumer_offset_file(root: &Path) -> Option<PathBuf> {
         path.parent()
             .and_then(Path::file_name)
             .is_some_and(|name| name == "consumers")
-            && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 8)
+            && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() >= 8)
     })
 }
 

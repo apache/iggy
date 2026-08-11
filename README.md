@@ -279,7 +279,7 @@ it should only be used for development and testing.
 
 `cargo run --bin iggy-server -- --with-default-root-credentials`
 
-Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables will have no effect. To reset credentials, delete the data directory.
+Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables are ignored. They are still validated, though: a half-set pair or an out-of-range value aborts the boot instead of being silently dropped. To reset credentials, delete the data directory.
 
 For configuration options and detailed help:
 

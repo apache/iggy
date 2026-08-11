@@ -4596,10 +4596,22 @@ where
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
             reconcile_partition_view_divergence(self.id, partition, &pending).await;
-            // Identity, not presence: see the metadata twin.
+            // Identity, not presence: see the metadata twin. The floor is the local
+            // commit point, the partition twin of the metadata snapshot floor:
+            // `evict_prefix` clears the header vec for the flushed (committed)
+            // prefix, so a survivor that flushes on every commit holds NO resident
+            // header for the op the merged window opens on. Demanding one parks the
+            // primary-elect in `ViewChange` forever, and the rotation lands
+            // primaryship on whichever replica still has its window resident -- a
+            // fresh rejoiner with nothing but repair-ingested entries, which then
+            // cannot serve the state transfer it itself needs. A committed op
+            // cannot diverge from the merged log, and its bytes stay serveable
+            // from the evicted ring or the flushed segments.
             let missing = {
                 let journal = partition.log.journal();
-                first_op_not_covered(&pending, 0, |op| journal.inner.header_by_op(op))
+                first_op_not_covered(&pending, consensus.commit_min(), |op| {
+                    journal.inner.header_by_op(op)
+                })
             };
             if let Some(missing_op) = missing {
                 tracing::debug!(
@@ -6650,6 +6662,10 @@ where
                         h.artifact = header.artifact;
                         h.offset = header.offset;
                         h.size = total_size as u32;
+                        // `StateChunk` is `FRAME_SEALED`: the receiver's router
+                        // drops an unsealed frame before any handler sees it, so
+                        // a missing seal starves the pull silently.
+                        h.seal();
                     },
                 ))))
             };
@@ -8565,8 +8581,13 @@ const fn header_is_view_entry(local: &PrepareHeader, canonical: &PrepareHeader) 
 ///
 /// Covers every op the merged log names, including headers inherited from senders
 /// behind the canonical `log_view`, which sit below the canonical window where header
-/// repair cannot walk back to them. `repair_floor` drops the ones compacted under a
-/// snapshot, which no repair can put back.
+/// repair cannot walk back to them. `repair_floor` drops the ops whose journal entry
+/// is legitimately gone AND whose identity is already settled: on the metadata plane
+/// ops compacted under a snapshot, on the partition plane ops at or below the local
+/// commit point, whose flushed entries `evict_prefix` moves out of the header vec.
+/// Neither can diverge from the merged log (a committed or compacted op is the
+/// quorum's op), and no repair puts the journal entry back, so demanding one parks
+/// the view change forever.
 fn first_op_not_covered(
     pending: &MergedLog,
     repair_floor: u64,
@@ -8583,7 +8604,7 @@ fn first_op_not_covered(
             .find(|header| header.op == op)
             .is_none_or(|canonical| header_is_view_entry(&local, canonical))
     };
-    (pending.commit_max.max(1)..=pending.op_head)
+    (pending.commit_max.max(1).max(repair_floor + 1)..=pending.op_head)
         .find(|op| !held(*op))
         .or_else(|| {
             pending
@@ -9206,6 +9227,35 @@ mod view_coverage_tests {
             held.iter().find(|header| header.op == op).copied()
         });
         assert_eq!(missing, Some(99));
+    }
+
+    #[test]
+    fn given_an_evicted_committed_window_when_floored_should_start_the_view() {
+        // The wedge behind the partition_state_transfer regressions: a survivor
+        // that flushes on every commit holds NO resident journal header (the
+        // flush evicts them), so a merged window opening on its own committed op
+        // reads as a hole nothing can fill -- no repair re-journals a committed
+        // op. The floor (local commit point) must count it as covered, or the
+        // primary-elect parks in `ViewChange` forever and the rotation hands
+        // primaryship to an empty rejoiner that then cannot be served the state
+        // transfer it needs.
+        let pending = MergedLog {
+            op_head: 256,
+            commit_max: 256,
+            headers: vec![sealed(256, 1)],
+            committed_elsewhere: Vec::new(),
+        };
+        let nothing_resident = |_: u64| None;
+        assert_eq!(
+            first_op_not_covered(&pending, 0, nothing_resident),
+            Some(256),
+            "unfloored, the evicted committed op reads as an unfillable hole"
+        );
+        assert_eq!(
+            first_op_not_covered(&pending, 256, nothing_resident),
+            None,
+            "floored at the local commit point, the view starts"
+        );
     }
 }
 
