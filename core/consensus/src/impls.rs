@@ -310,6 +310,26 @@ impl RequestEntry {
     }
 }
 
+/// Outcome of [`VsrConsensus::rollback_pipelined_prepare`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareRollback {
+    /// Sequencer, parent chain, and pipeline entry all restored. The op is free
+    /// again and the next request reuses it.
+    Unwound,
+    /// This replica never pre-advanced for the prepare, so there is nothing to
+    /// undo. A backup advances only AFTER its append succeeds.
+    NotPreAdvanced,
+    /// Refused: a sibling prepare was pipelined during the append await and is
+    /// already projected off the failed op, carrying `sequence` past it.
+    ///
+    /// Both outcomes are bad here and unwinding is the worse one: the sibling is
+    /// live in the pipeline and already chained to a prepare the WAL will never
+    /// hold, so rewinding underneath it would additionally hand its op number out
+    /// to the next request. The hole is not closable locally; a view change is
+    /// what repairs it.
+    Overtaken { sequence: u64 },
+}
+
 /// Two-queue pipeline: in-flight prepares + buffered requests.
 #[derive(Debug)]
 pub struct LocalPipeline {
@@ -484,6 +504,22 @@ impl LocalPipeline {
         self.prepare_queue.back()
     }
 
+    /// Drop the newest prepare when it is `op`, returning it.
+    ///
+    /// `None` (and no mutation) when the tail is a different op. The queue holds
+    /// a consecutive run, so removing anything but the tail would punch a hole in
+    /// it and break every `message_by_op` index computation; a caller whose op is
+    /// no longer the tail has been overtaken and must not unwind.
+    ///
+    /// The one caller is the journal-append rollback
+    /// ([`VsrConsensus::rollback_pipelined_prepare`]).
+    pub fn remove_prepare_tail(&mut self, op: u64) -> Option<PipelineEntry> {
+        if self.prepare_queue.back()?.header.op != op {
+            return None;
+        }
+        self.prepare_queue.pop_back()
+    }
+
     /// Find a message by op number and checksum (immutable).
     // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[must_use]
@@ -626,6 +662,10 @@ impl Pipeline for LocalPipeline {
 
     fn pop(&mut self) -> Option<Self::Entry> {
         Self::pop_message(self)
+    }
+
+    fn remove_tail(&mut self, op: u64) -> Option<Self::Entry> {
+        Self::remove_prepare_tail(self, op)
     }
 
     fn clear(&mut self) {
@@ -1482,6 +1522,47 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if !timeouts.is_ticking(TimeoutKind::Prepare) {
             timeouts.start(TimeoutKind::Prepare);
         }
+    }
+
+    /// Undo the [`Self::push_prepare_entry`] pre-advance for a prepare whose
+    /// journal append failed, so the op it claimed is handed back.
+    ///
+    /// The pre-advance runs the sequencer ahead of the WAL on purpose, so that a
+    /// sibling `on_request` racing the append await cannot project a duplicate op.
+    /// The cost is that a failed append leaves the op claimed with nothing durable
+    /// behind it: the next prepare chains off a phantom, the WAL takes a permanent
+    /// hole at that op, and the divergence rides the handoff bundle out to peers.
+    ///
+    /// Rolls the sequencer back to `header.op - 1` and the parent chain to
+    /// `header.parent`, both of which the header records from the moment it was
+    /// projected, and drops the pipeline entry so the reclaimed op is free rather
+    /// than colliding with a live entry. Dropping the entry drops its reply
+    /// sender, so a waiting client observes `Canceled` instead of hanging until
+    /// the request times out.
+    ///
+    /// The observed prepare timestamp is deliberately NOT rolled back:
+    /// [`Self::next_monotonic_timestamp`] only ever needs a lower bound, and
+    /// lowering it back could re-stamp a value a peer already observed.
+    ///
+    /// See [`PrepareRollback`] for the outcomes.
+    pub fn rollback_pipelined_prepare(&self, header: &PrepareHeader) -> PrepareRollback {
+        if !self.is_primary() {
+            return PrepareRollback::NotPreAdvanced;
+        }
+        let sequence = self.sequencer.current_sequence();
+        if sequence != header.op {
+            return PrepareRollback::Overtaken { sequence };
+        }
+        let removed = self.pipeline.borrow_mut().remove_tail(header.op);
+        debug_assert!(
+            removed.is_some(),
+            "sequencer at op {} but the pipeline tail is not that op",
+            header.op
+        );
+        drop(removed);
+        self.sequencer.set_sequence(header.op.saturating_sub(1));
+        self.set_last_prepare_checksum(header.parent);
+        PrepareRollback::Unwound
     }
 
     /// Push `message` with in-band reply subscriber.
@@ -4255,7 +4336,7 @@ mod timestamp_clamp_tests {
 }
 
 #[cfg(test)]
-mod state_transfer_stage_tests {
+mod vsr_consensus_tests {
     use super::*;
 
     #[test]
@@ -4464,6 +4545,119 @@ mod state_transfer_stage_tests {
         // Timeout at view 0 with the record still 5 must probe.
         let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
         assert_eq!(consensus.status(), Status::Recovering);
+    }
+
+    /// A prepare as the primary projects one: `parent` is the chain value the
+    /// sequencer stood on before this op, which is exactly what a rollback restores.
+    #[allow(clippy::cast_possible_truncation)]
+    fn projected_prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
+            *new = PrepareHeader {
+                command: Command2::Prepare,
+                size: size_of::<PrepareHeader>() as u32,
+                op,
+                parent,
+                ..Default::default()
+            };
+        })
+    }
+
+    /// Pipeline a prepare the way `on_request` does, pre-advancing the sequencer
+    /// and the parent chain ahead of the journal append.
+    fn pipeline(consensus: &VsrConsensus<StageNoopBus>, message: &Message<PrepareHeader>) {
+        consensus.pipeline_message(PlaneKind::Metadata, message);
+    }
+
+    #[test]
+    fn rollback_hands_back_the_op_a_failed_append_claimed() {
+        // Without this, the sequencer keeps claiming op 8 while the WAL stops at 7:
+        // the next request projects op 9 over a hole that no repair path refills.
+        const PARENT: u128 = 0xfeed;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+        consensus.set_last_prepare_checksum(PARENT);
+
+        let message = projected_prepare(8, PARENT);
+        pipeline(&consensus, &message);
+        assert_eq!(consensus.sequencer().current_sequence(), 8);
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Unwound
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 7);
+        assert_eq!(consensus.last_prepare_checksum(), PARENT);
+        assert!(
+            consensus.pipeline().borrow().is_empty(),
+            "the reclaimed op must not stay live in the pipeline; the next request reuses it"
+        );
+    }
+
+    #[test]
+    fn rollback_is_refused_once_a_sibling_took_the_next_op() {
+        // The race the pre-advance exists for: a request pipelined while op 8's
+        // append was in flight already chained op 9 off it. Rewinding would hand
+        // op 9's number back out while op 9 is still live, so the refusal is the
+        // safe answer and the caller escalates.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let first = projected_prepare(8, 0);
+        pipeline(&consensus, &first);
+        let sibling = projected_prepare(9, 0);
+        pipeline(&consensus, &sibling);
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(first.header()),
+            PrepareRollback::Overtaken { sequence: 9 }
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 9);
+        assert_eq!(
+            consensus.pipeline().borrow().len(),
+            2,
+            "a refused rollback must not touch the pipeline"
+        );
+    }
+
+    #[test]
+    fn rollback_finds_nothing_to_undo_on_a_backup() {
+        // Replica 1 is a backup at view 0, and a backup advances only after its
+        // append succeeds, so a failed append left nothing pre-advanced.
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let message = projected_prepare(8, 0);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::NotPreAdvanced
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 7);
+    }
+
+    #[test]
+    fn rollback_cancels_the_client_awaiting_the_dropped_prepare() {
+        // The write was never made durable, so the caller must learn it failed
+        // instead of parking until its request times out.
+        use futures::FutureExt as _;
+
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let message = projected_prepare(8, 0);
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &message);
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Unwound
+        );
+        assert!(
+            matches!(receiver.now_or_never(), Some(Err(crate::oneshot::Canceled))),
+            "dropping the entry must cancel its awaiter"
+        );
     }
 }
 

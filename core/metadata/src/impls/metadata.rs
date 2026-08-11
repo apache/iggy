@@ -27,8 +27,8 @@ use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
     Consensus, EvictionContext, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind,
-    PreflightOutcome, Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind,
-    VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
+    PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent, Sequencer,
+    SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
     build_eviction_message, build_reply_message, build_reply_message_with,
     build_result_rejection_reply, emit_sim_event, fence_old_prepare_by_commit,
     is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
@@ -1213,19 +1213,14 @@ where
         // violates VSR tail-ahead-of-head, recoverable only via hash-chain
         // fence + view change (burns a view).
         //
-        // TODO(hubcio): the primary path violates the invariant in the
-        // comment above. `consensus::impls::push_prepare_entry` pre-advances
-        // `sequencer.set_sequence(header.op)` and
-        // `set_last_prepare_checksum(header.checksum)` BEFORE this append.
-        // If the append below returns `Err`, sequencer + checksum stay
-        // advanced while the WAL holds no matching entry: the next prepare
-        // chains off a phantom op, cluster state diverges, and the
-        // `MetadataHandoff::Waiter` factory bundle propagates the divergence
-        // to peers. Fix: rollback `sequencer.set_sequence` +
-        // `set_last_prepare_checksum` to their captured prior values on
-        // append failure (preferred per CLAUDE.md "no panics in libraries"),
-        // or abort the shard.
+        // On the primary the pre-advance in `push_prepare_entry` already claimed
+        // this op, so a failed append has to hand it back or the next prepare
+        // chains off a phantom (see `rollback_pipelined_prepare`). The rollback is
+        // refused when a sibling prepare was pipelined during the await and has
+        // already been projected off this op; that log cannot be repaired from
+        // here, so it is reported and left to a view change.
         if let Err(e) = journal.handle().append(message.clone()).await {
+            let rollback = consensus.rollback_pipelined_prepare(&header);
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -1233,8 +1228,20 @@ where
                 op = header.op,
                 operation = ?header.operation,
                 error = %e,
+                rollback = ?rollback,
                 "journal append failed"
             );
+            if let PrepareRollback::Overtaken { sequence } = rollback {
+                error!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    sequence,
+                    "journal append failed after a sibling prepare was projected off this op; \
+                     the local log has a hole this replica cannot close, awaiting view change"
+                );
+            }
             return;
         }
 
@@ -5386,5 +5393,82 @@ mod tests {
         );
         assert_eq!(md.client_table.borrow().get_epoch(CLIENT_C), Some(2));
         assert!(is_caught_up_primary(consensus));
+    }
+
+    #[compio::test]
+    async fn failed_journal_append_hands_the_op_back_instead_of_leaving_a_phantom() {
+        // The primary claims its op before the append (`push_prepare_entry`), so a
+        // failed append used to leave the sequencer one ahead of the WAL forever:
+        // the next request projected over the hole, and no repair path refilled it.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        let projected = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        let op = projected.header().op;
+        let parent = projected.header().parent;
+        let sequence_before = consensus.sequencer().current_sequence();
+
+        // Forces the append to fail deterministically, before any disk write: the
+        // buffer carries eight bytes of slack past the header's `size`, which
+        // `PrepareJournal::append` refuses rather than write slack that would
+        // mis-frame the recovery scan. Any append failure reaches the same arm.
+        let size = projected.header().size as usize;
+        let mut padded = Message::<PrepareHeader>::new(size + 8);
+        padded.as_mut_slice()[..size].copy_from_slice(projected.as_slice());
+
+        consensus.pipeline_message(PlaneKind::Metadata, &padded);
+        assert_eq!(consensus.sequencer().current_sequence(), op);
+
+        md.on_replicate(padded).await;
+
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            sequence_before,
+            "the claimed op must be handed back so the next request reuses it"
+        );
+        assert_eq!(consensus.last_prepare_checksum(), parent);
+        assert!(
+            consensus.pipeline().borrow().is_empty(),
+            "the undurable prepare must not stay live in the pipeline"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let journaled = md.journal.as_ref().unwrap().handle().header(op as usize);
+        assert!(
+            journaled.is_none(),
+            "the append failed, so the WAL must hold nothing at that op"
+        );
     }
 }

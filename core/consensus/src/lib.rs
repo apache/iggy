@@ -34,6 +34,10 @@ pub trait Pipeline {
 
     fn pop(&mut self) -> Option<Self::Entry>;
 
+    /// Drop the newest entry when it is `op`, returning it; `None` and no
+    /// mutation otherwise. Unwinds a push that turned out not to be durable.
+    fn remove_tail(&mut self, op: u64) -> Option<Self::Entry>;
+
     fn clear(&mut self);
 
     fn entry_by_op(&self, op: u64) -> Option<&Self::Entry>;
