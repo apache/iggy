@@ -21,22 +21,33 @@ use crate::{
     BinaryClient, ClientState, DiagnosticEvent, IdentityInfo, IggyError, PersonalAccessTokenClient,
     PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::MAX_WIRE_NAME_LENGTH;
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::LOGIN_REGISTER_WITH_PAT_CODE;
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::codes::LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE;
 use iggy_binary_protocol::codes::{
     CREATE_PERSONAL_ACCESS_TOKEN_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
     GET_PERSONAL_ACCESS_TOKENS_CODE,
 };
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::requests::personal_access_tokens::LoginWithPersonalAccessTokenRequest;
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
     GetPersonalAccessTokensRequest,
 };
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::requests::users::LoginRegisterWithPatRequest;
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensResponse;
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
+#[cfg(feature = "vsr")]
 use secrecy::SecretString;
 
 #[async_trait::async_trait]
@@ -92,52 +103,73 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        super::logout_before_relogin(self).await?;
-        // The request stores a `SecretString` rather than a `WireName`, so the
-        // `WireName` bounds are enforced here to keep the u8 length prefix
-        // consistent with the realized bytes.
-        if token.is_empty() || token.len() > MAX_WIRE_NAME_LENGTH {
-            return Err(IggyError::InvalidFormat);
-        }
-        let response = match self
-            .send_raw_with_response(
-                LOGIN_REGISTER_WITH_PAT_CODE,
-                LoginRegisterWithPatRequest {
-                    version_info: super::rust_sdk_version_info(self.sdk_version())?,
-                    token: SecretString::from(token.to_string()),
-                    client_context: None,
-                }
-                .to_bytes(),
-            )
-            .await
+        #[cfg(feature = "vsr")]
         {
-            Ok(response) => response,
-            Err(error) => {
+            super::logout_before_relogin(self).await?;
+            // Same bounds the non-vsr branch gets from `WireName::new(token)`;
+            // the request stores a `SecretString`, so enforce them here to keep
+            // the u8 length prefix consistent with the realized bytes.
+            if token.is_empty() || token.len() > MAX_WIRE_NAME_LENGTH {
+                return Err(IggyError::InvalidFormat);
+            }
+            let response = match self
+                .send_raw_with_response(
+                    LOGIN_REGISTER_WITH_PAT_CODE,
+                    LoginRegisterWithPatRequest {
+                        version_info: super::rust_sdk_version_info(self.sdk_version())?,
+                        token: SecretString::from(token.to_string()),
+                        client_context: None,
+                    }
+                    .to_bytes(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    self.reset_vsr_session().await?;
+                    return Err(error);
+                }
+            };
+            let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
+                Ok(wire_resp) => wire_resp,
+                Err(error) => {
+                    self.reset_vsr_session().await?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
                 self.reset_vsr_session().await?;
                 return Err(error);
             }
-        };
-        let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
-            Ok(wire_resp) => wire_resp,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
-            self.reset_vsr_session().await?;
-            return Err(error);
+            tracing::debug!(
+                server_version = %wire_resp.server_version,
+                server_protocol_version = wire_resp.server_protocol_version,
+                "authenticated against iggy server"
+            );
+            self.set_state(ClientState::Authenticated).await;
+            self.publish_event(DiagnosticEvent::SignedIn).await;
+            return Ok(IdentityInfo {
+                user_id: wire_resp.user_id,
+                access_token: None,
+            });
         }
-        tracing::debug!(
-            server_version = %wire_resp.server_version,
-            server_protocol_version = wire_resp.server_protocol_version,
-            "authenticated against iggy server"
-        );
+
+        #[cfg(not(feature = "vsr"))]
+        let wire_token = WireName::new(token).map_err(|_| IggyError::InvalidFormat)?;
+        #[cfg(not(feature = "vsr"))]
+        let response = self
+            .send_raw_with_response(
+                LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+                LoginWithPersonalAccessTokenRequest { token: wire_token }.to_bytes(),
+            )
+            .await?;
+        #[cfg(not(feature = "vsr"))]
         self.set_state(ClientState::Authenticated).await;
+        #[cfg(not(feature = "vsr"))]
         self.publish_event(DiagnosticEvent::SignedIn).await;
-        Ok(IdentityInfo {
-            user_id: wire_resp.user_id,
-            access_token: None,
-        })
+        #[cfg(not(feature = "vsr"))]
+        let wire_resp = super::decode_response::<IdentityResponse>(&response)?;
+        #[cfg(not(feature = "vsr"))]
+        Ok(IdentityInfo::from(wire_resp))
     }
 }

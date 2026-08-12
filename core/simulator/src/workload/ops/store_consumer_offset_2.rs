@@ -23,7 +23,7 @@
 //! 4. `offset` range draw
 //! 5. `ack` ratio draw
 
-use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
+use iggy_binary_protocol::{AckLevel, RequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -64,7 +64,7 @@ pub fn sample(
             // Draw against the configured ceiling, then clamp to committed
             // reality so the offset is reachable. Clamping post-draw keeps
             // the PRNG draw order (and determinism hash baseline) intact
-            // while staying valid once the server validates offsets.
+            // while staying valid once server-ng validates offsets.
             let raw: u64 = prng.random_range(0..options.max_offset.max(1));
             let high = shadow.sends_committed(ns).max(1);
             let offset = raw % high;
@@ -86,7 +86,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.store_consumer_offset_2(
         input.ns,
         input.consumer_kind,

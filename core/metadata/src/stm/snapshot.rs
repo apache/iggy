@@ -53,10 +53,6 @@ pub enum SnapshotError {
         commit_op: u64,
         table_frontier: u64,
     },
-    /// The snapshot was written under a different format version. Refuse it
-    /// rather than reinterpret embedded raw bytes (the client table's cached
-    /// replies are wire `ReplyHeader` frames) under the wrong layout.
-    UnsupportedVersion { found: u32, supported: u32 },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -108,13 +104,6 @@ impl fmt::Display for SnapshotError {
                      commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
-            Self::UnsupportedVersion { found, supported } => {
-                write!(
-                    f,
-                    "unsupported metadata snapshot version {found}; this build reads only \
-                     version {supported}"
-                )
-            }
         }
     }
 }
@@ -127,8 +116,7 @@ impl std::error::Error for SnapshotError {
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
             Self::ChecksumMismatch { .. }
             | Self::Truncated { .. }
-            | Self::IncoherentManifest { .. }
-            | Self::UnsupportedVersion { .. } => None,
+            | Self::IncoherentManifest { .. } => None,
         }
     }
 }
@@ -150,17 +138,10 @@ impl From<std::io::Error> for SnapshotError {
 /// replicas with identical state must serialize identically. Regression guards:
 /// `stream::tests::populated_streams_snapshot_reencode_is_byte_stable` and
 /// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
-/// Current [`MetadataSnapshot::version`]. Bump whenever the serialized form
-/// changes meaning without changing shape -- in particular the client table's
-/// cached replies, which are embedded as raw `ReplyHeader` wire bytes msgpack
-/// cannot introspect. Version 2: `status` sits at reply-header offset 216
-/// (version 1 carried a `namespace` word before it).
-pub const METADATA_SNAPSHOT_VERSION: u32 = 2;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
-    /// Snapshot format version; [`MetadataSnapshot::decode`] refuses any other
-    /// value (see [`METADATA_SNAPSHOT_VERSION`]).
+    /// Snapshot format version for forward/backward compatibility.
+    /// TODO(krishvishal): Properly handle versioning for snapshot. This is a placeholder for now.
     pub version: u32,
     /// Timestamp when the snapshot was created (microseconds since epoch).
     pub created_at: u64,
@@ -190,7 +171,7 @@ impl MetadataSnapshot {
     #[must_use]
     pub const fn new(sequence_number: u64) -> Self {
         Self {
-            version: METADATA_SNAPSHOT_VERSION,
+            version: 1,
             // Deterministic placeholder. The real creation time is stamped by
             // `Snapshot::create` from the consensus-injected clock (see
             // `VsrConsensus::clock_realtime_micros`) so a replayed simulator
@@ -215,18 +196,9 @@ impl MetadataSnapshot {
     /// Decode a snapshot from msgpack bytes.
     ///
     /// # Errors
-    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails,
-    /// or `SnapshotError::UnsupportedVersion` if the snapshot was written
-    /// under a different format version.
+    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
-        if snapshot.version != METADATA_SNAPSHOT_VERSION {
-            return Err(SnapshotError::UnsupportedVersion {
-                found: snapshot.version,
-                supported: METADATA_SNAPSHOT_VERSION,
-            });
-        }
-        Ok(snapshot)
+        rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)
     }
 }
 
@@ -466,25 +438,6 @@ mod tests {
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
         assert!(decoded.client_table.is_none());
-    }
-
-    // The client table's cached replies are embedded as raw `ReplyHeader`
-    // wire bytes msgpack cannot introspect, so a snapshot from a different
-    // format version must be refused, never reinterpreted under the current
-    // header layout.
-    #[test]
-    fn decode_refuses_a_snapshot_from_another_format_version() {
-        let mut snapshot = MetadataSnapshot::new(42);
-        snapshot.version = METADATA_SNAPSHOT_VERSION - 1;
-
-        let encoded = snapshot.encode().unwrap();
-        assert!(matches!(
-            MetadataSnapshot::decode(&encoded),
-            Err(SnapshotError::UnsupportedVersion {
-                found,
-                supported: METADATA_SNAPSHOT_VERSION,
-            }) if found == METADATA_SNAPSHOT_VERSION - 1
-        ));
     }
 
     #[test]

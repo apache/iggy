@@ -34,12 +34,13 @@
  * </ul>
  *
  * <h2>Protocol Details</h2>
- * <p>The transport speaks the VSR (Viewstamped Replication) wire protocol:
- * every frame starts with a 256-byte consensus header ({@code RequestHeader}
- * on the way out, {@code ReplyHeader} or {@code EvictionHeader} on the way
- * back) followed by the command payload; see the {@code vsr} subpackage.
- * <p>Responses are matched to requests in FIFO order. The
- * {@link org.apache.iggy.client.async.tcp.AsyncTcpConnection}
+ * <p>The Iggy binary protocol uses a simple framing scheme:
+ * <ul>
+ *   <li><strong>Request:</strong> {@code [payload_size:4 LE][command:4 LE][payload:N]}</li>
+ *   <li><strong>Response:</strong> {@code [status:4 LE][length:4 LE][payload:N]}</li>
+ * </ul>
+ * <p>Responses are matched to requests in FIFO order (the protocol does not include
+ * request IDs). The {@link org.apache.iggy.client.async.tcp.AsyncTcpConnection}
  * serializes all writes through Netty's event loop to maintain ordering.
  *
  * @see org.apache.iggy.client.async.tcp.AsyncIggyTcpClient

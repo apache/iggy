@@ -3198,6 +3198,7 @@ dependencies = [
  "static-toml",
  "strum 0.28.0",
  "tracing",
+ "tungstenite 0.30.0",
 ]
 
 [[package]]
@@ -3214,7 +3215,6 @@ dependencies = [
 name = "consensus"
 version = "0.1.0"
 dependencies = [
- "aligned-vec",
  "bit-set 0.11.1",
  "bytemuck",
  "bytes",
@@ -6856,7 +6856,6 @@ dependencies = [
  "enumset",
  "secrecy",
  "thiserror 2.0.19",
- "twox-hash",
 ]
 
 [[package]]
@@ -7502,6 +7501,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server",
  "sqlx",
  "sysinfo 0.39.6",
  "tempfile",
@@ -9621,12 +9621,10 @@ dependencies = [
  "iggy_common",
  "journal",
  "message_bus",
- "nix",
  "papaya",
  "ringbuffer",
  "server_common",
  "smallvec",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -11907,6 +11905,71 @@ dependencies = [
 
 [[package]]
 name = "server"
+version = "0.8.2-edge.1"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "async-channel",
+ "async_zip",
+ "axum",
+ "axum-server",
+ "bytes",
+ "chrono",
+ "clap",
+ "compio",
+ "configs",
+ "ctrlc",
+ "cyper",
+ "cyper-axum",
+ "dashmap",
+ "dotenvy",
+ "err_trail",
+ "error_set",
+ "figlet-rs",
+ "flume",
+ "fs2",
+ "futures",
+ "hash32 1.0.0",
+ "human-repr",
+ "iggy_binary_protocol",
+ "iggy_common",
+ "jsonwebtoken",
+ "left-right",
+ "mimalloc",
+ "mime_guess",
+ "nix",
+ "papaya",
+ "prometheus-client",
+ "ringbuffer",
+ "rmp-serde",
+ "rust-embed",
+ "rustls",
+ "rustls-pemfile",
+ "sd-notify",
+ "secrecy",
+ "send_wrapper",
+ "serde",
+ "serde_json",
+ "server_common",
+ "shard_allocator",
+ "slab",
+ "socket2 0.6.5",
+ "strum 0.28.0",
+ "sysinfo 0.39.6",
+ "system_stats",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml 1.1.3+spec-1.1.0",
+ "tower-http 0.7.0",
+ "tracing",
+ "ulid",
+ "uuid",
+ "vergen-git2",
+]
+
+[[package]]
+name = "server-ng"
 version = "0.9.0-edge.2"
 dependencies = [
  "ahash 0.8.12",
@@ -11966,7 +12029,6 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pemfile",
- "sd-notify",
  "secrecy",
  "send_wrapper",
  "serde",
@@ -12253,7 +12315,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_xoshiro",
  "secrecy",
- "server",
+ "server-ng",
  "server_common",
  "shard",
  "strum 0.28.0",

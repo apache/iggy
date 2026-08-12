@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -174,7 +173,7 @@ public partial class IggyPublisher : IAsyncDisposable
         await Client.ConnectAsync(ct);
 
         LogInitializingPublisher(Config.StreamId, Config.TopicId);
-        if (!string.IsNullOrEmpty(Config.Login) && !Config.CreateIggyClient)
+        if (Config.CreateIggyClient)
         {
             await Client.LoginUserAsync(Config.Login, Config.Password, ct);
             LogUserLoggedIn(Config.Login);
@@ -282,12 +281,8 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </remarks>
     /// <param name="messages">The messages to send.</param>
     /// <param name="ct">Cancellation token to cancel the send operation.</param>
-    /// <returns>
-    ///     Commit confirmations for a direct send. Empty when background sending is enabled: the
-    ///     processor merges queued batches, so no 1:1 mapping to this call exists.
-    /// </returns>
     /// <exception cref="PublisherNotInitializedException">Thrown when attempting to send before initialization.</exception>
-    public async Task<SendMessagesResponse> SendMessagesAsync(IList<Message> messages, CancellationToken ct = default)
+    public async Task SendMessagesAsync(IList<Message> messages, CancellationToken ct = default)
     {
         if (!IsInitialized)
         {
@@ -297,19 +292,20 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (messages.Count == 0)
         {
-            return SendMessagesResponse.Empty;
+            return;
         }
 
         if (Config.EnableBackgroundSending && BackgroundProcessor != null)
         {
             LogQueuingMessages(messages.Count);
             // Snapshot so a caller mutating the list after enqueue cannot change the batch read at flush time.
-            return await SendReadyAsync(messages.ToArray(), null, ct);
+            await SendReadyAsync(messages.ToArray(), null, ct);
         }
-
-        var response = await SendReadyAsync(messages, null, ct);
-        LogSuccessfullySentMessages(messages.Count);
-        return response;
+        else
+        {
+            await SendReadyAsync(messages, null, ct);
+            LogSuccessfullySentMessages(messages.Count);
+        }
     }
 
     /// <summary>
@@ -319,11 +315,8 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     /// <param name="batch">The rented batch to send.</param>
     /// <param name="ct">Cancellation token to cancel the send operation.</param>
-    /// <returns>
-    ///     Commit confirmations for a direct send; empty when background sending is enabled.
-    /// </returns>
     /// <exception cref="PublisherNotInitializedException">Thrown when attempting to send before initialization.</exception>
-    public async Task<SendMessagesResponse> SendAsync(RentedMessageBatch batch, CancellationToken ct = default)
+    public async Task SendAsync(RentedMessageBatch batch, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(batch);
 
@@ -339,29 +332,29 @@ public partial class IggyPublisher : IAsyncDisposable
         if (messages.Count == 0)
         {
             batch.Dispose();
-            return SendMessagesResponse.Empty;
+            return;
         }
 
-        return await SendReadyAsync(messages, batch, ct);
+        await SendReadyAsync(messages, batch, ct);
     }
 
     // Background: queued as one unit, owner disposed after its flush. Direct: sent now, owner disposed after.
-    private async Task<SendMessagesResponse> SendReadyAsync(IList<Message> messages, IDisposable? owner,
-        CancellationToken ct)
+    private async Task SendReadyAsync(IList<Message> messages, IDisposable? owner, CancellationToken ct)
     {
         if (Config.EnableBackgroundSending && BackgroundProcessor != null)
         {
             await BackgroundProcessor.EnqueueAsync(new ReadyUnit(messages, owner), ct);
-            return SendMessagesResponse.Empty;
         }
-
-        try
+        else
         {
-            return await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, messages, ct);
-        }
-        finally
-        {
-            owner?.Dispose();
+            try
+            {
+                await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, messages, ct);
+            }
+            finally
+            {
+                owner?.Dispose();
+            }
         }
     }
 

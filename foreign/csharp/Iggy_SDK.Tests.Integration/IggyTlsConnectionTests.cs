@@ -34,7 +34,7 @@ public class IggyTlsConnectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
+            BaseAddress = Fixture.GetIggyAddress(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false },
             AutoLoginSettings = new AutoLoginSettings
@@ -62,15 +62,13 @@ public class IggyTlsConnectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
+            BaseAddress = Fixture.GetIggyAddress(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false }
         });
 
-        // The VSR register handshake runs inside ConnectAsync and dies against the TLS listener, so the
-        // client never reaches the connected state.
         await client.ConnectAsync();
-        await Should.ThrowAsync<NotConnectedException>(client.LoginUserAsync("iggy", "iggy"));
+        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUserAsync("iggy", "iggy"));
     }
 
     [Test]
@@ -78,7 +76,7 @@ public class IggyTlsConnectionTests
     {
         using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
-            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
+            BaseAddress = Fixture.GetIggyAddress(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings { Enabled = false },
             AutoLoginSettings = new AutoLoginSettings

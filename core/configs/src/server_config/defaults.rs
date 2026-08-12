@@ -15,167 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `Default` impls for the sections this module owns (`tcp`, `websocket`,
-//! `quic`, `cluster`, `metadata`, `partition`, `message_bus`), sourced
-//! from `core/server/config.toml` via [`SERVER_CONFIG`]. Sections drawn
-//! from [`crate::common`] (`http`, `system`, `telemetry`,
-//! `consumer_group`, `data_maintenance`, `message_saver`,
-//! `personal_access_token`, `heartbeat`) delegate to the `Default` impls
-//! in [`crate::common::defaults`].
-
 use super::cluster::{
     ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
 };
-use super::message_bus::MessageBusConfig;
-use super::metadata::MetadataConfig;
-use super::partition::PartitionConfig;
+use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use super::server::ServerSystemConfig;
-use super::server::{ExtraConfig, ServerConfig};
-use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
-use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
-use crate::common::http::HttpConfig;
-use crate::common::server::{
-    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
-    PersonalAccessTokenConfig, TelemetryConfig,
+use super::server::{
+    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
+    MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
+    PersonalAccessTokenConfig, ServerConfig, TelemetryConfig, TelemetryLogsConfig,
+    TelemetryTracesConfig,
 };
+use super::system::{
+    BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
+    MessageDeduplicationConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
+    StateConfig, StreamConfig, SystemConfig, TopicConfig,
+};
+use super::tcp::TcpSocketConfig;
+use super::tcp::{TcpConfig, TcpTlsConfig};
+use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
+use configs::ConfigEnvMappings;
+use iggy_common::IggyByteSize;
+use iggy_common::IggyDuration;
 use std::sync::Arc;
+use std::time::Duration;
 
-// Same embedded TOML the shared sections read; re-exported so sibling
-// modules reach it as `super::defaults::SERVER_CONFIG`.
-pub use crate::common::defaults::SERVER_CONFIG;
+static_toml::static_toml! {
+    // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).
+    pub static SERVER_CONFIG = include_toml!("../server/config.toml");
+}
 
 impl Default for ServerConfig {
     fn default() -> ServerConfig {
         ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
-            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            system: Arc::new(ServerSystemConfig::default()),
+            system: Arc::new(SystemConfig::default()),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
-            metadata: MetadataConfig::default(),
-            partition: PartitionConfig::default(),
-            message_bus: MessageBusConfig::default(),
         }
     }
 }
 
-impl Default for ClusterConfig {
-    fn default() -> ClusterConfig {
-        ClusterConfig {
-            enabled: SERVER_CONFIG.cluster.enabled,
-            name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            heartbeat_timeout: SERVER_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
-            commit_broadcast_interval: SERVER_CONFIG
-                .cluster
-                .commit_broadcast_interval
+impl Default for MessagesMaintenanceConfig {
+    fn default() -> MessagesMaintenanceConfig {
+        MessagesMaintenanceConfig {
+            cleaner_enabled: SERVER_CONFIG.data_maintenance.messages.cleaner_enabled,
+            interval: SERVER_CONFIG
+                .data_maintenance
+                .messages
+                .interval
                 .parse()
                 .unwrap(),
-            prepare_retransmit_interval: SERVER_CONFIG
-                .cluster
-                .prepare_retransmit_interval
-                .parse()
-                .unwrap(),
-            view_change_retransmit_interval: SERVER_CONFIG
-                .cluster
-                .view_change_retransmit_interval
-                .parse()
-                .unwrap(),
-            view_change_status_timeout: SERVER_CONFIG
-                .cluster
-                .view_change_status_timeout
-                .parse()
-                .unwrap(),
-            request_start_view_retransmit_interval: SERVER_CONFIG
-                .cluster
-                .request_start_view_retransmit_interval
-                .parse()
-                .unwrap(),
-            view_probe_attempts_max: SERVER_CONFIG.cluster.view_probe_attempts_max as u32,
-            repair_retry_interval: SERVER_CONFIG
-                .cluster
-                .repair_retry_interval
-                .parse()
-                .unwrap(),
-            repair_chunk_max: SERVER_CONFIG.cluster.repair_chunk_max as usize,
-            nodes: SERVER_CONFIG
-                .cluster
-                .nodes
-                .iter()
-                .map(|node| ClusterNodeConfig {
-                    name: node.name.parse().unwrap(),
-                    ip: node.ip.parse().unwrap(),
-                    advertised_address: None,
-                    advertised_addresses: Vec::new(),
-                    replica_id: u8::try_from(node.replica_id).expect(
-                        "static_toml replica_id must fit in u8 (0..=255); \
-                         fix core/server/config.toml",
-                    ),
-                    ports: TransportPorts {
-                        tcp: Some(u16::try_from(node.ports.tcp).expect(
-                            "static_toml cluster.nodes.ports.tcp must fit in u16 (0..=65535); \
-                             fix core/server/config.toml",
-                        )),
-                        quic: Some(u16::try_from(node.ports.quic).expect(
-                            "static_toml cluster.nodes.ports.quic must fit in u16 (0..=65535); \
-                             fix core/server/config.toml",
-                        )),
-                        http: Some(u16::try_from(node.ports.http).expect(
-                            "static_toml cluster.nodes.ports.http must fit in u16 (0..=65535); \
-                             fix core/server/config.toml",
-                        )),
-                        websocket: Some(u16::try_from(node.ports.websocket).expect(
-                            "static_toml cluster.nodes.ports.websocket must fit in u16 (0..=65535); \
-                             fix core/server/config.toml",
-                        )),
-                        tcp_replica: Some(u16::try_from(node.ports.tcp_replica).expect(
-                            "static_toml cluster.nodes.ports.tcp_replica must fit in u16 (0..=65535); \
-                             fix core/server/config.toml",
-                        )),
-                    },
-                })
-                .collect(),
-            auth: ClusterAuthConfig::default(),
-            tls: ClusterTlsConfig::default(),
-        }
-    }
-}
-
-impl Default for MetadataConfig {
-    fn default() -> MetadataConfig {
-        // Read from the embedded TOML so the Default impl and the on-disk
-        // schema cannot drift (same pattern as MessageBusConfig below).
-        let metadata = &SERVER_CONFIG.metadata;
-        MetadataConfig {
-            prepare_queue_depth: metadata.prepare_queue_depth as usize,
-            journal_slots: metadata.journal_slots as usize,
-            clients_table_max: metadata.clients_table_max as usize,
-        }
-    }
-}
-
-impl Default for PartitionConfig {
-    fn default() -> PartitionConfig {
-        // Read from the embedded TOML so the Default impl and the on-disk
-        // schema cannot drift (same pattern as MetadataConfig above).
-        let partition = &SERVER_CONFIG.partition;
-        PartitionConfig {
-            prepare_queue_depth: partition.prepare_queue_depth as usize,
-            evicted_ring_capacity: partition.evicted_ring_capacity as usize,
-            evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
-            transfer_served_cache_bytes_max: partition
-                .transfer_served_cache_bytes_max
-                .parse()
-                .unwrap(),
-            transfer_artifact_bytes_max: partition.transfer_artifact_bytes_max.parse().unwrap(),
         }
     }
 }
@@ -250,22 +148,18 @@ impl Default for TcpTlsConfig {
 impl Default for TcpSocketConfig {
     fn default() -> TcpSocketConfig {
         TcpSocketConfig {
-            override_defaults: SERVER_CONFIG.tcp.socket.override_defaults,
-            recv_buffer_size: SERVER_CONFIG.tcp.socket.recv_buffer_size.parse().unwrap(),
-            send_buffer_size: SERVER_CONFIG.tcp.socket.send_buffer_size.parse().unwrap(),
-            keepalive: SERVER_CONFIG.tcp.socket.keepalive,
-            nodelay: SERVER_CONFIG.tcp.socket.nodelay,
-            linger: SERVER_CONFIG.tcp.socket.linger.parse().unwrap(),
+            override_defaults: false,
+            recv_buffer_size: IggyByteSize::from(100_000_u64),
+            send_buffer_size: IggyByteSize::from(100_000_u64),
+            keepalive: false,
+            nodelay: false,
+            linger: IggyDuration::new(Duration::new(0, 0)),
         }
     }
 }
 
 impl Default for WebSocketConfig {
     fn default() -> WebSocketConfig {
-        // The size knobs are optional in the schema (commented-out by
-        // default), so they map to `None` here when absent; every other
-        // field comes from the embedded TOML so the Default impl and
-        // the on-disk schema cannot drift.
         WebSocketConfig {
             enabled: SERVER_CONFIG.websocket.enabled,
             address: SERVER_CONFIG.websocket.address.parse().unwrap(),
@@ -274,7 +168,7 @@ impl Default for WebSocketConfig {
             max_write_buffer_size: None,
             max_message_size: None,
             max_frame_size: None,
-            accept_unmasked_frames: SERVER_CONFIG.websocket.accept_unmasked_frames,
+            accept_unmasked_frames: false,
             tls: WebSocketTlsConfig::default(),
         }
     }
@@ -291,20 +185,430 @@ impl Default for WebSocketTlsConfig {
     }
 }
 
-impl Default for MessageBusConfig {
-    fn default() -> MessageBusConfig {
-        // Read every field from the embedded TOML so the Default impl
-        // and the on-disk schema cannot drift. Sibling impls in this
-        // file follow the same pattern.
-        let bus = &SERVER_CONFIG.message_bus;
-        MessageBusConfig {
-            max_batch: bus.max_batch as usize,
-            max_message_size: bus.max_message_size.parse().unwrap(),
-            peer_queue_capacity: bus.peer_queue_capacity as usize,
-            reconnect_period: bus.reconnect_period.parse().unwrap(),
-            close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
-            close_grace: bus.close_grace.parse().unwrap(),
-            handshake_grace: bus.handshake_grace.parse().unwrap(),
+impl Default for HttpConfig {
+    fn default() -> HttpConfig {
+        HttpConfig {
+            enabled: SERVER_CONFIG.http.enabled,
+            address: SERVER_CONFIG.http.address.parse().unwrap(),
+            max_request_size: SERVER_CONFIG.http.max_request_size.parse().unwrap(),
+            web_ui: SERVER_CONFIG.http.web_ui,
+            cors: HttpCorsConfig::default(),
+            jwt: HttpJwtConfig::default(),
+            metrics: HttpMetricsConfig::default(),
+            tls: HttpTlsConfig::default(),
+        }
+    }
+}
+
+impl Default for HttpCorsConfig {
+    fn default() -> HttpCorsConfig {
+        HttpCorsConfig {
+            enabled: SERVER_CONFIG.http.cors.enabled,
+            allowed_methods: SERVER_CONFIG
+                .http
+                .cors
+                .allowed_methods
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            allowed_origins: SERVER_CONFIG
+                .http
+                .cors
+                .allowed_origins
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            allowed_headers: SERVER_CONFIG
+                .http
+                .cors
+                .allowed_headers
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            exposed_headers: SERVER_CONFIG
+                .http
+                .cors
+                .exposed_headers
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            allow_credentials: SERVER_CONFIG.http.cors.allow_credentials,
+            allow_private_network: SERVER_CONFIG.http.cors.allow_private_network,
+        }
+    }
+}
+
+impl Default for HttpJwtConfig {
+    fn default() -> HttpJwtConfig {
+        HttpJwtConfig {
+            algorithm: SERVER_CONFIG.http.jwt.algorithm.parse().unwrap(),
+            issuer: SERVER_CONFIG.http.jwt.issuer.parse().unwrap(),
+            audience: SERVER_CONFIG.http.jwt.audience.parse().unwrap(),
+            valid_issuers: SERVER_CONFIG
+                .http
+                .jwt
+                .valid_issuers
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            valid_audiences: SERVER_CONFIG
+                .http
+                .jwt
+                .valid_audiences
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect(),
+            access_token_expiry: SERVER_CONFIG.http.jwt.access_token_expiry.parse().unwrap(),
+            clock_skew: SERVER_CONFIG.http.jwt.clock_skew.parse().unwrap(),
+            not_before: SERVER_CONFIG.http.jwt.not_before.parse().unwrap(),
+            encoding_secret: SERVER_CONFIG.http.jwt.encoding_secret.parse().unwrap(),
+            decoding_secret: SERVER_CONFIG.http.jwt.decoding_secret.parse().unwrap(),
+            use_base64_secret: SERVER_CONFIG.http.jwt.use_base_64_secret,
+            trusted_issuers: None,
+        }
+    }
+}
+
+impl Default for HttpMetricsConfig {
+    fn default() -> HttpMetricsConfig {
+        HttpMetricsConfig {
+            enabled: SERVER_CONFIG.http.metrics.enabled,
+            endpoint: SERVER_CONFIG.http.metrics.endpoint.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for HttpTlsConfig {
+    fn default() -> HttpTlsConfig {
+        HttpTlsConfig {
+            enabled: SERVER_CONFIG.http.tls.enabled,
+            cert_file: SERVER_CONFIG.http.tls.cert_file.parse().unwrap(),
+            key_file: SERVER_CONFIG.http.tls.key_file.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for MessageSaverConfig {
+    fn default() -> MessageSaverConfig {
+        MessageSaverConfig {
+            enabled: SERVER_CONFIG.message_saver.enabled,
+            enforce_fsync: SERVER_CONFIG.message_saver.enforce_fsync,
+            interval: SERVER_CONFIG.message_saver.interval.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for PersonalAccessTokenConfig {
+    fn default() -> PersonalAccessTokenConfig {
+        PersonalAccessTokenConfig {
+            max_tokens_per_user: SERVER_CONFIG.personal_access_token.max_tokens_per_user as u32,
+            cleaner: PersonalAccessTokenCleanerConfig::default(),
+        }
+    }
+}
+
+impl Default for PersonalAccessTokenCleanerConfig {
+    fn default() -> PersonalAccessTokenCleanerConfig {
+        PersonalAccessTokenCleanerConfig {
+            enabled: SERVER_CONFIG.personal_access_token.cleaner.enabled,
+            interval: SERVER_CONFIG
+                .personal_access_token
+                .cleaner
+                .interval
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl<S: ConfigEnvMappings + Default> Default for SystemConfig<S> {
+    fn default() -> Self {
+        Self {
+            path: SERVER_CONFIG.system.path.parse().unwrap(),
+            backup: BackupConfig::default(),
+            runtime: RuntimeConfig::default(),
+            logging: LoggingConfig::default(),
+            stream: StreamConfig::default(),
+            encryption: EncryptionConfig::default(),
+            topic: TopicConfig::default(),
+            partition: PartitionConfig::default(),
+            segment: SegmentConfig::default(),
+            state: StateConfig::default(),
+            compression: CompressionConfig::default(),
+            message_deduplication: MessageDeduplicationConfig::default(),
+            recovery: RecoveryConfig::default(),
+            memory_pool: MemoryPoolConfig::default(),
+            sharding: S::default(),
+        }
+    }
+}
+
+impl Default for BackupConfig {
+    fn default() -> BackupConfig {
+        BackupConfig {
+            path: SERVER_CONFIG.system.backup.path.parse().unwrap(),
+            compatibility: CompatibilityConfig::default(),
+        }
+    }
+}
+
+impl Default for CompatibilityConfig {
+    fn default() -> Self {
+        CompatibilityConfig {
+            path: SERVER_CONFIG
+                .system
+                .backup
+                .compatibility
+                .path
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> HeartbeatConfig {
+        HeartbeatConfig {
+            enabled: SERVER_CONFIG.heartbeat.enabled,
+            interval: SERVER_CONFIG.heartbeat.interval.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for ConsumerGroupConfig {
+    fn default() -> ConsumerGroupConfig {
+        ConsumerGroupConfig {
+            rebalancing_timeout: SERVER_CONFIG
+                .consumer_group
+                .rebalancing_timeout
+                .parse()
+                .unwrap(),
+            rebalancing_check_interval: SERVER_CONFIG
+                .consumer_group
+                .rebalancing_check_interval
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> RuntimeConfig {
+        RuntimeConfig {
+            path: SERVER_CONFIG.system.runtime.path.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        CompressionConfig {
+            allow_override: SERVER_CONFIG.system.compression.allow_override,
+            default_algorithm: SERVER_CONFIG
+                .system
+                .compression
+                .default_algorithm
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> LoggingConfig {
+        LoggingConfig {
+            path: SERVER_CONFIG.system.logging.path.parse().unwrap(),
+            level: SERVER_CONFIG.system.logging.level.parse().unwrap(),
+            file_enabled: SERVER_CONFIG.system.logging.file_enabled,
+            max_file_size: SERVER_CONFIG.system.logging.max_file_size.parse().unwrap(),
+            max_total_size: SERVER_CONFIG.system.logging.max_total_size.parse().unwrap(),
+            rotation_check_interval: SERVER_CONFIG
+                .system
+                .logging
+                .rotation_check_interval
+                .parse()
+                .unwrap(),
+            retention: SERVER_CONFIG.system.logging.retention.parse().unwrap(),
+            sysinfo_print_interval: SERVER_CONFIG
+                .system
+                .logging
+                .sysinfo_print_interval
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for EncryptionConfig {
+    fn default() -> EncryptionConfig {
+        EncryptionConfig {
+            enabled: SERVER_CONFIG.system.encryption.enabled,
+            key: SERVER_CONFIG.system.encryption.key.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for StreamConfig {
+    fn default() -> StreamConfig {
+        StreamConfig {
+            path: SERVER_CONFIG.system.stream.path.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for TopicConfig {
+    fn default() -> TopicConfig {
+        TopicConfig {
+            path: SERVER_CONFIG.system.topic.path.parse().unwrap(),
+            max_size: SERVER_CONFIG.system.topic.max_size.parse().unwrap(),
+            message_expiry: SERVER_CONFIG.system.topic.message_expiry.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for PartitionConfig {
+    fn default() -> PartitionConfig {
+        PartitionConfig {
+            path: SERVER_CONFIG.system.partition.path.parse().unwrap(),
+            size_of_messages_required_to_save: SERVER_CONFIG
+                .system
+                .partition
+                .size_of_messages_required_to_save
+                .parse()
+                .unwrap(),
+            messages_required_to_save: SERVER_CONFIG.system.partition.messages_required_to_save
+                as u32,
+            enforce_fsync: SERVER_CONFIG.system.partition.enforce_fsync,
+            validate_checksum: SERVER_CONFIG.system.partition.validate_checksum,
+        }
+    }
+}
+
+impl Default for SegmentConfig {
+    fn default() -> SegmentConfig {
+        SegmentConfig {
+            size: SERVER_CONFIG.system.segment.size.parse().unwrap(),
+            cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
+            archive_expired: SERVER_CONFIG.system.segment.archive_expired,
+        }
+    }
+}
+
+impl Default for StateConfig {
+    fn default() -> StateConfig {
+        StateConfig {
+            enforce_fsync: SERVER_CONFIG.system.state.enforce_fsync,
+            max_file_operation_retries: SERVER_CONFIG.system.state.max_file_operation_retries
+                as u32,
+            retry_delay: SERVER_CONFIG.system.state.retry_delay.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for MessageDeduplicationConfig {
+    fn default() -> MessageDeduplicationConfig {
+        MessageDeduplicationConfig {
+            enabled: SERVER_CONFIG.system.message_deduplication.enabled,
+            max_entries: SERVER_CONFIG.system.message_deduplication.max_entries as u64,
+            expiry: SERVER_CONFIG
+                .system
+                .message_deduplication
+                .expiry
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> RecoveryConfig {
+        RecoveryConfig {
+            recreate_missing_state: SERVER_CONFIG.system.recovery.recreate_missing_state,
+        }
+    }
+}
+
+impl Default for MemoryPoolConfig {
+    fn default() -> MemoryPoolConfig {
+        Self {
+            enabled: SERVER_CONFIG.system.memory_pool.enabled,
+            size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
+            bucket_capacity: SERVER_CONFIG.system.memory_pool.bucket_capacity as u32,
+        }
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> TelemetryConfig {
+        TelemetryConfig {
+            enabled: SERVER_CONFIG.telemetry.enabled,
+            service_name: SERVER_CONFIG.telemetry.service_name.parse().unwrap(),
+            logs: TelemetryLogsConfig::default(),
+            traces: TelemetryTracesConfig::default(),
+        }
+    }
+}
+
+impl Default for TelemetryLogsConfig {
+    fn default() -> TelemetryLogsConfig {
+        TelemetryLogsConfig {
+            transport: SERVER_CONFIG.telemetry.logs.transport.parse().unwrap(),
+            endpoint: SERVER_CONFIG.telemetry.logs.endpoint.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for TelemetryTracesConfig {
+    fn default() -> TelemetryTracesConfig {
+        TelemetryTracesConfig {
+            transport: SERVER_CONFIG.telemetry.traces.transport.parse().unwrap(),
+            endpoint: SERVER_CONFIG.telemetry.traces.endpoint.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> ClusterConfig {
+        ClusterConfig {
+            enabled: SERVER_CONFIG.cluster.enabled,
+            name: SERVER_CONFIG.cluster.name.parse().unwrap(),
+            nodes: SERVER_CONFIG
+                .cluster
+                .nodes
+                .iter()
+                .map(|node| ClusterNodeConfig {
+                    name: node.name.parse().unwrap(),
+                    ip: node.ip.parse().unwrap(),
+                    replica_id: u8::try_from(node.replica_id).expect(
+                        "static_toml replica_id must fit in u8 (0..=255); \
+                         fix core/server/config.toml",
+                    ),
+                    ports: TransportPorts {
+                        tcp: Some(u16::try_from(node.ports.tcp).expect(
+                            "static_toml cluster.nodes.ports.tcp must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        quic: Some(u16::try_from(node.ports.quic).expect(
+                            "static_toml cluster.nodes.ports.quic must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        http: Some(u16::try_from(node.ports.http).expect(
+                            "static_toml cluster.nodes.ports.http must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        websocket: Some(u16::try_from(node.ports.websocket).expect(
+                            "static_toml cluster.nodes.ports.websocket must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        tcp_replica: Some(u16::try_from(node.ports.tcp_replica).expect(
+                            "static_toml cluster.nodes.ports.tcp_replica must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                    },
+                })
+                .collect(),
+            auth: ClusterAuthConfig::default(),
+            tls: ClusterTlsConfig::default(),
         }
     }
 }

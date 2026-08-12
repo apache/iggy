@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! HTTP data-plane gate for the server: produce, poll, and consumer-offset
+//! HTTP data-plane gate for server-ng: produce, poll, and consumer-offset
 //! routes exercised over raw `reqwest` (not the SDK HTTP client) so the wire
 //! contract itself is under test - exact status codes, the
 //! `iggy-durability` header, the body-size cap, and cross-request isolation
@@ -36,7 +36,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-// Partition ids are 0-based (CreateTopic assigns them from 0).
+// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 
 /// Explicit consumer id shared by the offset store body and the read/delete
@@ -826,7 +826,7 @@ async fn given_valid_access_token_when_refreshing_should_issue_working_token_wit
         "the refreshed token must authenticate"
     );
 
-    // Stateless by design: the server has no replicated revocation list (P3), so
+    // Stateless by design: server-ng has no replicated revocation list (P3), so
     // refreshing never invalidates the token it was minted from - the old token
     // lives to its natural exp. Deliberate, not a bug; the same posture as
     // logout, which ends a session without revoking its bearer.

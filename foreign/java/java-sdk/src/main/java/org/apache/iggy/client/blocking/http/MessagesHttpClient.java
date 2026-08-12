@@ -28,7 +28,6 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
 import java.util.Optional;
@@ -64,14 +63,9 @@ class MessagesHttpClient implements MessagesClient {
     }
 
     @Override
-    public SendMessagesResponse sendMessages(
-            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
+    public void sendMessages(StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
         var request = httpClient.preparePostRequest(path(streamId, topicId), new SendMessages(partitioning, messages));
-        var body = httpClient.executeWithStringResponse(request);
-        if (body.isBlank()) {
-            return SendMessagesResponse.empty();
-        }
-        return ObjectMapperFactory.getInstance().readValue(body, SendMessagesResponse.class);
+        httpClient.execute(request);
     }
 
     private static String path(StreamId streamId, TopicId topicId) {

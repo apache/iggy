@@ -26,7 +26,6 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
 import java.util.Optional;
@@ -60,11 +59,9 @@ public interface MessagesClient {
             Long count,
             boolean autoCommit);
 
-    default SendMessagesResponse sendMessages(
-            Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {
-        return sendMessages(StreamId.of(streamId), TopicId.of(topicId), partitioning, messages);
+    default void sendMessages(Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {
+        sendMessages(StreamId.of(streamId), TopicId.of(topicId), partitioning, messages);
     }
 
-    SendMessagesResponse sendMessages(
-            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages);
+    void sendMessages(StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages);
 }

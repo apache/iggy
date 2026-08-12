@@ -20,9 +20,10 @@ import { EventEmitter } from 'node:events';
 import type {
   ClientConfig,
   ClientCredentials, CommandResponse,
-  PasswordCredentials, RawClient, SendCommandOptions,
+  PasswordCredentials, Protocol, RawClient, SendCommandOptions,
   TokenCredentials
 } from '../client/client.type.js';
+import { handleResponse } from './client.utils.js';
 import { ResponseError, responseError } from '../wire/error.utils.js';
 import { debug } from './client.debug.js';
 import { IggyConnection } from './client.connection.js';
@@ -85,6 +86,8 @@ export class VsrResponseTimeoutError extends Error {
  * Implements command queuing, authentication, and heartbeat functionality.
  */
 export class CommandResponseStream extends EventEmitter {
+  /** Server wire protocol used by this connection */
+  readonly protocol: Protocol;
   /** Client configuration */
   private options: ClientConfig;
   /** Underlying connection to the server */
@@ -117,6 +120,7 @@ export class CommandResponseStream extends EventEmitter {
     super();
     const normalizedConfig = normalizeClientConfig(options);
     this.options = normalizedConfig;
+    this.protocol = normalizedConfig.protocol;
     this.connection = new IggyConnection(normalizedConfig);
     this.busy = false;
     this.isAuthenticated = false;
@@ -172,7 +176,7 @@ export class CommandResponseStream extends EventEmitter {
       if (!this.connection.connected)
         await this.connection.connect()
 
-      if (isLoginCommand(command))
+      if (this.options.protocol === 'vsr' && isLoginCommand(command))
         await this._ensureVsrLeader();
 
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
@@ -243,6 +247,8 @@ export class CommandResponseStream extends EventEmitter {
     payload: Buffer,
     handleResp = true
   ): Promise<CommandResponse> {
+    if (this.options.protocol !== 'vsr')
+      return this._processClassic(command, payload, handleResp);
     if (isLoginCommand(command) && this.isAuthenticated)
       return this._processVsrLogin(command, payload, handleResp);
     return this._processVsr(command, payload, handleResp);
@@ -255,6 +261,22 @@ export class CommandResponseStream extends EventEmitter {
   ): Promise<CommandResponse> {
     await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true);
     return this._processVsr(command, payload, handleResp);
+  }
+
+  private async _processClassic(
+    command: number,
+    payload: Buffer,
+    handleResp: boolean
+  ): Promise<CommandResponse> {
+    const response = await this._exchange(
+      () => this.connection.writeCommand(command, payload)
+    );
+    if (!handleResp)
+      return response as unknown as CommandResponse;
+    const parsed = handleResponse(response);
+    if (parsed.status !== 0)
+      throw responseError(command, parsed.status);
+    return parsed;
   }
 
   private async _processVsr(
@@ -387,7 +409,8 @@ export class CommandResponseStream extends EventEmitter {
 
   private isUnloggedCommand(command: number): boolean {
     return UNLOGGED_COMMAND_CODE.includes(command) ||
-      command === COMMAND_CODE.GetClusterMetadata;
+      (this.options.protocol === 'vsr' &&
+        command === COMMAND_CODE.GetClusterMetadata);
   }
 
   private async _ensureVsrLeader(): Promise<void> {

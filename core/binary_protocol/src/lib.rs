@@ -71,14 +71,12 @@ pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusError, ConsensusHeader, DVC_HEADERS_MAX,
-    DoViewChangeHeader, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation,
-    PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN, RepairPrepareHeader,
-    RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
-    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
-    RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes, read_size_field,
-    result_code, result_section_len,
+    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
+    EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
+    RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, read_size_field, result_code, result_section_len,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

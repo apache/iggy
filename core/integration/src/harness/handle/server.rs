@@ -92,7 +92,15 @@ impl std::fmt::Debug for ServerHandle {
 
 impl ServerHandle {
     fn default_server_binary() -> &'static str {
-        "iggy-server"
+        #[cfg(feature = "vsr")]
+        {
+            "iggy-server-ng"
+        }
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            "iggy-server"
+        }
     }
 
     fn launched_binary(&self) -> String {
@@ -829,9 +837,13 @@ impl TestBinary for ServerHandle {
             // trusts (rcgen self-signed certs share the same subject DN), which
             // rustls rejects as `BadSignature`. Generate only when absent so all
             // nodes and clients share one keypair; this also keeps the
-            // certificate stable across a restart.
+            // certificate stable across a restart. The legacy single-node
+            // harness keeps its regenerate-per-start behavior.
+            #[cfg(feature = "vsr")]
             let should_generate = !(cert_dir.join("test_cert.pem").exists()
                 && cert_dir.join("test_key.pem").exists());
+            #[cfg(not(feature = "vsr"))]
+            let should_generate = true;
             if should_generate {
                 generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
                     TestBinaryError::InvalidState {
@@ -882,6 +894,13 @@ impl TestBinary for ServerHandle {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
         command.envs(&self.envs);
+
+        // Legacy clustering elects node 0 externally and requires explicit followers.
+        // VSR/server-ng elects its own primary and should see symmetric node startup.
+        #[cfg(not(feature = "vsr"))]
+        if self.server_id > 0 {
+            command.arg("--follower");
+        }
 
         // `--replica-id` is the single identity input expected by the
         // server when cluster mode is enabled; all other cluster config is

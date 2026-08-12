@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type { Protocol } from './client.type.js';
 import {
-  HEADER_SIZE,
-  readSize
+  HEADER_SIZE as VSR_HEADER_SIZE,
+  readSize as readVsrSize
 } from '../wire/vsr/header.js';
+
+const CLASSIC_HEADER_SIZE = 8;
 
 export class ProtocolFrameError extends Error {
   constructor(message: string) {
@@ -32,35 +35,45 @@ export type ExtractedFrames = {
   remainder: Buffer
 };
 
+const headerSizeFor = (protocol: Protocol): number =>
+  protocol === 'vsr' ? VSR_HEADER_SIZE : CLASSIC_HEADER_SIZE;
+
 const declaredFrameSize = (
+  protocol: Protocol,
   header: Buffer,
   maximumFrameSize: number
 ): number => {
-  const declaredSize = readSize(header);
+  const headerSize = headerSizeFor(protocol);
+  const declaredSize = protocol === 'vsr'
+    ? readVsrSize(header)
+    : CLASSIC_HEADER_SIZE + header.readUInt32LE(4);
 
-  if (declaredSize < HEADER_SIZE)
+  if (declaredSize < headerSize)
     throw new ProtocolFrameError(
-      `declared frame size ${declaredSize} is below header size`
+      `declared ${protocol} frame size ${declaredSize} is below header size`
     );
   if (declaredSize > maximumFrameSize)
     throw new ProtocolFrameError(
-      `declared frame size ${declaredSize} exceeds ` +
+      `declared ${protocol} frame size ${declaredSize} exceeds ` +
       `the ${maximumFrameSize} byte limit`
     );
   return declaredSize;
 };
 
 export const extractResponseFrames = (
+  protocol: Protocol,
   buffer: Buffer,
   maximumFrameSize: number
 ): ExtractedFrames => {
+  const headerSize = headerSizeFor(protocol);
   const frames: Buffer[] = [];
   let offset = 0;
 
-  while (buffer.length - offset >= HEADER_SIZE) {
+  while (buffer.length - offset >= headerSize) {
     const available = buffer.length - offset;
     const declaredSize = declaredFrameSize(
-      buffer.subarray(offset, offset + HEADER_SIZE),
+      protocol,
+      buffer.subarray(offset, offset + headerSize),
       maximumFrameSize
     );
     if (available < declaredSize)
@@ -83,15 +96,19 @@ export const extractResponseFrames = (
  * incomplete frame as new socket chunks arrive.
  */
 export class ResponseFrameDecoder {
+  private readonly protocol: Protocol;
   private readonly maximumFrameSize: number;
+  private readonly headerSize: number;
   private chunks: Buffer[];
   private chunkIndex: number;
   private chunkOffset: number;
   private bufferedLength: number;
   private expectedFrameSize?: number;
 
-  constructor(maximumFrameSize: number) {
+  constructor(protocol: Protocol, maximumFrameSize: number) {
+    this.protocol = protocol;
     this.maximumFrameSize = maximumFrameSize;
+    this.headerSize = headerSizeFor(protocol);
     this.chunks = [];
     this.chunkIndex = 0;
     this.chunkOffset = 0;
@@ -120,10 +137,11 @@ export class ResponseFrameDecoder {
     const frames: Buffer[] = [];
     while (true) {
       if (this.expectedFrameSize === undefined) {
-        if (this.bufferedLength < HEADER_SIZE)
+        if (this.bufferedLength < this.headerSize)
           break;
         this.expectedFrameSize = declaredFrameSize(
-          this.peek(HEADER_SIZE),
+          this.protocol,
+          this.peek(this.headerSize),
           this.maximumFrameSize
         );
       }

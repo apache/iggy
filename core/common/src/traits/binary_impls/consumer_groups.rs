@@ -159,6 +159,7 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         // Joining changes this member's assignment (and the group generation);
         // drop any cached assignment so the next group poll re-syncs. Key
         // format matches `binary_impls::messages::group_cache_key`.
+        #[cfg(feature = "vsr")]
         self.consumer_group_state()
             .invalidate_assignment(&format!("{stream_id}|{topic_id}|{group_id}"));
         Ok(())
@@ -184,6 +185,7 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
             .to_bytes(),
         )
         .await?;
+        #[cfg(feature = "vsr")]
         {
             let key = format!("{stream_id}|{topic_id}|{group_id}");
             self.consumer_group_state().invalidate_assignment(&key);

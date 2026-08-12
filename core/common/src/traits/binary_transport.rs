@@ -18,6 +18,7 @@
 use crate::{ClientState, DiagnosticEvent, IggyDuration, IggyError};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "vsr")]
 use std::sync::Arc;
 
 #[async_trait]
@@ -33,6 +34,7 @@ pub trait BinaryTransport {
     /// Per-transport consumer-group + partitioning cache used to resolve
     /// partitioning client-side under VSR (the broker never picks a
     /// partition). Shared via `Arc` so a refresh task can hold it.
+    #[cfg(feature = "vsr")]
     fn consumer_group_state(&self) -> Arc<crate::ConsumerGroupClientState>;
 }
 
@@ -40,6 +42,7 @@ pub trait BinaryTransport {
 /// [`VsrSessionControl`] because they cannot name
 /// `vsr_session_sealed::Sealed`. The session-mutation methods stay
 /// in-crate so only the SDK's login/logout flows can call them.
+#[cfg(feature = "vsr")]
 mod vsr_session_sealed {
     pub trait Sealed {}
 }
@@ -47,6 +50,7 @@ mod vsr_session_sealed {
 /// VSR-internal session control. Distinct from [`BinaryTransport`] so
 /// `&dyn BinaryTransport` cannot reach `bind`/`reset` -- mid-session
 /// mutation corrupts the dedup counter or silently breaks at-most-once.
+#[cfg(feature = "vsr")]
 #[async_trait]
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
@@ -57,4 +61,5 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     fn sdk_version(&self) -> &'static str;
 }
 
+#[cfg(feature = "vsr")]
 pub use vsr_session_sealed::Sealed as VsrSessionSealed;

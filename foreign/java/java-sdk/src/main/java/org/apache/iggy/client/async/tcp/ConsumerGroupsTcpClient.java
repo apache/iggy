@@ -22,7 +22,6 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
-import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -184,23 +183,5 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
                     log.debug("Successfully left consumer group");
                     response.release();
                 });
-    }
-
-    @Override
-    public CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
-            StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        var payload = Unpooled.buffer();
-        payload.writeBytes(BytesSerializer.toBytes(streamId));
-        payload.writeBytes(BytesSerializer.toBytes(topicId));
-        payload.writeBytes(BytesSerializer.toBytes(groupId));
-
-        log.debug("Syncing consumer group assignment - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
-
-        // An empty body means "not a member", which exchangeForOptional maps
-        // to an empty Optional; a member owning zero partitions still gets a
-        // non-empty body with a zero partition count.
-        return connection()
-                .exchangeForOptional(
-                        CommandCode.ConsumerGroup.SYNC, payload, BytesDeserializer::readConsumerGroupAssignment);
     }
 }

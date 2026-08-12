@@ -93,7 +93,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
 - **Single binary deployment** (no external dependencies)
-- Running as a single node or as a **cluster**, with data replication based on **[Viewstamped Replication (VSR)](https://github.com/apache/iggy/blob/master/assets/vsr.pdf)**
+- Running as a single node (clustering based on Viewstamped Replication will be implemented in the near future)
 
 ![server](assets/server.png)
 
@@ -114,6 +114,12 @@ This is the high-level architecture of the Iggy message streaming server, where 
 The official releases follow the regular semver (`0.7.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
 We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+
+---
+
+## Roadmap
+
+- **Clustering** & data replication based on **[VSR](https://github.com/apache/iggy/blob/master/assets/vsr.pdf)** (coming soon)
 
 ---
 
@@ -279,7 +285,7 @@ it should only be used for development and testing.
 
 `cargo run --bin iggy-server -- --with-default-root-credentials`
 
-Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables are ignored. They are still validated, though: a half-set pair or an out-of-range value aborts the boot instead of being silently dropped. To reset credentials, delete the data directory.
+Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables will have no effect. To reset credentials, delete the data directory.
 
 For configuration options and detailed help:
 

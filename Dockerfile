@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y \
 COPY . .
 RUN npm --prefix web ci && npm --prefix web run build:static
 RUN cargo build --bin iggy --release
-RUN cargo build --bin iggy-server -p server --release
+RUN cargo build --bin iggy-server --release
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y \
@@ -51,6 +51,7 @@ RUN apt-get update && apt-get install -y \
     liblzma5 \
     libhwloc15 \
     && rm -rf /var/lib/apt/lists/*
+COPY ./core/configs ./configs
 COPY --from=builder /build/target/release/iggy .
 COPY --from=builder /build/target/release/iggy-server .
 

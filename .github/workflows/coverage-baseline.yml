@@ -216,16 +216,11 @@ jobs:
 
       - name: Build Iggy server Docker image
         id: docker_build
-        run: |
-          cargo build --locked --bin iggy-server --bin iggy
-          docker build \
-            -f core/server/Dockerfile \
-            --target runtime-prebuilt \
-            -t iggy-server:test \
-            --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
-            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
-            .
-          echo "docker_image=iggy-server:test" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/utils/docker-build-test-server
+        with:
+          image-tag: "iggy-server:test"
+          libc: "glibc"
+          profile: "debug"
 
       - name: Restore and build
         working-directory: foreign/csharp
@@ -323,12 +318,14 @@ jobs:
       - name: Build server Docker image for TLS tests
         run: |
           # test_tls.py spawns the server in a container; build it from the
-          # same binaries the plain-TCP tests run against.
-          cargo build --locked --bin iggy-server --bin iggy
+          # same vsr binaries the plain-TCP tests run against.
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
           docker build \
-            -f core/server/Dockerfile \
+            -f core/server-ng/Dockerfile \
             --target runtime-prebuilt \
-            --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+            --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
             --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
             -t iggy-server:local .
         shell: bash
@@ -337,7 +334,10 @@ jobs:
         id: iggy
         uses: ./.github/actions/utils/server-start
         with:
-          cargo-bin: iggy-server
+          # TODO(hubcio): change to iggy-server once legacy server is removed
+          # (core/server has VSR support)
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
 
       - name: Run tests
         run: |
@@ -443,9 +443,8 @@ jobs:
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
-        with:
-          cargo-bin: iggy-server
-          wait-timeout-seconds: "90"
+        env:
+          IGGY_CLUSTER_ENABLED: true
 
       - name: Run unit tests with coverage
         run: |
@@ -458,6 +457,9 @@ jobs:
           cd foreign/node
           mkdir -p ../../reports/node-coverage/e2e
           npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
+        env:
+          IGGY_SERVER_HOST: 127.0.0.1
+          IGGY_SERVER_TCP_PORT: 8090
 
       - name: Stop Iggy server
         if: always()
@@ -498,7 +500,9 @@ jobs:
         id: iggy
         uses: ./.github/actions/utils/server-start
         with:
-          cargo-bin: iggy-server
+          # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+          cargo-bin: iggy-server-ng
+          cargo-features: vsr
           replica-id: "0"
           wait-timeout-seconds: "90"
 

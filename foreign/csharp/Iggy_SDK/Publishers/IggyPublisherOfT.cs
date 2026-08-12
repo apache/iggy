@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -61,10 +60,7 @@ public class IggyPublisher<T> : IggyPublisher
     /// <param name="messageId">Optional message ID. If null, the message is sent with ID 0 and the server assigns one</param>
     /// <param name="userHeaders">Optional user headers to attach to the message</param>
     /// <param name="ct">Cancellation token</param>
-    /// <returns>
-    ///     Commit confirmations for a direct send; empty when background sending is enabled.
-    /// </returns>
-    public async Task<SendMessagesResponse> SendAsync(T data, Guid? messageId = null,
+    public async Task SendAsync(T data, Guid? messageId = null,
         Dictionary<HeaderKey, HeaderValue>? userHeaders = null, CancellationToken ct = default)
     {
         EnsureInitialized();
@@ -74,7 +70,7 @@ public class IggyPublisher<T> : IggyPublisher
         if (BackgroundProcessor != null)
         {
             await BackgroundProcessor.EnqueueAsync(TypedUnit<T>.Single(data, id, userHeaders, _serializer), ct);
-            return SendMessagesResponse.Empty;
+            return;
         }
 
         var writer = new PooledBufferWriter();
@@ -82,7 +78,7 @@ public class IggyPublisher<T> : IggyPublisher
         {
             _serializer.Serialize(data, writer);
             var message = new Message(id, writer.Written, userHeaders);
-            return await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, message, ct);
+            await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, message, ct);
         }
         finally
         {
@@ -95,10 +91,7 @@ public class IggyPublisher<T> : IggyPublisher
     /// </summary>
     /// <param name="data">The collection of objects to serialize and send</param>
     /// <param name="ct">Cancellation token</param>
-    /// <returns>
-    ///     Commit confirmations for a direct send; empty when background sending is enabled.
-    /// </returns>
-    public async Task<SendMessagesResponse> SendAsync(IEnumerable<T> data, CancellationToken ct = default)
+    public async Task SendAsync(IEnumerable<T> data, CancellationToken ct = default)
     {
         EnsureInitialized();
 
@@ -110,7 +103,7 @@ public class IggyPublisher<T> : IggyPublisher
                 await BackgroundProcessor.EnqueueAsync(unit, ct);
             }
 
-            return SendMessagesResponse.Empty;
+            return;
         }
 
         using var builder = new RentedMessageBatchBuilder();
@@ -120,7 +113,7 @@ public class IggyPublisher<T> : IggyPublisher
                 static (state, writer) => state.Serializer.Serialize(state.Data, writer));
         }
 
-        return await SendDirectBatchAsync(builder, ct);
+        await SendDirectBatchAsync(builder, ct);
     }
 
     /// <summary>
@@ -128,10 +121,7 @@ public class IggyPublisher<T> : IggyPublisher
     /// </summary>
     /// <param name="items">The collection of items to send, each with optional message ID and headers</param>
     /// <param name="ct">Cancellation token</param>
-    /// <returns>
-    ///     Commit confirmations for a direct send; empty when background sending is enabled.
-    /// </returns>
-    public async Task<SendMessagesResponse> SendAsync(
+    public async Task SendAsync(
         IEnumerable<(T data, Guid? messageId, Dictionary<HeaderKey, HeaderValue>? userHeaders)> items,
         CancellationToken ct = default)
     {
@@ -145,7 +135,7 @@ public class IggyPublisher<T> : IggyPublisher
                 await BackgroundProcessor.EnqueueAsync(unit, ct);
             }
 
-            return SendMessagesResponse.Empty;
+            return;
         }
 
         using var builder = new RentedMessageBatchBuilder();
@@ -156,11 +146,10 @@ public class IggyPublisher<T> : IggyPublisher
                 item.userHeaders);
         }
 
-        return await SendDirectBatchAsync(builder, ct);
+        await SendDirectBatchAsync(builder, ct);
     }
 
-    private async Task<SendMessagesResponse> SendDirectBatchAsync(RentedMessageBatchBuilder builder,
-        CancellationToken ct)
+    private async Task SendDirectBatchAsync(RentedMessageBatchBuilder builder, CancellationToken ct)
     {
         var batch = builder.Build();
         try
@@ -168,10 +157,10 @@ public class IggyPublisher<T> : IggyPublisher
             IList<Message> messages = batch.Messages;
             if (messages.Count == 0)
             {
-                return SendMessagesResponse.Empty;
+                return;
             }
 
-            return await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, messages, ct);
+            await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, messages, ct);
         }
         finally
         {

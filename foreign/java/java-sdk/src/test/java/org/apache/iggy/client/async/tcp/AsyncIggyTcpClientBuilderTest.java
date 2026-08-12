@@ -148,6 +148,24 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void shouldThrowExceptionForZeroConnectionPoolSize() {
+        // Given: Builder with 0 connection pool size
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionPoolSize(0);
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForNegativeConnectionPoolSize() {
+        // Given: Builder with negative connection pool size
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionPoolSize(-1);
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
     void shouldThrowExceptionForZeroConnectionTimeout() {
         // Given: Builder with 0 connection timeout
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionTimeout(Duration.ofMillis(0));
@@ -191,63 +209,6 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
-    }
-
-    @Test
-    void shouldThrowExceptionForZeroRequestTimeout() {
-        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().requestTimeout(Duration.ZERO);
-
-        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
-    }
-
-    @Test
-    void shouldThrowExceptionForNegativeRequestTimeout() {
-        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().requestTimeout(Duration.ofMillis(-1));
-
-        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
-    }
-
-    @Test
-    void shouldAcceptCustomMaximumVsrFrameSize() {
-        client =
-                AsyncIggyTcpClient.builder().maxVsrFrameSize(128L * 1024 * 1024).build();
-
-        assertThat(client).isNotNull();
-    }
-
-    @Test
-    void shouldRejectMaximumVsrFrameSizeBelowHeader() {
-        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().maxVsrFrameSize(255);
-
-        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
-    }
-
-    @Test
-    void shouldRejectNonPositiveMaximumVsrFrameSize() {
-        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().maxVsrFrameSize(0).build())
-                .isInstanceOf(IggyInvalidArgumentException.class);
-        assertThatThrownBy(
-                        () -> AsyncIggyTcpClient.builder().maxVsrFrameSize(-1).build())
-                .isInstanceOf(IggyInvalidArgumentException.class);
-    }
-
-    @Test
-    void shouldRejectMaximumVsrFrameSizeAboveJavaBufferLimit() {
-        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().maxVsrFrameSize((long) Integer.MAX_VALUE + 1);
-
-        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
-    }
-
-    @Test
-    void shouldRejectNonPositiveHeartbeatInterval() {
-        assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
-                        .heartbeatInterval(Duration.ZERO)
-                        .build())
-                .isInstanceOf(IggyInvalidArgumentException.class);
-        assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
-                        .heartbeatInterval(Duration.ofMillis(-1))
-                        .build())
-                .isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -488,6 +449,18 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void testBuildClientWithConnectionPoolSize() throws Exception {
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .connectionPoolSize(5)
+                .build();
+        client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        assertThat(client.users()).isNotNull();
+    }
+
+    @Test
     void testBuildClientWithExponentialBackoffRetryPolicy() throws Exception {
         client = AsyncIggyTcpClient.builder()
                 .host(serverHost())
@@ -554,6 +527,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .connectionTimeout(Duration.ofSeconds(10))
                 .requestTimeout(Duration.ofSeconds(30))
+                .connectionPoolSize(5)
                 .retryPolicy(RetryPolicy.exponentialBackoff())
                 .tls(false)
                 .build();

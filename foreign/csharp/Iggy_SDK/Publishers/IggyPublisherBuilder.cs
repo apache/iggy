@@ -33,7 +33,7 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
-    private protected IMessageEncryptor? _encryptor;
+    private IMessageEncryptor? _encryptor;
 
     internal Func<PublisherErrorEventArgs, Task>? OnBackgroundError { get; set; }
     internal Func<MessageBatchFailedEventArgs, Task>? OnMessageBatchFailed { get; set; }
@@ -305,7 +305,6 @@ public class IggyPublisherBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
-                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });

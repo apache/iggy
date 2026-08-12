@@ -25,7 +25,6 @@ import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,9 +46,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Integration tests for connection authentication lifecycle.
+ * Integration tests for connection pool authentication lifecycle.
  * Verifies that lazy per-channel authentication works correctly across
- * login, logout, and re-login cycles on the pooled connection.
+ * login, logout, and re-login cycles with a pooled connection.
  */
 @DisplayName("Connection Pool Authentication")
 class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
@@ -57,7 +56,7 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
 
     private static final String USERNAME = "iggy";
     private static final String PASSWORD = "iggy";
-    private static final int CONCURRENCY = 3;
+    private static final int POOL_SIZE = 3;
 
     private AsyncIggyTcpClient client;
 
@@ -66,6 +65,7 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
         client = AsyncIggyTcpClient.builder()
                 .host(serverHost())
                 .port(serverTcpPort())
+                .connectionPoolSize(POOL_SIZE)
                 .build();
         client.connect().get(5, TimeUnit.SECONDS);
     }
@@ -78,15 +78,9 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
     }
 
     @Test
-    @DisplayName("should allow only bootstrap commands before login")
-    void shouldAllowOnlyBootstrapCommandsBeforeLogin() throws Exception {
-        // when
-        var ping = client.system().ping().get(5, TimeUnit.SECONDS);
-        var metadata = client.system().getClusterMetadata().get(5, TimeUnit.SECONDS);
-
-        // then
-        assertThat(ping).isEqualTo("pong");
-        assertThat(metadata).isNotNull();
+    @DisplayName("should reject commands before login")
+    void shouldRejectCommandsBeforeLogin() {
+        // when/then
         assertThatThrownBy(() -> client.streams().getStreams().get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
                 .hasCauseInstanceOf(IggyNotConnectedException.class);
@@ -165,10 +159,10 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         "test-topic")
                 .get(5, TimeUnit.SECONDS);
 
-        // when - fire a burst of concurrent requests to exercise lazy
-        // authentication on the shared channel
-        int concurrentRequests = CONCURRENCY * 3;
-        List<CompletableFuture<SendMessagesResponse>> futures = new ArrayList<>();
+        // when - fire more concurrent requests than the pool size to force
+        // multiple channels to be created and lazily authenticated
+        int concurrentRequests = POOL_SIZE * 3;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (int i = 0; i < concurrentRequests; i++) {
             var future = client.messages()
                     .sendMessages(
@@ -206,8 +200,8 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         "test-topic")
                 .get(5, TimeUnit.SECONDS);
 
-        List<CompletableFuture<SendMessagesResponse>> warmupFutures = new ArrayList<>();
-        for (int i = 0; i < CONCURRENCY * 2; i++) {
+        List<CompletableFuture<Void>> warmupFutures = new ArrayList<>();
+        for (int i = 0; i < POOL_SIZE * 2; i++) {
             warmupFutures.add(client.messages()
                     .sendMessages(
                             StreamId.of(streamName),
@@ -224,8 +218,8 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
         log.info("Logout + re-login complete");
 
         // then - all channels should re-authenticate transparently
-        List<CompletableFuture<SendMessagesResponse>> postReLoginFutures = new ArrayList<>();
-        for (int i = 0; i < CONCURRENCY * 2; i++) {
+        List<CompletableFuture<Void>> postReLoginFutures = new ArrayList<>();
+        for (int i = 0; i < POOL_SIZE * 2; i++) {
             postReLoginFutures.add(client.messages()
                     .sendMessages(
                             StreamId.of(streamName),

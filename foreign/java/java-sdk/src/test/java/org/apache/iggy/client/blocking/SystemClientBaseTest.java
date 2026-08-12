@@ -58,8 +58,6 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(metadata).isNotNull();
-        // The server runs standalone (cluster disabled), so it synthesizes
-        // itself as the sole leader of a single-node roster.
         assertThat(metadata.name()).isEqualTo("single-node");
         assertThat(metadata.nodes()).hasSize(1);
         var node = metadata.nodes().get(0);

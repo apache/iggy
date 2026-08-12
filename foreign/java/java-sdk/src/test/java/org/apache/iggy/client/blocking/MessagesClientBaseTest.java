@@ -70,70 +70,6 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void shouldSendMessageWithBalancedPartitioning() {
-        // given
-        setUpStreamAndTopic();
-
-        // when
-        String text = "message from java sdk";
-        messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.balanced(), List.of(Message.of(text)));
-
-        var polledMessages = messagesClient.pollMessages(
-                STREAM_NAME,
-                TOPIC_NAME,
-                empty(),
-                Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
-                10L,
-                false);
-
-        // then
-        assertThat(polledMessages.messages()).hasSize(1);
-    }
-
-    @Test
-    void shouldSendMessageWithMessageKeyPartitioning() {
-        // given
-        setUpStreamAndTopic();
-
-        // when
-        String text = "message from java sdk";
-        messagesClient.sendMessages(
-                STREAM_NAME, TOPIC_NAME, Partitioning.messagesKey("test-key"), List.of(Message.of(text)));
-        var polledMessages = messagesClient.pollMessages(
-                STREAM_NAME,
-                TOPIC_NAME,
-                empty(),
-                Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
-                10L,
-                false);
-
-        // then
-        assertThat(polledMessages.messages()).hasSize(1);
-    }
-
-    @Test
-    void shouldReturnSendConfirmations() {
-        // given
-        setUpStreamAndTopic();
-
-        // when
-        var firstResponse = messagesClient.sendMessages(
-                STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("first")));
-        var secondResponse = messagesClient.sendMessages(
-                STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("second")));
-
-        // then
-        assertThat(firstResponse.confirmations()).hasSize(1);
-        var firstConfirmation = firstResponse.confirmations().get(0);
-        assertThat(firstConfirmation.partitionId()).isEqualTo(0L);
-        assertThat(firstConfirmation.baseOffset()).isEqualTo(BigInteger.ZERO);
-        assertThat(secondResponse.confirmations()).hasSize(1);
-        assertThat(secondResponse.confirmations().get(0).baseOffset()).isEqualTo(BigInteger.ONE);
-    }
-
-    @Test
     void shouldPollMessagesWithFirstStrategy() {
         // given
         setUpStreamAndTopic();
@@ -212,5 +148,49 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
         // then
         assertThat(polledMessages.messages()).hasSize(1);
         assertThat(new String(polledMessages.messages().get(0).payload())).isEqualTo(content);
+    }
+
+    @Test
+    void shouldSendMessageWithBalancedPartitioning() {
+        // given
+        setUpStreamAndTopic();
+
+        // when
+        String text = "message from java sdk";
+        messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.balanced(), List.of(Message.of(text)));
+
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
+
+        // then
+        assertThat(polledMessages.messages()).hasSize(1);
+    }
+
+    @Test
+    void shouldSendMessageWithMessageKeyPartitioning() {
+        // given
+        setUpStreamAndTopic();
+
+        // when
+        String text = "message from java sdk";
+        messagesClient.sendMessages(
+                STREAM_NAME, TOPIC_NAME, Partitioning.messagesKey("test-key"), List.of(Message.of(text)));
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
+
+        // then
+        assertThat(polledMessages.messages()).hasSize(1);
     }
 }

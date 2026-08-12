@@ -55,7 +55,7 @@ pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -84,7 +84,7 @@ macro_rules! op_dispatch {
 
         /// In-flight entry recorded on submit, removed on reply.
         ///
-        /// `request_namespace` is the `header.group` the request was
+        /// `request_namespace` is the `header.namespace` the request was
         /// submitted with; the auditor cross-checks it against the
         /// reply's namespace so a misrouted reply cannot update the
         /// wrong VSR group's bookkeeping.
@@ -130,7 +130,7 @@ macro_rules! op_dispatch {
         }
 
         #[must_use]
-        pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RoutedRequestHeader> {
+        pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RequestHeader> {
             match input {
                 $( InFlightInput::$variant(i) => $module::build_message(client, i), )*
             }

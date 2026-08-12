@@ -29,6 +29,9 @@ repository = "https://github.com/apache/iggy"
 readme = "README.md"
 publish = false
 
+[features]
+vsr = ["iggy/vsr"]
+
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }

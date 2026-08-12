@@ -18,7 +18,7 @@
 //! `ChangePassword` op. Targets `Ok` (rotate live user's password) or
 //! `UserNotFound` (fabricated user).
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -68,7 +68,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.change_password(&input.user, &input.current_password, &input.new_password)
 }
 

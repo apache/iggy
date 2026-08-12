@@ -27,15 +27,7 @@
 /** Size of every consensus header, both directions. */
 export const HEADER_SIZE = 256;
 
-/**
- * `RequestHeader` field offsets the client writes.
- *
- * The client wire carries no routing namespace: the server derives the
- * consensus group (plane from `operation`, partition target from the payload)
- * and stamps it into its own internal header. Everything that followed the
- * removed field therefore sits eight bytes earlier than in the pre-derivation
- * layout.
- */
+/** `RequestHeader` field offsets the client writes. */
 export const REQUEST_OFFSET = {
   size: 48,
   command: 60,
@@ -43,8 +35,9 @@ export const REQUEST_OFFSET = {
   timestamp: 160,
   request: 168,
   operation: 176,
-  session: 184,
-  reserved: 196
+  namespace: 184,
+  session: 192,
+  reserved: 204
 } as const;
 
 /** `ReplyHeader` field offsets the client reads. */
@@ -52,7 +45,8 @@ export const REPLY_OFFSET = {
   size: 48,
   command: 60,
   operation: 208,
-  status: 216
+  namespace: 216,
+  status: 224
 } as const;
 
 /** `EvictionHeader` field offsets the client reads. */
@@ -104,6 +98,8 @@ export type RequestHeaderFields = {
   request: bigint,
   /** `Operation` discriminant. */
   operation: number,
+  /** Routing namespace (u64). */
+  namespace: bigint,
   /** Bound session (u64), or 0n. */
   session: bigint,
   /** Command code for `NonReplicated`, placed in `reserved[0..4]`. */
@@ -113,7 +109,7 @@ export type RequestHeaderFields = {
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 
 /**
- * Encodes a 256-byte request header. Only the six fields the server reads
+ * Encodes a 256-byte request header. Only the seven fields the server reads
  * are written; the checksums stay zero, matching the Rust SDK's contract
  * with the VSR server.
  */
@@ -126,6 +122,7 @@ export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   header.writeBigUInt64LE(fields.client >> 64n, REQUEST_OFFSET.client + 8);
   header.writeBigUInt64LE(fields.request, REQUEST_OFFSET.request);
   header.writeUInt8(fields.operation, REQUEST_OFFSET.operation);
+  header.writeBigUInt64LE(fields.namespace, REQUEST_OFFSET.namespace);
   header.writeBigUInt64LE(fields.session, REQUEST_OFFSET.session);
   if (fields.nonReplicatedCode !== undefined)
     header.writeUInt32LE(fields.nonReplicatedCode, REQUEST_OFFSET.reserved);

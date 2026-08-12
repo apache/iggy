@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(not(feature = "vsr"))]
+use crate::server::scenarios::bench_scenario;
 use crate::server::scenarios::{
     authentication_scenario, consumer_timestamp_polling_scenario, invalid_consumer_offset_scenario,
     message_headers_scenario, permissions_scenario, snapshot_scenario,
@@ -99,6 +101,23 @@ async fn message_headers(harness: &TestHarness) {
 )]
 async fn stream_size_validation(harness: &TestHarness) {
     stream_size_validation_scenario::run(harness).await;
+}
+
+// Blocked under vsr: pushes 8 MiB through the data plane, which drains the
+// in-memory partition journal to disk segments; benchmarks are out of
+// scope for the vsr test pass.
+#[cfg(not(feature = "vsr"))]
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn bench(harness: &TestHarness) {
+    bench_scenario::run(harness).await;
 }
 
 #[iggy_harness(

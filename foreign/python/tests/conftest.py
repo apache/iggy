@@ -131,10 +131,5 @@ def pytest_collection_modifyitems(items):
         path.name for path in Path(__file__).parent.glob("test_*.py")
     }
     for item in items:
-        # Tests explicitly marked as unit need no server; auto-marking them
-        # integration too would make `-m "not integration"` unable to select
-        # them.
-        if item.get_closest_marker("unit"):
-            continue
         if any(module in item.nodeid for module in integration_modules):
             item.add_marker(pytest.mark.integration)

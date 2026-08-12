@@ -16,7 +16,7 @@
 // under the License.
 
 //! End-to-end coverage for the SDK HTTP client's `refresh_access_token`
-//! against a live the server listener: the reissued token must replace the one
+//! against a live server-ng listener: the reissued token must replace the one
 //! the client holds and keep it authenticated.
 
 use iggy::http::http_client::HttpClient;

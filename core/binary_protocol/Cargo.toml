@@ -35,7 +35,6 @@ bytes = { workspace = true }
 enumset = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
-twox-hash = { workspace = true }
 
 [dev-dependencies]
 aligned-vec = { workspace = true }

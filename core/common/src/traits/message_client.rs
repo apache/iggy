@@ -28,7 +28,7 @@ pub trait MessageClient {
     ///
     /// Authentication is required, and the permission to poll the messages.
     ///
-    /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
+    /// Under the `vsr` feature, polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,

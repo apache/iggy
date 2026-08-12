@@ -37,6 +37,23 @@ describe('VSR custom request framing', () => {
     assert.deepEqual(frame.subarray(256), payload);
   });
 
+  it('does not consume a request ID when local routing fails', () => {
+    const session = new VsrSession(7n);
+    session.bind(42n);
+    assert.throws(
+      () => session.encode(
+        COMMAND_CODE.SendMessages,
+        Buffer.alloc(0)
+      )
+    );
+
+    const frame = session.encode(
+      COMMAND_CODE.CreateStream,
+      Buffer.alloc(0)
+    );
+    assert.equal(frame.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
+  });
+
   it('rejects an unbound replicated request with a typed error', () => {
     const session = new VsrSession();
     assert.throws(

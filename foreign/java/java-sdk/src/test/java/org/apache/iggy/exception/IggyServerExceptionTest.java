@@ -117,15 +117,6 @@ class IggyServerExceptionTest {
         }
 
         @Test
-        void shouldBuildMessageWithTransientErrorCode() {
-            IggyServerException exception = IggyServerException.fromTcpResponse(57, new byte[0]);
-
-            assertThat(exception.getErrorCode()).isEqualTo(IggyErrorCode.TRANSIENT_NOT_COMMITTED);
-            assertThat(exception.getMessage())
-                    .isEqualTo("Server error [code=57 (TRANSIENT_NOT_COMMITTED)]: Server error");
-        }
-
-        @Test
         void shouldBuildMessageWithEmptyReason() {
             // given
             IggyServerException exception = new IggyServerException(

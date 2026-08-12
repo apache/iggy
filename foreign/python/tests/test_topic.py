@@ -24,6 +24,7 @@ from apache_iggy import IggyClient, IggyExpiry, MaxTopicSize, SendMessage
 from .utils import (
     get_server_config,
     wait_for_ping,
+    wait_for_purged_topic,
     wait_for_server,
 )
 
@@ -1383,10 +1384,9 @@ class TestPurgeTopic:
 
         await iggy_client.purge_topic(stream_name, topic_name)
 
-        after = await iggy_client.get_topic(stream_name, topic_name)
-        assert after is not None
-        assert after.messages_count == 0
-        assert after.size == 0
+        # The purge ack precedes the asynchronous partition prune, so poll
+        # until the stats catch up instead of asserting the counts directly.
+        after = await wait_for_purged_topic(iggy_client, stream_name, topic_name)
         # Purging clears messages and size only; topic config is unchanged.
         assert after.id == before.id
         assert after.name == before.name
@@ -1437,10 +1437,7 @@ class TestPurgeTopic:
         await iggy_client.purge_topic(stream_name, topic_name)
         await iggy_client.purge_topic(stream_name, topic_name)
 
-        topic = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic is not None
-        assert topic.messages_count == 0
-        assert topic.size == 0
+        await wait_for_purged_topic(iggy_client, stream_name, topic_name)
 
     @pytest.mark.asyncio
     async def test_purge_nonexistent_topic_fails(

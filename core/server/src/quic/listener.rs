@@ -1,0 +1,239 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::binary::dispatch::{self, HandlerResult, MAX_CONTROL_FRAME_PAYLOAD};
+use crate::sender::SenderKind;
+use crate::server_error::ConnectionError;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use crate::streaming::session::Session;
+use anyhow::anyhow;
+use compio::io::AsyncReadExt;
+use compio::quic::{Connection, Endpoint, RecvStream, SendStream};
+use futures::FutureExt;
+use iggy_binary_protocol::RequestFrame;
+use iggy_binary_protocol::codes::{GET_CLUSTER_METADATA_CODE, SEND_MESSAGES_CODE, command_name};
+use iggy_common::{IggyError, TransportProtocol};
+use std::rc::Rc;
+use tracing::{debug, error, info, trace, warn};
+
+pub async fn start(
+    endpoint: Endpoint,
+    shard: Rc<IggyShard>,
+    shutdown: ShutdownToken,
+) -> Result<(), IggyError> {
+    loop {
+        let accept_future = endpoint.wait_incoming();
+
+        futures::select! {
+            _ = shutdown.wait().fuse() => {
+                debug!( "QUIC listener received shutdown signal, no longer accepting connections");
+                break;
+            }
+            incoming_conn = accept_future.fuse() => {
+                match incoming_conn {
+                    Some(incoming_conn) => {
+                        let remote_addr = incoming_conn.remote_address();
+                        info!("Received incoming QUIC connection from {}", remote_addr);
+
+                        if shard.is_shutting_down() {
+                            info!( "Rejecting new QUIC connection from {} during shutdown", remote_addr);
+                            continue;
+                        }
+
+                        trace!("Incoming connection from client: {}", remote_addr);
+                        let shard_for_conn = shard.clone();
+
+                        shard.task_registry.spawn_connection(async move {
+                            trace!("Accepting connection from {}", remote_addr);
+                            match incoming_conn.await {
+                                Ok(connection) => {
+                                    trace!("Connection established from {}", remote_addr);
+                                    if let Err(error) = handle_connection(connection, shard_for_conn).await {
+                                        error!("QUIC connection from {} has failed: {error}", remote_addr);
+                                    }
+                                }
+                                Err(error) => {
+                                    error!(
+                                        "Error when accepting incoming connection from {}: {:?}",
+                                        remote_addr, error
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        info!("QUIC endpoint closed for shard {}", shard.id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_connection(
+    connection: Connection,
+    shard: Rc<IggyShard>,
+) -> Result<(), ConnectionError> {
+    let address = connection.remote_address();
+    info!("Client has connected: {address}");
+    let session = Rc::new(shard.add_client(&address, TransportProtocol::Quic));
+
+    let client_id = session.client_id;
+    debug!(
+        "Added {} client with session: {} for IP address: {}",
+        TransportProtocol::Quic,
+        session,
+        address
+    );
+
+    let conn_stop_receiver = shard.task_registry.add_connection(client_id);
+
+    loop {
+        let shard = shard.clone();
+        futures::select! {
+            // Check for shutdown signal
+            _ = conn_stop_receiver.recv().fuse() => {
+                info!("QUIC connection {} shutting down gracefully", client_id);
+                break;
+            }
+            // Accept new connection
+            stream_result = accept_stream(&connection, shard.clone(), client_id).fuse() => {
+                match stream_result? {
+                    Some(stream) => {
+                        let shard_clone = shard.clone();
+                        let session_rc = session.clone();
+
+                        shard.task_registry.spawn_connection(async move {
+                            if let Err(err) = handle_stream(stream, shard_clone, &session_rc).await {
+                                error!("Error when handling QUIC stream: {:?}", err)
+                            }
+                        });
+                    }
+                    None => break, // Connection closed
+                }
+            }
+        }
+    }
+
+    shard.delete_client(client_id).await;
+    shard.task_registry.remove_connection(&client_id);
+    info!("QUIC connection {} closed", client_id);
+    Ok(())
+}
+
+type BiStream = (SendStream, RecvStream);
+
+async fn accept_stream(
+    connection: &Connection,
+    _shard: Rc<IggyShard>,
+    _client_id: u32,
+) -> Result<Option<BiStream>, ConnectionError> {
+    match connection.accept_bi().await {
+        Err(compio::quic::ConnectionError::ApplicationClosed { .. }) => {
+            info!("Connection closed");
+            Ok(None)
+        }
+        Err(error) => {
+            error!("Error when accepting QUIC connection: {:?}", error);
+            Err(error.into())
+        }
+        Ok(stream) => Ok(Some(stream)),
+    }
+}
+
+async fn handle_stream(
+    stream: BiStream,
+    shard: Rc<IggyShard>,
+    session: &Session,
+) -> anyhow::Result<()> {
+    let (send_stream, mut recv_stream) = stream;
+
+    let header_buf = [0u8; RequestFrame::HEADER_SIZE];
+    let compio::BufResult(result, header_buf) = recv_stream.read_exact(header_buf).await;
+    result?;
+
+    let length = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+    let code = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+    let cmd_name = command_name(code).unwrap_or("unknown");
+    trace!("Received a QUIC request, length: {length}, code: {code} ({cmd_name})");
+
+    let payload_length = RequestFrame::payload_length(length)
+        .map_err(|_| anyhow!("Invalid frame length: {length}"))?;
+
+    let mut sender = SenderKind::get_quic_sender(send_stream, recv_stream);
+
+    let result = if code == SEND_MESSAGES_CODE {
+        dispatch::dispatch_send_messages(&mut sender, payload_length, session, &shard).await
+    } else {
+        if payload_length > MAX_CONTROL_FRAME_PAYLOAD {
+            sender
+                .send_error_response(IggyError::InvalidCommand)
+                .await?;
+            return Ok(());
+        }
+        let payload = dispatch::read_payload(&mut sender, payload_length).await?;
+        let frame = RequestFrame::from_parts(code, &payload);
+        dispatch::dispatch(frame, &mut sender, session, &shard).await
+    };
+
+    match result {
+        Ok(HandlerResult::Finished) => {
+            trace!(
+                "Command was handled successfully, session: {:?}. QUIC response was sent.",
+                session
+            );
+            Ok(())
+        }
+        Ok(HandlerResult::Migrated { to_shard }) => {
+            warn!("Unexpected migration on QUIC: to_shard {to_shard}, session: {session:?}");
+            Ok(())
+        }
+        Err(e) => {
+            // Special handling for GetClusterMetadata when clustering is disabled
+            if code == GET_CLUSTER_METADATA_CODE && matches!(e, IggyError::FeatureUnavailable) {
+                debug!(
+                    "GetClusterMetadata command not available (clustering disabled), session: {:?}.",
+                    session
+                );
+                sender.send_error_response(e).await?;
+                trace!("QUIC error response was sent.");
+                Ok(())
+            } else {
+                error!(
+                    "Command was not handled successfully, session: {:?}, error: {e}.",
+                    session
+                );
+                // Only return a connection-terminating error for client not found or stale
+                if matches!(e, IggyError::ClientNotFound(_) | IggyError::StaleClient) {
+                    sender.send_error_response(e.clone()).await?;
+                    trace!("QUIC error response was sent.");
+                    error!("Session will be deleted.");
+                    Err(anyhow!("Client invalid: {e}"))
+                } else {
+                    // For all other errors, send response and continue the connection
+                    sender.send_error_response(e).await?;
+                    trace!("QUIC error response was sent.");
+                    Ok(())
+                }
+            }
+        }
+    }
+}

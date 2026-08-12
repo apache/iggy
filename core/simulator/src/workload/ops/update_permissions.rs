@@ -18,7 +18,7 @@
 //! `UpdatePermissions` op. Targets `Ok` (live user) or `UserNotFound`
 //! (fabricated user). No permissions payload, so every outcome is `Effect::None`.
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -53,7 +53,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.update_permissions(&input.user)
 }
 

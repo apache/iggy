@@ -18,7 +18,7 @@
 //! `CreateStream` op. Targets `Ok` with a fresh name, or `NameAlreadyExists`
 //! by reusing a live stream name from the shadow.
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -53,7 +53,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.create_stream(&input.name)
 }
 

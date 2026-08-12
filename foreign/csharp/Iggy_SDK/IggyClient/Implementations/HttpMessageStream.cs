@@ -16,7 +16,6 @@
 // under the License.
 
 using System.Buffers;
-using System.IO.Hashing;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -36,7 +35,6 @@ using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 using Apache.Iggy.StringHandlers;
 using Apache.Iggy.Utils;
-using Apache.Iggy.Vsr;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
@@ -49,7 +47,6 @@ public class HttpMessageStream : IIggyClient
     private const string Context = "csharp-sdk";
 
     private readonly bool _allowAutoCommitWithEncryptor;
-    private readonly ConsumerGroupClientState _groupState = new();
     private readonly HttpClient _httpClient;
 
     //TODO - create mechanism for refreshing jwt token
@@ -207,8 +204,6 @@ public class HttpMessageStream : IIggyClient
         {
             await HandleResponseAsync(response);
         }
-
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
 
     /// <inheritdoc />
@@ -256,8 +251,8 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId,
-        Partitioning partitioning, IList<Message> messages,
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        IList<Message> messages,
         CancellationToken token = default)
     {
         if (MessageEncryptor is not null)
@@ -269,11 +264,6 @@ public class HttpMessageStream : IIggyClient
             }
 
             messages = encrypted;
-        }
-
-        if (partitioning.Kind != Enums.Partitioning.PartitionId)
-        {
-            partitioning = await ResolvePartitioningAsync(streamId, topicId, partitioning, token);
         }
 
         var request = new MessageSendRequest
@@ -294,19 +284,20 @@ public class HttpMessageStream : IIggyClient
         {
             await HandleResponseAsync(response);
         }
-
-        return await response.Content.ReadFromJsonAsync<SendMessagesResponse>(_jsonSerializerOptions, token)
-               ?? throw new InvalidResponseException("Send messages reply carried no confirmation body.");
     }
 
-    /// <summary>
-    ///     This feature is not supported by the server.
-    /// </summary>
-    /// <exception cref="FeatureUnavailableException"></exception>
-    public Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
+    /// <inheritdoc />
+    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
         CancellationToken token = default)
     {
-        throw new FeatureUnavailableException();
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages/flush/{partitionId}/{fsync}");
+
+        var response = await _httpClient.GetAsync(url, token);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response, true);
+        }
     }
 
     /// <inheritdoc />
@@ -624,8 +615,6 @@ public class HttpMessageStream : IIggyClient
         {
             await HandleResponseAsync(response);
         }
-
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
 
     /// <summary>
@@ -657,8 +646,6 @@ public class HttpMessageStream : IIggyClient
         {
             await HandleResponseAsync(response);
         }
-
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
 
     /// <inheritdoc />
@@ -898,41 +885,6 @@ public class HttpMessageStream : IIggyClient
         return _httpClient.BaseAddress?.ToString() ?? string.Empty;
     }
 
-    /// <summary>
-    ///     Resolves balanced and message-key partitioning to an explicit partition id, mirroring the TCP client.
-    ///     Server-side balanced resolution races partition-count changes (a send right after CreatePartitions can
-    ///     land on a stale round-robin cycle), so the client picks the partition and sends it explicitly.
-    /// </summary>
-    private async ValueTask<Partitioning> ResolvePartitioningAsync(Identifier streamId, Identifier topicId,
-        Partitioning partitioning, CancellationToken token)
-    {
-        var key = new TopicKey(streamId, topicId);
-        var partitionCount = _groupState.PartitionCount(key);
-        if (partitionCount is null)
-        {
-            var topic = await GetTopicByIdAsync(streamId, topicId, token)
-                        ?? throw new IggyInvalidStatusCodeException((int)HttpStatusCode.NotFound,
-                            $"Topic {topicId} was not found in stream {streamId}.", true);
-            _groupState.SetPartitionCount(key, topic.PartitionsCount);
-            partitionCount = topic.PartitionsCount;
-        }
-
-        if (partitionCount == 0)
-        {
-            throw new IggyInvalidStatusCodeException((int)HttpStatusCode.NotFound,
-                $"Topic {topicId} in stream {streamId} has no partitions to resolve the message to.", true);
-        }
-
-        var partition = partitioning.Kind switch
-        {
-            Enums.Partitioning.Balanced => _groupState.NextBalancedPartition(key, partitionCount.Value),
-            Enums.Partitioning.MessageKey => XxHash32.HashToUInt32(partitioning.Value) % partitionCount.Value,
-            _ => throw new FeatureUnavailableException()
-        };
-
-        return Partitioning.PartitionId((int)partition);
-    }
-
     private void DecryptMessages(IReadOnlyList<MessageResponse> messages, uint partitionId)
     {
         foreach (var message in messages)
@@ -1029,30 +981,20 @@ public class HttpMessageStream : IIggyClient
 
     private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
-        if (response.IsSuccessStatusCode)
+        if ((int)response.StatusCode > 300
+            && (int)response.StatusCode < 500
+            && !(response.RequestMessage!.Method == HttpMethod.Get && response.StatusCode == HttpStatusCode.NotFound &&
+                 !shouldThrowOnGetNotFound))
         {
-            return;
+            var err = await response.Content.ReadAsStringAsync();
+            var errorModel = JsonSerializer.Deserialize<ErrorResponse>(err);
+            throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err);
         }
 
-        if (response.RequestMessage!.Method == HttpMethod.Get && response.StatusCode == HttpStatusCode.NotFound &&
-            !shouldThrowOnGetNotFound)
+        if (response.StatusCode == HttpStatusCode.InternalServerError)
         {
-            return;
+            throw new Exception("Internal server error");
         }
-
-        var err = await response.Content.ReadAsStringAsync();
-        ErrorResponse? errorModel = null;
-        try
-        {
-            errorModel = JsonSerializer.Deserialize<ErrorResponse>(err);
-        }
-        catch (JsonException)
-        {
-            // A gateway or proxy error body is not the server's JSON schema; the raw text still travels in
-            // the exception message.
-        }
-
-        throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
     }
 
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)

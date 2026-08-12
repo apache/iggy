@@ -27,7 +27,7 @@ pub trait Project<T, C: Consensus> {
 pub trait Pipeline {
     type Entry;
     /// Accepted-but-not-yet-prepared client request. For `LocalPipeline`,
-    /// `RequestEntry` wrapping `Message<RoutedRequestHeader>`.
+    /// `RequestEntry` wrapping `Message<RequestHeader>`.
     type Request;
 
     fn push(&mut self, entry: Self::Entry);
@@ -93,7 +93,7 @@ pub trait Pipeline {
     }
 }
 
-pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RoutedRequestHeader>;
+pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RequestHeader>;
 pub type ReplicateMessage<C> = <C as Consensus>::Message<<C as Consensus>::ReplicateHeader>;
 pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
 
@@ -102,7 +102,7 @@ pub trait Consensus: Sized {
     #[rustfmt::skip] // Scuffed formatter.
     type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
 
-    type RoutedRequestHeader: ConsensusHeader;
+    type RequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
     type AckHeader: ConsensusHeader;
 
@@ -180,9 +180,6 @@ pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;
-
-mod dvc_merge;
-pub use dvc_merge::*;
 mod vsr_state;
 pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;

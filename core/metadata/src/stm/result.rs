@@ -183,7 +183,6 @@ result_enum!(CreatePartitionsResult {
 result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
-    InvalidPartitionsCount = 2019,
 });
 // `TruncatePartition` is the committed form of a client `DeleteSegments`; an
 // unresolvable target commits as a rejection so the request sequence stays

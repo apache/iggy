@@ -22,7 +22,7 @@
 //! invoking the supplied callback, so the callback receives a
 //! ready-for-traffic [`compio_quic::Connection`] plus its
 //! `(SendStream, RecvStream)` pair. No ALPN is advertised; protocol
-//! version is validated by the caller (the server) inside the LOGIN
+//! version is validated by the caller (server-ng) inside the LOGIN
 //! command.
 //!
 //! 0-RTT data is refused at accept time

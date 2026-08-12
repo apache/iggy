@@ -230,6 +230,7 @@ updates:
     directories:
       - "/"
       - "/core/server"
+      - "/core/server-ng"
       - "/core/connectors/runtime"
       - "/core/ai/mcp"
       - "/core/bench/dashboard/server"

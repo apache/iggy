@@ -36,19 +36,4 @@ public class AutoLoginSettings
     ///     Specifies the password for auto-login authentication
     /// </summary>
     public string Password { get; set; } = string.Empty;
-
-    /// <summary>
-    ///     Settings for a builder-owned client that signs in with the given credentials. The credentials must
-    ///     reach the client and not only the explicit login the wrapper performs at startup: a reconnect or a
-    ///     leader redirect drops the session, and without them the client comes back unauthenticated.
-    /// </summary>
-    internal static AutoLoginSettings For(string username, string password)
-    {
-        return new AutoLoginSettings
-        {
-            Enabled = !string.IsNullOrEmpty(username),
-            Username = username,
-            Password = password
-        };
-    }
 }

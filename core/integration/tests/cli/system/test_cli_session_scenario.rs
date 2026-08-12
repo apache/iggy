@@ -91,12 +91,12 @@ pub async fn should_be_successful() {
     iggy_cmd_test
         .execute_test(TestMeCmd::new(
             TransportProtocol::Tcp,
-            Scenario::FailureDueToSessionTimeout,
+            Scenario::FailureDueToSessionTimeout(server_address),
         ))
         .await;
     // After the session timed out, logging in again with username and password
     // must recover: the CLI drops the dead session token and recreates it,
-    // rather than wedging on the expired credential (regression for the server,
+    // rather than wedging on the expired credential (regression for server-ng,
     // where the terminal auth failure is opaque and self-heal never happened).
     iggy_cmd_test
         .execute_test(TestLoginCmd::new(

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::time::Duration;
+
 use iggy::prelude::{
     IggyByteSize, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
     Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
@@ -24,7 +26,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
-use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
+use crate::consumer::py_delta_to_iggy_duration;
 
 /// The expiry of the messages in a topic.
 #[gen_stub_pyclass_complex_enum]
@@ -53,14 +55,7 @@ impl TryFrom<RustIggyExpiry> for IggyExpiry {
         Ok(match expiry {
             RustIggyExpiry::ServerDefault => IggyExpiry::ServerDefault(),
             RustIggyExpiry::ExpireDuration(duration) => IggyExpiry::ExpireDuration {
-                duration: Python::attach(|py| {
-                    iggy_duration_to_py_delta(py, duration).map(|delta| delta.unbind())
-                })
-                .map_err(|err| {
-                    PyValueError::new_err(format!(
-                        "topic message expiry duration does not fit within timedelta bounds: {err}"
-                    ))
-                })?,
+                duration: iggy_duration_to_py_delta(duration.get_duration())?,
             },
             RustIggyExpiry::NeverExpire => IggyExpiry::NeverExpire(),
         })
@@ -96,6 +91,26 @@ impl TryFrom<&IggyExpiry> for RustIggyExpiry {
             IggyExpiry::NeverExpire() => RustIggyExpiry::NeverExpire,
         })
     }
+}
+
+fn iggy_duration_to_py_delta(duration: Duration) -> PyResult<Py<PyDelta>> {
+    let days = duration.as_secs() / 86_400;
+    let secs_of_day = duration.as_secs() % 86_400;
+    Python::attach(|py| {
+        PyDelta::new(
+            py,
+            days as i32,
+            secs_of_day as i32,
+            duration.subsec_micros() as i32,
+            true,
+        )
+        .map(|delta| delta.unbind())
+        .map_err(|err| {
+            PyValueError::new_err(format!(
+                "topic message expiry duration does not fit within timedelta bounds: {err}"
+            ))
+        })
+    })
 }
 
 /// The maximum size of a topic.

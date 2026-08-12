@@ -38,22 +38,22 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 /**
- * Async TCP implementation of personal access tokens client. Login discovers
- * the active cluster leader before sending the VSR Register operation.
+ * Async TCP implementation of personal access tokens client.
  */
 public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
     private static final Logger log = LoggerFactory.getLogger(PersonalAccessTokensTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
-    private final LoginRoutingHook routingHook;
+    private final LoginRedirectionHook redirectionHook;
 
     public PersonalAccessTokensTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
-        this(connectionSupplier, LoginRoutingHook.NONE);
+        this(connectionSupplier, LoginRedirectionHook.NONE);
     }
 
-    PersonalAccessTokensTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, LoginRoutingHook routingHook) {
+    PersonalAccessTokensTcpClient(
+            Supplier<AsyncTcpConnection> connectionSupplier, LoginRedirectionHook redirectionHook) {
         this.connectionSupplier = connectionSupplier;
-        this.routingHook = routingHook;
+        this.redirectionHook = redirectionHook;
     }
 
     private AsyncTcpConnection connection() {
@@ -115,7 +115,9 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
     @Override
     public CompletableFuture<IdentityInfo> loginWithPersonalAccessToken(String token) {
-        return routingHook.loginOnLeader(() -> loginWithoutRedirect(token));
+        return loginWithoutRedirect(token).thenCompose(identity -> redirectionHook
+                .afterLogin(() -> loginWithoutRedirect(token))
+                .thenApply(redirectedIdentity -> redirectedIdentity != null ? redirectedIdentity : identity));
     }
 
     private CompletableFuture<IdentityInfo> loginWithoutRedirect(String token) {

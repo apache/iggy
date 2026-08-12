@@ -33,6 +33,7 @@ func TestEncodeRequestHeader_WritesEveryFieldAtItsCanonicalOffset(t *testing.T) 
 		Client:            ClientID{Lo: 0x99AABBCCDDEEFF00, Hi: 0x1122334455667788},
 		Request:           0x0102030405060708,
 		Operation:         OperationNonReplicated,
+		Namespace:         0x8877665544332211,
 		Session:           0x1020304050607080,
 		NonReplicatedCode: 60001,
 	})
@@ -43,6 +44,7 @@ func TestEncodeRequestHeader_WritesEveryFieldAtItsCanonicalOffset(t *testing.T) 
 	assert.Equal(t, uint64(0x1122334455667788), binary.LittleEndian.Uint64(header[requestOffsetClient+8:]))
 	assert.Equal(t, uint64(0x0102030405060708), binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 	assert.Equal(t, byte(OperationNonReplicated), header[requestOffsetOperation])
+	assert.Equal(t, uint64(0x8877665544332211), binary.LittleEndian.Uint64(header[requestOffsetNamespace:]))
 	assert.Equal(t, uint64(0x1020304050607080), binary.LittleEndian.Uint64(header[requestOffsetSession:]))
 	assert.Equal(t, uint32(60001), binary.LittleEndian.Uint32(header[requestOffsetReserved:]))
 	assert.Zero(t, binary.LittleEndian.Uint64(header[requestOffsetTimestamp:]), "timestamp stays zero")
@@ -54,6 +56,7 @@ func TestEncodeRequestHeader_LeavesEveryUnwrittenByteZero(t *testing.T) {
 		Size:      HeaderSize,
 		Client:    ClientID{Lo: 1},
 		Operation: OperationRegister,
+		Namespace: MetadataConsensusNamespace,
 	})
 
 	var expected [HeaderSize]byte
@@ -61,6 +64,7 @@ func TestEncodeRequestHeader_LeavesEveryUnwrittenByteZero(t *testing.T) {
 	expected[requestOffsetCommand] = byte(FrameRequest)
 	binary.LittleEndian.PutUint64(expected[requestOffsetClient:], 1)
 	expected[requestOffsetOperation] = byte(OperationRegister)
+	binary.LittleEndian.PutUint64(expected[requestOffsetNamespace:], MetadataConsensusNamespace)
 
 	assert.Equal(t, expected, header)
 }
@@ -88,12 +92,14 @@ func TestEncodeRequestHeader_SupportsMaximumWidthFields(t *testing.T) {
 		Client:    ClientID{Lo: math.MaxUint64, Hi: math.MaxUint64},
 		Request:   math.MaxUint64,
 		Operation: OperationSendMessages,
+		Namespace: math.MaxUint64,
 		Session:   math.MaxUint64,
 	})
 
 	assert.Equal(t, uint32(math.MaxUint32), binary.LittleEndian.Uint32(header[requestOffsetSize:]))
 	assert.Equal(t, uint64(math.MaxUint64), binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 	assert.Equal(t, uint64(math.MaxUint64), binary.LittleEndian.Uint64(header[requestOffsetSession:]))
+	assert.Equal(t, uint64(math.MaxUint64), binary.LittleEndian.Uint64(header[requestOffsetNamespace:]))
 }
 
 func TestEncodeRequestHeader_OmitsTheReservedCodeForReplicatedOperations(t *testing.T) {
@@ -116,6 +122,7 @@ func TestEncodeRequestHeader_ProducesTheGoldenFrame(t *testing.T) {
 		Client:    ClientID{Lo: 0x0807060504030201, Hi: 0x100F0E0D0C0B0A09},
 		Request:   2,
 		Operation: OperationCreateStream,
+		Namespace: 0,
 		Session:   11,
 	})
 
@@ -126,7 +133,7 @@ func TestEncodeRequestHeader_ProducesTheGoldenFrame(t *testing.T) {
 		136: {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10},
 		168: {0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		176: {0x80},
-		184: {0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		192: {0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 	}
 	written := 0
 	for offset, want := range golden {
@@ -202,14 +209,16 @@ func TestHeaderOffsets_MatchTheWireContract(t *testing.T) {
 	assert.Equal(t, 160, requestOffsetTimestamp)
 	assert.Equal(t, 168, requestOffsetRequest)
 	assert.Equal(t, 176, requestOffsetOperation)
-	assert.Equal(t, 184, requestOffsetSession)
-	assert.Equal(t, 196, requestOffsetReserved)
+	assert.Equal(t, 184, requestOffsetNamespace)
+	assert.Equal(t, 192, requestOffsetSession)
+	assert.Equal(t, 204, requestOffsetReserved)
 
 	assert.Equal(t, 48, replyOffsetSize)
 	assert.Equal(t, 60, replyOffsetCommand)
 	assert.Equal(t, 208, replyOffsetOperation)
-	assert.Equal(t, 216, replyOffsetStatus)
-	assert.Equal(t, replyOffsetOperation+8, replyOffsetStatus, "status follows the operation")
+	assert.Equal(t, 216, replyOffsetNamespace)
+	assert.Equal(t, 224, replyOffsetStatus)
+	assert.Equal(t, replyOffsetNamespace+8, replyOffsetStatus, "status follows namespace")
 
 	assert.Equal(t, 60, evictionOffsetCommand)
 	assert.Equal(t, 128, evictionOffsetClient)

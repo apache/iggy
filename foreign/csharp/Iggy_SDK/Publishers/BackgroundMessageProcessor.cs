@@ -17,7 +17,6 @@
 
 using System.Threading.Channels;
 using Apache.Iggy.Enums;
-using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
@@ -55,11 +54,6 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     // Mutated only via Interlocked; OnUnitsCompleted resolves _drainedSignal on the 1->0 transition.
     private int _inFlight;
     private PooledBufferWriter _payloadBuffer;
-
-    // Set by DisposeAsync so the loop finishes what it has instead of being cancelled mid-send. A send cancelled
-    // after its first byte is reported as an outcome only the server knows, which would make every ordinary
-    // shutdown publish a batch that may have committed twice.
-    private int _stopping;
 
     public BackgroundMessageProcessor(IIggyClient client, IggyPublisherConfig config, ILoggerFactory loggerFactory)
     {
@@ -103,7 +97,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 
         _client.UnsubscribeConnectionEvents(ClientOnOnConnectionStateChanged);
 
-        Volatile.Write(ref _stopping, 1);
+        await _cancellationTokenSource.CancelAsync();
         _writer.TryComplete();
 
         var backgroundTaskTimedOut = false;
@@ -124,14 +118,9 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             {
                 LogBackgroundProcessorError(e);
             }
-            finally
-            {
-                await _cancellationTokenSource.CancelAsync();
-            }
         }
         else
         {
-            await _cancellationTokenSource.CancelAsync();
             DrainAndDispose();
         }
 
@@ -255,11 +244,9 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                var stopping = Volatile.Read(ref _stopping) != 0;
-
                 if (!_canSend)
                 {
-                    if (stopping || !await timer.WaitForNextTickAsync(ct))
+                    if (!await timer.WaitForNextTickAsync(ct))
                     {
                         break;
                     }
@@ -269,7 +256,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 
                 if (!AccumulateBatch())
                 {
-                    if (stopping || !await timer.WaitForNextTickAsync(ct))
+                    if (!await timer.WaitForNextTickAsync(ct))
                     {
                         break;
                     }
@@ -490,16 +477,6 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                 // Disposal cancellation, not a send failure; let the loop's cancellation handling take over.
                 throw;
             }
-            catch (VsrRequestOutcomeUnknownException ex)
-            {
-                // May already have committed - report it as its own type rather than folding it into the
-                // generic failure path, so a subscriber can tell "not sent" from "possibly sent twice".
-                LogFailedToSendBatch(ex, wire.Count);
-                if (_messageBatchErrorAggregator.HasSubscribers)
-                {
-                    _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(ex, SnapshotForFailure(wire)));
-                }
-            }
             catch (Exception ex)
             {
                 LogFailedToSendBatch(ex, wire.Count);
@@ -529,20 +506,6 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                 // Disposal cancellation, not a send failure; without this the loop would spin through the
                 // remaining attempts instantly and publish a misleading "failed after N attempts" event.
                 throw;
-            }
-            catch (VsrRequestOutcomeUnknownException ex)
-            {
-                // The send may already have committed. The partition plane is sessionless - it keeps no
-                // client-table entry to deduplicate an append against - so a retry cannot be matched to the
-                // original under any client id and would simply append the batch twice. Report it instead.
-                LogFailedToSendBatch(ex, wire.Count);
-                if (_messageBatchErrorAggregator.HasSubscribers)
-                {
-                    _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(ex, SnapshotForFailure(wire),
-                        attempt + 1));
-                }
-
-                return;
             }
             catch (Exception ex)
             {

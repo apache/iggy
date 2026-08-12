@@ -22,7 +22,7 @@ use crate::version::ClientVersionInfo;
 use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretString};
 
-/// Combined login + register request for the server.
+/// Combined login + register request for server-ng.
 ///
 /// The server gates on `version_info.protocol_version` (see
 /// [`crate::version::is_protocol_compatible`]), verifies credentials
@@ -49,8 +49,8 @@ use secrecy::{ExposeSecret, SecretString};
 /// This wire shape is gated by the `vsr` cargo feature and lives under
 /// `LOGIN_REGISTER_CODE`. The legacy `LOGIN_USER_CODE` shape (still in use
 /// by non-`vsr` builds against the legacy `iggy-server`) is untouched.
-/// The server speaks VSR framing only; a non-`vsr` SDK cannot log in to
-/// the server. Foreign-language SDKs (C++, C#, Python, Go, Java) adopt this
+/// server-ng speaks VSR framing only; a non-`vsr` SDK cannot log in to
+/// server-ng. Foreign-language SDKs (C++, C#, Python, Go, Java) adopt this
 /// shape, with their own `sdk_name`, when they wire VSR framing. Bump
 /// [`crate::version::IGGY_PROTOCOL_VERSION`] on any wire-incompatible
 /// change.

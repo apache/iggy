@@ -20,7 +20,7 @@ use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::primitives::identifier::WireName;
 use bytes::{BufMut, BytesMut};
 
-/// Combined login + register response for the server.
+/// Combined login + register response for server-ng.
 ///
 /// Returns the authenticated user's ID, the consensus session number
 /// (commit op number from the Register operation), and the server's

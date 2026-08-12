@@ -25,6 +25,7 @@ use iggy_common::{StreamClient, UserClient};
 use integration::iggy_harness;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
+use server::http::jwt::json_web_token::Audience;
 
 const TEST_ISSUER: &str = "https://test-issuer.com";
 const TEST_AUDIENCE: &str = "iggy";
@@ -68,16 +69,6 @@ async fn seed_a2a_user(
     Ok(())
 }
 
-/// The `aud` claim as RFC 7519 allows it on the wire: one string, or an array
-/// of them. Untagged serialization emits each shape verbatim, which is what the
-/// server's own audience parser reads back.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-enum Audience {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
 /// Test claims structure for JWT tokens
 /// Supports both single string and array audience per RFC 7519
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,7 +96,7 @@ fn create_valid_jwt(exp_seconds: u64) -> String {
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
         iss: TEST_ISSUER.to_string(),
-        aud: Audience::Single(TEST_AUDIENCE.to_string()),
+        aud: Audience::from(TEST_AUDIENCE),
         sub: "external-a2a-user-123".to_string(),
         exp: now + exp_seconds,
         iat: now,
@@ -125,7 +116,7 @@ fn create_valid_jwt_with_array_aud(exp_seconds: u64) -> String {
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
         iss: TEST_ISSUER.to_string(),
-        aud: Audience::Multiple(vec![
+        aud: Audience::from(vec![
             "some-other-service".to_string(),
             TEST_AUDIENCE.to_string(),
             "another-service".to_string(),
@@ -149,7 +140,7 @@ fn create_expired_jwt() -> String {
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
         iss: TEST_ISSUER.to_string(),
-        aud: Audience::Single(TEST_AUDIENCE.to_string()),
+        aud: Audience::from(TEST_AUDIENCE),
         sub: "external-a2a-user-123".to_string(),
         exp: now.saturating_sub(3600),
         iat: now.saturating_sub(7200),
@@ -169,7 +160,7 @@ fn create_unknown_issuer_jwt() -> String {
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
         iss: "https://unknown-issuer.com".to_string(),
-        aud: Audience::Single(TEST_AUDIENCE.to_string()),
+        aud: Audience::from(TEST_AUDIENCE),
         sub: "external-a2a-user-123".to_string(),
         exp: now + 3600,
         iat: now,
@@ -193,7 +184,7 @@ fn create_algorithm_confusion_jwt() -> String {
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
         iss: TEST_ISSUER.to_string(),
-        aud: Audience::Single(TEST_AUDIENCE.to_string()),
+        aud: Audience::from(TEST_AUDIENCE),
         sub: "external-a2a-user-123".to_string(),
         exp: now + 3600,
         iat: now,
@@ -215,7 +206,7 @@ fn create_jwt_with_kid(kid: &str) -> String {
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
         iss: TEST_ISSUER.to_string(),
-        aud: Audience::Single(TEST_AUDIENCE.to_string()),
+        aud: Audience::from(TEST_AUDIENCE),
         sub: "external-a2a-user-123".to_string(),
         exp: now + 3600,
         iat: now,

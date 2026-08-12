@@ -43,7 +43,7 @@ rand_xoshiro = { workspace = true }
 secrecy = { workspace = true }
 # `default-features = false` drops the mimalloc global allocator and the
 # web-embed feature; the sim only needs the dispatch/bootstrap library.
-server = { path = "../server", default-features = false }
+server-ng = { path = "../server-ng", default-features = false }
 server_common = { path = "../server_common", features = ["simulator"] }
 shard = { path = "../shard", features = ["simulator"] }
 strum = { workspace = true }

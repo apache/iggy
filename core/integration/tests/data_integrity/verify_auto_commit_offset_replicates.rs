@@ -150,10 +150,8 @@ async fn run(harness: &TestHarness) {
 /// The u64 offset persisted under any `offsets/consumers/<id>` file in a node's
 /// data dir, or `None` when no such file has been written yet. Walks the tree so
 /// it is robust to the stream/topic/partition id layout; the test drives exactly
-/// one consumer, so at most one such file exists. Reads the leading u64 of the
-/// record: the file is offset + trailing checksum (see
-/// `partitions::offset_storage::encode_offset_record`), and a shorter read
-/// (persist truncates before writing) is treated as not-yet-written.
+/// one consumer, so at most one such file exists. A zero-length read (persist
+/// truncates before writing the 8 bytes) is treated as not-yet-written.
 fn read_replicated_consumer_offset(data_dir: &Path) -> Option<u64> {
     let mut stack: Vec<PathBuf> = vec![data_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -180,9 +178,9 @@ fn read_replicated_consumer_offset(data_dir: &Path) -> Option<u64> {
                     .is_some_and(|name| name == "offsets");
             if is_consumer_offset
                 && let Ok(bytes) = std::fs::read(&path)
-                && let Some(offset_bytes) = bytes.first_chunk::<8>()
+                && let Ok(array) = <[u8; 8]>::try_from(bytes.as_slice())
             {
-                return Some(u64::from_le_bytes(*offset_bytes));
+                return Some(u64::from_le_bytes(array));
             }
         }
     }

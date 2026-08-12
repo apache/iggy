@@ -19,12 +19,13 @@
 //
 // The suite skips unless IGGY_TCP_ADDRESS points at a server. Start one with:
 //
-//	cargo build --bin iggy-server
+//	# TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+//	cargo build --bin iggy-server-ng --features vsr
 //	IGGY_SYSTEM_PATH=/tmp/iggy-go-e2e \
 //	IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 //	IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
 //	IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
-//	target/debug/iggy-server
+//	target/debug/iggy-server-ng
 //
 //	IGGY_TCP_ADDRESS=127.0.0.1:8090 go test ./tests
 //

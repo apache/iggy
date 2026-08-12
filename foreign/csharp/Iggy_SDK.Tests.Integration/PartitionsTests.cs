@@ -43,7 +43,8 @@ public class PartitionsTests
             client.CreatePartitionsAsync(Identifier.String(streamName),
                 Identifier.String(topicName), 3));
 
-        var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String(topicName));
+        var response = await client.GetTopicByIdAsync(
+            Identifier.String(streamName), Identifier.String(topicName));
         response.ShouldNotBeNull();
         response.PartitionsCount.ShouldBe(4u);
     }
@@ -64,7 +65,8 @@ public class PartitionsTests
             client.DeletePartitionsAsync(Identifier.String(streamName),
                 Identifier.String(topicName), 1));
 
-        var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String(topicName));
+        var response = await client.GetTopicByIdAsync(
+            Identifier.String(streamName), Identifier.String(topicName));
         response.ShouldNotBeNull();
         response.PartitionsCount.ShouldBe(3u);
     }

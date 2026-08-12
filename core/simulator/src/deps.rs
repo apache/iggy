@@ -176,37 +176,6 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     where
         Self: 'a;
 
-    fn last_op(&self) -> Option<u64> {
-        self.last_op.get()
-    }
-
-    /// Drop the suffix, so a simulated backup whose entries disagree with a started
-    /// view reconciles the way a real one does. Mirrors
-    /// `PrepareJournal::truncate_from`, whose watermark stays put; here it never moves.
-    async fn truncate_from(&self, from_op: u64) -> std::io::Result<usize> {
-        if from_op == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
-            ));
-        }
-        #[cfg(debug_assertions)]
-        let _guard = JournalAccessGuard::new(&self.accessing);
-        let headers = unsafe { &mut *self.headers.get() };
-        let offsets = unsafe { &mut *self.offsets.get() };
-        let doomed: Vec<u64> = headers
-            .keys()
-            .copied()
-            .filter(|op| *op >= from_op)
-            .collect();
-        for op in &doomed {
-            headers.remove(op);
-            offsets.remove(op);
-        }
-        self.last_op.set(headers.keys().copied().max());
-        Ok(doomed.len())
-    }
-
     /// The simulated journal retains everything for the run, so nothing is
     /// ever superseded by a snapshot. Answered explicitly (the trait has no
     /// default) so a simulated state transfer has to opt into a watermark
@@ -297,24 +266,6 @@ impl SimJournal<MemStorage> {
     #[must_use]
     pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
-    }
-
-    /// Forget one op, leaving a hole exactly where a lost prepare would.
-    ///
-    /// Tests only. The alternative is choreographing `Prepare`, `Commit` and
-    /// `RepairPrepare` drops on a directed link until a replica falls behind, which
-    /// is fragile to tune; the scenarios are about what a replica does with a hole,
-    /// not how it got one.
-    ///
-    /// `last_op` is deliberately left alone: a hole below the head must not look like
-    /// a shorter log, since that is the state a view change has to survive.
-    pub fn forget_op(&self, op: u64) -> bool {
-        #[cfg(debug_assertions)]
-        let _guard = JournalAccessGuard::new(&self.accessing);
-        let headers = unsafe { &mut *self.headers.get() };
-        let offsets = unsafe { &mut *self.offsets.get() };
-        offsets.remove(&op);
-        headers.remove(&op).is_some()
     }
 
     /// The committed watermark to restore after a restart, mirroring

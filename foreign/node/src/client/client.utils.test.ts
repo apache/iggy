@@ -18,19 +18,32 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { deserializeVoidResponse } from './client.utils.js';
+import { handleResponse, deserializeVoidResponse } from './client.utils.js';
 
-describe('deserializeVoidResponse', () => {
+const SUCCESS = 0;
 
-  it('returns true only for a success status with an empty payload', () => {
-    const success = { status: 0, length: 0, data: Buffer.alloc(0) };
-    assert.equal(deserializeVoidResponse(success), true);
+describe('handleResponse', () => {
 
-    const failed = { status: 1, length: 0, data: Buffer.alloc(0) };
-    assert.equal(deserializeVoidResponse(failed), false);
+  it('bounds data to the length field, not the full buffer', () => {
+    // Server says: status=0, length=0, no payload.
+    // But the raw buffer has 4 trailing bytes (e.g. start of next response).
+    const buf = Buffer.alloc(12);
+    buf.writeUInt32LE(SUCCESS, 0); // status
+    buf.writeUInt32LE(0, 4);       // length = 0 (void response)
+    buf.writeUInt32LE(42, 8);      // trailing bytes — NOT part of this response
 
-    const withData = { status: 0, length: 4, data: Buffer.alloc(4) };
-    assert.equal(deserializeVoidResponse(withData), false);
+    const r = handleResponse(buf);
+    assert.equal(r.data.length, 0);
+  });
+
+  it('deserializeVoidResponse returns true for a valid void response with trailing buffer bytes', () => {
+    const buf = Buffer.alloc(12);
+    buf.writeUInt32LE(SUCCESS, 0);
+    buf.writeUInt32LE(0, 4);       // length = 0
+    buf.writeUInt32LE(42, 8);      // trailing bytes
+
+    const r = handleResponse(buf);
+    assert.equal(deserializeVoidResponse(r), true);
   });
 
 });

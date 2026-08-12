@@ -1,0 +1,176 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::http::error::CustomError;
+use crate::http::jwt::json_web_token::Identity;
+use crate::http::mapper;
+use crate::http::shared::AppState;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
+use axum::debug_handler;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Extension, Json, Router};
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest as WireCreateConsumerGroup,
+    DeleteConsumerGroupRequest as WireDeleteConsumerGroup,
+};
+use iggy_common::Identifier;
+use iggy_common::Validatable;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::{ConsumerGroup, ConsumerGroupDetails, IggyError};
+use std::sync::Arc;
+use tracing::instrument;
+
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
+            get(get_consumer_groups).post(create_consumer_group),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}",
+            get(get_consumer_group).delete(delete_consumer_group),
+        )
+        .with_state(state)
+}
+
+async fn get_consumer_group(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+    Path((stream_id, topic_id, group_id)): Path<(String, String, String)>,
+) -> Result<Json<ConsumerGroupDetails>, CustomError> {
+    let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
+    let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
+    let identifier_group_id = Identifier::from_str_value(&group_id)?;
+
+    let shard = state.shard.shard();
+    let group = shard.resolve_consumer_group(
+        &identifier_stream_id,
+        &identifier_topic_id,
+        &identifier_group_id,
+    )?;
+
+    shard
+        .metadata
+        .perm_get_consumer_group(identity.user_id, group.stream_id, group.topic_id)?;
+
+    let cg_meta = shard
+        .metadata
+        .get_consumer_group(group.stream_id, group.topic_id, group.group_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    let consumer_group = mapper::map_consumer_group_details_from_metadata(&cg_meta);
+
+    Ok(Json(consumer_group))
+}
+
+async fn get_consumer_groups(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+) -> Result<Json<Vec<ConsumerGroup>>, CustomError> {
+    let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
+    let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
+
+    let shard = state.shard.shard();
+    let topic = shard.resolve_topic(&identifier_stream_id, &identifier_topic_id)?;
+
+    shard
+        .metadata
+        .perm_get_consumer_groups(identity.user_id, topic.stream_id, topic.topic_id)?;
+
+    let topic_meta = shard
+        .metadata
+        .get_topic(topic.stream_id, topic.topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let consumer_groups = mapper::map_consumer_groups_from_metadata(&topic_meta);
+
+    Ok(Json(consumer_groups))
+}
+
+#[debug_handler]
+#[instrument(skip_all, name = "trace_create_consumer_group", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id, iggy_topic_id = topic_id))]
+async fn create_consumer_group(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Json(mut command): Json<CreateConsumerGroup>,
+) -> Result<(StatusCode, Json<ConsumerGroupDetails>), CustomError> {
+    command.stream_id = Identifier::from_str_value(&stream_id)?;
+    command.topic_id = Identifier::from_str_value(&topic_id)?;
+    command.validate()?;
+
+    let shard = state.shard.shard();
+    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+
+    let wire_command = WireCreateConsumerGroup {
+        stream_id: identifier_to_wire(&command.stream_id)?,
+        topic_id: identifier_to_wire(&command.topic_id)?,
+        name: WireName::new(&command.name).map_err(|_| IggyError::InvalidConsumerGroupName)?,
+    };
+    let request = ShardRequest::control_plane(ShardRequestPayload::CreateConsumerGroupRequest {
+        user_id: identity.user_id,
+        command: wire_command,
+    });
+
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::CreateConsumerGroupResponse(data) => {
+            let cg_meta = state
+                .shard
+                .shard()
+                .metadata
+                .get_consumer_group(topic.stream_id, topic.topic_id, data.id as usize)
+                .expect("Consumer group must exist after creation");
+            let consumer_group_details = mapper::map_consumer_group_details_from_metadata(&cg_meta);
+            Ok((StatusCode::CREATED, Json(consumer_group_details)))
+        }
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected CreateConsumerGroupResponse"),
+    }
+}
+
+#[debug_handler]
+#[instrument(skip_all, name = "trace_delete_consumer_group", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id, iggy_topic_id = topic_id, iggy_group_id = group_id))]
+async fn delete_consumer_group(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+    Path((stream_id, topic_id, group_id)): Path<(String, String, String)>,
+) -> Result<StatusCode, CustomError> {
+    let stream_id = Identifier::from_str_value(&stream_id)?;
+    let topic_id = Identifier::from_str_value(&topic_id)?;
+    let group_id = Identifier::from_str_value(&group_id)?;
+
+    let wire_command = WireDeleteConsumerGroup {
+        stream_id: identifier_to_wire(&stream_id)?,
+        topic_id: identifier_to_wire(&topic_id)?,
+        group_id: identifier_to_wire(&group_id)?,
+    };
+    let request = ShardRequest::control_plane(ShardRequestPayload::DeleteConsumerGroupRequest {
+        user_id: identity.user_id,
+        command: wire_command,
+    });
+
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::DeleteConsumerGroupResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected DeleteConsumerGroupResponse"),
+    }
+}

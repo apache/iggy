@@ -195,7 +195,9 @@ public class MessageEncryptionIntegrationTests
 
     private Task<IIggyClient> CreateClient(Protocol protocol, IMessageEncryptor encryptor)
     {
-        return Fixture.CreateAuthenticatedClient(protocol, encryptor: encryptor);
+        return protocol == Protocol.Tcp
+            ? Fixture.CreateTcpClient(encryptor: encryptor)
+            : Fixture.CreateHttpClient(encryptor: encryptor);
     }
 
     private static AesMessageEncryptor CreateEncryptor()

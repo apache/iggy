@@ -171,7 +171,7 @@ impl IggyIndexesMut {
 
         // Bound to exactly one entry rather than to the buffer end: a file
         // whose length is not a whole multiple of INDEX_SIZE (e.g. a 24-byte
-        // server sparse index read back through this 16-byte reader on a
+        // server-ng sparse index read back through this 16-byte reader on a
         // mixed-format recovery) would otherwise hand an oversized slice to the
         // view and trip its length assertion.
         let start = (self.count() - 1) as usize * INDEX_SIZE;

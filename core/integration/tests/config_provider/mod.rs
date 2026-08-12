@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use configs::server::ServerConfig;
 use configs::{ConfigEnvMappings, ConfigProvider, TypedEnvProvider};
 use configs_derive::ConfigEnv;
 use figment::providers::{Format, Toml};
@@ -23,6 +22,7 @@ use figment::value::Dict;
 use figment::{Figment, Provider};
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
+use server::configs::server::ServerConfig;
 use std::env;
 use std::path::PathBuf;
 

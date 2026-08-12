@@ -18,9 +18,6 @@
 
 set -euo pipefail
 
-# shellcheck source-path=SCRIPTDIR
-source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
-
 # binary-artifacts.sh -- Prevent compiled binaries from entering the repo.
 #
 # .gitignore catches common extensions (*.o, *.so, *.exe, *.out, etc.) but

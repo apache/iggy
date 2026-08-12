@@ -45,8 +45,12 @@ public class HeaderEncryptionIntegrationTests
 
         // Publisher on an encrypting client; a plain client raw-polls the same topic to prove the wire bytes
         // stay encrypted.
-        var encryptingClient = await Fixture.CreateAuthenticatedClient(protocol, encryptor: encryptor);
-        var plainClient = await Fixture.CreateAuthenticatedClient(protocol);
+        var encryptingClient = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient(encryptor: encryptor)
+            : await Fixture.CreateHttpClient(encryptor: encryptor);
+        var plainClient = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStream(plainClient, protocol);
         var streamId = Identifier.String(testStream.StreamId);
@@ -89,11 +93,7 @@ public class HeaderEncryptionIntegrationTests
         Dictionary<HeaderKey, HeaderValue> decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytesResult);
         decryptedHeaders.Count.ShouldBe(3);
 
-        var typeHeader = decryptedHeaders[new HeaderKey
-        {
-            Kind = HeaderKind.String,
-            Value = "type"u8.ToArray()
-        }];
+        var typeHeader = decryptedHeaders[new HeaderKey { Kind = HeaderKind.String, Value = "type"u8.ToArray() }];
         Encoding.UTF8.GetString(typeHeader.Value).ShouldBe("test-message");
     }
 
@@ -104,7 +104,9 @@ public class HeaderEncryptionIntegrationTests
         var encryptor = CreateEncryptor();
 
         // One encrypting client serves both publisher and consumer: it encrypts on send and decrypts on poll.
-        var client = await Fixture.CreateAuthenticatedClient(protocol, encryptor: encryptor);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient(encryptor: encryptor)
+            : await Fixture.CreateHttpClient(encryptor: encryptor);
 
         var testStream = await CreateTestStream(client, protocol);
         var streamId = Identifier.String(testStream.StreamId);
@@ -160,25 +162,13 @@ public class HeaderEncryptionIntegrationTests
         received.Message.UserHeaders.ShouldNotBeNull();
         received.Message.UserHeaders!.Count.ShouldBe(3);
 
-        var batchHeader = received.Message.UserHeaders[new HeaderKey
-        {
-            Kind = HeaderKind.String,
-            Value = "batch"u8.ToArray()
-        }];
+        var batchHeader = received.Message.UserHeaders[new HeaderKey { Kind = HeaderKind.String, Value = "batch"u8.ToArray() }];
         BitConverter.ToUInt64(batchHeader.Value).ShouldBe(1UL);
 
-        var typeHeader = received.Message.UserHeaders[new HeaderKey
-        {
-            Kind = HeaderKind.String,
-            Value = "type"u8.ToArray()
-        }];
+        var typeHeader = received.Message.UserHeaders[new HeaderKey { Kind = HeaderKind.String, Value = "type"u8.ToArray() }];
         Encoding.UTF8.GetString(typeHeader.Value).ShouldBe("test-message");
 
-        var encHeader = received.Message.UserHeaders[new HeaderKey
-        {
-            Kind = HeaderKind.String,
-            Value = "encrypted"u8.ToArray()
-        }];
+        var encHeader = received.Message.UserHeaders[new HeaderKey { Kind = HeaderKind.String, Value = "encrypted"u8.ToArray() }];
         encHeader.Value[0].ShouldBe((byte)1);
     }
 
@@ -192,41 +182,17 @@ public class HeaderEncryptionIntegrationTests
         return new Dictionary<HeaderKey, HeaderValue>
         {
             {
-                new HeaderKey
-                {
-                    Kind = HeaderKind.String,
-                    Value = "batch"u8.ToArray()
-                },
-                new HeaderValue
-                {
-                    Kind = HeaderKind.Uint64,
-                    Value = BitConverter.GetBytes(1UL)
-                }
+                new HeaderKey { Kind = HeaderKind.String, Value = "batch"u8.ToArray() },
+                new HeaderValue { Kind = HeaderKind.Uint64, Value = BitConverter.GetBytes(1UL) }
             },
             {
-                new HeaderKey
-                {
-                    Kind = HeaderKind.String,
-                    Value = "type"u8.ToArray()
-                },
-                new HeaderValue
-                {
-                    Kind = HeaderKind.String,
-                    Value = "test-message"u8.ToArray()
-                }
+                new HeaderKey { Kind = HeaderKind.String, Value = "type"u8.ToArray() },
+                new HeaderValue { Kind = HeaderKind.String, Value = "test-message"u8.ToArray() }
             },
             {
-                new HeaderKey
-                {
-                    Kind = HeaderKind.String,
-                    Value = "encrypted"u8.ToArray()
-                },
-                new HeaderValue
-                {
-                    Kind = HeaderKind.Bool,
-                    Value = [1]
-                }
-            }
+                new HeaderKey { Kind = HeaderKind.String, Value = "encrypted"u8.ToArray() },
+                new HeaderValue { Kind = HeaderKind.Bool, Value = [1] }
+            },
         };
     }
 

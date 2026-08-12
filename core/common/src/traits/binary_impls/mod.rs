@@ -33,17 +33,21 @@ use crate::IggyError;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
+#[cfg(feature = "vsr")]
 use crate::{BinaryClient, ClientState};
 use iggy_binary_protocol::WireDecode;
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
 
 /// SDK identifier sent in the login-register version prefix. Foreign SDKs
 /// send their own (e.g. `go-sdk`) once they adopt VSR framing.
+#[cfg(feature = "vsr")]
 pub(crate) const RUST_SDK_NAME: &str = "rust-sdk";
 
 /// Version prefix for both login-register request shapes. `sdk_version`
 /// comes from [`crate::VsrSessionControl::sdk_version`] so it is the SDK
 /// crate's version, not this crate's.
+#[cfg(feature = "vsr")]
 pub(crate) fn rust_sdk_version_info(sdk_version: &str) -> Result<ClientVersionInfo, IggyError> {
     Ok(ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
@@ -54,13 +58,14 @@ pub(crate) fn rust_sdk_version_info(sdk_version: &str) -> Result<ClientVersionIn
 
 /// Release a live session before a fresh login on the same connection.
 ///
-/// The server binds a connection to one `(client, session)` and resolves the
+/// server-ng binds a connection to one `(client, session)` and resolves the
 /// acting user from that binding, not the wire header. A re-login on a still-
 /// bound connection is served as an idempotent replay that keeps the old
 /// identity, so switching users on a live connection requires logging out
 /// first: the committed Logout unbinds the connection cluster-wide, so the
 /// following Register takes the full register path and rebinds the newly
 /// authenticated user. No-op when the client is not authenticated.
+#[cfg(feature = "vsr")]
 pub(crate) async fn logout_before_relogin<B: BinaryClient>(client: &B) -> Result<(), IggyError> {
     if client.get_state().await == ClientState::Authenticated {
         client.logout_user().await?;

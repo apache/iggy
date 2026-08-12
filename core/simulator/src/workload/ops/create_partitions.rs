@@ -19,11 +19,10 @@
 //!
 //! Targets `Ok` (live topic), `StreamNotFound` (fabricated parent stream), or
 //! `TopicNotFound` (live stream, fabricated topic). `InvalidPartitionsCount`
-//! not targeted (only reachable through partition-id overflow). A committed
-//! `Ok` grows the shadow's per-topic partition count, which
-//! `delete_partitions` samples against.
+//! not targeted. Shadow tracks no partition counts, so every outcome predicts
+//! `Effect::None`.
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -87,7 +86,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.create_partitions(&input.stream, &input.topic, input.partitions_count)
 }
 
@@ -101,13 +100,7 @@ pub const fn classify_reply(code: u32) -> Outcome {
 }
 
 #[must_use]
-pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
-    match outcome {
-        Outcome::Ok => Effect::AddPartitions {
-            stream: input.stream.clone(),
-            topic: input.topic.clone(),
-            count: input.partitions_count,
-        },
-        _ => Effect::None,
-    }
+pub const fn predicted_effect(_input: &Input, _outcome: Outcome) -> Effect {
+    // Shadow tracks no per-topic partition counts.
+    Effect::None
 }

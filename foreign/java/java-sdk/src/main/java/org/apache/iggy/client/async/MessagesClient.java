@@ -26,7 +26,6 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
 import java.util.Optional;
@@ -84,10 +83,8 @@ public interface MessagesClient {
      *
      * @param streamId    the stream identifier (numeric or string-based)
      * @param topicId     the topic identifier (numeric or string-based)
-     * @param partitionId optional partition ID to poll from; when empty and polling with a
-     *                    group consumer, the client selects the partition round-robin from
-     *                    the member's synced group assignment (the group must be joined
-     *                    first)
+     * @param partitionId optional partition ID to poll from; if empty, the server selects
+     *                    the partition (required when using consumer groups)
      * @param consumer    the consumer identity, either individual ({@link Consumer#of(Long)})
      *                    or group ({@link Consumer#group(Long)})
      * @param strategy    the polling strategy controlling where to start reading
@@ -151,11 +148,6 @@ public interface MessagesClient {
      *       messages with the same key always go to the same partition, preserving order</li>
      * </ul>
      *
-     * <p>Over TCP the VSR broker routes explicit partitions only, so balanced and
-     * key-based partitioning are resolved to a concrete partition by the client
-     * (round-robin cursor and {@code xxh32(key) % partitionCount} respectively),
-     * consistently with the other Iggy SDKs.
-     *
      * <p>Messages are batched into a single network request for efficiency. For high
      * throughput, accumulate messages and send them in larger batches rather than one
      * at a time.
@@ -164,11 +156,11 @@ public interface MessagesClient {
      * @param topicId      the topic identifier (numeric or string-based)
      * @param partitioning the partitioning strategy for routing messages
      * @param messages     the list of messages to send
-     * @return a {@link CompletableFuture} that completes with the {@link SendMessagesResponse}
-     *         confirming the partition and base offset of the committed batch
+     * @return a {@link CompletableFuture} that completes when all messages have been
+     *         acknowledged by the server
      * @throws org.apache.iggy.exception.IggyException if the stream or topic does not exist
      */
-    CompletableFuture<SendMessagesResponse> sendMessages(
+    CompletableFuture<Void> sendMessages(
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages);
 
     /**
@@ -181,9 +173,9 @@ public interface MessagesClient {
      * @param topicId      the numeric topic ID
      * @param partitioning the partitioning strategy
      * @param messages     the list of messages to send
-     * @return a {@link CompletableFuture} that completes with the {@link SendMessagesResponse}
+     * @return a {@link CompletableFuture} that completes when messages are acknowledged
      */
-    default CompletableFuture<SendMessagesResponse> sendMessages(
+    default CompletableFuture<Void> sendMessages(
             Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {
         return sendMessages(StreamId.of(streamId), TopicId.of(topicId), partitioning, messages);
     }

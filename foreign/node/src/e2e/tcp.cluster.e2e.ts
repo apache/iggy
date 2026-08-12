@@ -20,14 +20,13 @@ import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { getTestClient } from "./test-client.utils.js";
 
-// The suite runs against a single-node server (cluster mode off), which
-// reports itself as the sole healthy leader with endpoints derived from
-// its default config.
+// cluster mode still in dev atm
+// response is mocked from /core/server/config.toml
 const expectedMeta = {
-  name: "single-node",
+  name: "iggy-cluster",
   nodes: [
     {
-      name: "iggy-node",
+      name: "iggy-node-1",
       ip: "127.0.0.1",
       endpoints: {
         tcp: 8090,
@@ -36,6 +35,18 @@ const expectedMeta = {
         websocket: 8092,
       },
       role: "Leader",
+      status: "Healthy",
+    },
+    {
+      name: "iggy-node-2",
+      ip: "127.0.0.1",
+      endpoints: {
+        tcp: 8091,
+        quic: 8081,
+        http: 3001,
+        websocket: 8093,
+      },
+      role: "Follower",
       status: "Healthy",
     },
   ],

@@ -1,0 +1,105 @@
+﻿# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+
+name: docker-build-test-server
+description: Build Iggy server binaries and Docker image with prebuilt binaries
+inputs:
+  dockerfile:
+    description: "Path to Dockerfile"
+    required: false
+    default: "core/server/Dockerfile"
+  dockerfile-target:
+    description: "Dockerfile target stage (e.g., runtime-prebuilt)"
+    required: false
+    default: "runtime-prebuilt"
+  image-tag:
+    description: "Docker image tag (without registry/name)"
+    required: false
+    default: "iggy-server:test"
+  docker-build-context:
+    description: "Docker build context"
+    required: false
+    default: "."
+  prebuilt-server-binary:
+    description: "Path to prebuilt iggy-server binary"
+    required: false
+    default: "target/debug/iggy-server"
+  prebuilt-cli-binary:
+    description: "Path to prebuilt iggy CLI binary"
+    required: false
+    default: "target/debug/iggy"
+  libc:
+    description: "Libc type (musl or glibc)"
+    required: false
+    default: "glibc"
+  profile:
+    description: "Build profile (debug or release)"
+    required: false
+    default: "debug"
+outputs:
+  docker_image:
+    description: "Full Docker image name built"
+    value: ${{ steps.build.outputs.image_tag }}
+runs:
+  using: "composite"
+  steps:
+    - name: Build Iggy server and CLI binaries
+      shell: bash
+      run: |
+        echo "Building Iggy server and CLI binaries with cargo..."
+        cargo build --locked --bin iggy-server --bin iggy
+
+        echo "✅ Binaries built successfully:"
+        ls -lh ${{ inputs.prebuilt-server-binary }} ${{ inputs.prebuilt-cli-binary }}
+
+    - name: Build Docker image with prebuilt binaries
+      id: build
+      shell: bash
+      run: |
+        set -euo pipefail
+        DOCKERFILE="${{ inputs.dockerfile }}"
+        DOCKERFILE_TARGET="${{ inputs.dockerfile-target }}"
+        IMAGE_TAG="${{ inputs.image-tag }}"
+        BUILD_CONTEXT="${{ inputs.docker-build-context }}"
+        PREBUILT_IGGY_SERVER="${{ inputs.prebuilt-server-binary }}"
+        PREBUILT_IGGY_CLI="${{ inputs.prebuilt-cli-binary }}"
+        LIBC="${{ inputs.libc }}"
+        PROFILE="${{ inputs.profile }}"
+
+        echo "Building Docker image with prebuilt binaries..."
+        echo "  Dockerfile: $DOCKERFILE"
+        echo "  Target: $DOCKERFILE_TARGET"
+        echo "  Image Tag: $IMAGE_TAG"
+        echo "  Context: $BUILD_CONTEXT"
+        echo "  Server Binary: $PREBUILT_IGGY_SERVER"
+        echo "  CLI Binary: $PREBUILT_IGGY_CLI"
+        echo "  Libc: $LIBC"
+        echo "  Profile: $PROFILE"
+
+        docker build \
+          -f "$DOCKERFILE" \
+          --target "$DOCKERFILE_TARGET" \
+          -t "$IMAGE_TAG" \
+          --build-arg PREBUILT_IGGY_SERVER="$PREBUILT_IGGY_SERVER" \
+          --build-arg PREBUILT_IGGY_CLI="$PREBUILT_IGGY_CLI" \
+          --build-arg LIBC="$LIBC" \
+          --build-arg PROFILE="$PROFILE" \
+          "$BUILD_CONTEXT"
+
+        echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+        echo "✅ Docker image built successfully: $IMAGE_TAG"

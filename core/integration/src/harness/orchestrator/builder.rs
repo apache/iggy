@@ -297,7 +297,7 @@ fn build_servers(
 fn default_cluster_node_count() -> usize {
     // Suite-wide override: run every test that does not pin `cluster_nodes`
     // against an N-node cluster (e.g. `IGGY_TEST_CLUSTER_NODES=1` probes the
-    // whole vsr suite on a single the server node). Explicit attrs win.
+    // whole vsr suite on a single server-ng node). Explicit attrs win.
     if let Some(count) = std::env::var("IGGY_TEST_CLUSTER_NODES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -306,7 +306,15 @@ fn default_cluster_node_count() -> usize {
         return count;
     }
 
-    3
+    #[cfg(feature = "vsr")]
+    {
+        3
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    {
+        1
+    }
 }
 
 fn build_cluster_envs(
@@ -324,6 +332,7 @@ fn build_cluster_envs(
 
     envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
     envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());
+    #[cfg(feature = "vsr")]
     envs.insert(
         "IGGY_MESSAGE_BUS_RECONNECT_PERIOD".to_string(),
         "100ms".to_string(),

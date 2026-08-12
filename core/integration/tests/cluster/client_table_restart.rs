@@ -71,6 +71,8 @@
 //! work later settles on an explicit resume handshake, adjust `resume_request`
 //! to speak it -- but it must stay credential-bearing.
 
+#![cfg(feature = "vsr")]
+
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
@@ -78,6 +80,7 @@ use iggy_binary_protocol::consensus::{
     Command2, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
 };
+use iggy_binary_protocol::namespace::METADATA_CONSENSUS_NAMESPACE;
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -275,6 +278,10 @@ fn request_header(
         client: CLIENT_ID,
         session,
         request,
+        namespace: match operation {
+            Operation::Register => METADATA_CONSENSUS_NAMESPACE,
+            _ => 0,
+        },
         ..Default::default()
     }
 }

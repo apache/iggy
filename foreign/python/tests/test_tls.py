@@ -27,8 +27,10 @@ Requirements:
     - testcontainers[docker] installed (in [testing-docker] extras)
     - CA certificate available at core/certs/iggy_ca_cert.pem
     - server image built locally (or IGGY_SERVER_DOCKER_IMAGE set):
-      docker build -f core/server/Dockerfile --target runtime-prebuilt \
-        --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+      TODO(hubcio): change to iggy-server once legacy server is removed
+      (core/server has VSR support)
+      docker build -f core/server-ng/Dockerfile --target runtime-prebuilt \
+        --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
         --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
         -t iggy-server:local .
 """
@@ -71,7 +73,7 @@ def tls_container():
     )
     container.start()
     # Wait for the server to be ready inside the container
-    wait_for_logs(container, "server running", timeout=60)
+    wait_for_logs(container, "server-ng running", timeout=60)
     yield container
     container.stop()
 

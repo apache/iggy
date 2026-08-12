@@ -183,6 +183,7 @@ var client = Iggy.tcpClientBuilder()
     .port(8090)
     .connectionTimeout(Duration.ofSeconds(10))
     .requestTimeout(Duration.ofSeconds(30))
+    .connectionPoolSize(10)
     .retryPolicy(RetryPolicy.exponentialBackoff())
     .credentials("iggy", "iggy")
     .buildAndLogin();
@@ -212,7 +213,7 @@ See the **[Java Examples](../../examples/java/)** directory for runnable applica
 
 - **BlockingProducer**: synchronous message production with batch sending
 - **BlockingConsumer**: synchronous consumption with polling loops
-- **AsyncProducer**: non-blocking batch production with concurrent request submission
+- **AsyncProducer**: high-throughput async production with pipelining
 - **AsyncConsumer**: async consumption with backpressure and error recovery
 
 Each example includes comprehensive documentation on when to use blocking vs. async clients, CompletableFuture patterns, thread pool management, and performance characteristics.

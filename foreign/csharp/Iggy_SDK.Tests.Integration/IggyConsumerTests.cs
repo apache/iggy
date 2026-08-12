@@ -38,7 +38,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithSingleConsumer_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -61,7 +63,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithConsumerGroup_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -84,11 +88,13 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_NewClient_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
-        var clientAddress = await Fixture.GetIggyAddressAsync(protocol);
+        var clientAddress = Fixture.GetIggyAddress(protocol); ;
 
         var consumer = IggyConsumerBuilder
             .Create(Identifier.String(testStream.StreamId),
@@ -108,7 +114,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -131,7 +139,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithoutInit_Should_Throw_ConsumerNotInitializedException(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -159,7 +169,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithConsumerGroup_Should_CreateGroup_WhenNotExists(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -192,7 +204,9 @@ public class IggyConsumerTests
     public async Task InitAsync_WithConsumerGroup_Should_Throw_WhenGroupNotExists_AndAutoCreateDisabled(
         Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -216,7 +230,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithConsumerGroup_Should_JoinGroup_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -245,7 +261,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_Should_LeaveConsumerGroup(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -276,7 +294,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithSingleConsumer_Should_ReceiveMessages_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -319,7 +339,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithBatchSize_Should_RespectBatchSize(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -358,7 +380,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithPollingInterval_Should_RespectInterval(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -398,7 +422,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithAutoCommitAfterReceive_Should_StoreOffset(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -446,7 +472,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithAutoCommitAfterPoll_Should_StoreOffset(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -493,7 +521,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task StoreOffsetAsync_Should_StoreOffset_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -530,7 +560,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteOffsetAsync_Should_DeleteOffset_Successfully(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -573,7 +605,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_Should_NotThrow(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -595,7 +629,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -618,7 +654,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_WithoutInit_Should_NotThrow(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -639,7 +677,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task OnPollingError_Should_Fire_WhenPollingFails(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -688,7 +728,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithOffsetStrategy_Should_StartFromOffset(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -725,7 +767,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithFirstStrategy_Should_StartFromBeginning(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -757,7 +801,9 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithLastStrategy_Should_StartFromEnd(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 

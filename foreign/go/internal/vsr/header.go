@@ -33,12 +33,6 @@ const (
 // Request header field offsets the client writes. Fields are addressed by
 // byte offset rather than a struct cast because the header leads with
 // unaligned u128 values.
-//
-// The client wire carries no routing namespace: the server derives the
-// consensus group (plane from the operation, partition target from the
-// payload) and stamps it into its own internal header. Everything that
-// followed the removed field therefore sits eight bytes earlier than in the
-// pre-derivation layout.
 const (
 	requestOffsetSize      = 48
 	requestOffsetCommand   = 60
@@ -46,8 +40,9 @@ const (
 	requestOffsetTimestamp = 160
 	requestOffsetRequest   = 168
 	requestOffsetOperation = 176
-	requestOffsetSession   = 184
-	requestOffsetReserved  = 196
+	requestOffsetNamespace = 184
+	requestOffsetSession   = 192
+	requestOffsetReserved  = 204
 )
 
 // Reply header field offsets the client reads.
@@ -56,7 +51,8 @@ const (
 	replyOffsetCommand   = 60
 	replyOffsetRequest   = 200
 	replyOffsetOperation = 208
-	replyOffsetStatus    = 216
+	replyOffsetNamespace = 216
+	replyOffsetStatus    = 224
 )
 
 // Eviction header field offsets the client reads.
@@ -126,6 +122,8 @@ type RequestFields struct {
 	Request uint64
 	// Operation is the consensus operation discriminant.
 	Operation Operation
+	// Namespace routes the request to the owning shard.
+	Namespace uint64
 	// Session is the bound session fence, or 0 while unbound.
 	Session uint64
 	// NonReplicatedCode is the raw command code the server reads out of
@@ -144,6 +142,7 @@ func EncodeRequestHeader(dst *[HeaderSize]byte, fields RequestFields) {
 	binary.LittleEndian.PutUint64(dst[requestOffsetClient+8:], fields.Client.Hi)
 	binary.LittleEndian.PutUint64(dst[requestOffsetRequest:], fields.Request)
 	dst[requestOffsetOperation] = byte(fields.Operation)
+	binary.LittleEndian.PutUint64(dst[requestOffsetNamespace:], fields.Namespace)
 	binary.LittleEndian.PutUint64(dst[requestOffsetSession:], fields.Session)
 	if fields.NonReplicatedCode != 0 {
 		binary.LittleEndian.PutUint32(dst[requestOffsetReserved:], fields.NonReplicatedCode)

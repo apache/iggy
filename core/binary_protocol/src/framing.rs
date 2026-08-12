@@ -184,7 +184,7 @@ impl<'a> ResponseFrame<'a> {
 }
 
 /// Decoded request frame with request ID for request-response correlation
-/// and consensus-level duplicate detection (the server framing).
+/// and consensus-level duplicate detection (server-ng framing).
 ///
 /// Wire format: `[length:4 LE][code:4 LE][request_id:8 LE][payload:N]`
 /// where `length` = 4 (code) + 8 (`request_id`) + N (payload).
@@ -282,7 +282,7 @@ impl<'a> RequestFrame2<'a> {
 }
 
 /// Decoded response frame with request ID for request-response correlation
-/// (the server framing).
+/// (server-ng framing).
 ///
 /// Wire format: `[status:4 LE][length:4 LE][request_id:8 LE][payload:N]`
 /// where `status` = 0 for success, non-zero for error code.

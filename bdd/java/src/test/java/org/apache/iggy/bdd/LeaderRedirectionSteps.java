@@ -23,7 +23,6 @@ import io.cucumber.java.After;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
-import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.cluster.ClusterNode;
 import org.apache.iggy.cluster.ClusterNodeRole;
@@ -31,9 +30,6 @@ import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.apache.iggy.exception.IggyException;
 import org.apache.iggy.stream.StreamDetails;
 
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -172,15 +168,11 @@ public class LeaderRedirectionSteps {
     public void bothClientsUseTheSameServer() {
         IggyTcpClient clientA = client("A");
         IggyTcpClient clientB = client("B");
-        ConnectionInfo connectionA = clientA.getConnectionInfo();
-        ConnectionInfo connectionB = clientB.getConnectionInfo();
 
-        assertTrue(
-                isSameEndpoint(connectionA, connectionB),
-                () -> "Both clients should be connected to the same server, got "
-                        + connectionA.serverAddress()
-                        + " and "
-                        + connectionB.serverAddress());
+        assertEquals(
+                clientA.getConnectionInfo().serverAddress(),
+                clientB.getConnectionInfo().serverAddress(),
+                "Both clients should be connected to the same server");
 
         clientA.system().ping();
         clientB.system().ping();
@@ -247,25 +239,6 @@ public class LeaderRedirectionSteps {
                     .findFirst();
         } catch (IggyException error) {
             return Optional.empty();
-        }
-    }
-
-    private static boolean isSameEndpoint(ConnectionInfo left, ConnectionInfo right) {
-        if (left.port() != right.port()) {
-            return false;
-        }
-
-        InetAddress[] leftAddresses = resolveHost(left.host());
-        InetAddress[] rightAddresses = resolveHost(right.host());
-        return Arrays.stream(leftAddresses)
-                .anyMatch(leftAddress -> Arrays.stream(rightAddresses).anyMatch(leftAddress::equals));
-    }
-
-    private static InetAddress[] resolveHost(String host) {
-        try {
-            return InetAddress.getAllByName(host);
-        } catch (UnknownHostException error) {
-            throw new AssertionError("Failed to resolve server host " + host, error);
         }
     }
 

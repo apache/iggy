@@ -82,7 +82,8 @@ install` (Python) or `prek install` (Rust drop-in) - both read
 ```text
 iggy/
 ├── core/
-│   ├── server/           Iggy server binary (Viewstamped Replication)
+│   ├── server/           Iggy server binary
+│   ├── server-ng/        Next-gen server (Viewstamped Replication, WIP)
 │   ├── sdk/              Rust client SDK
 │   ├── cli/              iggy CLI
 │   ├── connectors/       Connectors runtime + SDK + sinks/sources
@@ -113,6 +114,7 @@ iggy/
 | --------------------- | ---------------------------------------- |
 | Wire protocol         | `core/binary_protocol/`                  |
 | Server                | `core/server/src/`                       |
+| Next-gen server (WIP) | `core/server-ng/`                        |
 | Rust client SDK       | `core/sdk/src/`                          |
 | Connectors            | `core/connectors/` -> connector-* skills |
 | Integration tests     | `core/integration/tests/`                |

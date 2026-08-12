@@ -95,9 +95,17 @@ pub async fn run(harness: &mut TestHarness) {
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); graceful
-    // shutdown flushes the committed journal, which this scenario's restart
-    // exercises instead.
+    // Explicitly flush to disk, then wait for message_saver to persist.
+    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
+    // its graceful shutdown flushes the committed journal, which this
+    // scenario's restart exercises instead.
+    #[cfg(not(feature = "vsr"))]
+    setup_client
+        .flush_unsaved_buffer(
+            &stream_id, &topic_id, 0, true, // fsync
+        )
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     drop(setup_client);
 

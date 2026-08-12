@@ -1,0 +1,105 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::http::jwt::json_web_token::Identity;
+use crate::http::shared::{AppState, RequestDetails};
+use axum::body::Body;
+use axum::{
+    extract::State,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::Response,
+};
+use err_trail::ErrContext;
+use send_wrapper::SendWrapper;
+use std::sync::Arc;
+
+const COMPONENT: &str = "JWT_MIDDLEWARE";
+const AUTHORIZATION: &str = "authorization";
+const BEARER: &str = "Bearer ";
+const UNAUTHORIZED: StatusCode = StatusCode::UNAUTHORIZED;
+
+const PUBLIC_PATHS: &[&str] = &[
+    "/",
+    "/metrics",
+    "/ping",
+    "/users/login",
+    "/users/refresh-token",
+    "/personal-access-tokens/login",
+    "/ui",
+];
+
+pub async fn jwt_auth(
+    State(state): State<Arc<AppState>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if PUBLIC_PATHS.contains(&request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
+
+    let bearer = request
+        .headers()
+        .get(AUTHORIZATION)
+        .ok_or(UNAUTHORIZED)
+        .error(|e: &StatusCode| {
+            format!("{COMPONENT} (error: {e}) - missing or inaccessible Authorization header")
+        })?
+        .to_str()
+        .error(|e: &axum::http::header::ToStrError| {
+            format!("{COMPONENT} (error: {e}) - invalid authorization header format")
+        })
+        .map_err(|_| UNAUTHORIZED)?;
+
+    if !bearer.starts_with(BEARER) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let jwt_token = &bearer[BEARER.len()..];
+    let token_header = jsonwebtoken::decode_header(jwt_token)
+        .error(|e: &jsonwebtoken::errors::Error| {
+            format!("{COMPONENT} (error: {e}) - failed to decode JWT header")
+        })
+        .map_err(|_| UNAUTHORIZED)?;
+    // `decode` may fetch JWKS via the cyper client, which is `!Send` since
+    // cyper 0.9 (`Rc`-backed). axum requires this middleware's future to be
+    // `Send`, so wrap the `!Send` sub-futures in `SendWrapper` -- the same
+    // pattern the rest of the HTTP layer uses for compio shard ops.
+    // Sound under compio's thread-per-core model: the future is never
+    // polled from another thread.
+    let jwt_claims = SendWrapper::new(state.jwt_manager.decode(jwt_token, token_header.alg))
+        .await
+        .map_err(|_| UNAUTHORIZED)?;
+    if SendWrapper::new(state.jwt_manager.is_token_revoked(&jwt_claims.claims.jti)).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let request_details = request.extensions().get::<RequestDetails>().unwrap();
+    let user_id = jwt_claims
+        .claims
+        .sub
+        .parse::<u32>()
+        .map_err(|_| UNAUTHORIZED)?;
+    let identity = Identity {
+        token_id: jwt_claims.claims.jti,
+        token_expiry: jwt_claims.claims.exp,
+        user_id,
+        ip_address: request_details.ip_address,
+    };
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
+}

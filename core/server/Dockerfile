@@ -29,7 +29,6 @@
 
 ARG RUST_VERSION=1.97.1
 ARG ALPINE_VERSION=3.23
-
 # ── from-source path ─────────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine${ALPINE_VERSION} AS chef
 WORKDIR /app
@@ -155,12 +154,12 @@ RUN apt-get update && apt-get install -y \
     libudev-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=prebuilt /out/iggy-server /usr/local/bin/iggy-server
-COPY --from=prebuilt /out/iggy        /usr/local/bin/iggy
-COPY --from=license-gen /app/LICENSE-binary /usr/share/doc/iggy/LICENSE-binary
+COPY --from=prebuilt    /out/iggy-server                /usr/local/bin/iggy-server
+COPY --from=prebuilt    /out/iggy                       /usr/local/bin/iggy
+COPY --from=license-gen /app/LICENSE-binary             /usr/share/doc/iggy/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy/
 RUN echo "═══════════════════════════════════════════════════════════════" && \
-    echo "                   IGGY SERVER BUILD SUMMARY                   " && \
+    echo "                    IGGY SERVER BUILD SUMMARY                  " && \
     echo "═══════════════════════════════════════════════════════════════" && \
     echo "Build Type:     PREBUILT BINARIES" && \
     echo "Platform:       ${TARGETPLATFORM:-linux/amd64}" && \
@@ -190,7 +189,7 @@ COPY --from=builder /app/iggy        /usr/local/bin/iggy
 COPY --from=builder /app/LICENSE-binary /usr/share/doc/iggy/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy/
 RUN echo "═══════════════════════════════════════════════════════════════" && \
-    echo "                   IGGY SERVER BUILD SUMMARY                   " && \
+    echo "                    IGGY SERVER BUILD SUMMARY                  " && \
     echo "═══════════════════════════════════════════════════════════════" && \
     echo "Build Type:     FROM SOURCE" && \
     echo "Platform:       ${TARGETPLATFORM:-linux/amd64}" && \

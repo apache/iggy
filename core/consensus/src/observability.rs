@@ -249,7 +249,7 @@ impl ReplicaLogContext {
             plane,
             cluster_id: consensus.cluster(),
             replica_id: consensus.replica(),
-            namespace: NamespaceLogContext::from_raw(plane, consensus.group()),
+            namespace: NamespaceLogContext::from_raw(plane, consensus.namespace()),
             view: consensus.view(),
             log_view: consensus.log_view(),
             commit: consensus.commit_max(),

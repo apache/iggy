@@ -19,7 +19,7 @@ use crate::consensus_message::{MESSAGE_ALIGN, Message};
 use crate::iobuf::Owned;
 use crate::sharding::IggyNamespace;
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::{PrepareHeader, RoutedRequestHeader};
+use iggy_binary_protocol::{PrepareHeader, RequestHeader};
 use iggy_common::{EncryptorKind, INDEX_SIZE, IggyError, random_id};
 use std::hash::Hasher;
 use twox_hash::XxHash3_64;
@@ -196,20 +196,20 @@ impl SendMessages2Owned {
 
     pub fn encode_request(
         self,
-        mut request_header: RoutedRequestHeader,
-    ) -> Result<Message<RoutedRequestHeader>, IggyError> {
-        let total_size = std::mem::size_of::<RoutedRequestHeader>() + self.header.total_size();
+        mut request_header: RequestHeader,
+    ) -> Result<Message<RequestHeader>, IggyError> {
+        let total_size = std::mem::size_of::<RequestHeader>() + self.header.total_size();
         // The converted body differs in size from the legacy wire body the
         // header described; a stale `size` truncates the rebuilt blob for
         // every downstream slice (stamping, journal reads).
         request_header.size = u32::try_from(total_size).map_err(|_| IggyError::InvalidCommand)?;
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total_size);
         let bytes = buffer.as_mut_slice();
-        bytes[0..std::mem::size_of::<RoutedRequestHeader>()]
+        bytes[0..std::mem::size_of::<RequestHeader>()]
             .copy_from_slice(bytemuck::bytes_of(&request_header));
         self.header.encode_into(
-            &mut bytes[std::mem::size_of::<RoutedRequestHeader>()
-                ..std::mem::size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE],
+            &mut bytes[std::mem::size_of::<RequestHeader>()
+                ..std::mem::size_of::<RequestHeader>() + COMMAND_HEADER_SIZE],
         );
         bytes[PREPARE_SPLIT_POINT..PREPARE_SPLIT_POINT + self.blob.len()]
             .copy_from_slice(&self.blob);
@@ -473,12 +473,12 @@ pub(crate) type FrozenBatchHeader = crate::iobuf::Frozen<MESSAGE_ALIGN>;
 /// [`IggyError::InvalidCommand`] on an undecodable batch; encryption errors
 /// propagate from the encryptor.
 pub fn encrypt_batch_request(
-    message: Message<RoutedRequestHeader>,
+    message: Message<RequestHeader>,
     encryptor: &EncryptorKind,
-) -> Result<Message<RoutedRequestHeader>, IggyError> {
+) -> Result<Message<RequestHeader>, IggyError> {
     let request_header = *message.header();
     let total_size = request_header.size as usize;
-    let body = &message.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..total_size];
+    let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
     let batch = decode_batch_slice(body)?;
 
     let mut blob = BytesMut::with_capacity(batch.blob().len() * 2);
@@ -537,27 +537,26 @@ pub enum ChecksumMode {
 
 pub fn convert_request_message(
     namespace: IggyNamespace,
-    message: Message<RoutedRequestHeader>,
+    message: Message<RequestHeader>,
     checksum: ChecksumMode,
-) -> Result<Message<RoutedRequestHeader>, IggyError> {
+) -> Result<Message<RequestHeader>, IggyError> {
     let request_header = *message.header();
     let total_size = request_header.size as usize;
-    let body = &message.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..total_size];
+    let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
     // A canonical body enters the pipeline verbatim, so it must end exactly at
     // `batch_length`: `size` and `batch_length` are independent client-supplied
     // fields and `decode_batch_slice` only lower-bounds the frame. A suffix past
     // `batch_length` is covered by no checksum, still rides the buffer to disk,
     // and desyncs the segment walk that advances by `batch_length`.
-    match decode_batch_slice(body) {
-        Ok(batch) if batch.message_count() == 0 => Err(IggyError::InvalidCommand),
-        Ok(batch) if body.len() == batch.header.total_size() => Ok(message),
+    match decode_batch_slice(body).map(|batch| batch.header.total_size()) {
+        Ok(batch_length) if body.len() == batch_length => Ok(message),
         Ok(_) => Err(IggyError::InvalidCommand),
         Err(_) => transcode_legacy_request(namespace, body, request_header, checksum),
     }
 }
 
 /// Transcode a legacy `SendMessages` request body directly into the canonical
-/// `[RoutedRequestHeader][256B SendMessages2Header][blob]` form, writing each message
+/// `[RequestHeader][256B SendMessages2Header][blob]` form, writing each message
 /// record straight into the final aligned buffer.
 ///
 /// Fused replacement for the `from_legacy_request(..).encode_request(..)`
@@ -572,13 +571,10 @@ pub fn convert_request_message(
 fn transcode_legacy_request(
     namespace: IggyNamespace,
     body: &[u8],
-    mut request_header: RoutedRequestHeader,
+    mut request_header: RequestHeader,
     checksum: ChecksumMode,
-) -> Result<Message<RoutedRequestHeader>, IggyError> {
+) -> Result<Message<RequestHeader>, IggyError> {
     let (message_count, messages) = legacy_messages_slice(body)?;
-    if message_count == 0 {
-        return Err(IggyError::InvalidCommand);
-    }
     let mut parsed = Vec::with_capacity(message_count as usize);
     let mut origin_timestamp = u64::MAX;
     let mut cursor = 0usize;
@@ -602,7 +598,7 @@ fn transcode_legacy_request(
         origin_timestamp = 0;
     }
 
-    let header_size = std::mem::size_of::<RoutedRequestHeader>();
+    let header_size = std::mem::size_of::<RequestHeader>();
     let batch_length = COMMAND_HEADER_SIZE
         .checked_add(blob_len)
         .ok_or(IggyError::InvalidCommand)?;
@@ -682,37 +678,6 @@ fn transcode_legacy_request(
 /// chunk and steps by `batch_length`. Callers whose buffer is meant to BE the
 /// batch must reject the surplus themselves - see [`convert_request_message`].
 pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
-    decode_batch_slice_with(body, BatchIntegrity::Verify)
-}
-
-/// How much of a batch record [`decode_batch_slice_with`] proves before returning it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchIntegrity {
-    /// Re-hash the batch and reject it unless it matches its own `batch_checksum`.
-    Verify,
-    /// Check the framing only, and hand back whatever it describes. The caller is
-    /// accepting bytes that may not be the ones written.
-    LayoutOnly,
-}
-
-/// [`decode_batch_slice`] with the integrity level chosen by the caller.
-///
-/// An enum, not a bool: the one caller that passes anything but
-/// [`BatchIntegrity::Verify`] is the disk poll under its operator knob, and
-/// `..., false)` there reads like a detail rather than opting a read out of
-/// corruption detection.
-///
-/// Layout checks are not optional either way: a short or self-inconsistent record is
-/// rejected regardless, because the caller would otherwise index past it.
-///
-/// # Errors
-/// [`IggyError::InvalidCommand`] for a short or inconsistent record, and
-/// [`IggyError::InvalidBatchChecksum`] under [`BatchIntegrity::Verify`] when the batch
-/// does not match. Callers that must tell corruption from a partial tail need both.
-pub fn decode_batch_slice_with(
-    body: &[u8],
-    integrity: BatchIntegrity,
-) -> Result<SendMessages2Ref<'_>, IggyError> {
     if body.len() < COMMAND_HEADER_SIZE {
         return Err(IggyError::InvalidCommand);
     }
@@ -725,18 +690,13 @@ pub fn decode_batch_slice_with(
 
     let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
     let batch = SendMessages2Ref { header, blob };
-    match integrity {
-        BatchIntegrity::Verify => {
-            let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
-            if header.batch_checksum != expected_checksum {
-                return Err(IggyError::InvalidBatchChecksum(
-                    header.batch_checksum,
-                    expected_checksum,
-                    header.base_offset,
-                ));
-            }
-        }
-        BatchIntegrity::LayoutOnly => validate_batch_layout(&batch)?,
+    let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
+    if header.batch_checksum != expected_checksum {
+        return Err(IggyError::InvalidBatchChecksum(
+            header.batch_checksum,
+            expected_checksum,
+            header.base_offset,
+        ));
     }
 
     Ok(batch)
@@ -766,13 +726,15 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyEr
 ///
 /// INVARIANT: `bytes` MUST be node-local self-stamped -
 /// [`stamp_prepare_for_persistence`] recomputed the batch checksum over the
-/// exact blob on the local node - or already integrity-checked at network
+/// exact blob on THIS node - or already integrity-checked at their network
 /// ingress. There is no consensus-layer blob validation: the `PrepareHeader`
-/// integrity fields are inert zeros. Replicated and repaired prepares are
-/// validated via [`decode_prepare_slice`] before the bytes reach any trusted
-/// decode. Calling this on unvalidated network bytes would let a corrupted blob
-/// pass undetected. The full-body per-message checksum pass dominates
-/// produce-path CPU, so trusted call sites that only read header meta skip it.
+/// integrity fields are inert zeros. A replicated `SendMessages` prepare is
+/// gated per-message on receipt by [`verify_received_send_messages`], and a
+/// repaired prepare is validated via [`decode_prepare_slice`]; both run BEFORE
+/// the bytes reach any trusted decode. NEVER call this on unvalidated network
+/// bytes - it would let a corrupted blob pass undetected. The full-body
+/// per-message checksum pass dominates produce-path CPU, so trusted call sites
+/// that only read header meta skip it.
 ///
 /// # Errors
 ///
@@ -860,6 +822,35 @@ pub fn stamp_prepare_for_persistence(
     command.batch_checksum = calculate_batch_checksum(&command, blob);
     command.encode_into(&mut bytes[header_offset..header_offset + COMMAND_HEADER_SIZE]);
     Ok((message, command, command.message_count))
+}
+
+/// Verify every per-message checksum in a received `SendMessages` prepare.
+///
+/// The FIRST blob-integrity check on the replicated path: the `PrepareHeader`
+/// integrity fields are inert zeros and the batch checksum is recomputed
+/// locally at stamp, so transit corruption of a message body would otherwise
+/// reach apply undetected. Backups call this before journaling a replicated
+/// prepare; on a mismatch the caller fails closed (drop, no `PrepareOk`) and the
+/// primary retransmits on prepare-timeout.
+///
+/// The stored `batch_checksum` is not consulted (a received prepare is
+/// pre-stamp, `base_offset` / `base_timestamp` zero): integrity rests on the
+/// per-message checksums, recomputed over the stamp-invariant cover
+/// (`header[8..48] || payload || user_headers`), which excludes the 256B command
+/// header, so it holds whether or not this node has stamped yet. Shares the
+/// frame walk with the validating decoders via
+/// [`verify_and_recompute_batch_checksum`], discarding its recomputed batch
+/// value.
+///
+/// # Errors
+///
+/// [`IggyError::InvalidCommand`] if the records do not tile `message_count`
+/// exactly (a length-field corruption desyncs the walk);
+/// [`IggyError::InvalidMessageChecksum`] on the first per-message mismatch.
+pub fn verify_received_send_messages(bytes: &[u8]) -> Result<(), IggyError> {
+    let batch = decode_prepare_slice_trusted(bytes)?;
+    verify_and_recompute_batch_checksum(&batch)?;
+    Ok(())
 }
 
 fn legacy_messages_slice(body: &[u8]) -> Result<(u32, &[u8]), IggyError> {
@@ -1007,24 +998,6 @@ fn verify_and_recompute_batch_checksum(batch: &SendMessages2Ref<'_>) -> Result<u
         return Err(IggyError::InvalidCommand);
     }
     Ok(hasher.finish())
-}
-
-/// The layout half of [`verify_and_recompute_batch_checksum`], without the hashing.
-///
-/// A caller that opts out of checksum verification still must not be handed a batch
-/// whose framing disagrees with its header, since it indexes by `batch_length` and
-/// would step into the next record. Walking the frames costs no hashing.
-fn validate_batch_layout(batch: &SendMessages2Ref<'_>) -> Result<(), IggyError> {
-    let mut framed = 0u32;
-    let mut covered = 0usize;
-    for message in batch.iter_with_offsets() {
-        framed += 1;
-        covered = message.end;
-    }
-    if framed != batch.message_count() || covered != batch.blob().len() {
-        return Err(IggyError::InvalidCommand);
-    }
-    Ok(())
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IggyError> {
@@ -1206,13 +1179,49 @@ mod tests {
     }
 
     /// `[PrepareHeader][256B batch header][blob]` carrying real per-message
-    /// records and checksums from the production encoder, with the initial zero
-    /// base offset and timestamp.
+    /// records + checksums from the production encoder, left pre-stamp
+    /// (`base_offset` / `base_timestamp` zero) as a follower receives it.
     fn prepare_with_messages(messages: &IggyMessages2) -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
             SendMessages2Owned::from_messages(namespace, messages).expect("build send batch");
         prepare_from_owned(&owned)
+    }
+
+    #[test]
+    fn verify_received_send_messages_accepts_clean_batch() {
+        let owned = prepare_with_messages(&sample_messages());
+        verify_received_send_messages(owned.as_slice())
+            .expect("a clean batch passes the receive gate");
+    }
+
+    #[test]
+    fn verify_received_send_messages_rejects_flipped_payload_byte() {
+        let mut owned = prepare_with_messages(&sample_messages());
+        // First payload begins right after the first message's 48B header.
+        let payload_index = PREPARE_SPLIT_POINT + MESSAGE_HEADER_SIZE;
+        owned.as_mut_slice()[payload_index] ^= 0xFF;
+        assert!(
+            matches!(
+                verify_received_send_messages(owned.as_slice()),
+                Err(IggyError::InvalidMessageChecksum(..))
+            ),
+            "a flipped payload byte must fail the per-message checksum",
+        );
+    }
+
+    #[test]
+    fn verify_received_send_messages_rejects_flipped_stored_checksum() {
+        let mut owned = prepare_with_messages(&sample_messages());
+        // The first message's stored checksum is the first 8 bytes of the blob.
+        owned.as_mut_slice()[PREPARE_SPLIT_POINT] ^= 0xFF;
+        assert!(
+            matches!(
+                verify_received_send_messages(owned.as_slice()),
+                Err(IggyError::InvalidMessageChecksum(..))
+            ),
+            "a flipped stored checksum must fail the per-message check",
+        );
     }
 
     #[test]
@@ -1372,14 +1381,14 @@ mod tests {
         body
     }
 
-    fn legacy_request_message(body: &[u8]) -> Message<RoutedRequestHeader> {
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+    fn legacy_request_message(body: &[u8]) -> Message<RequestHeader> {
+        let header_size = std::mem::size_of::<RequestHeader>();
         let total = header_size + body.len();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
         {
-            let header: &mut RoutedRequestHeader =
+            let header: &mut RequestHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid RoutedRequestHeader");
+                    .expect("zeroed bytes form a valid RequestHeader");
             header.command = Command2::Request;
             header.operation = Operation::SendMessages;
             header.client = 1;
@@ -1389,29 +1398,6 @@ mod tests {
         }
         buffer.as_mut_slice()[header_size..].copy_from_slice(body);
         Message::try_from(buffer).expect("legacy request message is valid")
-    }
-
-    #[test]
-    fn convert_request_message_rejects_empty_canonical_and_legacy_batches() {
-        let namespace = IggyNamespace::new(1, 1, 3);
-        let messages = IggyMessages2::with_capacity(0);
-        let canonical = SendMessages2Owned::from_messages(namespace, &messages)
-            .expect("build empty canonical batch");
-        let mut canonical_body = vec![0; canonical.header.total_size()];
-        canonical
-            .header
-            .encode_into(&mut canonical_body[..COMMAND_HEADER_SIZE]);
-        let legacy_body = legacy_send_messages_body(&messages);
-
-        for mode in [ChecksumMode::Compute, ChecksumMode::Skip] {
-            let canonical_result =
-                convert_request_message(namespace, legacy_request_message(&canonical_body), mode);
-            assert!(matches!(canonical_result, Err(IggyError::InvalidCommand)));
-
-            let legacy_result =
-                convert_request_message(namespace, legacy_request_message(&legacy_body), mode);
-            assert!(matches!(legacy_result, Err(IggyError::InvalidCommand)));
-        }
     }
 
     #[test]
@@ -1434,7 +1420,7 @@ mod tests {
         let legacy = legacy_request_message(&legacy_send_messages_body(&messages));
         let converted = convert_request_message(namespace, legacy, ChecksumMode::Compute)
             .expect("legacy body transcodes");
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let header_size = std::mem::size_of::<RequestHeader>();
         let actual_body = &converted.as_slice()[header_size..converted.header().size as usize];
 
         assert_eq!(
@@ -1461,7 +1447,7 @@ mod tests {
         let namespace = IggyNamespace::new(1, 1, 3);
         let messages = sample_messages();
         let body = legacy_send_messages_body(&messages);
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let header_size = std::mem::size_of::<RequestHeader>();
 
         let computed = convert_request_message(
             namespace,
@@ -1504,7 +1490,7 @@ mod tests {
         // batch and returns it unchanged. Every decode must succeed.
         let namespace = IggyNamespace::new(1, 1, 3);
         let messages = sample_messages();
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let header_size = std::mem::size_of::<RequestHeader>();
 
         let legacy = legacy_request_message(&legacy_send_messages_body(&messages));
         let canonical = convert_request_message(namespace, legacy, ChecksumMode::Compute)
@@ -1537,19 +1523,19 @@ mod tests {
     const TRAILING_JUNK_CASES: [&[u8]; 2] = [&[0xAA], &[0xFF; 64]];
 
     /// Canonical `SendMessages` request carrying `junk` past `batch_length`, with
-    /// `RoutedRequestHeader.size` inflated to cover it. `size` and `batch_length` are
+    /// `RequestHeader.size` inflated to cover it. `size` and `batch_length` are
     /// independent wire fields, so a non-conforming client can emit this.
-    fn canonical_request_with_trailing_bytes(junk: &[u8]) -> Message<RoutedRequestHeader> {
+    fn canonical_request_with_trailing_bytes(junk: &[u8]) -> Message<RequestHeader> {
         let namespace = IggyNamespace::new(1, 1, 3);
         let owned =
             SendMessages2Owned::from_messages(namespace, &sample_messages()).expect("build batch");
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let header_size = std::mem::size_of::<RequestHeader>();
         let total = header_size + owned.header.total_size() + junk.len();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
         {
-            let header: &mut RoutedRequestHeader =
+            let header: &mut RequestHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid RoutedRequestHeader");
+                    .expect("zeroed bytes form a valid RequestHeader");
             header.command = Command2::Request;
             header.operation = Operation::SendMessages;
             header.client = 1;
@@ -1567,7 +1553,8 @@ mod tests {
         Message::try_from(buffer).expect("request message is valid")
     }
 
-    /// A `Prepare` whose `size` covers `junk` past `batch_length`.
+    /// The replicated counterpart: a pre-stamp `Prepare` whose `size` covers
+    /// `junk` past `batch_length`.
     fn prepare_with_trailing_bytes(junk: &[u8]) -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
@@ -1625,11 +1612,18 @@ mod tests {
     }
 
     #[test]
-    fn decode_prepare_slice_rejects_trailing_bytes_past_batch_length() {
-        // Replica ingest must reject bytes beyond `batch_length` because no
-        // per-message checksum covers them.
+    fn verify_received_send_messages_rejects_trailing_bytes_past_batch_length() {
+        // Replica ingest boundary. The gate clamps the blob to `batch_length`
+        // before verifying, so without an exact-frame check a primary could plant
+        // bytes that no per-message checksum covers on every backup.
         for junk in TRAILING_JUNK_CASES {
             let owned = prepare_with_trailing_bytes(junk);
+            let result = verify_received_send_messages(owned.as_slice());
+            assert!(
+                matches!(result, Err(IggyError::InvalidCommand)),
+                "{} trailing bytes must fail the receive gate, got {result:?}",
+                junk.len(),
+            );
             assert!(
                 matches!(
                     decode_prepare_slice(owned.as_slice()),

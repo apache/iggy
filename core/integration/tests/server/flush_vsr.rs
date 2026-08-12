@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Flush contract against the server (vsr): the server has no on-demand flush
+//! Flush contract against server-ng (vsr): the server has no on-demand flush
 //! primitive, so `FLUSH_UNSAVED_BUFFER` must surface a typed
 //! `FeatureUnavailable` over the SDK rather than the non-replicated catch-all's
 //! empty-ok, which would fake a durability guarantee.
@@ -27,7 +27,7 @@
 use iggy::prelude::*;
 use integration::iggy_harness;
 
-// Partition ids are 0-based (CreateTopic assigns them from 0).
+// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 
 #[iggy_harness(

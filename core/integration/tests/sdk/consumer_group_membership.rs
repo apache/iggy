@@ -148,7 +148,7 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
 
 // End-to-end wire pin for the consumer-group join/leave error ladder. The
 // metadata STM unit tests pin the committed result codes; this pins that
-// the server actually emits them over the wire, so a client observes the same
+// server-ng actually emits them over the wire, so a client observes the same
 // codes the legacy server returns. Binary transports only: the HTTP client
 // has no join/leave (stateless sessions carry no member identity, the SDK
 // returns FeatureUnavailable client-side), so the ladder cannot run there.

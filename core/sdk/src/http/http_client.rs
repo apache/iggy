@@ -307,7 +307,7 @@ impl HttpClient {
     /// - Legacy server: one-shot. The presented token is revoked as it is
     ///   consumed, so a concurrent in-flight request still carrying the old
     ///   token may fail with 401.
-    /// - the server: stateless. The old token stays valid until its natural
+    /// - server-ng: stateless. The old token stays valid until its natural
     ///   expiry; refreshing never revokes it.
     pub async fn refresh_access_token(&self) -> Result<IdentityInfo, IggyError> {
         // Release the read guard before `set_token_from_identity` takes the

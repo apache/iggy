@@ -115,7 +115,7 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        // The server purge is eventually consistent: the partition reset (and
+        // server-ng purge is eventually consistent: the partition reset (and
         // its stats zeroing) runs in the reconciler after the metadata commit
         // the purge command awaited. Legacy is synchronous and satisfies this
         // on the first poll.

@@ -20,4 +20,5 @@ namespace Apache.Iggy.Utils;
 internal static class BufferSizes
 {
     internal const int INITIAL_BYTES_LENGTH = 4;
+    internal const int EXPECTED_RESPONSE_SIZE = 8;
 }

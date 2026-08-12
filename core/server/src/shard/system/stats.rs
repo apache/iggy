@@ -1,0 +1,120 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::shard::IggyShard;
+use crate::{SEMANTIC_VERSION, VERSION};
+use iggy_common::{IggyDuration, IggyError, Stats};
+use std::cell::RefCell;
+use sysinfo::System as SysinfoSystem;
+use system_stats::SystemProbe;
+
+thread_local! {
+    static SYSINFO: RefCell<Option<SysinfoSystem>> = const { RefCell::new(None) };
+}
+
+impl IggyShard {
+    pub async fn get_stats(&self) -> Result<Stats, IggyError> {
+        assert_eq!(self.id, 0, "GetStats should only be called on shard0");
+
+        let probe = SYSINFO.with_borrow_mut(|slot| {
+            let sys = slot.get_or_insert_with(SysinfoSystem::new);
+            SystemProbe::capture(sys)
+        });
+
+        let clients_count = self.client_manager.get_clients().len() as u32;
+        let hostname = sysinfo::System::host_name().unwrap_or("unknown_hostname".to_string());
+        let os_name = sysinfo::System::name().unwrap_or("unknown_os_name".to_string());
+        let os_version =
+            sysinfo::System::long_os_version().unwrap_or("unknown_os_version".to_string());
+        let kernel_version =
+            sysinfo::System::kernel_version().unwrap_or("unknown_kernel_version".to_string());
+
+        let mut stats = Stats {
+            process_id: probe.process_id,
+            cpu_usage: probe.cpu_usage,
+            total_cpu_usage: probe.total_cpu_usage,
+            memory_usage: probe.memory_usage.into(),
+            total_memory: probe.total_memory.into(),
+            available_memory: probe.available_memory.into(),
+            run_time: IggyDuration::new_from_secs(probe.run_time_secs),
+            start_time: IggyDuration::new_from_secs(probe.start_time_secs)
+                .as_micros()
+                .into(),
+            read_bytes: probe.read_bytes.into(),
+            written_bytes: probe.written_bytes.into(),
+            threads_count: probe.threads_count,
+            clients_count,
+            hostname,
+            os_name,
+            os_version,
+            kernel_version,
+            iggy_server_version: VERSION.to_owned(),
+            iggy_server_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
+            ..Default::default()
+        };
+
+        let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
+            self.metadata.with_metadata(|m| {
+                let mut topics = 0u32;
+                let mut partitions = 0u32;
+                let mut cg = 0u32;
+                let ids: Vec<_> = m.streams.iter().map(|(k, _)| k).collect();
+                for (_, stream) in m.streams.iter() {
+                    topics += stream.topics.len() as u32;
+                    for (_, topic) in stream.topics.iter() {
+                        partitions += topic.partitions.len() as u32;
+                        cg += topic.consumer_groups.len() as u32;
+                    }
+                }
+                (m.streams.len() as u32, topics, partitions, cg, ids)
+            });
+
+        stats.streams_count = streams_count;
+        stats.topics_count = topics_count;
+        stats.partitions_count = partitions_count;
+        stats.consumer_groups_count = consumer_groups_count;
+
+        for stream_id in stream_ids {
+            if let Some(stream_stat) = self.metadata.get_stream_stats(stream_id) {
+                stats.messages_count += stream_stat.messages_count_inconsistent();
+                stats.segments_count += stream_stat.segments_count_inconsistent();
+                stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
+            }
+        }
+
+        match fs2::available_space(&self.config.system.path) {
+            Ok(space) => stats.free_disk_space = space.into(),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get available disk space for '{}': {err}",
+                    self.config.system.path
+                );
+            }
+        }
+        match fs2::total_space(&self.config.system.path) {
+            Ok(space) => stats.total_disk_space = space.into(),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get total disk space for '{}': {err}",
+                    self.config.system.path
+                );
+            }
+        }
+
+        Ok(stats)
+    }
+}

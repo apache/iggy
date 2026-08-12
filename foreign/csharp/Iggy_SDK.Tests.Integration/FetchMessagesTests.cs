@@ -23,7 +23,6 @@ using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -91,23 +90,23 @@ public class FetchMessagesTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PollMessages_InvalidTopic_Should_Throw_NotFound(Protocol protocol)
+    public async Task PollMessages_InvalidTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
         var (client, streamName) = await CreateStreamWithMessages(protocol);
 
-        // A missing topic is an addressing error, not an empty partition:
-        // HTTP answers 404, TCP the typed topic-not-found rejection.
+        var invalidFetchRequest = new MessageFetchRequest
+        {
+            Count = 10,
+            AutoCommit = true,
+            Consumer = Consumer.New(1),
+            PartitionId = 0,
+            PollingStrategy = PollingStrategy.Next(),
+            StreamId = Identifier.String(streamName),
+            TopicId = Identifier.Numeric(2137)
+        };
+
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            client.PollMessagesAsync(new MessageFetchRequest
-            {
-                Count = 10,
-                AutoCommit = true,
-                Consumer = Consumer.New(1),
-                PartitionId = 0,
-                PollingStrategy = PollingStrategy.Next(),
-                StreamId = Identifier.String(streamName),
-                TopicId = Identifier.Numeric(2137)
-            }));
+            client.PollMessagesAsync(invalidFetchRequest));
     }
 
     [Test]

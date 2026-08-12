@@ -21,7 +21,7 @@
 //! (fabricated stream). `NameAlreadyExists` (rename onto a live name) not
 //! targeted, but the server still classifies it on a race.
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -63,7 +63,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.update_stream(&input.stream, &input.new_name)
 }
 

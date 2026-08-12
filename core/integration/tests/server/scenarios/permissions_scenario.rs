@@ -69,7 +69,7 @@ pub async fn run(harness: &TestHarness) {
     // Missing resource behavior tests
     test_missing_resource_behavior(harness, &root_client).await;
 
-    // RBAC surface ported from the raw-HTTP the server suite (server::http_rbac),
+    // RBAC surface ported from the raw-HTTP server-ng suite (server::http_rbac),
     // asserting the exact typed IggyError over every transport.
     test_consumer_offset_permissions(harness, &root_client).await;
     test_change_password_reply_path(harness, &root_client).await;
@@ -2474,7 +2474,7 @@ async fn test_consumer_offset_permissions(harness: &TestHarness, root_client: &I
         IggyError::Unauthorized,
         "no perms: delete_consumer_offset",
     );
-    // GET is enumeration-safe: legacy answers Ok(None), the server denies typed.
+    // GET is enumeration-safe: legacy answers Ok(None), server-ng denies typed.
     assert_unauthorized(
         client
             .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(0))

@@ -31,7 +31,7 @@ func EncodeRequest(session *Session, code uint32, payload []byte) ([]byte, error
 }
 
 // StampRequestHeader writes the request header into the first HeaderSize bytes
-// of frame, deriving sequencing from the command code and the session state.
+// of frame, deriving routing and sequencing from the payload that follows it.
 // Callers that encode a payload into a pooled buffer reserve the prologue up
 // front and stamp it here, which keeps the frame a single allocation.
 //
@@ -40,17 +40,25 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	if len(frame) > MaxFrameSize {
 		return ierror.ErrInvalidConfiguration
 	}
+	payload := frame[HeaderSize:]
 	operation := OperationForCode(code)
 	replicated := operation != OperationRegister && operation != OperationNonReplicated
 
-	// A replicated operation needs a bound session; refusing it here leaves
-	// the request-id counter untouched.
+	// A replicated operation needs a bound session. Checking that ahead of the
+	// payload means an unauthenticated caller hears about the missing session
+	// rather than about the request it could not have sent anyway.
 	if replicated && !session.Bound() {
 		return ierror.ErrUnauthenticated
 	}
 
+	// Namespace derivation can fail on a malformed payload. Run it before
+	// taking a request id so a local failure leaves the counter untouched.
+	namespace, err := NamespaceForRequest(code, payload, operation)
+	if err != nil {
+		return err
+	}
+
 	var request, sessionID uint64
-	var err error
 	switch operation {
 	case OperationRegister:
 		request = session.BeginRegister()
@@ -77,6 +85,7 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		Client:    session.ClientID(),
 		Request:   request,
 		Operation: operation,
+		Namespace: namespace,
 		Session:   sessionID,
 	}
 	if operation == OperationNonReplicated {

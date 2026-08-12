@@ -24,7 +24,6 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.message.SendMessagesResponse;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -117,7 +116,7 @@ class AsyncTcpMessageSendTest {
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<SendMessagesResponse> sendFuture =
+        CompletableFuture<Void> sendFuture =
                 client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
 
         sendFuture.get();
@@ -143,7 +142,7 @@ class AsyncTcpMessageSendTest {
             messages.add(Message.of(content));
         }
 
-        CompletableFuture<SendMessagesResponse> sendFuture =
+        CompletableFuture<Void> sendFuture =
                 client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
 
@@ -167,7 +166,7 @@ class AsyncTcpMessageSendTest {
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<SendMessagesResponse> sendFuture =
+        CompletableFuture<Void> sendFuture =
                 client.messages().sendMessages(streamId, topicId, Partitioning.partitionId(targetPartition), messages);
         sendFuture.get();
 
@@ -191,7 +190,7 @@ class AsyncTcpMessageSendTest {
         messages.add(message);
 
         String messageKey = "test-key-123";
-        CompletableFuture<SendMessagesResponse> sendFuture =
+        CompletableFuture<Void> sendFuture =
                 client.messages().sendMessages(streamId, topicId, Partitioning.messagesKey(messageKey), messages);
         sendFuture.get();
 
@@ -215,7 +214,7 @@ class AsyncTcpMessageSendTest {
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<SendMessagesResponse> sendFuture =
+        CompletableFuture<Void> sendFuture =
                 client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
 
@@ -233,7 +232,7 @@ class AsyncTcpMessageSendTest {
         TopicId topicId = TopicId.of("lines");
 
         int parallelRequests = 5;
-        List<CompletableFuture<SendMessagesResponse>> futures = new ArrayList<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         for (int i = 0; i < parallelRequests; i++) {
             String content = "Parallel message #" + i;
@@ -241,7 +240,7 @@ class AsyncTcpMessageSendTest {
             List<Message> messages = new ArrayList<>();
             messages.add(message);
 
-            CompletableFuture<SendMessagesResponse> future =
+            CompletableFuture<Void> future =
                     client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
             futures.add(future);
         }
@@ -270,7 +269,7 @@ class AsyncTcpMessageSendTest {
         }
 
         long startTime = System.currentTimeMillis();
-        CompletableFuture<SendMessagesResponse> sendFuture =
+        CompletableFuture<Void> sendFuture =
                 client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
         long duration = System.currentTimeMillis() - startTime;

@@ -86,10 +86,7 @@ public interface IIggySystem
     ///     Sends a ping request to the server to verify connectivity.
     /// </summary>
     /// <remarks>
-    ///     This is a simple health check operation that can be used to verify the connection is active. On the
-    ///     VSR wire protocol it also re-syncs the assignment of every consumer group this client has joined, so
-    ///     it costs one extra round trip per joined group. The SDK never calls it on its own: an application
-    ///     that wants assignments refreshed has to ping on its own cadence.
+    ///     This is a simple health check operation that can be used to verify the connection is active.
     /// </remarks>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>

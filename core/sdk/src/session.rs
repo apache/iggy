@@ -24,7 +24,7 @@
 //! The SDK tracks the `(client_id, session)` pair and a monotonically
 //! increasing `request_id` counter. These values populate the consensus
 //! headers (`RequestHeader.client`, `.session`, `.request`) when the
-//! transport sends requests through the server.
+//! transport sends requests through server-ng.
 //!
 //! ## Lifecycle
 //!

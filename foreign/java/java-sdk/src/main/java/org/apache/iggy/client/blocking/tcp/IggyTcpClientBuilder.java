@@ -126,6 +126,17 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
+     * Sets the connection pool size.
+     *
+     * @param connectionPoolSize the size of the connection pool
+     * @return this builder
+     */
+    public IggyTcpClientBuilder connectionPoolSize(Integer connectionPoolSize) {
+        asyncBuilder.connectionPoolSize(connectionPoolSize);
+        return this;
+    }
+
+    /**
      * Sets the retry policy.
      *
      * @param retryPolicy the retry policy to use

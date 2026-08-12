@@ -19,10 +19,6 @@
 # Activated by: ./scripts/run-bdd-tests.sh <sdk> basic_messaging
 #               ./scripts/run-bdd-tests.sh <sdk> leader_redirection
 #               ./scripts/run-bdd-tests.sh <sdk> all
-#
-# Each run starts from a new container, so `--fresh` would be redundant; root
-# credentials arrive through IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD rather
-# than through `--with-default-root-credentials`.
 
 x-server-bdd-deps: &server-bdd-deps
   depends_on:
@@ -44,7 +40,7 @@ services:
         PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
         LIBC: glibc
         PROFILE: debug
-    command: []
+    command: [ "--fresh", "--with-default-root-credentials" ]
     cap_add:
       - SYS_NICE
     security_opt:
@@ -61,8 +57,6 @@ services:
       start_period: 2s
     environment:
       - RUST_LOG=info
-      - IGGY_ROOT_USERNAME=iggy
-      - IGGY_ROOT_PASSWORD=iggy
       - IGGY_SYSTEM_PATH=local_data
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000

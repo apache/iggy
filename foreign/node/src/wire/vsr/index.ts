@@ -21,6 +21,7 @@ import type { CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
 import { HEADER_SIZE, encodeRequestHeader } from './header.js';
+import { namespaceForRequest } from './namespace.js';
 import {
   Operation,
   isPartition,
@@ -65,6 +66,7 @@ export class VsrSession {
     const operation = registerCommand(command)
       ? Operation.Register
       : operationForCode(command);
+    const namespace = namespaceForRequest(command, payload, operation);
     const size = HEADER_SIZE + payload.length;
     if (size > MAX_U32)
       throw new RangeError('VSR request exceeds the u32 frame-size limit');
@@ -92,6 +94,7 @@ export class VsrSession {
       client: this.state.clientId,
       request,
       operation,
+      namespace,
       session,
       nonReplicatedCode:
         operation === Operation.NonReplicated ? command : undefined,

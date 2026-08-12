@@ -124,12 +124,14 @@ runs:
       if: inputs.task == 'test'
       run: |
         # test_tls.py spawns the server in a container; build it from the
-        # same binaries the plain-TCP tests run against.
-        cargo build --locked --bin iggy-server --bin iggy
+        # same vsr binaries the plain-TCP tests run against.
+        # TODO(hubcio): change to iggy-server once legacy server is removed
+        # (core/server has VSR support)
+        cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
         docker build \
-          -f core/server/Dockerfile \
+          -f core/server-ng/Dockerfile \
           --target runtime-prebuilt \
-          --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+          --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
           --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
           -t iggy-server:local .
       shell: bash
@@ -139,7 +141,10 @@ runs:
       id: iggy
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        # TODO(hubcio): change to iggy-server once legacy server is removed
+        # (core/server has VSR support)
+        cargo-bin: iggy-server-ng
+        cargo-features: vsr
 
     - name: Run Python integration tests
       if: inputs.task == 'test'

@@ -31,11 +31,7 @@ use test_case::test_matrix;
 #[tokio::test]
 #[parallel]
 async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryption: bool) {
-    // Restart scenarios run single-node: restarting a node in a multi-node
-    // cluster trips a known partitions-plane view-change stall, tracked
-    // separately.
     let mut harness = TestHarness::builder()
-        .cluster_nodes(1)
         .server(build_server_config(encryption))
         .build()
         .unwrap();
@@ -97,9 +93,20 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); the
-    // eager-flush envs in `build_server_config` make every committed batch hit
-    // disk instead.
+    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
+    // the eager-flush envs in `build_server_config` make every committed
+    // batch hit disk instead.
+    #[cfg(not(feature = "vsr"))]
+    client
+        .flush_unsaved_buffer(
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Verify on-disk encryption of headers and payload
@@ -244,9 +251,20 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); the
-    // eager-flush envs in `build_server_config` make every committed batch hit
-    // disk instead.
+    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
+    // the eager-flush envs in `build_server_config` make every committed
+    // batch hit disk instead.
+    #[cfg(not(feature = "vsr"))]
+    client
+        .flush_unsaved_buffer(
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let polled = client
@@ -480,7 +498,7 @@ fn encryption_disabled() -> bool {
 fn build_server_config(encryption: bool) -> TestServerConfig {
     let mut extra_envs = HashMap::new();
 
-    // The server flushes on the journal thresholds (no flush primitive), so
+    // server-ng flushes on the journal thresholds (no flush primitive), so
     // force every committed batch straight to disk for the on-disk asserts.
     extra_envs.insert(
         "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),

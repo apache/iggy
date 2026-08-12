@@ -267,7 +267,7 @@ impl Users {
             "root username length {length} outside {MIN_USERNAME_LENGTH}..={MAX_USERNAME_LENGTH}; fix IGGY_ROOT_USERNAME"
         );
 
-        // Boot-only invariant: the server calls this before listeners and
+        // Boot-only invariant: server-ng calls this before listeners and
         // consensus traffic start, on shard 0 initialization. The read/apply
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
@@ -571,7 +571,7 @@ impl StateHandler for ChangePasswordRequest {
         };
 
         // An empty `new_password` is the primary's signal that the caller's
-        // current password did not match (see the server
+        // current password did not match (see server-ng
         // `verify_and_rewrite_change_password`): the accept path always
         // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
         // here (rather than denying pre-consensus) commits the op as a no-op,

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Legacy login codes against the server (vsr). The server authenticates only
+//! Legacy login codes against server-ng (vsr). server-ng authenticates only
 //! through the Register handshake, so the pre-register `LOGIN_USER` (38) and
 //! `LOGIN_WITH_PERSONAL_ACCESS_TOKEN` (44) codes -- which the vsr SDK never
 //! emits (its typed login methods send the register codes, its raw path
@@ -27,9 +27,12 @@
 //! TCP socket: a header-only non-replicated frame carrying the code in the
 //! reserved command slot.
 
+#![cfg(feature = "vsr")]
+
 use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::codes::{LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE};
 use iggy_binary_protocol::consensus::{Command2, Operation, RequestHeader};
+use iggy_binary_protocol::namespace::METADATA_CONSENSUS_NAMESPACE;
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use std::mem::offset_of;
@@ -69,6 +72,7 @@ async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
         client: 0xC0FFEE,
         session: 0,
         request: 0,
+        namespace: METADATA_CONSENSUS_NAMESPACE,
         ..Default::default()
     };
     // A non-replicated command code travels in the first 4 reserved bytes.

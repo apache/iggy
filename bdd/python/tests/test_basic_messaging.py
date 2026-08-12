@@ -64,7 +64,8 @@ def authenticated_root_user(context):
 @given("I have no streams in the system")
 def no_streams_in_system(context):
     """Ensure no streams exist in the system"""
-    # Every run gets a new server container, so the system starts empty
+    # With --fresh flag on server, this should already be clean
+    # Just verify by attempting to get a stream that shouldn't exist
     pass
 
 

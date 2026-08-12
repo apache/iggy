@@ -24,34 +24,43 @@ use crate::{
     Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
     PollingStrategy, SendMessagesResponse,
 };
+#[cfg(feature = "vsr")]
 use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
 use bytes::BytesMut;
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
 use iggy_binary_protocol::codes::{
     FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
 };
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 
 /// Max attempts to resolve a fenced consumer-group poll: one re-sync after the
 /// coordinator rejects a stale assignment, then retry once.
+#[cfg(feature = "vsr")]
 const GROUP_POLL_MAX_ATTEMPTS: usize = 2;
 
+#[cfg(feature = "vsr")]
 fn group_cache_key(stream_id: &Identifier, topic_id: &Identifier, group_id: &Identifier) -> String {
     format!("{stream_id}|{topic_id}|{group_id}")
 }
 
+#[cfg(feature = "vsr")]
 fn topic_cache_key(stream_id: &Identifier, topic_id: &Identifier) -> String {
     format!("{stream_id}|{topic_id}")
 }
 
 /// Sync the requesting member's assignment from the coordinator into the
 /// transport cache. An empty reply means the client is not a member.
+#[cfg(feature = "vsr")]
 async fn sync_group_assignment<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -97,6 +106,7 @@ async fn sync_group_assignment<B: BinaryClient>(
 /// driven so a member picks up a widened assignment (e.g. after a
 /// partition-count change) without first hitting an ownership fence. A failed
 /// per-group sync is logged and skipped so one bad group can't stall the rest.
+#[cfg(feature = "vsr")]
 pub(crate) async fn refresh_group_assignments<B: BinaryClient>(client: &B) {
     for (stream_id, topic_id, group_id) in client.consumer_group_state().registered_groups() {
         if let Err(error) = sync_group_assignment(client, &stream_id, &topic_id, &group_id).await {
@@ -109,6 +119,7 @@ pub(crate) async fn refresh_group_assignments<B: BinaryClient>(client: &B) {
 
 /// Resolve (and cache) the topic's partition count for client-side produce
 /// partitioning.
+#[cfg(feature = "vsr")]
 async fn topic_partition_count<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -129,6 +140,7 @@ async fn topic_partition_count<B: BinaryClient>(
 
 /// Resolve `Balanced` / `MessagesKey` to an explicit `PartitionId` client-side
 /// (the VSR broker only routes explicit partitions, matching Kafka).
+#[cfg(feature = "vsr")]
 async fn resolve_partitioning<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -168,6 +180,7 @@ async fn resolve_partitioning<B: BinaryClient>(
 /// Poll a consumer group: select one of the member's assigned partitions
 /// (round-robin) and send an explicit-partition poll. A coordinator fence
 /// rejection (stale assignment after a rebalance) triggers one re-sync + retry.
+#[cfg(feature = "vsr")]
 async fn poll_group_messages<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -288,6 +301,7 @@ impl<B: BinaryClient> MessageClient for B {
         // VSR: a consumer-group poll without an explicit partition is resolved
         // client-side from the member's cached assignment (the broker routes
         // explicit partitions only).
+        #[cfg(feature = "vsr")]
         if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
             return poll_group_messages(
                 self,
@@ -326,7 +340,9 @@ impl<B: BinaryClient> MessageClient for B {
         // VSR: resolve Balanced/MessagesKey to an explicit partition client-side.
         // An explicit `PartitionId` needs no resolution, so borrow the input
         // directly on that fast path instead of cloning its `value: Vec<u8>`.
+        #[cfg(feature = "vsr")]
         let resolved_partitioning;
+        #[cfg(feature = "vsr")]
         let partitioning = if partitioning.kind == PartitioningKind::PartitionId {
             partitioning
         } else {

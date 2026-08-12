@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -53,8 +54,8 @@ public class UsersTests
         var username = $"dup-{Guid.NewGuid():N}"[..20];
         await client.CreateUserAsync(username, "test1", UserStatus.Active);
 
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.CreateUserAsync(username, "test1",
-            UserStatus.Active));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            client.CreateUserAsync(username, "test1", UserStatus.Active));
     }
 
     [Test]
@@ -168,11 +169,10 @@ public class UsersTests
         var username = $"chpw-{Guid.NewGuid():N}"[..20];
         await client.CreateUserAsync(username, "old_password", UserStatus.Active);
 
-        await Should.NotThrowAsync(client.ChangePasswordAsync(Identifier.String(username), "old_password",
-            "new_password"));
+        await Should.NotThrowAsync(client.ChangePasswordAsync(Identifier.String(username), "old_password", "new_password"));
 
         // Verify password was actually changed by logging in with the new credentials
-        var loginClient = await Fixture.CreateClient(protocol, true);
+        var loginClient = await Fixture.CreateClient(protocol);
         var loginResponse = await loginClient.LoginUserAsync(username, "new_password");
         loginResponse.ShouldNotBeNull();
         loginResponse.UserId.ShouldBeGreaterThan(0);
@@ -187,8 +187,8 @@ public class UsersTests
         var username = $"chpwf-{Guid.NewGuid():N}"[..20];
         await client.CreateUserAsync(username, "correct_password", UserStatus.Active);
 
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.ChangePasswordAsync(Identifier.String(username),
-            "wrong_password", "new_password"));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            client.ChangePasswordAsync(Identifier.String(username), "wrong_password", "new_password"));
     }
 
     [Test]
@@ -200,7 +200,7 @@ public class UsersTests
         var username = $"login-{Guid.NewGuid():N}"[..20];
         await client.CreateUserAsync(username, "login_password", UserStatus.Active);
 
-        var loginClient = await Fixture.CreateClient(protocol, true);
+        var loginClient = await Fixture.CreateClient(protocol);
         var response = await loginClient.LoginUserAsync(username, "login_password");
 
         response.ShouldNotBeNull();

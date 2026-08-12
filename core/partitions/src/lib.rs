@@ -25,7 +25,7 @@ mod iggy_partitions;
 mod journal;
 mod log;
 mod messages_writer;
-pub mod offset_storage;
+mod offset_storage;
 mod poll_plan;
 mod segment;
 pub mod state_transfer;

@@ -34,6 +34,7 @@ ignored = ["cfg_aliases", "rust-s3"]
 ci-qemu = []
 default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
+vsr = ["dep:consensus", "dep:journal", "iggy/vsr"]
 
 [dependencies]
 assert_cmd = { workspace = true }
@@ -45,9 +46,9 @@ bytes = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
-# Decodes a metadata replica's durable `VsrState` off disk in the superblock
-# recovery test.
-consensus = { workspace = true }
+# vsr-only: decode a metadata replica's durable `VsrState` off disk in the
+# superblock recovery test.
+consensus = { workspace = true, optional = true }
 ctor = { workspace = true }
 deltalake = { workspace = true }
 dtor = { workspace = true }
@@ -63,9 +64,9 @@ iggy_common = { workspace = true }
 # `build_label` function — keeping the test and production label format in lock-step.
 iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
-# Locates and decodes the on-disk superblock slot files in the recovery test
-# (`SLOT_FILE_NAMES`, `decode_slots`).
-journal = { workspace = true }
+# vsr-only: locate and decode the on-disk superblock slot files in the recovery
+# test (`SLOT_FILE_NAMES`, `decode_slots`).
+journal = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
 lazy_static = { workspace = true }
@@ -88,6 +89,7 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
+server = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }

@@ -21,7 +21,6 @@ package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
-import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -66,10 +65,5 @@ final class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     @Override
     public void leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
         FutureUtil.resolve(delegate.leaveConsumerGroup(streamId, topicId, groupId));
-    }
-
-    @Override
-    public Optional<ConsumerGroupAssignment> syncConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        return FutureUtil.resolve(delegate.syncConsumerGroup(streamId, topicId, groupId));
     }
 }

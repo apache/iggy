@@ -22,7 +22,7 @@
 //! `ConsumerGroupNotFound` (a live stream/topic with a fabricated group
 //! name), mirroring the legacy resolution ladder.
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -86,7 +86,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
     client.delete_consumer_group(&input.stream, &input.topic, &input.group)
 }
 

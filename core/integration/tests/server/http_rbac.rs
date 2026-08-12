@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! HTTP wire-contract residue for the server's shard-0 REST listener. The RBAC
+//! HTTP wire-contract residue for server-ng's shard-0 REST listener. The RBAC
 //! authorization matrix itself (who may do what, over every transport) lives in
 //! the cross-transport `permissions_scenario` suite; this file keeps only what
 //! the SDK abstracts away and only raw HTTP can show:
@@ -42,7 +42,7 @@ use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
 
-// Partition ids are 0-based (CreateTopic assigns them from 0).
+// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 // Explicit consumer id in the poll query (`Consumer::default()` is numeric 0).
 const CONSUMER_ID: u32 = 1;

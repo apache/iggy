@@ -15,25 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Consumer-group partition assignment specs.
-//!
-//! # Why most specs here ask for a 60s server heartbeat
-//!
-//! `run_heartbeat_verifier` evicts a connection idle past `1.2 x
-//! heartbeat.interval`, and a harness client NEVER pings on its own: the SDK's
-//! pinger is spawned by `IggyClient::connect`, which the harness builder does
-//! not call. A spec that joins a member and then spends its setup elsewhere
-//! therefore races its own subject being reaped, and the failure surfaces as a
-//! short `members_count` or a `StaleClient` rather than as anything about
-//! assignment. At the former 2s interval the 16-consumer spec sat 2.27s into a
-//! 2.4s deadline over quic -- under 5% margin.
-//!
-//! These specs assert ASSIGNMENT, not liveness, so the deadline is pushed out
-//! of reach instead of being raced. The two that genuinely drive eviction keep
-//! the short interval and are marked as such: they build members with
-//! [`create_stale_tcp_client`], whose 1h client-side heartbeat means only the
-//! server's verifier can ever remove them.
-
 use iggy::prelude::*;
 use integration::iggy_harness;
 use std::collections::HashSet;
@@ -79,8 +60,6 @@ async fn create_tcp_client(server_addr: &str) -> IggyClient {
 
 #[iggy_harness(server(
     heartbeat.enabled = true,
-    // Deliberately short: this spec drives the server's eviction path (see the
-    // module note), so the verifier must be able to reap a stale member.
     heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
@@ -277,7 +256,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -355,7 +334,7 @@ async fn should_not_reshuffle_partitions_when_new_member_joins(harness: &TestHar
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -437,7 +416,7 @@ async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -597,7 +576,7 @@ async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -745,7 +724,7 @@ async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harn
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -882,7 +861,7 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1064,7 +1043,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1185,7 +1164,7 @@ async fn should_split_evenly_when_consumer_joins_after_partitions_added(harness:
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1286,7 +1265,7 @@ async fn should_not_duplicate_messages_when_partitions_added_during_polling(harn
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1418,7 +1397,7 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1556,7 +1535,7 @@ async fn should_handle_rapid_partition_changes_with_active_consumers(harness: &T
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1630,7 +1609,7 @@ async fn should_rebalance_after_adding_partitions(harness: &TestHarness) {
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1718,7 +1697,7 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -1909,8 +1888,6 @@ async fn should_timeout_revocation(harness: &TestHarness) {
 
 #[iggy_harness(server(
     heartbeat.enabled = true,
-    // Deliberately short: this spec drives the server's eviction path (see the
-    // module note), so the verifier must be able to reap a stale member.
     heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
@@ -2332,7 +2309,7 @@ fn assert_balanced_partition_distribution(cg: &ConsumerGroupDetails, expected_to
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -2441,7 +2418,7 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -2513,7 +2490,7 @@ async fn should_complete_revocation_on_auto_commit(harness: &TestHarness) {
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -2571,7 +2548,7 @@ async fn should_transfer_never_polled_partitions_immediately(harness: &TestHarne
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -2663,7 +2640,7 @@ async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &T
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -2821,7 +2798,7 @@ async fn should_not_produce_duplicate_messages_with_sequential_consumer_joins(
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -2930,7 +2907,7 @@ async fn should_wait_for_manual_commit_before_completing_revocation(harness: &Te
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3023,7 +3000,7 @@ async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3123,7 +3100,7 @@ async fn should_distribute_partitions_evenly_with_concurrent_joins(harness: &Tes
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3229,7 +3206,7 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3360,7 +3337,7 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3453,7 +3430,7 @@ async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &Te
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3520,7 +3497,7 @@ async fn should_distribute_excess_evenly_when_multiple_idle_members_join(harness
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3585,7 +3562,7 @@ async fn should_distribute_remainder_fairly_with_uneven_ratio(harness: &TestHarn
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3646,7 +3623,7 @@ async fn should_collect_excess_from_multiple_overassigned_members(harness: &Test
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]
@@ -3701,7 +3678,7 @@ async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHar
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.interval = "2s",
     tcp.socket.override_defaults = true,
     tcp.socket.nodelay = true
 ))]

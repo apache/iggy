@@ -23,6 +23,7 @@ import type { RawClient } from '../client/client.type.js';
 import { COMMAND_CODE } from './command.code.js';
 
 const mockRawClient = (): RawClient => ({
+  protocol: 'classic',
   sendCommand: async () => {
     throw new Error('sendCommand should not be called by the session-control guard');
   },

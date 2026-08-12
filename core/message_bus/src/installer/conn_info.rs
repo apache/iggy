@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Per-client transport metadata exposed to the caller (`the server`).
+//! Per-client transport metadata exposed to the caller (`server-ng`).
 //!
 //! Constructed by the listener / install path on shard 0 with whatever
 //! is known at accept time (`client_id`, `peer_addr`, `transport`) and

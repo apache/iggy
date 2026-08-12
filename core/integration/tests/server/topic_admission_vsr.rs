@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Topic admission and echo semantics against the server (vsr). Create bounds
+//! Topic admission and echo semantics against server-ng (vsr). Create bounds
 //! must be rejected with typed errors before consensus: partitions count above
 //! `MAX_PARTITIONS_PER_REQUEST` denies with `TooManyPartitions` (for create
 //! topic, create partitions and delete partitions alike); a custom
@@ -23,10 +23,8 @@
 //! `InvalidTopicSize`; `ServerDefault` and `Unlimited` sizes pass. Update
 //! stores `max_topic_size` and `message_expiry` verbatim and gets echo the
 //! stored value (never the node default frozen at update time), matching
-//! legacy wire behavior. Deleting more partitions than the topic has rejects
-//! with `InvalidPartitionsCount` as a committed result instead of silently
-//! acking a no-op. Listing topics of a missing stream replies with an empty
-//! list, as the legacy server does.
+//! legacy wire behavior. Listing topics of a missing stream replies with an
+//! empty list, as the legacy server does.
 
 use std::str::FromStr;
 
@@ -253,69 +251,6 @@ async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
     assert_eq!(
         topic.partitions_count, 3,
         "the in-bounds add lands after the oversized denies"
-    );
-}
-
-#[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
-)]
-async fn given_over_count_when_deleting_partitions_should_reject_invalid_partitions_count(
-    harness: &TestHarness,
-) {
-    let client = harness.tcp_root_client().await.expect("tcp root client");
-    client
-        .create_stream("over-count-stream")
-        .await
-        .expect("create stream");
-    let stream_id = Identifier::from_str_value("over-count-stream").expect("stream identifier");
-    create_topic_with(
-        &client,
-        &stream_id,
-        "over-count-topic",
-        3,
-        MaxTopicSize::ServerDefault,
-    )
-    .await
-    .expect("create topic");
-    let topic_id = Identifier::from_str_value("over-count-topic").expect("topic identifier");
-
-    // Deleting more partitions than the topic has must reject with the legacy
-    // typed error, not silently no-op and ack.
-    let invalid_count = IggyError::InvalidPartitionsCount.as_code();
-    let result = client.delete_partitions(&stream_id, &topic_id, 4).await;
-    assert!(
-        matches!(&result, Err(error) if error.as_code() == invalid_count),
-        "deleting 4 partitions of a 3-partition topic must deny with \
-         InvalidPartitionsCount, got {result:?}"
-    );
-    let topic = client
-        .get_topic(&stream_id, &topic_id)
-        .await
-        .expect("get topic")
-        .expect("topic exists");
-    assert_eq!(
-        topic.partitions_count, 3,
-        "the rejected over-count delete must not remove any partition"
-    );
-
-    client
-        .delete_partitions(&stream_id, &topic_id, 3)
-        .await
-        .expect("deleting exactly the topic's partition count is accepted");
-    let topic = client
-        .get_topic(&stream_id, &topic_id)
-        .await
-        .expect("get topic")
-        .expect("topic exists");
-    assert_eq!(topic.partitions_count, 0, "all partitions are gone");
-
-    // Same rejection once the topic is already empty (any count exceeds 0).
-    let result = client.delete_partitions(&stream_id, &topic_id, 1).await;
-    assert!(
-        matches!(&result, Err(error) if error.as_code() == invalid_count),
-        "deleting from a zero-partition topic must deny with \
-         InvalidPartitionsCount, got {result:?}"
     );
 }
 

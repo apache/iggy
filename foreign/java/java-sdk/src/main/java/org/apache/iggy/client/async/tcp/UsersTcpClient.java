@@ -41,22 +41,21 @@ import java.util.function.Supplier;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
- * Async TCP implementation of users client. Login discovers the active
- * cluster leader before sending the VSR Register operation.
+ * Async TCP implementation of users client.
  */
 public class UsersTcpClient implements UsersClient {
     private static final Logger log = LoggerFactory.getLogger(UsersTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
-    private final LoginRoutingHook routingHook;
+    private final LoginRedirectionHook redirectionHook;
 
     public UsersTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
-        this(connectionSupplier, LoginRoutingHook.NONE);
+        this(connectionSupplier, LoginRedirectionHook.NONE);
     }
 
-    UsersTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, LoginRoutingHook routingHook) {
+    UsersTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, LoginRedirectionHook redirectionHook) {
         this.connectionSupplier = connectionSupplier;
-        this.routingHook = routingHook;
+        this.redirectionHook = redirectionHook;
     }
 
     private AsyncTcpConnection connection() {
@@ -146,7 +145,9 @@ public class UsersTcpClient implements UsersClient {
 
     @Override
     public CompletableFuture<IdentityInfo> login(String username, String password) {
-        return routingHook.loginOnLeader(() -> loginWithoutRedirect(username, password));
+        return loginWithoutRedirect(username, password).thenCompose(identity -> redirectionHook
+                .afterLogin(() -> loginWithoutRedirect(username, password))
+                .thenApply(redirectedIdentity -> redirectedIdentity != null ? redirectedIdentity : identity));
     }
 
     private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password) {

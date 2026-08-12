@@ -32,6 +32,8 @@
 //! functional assert (post-restart continuation commits cluster-wide) rides
 //! on top.
 
+#![cfg(feature = "vsr")]
+
 use super::client_table_restart::{
     commit_request, create_stream_payload, register, resume_request, tcp_addr, tcp_addrs,
 };

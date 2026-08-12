@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
@@ -69,23 +68,5 @@ public class IggyConsumerBuilderTests
             .Build();
 
         Assert.NotNull(consumer);
-    }
-
-    [Fact]
-    public void TypedBuild_OverTcp_CreatesTheClient()
-    {
-        IggyConsumerBuilder<string> builder = IggyConsumerBuilder<string>
-            .Create(StreamId, TopicId, Consumer.New(1), new StringDeserializer());
-        builder.WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
-
-        Assert.NotNull(builder.Build());
-    }
-
-    private sealed class StringDeserializer : IDeserializer<string>
-    {
-        public string Deserialize(ReadOnlyMemory<byte> data)
-        {
-            return Encoding.UTF8.GetString(data.Span);
-        }
     }
 }

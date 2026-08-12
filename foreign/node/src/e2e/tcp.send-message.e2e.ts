@@ -27,6 +27,10 @@ describe('e2e -> message', async () => {
 
   const c = getTestClient();
 
+  // Only the VSR lane reaches a server that reports offsets. The classic lane
+  // runs against the legacy server, which commits without confirming.
+  const vsr = process.env.IGGY_TEST_PROTOCOL === 'vsr';
+
   const streamName = 'e2e-stream-934';
   const topicName = 'e2e-topic-832';
   const partitionId = 0;
@@ -49,6 +53,10 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::send', async () => {
     const { confirmations } = await c.message.send(msg);
+    if (!vsr) {
+      assert.equal(confirmations.length, 0);
+      return;
+    }
     assert.equal(confirmations.length, 1);
     assert.equal(confirmations[0].partitionId, partitionId);
   });
@@ -169,6 +177,10 @@ describe('e2e -> message', async () => {
       ...msg,
       messages: generateMessages(3)
     });
+    if (!vsr) {
+      assert.equal(confirmations.length, 0);
+      return;
+    }
     // Landing behind the already committed batch is the part no placeholder
     // confirmation could reproduce.
     assert.equal(confirmations.length, 1);

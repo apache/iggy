@@ -83,8 +83,6 @@ runs:
     - name: Setup server for e2e tests
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
-      with:
-        cargo-bin: iggy-server
 
     - name: Run e2e tests
       if: inputs.task == 'e2e'

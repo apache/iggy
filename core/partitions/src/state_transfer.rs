@@ -1512,15 +1512,16 @@ where
                 .retain(|start_offset, _| live.contains_key(start_offset));
         }
 
-        // An empty chain at frontier 0 tells the receiver to unlink its own, so
-        // serve it only when a recorded purge says the emptiness is the truth.
-        // `install_state_transfer`'s `purge_advances` check re-decides that
-        // against the metadata plane and refuses the rest.
+        // Second phantom gate, on the BUILT offer rather than on `commit_max`.
+        // The gate above keys on `commit_max() == 0`, which a replica that lifted
+        // its commit floor through an offsets-only repair window clears while
+        // still holding zero bytes; such a replica passes `is_caught_up_primary`
+        // and would hand a data-holding peer an empty chain at frontier 0,
+        // making it unlink its own. An offer with no segments AND no offset
+        // space is indistinguishable from that phantom, and a group genuinely
+        // in that state has nothing worth transferring anyway.
         let offsets_wire = self.offsets_wire_snapshot();
-        if segments.is_empty()
-            && offsets_wire.next_offset == 0
-            && offsets_wire.purge_generation == 0
-        {
+        if segments.is_empty() && offsets_wire.next_offset == 0 {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
         let offsets_bytes = Rc::new(offsets_wire.encode());
@@ -1985,15 +1986,7 @@ where
         // purge disables the `OfferRewindsDurableData` refusal below -- the
         // one guard standing between an offer that rewinds this replica's
         // offset space and its durable data.
-        // Second disjunct: this replica has NOT applied the committed purge, so
-        // its frontier still measures the pre-purge offset space and cannot be
-        // compared against a post-purge offer. Restricted to `next_offset == 0`
-        // -- the state a purge leaves before anything is appended -- so an
-        // origin that merely lags within the same purge era still fails the
-        // fence rather than rewinding this replica's durable post-purge data.
-        let purge_advances = offsets_wire.purge_generation > committed_purge_generation
-            || (self.applied_purge_generation < committed_purge_generation
-                && offsets_wire.next_offset == 0);
+        let purge_advances = offsets_wire.purge_generation > committed_purge_generation;
         let local_next_offset = self.offset_frontier();
         if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
         {
@@ -2101,7 +2094,7 @@ where
             tracing::error!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = self.consensus().group(),
+                namespace_raw = self.consensus().namespace(),
                 frontier = self.offset_frontier(),
                 "state-transfer install could not record the installed offset frontier; \
                  the durable record stays at the pre-swap claim until the next view change"
@@ -2155,7 +2148,7 @@ where
         // Unlink the old segment chain oldest-first (a crash mid-loop leaves
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
-        let namespace_raw = self.consensus().group();
+        let namespace_raw = self.consensus().namespace();
         while let Some((_, mut storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -2331,7 +2324,6 @@ where
                     messages_w.size_counter(),
                     config.enforce_fsync,
                     true,
-                    config.preallocate_segments.then_some(config.segment_size),
                 )
                 .await
                 .map_err(|source| PartitionInstallError::SegmentOpen {
@@ -2381,7 +2373,7 @@ where
         // keys are minted from u32 wire ids, so assert it.
         let old_consumer_paths: Vec<String> = {
             let guard = self.consumer_offsets.pin();
-            let mut paths: Vec<String> = guard
+            let paths = guard
                 .iter()
                 .filter_map(|(key, _)| {
                     let narrowed = u32::try_from(*key).ok();
@@ -2390,20 +2382,11 @@ where
                 })
                 .collect();
             guard.clear();
-            // The map is not the whole truth about what is on disk: a repaired
-            // pre-purge offset op persists a file this incarnation never held,
-            // and a purged origin offering `next_offset = 0` drops every
-            // incoming entry, so a map-only sweep leaves the old table for boot
-            // to resurrect.
-            paths.extend(strayed_offset_files(
-                self.consumer_offsets_path.as_deref(),
-                &offsets_wire.consumers,
-            ));
             paths
         };
         let old_group_paths: Vec<String> = {
             let guard = self.consumer_group_offsets.pin();
-            let mut paths: Vec<String> = guard
+            let paths = guard
                 .iter()
                 .filter_map(|(key, _)| {
                     let narrowed = u32::try_from(key.0).ok();
@@ -2417,10 +2400,6 @@ where
                 })
                 .collect();
             guard.clear();
-            paths.extend(strayed_offset_files(
-                self.consumer_group_offsets_path.as_deref(),
-                &offsets_wire.groups,
-            ));
             paths
         };
         for path in old_consumer_paths.into_iter().chain(old_group_paths) {
@@ -2434,7 +2413,7 @@ where
                 tracing::warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
-                    namespace_raw = self.consensus().group(),
+                    namespace_raw = self.consensus().namespace(),
                     path = %path,
                     %error,
                     "failed to unlink a superseded consumer-offset file during install"
@@ -2597,7 +2576,7 @@ where
                 tracing::warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
-                    namespace_raw = self.consensus().group(),
+                    namespace_raw = self.consensus().namespace(),
                     purge_generation = offsets_wire.purge_generation,
                     %error,
                     "state-transfer install could not record the offered purge \
@@ -2701,7 +2680,7 @@ where
                     tracing::error!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
-                        namespace_raw = self.consensus().group(),
+                        namespace_raw = self.consensus().namespace(),
                         partition_dir,
                         %error,
                         "converge sweep cannot list the partition directory"
@@ -2715,7 +2694,7 @@ where
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         warn_unlink(
-                            self.consensus().group(),
+                            self.consensus().namespace(),
                             &path.display().to_string(),
                             &error,
                         );
@@ -3016,35 +2995,6 @@ pub fn offered_purge_generation(offsets_bytes: &[u8]) -> u64 {
     ConsumerOffsetsWire::decode(offsets_bytes)
         .map(|wire| wire.purge_generation)
         .unwrap_or_default()
-}
-
-/// Offset files under `dir` whose id is absent from `incoming`.
-///
-/// The install's own map cannot name these: a pre-purge offset op replayed by
-/// journal repair persists a file this incarnation never held, and a purged
-/// origin offers `next_offset = 0`, which drops every incoming entry. Left
-/// behind, boot hydrates them back.
-///
-/// A file whose name is not a bare u32 is left alone rather than guessed at:
-/// every offset file is named by its id, so anything else is not ours.
-pub(crate) fn strayed_offset_files(dir: Option<&str>, incoming: &[(u32, u64)]) -> Vec<String> {
-    let Some(dir) = dir else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let id: u32 = name.parse().ok()?;
-            incoming
-                .iter()
-                .all(|(incoming_id, _)| *incoming_id != id)
-                .then(|| format!("{dir}/{name}"))
-        })
-        .collect()
 }
 
 /// Stamp over every `SEGMENT_LOG` entry of a manifest, keying

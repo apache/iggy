@@ -51,9 +51,24 @@ jobs:
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          SERVER_BIN="iggy-server"
-          echo "Building server binary and CLI for BDD tests..."
-          cargo build --locked --bin iggy-server --bin iggy
+          # The VSR lanes need the vsr feature on both the server and the CLI,
+          # otherwise the CLI cannot frame requests for the VSR wire protocol
+          # and the healthcheck ping fails. The Go SDK speaks only VSR and the
+          # Python wheels are vsr-built, so those suites are always on this
+          # branch.
+          case "${{ inputs.task }}" in
+          bdd-rust-vsr|bdd-go|bdd-go-race|bdd-python|bdd-node-vsr)
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+            SERVER_BIN="iggy-server-ng"
+            echo "Building the VSR server binary and CLI (--features vsr) for BDD tests..."
+            cargo build --locked --bin iggy-server-ng --bin iggy --features vsr
+            ;;
+          *)
+            SERVER_BIN="iggy-server"
+            echo "Building server binary and CLI for BDD tests..."
+            cargo build --locked --bin iggy-server --bin iggy
+            ;;
+          esac
 
           echo "Server binary built at: target/debug/${SERVER_BIN}"
           ls -lh "target/debug/${SERVER_BIN}"
@@ -75,20 +90,39 @@ jobs:
       - name: Run BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          # Extract SDK name from task (format: bdd-<sdk>).
-          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
-          export IGGY_SERVER_PATH="target/debug/iggy-server"
-          echo "Server binary location: $(ls -lh target/debug/iggy-server)"
+          # Extract SDK name from task (format: bdd-<sdk>, or bdd-<sdk>-vsr
+          # for an explicit vsr lane). Python has no legacy lane, so its
+          # plain task name runs vsr.
+          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//; s/-vsr$//')
+          EXTRA_FLAGS=()
+          case "${{ inputs.task }}" in
+          bdd-rust-vsr|bdd-python|bdd-node-vsr)
+            EXTRA_FLAGS+=(--vsr)
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+            export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
+            echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
+            ;;
+          bdd-go|bdd-go-race)
+            # The Go SDK speaks only VSR, so the runner forces the overlay.
+            # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
+            export IGGY_SERVER_NG_PATH="target/debug/iggy-server-ng"
+            echo "Server binary location: $(ls -lh target/debug/iggy-server-ng)"
+            ;;
+          *)
+            echo "Server binary location: $(ls -lh target/debug/iggy-server)"
+            ;;
+          esac
 
           echo "Running BDD tests for SDK: $SDK_NAME"
           echo "Current directory: $(pwd)"
           echo "CLI binary location: $(ls -lh target/debug/iggy)"
 
-          # Export path to the pre-built cli binary (relative to repo root)
+          # Export path to the pre-built server and cli binaries (relative to repo root)
+          export IGGY_SERVER_PATH="target/debug/iggy-server"
           export IGGY_CLI_PATH="target/debug/iggy"
           export IGGY_ROOT_USERNAME="iggy"
           export IGGY_ROOT_PASSWORD="iggy"
-          ./scripts/run-bdd-tests.sh "$SDK_NAME"
+          ./scripts/run-bdd-tests.sh "${EXTRA_FLAGS[@]}" "$SDK_NAME"
 
       - name: Clean up Docker resources (BDD)
         if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')

@@ -203,6 +203,7 @@ const singleNodeHandler = (port: number): FrameHandler =>
   };
 
 const vsrConfig = (port: number): ClientConfig => ({
+  protocol: 'vsr',
   transport: 'TCP',
   options: { host: '127.0.0.1', port },
   credentials: { username: 'iggy', password: 'iggy' },

@@ -20,7 +20,6 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.consumergroup.ConsumerGroup;
-import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -182,26 +181,4 @@ public interface ConsumerGroupsClient {
      *         group
      */
     CompletableFuture<Void> leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId);
-
-    /**
-     * Fetches this client's current partition assignment for a consumer group.
-     *
-     * <p>The server identifies the member by the connection's session, so no
-     * member identifier is sent. The returned assignment carries the group
-     * generation; it advances on every rebalance, at which point cached
-     * assignments become stale and polls against revoked partitions are
-     * fenced by the server.
-     *
-     * <p>Group polling calls this internally; explicit calls are only needed
-     * for custom partition-selection logic.
-     *
-     * @param streamId the stream identifier containing the topic
-     * @param topicId  the topic identifier
-     * @param groupId  the consumer group identifier
-     * @return a {@link CompletableFuture} completing with the member's
-     *         {@link ConsumerGroupAssignment}, or empty when this client is
-     *         not a member of the group
-     */
-    CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
-            StreamId streamId, TopicId topicId, ConsumerId groupId);
 }

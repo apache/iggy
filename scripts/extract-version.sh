@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -60,9 +60,6 @@
 #   - Package name for Rust crates (package)
 
 set -euo pipefail
-
-# shellcheck source-path=SCRIPTDIR
-source "$(dirname "${BASH_SOURCE[0]}")/ci/lib/init.sh"
 
 # Colors for output
 RED='\033[0;31m'

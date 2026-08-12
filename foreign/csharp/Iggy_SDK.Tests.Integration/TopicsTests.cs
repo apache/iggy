@@ -21,7 +21,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -41,8 +40,8 @@ public class TopicsTests
         var streamName = $"topic-create-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
 
-        var response = await client.CreateTopicAsync(Identifier.String(streamName), "Test Topic", 2,
-            CompressionAlgorithm.Gzip,
+        var response = await client.CreateTopicAsync(
+            Identifier.String(streamName), "Test Topic", 2, CompressionAlgorithm.Gzip,
             1, TimeSpan.FromMinutes(10), 2_000_000_000);
 
         response.ShouldNotBeNull();
@@ -69,8 +68,8 @@ public class TopicsTests
         await client.CreateStreamAsync(streamName);
         await client.CreateTopicAsync(Identifier.String(streamName), "Dup Topic", 1);
 
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.CreateTopicAsync(Identifier.String(streamName),
-            "Dup Topic", 1));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            client.CreateTopicAsync(Identifier.String(streamName), "Dup Topic", 1));
     }
 
     [Test]
@@ -198,11 +197,13 @@ public class TopicsTests
         var topicToUpdate = await client.CreateTopicAsync(Identifier.String(streamName), "topic-to-update", 1);
         topicToUpdate.ShouldNotBeNull();
 
-        await Should.NotThrowAsync(client.UpdateTopicAsync(Identifier.String(streamName),
+        await Should.NotThrowAsync(client.UpdateTopicAsync(
+            Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id), "Updated Topic",
             CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10), 3));
 
-        var result = await client.GetTopicByIdAsync(Identifier.String(streamName),
+        var result = await client.GetTopicByIdAsync(
+            Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id));
         result.ShouldNotBeNull();
         result!.Name.ShouldBe("Updated Topic");
@@ -231,13 +232,11 @@ public class TopicsTests
         beforePurge.MessagesCount.ShouldBe(5u);
         beforePurge.Size.ShouldBeGreaterThan(0u);
 
-        await Should.NotThrowAsync(client.PurgeTopicAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic")));
+        await Should.NotThrowAsync(client.PurgeTopicAsync(
+            Identifier.String(streamName), Identifier.String("Purge Topic")));
 
-        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
-        var afterPurge = await Eventually.ReadAsync(
-            () => client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("Purge Topic")),
-            topic => topic?.MessagesCount == 0, TimeSpan.FromSeconds(10));
+        var afterPurge = await client.GetTopicByIdAsync(Identifier.String(streamName),
+            Identifier.String("Purge Topic"));
         afterPurge.ShouldNotBeNull();
         afterPurge!.MessagesCount.ShouldBe(0u);
         afterPurge.Size.ShouldBe(0u);
@@ -254,8 +253,8 @@ public class TopicsTests
         var topicToDelete = await client.CreateTopicAsync(Identifier.String(streamName), "topic-to-delete", 1);
         topicToDelete.ShouldNotBeNull();
 
-        await Should.NotThrowAsync(client.DeleteTopicAsync(Identifier.String(streamName),
-            Identifier.Numeric(topicToDelete.Id)));
+        await Should.NotThrowAsync(client.DeleteTopicAsync(
+            Identifier.String(streamName), Identifier.Numeric(topicToDelete.Id)));
     }
 
     [Test]
@@ -267,8 +266,8 @@ public class TopicsTests
         var streamName = $"topic-delnone-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
 
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.DeleteTopicAsync(Identifier.String(streamName),
-            Identifier.String("nonexistent-topic")));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.DeleteTopicAsync(
+            Identifier.String(streamName), Identifier.String("nonexistent-topic")));
     }
 
     [Test]
@@ -280,8 +279,8 @@ public class TopicsTests
         var streamName = $"topic-getnone-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
 
-        var topic = await client.GetTopicByIdAsync(Identifier.String(streamName),
-            Identifier.String("nonexistent-topic"));
+        var topic = await client.GetTopicByIdAsync(
+            Identifier.String(streamName), Identifier.String("nonexistent-topic"));
 
         topic.ShouldBeNull();
     }

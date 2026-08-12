@@ -22,6 +22,16 @@ use iggy_binary_protocol::codes::{GET_STATS_CODE, LOGIN_USER_CODE, PING_CODE};
 use iggy_binary_protocol::requests::system::{GetStatsRequest, PingRequest};
 use integration::iggy_harness;
 
+#[cfg(not(feature = "vsr"))]
+#[iggy_harness(test_client_transport = [Tcp, Quic, Http, WebSocket])]
+async fn given_authenticated_client_when_sending_raw_request_should_round_trip(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.unwrap();
+    assert_raw_round_trip(&client).await;
+}
+
+#[cfg(feature = "vsr")]
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
 async fn given_authenticated_client_when_sending_raw_request_should_round_trip(
     harness: &TestHarness,
@@ -82,6 +92,7 @@ async fn assert_raw_round_trip(client: &IggyClient) {
             // follow-up ping is the point of the case: the server must answer
             // with a deny frame, not drop the frame and leave the connection
             // wedged until the read timeout.
+            #[cfg(feature = "vsr")]
             {
                 let error = client
                     .send_binary_request(60_000, Bytes::new())

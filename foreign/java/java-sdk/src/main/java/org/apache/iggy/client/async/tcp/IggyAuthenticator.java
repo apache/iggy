@@ -21,13 +21,15 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.util.AttributeKey;
+import org.apache.iggy.client.async.tcp.AsyncTcpConnection.IggyResponseHandler;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Function;
 
 final class IggyAuthenticator {
     private static final Logger log = LoggerFactory.getLogger(IggyAuthenticator.class);
@@ -42,15 +44,12 @@ final class IggyAuthenticator {
      *
      * @param channel           the channel to authenticate
      * @param loginPayload      the login payload to send (will be released by this method)
+     * @param commandCode       the login command code
      * @param currentGeneration the current authentication generation counter
-     * @param login             sends the login payload through the connection's retry path
      * @return a future that completes when authentication is done
      */
     static CompletableFuture<Void> ensureAuthenticated(
-            Channel channel,
-            ByteBuf loginPayload,
-            AtomicLong currentGeneration,
-            Function<ByteBuf, CompletableFuture<ByteBuf>> login) {
+            Channel channel, ByteBuf loginPayload, int commandCode, AtomicLong currentGeneration) {
         Long channelGeneration = channel.attr(AUTH_GENERATION_KEY).get();
         long requiredGeneration = currentGeneration.get();
 
@@ -59,13 +58,20 @@ final class IggyAuthenticator {
             return CompletableFuture.completedFuture(null);
         }
 
-        CompletableFuture<ByteBuf> loginFuture;
-        try {
-            loginFuture = login.apply(loginPayload);
-        } catch (RuntimeException loginError) {
-            loginPayload.release();
-            return CompletableFuture.failedFuture(loginError);
+        if (loginPayload == null) {
+            return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
         }
+
+        CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
+        IggyResponseHandler handler = channel.pipeline().get(IggyResponseHandler.class);
+        handler.enqueueRequest(loginFuture);
+        ByteBuf frame = IggyFrameEncoder.encode(channel.alloc(), commandCode, loginPayload);
+        loginPayload.release();
+        channel.writeAndFlush(frame).addListener((ChannelFutureListener) f -> {
+            if (!f.isSuccess()) {
+                loginFuture.completeExceptionally(f.cause());
+            }
+        });
 
         return loginFuture.thenAccept(result -> {
             try {

@@ -100,6 +100,7 @@ public final class TcpAsyncPinnedProducerActor {
                     rateLimit);
             return AsyncIggyTcpClient.builder()
                     .credentials(globalCliArgs.username(), globalCliArgs.password())
+                    .connectionPoolSize(1)
                     .buildAndLogin()
                     .thenCompose(client -> {
                         this.client = client;

@@ -25,6 +25,7 @@ import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
+import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -220,7 +221,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         assertThat(user).isEmpty();
     }
 
-    private static GlobalPermissions createGlobalPermissions(boolean manageServers) {
+    private static @NotNull GlobalPermissions createGlobalPermissions(boolean manageServers) {
         return new GlobalPermissions(manageServers, false, false, false, false, false, false, false, false, false);
     }
 }

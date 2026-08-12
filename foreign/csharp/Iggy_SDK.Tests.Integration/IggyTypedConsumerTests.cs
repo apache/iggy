@@ -38,7 +38,9 @@ public class IggyTypedConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveDeserializedAsync_Should_YieldMessages_WithCorrectData(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -75,7 +77,9 @@ public class IggyTypedConsumerTests
     public async Task ReceiveDeserializedAsync_WithoutInit_Should_Throw_ConsumerNotInitializedException(
         Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -97,7 +101,9 @@ public class IggyTypedConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveDeserializedAsync_WithAutoCommitAfterReceive_Should_StoreOffset(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -136,7 +142,9 @@ public class IggyTypedConsumerTests
     public async Task ReceiveDeserializedAsync_WithFailingDeserializer_Should_YieldDeserializationFailed(
         Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
@@ -164,7 +172,9 @@ public class IggyTypedConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveDeserializedAsync_Should_StopCleanly_OnCancellation(Protocol protocol)
     {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 

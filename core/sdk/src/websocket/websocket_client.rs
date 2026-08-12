@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
+#[cfg(feature = "vsr")]
 use crate::session::ConsensusSession;
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
@@ -26,7 +27,13 @@ use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(not(feature = "vsr"))]
+use bytes::{BufMut, BytesMut};
+#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
+#[cfg(not(feature = "vsr"))]
+use iggy_common::IggyErrorDiscriminants;
+#[cfg(feature = "vsr")]
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
@@ -36,6 +43,7 @@ use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, User
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
 use std::sync::Mutex as StdMutex;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -46,11 +54,16 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(not(feature = "vsr"))]
+const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+#[cfg(not(feature = "vsr"))]
+const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "WebSocket";
 /// Bound on how long a single VSR reply read may block. The connection is
 /// lockstep and the read runs in the caller's task while holding the stream
 /// lock, so an unanswered read (lost server reply) would wedge every later
 /// request on this client forever. On expiry the stream is dropped.
+#[cfg(feature = "vsr")]
 const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Backoff before replaying a request the server answered with an explicit
@@ -58,6 +71,7 @@ const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// view-change cancel). The reply arrives promptly, so a short pause keeps the
 /// replay from spinning while the primary catches up. Bounded by
 /// `RESPONSE_READ_TIMEOUT`.
+#[cfg(feature = "vsr")]
 const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Debug)]
@@ -70,10 +84,13 @@ pub struct WebSocketClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    #[cfg(feature = "vsr")]
     // See `core/sdk/src/tcp/tcp_client.rs` for the `tokio::sync::Mutex` ->
     // `std::sync::Mutex` rationale (pure-CPU critical section).
     consensus_session: Arc<StdMutex<ConsensusSession>>,
+    #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
+    #[cfg(feature = "vsr")]
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
@@ -145,13 +162,16 @@ impl BinaryTransport for WebSocketClient {
             return Err(IggyError::Disconnected);
         }
 
+        #[cfg(feature = "vsr")]
         if matches!(self.config.auto_login, AutoLogin::Disabled) {
             return Err(error);
         }
 
         self.disconnect().await?;
 
+        #[cfg(feature = "vsr")]
         let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
         }
@@ -165,6 +185,7 @@ impl BinaryTransport for WebSocketClient {
         }
 
         let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
         if skip_auto_login && reconnect.is_err() {
             *self.skip_auto_login_once.lock().await = false;
         }
@@ -176,13 +197,16 @@ impl BinaryTransport for WebSocketClient {
         self.config.heartbeat_interval
     }
 
+    #[cfg(feature = "vsr")]
     fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
         Arc::clone(&self.consumer_group_state)
     }
 }
 
+#[cfg(feature = "vsr")]
 impl iggy_common::VsrSessionSealed for WebSocketClient {}
 
+#[cfg(feature = "vsr")]
 #[async_trait::async_trait]
 impl iggy_common::VsrSessionControl for WebSocketClient {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
@@ -231,8 +255,11 @@ impl WebSocketClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            #[cfg(feature = "vsr")]
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
+            #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
+            #[cfg(feature = "vsr")]
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
@@ -509,15 +536,25 @@ impl WebSocketClient {
         match &self.config.auto_login {
             // Leadership still matters without auto-login: the caller signs in
             // manually, and a login against a non-leader replays for its whole
-            // read timeout. `GetClusterMetadata` is sessionless and pre-auth,
-            // so the check works on the unauthenticated connection.
+            // read timeout. `GetClusterMetadata` is sessionless and pre-auth on
+            // server-ng, so the check works on the unauthenticated connection.
+            // vsr-only: the legacy server auth-gates cluster metadata, so this
+            // check would bounce `Unauthenticated` into the reconnect path and
+            // recurse back into `connect`.
+            #[cfg(feature = "vsr")]
             AutoLogin::Disabled => self.handle_leader_redirection().await,
+            #[cfg(not(feature = "vsr"))]
+            AutoLogin::Disabled => Ok(false),
             AutoLogin::Enabled(_) => {
                 // Check leadership BEFORE signing in: register/login are
                 // consensus ops a backup answers with a transient frame, so
                 // signing in against a non-leader replays for the whole read
                 // timeout instead of failing over. `GetClusterMetadata` is
-                // sessionless and pre-auth.
+                // sessionless and pre-auth on server-ng. vsr-only: the legacy
+                // server auth-gates cluster metadata, so this pre-login check
+                // would bounce `Unauthenticated` into the reconnect path and
+                // recurse back into `connect`.
+                #[cfg(feature = "vsr")]
                 if self.handle_leader_redirection().await? {
                     return Ok(true);
                 }
@@ -564,6 +601,7 @@ impl WebSocketClient {
 
     async fn auto_login(&self) -> Result<(), IggyError> {
         let client_address = self.get_client_address_value().await;
+        #[cfg(feature = "vsr")]
         let skip_auto_login = {
             let mut guard = self.skip_auto_login_once.lock().await;
             std::mem::take(&mut *guard)
@@ -575,6 +613,7 @@ impl WebSocketClient {
                 Ok(())
             }
             AutoLogin::Enabled(credentials) => {
+                #[cfg(feature = "vsr")]
                 if skip_auto_login {
                     info!("Skipping automatic sign-in for a retried login/register request.");
                     return Ok(());
@@ -612,6 +651,7 @@ impl WebSocketClient {
         self.set_state(ClientState::Disconnected).await;
 
         self.stream.lock().await.take();
+        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
 
         self.publish_event(DiagnosticEvent::Disconnected).await;
@@ -635,6 +675,7 @@ impl WebSocketClient {
             let _ = stream.shutdown().await;
         }
 
+        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
@@ -665,6 +706,7 @@ impl WebSocketClient {
             return Err(IggyError::NotConnected);
         }
 
+        #[cfg(feature = "vsr")]
         {
             // Encode the request ONCE: `next_request_id` advances here, so a
             // transient replay must reuse the same id for the server's dedup.
@@ -743,9 +785,87 @@ impl WebSocketClient {
                 }
             }
         }
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            let stream = stream_guard.as_mut().ok_or_else(|| {
+                trace!("Cannot send data. Client is not connected.");
+                IggyError::NotConnected
+            })?;
+            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+            let mut request =
+                BytesMut::with_capacity(4 + REQUEST_INITIAL_BYTES_LENGTH + payload.len());
+            request.put_u32_le(payload_length as u32);
+            request.put_u32_le(code);
+            request.put_slice(&payload);
+            trace!(
+                "Sending {NAME} message with code: {}, payload size: {} bytes",
+                code,
+                payload.len()
+            );
+            stream.write(&request).await?;
+            stream.flush().await?;
+
+            let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+            stream.read(&mut response_initial_buffer).await?;
+
+            let status = u32::from_le_bytes([
+                response_initial_buffer[0],
+                response_initial_buffer[1],
+                response_initial_buffer[2],
+                response_initial_buffer[3],
+            ]);
+
+            let length = u32::from_le_bytes([
+                response_initial_buffer[4],
+                response_initial_buffer[5],
+                response_initial_buffer[6],
+                response_initial_buffer[7],
+            ]) as usize;
+
+            trace!(
+                "Received {NAME} response status: {}, length: {} bytes",
+                status, length
+            );
+
+            if status != 0 {
+                // TEMP: See https://github.com/apache/iggy/pull/604 for context.
+                if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::UserAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
+                {
+                    debug!(
+                        "Received a server resource already exists response: {} ({})",
+                        status,
+                        IggyError::from_code_as_string(status)
+                    )
+                } else {
+                    error!(
+                        "Received an invalid response with status: {} ({}).",
+                        status,
+                        IggyError::from_code_as_string(status),
+                    );
+                }
+
+                return Err(IggyError::from_code(status));
+            }
+
+            if length == 0 {
+                return Ok(Bytes::new());
+            }
+
+            let mut response_buffer = vec![0u8; length];
+            stream.read(&mut response_buffer).await?;
+
+            trace!("Received {NAME} response payload, size: {} bytes", length);
+            Ok(Bytes::from(response_buffer))
+        }
     }
 }
 
+#[cfg(feature = "vsr")]
 const fn is_login_register_code(code: u32) -> bool {
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }

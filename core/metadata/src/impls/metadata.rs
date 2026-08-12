@@ -34,7 +34,6 @@ use consensus::{
     is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
     pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
     request_preflight, send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -44,7 +43,7 @@ use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopi
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireName,
+    PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::IggyError;
 use iggy_common::UserId;
@@ -415,29 +414,17 @@ impl<M> SnapshotCoordinator<M> {
         Ok(checksum)
     }
 
-    /// Drain the snapshotted prefix below `last_op` to reclaim WAL space. Runs
-    /// only after the pairing is durable (see [`Self::persist_snapshot`]).
-    ///
-    /// `last_op` itself is retained, one entry the snapshot has already
-    /// superseded. It is this replica's commit point, and a `DoViewChange`
-    /// carries a header for every op from there up. Draining it inclusively
-    /// leaves that entry blank, and blank at the commit point is the one slot
-    /// the merge can neither adopt nor discard: a quorum of senders that all
-    /// checkpointed at the same op deadlocks the view change
-    /// (`dvc_merge::merge_dvc_quorum`). Reclaiming one more entry is not worth
-    /// a group that cannot elect.
+    /// Drain the snapshotted prefix `0..=last_op` to reclaim WAL space. Runs only
+    /// after the pairing is durable (see [`Self::persist_snapshot`]).
     #[allow(clippy::future_not_send)]
     async fn drain<J: JournalHandle>(
         &self,
         journal: &J,
         last_op: u64,
     ) -> Result<(), SnapshotError> {
-        let Some(drain_to) = last_op.checked_sub(1) else {
-            return Ok(());
-        };
         journal
             .handle()
-            .drain(0..=drain_to)
+            .drain(0..=last_op)
             .await
             .map_err(SnapshotError::Io)?;
         Ok(())
@@ -641,7 +628,7 @@ pub fn apply_committed_prepare<M>(
 /// Late-bound callback invoked after every committed op on shard 0's metadata
 /// commit path (via `gated_apply`, including a gated no-op).
 ///
-/// Wired by the server bootstrap once the metadata bundle has broadcast;
+/// Wired by server-ng bootstrap once the metadata bundle has broadcast;
 /// receives the committed [`Operation`] so the recipient can filter (the
 /// partition reconciliation loop only cares about partition-shaped
 /// events). Wrapped in [`RefCell`] for late binding; the per-shard
@@ -660,7 +647,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// the WAL at all. They receive a `MetadataHandoff::Waiter` factory
     /// bundle from shard 0 over the bootstrap broadcast channel and
     /// reconstruct `mux_stm` from the in-memory snapshot it carries (see
-    /// `server/src/bootstrap.rs` `await_metadata_bundle` /
+    /// `server-ng/src/bootstrap.rs` `await_metadata_bundle` /
     /// `broadcast_metadata_bundle`).
     pub journal: Option<J>,
     /// `Some` on shard 0, `None` on other shards.
@@ -728,7 +715,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// after `gated_apply` returns (including a gated `Unauthorized` no-op that
     /// never reaches [`crate::stm::StateMachine::update`]) in both
     /// [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
-    /// [`Self::set_commit_notifier`] runs (the server bootstrap on shard
+    /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
     /// 0 sets it; peer shards and tests leave it `None`).
     commit_notifier: RefCell<Option<CommitNotifier>>,
     /// Resolved byte value for `MaxTopicSize::ServerDefault` (`0` on the
@@ -946,10 +933,7 @@ where
             Error = iggy_common::IggyError,
         >,
 {
-    async fn on_request(
-        &self,
-        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
-    ) {
+    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let Some(consensus) =
             require_shard_zero(self.consensus.as_ref(), "on_request", "consensus")
         else {
@@ -1053,23 +1037,6 @@ where
         };
 
         let header = *message.header();
-
-        // Before anything trusts `checksum` as an identity token, and before the WAL
-        // takes the bytes. Every live prepare travels this path: unverified, a frame
-        // corrupted between primary and backup is journaled as-is and re-served to
-        // peers, which the interior-corruption boot refusal turns into an unbootable
-        // node on the next restart.
-        if let Err(reason) = verify_prepare_integrity(&header, message.as_slice()) {
-            warn!(
-                target: "iggy.metadata.diag",
-                plane = "metadata",
-                replica_id = consensus.replica(),
-                view = consensus.view(),
-                op = header.op,
-                "discarding prepare: {reason}"
-            );
-            return;
-        }
 
         let current_op = match replicate_preflight(consensus, &header) {
             Ok(current_op) => current_op,
@@ -1896,7 +1863,7 @@ where
         }
 
         let request = build_register_request_message(consensus, client_id, user_id);
-        // Wire path runs `RoutedRequestHeader::validate` at network boundary;
+        // Wire path runs `RequestHeader::validate` at network boundary;
         // in-process skips it. debug_assert pins drift.
         debug_assert!(
             {
@@ -1998,7 +1965,7 @@ where
     /// commit.
     fn answer_preflight(
         consensus: &VsrConsensus<B>,
-        request_header: &RoutedRequestHeader,
+        request_header: &RequestHeader,
         outcome: PreflightOutcome,
     ) -> Option<Result<Message<GenericHeader>, MetadataSubmitError>> {
         let client_id = request_header.client;
@@ -2311,10 +2278,10 @@ where
         // Build the prepare directly so the `client = 0` header skips the
         // client-header validation in `prepare_request` / `Project::project`
         // (the in-process path `build_prepare_message` documents).
-        let header = RoutedRequestHeader {
+        let header = RequestHeader {
             client: 0,
-            group: server_common::sharding::METADATA_GROUP,
-            ..RoutedRequestHeader::default()
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
         };
         let prepare = build_prepare_message(
             consensus,
@@ -2357,7 +2324,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn submit_request_in_process(
         &self,
-        message: Message<RoutedRequestHeader>,
+        message: Message<RequestHeader>,
     ) -> Result<Message<GenericHeader>, MetadataSubmitError> {
         let request_header = *message.header();
         let client_id = request_header.client;
@@ -3124,7 +3091,7 @@ where
             return;
         };
         // Serialize whole checkpoints against each other. In-process metadata submits
-        // each run on their own spawned task (`bus.spawn` in the server's metadata submit
+        // each run on their own spawned task (`bus.spawn` in server-ng's metadata submit
         // handler), so at the checkpoint margin two can enter here concurrently; without
         // this lock they would run concurrent `persist_snapshot`s over the single
         // `snapshot.bin` and concurrently `drain` the WAL, which rewrites through a
@@ -3233,7 +3200,7 @@ where
     #[allow(clippy::too_many_lines)]
     fn prepare_request(
         &self,
-        mut message: Message<RoutedRequestHeader>,
+        mut message: Message<RequestHeader>,
     ) -> Result<Message<PrepareHeader>, iggy_common::IggyError> {
         let consensus = self.consensus.as_ref().unwrap();
         let operation = message.header().operation;
@@ -3264,8 +3231,8 @@ where
         if let Some(acting_user_id) =
             resolve_acting_user_id(operation, client_id, &self.client_table)?
         {
-            let request_header = bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
-                &mut message.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+            let request_header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
             );
             request_header.user_id = acting_user_id;
         }
@@ -3278,7 +3245,7 @@ where
         // authz gate. The default arm projects the mutated buffer directly and
         // is order-independent.
         let header = *message.header();
-        let body = &message.as_slice()[size_of::<RoutedRequestHeader>()..header.size as usize];
+        let body = &message.as_slice()[size_of::<RequestHeader>()..header.size as usize];
 
         match header.operation {
             Operation::CreateTopic => {
@@ -3511,36 +3478,36 @@ where
     }
 }
 
-/// In-process Register `Message<RoutedRequestHeader>`. Mirrors
+/// In-process Register `Message<RequestHeader>`. Mirrors
 /// `SimClient::register`: `session=0`, `request=0` per
-/// [`RoutedRequestHeader::validate`]; empty body.
+/// [`RequestHeader::validate`]; empty body.
 ///
 /// `cluster` + `view` from `consensus` for self-consistency before
 /// `Project::project` overwrites. `release = 0` matches wire today; both
 /// paths should switch to `consensus.release()` once
 /// `ClientReleaseTooLow/TooHigh` lands.
 ///
-/// Buffer is `size_of::<RoutedRequestHeader>()`; `prepare_request` transmutes into
+/// Buffer is `size_of::<RequestHeader>()`; `prepare_request` transmutes into
 /// `PrepareHeader` (also 256 bytes), no realloc.
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
     user_id: u32,
-) -> Message<RoutedRequestHeader>
+) -> Message<RequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let header_size = size_of::<RoutedRequestHeader>();
-    let mut msg = Message::<RoutedRequestHeader>::new(header_size);
-    let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+    let header_size = size_of::<RequestHeader>();
+    let mut msg = Message::<RequestHeader>::new(header_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
         &mut msg.as_mut_slice()[..header_size],
     )
-    .expect("zeroed bytes are a valid RoutedRequestHeader");
-    *header = RoutedRequestHeader {
+    .expect("zeroed bytes are a valid RequestHeader");
+    *header = RequestHeader {
         command: Command2::Request,
         operation: Operation::Register,
-        size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
+        size: u32::try_from(header_size).expect("RequestHeader size fits u32"),
         cluster: consensus.cluster(),
         view: consensus.view(),
         release: 0,
@@ -3553,8 +3520,8 @@ where
         // prepare is re-routed on each peer by namespace; a `0` here would
         // hash to a non-zero shard with no metadata consensus and be
         // silently dropped (see `shard::router::route_typed`).
-        group: server_common::sharding::METADATA_GROUP,
-        ..RoutedRequestHeader::default()
+        namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+        ..RequestHeader::default()
     };
     msg
 }
@@ -3564,21 +3531,21 @@ fn build_logout_request_message<B, P>(
     client_id: u128,
     session: u64,
     request: u64,
-) -> Message<RoutedRequestHeader>
+) -> Message<RequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let header_size = size_of::<RoutedRequestHeader>();
-    let mut msg = Message::<RoutedRequestHeader>::new(header_size);
-    let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+    let header_size = size_of::<RequestHeader>();
+    let mut msg = Message::<RequestHeader>::new(header_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
         &mut msg.as_mut_slice()[..header_size],
     )
-    .expect("zeroed bytes are a valid RoutedRequestHeader");
-    *header = RoutedRequestHeader {
+    .expect("zeroed bytes are a valid RequestHeader");
+    *header = RequestHeader {
         command: Command2::Request,
         operation: Operation::Logout,
-        size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
+        size: u32::try_from(header_size).expect("RequestHeader size fits u32"),
         cluster: consensus.cluster(),
         view: consensus.view(),
         release: 0,
@@ -3586,8 +3553,8 @@ where
         session,
         request,
         // Metadata consensus group (see `build_register_request_message`).
-        group: server_common::sharding::METADATA_GROUP,
-        ..RoutedRequestHeader::default()
+        namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+        ..RequestHeader::default()
     };
     msg
 }
@@ -3597,21 +3564,21 @@ fn build_complete_revocation_request_message<B, P>(
     client_id: u128,
     request: u64,
     body: &[u8],
-) -> Message<RoutedRequestHeader>
+) -> Message<RequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let header_size = size_of::<RoutedRequestHeader>();
+    let header_size = size_of::<RequestHeader>();
     let total = header_size + body.len();
-    let mut msg = Message::<RoutedRequestHeader>::new(total);
+    let mut msg = Message::<RequestHeader>::new(total);
     {
         let slice = msg.as_mut_slice();
         slice[header_size..total].copy_from_slice(body);
         let header =
-            bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size])
-                .expect("zeroed bytes are a valid RoutedRequestHeader");
-        *header = RoutedRequestHeader {
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
             command: Command2::Request,
             operation: Operation::CompleteConsumerGroupRevocation,
             size: u32::try_from(total).expect("request size fits u32"),
@@ -3623,8 +3590,8 @@ where
             // there is no real session (the commit path skips reply-caching).
             session: 1,
             request,
-            group: server_common::sharding::METADATA_GROUP,
-            ..RoutedRequestHeader::default()
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
         };
     }
     msg
@@ -3647,14 +3614,14 @@ where
 /// a few fixed-width fields, so this cannot happen in practice.
 #[must_use]
 pub fn build_truncate_partition_client_message(
-    template: &RoutedRequestHeader,
+    template: &RequestHeader,
     client_id: u128,
     session: u64,
     stream_id: u32,
     topic_id: u32,
     partition_id: u32,
     up_to_offset: u64,
-) -> Message<RoutedRequestHeader> {
+) -> Message<RequestHeader> {
     build_truncate_partition_client_message_with_identifiers(
         template,
         client_id,
@@ -3678,14 +3645,14 @@ pub fn build_truncate_partition_client_message(
 /// a few small fields, so this cannot happen in practice.
 #[must_use]
 pub fn build_truncate_partition_client_message_with_identifiers(
-    template: &RoutedRequestHeader,
+    template: &RequestHeader,
     client_id: u128,
     session: u64,
     stream_id: WireIdentifier,
     topic_id: WireIdentifier,
     partition_id: u32,
     up_to_offset: u64,
-) -> Message<RoutedRequestHeader> {
+) -> Message<RequestHeader> {
     let body = TruncatePartitionRequest {
         stream_id,
         topic_id,
@@ -3693,16 +3660,16 @@ pub fn build_truncate_partition_client_message_with_identifiers(
         up_to_offset,
     }
     .to_bytes();
-    let header_size = size_of::<RoutedRequestHeader>();
+    let header_size = size_of::<RequestHeader>();
     let total = header_size + body.len();
-    let mut msg = Message::<RoutedRequestHeader>::new(total);
+    let mut msg = Message::<RequestHeader>::new(total);
     {
         let slice = msg.as_mut_slice();
         slice[header_size..total].copy_from_slice(&body);
         let header =
-            bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size])
-                .expect("zeroed bytes are a valid RoutedRequestHeader");
-        *header = RoutedRequestHeader {
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
             command: Command2::Request,
             operation: Operation::TruncatePartition,
             size: u32::try_from(total).expect("request size fits u32"),
@@ -3712,8 +3679,8 @@ pub fn build_truncate_partition_client_message_with_identifiers(
             client: client_id,
             session,
             request: template.request,
-            group: server_common::sharding::METADATA_GROUP,
-            ..RoutedRequestHeader::default()
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
         };
     }
     msg
@@ -3721,7 +3688,7 @@ pub fn build_truncate_partition_client_message_with_identifiers(
 
 fn build_prepare_message<B, P>(
     consensus: &VsrConsensus<B, P>,
-    request: &RoutedRequestHeader,
+    request: &RequestHeader,
     operation: Operation,
     body: &[u8],
 ) -> Message<PrepareHeader>
@@ -3768,7 +3735,7 @@ where
         operation,
         // The group's namespace, never the request's: clients send 0, and a
         // journaled 0 mis-routes the entry when repair replays it verbatim.
-        group: consensus.group(),
+        namespace: consensus.namespace(),
         // Carry the acting user id so the in-apply RBAC gate sees the same
         // identity on every replica. The default projection copies it (see
         // `Project::project`); this helper builds prepares for the ops it
@@ -3785,12 +3752,7 @@ where
         ..Default::default()
     };
 
-    // Last, because the identity checksum covers every other field. Same contract as
-    // the wire path in `Project::project`; skipping it would leave the rewritten
-    // prepares (CreateTopic/CreatePartitions assignments, the UpdateTopic default-size
-    // rewrite, the PAT-cleaner delete) as the only ops the merge cannot tell apart
-    // from a competing prepare.
-    consensus::seal_prepare_checksum(prepare)
+    prepare
 }
 
 /// Eviction reason for a request `prepare_request` rejected as structurally
@@ -3804,7 +3766,7 @@ const fn eviction_reason_for_invalid(operation: Operation) -> EvictionReason {
 }
 
 /// Resolve the acting user id to stamp into a client op's replicated
-/// `RoutedRequestHeader`, so the in-apply RBAC gate (`crate::stm::authz`) reads the
+/// `RequestHeader`, so the in-apply RBAC gate (`crate::stm::authz`) reads the
 /// same identity on every replica (WAL replay has no session table).
 ///
 /// - `Ok(Some(id))`: overwrite the header's `user_id` with the committed
@@ -3881,7 +3843,7 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
 /// A cached REJECTION replays untouched: it carries no secret, so serving it
 /// is both safe and useful.
 fn unreplayable_secret_refusal(
-    request_header: &RoutedRequestHeader,
+    request_header: &RequestHeader,
     cached: &Frozen<{ server_common::MESSAGE_ALIGN }>,
     commit: u64,
     client_id: u128,
@@ -4170,7 +4132,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );
@@ -4277,7 +4239,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );
@@ -4285,7 +4247,7 @@ mod tests {
         IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None)
     }
 
-    fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {
+    fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RequestHeader> {
         let body = CreateTopicRequest {
             stream_id: WireIdentifier::numeric(1),
             partitions_count: 1,
@@ -4296,15 +4258,15 @@ mod tests {
             name: WireName::new("t").unwrap(),
         }
         .to_bytes();
-        let header_size = size_of::<RoutedRequestHeader>();
+        let header_size = size_of::<RequestHeader>();
         let total = header_size + body.len();
-        let mut message = Message::<RoutedRequestHeader>::new(total);
+        let mut message = Message::<RequestHeader>::new(total);
         {
             let slice = message.as_mut_slice();
             slice[header_size..total].copy_from_slice(&body);
             let header =
-                bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
-            *header = RoutedRequestHeader {
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
+            *header = RequestHeader {
                 command: Command2::Request,
                 operation: Operation::CreateTopic,
                 size: u32::try_from(total).unwrap(),
@@ -4312,7 +4274,7 @@ mod tests {
                 session: 1,
                 request: 1,
                 user_id: wire_user_id,
-                group: server_common::sharding::METADATA_GROUP,
+                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
                 ..Default::default()
             };
         }
@@ -4440,7 +4402,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );
@@ -4535,43 +4497,39 @@ mod tests {
         reply
     }
 
-    fn pat_create_request(client: u128, request: u64) -> Message<RoutedRequestHeader> {
-        let header_size = size_of::<RoutedRequestHeader>();
-        let mut message = Message::<RoutedRequestHeader>::new(header_size);
-        let header = bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
+    fn pat_create_request(client: u128, request: u64) -> Message<RequestHeader> {
+        let header_size = size_of::<RequestHeader>();
+        let mut message = Message::<RequestHeader>::new(header_size);
+        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
             &mut message.as_mut_slice()[..header_size],
         );
-        *header = RoutedRequestHeader {
+        *header = RequestHeader {
             command: Command2::Request,
             operation: Operation::CreatePersonalAccessToken,
             size: u32::try_from(header_size).unwrap(),
             client,
             session: 1,
             request,
-            group: server_common::sharding::METADATA_GROUP,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             ..Default::default()
         };
         message
     }
 
-    fn create_stream_request(
-        client: u128,
-        request: u64,
-        name: &str,
-    ) -> Message<RoutedRequestHeader> {
+    fn create_stream_request(client: u128, request: u64, name: &str) -> Message<RequestHeader> {
         let body = iggy_binary_protocol::requests::streams::CreateStreamRequest {
             name: WireName::new(name).unwrap(),
         }
         .to_bytes();
-        let header_size = size_of::<RoutedRequestHeader>();
+        let header_size = size_of::<RequestHeader>();
         let total = header_size + body.len();
-        let mut message = Message::<RoutedRequestHeader>::new(total);
+        let mut message = Message::<RequestHeader>::new(total);
         {
             let slice = message.as_mut_slice();
             slice[header_size..total].copy_from_slice(&body);
             let header =
-                bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
-            *header = RoutedRequestHeader {
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
+            *header = RequestHeader {
                 command: Command2::Request,
                 operation: Operation::CreateStream,
                 size: u32::try_from(total).unwrap(),
@@ -4579,7 +4537,7 @@ mod tests {
                 session: 1,
                 request,
                 user_id: 0,
-                group: server_common::sharding::METADATA_GROUP,
+                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
                 ..Default::default()
             };
         }
@@ -4621,7 +4579,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             StallBus::default(),
             LocalPipeline::new(),
         );
@@ -4730,87 +4688,6 @@ mod tests {
         );
     }
 
-    /// A checkpoint reclaims the WAL prefix the snapshot supersedes, but must
-    /// stop one op short of the checkpoint op itself.
-    ///
-    /// That op is the replica's commit point, and its `DoViewChange` suffix is
-    /// floored there. The merge scans the commit point and may not discard it,
-    /// so a sender with no header to put there is deferring to a peer; when
-    /// every sender has checkpointed at the same op the view change deadlocks
-    /// (`dvc_merge::merge_dvc_quorum`). Checkpoints fire on local journal
-    /// occupancy, which is symmetric across replicas seeing the same ops, so
-    /// "every sender" is the ordinary case, not a coincidence.
-    #[compio::test]
-    async fn checkpoint_drain_retains_the_commit_point_header() {
-        const CLIENT: u128 = 1;
-        const SESSION: u64 = 1;
-        const ACTING_USER: u32 = 7;
-        const OPS: u64 = 5;
-        const CHECKPOINT_OP: u64 = 3;
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
-        let journal =
-            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
-                .await
-                .unwrap();
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            1,
-            server_common::sharding::METADATA_GROUP,
-            NoopBus,
-            LocalPipeline::new(),
-        );
-        consensus.init();
-        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
-            IggyMetadata::new(
-                Some(consensus),
-                Some(journal),
-                None,
-                None,
-                TestMux::default(),
-                Some(dir.path().to_path_buf()),
-            );
-        let consensus = md.consensus.as_ref().unwrap();
-        md.client_table.borrow_mut().commit_register(
-            CLIENT,
-            ACTING_USER,
-            register_reply(CLIENT, SESSION),
-        );
-
-        for op in 1..=OPS {
-            let prepare = md
-                .prepare_request(create_stream_request(CLIENT, op, &format!("s{op}")))
-                .expect("CreateStream is client-allowed");
-            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
-            md.on_replicate(prepare).await;
-        }
-
-        let journal = md.journal.as_ref().unwrap();
-        md.coordinator
-            .as_ref()
-            .expect("data_dir present arms the coordinator")
-            .drain(journal, CHECKPOINT_OP)
-            .await
-            .expect("drain the snapshotted prefix");
-
-        let header_at = |op: u64| journal.header(usize::try_from(op).expect("test ops fit usize"));
-        for op in 1..CHECKPOINT_OP {
-            assert!(
-                header_at(op).is_none(),
-                "op {op} is below the checkpoint and must be reclaimed"
-            );
-        }
-        assert!(
-            header_at(CHECKPOINT_OP).is_some(),
-            "the checkpoint op is the commit point and must stay describable in a DVC"
-        );
-        for op in CHECKPOINT_OP + 1..=OPS {
-            assert!(header_at(op).is_some(), "op {op} was never snapshotted");
-        }
-    }
-
     /// Reproduces the single-node "metadata prepare queue is full" wedge
     ///
     /// `checkpoint_if_needed` runs inside `on_replicate`, once per submit.
@@ -4852,7 +4729,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );
@@ -4999,7 +4876,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );
@@ -5124,7 +5001,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );
@@ -5260,7 +5137,7 @@ mod tests {
             1,
             0,
             1,
-            server_common::sharding::METADATA_GROUP,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             NoopBus,
             LocalPipeline::new(),
         );

@@ -30,6 +30,10 @@ inputs:
     description: "Cargo profile: release|debug"
     required: false
     default: "debug"
+  cargo-features:
+    description: "Comma-separated Cargo features"
+    required: false
+    default: ""
   bin:
     description: "Path to server binary (when mode=bin)"
     required: false
@@ -112,11 +116,14 @@ runs:
           else
             OUT="target/debug/$NAME"
           fi
-          if [[ ! -x "$OUT" ]]; then
+          if [[ ! -x "$OUT" || -n "${{ inputs.cargo-features }}" ]]; then
             echo "Building $NAME with cargo ($PROFILE)…"
             CARGO_ARGS=(build --locked --bin "$NAME")
             if [[ "$PROFILE" == "release" ]]; then
               CARGO_ARGS+=(--release)
+            fi
+            if [[ -n "${{ inputs.cargo-features }}" ]]; then
+              CARGO_ARGS+=(--features "${{ inputs.cargo-features }}")
             fi
             cargo "${CARGO_ARGS[@]}"
           fi

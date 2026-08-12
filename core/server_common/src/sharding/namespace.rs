@@ -27,7 +27,7 @@
 // shard. Re-exported here for ergonomics of existing call sites.
 
 pub use iggy_binary_protocol::namespace::{
-    MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_GROUP, PACKED_NAMESPACE_BITS,
+    MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE, PACKED_NAMESPACE_BITS,
     PACKED_NAMESPACE_MAX, PARTITION_BITS, PARTITION_MASK, PARTITION_SHIFT, STREAM_BITS,
     STREAM_MASK, STREAM_SHIFT, TOPIC_BITS, TOPIC_MASK, TOPIC_SHIFT, bits_required,
 };
@@ -149,7 +149,7 @@ impl IggyNamespace {
 #[cfg(test)]
 mod tests {
     use super::{
-        IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_GROUP,
+        IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE,
         NamespaceCapacityError, PACKED_NAMESPACE_BITS, PACKED_NAMESPACE_MAX,
     };
 
@@ -158,26 +158,26 @@ mod tests {
     // STREAM_BITS / TOPIC_BITS / PARTITION_BITS that closes the gap between
     // the packed range and the sentinel will fail to build.
     const _: () = {
-        assert!(METADATA_GROUP > PACKED_NAMESPACE_MAX);
+        assert!(METADATA_CONSENSUS_NAMESPACE > PACKED_NAMESPACE_MAX);
         assert!(PACKED_NAMESPACE_BITS == 12 + 12 + 20);
         assert!(PACKED_NAMESPACE_MAX == (1u64 << PACKED_NAMESPACE_BITS) - 1);
     };
 
     #[test]
     fn metadata_sentinel_cannot_collide_with_any_packable_namespace() {
-        assert!(!IggyNamespace::is_packable(METADATA_GROUP));
+        assert!(!IggyNamespace::is_packable(METADATA_CONSENSUS_NAMESPACE));
 
         // The (0, 0, 0) corner is intentionally a legal partition, which is
         // precisely why `0` is unsuitable as the metadata sentinel.
         let zero = IggyNamespace::new(0, 0, 0);
         assert_eq!(zero.inner(), 0);
         assert!(IggyNamespace::is_packable(zero.inner()));
-        assert_ne!(zero.inner(), METADATA_GROUP);
+        assert_ne!(zero.inner(), METADATA_CONSENSUS_NAMESPACE);
 
         // Maximum packable triple stays inside the packed range.
         let max = IggyNamespace::new(MAX_STREAMS - 1, MAX_TOPICS - 1, MAX_PARTITIONS - 1);
         assert!(IggyNamespace::is_packable(max.inner()));
-        assert_ne!(max.inner(), METADATA_GROUP);
+        assert_ne!(max.inner(), METADATA_CONSENSUS_NAMESPACE);
     }
 
     #[test]

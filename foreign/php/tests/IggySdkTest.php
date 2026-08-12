@@ -222,8 +222,8 @@ final class IggySdkTest extends TestCase
         }
     }
 
-    #[TestDox('sendMessages reports one commit confirmation per written partition')]
-    public function testSendMessagesReportsCommitConfirmation(): void
+    #[TestDox('sendMessages against the legacy server reports no commit confirmations')]
+    public function testSendMessagesReportsNoConfirmationFromLegacyServer(): void
     {
         $client = new_client();
         $streamName = unique_name('confirm-stream');
@@ -235,17 +235,7 @@ final class IggySdkTest extends TestCase
 
             $response = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-first')]);
             assert_instance_of(SendMessagesResponse::class, $response);
-            assert_count(1, $response->confirmations, 'a single-partition send commits in exactly one partition');
-            assert_same($partitionId, $response->confirmations[0]->partition_id);
-
-            // Offsets are per partition and start at 0, so the second send of
-            // the same size must be confirmed one message later.
-            $second = $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('confirm-second')]);
-            assert_same(
-                $response->confirmations[0]->base_offset + 1,
-                $second->confirmations[0]->base_offset,
-                'the confirmed offset must advance by the committed message count'
-            );
+            assert_count(0, $response->confirmations, 'the legacy server answers a send with no offsets');
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

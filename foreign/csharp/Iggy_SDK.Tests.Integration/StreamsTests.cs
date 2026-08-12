@@ -20,7 +20,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -217,9 +216,7 @@ public class StreamsTests
 
         await Should.NotThrowAsync(() => client.PurgeStreamAsync(Identifier.String(streamName)));
 
-        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
-        stream = await Eventually.ReadAsync(() => client.GetStreamByIdAsync(Identifier.String(streamName)),
-            purged => purged?.MessagesCount == 0, TimeSpan.FromSeconds(10));
+        stream = await client.GetStreamByIdAsync(Identifier.String(streamName));
         stream.ShouldNotBeNull();
         stream.MessagesCount.ShouldBe(0u);
         stream.TopicsCount.ShouldBe(1);

@@ -29,6 +29,9 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "README.md"
 
+[features]
+vsr = ["iggy_common/vsr"]
+
 [dependencies]
 async-broadcast = { workspace = true }
 async-dropper = { workspace = true }

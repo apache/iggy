@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { ClientConfig } from './client.type.js';
+import type { ClientConfig, Protocol } from './client.type.js';
 
 export const DEFAULT_MAX_RESPONSE_FRAME_SIZE = 64 * 1024 * 1024;
 
+const isProtocol = (value: unknown): value is Protocol =>
+  value === 'classic' || value === 'vsr';
+
 export const normalizeClientConfig = (
   config: ClientConfig
-): ClientConfig => {
+): ClientConfig & { protocol: Protocol } => {
+  const protocol = config.protocol ?? 'classic';
+  if (!isProtocol(protocol))
+    throw new TypeError(`unsupported wire protocol: ${String(protocol)}`);
+
   const maxResponseFrameSize =
     config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE;
   if (!Number.isSafeInteger(maxResponseFrameSize) ||
@@ -30,15 +37,17 @@ export const normalizeClientConfig = (
       'maxResponseFrameSize must be a safe integer of at least 256 bytes'
     );
 
-  if ((config.poolSize?.min ?? 1) > 1 || (config.poolSize?.max ?? 1) > 1)
+  if (protocol === 'vsr' &&
+      ((config.poolSize?.min ?? 1) > 1 || (config.poolSize?.max ?? 1) > 1))
     throw new TypeError(
       'VSR clients currently support exactly one pooled connection'
     );
 
   return {
     ...config,
+    protocol,
     options: { ...config.options },
     maxResponseFrameSize,
-    poolSize: { min: 1, max: 1 }
+    ...(protocol === 'vsr' ? { poolSize: { min: 1, max: 1 } } : {})
   };
 };

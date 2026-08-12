@@ -21,7 +21,7 @@ use crate::version::ClientVersionInfo;
 use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretString};
 
-/// Combined login-with-PAT + register request for the server.
+/// Combined login-with-PAT + register request for server-ng.
 ///
 /// Shares the `ClientVersionInfo` prefix with `LoginRegisterRequest` so the
 /// server gates on the protocol version once before attempting either body

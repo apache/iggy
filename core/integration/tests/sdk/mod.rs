@@ -16,10 +16,13 @@
 // under the License.
 
 mod consumer_group;
+#[cfg(feature = "vsr")]
 mod consumer_group_membership;
 mod hello_world;
+#[cfg(feature = "vsr")]
 mod http_refresh;
 mod producer;
+#[cfg(feature = "vsr")]
 mod protocol_version;
 mod raw;
 mod send_confirmation;

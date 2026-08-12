@@ -29,7 +29,10 @@ use iggy::prelude::Client;
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
+#[cfg(feature = "vsr")]
 use predicates::str::contains;
+#[cfg(not(feature = "vsr"))]
+use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
 
@@ -147,12 +150,21 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
             }
         );
 
-        // The server has no on-demand flush primitive: FLUSH_UNSAVED_BUFFER
+        // server-ng has no on-demand flush primitive: FLUSH_UNSAVED_BUFFER
         // surfaces a typed FeatureUnavailable (see flush_vsr.rs), so the CLI
         // reports a flush problem instead of success.
+        #[cfg(feature = "vsr")]
         command_state.failure().stderr(contains(format!(
             "Problem flushing messages {identification_part}"
         )));
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            let message = format!(
+                "Executing flush messages {identification_part}\nFlushed messages {identification_part}\n"
+            );
+            command_state.success().stdout(diff(message));
+        }
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
