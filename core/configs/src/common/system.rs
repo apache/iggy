@@ -175,6 +175,8 @@ pub struct RecoveryConfig {
 pub struct SegmentConfig {
     #[config_env(leaf)]
     pub size: IggyByteSize,
+    #[serde(default)]
+    pub preallocate: bool,
     #[config_env(leaf)]
     pub cache_indexes: CacheIndexesConfig,
     pub archive_expired: bool,
