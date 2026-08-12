@@ -154,6 +154,8 @@ runs:
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
 
     - name: Run PHP SDK tests
       if: inputs.task == 'test'
@@ -180,6 +182,7 @@ runs:
       id: iggy-tls
       uses: ./.github/actions/utils/server-start
       with:
+        cargo-bin: iggy-server
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:

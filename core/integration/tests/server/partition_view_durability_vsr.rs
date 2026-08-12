@@ -29,7 +29,7 @@
 //! partition data path rides along.
 //!
 //! vsr-only: partition consensus groups and their superblocks exist only on
-//! `iggy-server-ng`.
+//! `iggy-server`.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -44,7 +44,7 @@ use tokio::time::sleep;
 
 const STREAM_NAME: &str = "partition-view-durability-stream";
 const TOPIC_NAME: &str = "partition-view-durability-topic";
-/// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
+/// Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 const MESSAGES_COUNT: u32 = 10;
 

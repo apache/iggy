@@ -51,7 +51,6 @@ login-session = [
     "dep:apple-native-keyring-store",
     "dep:windows-native-keyring-store",
 ]
-vsr = ["iggy/vsr"]
 
 [dependencies]
 anyhow = { workspace = true }

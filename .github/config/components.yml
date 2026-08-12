@@ -121,7 +121,6 @@ components:
       - "rust-cluster"
     paths:
       - "core/server/**"
-      - "core/server-ng/**"
 
   rust-cluster:
     depends_on:
@@ -176,7 +175,7 @@ components:
       - "machete"
       - "test-1"
       - "test-2"
-      - "compat"
+      - "test-3"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
@@ -250,7 +249,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/node/**"
-    tasks: ["lint", "test", "build", "e2e", "e2e-vsr"]
+    tasks: ["lint", "test", "build", "e2e"]
 
   sdk-go:
     depends_on:
@@ -264,8 +263,7 @@ components:
       # The SDK compiles against the VSR wire contract, so a change to the
       # protocol crate or the VSR server must rerun it.
       - "core/binary_protocol/**"
-      # TODO: change to core/server once legacy server is removed (core/server has VSR support)
-      - "core/server-ng/**"
+      - "core/server/**"
     # VSR is the only protocol the Go SDK speaks, so there is no separate lane.
     tasks: ["lint", "test", "build", "e2e"]
 
@@ -306,7 +304,6 @@ components:
       - "bdd/docker-compose.server.yml"
       - "bdd/docker-compose.cluster.yml"
       - "bdd/docker-compose.coverage.yml"
-      - "bdd/docker-compose.vsr.yml"
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
@@ -318,7 +315,7 @@ components:
     paths:
       - "bdd/rust/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-rust", "bdd-rust-vsr"]
+    tasks: ["bdd-rust"]
 
   bdd-python:
     depends_on:
@@ -356,8 +353,7 @@ components:
       - "bdd/scenarios/**"
       # The Go suites run against the VSR server, so its sources gate them.
       - "core/binary_protocol/**"
-      # TODO: change to core/server once legacy server is removed (core/server has VSR support)
-      - "core/server-ng/**"
+      - "core/server/**"
     tasks: ["bdd-go", "bdd-go-race"]
 
   bdd-node:
@@ -370,7 +366,7 @@ components:
     paths:
       - "bdd/node/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-node", "bdd-node-vsr"]
+    tasks: ["bdd-node"]
 
   bdd-csharp:
     depends_on:

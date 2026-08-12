@@ -627,7 +627,7 @@ pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
     // count the overflow stops happening and the test silently passes without
     // covering the floor path. Fail loud instead.
     const _: () = assert!(
-        RING_OVERFLOW_OPS as usize > configs::ng_partition::DEFAULT_EVICTED_RING_CAPACITY,
+        RING_OVERFLOW_OPS as usize > configs::partition::DEFAULT_EVICTED_RING_CAPACITY,
         "RING_OVERFLOW_OPS must exceed the default evicted ring capacity, or this scenario no longer exercises RangeEvicted",
     );
 

@@ -22,12 +22,9 @@
 //! frame carrying `IncompatibleProtocol` plus the accepted window; a body
 //! without a decodable prefix with `MalformedLogin` and a zero window.
 
-#![cfg(feature = "vsr")]
-
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{Command2, Operation, RequestHeader};
-use iggy_binary_protocol::namespace::METADATA_CONSENSUS_NAMESPACE;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireName,
@@ -88,7 +85,6 @@ async fn assert_login_evicted(
         client: 0xC0FFEE,
         session: 0,
         request: 0,
-        namespace: METADATA_CONSENSUS_NAMESPACE,
         ..Default::default()
     };
 

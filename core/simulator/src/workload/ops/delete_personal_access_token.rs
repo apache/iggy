@@ -18,7 +18,7 @@
 //! `DeletePersonalAccessToken` op. Targets `Ok` (a live token) or `NotFound`
 //! (a fabricated name).
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -51,7 +51,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.delete_personal_access_token(&input.name)
 }
 

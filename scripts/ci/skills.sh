@@ -23,6 +23,9 @@
 
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 

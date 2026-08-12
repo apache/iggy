@@ -289,11 +289,8 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
-    // The exact byte size is framing-specific: legacy counts a 64-byte header
-    // per message; server-ng counts its on-disk batch framing.
-    #[cfg(not(feature = "vsr"))]
-    assert_eq!(topic.size, 100502);
-    #[cfg(feature = "vsr")]
+    // The exact byte size tracks the on-disk batch framing, so only its
+    // presence is asserted here.
     assert!(topic.size > 0);
     assert_eq!(topic.messages_count, MESSAGES_COUNT as u64);
     let topic_partition = topic.partitions.get((PARTITION_ID) as usize).unwrap();

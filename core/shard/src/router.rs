@@ -27,7 +27,7 @@ use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHea
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
-use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
 
 /// How often the shard pump drives `VsrConsensus::tick`.
@@ -46,63 +46,63 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
     match bag {
         MessageBag::Request(r) => {
             let h = *r.header();
-            (h.operation, h.namespace, r.into_generic())
+            (h.operation, h.group, r.into_generic())
         }
         MessageBag::Prepare(p) => {
             let h = *p.header();
-            (h.operation, h.namespace, p.into_generic())
+            (h.operation, h.group, p.into_generic())
         }
         MessageBag::PrepareOk(p) => {
             let h = *p.header();
-            (h.operation, h.namespace, p.into_generic())
+            (h.operation, h.group, p.into_generic())
         }
         MessageBag::StartViewChange(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::DoViewChange(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::StartView(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::Commit(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestStartView(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestPrepares(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RepairPrepare(m) => {
             let h = *m.header();
-            (h.0.operation, h.0.namespace, m.into_generic())
+            (h.0.operation, h.0.group, m.into_generic())
         }
         MessageBag::RepairRangeReply(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestStateTransfer(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::StateTransferTarget(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::RequestStateChunk(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
         MessageBag::StateChunk(m) => {
             let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
+            (h.operation(), h.group, m.into_generic())
         }
     }
 }
@@ -150,7 +150,7 @@ where
                 // consensus-op additions need a version fence (release_min /
                 // release_max bounds on the replica plane) before this arm is
                 // safe to hit.
-                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+                tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
         };
@@ -163,7 +163,7 @@ where
     /// The simulator's dispatch shell uses this to drive `SimClient` requests
     /// through the real `on_client_request` path (auth, session binding,
     /// consensus submit, reply) instead of the raw `dispatch` routing the
-    /// shell-off fast path takes. No production caller: a `-p iggy-server-ng`
+    /// shell-off fast path takes. No production caller: a `-p iggy-server`
     /// build excludes the `simulator` feature and this method.
     #[cfg(any(test, feature = "simulator"))]
     pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
@@ -195,7 +195,7 @@ where
     ///    frame (`StartViewChange`, `DoViewChange`, `StartView`, `Commit`)
     ///    or a client `Register` request. The owning consensus group is
     ///    identified by `namespace_u64`:
-    ///    - `METADATA_CONSENSUS_NAMESPACE` -> shard 0.
+    ///    - `METADATA_GROUP` -> shard 0.
     ///    - packable `IggyNamespace::inner()` -> the shard owning that
     ///      partition's consensus group.
     fn route_typed(
@@ -242,7 +242,7 @@ where
             "route_typed: operation {operation:?} fell through unclassified; \
              expected is_metadata / is_partition / is_vsr_reserved"
         );
-        if namespace_u64 == METADATA_CONSENSUS_NAMESPACE {
+        if namespace_u64 == METADATA_GROUP {
             self.try_send_to_target(0, generic, operation);
             return;
         }
@@ -572,7 +572,7 @@ where
                 // Only shard 0 owns the metadata consensus group, and
                 // `forward_metadata_submit` always addresses shard 0, so a
                 // non-zero shard here is a routing bug. The handler (wired
-                // by server-ng) replies `None` on the carried sender if it
+                // by the server) replies `None` on the carried sender if it
                 // cannot submit, so the awaiting peer never blocks forever.
                 debug_assert_eq!(
                     self.id, 0,
@@ -583,7 +583,7 @@ where
             LifecycleFrame::ListClients { reply } => {
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
-                // (wired by server-ng) reads this shard's `SessionManager`
+                // (wired by the server) reads this shard's `SessionManager`
                 // and pushes the list over `reply`.
                 (self.on_list_clients)(reply);
             }
@@ -594,7 +594,7 @@ where
             } => {
                 // Addressed to the shard owning `namespace` (the sender
                 // resolved it via the shards table). The handler (wired by
-                // server-ng) runs the read against this shard's partitions
+                // the server) runs the read against this shard's partitions
                 // plane and pushes the result over `reply`; a dropped
                 // sender means the read is skipped and the gather side
                 // times out.
