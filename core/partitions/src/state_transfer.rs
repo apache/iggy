@@ -2331,6 +2331,7 @@ where
                     messages_w.size_counter(),
                     config.enforce_fsync,
                     true,
+                    config.preallocate_segments.then_some(config.segment_size),
                 )
                 .await
                 .map_err(|source| PartitionInstallError::SegmentOpen {
