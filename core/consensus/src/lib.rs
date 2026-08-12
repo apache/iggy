@@ -56,6 +56,9 @@ pub trait Pipeline {
 
     fn len(&self) -> usize;
 
+    /// Requests parked waiting for a prepare slot (the second queue).
+    fn request_queue_len(&self) -> usize;
+
     /// In-flight prepare-queue capacity. `VsrConsensus` snapshots it at
     /// construction to size the loopback queue and to bound the uncommitted
     /// range a new primary may rebuild after a view change.

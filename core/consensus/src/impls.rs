@@ -268,7 +268,7 @@ pub struct RequestEntry {
     // TODO: populate from monotonic clock at push, promote to `pub` for
     // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
     #[allow(dead_code)]
-    pub(crate) received_at: i64,
+    pub(crate) received_at: u64,
     /// In-process reply subscriber, carried through the queue so promotion
     /// can hand it to the pipeline entry (see [`PipelineEntry::with_sender`]).
     /// `None` = network path. Dropping a queued entry (view-change reset,
@@ -726,6 +726,10 @@ impl Pipeline for LocalPipeline {
 
     fn pop_request(&mut self) -> Option<Self::Request> {
         Self::pop_request(self)
+    }
+
+    fn request_queue_len(&self) -> usize {
+        Self::request_queue_len(self)
     }
 }
 
@@ -1458,17 +1462,105 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.get()
     }
 
-    // TODO(hubcio): returning &RefCell<P> leaks interior mutability - callers
-    // could hold a Ref/RefMut across an .await and cause a runtime panic.
-    // We had this problem with slab + ECS.
+    /// Run `f` against the pipeline.
+    ///
+    /// The borrow cannot escape `f`, so it cannot be held across an `.await` and
+    /// alias a sibling task's `borrow_mut` into a `BorrowMutError` panic. Same
+    /// shape, and the same reason, as `IggyPartitions::with_partition`. Prefer
+    /// the named accessors below; this is for the few callers that need several
+    /// reads under one borrow.
+    pub fn with_pipeline<R>(&self, f: impl FnOnce(&P) -> R) -> R {
+        f(&self.pipeline.borrow())
+    }
+
+    /// [`Self::with_pipeline`] for a mutating operation.
+    ///
+    /// Callers that pop or clear should prefer [`Self::pop_committed_prepare`] /
+    /// [`Self::clear_pipeline`], which also keep the prepare timeout's
+    /// ticking-iff-non-empty invariant. This form does not.
+    pub fn with_pipeline_mut<R>(&self, f: impl FnOnce(&mut P) -> R) -> R {
+        f(&mut self.pipeline.borrow_mut())
+    }
+
+    /// Whether the prepare queue is at its depth bound; callers route to
+    /// [`Self::push_queued_request`] on `true`.
     #[must_use]
-    pub const fn pipeline(&self) -> &RefCell<P> {
-        &self.pipeline
+    pub fn pipeline_is_full(&self) -> bool {
+        self.pipeline.borrow().is_full()
     }
 
     #[must_use]
-    pub const fn pipeline_mut(&mut self) -> &mut RefCell<P> {
-        &mut self.pipeline
+    pub fn pipeline_is_empty(&self) -> bool {
+        self.pipeline.borrow().is_empty()
+    }
+
+    /// In-flight prepare count.
+    #[must_use]
+    pub fn pipeline_len(&self) -> usize {
+        self.pipeline.borrow().len()
+    }
+
+    /// Requests parked waiting for a prepare slot.
+    #[must_use]
+    pub fn request_queue_len(&self) -> usize {
+        self.pipeline.borrow().request_queue_len()
+    }
+
+    /// Whether either queue already carries a request from `client_id`: the
+    /// metadata plane's in-flight dedup.
+    #[must_use]
+    pub fn pipeline_has_message_from_client(&self, client_id: u128) -> bool {
+        self.pipeline.borrow().has_message_from_client(client_id)
+    }
+
+    /// Header of the oldest in-flight prepare.
+    #[must_use]
+    pub fn pipeline_head_header(&self) -> Option<PrepareHeader> {
+        self.pipeline.borrow().head().map(|entry| entry.header)
+    }
+
+    /// Whether an in-flight prepare matches `(op, checksum)`: the ack paths' test
+    /// that the frame they are about to count still describes a live entry.
+    #[must_use]
+    pub fn pipeline_holds_entry(&self, op: u64, checksum: u128) -> bool {
+        self.pipeline
+            .borrow()
+            .entry_by_op_and_checksum(op, checksum)
+            .is_some()
+    }
+
+    /// Park a request that could not take a prepare slot. `Err` hands it back
+    /// when the request queue is also full.
+    ///
+    /// # Errors
+    /// The entry itself, when the request queue is at its depth bound.
+    pub fn push_queued_request(&self, entry: P::Request) -> Result<(), P::Request> {
+        self.pipeline.borrow_mut().push_request(entry)
+    }
+
+    /// Promote the oldest parked request, if any.
+    pub fn pop_queued_request(&self) -> Option<P::Request> {
+        self.pipeline.borrow_mut().pop_request()
+    }
+
+    /// Pop the pipeline head once its op has committed, keeping the prepare
+    /// timeout's lifecycle in step.
+    ///
+    /// The timeout measures the age of the oldest un-acked prepare, so draining
+    /// the head has to either stop it (nothing left to retransmit) or restart it
+    /// (the next entry becomes the oldest, and it must be timed from now rather
+    /// than inheriting the drained entry's elapsed ticks). Arming happens in
+    /// [`Self::push_prepare_entry`]; between the two the invariant is "ticking
+    /// iff the pipeline is non-empty".
+    pub fn pop_committed_prepare(&self) -> Option<P::Entry> {
+        self.pipeline.borrow_mut().pop()
+    }
+
+    /// Drop every in-flight prepare and parked request, and disarm the prepare
+    /// timeout with them (a view change re-prepares from the new primary; there
+    /// is nothing left here to retransmit).
+    pub fn clear_pipeline(&self) {
+        self.pipeline.borrow_mut().clear();
     }
 
     /// Push a pre-built [`PipelineEntry`]; start prepare timeout if idle.
@@ -4589,7 +4681,7 @@ mod vsr_consensus_tests {
         assert_eq!(consensus.sequencer().current_sequence(), 7);
         assert_eq!(consensus.last_prepare_checksum(), PARENT);
         assert!(
-            consensus.pipeline().borrow().is_empty(),
+            consensus.pipeline_is_empty(),
             "the reclaimed op must not stay live in the pipeline; the next request reuses it"
         );
     }
@@ -4615,7 +4707,7 @@ mod vsr_consensus_tests {
         );
         assert_eq!(consensus.sequencer().current_sequence(), 9);
         assert_eq!(
-            consensus.pipeline().borrow().len(),
+            consensus.pipeline_len(),
             2,
             "a refused rollback must not touch the pipeline"
         );

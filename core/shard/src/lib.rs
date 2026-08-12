@@ -8361,10 +8361,11 @@ fn rebuild_pipeline_entries<B, P>(
         );
     }
 
-    let mut pipeline = consensus.pipeline().borrow_mut();
-    for entry in entries {
-        pipeline.push(entry);
-    }
+    consensus.with_pipeline_mut(|pipeline| {
+        for entry in entries {
+            pipeline.push(entry);
+        }
+    });
 }
 
 /// Snapshot this replica's uncommitted suffix into consensus, if the journal has

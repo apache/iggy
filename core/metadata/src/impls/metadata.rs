@@ -1011,11 +1011,8 @@ where
         // Two-queue admission: prepare slot then project+replicate; prepare
         // full + request room then buffer; both full then drop+warn (SDK
         // retries via read-timeout).
-        if consensus.pipeline().borrow().is_full() {
-            let push_result = consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(consensus::RequestEntry::new(message));
+        if consensus.pipeline_is_full() {
+            let push_result = consensus.push_queued_request(consensus::RequestEntry::new(message));
             if push_result.is_err() {
                 warn!(
                     target: "iggy.metadata.diag",
@@ -1291,11 +1288,7 @@ where
         }
 
         {
-            let pipeline = consensus.pipeline().borrow();
-            if pipeline
-                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
-                .is_none()
-            {
+            if !consensus.pipeline_holds_entry(header.op, header.prepare_checksum) {
                 debug!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
@@ -1921,11 +1914,7 @@ where
         // commit a second register and bump the epoch past the first reply's.
         // Surface pre-synthesis. Scans both the prepare queue and the request
         // queue, so a register absorbed below dedups its own replays.
-        if consensus
-            .pipeline()
-            .borrow()
-            .has_message_from_client(client_id)
-        {
+        if consensus.pipeline_has_message_from_client(client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
 
@@ -1954,14 +1943,9 @@ where
         // re-runs `register_preflight` and so applies the ownership gate) as
         // soon as the in-flight batch drains, and the await below resolves
         // exactly like the direct dispatch would.
-        if !is_caught_up_primary(consensus) || consensus.pipeline().borrow().is_full() {
+        if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
-            if consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(entry)
-                .is_err()
-            {
+            if consensus.push_queued_request(entry).is_err() {
                 // Both queues full: honest terminal backpressure.
                 return Err(MetadataSubmitError::PipelineFull);
             }
@@ -2129,11 +2113,7 @@ where
             return Err(MetadataSubmitError::NotPrimary);
         }
 
-        if consensus
-            .pipeline()
-            .borrow()
-            .has_message_from_client(client_id)
-        {
+        if consensus.pipeline_has_message_from_client(client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
 
@@ -2149,14 +2129,9 @@ where
         // Prepare queue full: absorb into the request queue with this
         // caller's reply subscriber, promoted as
         // commits free slots.
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
-            if consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(entry)
-                .is_err()
-            {
+            if consensus.push_queued_request(entry).is_err() {
                 return Err(MetadataSubmitError::PipelineFull);
             }
             return match receiver.await {
@@ -2246,14 +2221,10 @@ where
                 },
             );
         }
-        if consensus
-            .pipeline()
-            .borrow()
-            .has_message_from_client(internal_client_id)
-        {
+        if consensus.pipeline_has_message_from_client(internal_client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             return Err(MetadataSubmitError::PipelineFull);
         }
 
@@ -2329,7 +2300,7 @@ where
             );
         }
 
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             return Err(MetadataSubmitError::PipelineFull);
         }
 
@@ -2452,14 +2423,9 @@ where
         // with the committed reply. Only a full request queue is terminal
         // (`TransientNotAccepted`, re-issuable anywhere: the request never
         // entered a queue).
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(message);
-            if consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(entry)
-                .is_err()
-            {
+            if consensus.push_queued_request(entry).is_err() {
                 return Ok(build_result_rejection_reply(
                     &request_header,
                     consensus.commit_max(),
@@ -2599,8 +2565,7 @@ where
         // Snapshot durable, self-unacked pending ops, dropping the pipeline and
         // journal borrows before the `send_prepare_ok` awaits below.
         let mut headers: Vec<PrepareHeader> = Vec::new();
-        {
-            let pipeline = consensus.pipeline().borrow();
+        consensus.with_pipeline(|pipeline| {
             let from = consensus.commit_max() + 1;
             let to = consensus.sequencer().current_sequence();
             for op in from..=to {
@@ -2616,7 +2581,7 @@ where
                     headers.push(header);
                 }
             }
-        }
+        });
         if headers.is_empty() {
             return;
         }
@@ -2719,21 +2684,18 @@ where
 
             // Revalidate after the await: a sibling driver may have
             // committed this op (and more) while we were parked.
-            let head_is_ours = consensus.pipeline().borrow().head().is_some_and(|head| {
-                head.header.op == prepare_header.op
-                    && head.header.checksum == prepare_header.checksum
+            let head_is_ours = consensus.pipeline_head_header().is_some_and(|head| {
+                head.op == prepare_header.op && head.checksum == prepare_header.checksum
             });
             if !head_is_ours {
                 continue;
             }
 
             let mut entry = consensus
-                .pipeline()
-                .borrow_mut()
-                .pop()
+                .pop_committed_prepare()
                 .expect("on_ack: revalidated head exists");
 
-            let pipeline_depth = consensus.pipeline().borrow().len();
+            let pipeline_depth = consensus.pipeline_len();
             let event = CommitLogEvent {
                 replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
                 op: prepare_header.op,
@@ -2895,10 +2857,8 @@ where
             return;
         }
         let stranded_commits = consensus.commit_min() < consensus.commit_max();
-        let promotable_requests = {
-            let pipeline = consensus.pipeline().borrow();
-            !pipeline.request_queue_is_empty() && !pipeline.is_full()
-        };
+        let promotable_requests = consensus
+            .with_pipeline(|pipeline| !pipeline.request_queue_is_empty() && !pipeline.is_full());
         if !stranded_commits && !promotable_requests {
             return;
         }
@@ -2923,10 +2883,10 @@ where
         // one commit window drains the moment the window closes. Promoted
         // prepares are un-quorum'd, so they never re-close the gate here.
         loop {
-            if consensus.pipeline().borrow().is_full() {
+            if consensus.pipeline_is_full() {
                 break;
             }
-            let req = consensus.pipeline().borrow_mut().pop_request();
+            let req = consensus.pop_queued_request();
             let Some(mut req) = req else { break };
 
             let client_id = req.message.header().client;
@@ -5206,7 +5166,7 @@ mod tests {
             "mid-window register must park in the request queue, not error"
         );
         assert_eq!(
-            consensus.pipeline().borrow().request_queue_len(),
+            consensus.request_queue_len(),
             1,
             "register buffered in the request queue"
         );
@@ -5224,7 +5184,7 @@ mod tests {
         assert!(resumed, "B's commit must complete and promote the register");
         assert_eq!(consensus.commit_min(), 1, "B's op committed");
         assert_eq!(
-            consensus.pipeline().borrow().request_queue_len(),
+            consensus.request_queue_len(),
             0,
             "promotion emptied the request queue"
         );
@@ -5339,7 +5299,7 @@ mod tests {
         // C's register lands in the window: absorbed into the request queue.
         let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
         assert!(register.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+        assert_eq!(consensus.request_queue_len(), 1);
 
         // The committing driver dies at its await — the hyper-disconnect
         // analogue. Commit and promotion are now stranded: op 1 is quorum'd
@@ -5348,7 +5308,7 @@ mod tests {
         drop(driver);
         assert_eq!(consensus.commit_max(), 1);
         assert_eq!(consensus.commit_min(), 0);
-        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+        assert_eq!(consensus.request_queue_len(), 1);
         assert!(
             register.as_mut().poll(&mut cx).is_pending(),
             "queued register must still be parked with no driver alive"
@@ -5359,11 +5319,7 @@ mod tests {
         // (its self-ack lands on the loopback).
         md.resume_stranded_commits().await;
         assert_eq!(consensus.commit_min(), 1, "stranded op 1 applied");
-        assert_eq!(
-            consensus.pipeline().borrow().request_queue_len(),
-            0,
-            "queued register promoted"
-        );
+        assert_eq!(consensus.request_queue_len(), 0, "queued register promoted");
 
         // Commit the promoted register (production: pump loopback drain)
         // and the parked caller resolves with its session.
@@ -5461,7 +5417,7 @@ mod tests {
         );
         assert_eq!(consensus.last_prepare_checksum(), parent);
         assert!(
-            consensus.pipeline().borrow().is_empty(),
+            consensus.pipeline_is_empty(),
             "the undurable prepare must not stay live in the pipeline"
         );
         #[allow(clippy::cast_possible_truncation)]
