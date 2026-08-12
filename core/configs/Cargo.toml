@@ -37,4 +37,3 @@ server_common = { workspace = true }
 static-toml = { workspace = true }
 strum = { workspace = true }
 tracing = { workspace = true }
-tungstenite = { workspace = true }

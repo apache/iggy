@@ -24,7 +24,7 @@ import os
 import socket
 import time
 
-from apache_iggy import IggyClient, TopicDetails
+from apache_iggy import IggyClient
 
 # Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
 MIN_USERNAME_BYTES = 3
@@ -113,37 +113,6 @@ async def wait_for_ping(
                     f"Server not responding to ping after {timeout}s"
                 ) from err
             await asyncio.sleep(interval)
-
-
-async def wait_for_purged_topic(
-    client: IggyClient, stream: str, topic: str, timeout: float = 10.0
-) -> TopicDetails:
-    """
-    Poll get_topic until a committed purge is reflected in the stats.
-
-    The VSR server acknowledges a purge once it commits; partition data
-    is pruned asynchronously, so stats can transiently report pre-purge
-    counts.
-
-    Returns:
-        TopicDetails once messages_count and size reach 0
-
-    Raises:
-        TimeoutError: If the purge is not reflected within timeout
-    """
-    deadline = time.time() + timeout
-
-    while True:
-        details = await client.get_topic(stream, topic)
-        assert details is not None, "purged topic must still exist"
-        if details.messages_count == 0 and details.size == 0:
-            return details
-        if time.time() >= deadline:
-            raise TimeoutError(
-                f"purge of {stream}/{topic} not reflected after {timeout}s: "
-                f"messages_count={details.messages_count} size={details.size}"
-            )
-        await asyncio.sleep(0.05)
 
 
 def unique_credentials(unique_name) -> tuple[str, str]:

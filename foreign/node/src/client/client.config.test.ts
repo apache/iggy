@@ -30,55 +30,34 @@ const config = (): ClientConfig => ({
 });
 
 describe('normalizeClientConfig', () => {
-  it('defaults to classic without changing classic pool sizing', () => {
-    const normalized = normalizeClientConfig({
-      ...config(),
-      poolSize: { min: 2, max: 4 }
-    });
+  it('applies the default response frame limit', () => {
+    const normalized = normalizeClientConfig(config());
 
-    assert.equal(normalized.protocol, 'classic');
-    assert.deepEqual(normalized.poolSize, { min: 2, max: 4 });
     assert.equal(
       normalized.maxResponseFrameSize,
       DEFAULT_MAX_RESPONSE_FRAME_SIZE
     );
   });
 
-  it('restricts VSR to one pooled connection', () => {
-    const normalized = normalizeClientConfig({
-      ...config(),
-      protocol: 'vsr'
-    });
+  it('restricts the client to one pooled connection', () => {
+    const normalized = normalizeClientConfig(config());
     assert.deepEqual(normalized.poolSize, { min: 1, max: 1 });
 
     assert.throws(
       () => normalizeClientConfig({
         ...config(),
-        protocol: 'vsr',
         poolSize: { max: 2 }
       }),
       /exactly one pooled connection/
     );
   });
 
-  it('rejects invalid protocols before opening a socket', () => {
-    assert.throws(
-      () => normalizeClientConfig({
-        ...config(),
-        protocol: 'auto' as 'vsr'
-      }),
-      /unsupported wire protocol/
-    );
-  });
-
-  it('supports VSR over TLS', () => {
+  it('supports TLS transport', () => {
     const normalized = normalizeClientConfig({
       ...config(),
-      protocol: 'vsr',
       transport: 'TLS'
     });
 
-    assert.equal(normalized.protocol, 'vsr');
     assert.equal(normalized.transport, 'TLS');
     assert.deepEqual(normalized.poolSize, { min: 1, max: 1 });
   });

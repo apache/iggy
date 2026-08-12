@@ -16,63 +16,55 @@
 // under the License.
 
 // a2a_jwt exercises trusted-issuer (JWKS) tokens; both the legacy verifier and
-// server-ng's ported trusted-issuer path verify them.
+// the server's ported trusted-issuer path verify them.
 mod a2a_jwt;
 mod cg;
-// Flush (FLUSH_UNSAVED_BUFFER) has no server-ng primitive; it must deny typed.
-#[cfg(feature = "vsr")]
+// Flush (FLUSH_UNSAVED_BUFFER) has no the server primitive; it must deny typed.
 mod flush_vsr;
-// Legacy login codes (LOGIN_USER / LOGIN_WITH_PAT) have no server-ng handler;
+// Legacy login codes (LOGIN_USER / LOGIN_WITH_PAT) have no the server handler;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
-#[cfg(feature = "vsr")]
 mod legacy_login_vsr;
+// A failed credential login must report the credential failure, not the
+// payload shape it fell through to.
+mod login_credentials_vsr;
 // Poll addressing + timestamp semantics: typed PartitionNotFound on a bad
 // partition id, at-or-after timestamp polls.
-#[cfg(feature = "vsr")]
 mod poll_semantics_vsr;
 // Create-topic static bounds deny typed before consensus.
-#[cfg(feature = "vsr")]
 mod topic_admission_vsr;
+// Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
+mod stats_vsr;
 // Purge durability: applied generation survives restart; journal-resident
 // purged batches stay fenced behind the purge floor.
-#[cfg(feature = "vsr")]
 mod purge_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
-// server-ng suites below.
-#[cfg(feature = "vsr")]
+// server suites below.
 mod http_client;
-// Raw-HTTP data-plane contract against server-ng's shard-0 listener.
-#[cfg(feature = "vsr")]
+// Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
-// Raw-HTTP wire-contract residue against server-ng (status codes + typed error
+// Raw-HTTP wire-contract residue against the server (status codes + typed error
 // bodies); the RBAC matrix lives in permissions_scenario.
-#[cfg(feature = "vsr")]
 mod http_rbac;
-// End-to-end HTTPS: server-ng serves the REST listener over TLS and negotiates
+// End-to-end HTTPS: the server serves the REST listener over TLS and negotiates
 // HTTP/2 via ALPN.
-#[cfg(feature = "vsr")]
 mod http_tls;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
-#[cfg(feature = "vsr")]
 mod cluster_metadata_vsr;
 // A metadata view change must persist the advanced view and recover it from disk
 // across a replica restart.
-#[cfg(feature = "vsr")]
 mod cluster_view_durability_vsr;
 // A partition view change must persist the advanced view in that group's own
 // superblock and recover it from disk across a replica restart.
-#[cfg(feature = "vsr")]
 mod partition_view_durability_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;
 mod general;
-// The per-shard segment cleaner deletes expired / oversize segments from disk
-// under both the legacy server and server-ng.
+// The per-shard segment cleaner deletes expired / oversize segments from disk.
 mod message_cleanup;
 mod message_retrieval;
 // Server restarts, consumer-group barriers, and DeleteSegments maintenance.
-// The full restart matrix (consumer variants included) runs under server-ng:
+// The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
 mod purge_delete;
 mod scenarios;

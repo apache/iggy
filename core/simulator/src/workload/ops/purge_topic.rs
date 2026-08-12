@@ -18,7 +18,7 @@
 //! `PurgeTopic` op. Targets `Ok` (live topic), `StreamNotFound` (fabricated
 //! parent stream), or `TopicNotFound` (live stream, fabricated topic).
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -62,7 +62,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.purge_topic(&input.stream, &input.topic)
 }
 

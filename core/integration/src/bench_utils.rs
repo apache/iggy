@@ -34,10 +34,9 @@ const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
 // Generous for a few MB of traffic even in debug builds, and deliberately
 // UNDER nextest's harness timeout (`.config/nextest.toml` sigkills at
 // 60s x 5): a longer wait here would never fire, taking the capture dump and
-// the `--features vsr` hint below with it. Exists because a protocol mismatch
-// (an SDK framing the server does not speak, e.g. a default-features
-// iggy-bench against a vsr cluster) hangs both sides silently instead of
-// erroring.
+// the stale-binary hint below with it. Exists because a stale prebuilt
+// iggy-bench speaking an outdated protocol hangs both sides silently
+// instead of erroring.
 const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub fn run_bench_and_wait_for_finish(
@@ -156,9 +155,9 @@ pub fn run_bench_and_wait_for_finish(
 
     assert!(
         !timed_out,
-        "iggy-bench did not finish within {BENCH_WAIT_TIMEOUT:?}; if the server \
-         runs in vsr mode, make sure iggy-bench was built with --features vsr \
-         (the SDK framing is chosen at compile time)"
+        "iggy-bench did not finish within {BENCH_WAIT_TIMEOUT:?}; the harness \
+         spawns the prebuilt binary, so make sure iggy-bench was rebuilt \
+         alongside the server (a stale binary hangs instead of erroring)"
     );
     assert!(status.is_some_and(|status| status.success()));
 }

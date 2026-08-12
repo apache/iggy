@@ -16,7 +16,9 @@
 // under the License.
 
 pub mod client;
+mod config;
 mod consumer;
+mod duration;
 mod identifier;
 mod permissions;
 mod receive_message;
@@ -27,6 +29,7 @@ mod user;
 mod user_headers;
 
 use client::IggyClient;
+use config::{AutoLogin, TcpConfig, TcpReconnectionConfig};
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
@@ -40,7 +43,7 @@ use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 use user::{UserInfo, UserInfoDetails, UserStatus};
 use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 
-/// A Python module implemented in Rust.
+/// Python client for Apache Iggy, the persistent message streaming platform.
 #[pymodule]
 fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessage>()?;
@@ -48,6 +51,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<AutoLogin>()?;
+    m.add_class::<TcpConfig>()?;
+    m.add_class::<TcpReconnectionConfig>()?;
     m.add_class::<StreamDetails>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;

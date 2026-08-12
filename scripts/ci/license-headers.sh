@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+
 # Parse arguments
 MODE="check"
 if [ $# -gt 0 ]; then

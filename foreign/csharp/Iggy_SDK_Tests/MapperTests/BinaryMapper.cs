@@ -432,6 +432,82 @@ public sealed class BinaryMapper
         Assert.IsAssignableFrom<CryptographicException>(ex.InnerException);
     }
 
+    [Fact]
+    public void MapSendMessages_ReturnsConfirmations()
+    {
+        // Wire layout mirrors core/binary_protocol responses/messages/send_messages.rs:
+        // [count:4][stream_id:4][topic_id:4][partition_id:4][base_offset:8]*
+        var payload = new byte[4 + 20];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8, 4), 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12, 4), 3);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16, 8), 42);
+
+        var response = Mappers.BinaryMapper.MapSendMessages(payload);
+
+        var confirmation = Assert.Single(response.Confirmations);
+        Assert.Equal(1u, confirmation.StreamId);
+        Assert.Equal(2u, confirmation.TopicId);
+        Assert.Equal(3u, confirmation.PartitionId);
+        Assert.Equal(42ul, confirmation.BaseOffset);
+    }
+
+    [Fact]
+    public void MapSendMessages_MultipleConfirmations_ReturnsAll()
+    {
+        var payload = new byte[4 + 3 * 20];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 3);
+        for (var i = 0; i < 3; i++)
+        {
+            var position = 4 + i * 20;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position, 4), 1);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position + 4, 4), 2);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position + 8, 4), (uint)i);
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(position + 12, 8), (ulong)(100 + i));
+        }
+
+        var response = Mappers.BinaryMapper.MapSendMessages(payload);
+
+        Assert.Equal(3, response.Confirmations.Count);
+        Assert.Equal(2u, response.Confirmations[2].PartitionId);
+        Assert.Equal(102ul, response.Confirmations[2].BaseOffset);
+    }
+
+    [Fact]
+    public void MapSendMessages_EmptyBody_Throws()
+    {
+        Assert.Throws<InvalidResponseException>(() => Mappers.BinaryMapper.MapSendMessages([]));
+    }
+
+    [Fact]
+    public void MapSendMessages_ZeroCount_ReturnsNoConfirmations()
+    {
+        var response = Mappers.BinaryMapper.MapSendMessages(new byte[4]);
+
+        Assert.Empty(response.Confirmations);
+    }
+
+    [Theory]
+    [InlineData(4 + 19)] // truncated entry
+    [InlineData(4 + 21)] // trailing byte
+    public void MapSendMessages_ShapeMismatch_Throws(int payloadLength)
+    {
+        var payload = new byte[payloadLength];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 1);
+
+        Assert.Throws<InvalidResponseException>(() => Mappers.BinaryMapper.MapSendMessages(payload));
+    }
+
+    [Fact]
+    public void MapSendMessages_BogusCount_DoesNotOverflow()
+    {
+        var payload = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, uint.MaxValue);
+
+        Assert.Throws<InvalidResponseException>(() => Mappers.BinaryMapper.MapSendMessages(payload));
+    }
+
     private static byte[] BuildEncryptedFrame(AesMessageEncryptor encryptor, ulong offset,
         ReadOnlySpan<byte> plainPayload, ReadOnlySpan<byte> plainHeaders)
     {

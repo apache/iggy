@@ -11,9 +11,7 @@
 Official Go client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
 The client speaks the VSR wire protocol over TCP, with or without TLS, in a
-blocking implementation. VSR is the only protocol it supports: there is no
-option to fall back to the classic framing, so the SDK requires a server that
-speaks VSR and no longer works with the legacy `iggy-server`.
+blocking implementation. VSR is the only protocol it supports.
 
 > Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
 >
@@ -31,16 +29,14 @@ go get github.com/apache/iggy/foreign/go
 
 Build and start a VSR server from a checkout of this repository:
 
-<!-- TODO: change to iggy-server once legacy server is removed (core/server has VSR support) -->
-
 ```bash
-cargo build --bin iggy-server-ng --features vsr
+cargo build --bin iggy-server
 
 IGGY_SYSTEM_PATH=/tmp/iggy-go \
 IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
-target/debug/iggy-server-ng
+target/debug/iggy-server
 ```
 
 QUIC, WebSocket and HTTP are enabled by default on ports 8080, 8092 and 3000.

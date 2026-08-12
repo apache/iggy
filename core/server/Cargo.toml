@@ -17,13 +17,66 @@
 
 [package]
 name = "server"
-version = "0.8.2-edge.1"
+version = "0.9.0-edge.2"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[package.metadata.cargo-udeps.ignore]
+normal = ["tracing-appender"]
+
 [package.metadata.cargo-machete]
-ignored = ["vergen-git2"]
+ignored = [
+    "ahash",
+    "anyhow",
+    "argon2",
+    "async-channel",
+    "async_zip",
+    "axum",
+    "axum-server",
+    "bytes",
+    "chrono",
+    "ctrlc",
+    "cyper",
+    "cyper-axum",
+    "dashmap",
+    "err_trail",
+    "error_set",
+    "figlet-rs",
+    "hash32",
+    "human-repr",
+    "hwlocality",
+    "jsonwebtoken",
+    "left-right",
+    "mimalloc",
+    "mime_guess",
+    "nix",
+    "opentelemetry",
+    "opentelemetry-appender-tracing",
+    "opentelemetry-otlp",
+    "opentelemetry-semantic-conventions",
+    "opentelemetry_sdk",
+    "papaya",
+    "rand",
+    "ringbuffer",
+    "rmp-serde",
+    "rolling-file",
+    "rust-embed",
+    "rustls",
+    "rustls-pemfile",
+    "send_wrapper",
+    "serde",
+    "slab",
+    "socket2",
+    "strum",
+    "sysinfo",
+    "tempfile",
+    "tracing-appender",
+    "tracing-opentelemetry",
+    "ulid",
+    "uuid",
+    "vergen-git2",
+]
 
 [[bin]]
 name = "iggy-server"
@@ -38,40 +91,57 @@ systemd = ["dep:sd-notify"]
 
 [dependencies]
 ahash = { workspace = true }
-anyhow = { workspace = true }
+argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
+blake3 = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
+consensus = { workspace = true }
+crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
+cyper-core = { workspace = true }
 dashmap = { workspace = true }
 dotenvy = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
-flume = { workspace = true }
 fs2 = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
+message_bus = { workspace = true }
+metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 nix = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
+partitions = { workspace = true }
 prometheus-client = { workspace = true }
+rand = { workspace = true }
 ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
+rolling-file = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -81,6 +151,7 @@ send_wrapper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 server_common = { workspace = true }
+shard = { workspace = true }
 shard_allocator = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
@@ -93,8 +164,33 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+hwlocality = { workspace = true, features = ["vendored"] }
+
 [build-dependencies]
 vergen-git2 = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+bytemuck = { workspace = true }
+# Reconciler unit tests assert on `ShardMetrics` snapshots and
+# `IggyShard::parked_frame_count`, gated to test/simulator so they cannot grow
+# production callers. `shard`'s own `cfg(test)` is false when compiled as our
+# dependency, so the feature is how those accessors become visible. The resolver
+# keeps a dev-dependency's features out of non-test targets, so a production
+# build still links `shard` without `simulator`.
+shard = { workspace = true, features = ["simulator"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"
