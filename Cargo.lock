@@ -7548,8 +7548,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "server",
- "socket2 0.6.5",
  "sqlparser 0.62.0",
  "sqlx",
  "sysinfo 0.39.6",
