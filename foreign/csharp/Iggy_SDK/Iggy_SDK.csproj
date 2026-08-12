@@ -68,13 +68,13 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions"/>
-        <PackageReference Include="System.IO.Hashing"/>
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+        <PackageReference Include="System.IO.Hashing" />
     </ItemGroup>
 
     <ItemGroup>
-        <InternalsVisibleTo Include="Apache.Iggy.Tests"/>
-        <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations"/>
+        <InternalsVisibleTo Include="Apache.Iggy.Tests" />
+        <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />
     </ItemGroup>
 
 </Project>

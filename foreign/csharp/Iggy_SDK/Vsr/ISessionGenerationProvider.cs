@@ -23,8 +23,8 @@ namespace Apache.Iggy.Vsr;
 ///     it gets edge-based group rejoin from the connection-state events it publishes; a transport that
 ///     publishes no such events (the built-in HTTP client) gets neither and keeps its membership as-is.
 /// </summary>
-public interface ISessionEpochProvider
+public interface ISessionGenerationProvider
 {
     /// <summary>Generation of the transport's consensus session, bumped on every session re-arm.</summary>
-    ulong SessionEpoch { get; }
+    ulong SessionGeneration { get; }
 }

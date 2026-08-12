@@ -34,6 +34,13 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public partial class IggyConsumer : IAsyncDisposable
 {
+    /// <summary>
+    ///     Backoff between poll iterations that found the group membership missing. It bounds the retry rate of
+    ///     the poll-side rejoin below and keeps the receive loop from spinning while the membership is
+    ///     unrecoverable (client disconnected, group deleted).
+    /// </summary>
+    private const int GroupRejoinRetryDelayMs = 1_000;
+
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
@@ -49,10 +56,10 @@ public partial class IggyConsumer : IAsyncDisposable
     private volatile bool _joinedConsumerGroup;
 
     /// <summary>
-    ///     Consensus session epoch the group membership was established under. A later epoch means the server
-    ///     session that held the membership is gone and the group must be rejoined.
+    ///     Consensus session generation the group membership was established under. A later generation means the
+    ///     server session that held the membership is gone and the group must be rejoined.
     /// </summary>
-    private ulong _joinedSessionEpoch;
+    private ulong _joinedSessionGeneration;
 
     private long _lastPolledAtMs;
 
@@ -271,13 +278,13 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
-        // Captured before the join: a session reset racing the join lands the membership on a later epoch, and
-        // the mismatch triggers one redundant (idempotent) rejoin instead of a missed one.
-        var sessionEpoch = (_client as ISessionEpochProvider)?.SessionEpoch ?? 0;
+        // Captured before the join: a session reset racing the join lands the membership on a later generation,
+        // and the mismatch triggers one redundant (idempotent) rejoin instead of a missed one.
+        var sessionGeneration = (_client as ISessionGenerationProvider)?.SessionGeneration ?? 0;
 
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
-            Interlocked.Exchange(ref _joinedSessionEpoch, sessionEpoch);
+            Interlocked.Exchange(ref _joinedSessionGeneration, sessionGeneration);
             _joinedConsumerGroup = true;
             return;
         }
@@ -319,7 +326,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
                     Identifier.String(_consumerGroupName), ct);
 
-                Interlocked.Exchange(ref _joinedSessionEpoch, sessionEpoch);
+                Interlocked.Exchange(ref _joinedSessionGeneration, sessionGeneration);
                 _joinedConsumerGroup = true;
                 LogConsumerGroupJoined(_consumerGroupName);
             }
@@ -378,9 +385,10 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
-        if (!_joinedConsumerGroup || !IsGroupMembershipEpochCurrent())
+        if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
+            await TryRecoverGroupMembershipAsync(ct);
             return;
         }
 
@@ -467,21 +475,54 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Whether the session epoch the group membership was stamped under is still the transport's current
-    ///     one. Gating the poll here instead of clearing the joined flag on a Disconnected event survives a
-    ///     late event landing after a rejoin already re-stamped the epoch: state events are published outside
-    ///     the state lock, so their order is not guaranteed. Runs outside <see cref="_connectionStateSemaphore" />,
-    ///     hence the interlocked read.
+    ///     Whether the session generation the group membership was stamped under is still the transport's
+    ///     current one. Gating the poll here instead of clearing the joined flag on a Disconnected event survives
+    ///     a late event landing after a rejoin already re-stamped the generation: state events are published
+    ///     outside the state lock, so their order is not guaranteed. Runs outside
+    ///     <see cref="_connectionStateSemaphore" />, hence the interlocked read.
     /// </summary>
-    private bool IsGroupMembershipEpochCurrent()
+    private bool IsGroupMembershipCurrent()
     {
         if (_config.Consumer.Type != ConsumerType.ConsumerGroup
-            || _client is not ISessionEpochProvider epochProvider)
+            || _client is not ISessionGenerationProvider generationProvider)
         {
             return true;
         }
 
-        return epochProvider.SessionEpoch == Interlocked.Read(ref _joinedSessionEpoch);
+        return generationProvider.SessionGeneration == Interlocked.Read(ref _joinedSessionGeneration);
+    }
+
+    /// <summary>
+    ///     Poll-side rejoin for a membership found missing or stamped under a dead session. The state-event
+    ///     rejoin swallows its failures so the event loop survives them, and the transport suppresses a repeat
+    ///     event for an unchanged state, so without this backstop one failed rejoin would park the consumer for
+    ///     good. The trailing delay keeps the receive loop from spinning while the membership stays gone.
+    /// </summary>
+    private async Task TryRecoverGroupMembershipAsync(CancellationToken ct)
+    {
+        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.JoinConsumerGroup)
+        {
+            await _connectionStateSemaphore.WaitAsync(ct);
+            try
+            {
+                if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
+                {
+                    _joinedConsumerGroup = false;
+                    await RejoinConsumerGroupOnReconnectionAsync();
+                }
+            }
+            finally
+            {
+                _connectionStateSemaphore.Release();
+            }
+
+            if (_joinedConsumerGroup && IsGroupMembershipCurrent())
+            {
+                return;
+            }
+        }
+
+        await Task.Delay(GroupRejoinRetryDelayMs, ct);
     }
 
     /// <summary>
@@ -542,7 +583,7 @@ public partial class IggyConsumer : IAsyncDisposable
         await _connectionStateSemaphore.WaitAsync();
         try
         {
-            if (_client is ISessionEpochProvider epochProvider)
+            if (_client is ISessionGenerationProvider generationProvider)
             {
                 if (e.CurrentState != ConnectionState.Authenticated)
                 {
@@ -550,7 +591,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 }
 
                 if (_joinedConsumerGroup
-                    && epochProvider.SessionEpoch == Interlocked.Read(ref _joinedSessionEpoch))
+                    && generationProvider.SessionGeneration == Interlocked.Read(ref _joinedSessionGeneration))
                 {
                     return;
                 }

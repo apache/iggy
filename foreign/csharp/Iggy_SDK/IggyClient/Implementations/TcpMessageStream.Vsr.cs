@@ -38,7 +38,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 ///     register handshake, and the client-side partitioning and consumer-group assignment the broker does not
 ///     resolve server-side. The command surface lives in <see cref="TcpMessageStream" />.
 /// </summary>
-public sealed partial class TcpMessageStream : ISessionEpochProvider
+public sealed partial class TcpMessageStream : ISessionGenerationProvider
 {
     /// <summary>
     ///     Upper bound for a whole VSR request: the transient replays and the leader failovers share it, and so
@@ -99,7 +99,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     private readonly ConsumerGroupClientState _groupState = new();
 
     /// <inheritdoc />
-    ulong ISessionEpochProvider.SessionEpoch => _consensusSession.Epoch;
+    ulong ISessionGenerationProvider.SessionGeneration => _consensusSession.Generation;
 
     /// <summary>
     ///     Runs the consensus register handshake and binds the session it commits. Everything before the bind
@@ -119,18 +119,18 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             {
                 await LogoutUserAsync(token);
             }
-            else if (_state == ConnectionState.Authenticated)
+            else if (State == ConnectionState.Authenticated)
             {
-                SetConnectionStateAsync(ConnectionState.Connected);
+                SetConnectionState(ConnectionState.Connected);
             }
 
-            SetConnectionStateAsync(ConnectionState.Authenticating);
+            SetConnectionState(ConnectionState.Authenticating);
 
             LoginRegisterResponse response;
             try
             {
                 using IMemoryOwner<byte> responseBuffer =
-                    await SendWithResponseAsync(code, message, token, autoLoginOnReconnect: false);
+                    await SendWithResponseAsync(code, message, autoLoginOnReconnect: false, token: token);
 
                 response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
                 _consensusSession.Bind(response.Session);
@@ -138,9 +138,9 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             catch
             {
                 await ResetConsensusSessionAsync();
-                if (_state == ConnectionState.Authenticating)
+                if (State == ConnectionState.Authenticating)
                 {
-                    SetConnectionStateAsync(ConnectionState.Connected);
+                    SetConnectionState(ConnectionState.Connected);
                 }
 
                 throw;
@@ -149,7 +149,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             _logger.LogInformation(
                 "Authenticated against the server, version {ServerVersion}, protocol version {ServerProtocolVersion}",
                 response.ServerVersion, response.ServerProtocolVersion);
-            SetConnectionStateAsync(ConnectionState.Authenticated);
+            SetConnectionState(ConnectionState.Authenticated);
 
             var authResponse = new AuthResponse((int)response.UserId, null);
             if (IsConnecting)
@@ -170,7 +170,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
 
             // The redirect probe can tear the connection down without throwing, and success on a client that is
             // no longer bound would leave the caller unauthenticated with nothing left to re-authenticate it.
-            if (_state != ConnectionState.Authenticated)
+            if (State != ConnectionState.Authenticated)
             {
                 throw new NotConnectedException();
             }
@@ -313,7 +313,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     {
         var message = TcpContracts.GetGroup(streamId, topicId, groupId);
         using IMemoryOwner<byte> responseBuffer =
-            await SendWithResponseAsync(CommandCodes.SYNC_CONSUMER_GROUP_CODE, message, token);
+            await SendWithResponseAsync(CommandCodes.SYNC_CONSUMER_GROUP_CODE, message, token: token);
 
         var key = new GroupKey(streamId, topicId, groupId);
         if (responseBuffer.Memory.Length == 0)
@@ -373,9 +373,11 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
         // The roster may name the leader by either side of this connection: the address the client dialed
         // (a hostname, an advertised_address) or the endpoint the socket resolved to. IsSame does no DNS
         // resolution, so a match on either means the client is already on the leader; checking only one
-        // side redirect-loops the other kind of roster.
-        if (ServerAddress.IsSame(leaderAddress, _currentAddress)
-            || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _currentRemoteAddress)))
+        // side redirect-loops the other kind of roster. Both are evidence of where the socket landed, so
+        // both come from the connect loop: _currentAddress may already name a leader the client never
+        // reached, and matching on it would silently refuse the redirect that gets it there.
+        if ((_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _currentRemoteAddress))
+            || (_connectedAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _connectedAddress)))
         {
             return false;
         }
@@ -483,12 +485,13 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
+        if (State is ConnectionState.Disconnected or ConnectionState.Connecting)
         {
             throw new NotConnectedException();
         }
 
         var isLoginRegister = code is CommandCodes.LOGIN_REGISTER_CODE or CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE;
+        var clearSensitiveReply = HasSensitiveReply(code);
         var overallDeadline = Environment.TickCount64 + VsrRequestTimeoutMs;
         var requestEncoded = false;
         var redirects = 0;
@@ -504,7 +507,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
                 var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
-                    token);
+                    clearSensitiveReply, token);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
 
@@ -572,6 +575,19 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
     ///     outcome of a request the server may still commit unknowable.
     /// </summary>
+    /// <summary>
+    ///     Whether the reply body may carry a credential - a raw personal access token, a session secret - and
+    ///     therefore must be zeroed before its pooled buffer is handed back for reuse.
+    /// </summary>
+    private static bool HasSensitiveReply(int code)
+    {
+        return code is CommandCodes.LOGIN_USER_CODE
+            or CommandCodes.LOGIN_REGISTER_CODE
+            or CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+            or CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE
+            or CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE;
+    }
+
     private static bool IsDefinitiveVerdict(Exception error)
     {
         return error is IggyInvalidStatusCodeException
@@ -587,7 +603,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, CancellationToken token)
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -599,7 +615,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
             }
 
             return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                token);
+                clearSensitiveReply, token);
         }
         finally
         {
@@ -678,7 +694,7 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
 
         ResetConsensusSession();
         _connection = null;
-        SetConnectionStateAsync(ConnectionState.Disconnected);
+        SetConnectionState(ConnectionState.Disconnected);
         connection.Dispose();
     }
 

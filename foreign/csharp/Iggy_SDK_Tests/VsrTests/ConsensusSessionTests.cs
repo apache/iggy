@@ -217,22 +217,22 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
-    public void Epoch_AdvancesOnEveryReArmAndNotOnBind()
+    public void Generation_AdvancesOnEveryReArmAndNotOnBind()
     {
         var session = new ConsensusSession(1);
-        var initialEpoch = session.Epoch;
+        var initialGeneration = session.Generation;
 
         session.Resolve(VsrOperation.Register);
         session.Bind(10);
-        Assert.Equal(initialEpoch, session.Epoch);
+        Assert.Equal(initialGeneration, session.Generation);
 
         session.Reset();
-        Assert.Equal(initialEpoch + 1, session.Epoch);
+        Assert.Equal(initialGeneration + 1, session.Generation);
 
-        // A register on a previously bound session re-arms the identity, which is a new epoch too.
+        // A register on a previously bound session re-arms the identity, which is a new generation too.
         session.Resolve(VsrOperation.Register);
         session.Bind(11);
         session.Resolve(VsrOperation.Register);
-        Assert.Equal(initialEpoch + 2, session.Epoch);
+        Assert.Equal(initialGeneration + 2, session.Generation);
     }
 }

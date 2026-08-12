@@ -28,16 +28,16 @@ using Moq;
 namespace Apache.Iggy.Tests.ConsumerTests;
 
 /// <summary>
-///     Group membership on a transport that exposes a consensus session is keyed off the session epoch rather
-///     than off connection-state edges, so these cover both arms of that branch.
+///     Group membership on a transport that exposes a consensus session is keyed off the session generation
+///     rather than off connection-state edges, so these cover both arms of that branch.
 /// </summary>
-public sealed class ConsumerSessionEpochTests
+public sealed class ConsumerSessionGenerationTests
 {
     [Fact]
     public async Task
-        given_group_consumer_when_reauthenticated_on_the_same_session_epoch_should_not_rejoin_the_group()
+        given_group_consumer_when_reauthenticated_on_the_same_session_generation_should_not_rejoin_the_group()
     {
-        var client = new EpochClient();
+        var client = new GenerationClient();
         var consumer = new IggyConsumer(client.Object, BuildGroupConfig(), NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
         Assert.Equal(1, client.JoinCount);
@@ -49,21 +49,21 @@ public sealed class ConsumerSessionEpochTests
     }
 
     [Fact]
-    public async Task given_group_consumer_when_the_session_epoch_moved_should_rejoin_the_group()
+    public async Task given_group_consumer_when_the_session_generation_moved_should_rejoin_the_group()
     {
-        var client = new EpochClient();
+        var client = new GenerationClient();
         var consumer = new IggyConsumer(client.Object, BuildGroupConfig(), NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
         Assert.Equal(1, client.JoinCount);
 
         // The session the membership was established under is gone.
-        client.SessionEpoch++;
+        client.SessionGeneration++;
         await client.RaiseAsync(ConnectionState.Connected, ConnectionState.Authenticated);
 
         Assert.Equal(2, client.JoinCount);
 
-        // The rejoin must re-stamp the membership epoch: without it every later event would rejoin again,
-        // triggering a group-wide rebalance per reconnect.
+        // The rejoin must re-stamp the membership generation: without it every later event would rejoin
+        // again, triggering a group-wide rebalance per reconnect.
         await client.RaiseAsync(ConnectionState.Connected, ConnectionState.Authenticated);
 
         Assert.Equal(2, client.JoinCount);
@@ -71,23 +71,49 @@ public sealed class ConsumerSessionEpochTests
     }
 
     /// <summary>
-    ///     A disconnect re-arms the transport's session, so the epoch moves and the reconnect rejoins. The
-    ///     membership is not cleared on the Disconnected event itself: the poll gate compares epochs instead,
-    ///     which survives state events arriving out of order.
+    ///     A disconnect re-arms the transport's session, so the generation moves and the reconnect rejoins. The
+    ///     membership is not cleared on the Disconnected event itself: the poll gate compares generations
+    ///     instead, which survives state events arriving out of order.
     /// </summary>
     [Fact]
     public async Task given_group_consumer_when_disconnected_should_surrender_membership_and_rejoin_on_reconnect()
     {
-        var client = new EpochClient();
+        var client = new GenerationClient();
         var consumer = new IggyConsumer(client.Object, BuildGroupConfig(), NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
         Assert.Equal(1, client.JoinCount);
 
         await client.RaiseAsync(ConnectionState.Authenticated, ConnectionState.Disconnected);
         // The transport re-arms the consensus session when the connection drops.
-        client.SessionEpoch++;
+        client.SessionGeneration++;
         await client.RaiseAsync(ConnectionState.Connecting, ConnectionState.Authenticated);
 
+        Assert.Equal(2, client.JoinCount);
+        await consumer.DisposeAsync();
+    }
+
+    /// <summary>
+    ///     The event-time rejoin swallows its failures and the transport never republishes an unchanged state,
+    ///     so the poll loop is the only place left that can restore a membership the event handler failed to.
+    /// </summary>
+    [Fact]
+    public async Task given_group_consumer_when_the_event_time_rejoin_fails_should_rejoin_from_the_poll_loop()
+    {
+        var client = new GenerationClient();
+        var consumer = new IggyConsumer(client.Object, BuildGroupConfig(), NullLoggerFactory.Instance);
+        await consumer.InitAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(1, client.JoinCount);
+
+        client.SessionGeneration++;
+        client.FailNextJoin = true;
+        await client.RaiseAsync(ConnectionState.Connected, ConnectionState.Authenticated);
+        Assert.Equal(1, client.JoinCount);
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using IAsyncEnumerator<ReceivedMessage> messages = consumer.ReceiveAsync(cts.Token)
+            .GetAsyncEnumerator(TestContext.Current.CancellationToken);
+
+        Assert.True(await messages.MoveNextAsync());
         Assert.Equal(2, client.JoinCount);
         await consumer.DisposeAsync();
     }
@@ -99,7 +125,7 @@ public sealed class ConsumerSessionEpochTests
     [Fact]
     public async Task given_plain_consumer_when_disconnected_should_keep_polling_after_reconnect()
     {
-        var client = new EpochClient();
+        var client = new GenerationClient();
         var config = BuildGroupConfig();
         config.Consumer = Consumer.New(1);
         var consumer = new IggyConsumer(client.Object, config, NullLoggerFactory.Instance);
@@ -107,7 +133,7 @@ public sealed class ConsumerSessionEpochTests
         Assert.Equal(0, client.JoinCount);
 
         await client.RaiseAsync(ConnectionState.Authenticated, ConnectionState.Disconnected);
-        client.SessionEpoch++;
+        client.SessionGeneration++;
         await client.RaiseAsync(ConnectionState.Connecting, ConnectionState.Authenticated);
 
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -138,20 +164,24 @@ public sealed class ConsumerSessionEpochTests
     ///     A client that carries a consensus session, counts group joins, and replays connection-state events on
     ///     demand so a test can drive the reconnection handler without a socket.
     /// </summary>
-    private sealed class EpochClient
+    private sealed class GenerationClient
     {
         private readonly List<Func<ConnectionStateChangedEventArgs, Task>> _subscribers = [];
 
         public IIggyClient Object { get; }
 
-        public ulong SessionEpoch { get; set; }
+        public ulong SessionGeneration { get; set; }
 
         public int JoinCount { get; private set; }
 
-        public EpochClient()
+        /// <summary>The next join attempt throws instead of counting, then the flag disarms itself.</summary>
+        public bool FailNextJoin { get; set; }
+
+        public GenerationClient()
         {
             var mock = new Mock<IIggyClient>(MockBehavior.Loose);
-            mock.As<ISessionEpochProvider>().SetupGet(c => c.SessionEpoch).Returns(() => SessionEpoch);
+            mock.As<ISessionGenerationProvider>().SetupGet(c => c.SessionGeneration)
+                .Returns(() => SessionGeneration);
             mock.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
             mock.Setup(c => c.SubscribeConnectionEvents(It.IsAny<Func<ConnectionStateChangedEventArgs, Task>>()))
                 .Callback<Func<ConnectionStateChangedEventArgs, Task>>(_subscribers.Add);
@@ -168,7 +198,16 @@ public sealed class ConsumerSessionEpochTests
                 });
             mock.Setup(c => c.JoinConsumerGroupAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                     It.IsAny<Identifier>(), It.IsAny<CancellationToken>()))
-                .Callback(() => JoinCount++)
+                .Callback(() =>
+                {
+                    if (FailNextJoin)
+                    {
+                        FailNextJoin = false;
+                        throw new InvalidOperationException("Injected join failure.");
+                    }
+
+                    JoinCount++;
+                })
                 .Returns(Task.CompletedTask);
             mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
                     It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(), It.IsAny<bool>(),
