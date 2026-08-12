@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
@@ -64,6 +65,12 @@ public sealed partial class TcpMessageStream : IIggyClient
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _sendingSemaphore;
     private string _currentAddress = string.Empty;
+
+    // The address the socket actually connected to, as an IP the roster can be compared against.
+    // _currentAddress keeps whatever the caller configured (possibly a hostname the roster never
+    // mentions), so leader comparisons made against it would move a client that is already on the
+    // leader. Written only by the connect loop.
+    private string _currentRemoteAddress = string.Empty;
     private X509Certificate2Collection _customCaStore = [];
     private volatile bool _disposed;
     private int _isConnecting;
@@ -1052,6 +1059,10 @@ public sealed partial class TcpMessageStream : IIggyClient
                 socket.NoDelay = true;
 
                 await socket.ConnectAsync(host, port, token);
+
+                _currentRemoteAddress = socket.RemoteEndPoint is IPEndPoint remote
+                    ? ServerAddress.HostPort(remote.Address.ToString(), (ushort)remote.Port)
+                    : string.Empty;
 
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
