@@ -35,6 +35,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }

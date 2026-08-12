@@ -35,21 +35,9 @@ const SINK_TABLE: &str = "iggy_messages";
 const API_KEY: &str = "test-api-key";
 const REDSHIFT_SINK_KEY: &str = "redshift";
 
-type SinkRow = (
-    String,
-    String,
-    String,
-    String,
-    chrono::DateTime<chrono::Utc>,
-);
-type SinkRawRow = (
-    String,
-    String,
-    String,
-    Vec<u8>,
-    chrono::DateTime<chrono::Utc>,
-);
-type SinkJsonRow = (String, String, chrono::DateTime<chrono::Utc>);
+type SinkRow = (String, String, String, String, String);
+type SinkRawRow = (String, String, String, Vec<u8>, String);
+type SinkJsonRow = (String, String, String);
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/redshift/sink.toml")),

@@ -97,10 +97,6 @@ pub fn row_to_data_row(row: &Row, fields: &[FieldInfo]) -> PgWireResult<DataRow>
             &PgWireType::NUMERIC => {
                 encoder.encode_field(&row.try_get::<_, Option<String>>(i).map_err(backend_err)?)?
             }
-            &PgWireType::TIMESTAMP => encoder.encode_field(
-                &row.try_get::<_, Option<chrono::NaiveDateTime>>(i)
-                    .map_err(backend_err)?,
-            )?,
             &PgWireType::BYTEA => {
                 encoder.encode_field(&row.try_get::<_, Option<Vec<u8>>>(i).map_err(backend_err)?)?
             }
@@ -151,7 +147,6 @@ pub fn decode_param(
         PgType::FLOAT8 => decode!(f64),
         PgType::TEXT | PgType::VARCHAR => decode!(String),
         PgType::BYTEA => decode!(Vec<u8>),
-        PgType::TIMESTAMP => decode!(chrono::NaiveDateTime),
         _ => decode!(String), // last resort: treat as text
     })
 }

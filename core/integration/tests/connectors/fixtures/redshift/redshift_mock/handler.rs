@@ -232,7 +232,7 @@ async fn execute_statement<'a>(
                 pgwire::api::results::Tag::new("COPY").with_rows(affected as usize),
             ))
         }
-        QueryClass::DmlMerge => {
+        QueryClass::DmlInsert => {
             let response = dml::execute_dml(pg, ctx).await?;
 
             Ok(response)

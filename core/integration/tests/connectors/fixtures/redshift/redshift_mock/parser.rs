@@ -43,7 +43,7 @@ use super::util::user_err;
 pub enum QueryClass {
     DdlCreate,
     DdlTruncate,
-    DmlMerge,
+    DmlInsert,
     DmlCopy,
     Dql,
     /// Anything we don't special-case: passthrough with no rewriting,
@@ -139,7 +139,7 @@ fn classify(stmt: &SqlStatement) -> QueryClass {
 
         SqlStatement::Truncate { .. } => QueryClass::DdlTruncate,
 
-        SqlStatement::Merge { .. } => QueryClass::DmlMerge,
+        SqlStatement::Insert { .. } => QueryClass::DmlInsert,
 
         SqlStatement::Copy { .. } => QueryClass::DmlCopy,
 

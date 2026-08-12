@@ -179,11 +179,10 @@ Substitutions: `pg_table_def` → `information_schema.columns`, `"column"` → `
 **Redshift:**
 
 ```sql
-COPY {staging_table} ({columns})
-FROM '{s3_path}'
-CREDENTIALS 'AWS_IAM_ROLE={iam_role}'
+COPY "staging_iggy_messages" (id, iggy_offset, iggy_timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_checksum, iggy_origin_timestamp, payload, created_at) FROM 's3://iggystaging/iggy/messages/019ff3d5-a06f-7921-b084-0c67cabfefed.parquet'
+CREDENTIALS 'aws_iam_role=arn:aws:iam::0123456789012:role/iggyRole'
 FORMAT AS PARQUET
-REGION '{region}';
+REGION 'us-east-1';
 ```
 
 **pgwire test equivalent:**
@@ -195,22 +194,17 @@ FROM STDIN BINARY
 
 The `s3_path` is parsed and used to fetch the object from the MinIO instance backing the mock container, with access key and secret key supplied to the container via environment variables rather than an IAM role. Instead of Redshift pulling directly from S3, the connector reads the object itself and streams it into the mock over `COPY ... FROM STDIN BINARY`, so the `CREDENTIALS`, `FORMAT AS PARQUET`, and `REGION` clauses have no equivalent here.
 
-## 5. Staging → target merge (idempotent upsert)
+## 5. Staging → target insert (idempotent upsert)
 
 ```sql
-MERGE INTO "target_table" AS t
-USING staging_target_table AS sm
-ON t.id = sm.id
-WHEN NOT MATCHED THEN INSERT (
-    id, iggy_offset, iggy_timestamp, iggy_stream, iggy_topic,
-    iggy_partition_id, iggy_checksum, iggy_origin_timestamp, payload, created_at
-) VALUES (
-    sm.id, sm.iggy_offset, sm.iggy_timestamp, sm.iggy_stream, sm.iggy_topic,
-    sm.iggy_partition_id, sm.iggy_checksum, sm.iggy_origin_timestamp, sm.payload, sm.created_at
-);
+INSERT INTO "iggy_messages" (id, iggy_offset, iggy_timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_checksum, iggy_origin_timestamp, payload, created_at)
+SELECT s.id, s.iggy_offset, s.iggy_timestamp, s.iggy_stream, s.iggy_topic, s.iggy_partition_id, s.iggy_checksum, s.iggy_origin_timestamp, s.payload, s.created_at
+FROM (SELECT sm.*, ROW_NUMBER() OVER (PARTITION BY sm.id ORDER BY sm.created_at) AS rn FROM "staging_iggy_messages" sm) s
+WHERE s.rn = 1
+AND NOT EXISTS (SELECT 1 FROM "iggy_messages" t WHERE t.id = s.id);
 ```
 
-Uniqueness enforced on `id` — no update branch by design (insert-only merge). No dialect differences.
+Uniqueness enforced on `id` — no update branch by design. No dialect differences.
 
 ## 6. Staging table reset
 

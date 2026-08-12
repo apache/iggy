@@ -7207,6 +7207,7 @@ version = "0.4.1-edge.1"
 dependencies = [
  "arrow 57.3.1",
  "async-trait",
+ "chrono",
  "humantime",
  "iggy_common",
  "iggy_connector_sdk",
@@ -7510,7 +7511,6 @@ dependencies = [
  "bytemuck",
  "bytes",
  "cfg_aliases",
- "chrono",
  "compio",
  "configs",
  "configs_derive",

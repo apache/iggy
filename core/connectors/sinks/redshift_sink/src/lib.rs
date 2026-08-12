@@ -267,7 +267,7 @@ impl RedshiftSink {
             expected_cols.insert("iggy_origin_timestamp", "VARCHAR");
         }
         expected_cols.insert("payload", payload_type);
-        expected_cols.insert("created_at", "TIMESTAMPTZ");
+        expected_cols.insert("created_at", "VARCHAR");
 
         let target_cols = Self::load_columns(pool, &target_table).await?;
         let staging_cols = Self::load_columns(pool, &staging_table).await?;
@@ -352,13 +352,19 @@ impl RedshiftSink {
     }
 
     fn normalize_type(t: &str) -> &'static str {
-        match t.to_ascii_uppercase().as_str() {
+        let base = t.split('(').next().unwrap_or(t).trim();
+
+        match base.to_ascii_uppercase().as_str() {
             "INTEGER" | "INT" | "INT4" => "INTEGER",
+            // e.g. "bigint"
             "INT8" | "BIGINT" => "BIGINT",
+            // e.g "character varying(40)", "character varying(20)", "character varying(256)"
             "VARCHAR" | "CHARACTER VARYING" => "VARCHAR",
             // Having bytea because of the Postgres Test
+            // e.g. "binary varying(64000)"
             "BYTEA" | "VARBYTE" | "VARBINARY" | "BINARY VARYING" => "VARBYTE",
             "TEXT" => "TEXT",
+            // e.g. "timestamp with time zone"
             "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => "TIMESTAMPTZ",
             _ => "UNKNOWN",
         }
@@ -492,7 +498,7 @@ impl RedshiftSink {
         tracing::info!("Redshift stging COPY completed");
 
         // Do a merge into Redshift target table
-        self.merge_into_target(&cols).await?;
+        self.insert_into_target(&cols).await?;
 
         tracing::info!("Redshift target table merge completed");
 
@@ -530,18 +536,19 @@ impl RedshiftSink {
         Ok(())
     }
 
-    async fn merge_into_target(&self, cols: &[&str]) -> Result<(), Error> {
+    async fn insert_into_target(&self, cols: &[&str]) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
         let retry_delay = self.get_retry_delay();
         let target_table = quote_identifier(&self.config.target_table)?;
         let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
-        let sql = self.build_merge_sql(cols, &staging_table, &target_table);
+        let sql = self.build_insert_sql(cols, &staging_table, &target_table);
+
         let pool = self.get_pool()?;
 
         tracing::debug!(table = %self.config.target_table, "issuing Redshift MERGE");
 
         retry_with_backoff(
-            "Redshift MERGE",
+            "Redshift INSERT",
             max_retries,
             retry_delay,
             is_transient_error,
@@ -554,7 +561,7 @@ impl RedshiftSink {
         )
         .await?;
 
-        tracing::debug!(staging_table = %staging_table, target_table = %target_table, "Redshift MERGE completed");
+        tracing::debug!(staging_table = %staging_table, target_table = %target_table, "Redshift INSERT completed");
 
         Ok(())
     }
@@ -608,7 +615,7 @@ impl RedshiftSink {
         }
 
         query.push_str(&format!(", payload {payload_type}"));
-        query.push_str(", created_at TIMESTAMPTZ DEFAULT GETDATE());");
+        query.push_str(", created_at VARCHAR);");
 
         Ok(query)
     }
@@ -621,28 +628,33 @@ impl RedshiftSink {
     ) -> Result<String, Error> {
         // Redshift allows this from the docs
         // https://docs.aws.amazon.com/redshift/latest/dg/r_COPY_command_examples.html
-        let iam_role = quote_identifier(&self.config.aws_iam_role)?;
+        let iam_role = quote_identifier(&self.config.aws_iam_role)?.replace('"', "");
 
-        let region = quote_identifier(&self.config.aws_region)?;
+        let region = quote_identifier(&self.config.aws_region)?.replace('"', "");
 
         Ok(format!(
-            "COPY {} ({}) FROM '{}' CREDENTIALS 'AWS_IAM_ROLE={}' FORMAT AS PARQUET REGION '{}';",
+            "COPY {} ({}) FROM '{}' CREDENTIALS 'aws_iam_role={}' FORMAT AS PARQUET REGION '{}';",
             staging_table, cols, s3_path, iam_role, region
         ))
     }
 
-    fn build_merge_sql(&self, cols: &[&str], staging: &str, target: &str) -> String {
+    fn build_insert_sql(&self, cols: &[&str], staging: &str, target: &str) -> String {
         let t_cols = cols.join(", ");
 
         let s_cols = cols
             .iter()
-            .map(|v| format!("sm.{v}"))
+            .map(|v| format!("s.{v}"))
             .collect::<Vec<_>>()
             .join(", ");
 
         format!(
-            "MERGE INTO {} AS t USING {} AS sm ON t.id = sm.id WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});",
-            target, staging, t_cols, s_cols
+            "
+            INSERT INTO {} ({})
+                SELECT {}
+            FROM (SELECT sm.*, ROW_NUMBER() OVER (PARTITION BY sm.id ORDER BY sm.created_at) AS rn FROM {} sm) s
+                WHERE s.rn = 1
+                AND NOT EXISTS (SELECT 1 FROM {} t WHERE t.id = s.id);",
+            target, t_cols, s_cols, staging, target
         )
     }
 
@@ -890,6 +902,9 @@ fn create_record_batch(
     fields.push(Field::new("payload", payload_format.arrow_type(), false));
     columns.push(payload_column(messages, payload_format)?);
 
+    fields.push(Field::new("created_at", DataType::Utf8, false));
+    columns.push(created_at_column(messages.len())?);
+
     let schema = Arc::new(Schema::new(fields));
     let batch =
         RecordBatch::try_new(schema, columns).map_err(|e| Error::CannotStoreData(e.to_string()))?;
@@ -979,6 +994,18 @@ fn payload_column(messages: &[ConsumedMessage], format: PayloadFormat) -> Result
             Ok(Arc::new(builder.finish()))
         }
     }
+}
+
+fn created_at_column(size: usize) -> Result<ArrayRef, Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut builder = StringBuilder::with_capacity(size, 0);
+
+    for _ in 0..size {
+        builder.append_value(now.as_str());
+    }
+
+    Ok(Arc::new(builder.finish()))
 }
 
 fn redact_connection_string(conn_str: &str) -> String {
