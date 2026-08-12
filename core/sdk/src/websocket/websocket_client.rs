@@ -143,15 +143,15 @@ impl BinaryTransport for WebSocketClient {
             return Err(error);
         }
 
+        if is_unauthenticated_metadata_probe(code, &error) {
+            return Err(error);
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
 
-        if matches!(self.config.auto_login, AutoLogin::Disabled) {
-            return Err(error);
-        }
-
-        if is_unauthenticated_metadata_probe(code, &error) {
+        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
             return Err(error);
         }
 

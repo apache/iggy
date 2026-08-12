@@ -151,6 +151,10 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
+        if is_unauthenticated_metadata_probe(code, &error) {
+            return Err(error);
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
@@ -161,10 +165,6 @@ impl BinaryTransport for TcpClient {
             // exception: the server stays deliberately silent on transient
             // register failures (the server `surface_login_failure`) and
             // relies on the client timing out and replaying the request.
-            return Err(error);
-        }
-
-        if is_unauthenticated_metadata_probe(code, &error) {
             return Err(error);
         }
 

@@ -437,10 +437,11 @@ describe('VSR client socket', () => {
         );
         assert.deepEqual(leaderOperations, [
           Operation.Register,
+          Operation.NonReplicated,
           Operation.NonReplicated
         ]);
         assert.equal(
-          leader.frames[1].readUInt32LE(REQUEST_OFFSET.reserved),
+          leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
           60_018
         );
         assert.equal(follower.frames.length, 2);
@@ -450,6 +451,59 @@ describe('VSR client socket', () => {
         await follower.close();
       }
     });
+
+  it('rechecks leadership after a redirected login', async () => {
+    const leader = await startVsrServer(
+      (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
+    );
+    const intermediate = await startVsrServer((frame, socket) => {
+      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+      if (operation === Operation.Register) {
+        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        return;
+      }
+      socket.write(replyFrame(
+        Operation.NonReplicated,
+        twoNodeMetadataBody(intermediate.port, leader.port)
+      ));
+    });
+    const follower = await startVsrServer((frame, socket) => {
+      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+      if (operation === Operation.Register) {
+        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        return;
+      }
+      socket.write(replyFrame(
+        Operation.NonReplicated,
+        twoNodeMetadataBody(follower.port, intermediate.port)
+      ));
+    });
+    const client = new CommandResponseStream(vsrConfig(follower.port));
+    try {
+      await client.authenticate(vsrConfig(follower.port).credentials);
+      await client.sendCommand(60_019, Buffer.alloc(0));
+
+      assert.deepEqual(
+        follower.frames.map((frame) => frame.readUInt8(REQUEST_OFFSET.operation)),
+        [Operation.Register, Operation.NonReplicated]
+      );
+      assert.deepEqual(
+        intermediate.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        ),
+        [Operation.Register, Operation.NonReplicated]
+      );
+      assert.equal(
+        leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
+        60_019
+      );
+    } finally {
+      client.destroy();
+      await follower.close();
+      await intermediate.close();
+      await leader.close();
+    }
+  });
 
   it('keeps a single-node login on its node', async () => {
     const server = await startVsrServer(
@@ -507,7 +561,10 @@ describe('VSR client socket', () => {
         const leaderOperations = leader.frames.map(
           (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
         );
-        assert.deepEqual(leaderOperations, [Operation.Register]);
+        assert.deepEqual(leaderOperations, [
+          Operation.Register,
+          Operation.NonReplicated
+        ]);
         assert.equal(client.isAuthenticated, true);
       } finally {
         client.destroy();

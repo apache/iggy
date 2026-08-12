@@ -146,6 +146,10 @@ impl BinaryTransport for QuicClient {
             return Err(error);
         }
 
+        if is_unauthenticated_metadata_probe(code, &error) {
+            return Err(error);
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
@@ -157,10 +161,6 @@ impl BinaryTransport for QuicClient {
             // is the exception: the server stays deliberately silent on a
             // transient register failure and relies on the client replaying via
             // a reconnect with a fresh session.
-            return Err(error);
-        }
-
-        if is_unauthenticated_metadata_probe(code, &error) {
             return Err(error);
         }
 

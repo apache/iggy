@@ -150,6 +150,31 @@ async fn given_a_backup_when_a_client_signs_in_should_bind_the_session_there(
 }
 
 #[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+async fn given_a_backup_bound_session_when_the_client_logs_out_should_remove_it_cluster_wide(
+    harness: &TestHarness,
+) {
+    let address = backup_address(harness).await;
+    let client = connect_without_login(address).await;
+
+    login_root_within(&client, LOGIN_BUDGET)
+        .await
+        .expect("a backup must complete the login before logout");
+    client
+        .logout_user()
+        .await
+        .expect("the backup must forward Logout to the metadata primary");
+
+    assert_eq!(
+        client
+            .get_me()
+            .await
+            .expect_err("the local session must be unbound after logout")
+            .as_code(),
+        IggyError::Unauthenticated.as_code(),
+    );
+}
+
+#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
 async fn given_a_backup_when_a_pat_login_arrives_should_bind_the_session_there(
     harness: &TestHarness,
 ) {

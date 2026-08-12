@@ -18,11 +18,12 @@
 use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-    ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader,
-    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader,
+    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
+    RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader, RequestPreparesHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+    StateTransferTargetHeader,
 };
 use smallvec::SmallVec;
 use std::{
@@ -558,6 +559,10 @@ pub enum MessageBag {
     ForwardRegister(Message<ForwardRegisterHeader>),
     /// The primary's verdict, routed back to the parked login by nonce.
     ForwardRegisterResult(Message<ForwardRegisterResultHeader>),
+    /// A backup asks the primary to commit a session teardown.
+    ForwardLogout(Message<ForwardLogoutHeader>),
+    /// The primary's verdict, routed back to the parked logout by nonce.
+    ForwardLogoutResult(Message<ForwardLogoutResultHeader>),
 }
 
 impl MessageBag {
@@ -581,6 +586,8 @@ impl MessageBag {
             Self::StateChunk(message) => message.header().command,
             Self::ForwardRegister(message) => message.header().command,
             Self::ForwardRegisterResult(message) => message.header().command,
+            Self::ForwardLogout(message) => message.header().command,
+            Self::ForwardLogoutResult(message) => message.header().command,
         }
     }
 
@@ -604,6 +611,8 @@ impl MessageBag {
             Self::StateChunk(message) => message.header().size(),
             Self::ForwardRegister(message) => message.header().size(),
             Self::ForwardRegisterResult(message) => message.header().size(),
+            Self::ForwardLogout(message) => message.header().size(),
+            Self::ForwardLogoutResult(message) => message.header().size(),
         }
     }
 
@@ -627,6 +636,8 @@ impl MessageBag {
             Self::StateChunk(message) => message.header().operation(),
             Self::ForwardRegister(message) => message.header().operation(),
             Self::ForwardRegisterResult(message) => message.header().operation(),
+            Self::ForwardLogout(message) => message.header().operation(),
+            Self::ForwardLogoutResult(message) => message.header().operation(),
         }
     }
 }
@@ -692,6 +703,12 @@ where
             Command2::ForwardRegisterResult => Ok(Self::ForwardRegisterResult(
                 value.try_into_typed::<ForwardRegisterResultHeader>()?,
             )),
+            Command2::ForwardLogout => Ok(Self::ForwardLogout(
+                value.try_into_typed::<ForwardLogoutHeader>()?,
+            )),
+            Command2::ForwardLogoutResult => Ok(Self::ForwardLogoutResult(
+                value.try_into_typed::<ForwardLogoutResultHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command2::Reply | Command2::Eviction => {
@@ -709,7 +726,8 @@ where
 mod tests {
     use super::*;
     use iggy_binary_protocol::{
-        HEADER_SIZE, Operation, ReplyHeader, RequestHeader, frame_checksum_bytes,
+        ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader, HEADER_SIZE,
+        Operation, ReplyHeader, RequestHeader, frame_checksum_bytes,
     };
     use smallvec::smallvec;
 
@@ -846,6 +864,42 @@ mod tests {
             assert!(routed, "{command:?} parsed into the wrong bag variant");
             assert_eq!(bag.command(), command, "original command byte must survive");
         }
+    }
+
+    #[test]
+    fn forward_logout_commands_round_trip_into_bag() {
+        let forward = Message::<ForwardLogoutHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut ForwardLogoutHeader| {
+                header.command = Command2::ForwardLogout;
+                header.size = HEADER_SIZE as u32;
+                header.client = 7;
+                header.nonce = 8;
+                header.session = 9;
+                header.request = 10;
+                header.seal();
+            },
+        );
+        let result = Message::<ForwardLogoutResultHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut ForwardLogoutResultHeader| {
+                header.command = Command2::ForwardLogoutResult;
+                header.size = HEADER_SIZE as u32;
+                header.client = 7;
+                header.nonce = 8;
+                header.commit = 11;
+                header.outcome = ForwardLogoutOutcome::Ok;
+                header.seal();
+            },
+        );
+
+        let forward = MessageBag::try_from(forward.into_generic()).expect("parse ForwardLogout");
+        let result =
+            MessageBag::try_from(result.into_generic()).expect("parse ForwardLogoutResult");
+        assert!(matches!(forward, MessageBag::ForwardLogout(_)));
+        assert!(matches!(result, MessageBag::ForwardLogoutResult(_)));
+        assert_eq!(forward.command(), Command2::ForwardLogout);
+        assert_eq!(result.command(), Command2::ForwardLogoutResult);
+        assert_eq!(forward.operation(), Operation::Reserved);
+        assert_eq!(result.size(), HEADER_SIZE as u32);
     }
 
     // Construction via Message::new (zeroed)

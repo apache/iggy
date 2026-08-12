@@ -1469,12 +1469,16 @@ async fn await_pump_drain(
     };
     let drain_budget = config.system.sharding.shutdown_drain_timeout.get_duration();
     let Ok(join_result) = compio::time::timeout(drain_budget, pump_handle).await else {
-        warn!(
+        error!(
             shard = shard_id,
+            timeout = ?drain_budget,
             "message pump did not drain within the shutdown budget; \
              committed journal tail may not have flushed"
         );
-        return Ok(());
+        return Err(ServerError::ShardPumpDrainTimedOut {
+            shard_id,
+            timeout: drain_budget,
+        });
     };
     // `JoinError` renders a panic as the bare "Task has panicked" and the
     // type is not re-exported, so the payload -- the only part with
@@ -4408,6 +4412,28 @@ mod tests {
             ),
             "expected ShardBootstrapBarrierAborted, got {err:?}"
         );
+    }
+
+    #[compio::test]
+    async fn pump_drain_timeout_is_not_reported_as_clean() {
+        let mut config = ServerConfig::default();
+        let timeout = Duration::from_millis(1);
+        Arc::get_mut(&mut config.system)
+            .expect("a fresh ServerConfig owns its system config")
+            .sharding
+            .shutdown_drain_timeout = iggy_common::IggyDuration::new(timeout);
+        let pump = compio::runtime::spawn(std::future::pending::<()>());
+
+        let error = await_pump_drain(Some(pump), &config, 7)
+            .await
+            .expect_err("a live pump past the drain budget is not a clean exit");
+        assert!(matches!(
+            error,
+            ServerError::ShardPumpDrainTimedOut {
+                shard_id: 7,
+                timeout: actual,
+            } if actual == timeout
+        ));
     }
 
     #[compio::test]

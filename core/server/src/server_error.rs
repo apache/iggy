@@ -77,6 +77,14 @@ pub enum ServerError {
          committed journal tail may not have flushed"
     )]
     ShardPumpDied { shard_id: u16, reason: String },
+    #[error(
+        "shard {shard_id} message pump did not drain within {timeout:?}. \
+         Committed journal tail may not have flushed"
+    )]
+    ShardPumpDrainTimedOut {
+        shard_id: u16,
+        timeout: std::time::Duration,
+    },
     #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
     InvalidInboxCapacity { value: usize, max: usize },
     #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]

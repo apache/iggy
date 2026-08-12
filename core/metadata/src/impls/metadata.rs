@@ -494,10 +494,10 @@ pub enum MetadataSubmitError {
     /// the new primary.
     Canceled,
     /// The node this view names primary is not reachable from this shard, so
-    /// a forwarded register never left. Nothing was proposed.
+    /// a forwarded session operation never left. Nothing was proposed.
     PrimaryUnreachable,
-    /// A forwarded register left but no verdict came back within the forward
-    /// timeout. The proposal's outcome is unknown.
+    /// A forwarded session operation left but no verdict came back within the
+    /// forward timeout. The proposal's outcome is unknown.
     ForwardTimedOut,
     /// The presented `client_id` already has a table entry owned by a
     /// DIFFERENT user. TERMINAL, unlike every sibling: retrying cannot help,

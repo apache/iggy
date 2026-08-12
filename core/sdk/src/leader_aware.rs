@@ -230,6 +230,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_unauthenticated_cluster_metadata_is_a_pre_login_probe() {
+        assert!(is_unauthenticated_metadata_probe(
+            GET_CLUSTER_METADATA_CODE,
+            &IggyError::Unauthenticated,
+        ));
+        assert!(!is_unauthenticated_metadata_probe(
+            GET_CLUSTER_METADATA_CODE,
+            &IggyError::Disconnected,
+        ));
+        assert!(!is_unauthenticated_metadata_probe(
+            GET_CLUSTER_METADATA_CODE + 1,
+            &IggyError::Unauthenticated,
+        ));
+    }
+
+    #[test]
     fn test_is_same_address() {
         assert!(is_same_address("127.0.0.1:8090", "127.0.0.1:8090"));
         assert!(is_same_address("localhost:8090", "127.0.0.1:8090"));

@@ -40,6 +40,7 @@ use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader,
+    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
     ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
     RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
     RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
@@ -173,7 +174,9 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// and awaits the outcome over `reply`. `Register` carries the submit error
 /// verbatim because one variant
 /// (`MetadataSubmitError::ClientIdOwnedByAnotherUser`) is terminal and must
-/// not be retried; the remaining variants are transient by contract.
+/// not be retried. The remaining variants are transient by contract, and
+/// Logout preserves them so its caller can distinguish an unknown outcome
+/// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
@@ -201,11 +204,20 @@ pub enum MetadataSubmit {
         /// Replica the result frame goes back to.
         origin_replica: u8,
     },
+    /// A backup owns a bound client connection and asks the metadata primary
+    /// to commit its Logout. The result returns over the replica interconnect.
+    ForwardedLogout {
+        vsr_client_id: u128,
+        session: u64,
+        request: u64,
+        nonce: u128,
+        origin_replica: u8,
+    },
     Logout {
         vsr_client_id: u128,
         session: u64,
         request: u64,
-        reply: Sender<Option<u64>>,
+        reply: Sender<Result<u64, MetadataSubmitError>>,
     },
     /// A peer (home) shard relays a client's replicated request to shard 0
     /// and awaits the committed reply over `reply` (`None` on a transient
@@ -520,7 +532,7 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
     Ok(())
 }
 
-/// Starting point for [`IggyShard::next_register_forward_nonce`]: the low half
+/// Starting point for [`IggyShard::next_forward_nonce`]: the low half
 /// of this boot's consensus incarnation.
 ///
 /// Forward nonces are node-local and never persisted, so a counter that starts
@@ -533,7 +545,7 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
 /// wherever nothing set an incarnation, which degenerates to the unseeded
 /// sequence: no worse than before, and the shards that take it are test ones.
 #[allow(clippy::cast_possible_truncation)]
-fn register_forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
+fn forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
     consensus.map_or(0, VsrConsensus::incarnation) as u64
 }
 
@@ -1228,11 +1240,14 @@ where
     /// legitimate entry parked instead of evicting it.
     register_forwards: RefCell<HashMap<(u128, u128), Sender<ForwardRegisterResultHeader>>>,
 
-    /// Monotonic source of [`Self::register_forwards`] nonces. Node-local: the
+    /// Logouts this node forwarded to the primary and is still waiting on.
+    logout_forwards: RefCell<HashMap<(u128, u128), Sender<ForwardLogoutResultHeader>>>,
+
+    /// Monotonic source of forwarding nonces. Node-local: the
     /// nonce only has to distinguish this node's own in-flight forwards, across
     /// its restarts as well as within one boot. Seeded by
-    /// [`register_forward_nonce_seed`].
-    register_forward_nonce: Cell<u64>,
+    /// [`forward_nonce_seed`].
+    forward_nonce: Cell<u64>,
 
     /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
     /// these (it owns the metadata consensus group); peers send them here
@@ -1460,7 +1475,7 @@ where
             u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
-        let nonce_seed = register_forward_nonce_seed(metadata.consensus.as_ref());
+        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         Ok(Self {
@@ -1492,7 +1507,8 @@ where
             partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             register_forwards: RefCell::new(HashMap::new()),
-            register_forward_nonce: Cell::new(nonce_seed),
+            logout_forwards: RefCell::new(HashMap::new()),
+            forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
@@ -1536,7 +1552,7 @@ where
         self.bus_max_message_size.set(max_message_size);
     }
 
-    /// Mint a fresh, never-zero nonce for [`Self::park_register_forward`].
+    /// Mint a fresh, never-zero nonce for a register or logout forward.
     ///
     /// `replica` rides the high half, which separates the nonce spaces of
     /// different NODES: a result frame that somehow arrives from the wrong node
@@ -1546,9 +1562,9 @@ where
     /// The counter skips zero on wrap: both forwarding headers reject a zero
     /// nonce in `validate`, so a wrapped counter would have the origin build a
     /// frame the primary drops.
-    pub fn next_register_forward_nonce(&self, replica: u8) -> u128 {
-        let counter = self.register_forward_nonce.get().wrapping_add(1).max(1);
-        self.register_forward_nonce.set(counter);
+    pub fn next_forward_nonce(&self, replica: u8) -> u128 {
+        let counter = self.forward_nonce.get().wrapping_add(1).max(1);
+        self.forward_nonce.set(counter);
         (u128::from(replica) << 64) | u128::from(counter)
     }
 
@@ -1567,6 +1583,23 @@ where
     /// Drop a parked login (timeout, or a forward that never left the node).
     pub fn cancel_register_forward(&self, nonce: u128, client: u128) {
         self.register_forwards.borrow_mut().remove(&(nonce, client));
+    }
+
+    /// Park a forwarded logout under `(nonce, client)` until the primary answers.
+    pub fn park_logout_forward(
+        &self,
+        nonce: u128,
+        client: u128,
+        reply: Sender<ForwardLogoutResultHeader>,
+    ) {
+        self.logout_forwards
+            .borrow_mut()
+            .insert((nonce, client), reply);
+    }
+
+    /// Drop a parked logout after timeout or a failed send.
+    pub fn cancel_logout_forward(&self, nonce: u128, client: u128) {
+        self.logout_forwards.borrow_mut().remove(&(nonce, client));
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1744,7 +1777,7 @@ where
         // with the current type setup; revisit when crossfire grows an
         // unbounded variant or we replace it.
         let (_tx, inbox) = channel(1);
-        let nonce_seed = register_forward_nonce_seed(metadata.consensus.as_ref());
+        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         Self {
@@ -1782,7 +1815,8 @@ where
             partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             register_forwards: RefCell::new(HashMap::new()),
-            register_forward_nonce: Cell::new(nonce_seed),
+            logout_forwards: RefCell::new(HashMap::new()),
+            forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
@@ -2462,55 +2496,86 @@ where
             }
             Ok(MessageBag::RequestStateChunk(ref msg)) => self.on_request_state_chunk(msg).await,
             Ok(MessageBag::StateChunk(ref msg)) => self.on_state_chunk(msg).await,
-            // The proposal must not run on the pump (it awaits a commit that
-            // this very pump has to drive), so it goes through the same
-            // handler seam a peer shard's login uses, which spawns it.
-            Ok(MessageBag::ForwardRegister(ref msg)) => {
-                let header = *msg.header();
-                // The result frame is addressed by this id; bound it at ingress
-                // like every other off-wire replica id, instead of committing a
-                // register whose answer can never route.
-                if !self.peer_is_known(header.replica, "ForwardRegister") {
-                    return;
-                }
-                debug_assert_eq!(
-                    self.id, 0,
-                    "ForwardRegister routes to the metadata consensus owner"
-                );
-                (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
-                    vsr_client_id: header.client,
-                    user_id: header.user_id,
-                    nonce: header.nonce,
-                    origin_replica: header.replica,
-                });
-            }
+            // A forwarded proposal must leave the pump because its commit is
+            // driven by this same pump. The metadata-submit handler spawns it.
+            Ok(MessageBag::ForwardRegister(ref msg)) => self.on_forward_register(*msg.header()),
             Ok(MessageBag::ForwardRegisterResult(ref msg)) => {
-                let header = *msg.header();
-                // The whole header travels: every field on it is wire
-                // vocabulary the server layer owns, and nothing here has to
-                // learn what an outcome means.
-                let waiter = self
-                    .register_forwards
-                    .borrow_mut()
-                    .remove(&(header.nonce, header.client));
-                if let Some(waiter) = waiter {
-                    let _ = waiter.try_send(header);
-                } else {
-                    // Either the login gave up (timed out, or its connection
-                    // died) and removed its own entry, or the answer names a
-                    // client this nonce was never parked for. Nothing to
-                    // answer, and the parked entry of any other login stands.
-                    tracing::debug!(
-                        shard = self.id,
-                        nonce = header.nonce,
-                        client = header.client,
-                        "dropping forward-register result with no parked login"
-                    );
-                }
+                self.on_forward_register_result(*msg.header());
+            }
+            Ok(MessageBag::ForwardLogout(ref msg)) => self.on_forward_logout(*msg.header()),
+            Ok(MessageBag::ForwardLogoutResult(ref msg)) => {
+                self.on_forward_logout_result(*msg.header());
             }
             Err(e) => {
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
             }
+        }
+    }
+
+    fn on_forward_register(&self, header: ForwardRegisterHeader) {
+        if !self.peer_is_known(header.replica, "ForwardRegister") {
+            return;
+        }
+        debug_assert_eq!(
+            self.id, 0,
+            "ForwardRegister routes to the metadata consensus owner"
+        );
+        (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
+            vsr_client_id: header.client,
+            user_id: header.user_id,
+            nonce: header.nonce,
+            origin_replica: header.replica,
+        });
+    }
+
+    fn on_forward_register_result(&self, header: ForwardRegisterResultHeader) {
+        let waiter = self
+            .register_forwards
+            .borrow_mut()
+            .remove(&(header.nonce, header.client));
+        if let Some(waiter) = waiter {
+            let _ = waiter.try_send(header);
+        } else {
+            tracing::debug!(
+                shard = self.id,
+                nonce = header.nonce,
+                client = header.client,
+                "dropping forward-register result with no parked login"
+            );
+        }
+    }
+
+    fn on_forward_logout(&self, header: ForwardLogoutHeader) {
+        if !self.peer_is_known(header.replica, "ForwardLogout") {
+            return;
+        }
+        debug_assert_eq!(
+            self.id, 0,
+            "ForwardLogout routes to the metadata consensus owner"
+        );
+        (self.on_metadata_submit)(MetadataSubmit::ForwardedLogout {
+            vsr_client_id: header.client,
+            session: header.session,
+            request: header.request,
+            nonce: header.nonce,
+            origin_replica: header.replica,
+        });
+    }
+
+    fn on_forward_logout_result(&self, header: ForwardLogoutResultHeader) {
+        let waiter = self
+            .logout_forwards
+            .borrow_mut()
+            .remove(&(header.nonce, header.client));
+        if let Some(waiter) = waiter {
+            let _ = waiter.try_send(header);
+        } else {
+            tracing::debug!(
+                shard = self.id,
+                nonce = header.nonce,
+                client = header.client,
+                "dropping forward-logout result with no parked request"
+            );
         }
     }
 

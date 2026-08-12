@@ -115,6 +115,14 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
             let h = *m.header();
             (h.operation(), METADATA_GROUP, m.into_generic())
         }
+        MessageBag::ForwardLogout(m) => {
+            let h = *m.header();
+            (h.operation(), METADATA_GROUP, m.into_generic())
+        }
+        MessageBag::ForwardLogoutResult(m) => {
+            let h = *m.header();
+            (h.operation(), METADATA_GROUP, m.into_generic())
+        }
     }
 }
 
@@ -266,9 +274,9 @@ where
     /// partition-plane operation and `variant=consensus` otherwise -- the two
     /// have different recovery stories, so folding them into one label hides
     /// which one is bleeding. VSR retransmit recovers consensus drops, except
-    /// the two forward-register frames, which no retransmit covers: a dropped
-    /// forward or its result surfaces as the origin's forward timeout plus the
-    /// SDK's login replay. A
+    /// the four register/logout forwarding frames, which no retransmit covers: a
+    /// dropped forward or its result surfaces as the origin's forward timeout
+    /// plus the SDK's session-operation replay. A
     /// `target` past the end of `senders` (a stored `u16` from `shard_for`, not
     /// a trusted index) is dropped with `reason=unroutable` rather than
     /// panicking. Metadata frames always pass `target = 0` here, since

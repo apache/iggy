@@ -326,32 +326,7 @@ impl HttpInner {
             .map_err(|_| AuthError::SessionUnavailable)?
             .map_err(|error| {
                 warn!(?error, "server HTTP: VSR Register submit failed");
-                match error {
-                    // The Register never entered the pipeline, so re-issuing
-                    // it anywhere is safe; the transient-not-accepted body
-                    // tells a forwarding peer to retry against the current
-                    // primary. `PrimaryUnreachable` qualifies too: a forwarded
-                    // register never left this node, nothing was proposed.
-                    MetadataSubmitError::NotPrimary
-                    | MetadataSubmitError::NotCaughtUp
-                    | MetadataSubmitError::PipelineFull
-                    | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
-                    // Terminal, and the only variant here that is: retrying
-                    // anywhere cannot make the id free. Kept off the 503 path
-                    // so the caller's HTTP stack does not auto-retry forever.
-                    MetadataSubmitError::ClientIdOwnedByAnotherUser => {
-                        AuthError::SessionIdOwnedByAnotherUser
-                    }
-                    // `InProgress` / `Canceled` / `ForwardTimedOut` mean a
-                    // prepare may still commit cluster-wide, so the outcome
-                    // is unknown rather than terminal. A future variant lands
-                    // here too: 503 is the safe default, since it never
-                    // asserts a refusal the server did not make.
-                    MetadataSubmitError::InProgress
-                    | MetadataSubmitError::Canceled
-                    | MetadataSubmitError::ForwardTimedOut
-                    | _ => AuthError::SessionUnavailable,
-                }
+                register_submit_auth_error(&error)
             })?;
         // A fresh mint must land on a fresh entry, so a watermark it did not
         // write means the id was already registered to this same user (see
@@ -424,6 +399,24 @@ impl HttpInner {
     }
 }
 
+const fn register_submit_auth_error(error: &MetadataSubmitError) -> AuthError {
+    match error {
+        // These outcomes prove the Register never entered a pipeline, so a
+        // forwarding peer may safely retry against a re-resolved primary.
+        MetadataSubmitError::NotPrimary
+        | MetadataSubmitError::NotCaughtUp
+        | MetadataSubmitError::PipelineFull
+        | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
+        MetadataSubmitError::ClientIdOwnedByAnotherUser => AuthError::SessionIdOwnedByAnotherUser,
+        // The proposal may still commit. Unknown future outcomes fail closed
+        // into the same client-only retry class.
+        MetadataSubmitError::InProgress
+        | MetadataSubmitError::Canceled
+        | MetadataSubmitError::ForwardTimedOut
+        | _ => AuthError::SessionUnavailable,
+    }
+}
+
 /// Set the [`VIEW_HEADER`] to the current VSR view on a successful or redirect
 /// `response`. Omits the header on error responses and when this node has no
 /// live consensus: a missing header is unambiguous, whereas a fabricated view
@@ -443,4 +436,40 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
             .or_insert(HeaderValue::from(consensus.view()));
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_submit_auth_error;
+    use crate::http::error::AuthError;
+    use metadata::MetadataSubmitError;
+
+    #[test]
+    fn register_submit_errors_preserve_known_and_unknown_outcomes() {
+        for error in [
+            MetadataSubmitError::NotPrimary,
+            MetadataSubmitError::NotCaughtUp,
+            MetadataSubmitError::PipelineFull,
+            MetadataSubmitError::PrimaryUnreachable,
+        ] {
+            assert!(matches!(
+                register_submit_auth_error(&error),
+                AuthError::SessionNotAccepted
+            ));
+        }
+        assert!(matches!(
+            register_submit_auth_error(&MetadataSubmitError::ClientIdOwnedByAnotherUser),
+            AuthError::SessionIdOwnedByAnotherUser
+        ));
+        for error in [
+            MetadataSubmitError::InProgress,
+            MetadataSubmitError::Canceled,
+            MetadataSubmitError::ForwardTimedOut,
+        ] {
+            assert!(matches!(
+                register_submit_auth_error(&error),
+                AuthError::SessionUnavailable
+            ));
+        }
+    }
 }

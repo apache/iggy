@@ -32,6 +32,12 @@
 //! mixed pair is dropped, so no view change reaches a quorum. Nothing enforces this,
 //! because there is nothing left to enforce it with; this note is the declaration.
 //!
+//! The forwarding commands at discriminants 26 through 29 are same-release
+//! replica messages. A build whose command bit-pattern predates them drops the
+//! frames as unparsable and never sends a result, so backup-dialed session
+//! operations wait for their forward timeout in a mixed fleet. These commands are
+//! another reason the release cannot be rolled node by node.
+//!
 //! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
 //! `checksum` as their view-independent identity, and the three client-facing
 //! headers are sealed on neither side, so SDKs are untouched.
@@ -2429,7 +2435,13 @@ impl ConsensusHeader for ForwardRegisterResultHeader {
                 found: self.command,
             });
         }
-        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)
+        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)?;
+        if self.outcome != ForwardRegisterOutcome::Ok && (self.epoch != 0 || self.watermark != 0) {
+            return Err(ConsensusError::InvalidField(
+                "forward register result bind must be zero on failure".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2439,8 +2451,215 @@ impl ConsensusHeader for ForwardRegisterResultHeader {
 /// travels between replicas of one release (see the wire-compatibility note at
 /// the top of this module), so there is no forward-compatibility to preserve
 /// and a nonzero byte can only mean a builder bug or a mangled frame.
-#[allow(clippy::cast_possible_truncation)]
 fn validate_forward_register_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    validate_forward_frame(size, client, nonce, reserved)
+}
+
+// ForwardLogoutHeader - backup shard 0 -> primary shard 0
+
+/// A backup asks the metadata primary to tear down a session it owns.
+///
+/// The client-facing Logout request stays on the backup. Only the replicated
+/// session identity and request number cross the replica interconnect, and the
+/// primary's epoch guard makes a delayed forward harmless after a rebind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardLogoutHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The consensus client id whose table entry should be removed.
+    pub client: u128,
+    /// Correlation minted by the backup and echoed in the result.
+    pub nonce: u128,
+    /// The exact register epoch being logged out.
+    pub session: u64,
+    /// The client's request number, or the server's synthetic disconnect id.
+    pub request: u64,
+    pub reserved: [u8; 80],
+}
+const _: () = {
+    assert!(size_of::<ForwardLogoutHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardLogoutHeader, client)
+            == offset_of!(ForwardLogoutHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardLogoutHeader, nonce) == 144);
+    assert!(offset_of!(ForwardLogoutHeader, session) == 160);
+    assert!(offset_of!(ForwardLogoutHeader, request) == 168);
+    assert!(offset_of!(ForwardLogoutHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for ForwardLogoutHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command2 = Command2::ForwardLogout;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+
+    fn command(&self) -> Command2 {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardLogout {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardLogout,
+                found: self.command,
+            });
+        }
+        validate_forward_logout_frame(
+            self.size,
+            self.client,
+            self.nonce,
+            self.session,
+            self.request,
+            &self.reserved,
+        )
+    }
+}
+
+// ForwardLogoutResultHeader - primary shard 0 -> backup shard 0
+
+/// The metadata primary's verdict on a [`ForwardLogoutHeader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardLogoutResultHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// Echo of [`ForwardLogoutHeader::nonce`].
+    pub nonce: u128,
+    /// Echo of [`ForwardLogoutHeader::client`].
+    pub client: u128,
+    /// Committed Logout op, or the current commit for an idempotent no-op.
+    /// Zero unless `outcome` is [`ForwardLogoutOutcome::Ok`].
+    pub commit: u64,
+    pub reserved: [u8; 87],
+    pub outcome: ForwardLogoutOutcome,
+}
+const _: () = {
+    assert!(size_of::<ForwardLogoutResultHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardLogoutResultHeader, nonce)
+            == offset_of!(ForwardLogoutResultHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardLogoutResultHeader, client) == 144);
+    assert!(offset_of!(ForwardLogoutResultHeader, commit) == 160);
+    assert!(
+        offset_of!(ForwardLogoutResultHeader, outcome) + size_of::<ForwardLogoutOutcome>()
+            == HEADER_SIZE
+    );
+};
+
+/// Wire verdict on a forwarded logout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum ForwardLogoutOutcome {
+    Ok = 0,
+    NotPrimary = 1,
+    PipelineFull = 2,
+    InProgress = 3,
+    Canceled = 4,
+}
+
+impl ConsensusHeader for ForwardLogoutResultHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command2 = Command2::ForwardLogoutResult;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+
+    fn command(&self) -> Command2 {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardLogoutResult {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardLogoutResult,
+                found: self.command,
+            });
+        }
+        validate_forward_frame(self.size, self.client, self.nonce, &self.reserved)?;
+        if self.outcome != ForwardLogoutOutcome::Ok && self.commit != 0 {
+            return Err(ConsensusError::InvalidField(
+                "forward logout result commit must be zero on failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_forward_logout_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    session: u64,
+    request: u64,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    validate_forward_frame(size, client, nonce, reserved)?;
+    if session == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward logout session must be non-zero".to_string(),
+        ));
+    }
+    if request == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward logout request must be non-zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn validate_forward_frame(
     size: u32,
     client: u128,
     nonce: u128,
@@ -2454,17 +2673,17 @@ fn validate_forward_register_frame(
     }
     if client == 0 {
         return Err(ConsensusError::InvalidField(
-            "forward register client must be non-zero".to_string(),
+            "forward client must be non-zero".to_string(),
         ));
     }
     if nonce == 0 {
         return Err(ConsensusError::InvalidField(
-            "forward register nonce must be non-zero".to_string(),
+            "forward nonce must be non-zero".to_string(),
         ));
     }
     if reserved.iter().any(|&byte| byte != 0) {
         return Err(ConsensusError::InvalidField(
-            "forward register reserved bytes must be zero".to_string(),
+            "forward reserved bytes must be zero".to_string(),
         ));
     }
     Ok(())
@@ -2476,7 +2695,8 @@ fn validate_forward_register_frame(
 mod tests {
     use super::{
         Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-        EvictionHeader, EvictionReason, ForwardRegisterHeader, ForwardRegisterOutcome,
+        EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
+        ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
         ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
         PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
         RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
@@ -2555,6 +2775,8 @@ mod tests {
             StateChunkHeader,
             ForwardRegisterHeader,
             ForwardRegisterResultHeader,
+            ForwardLogoutHeader,
+            ForwardLogoutResultHeader,
         );
     }
 
@@ -2958,8 +3180,8 @@ mod tests {
             reserved_frame: [0; 66],
             nonce: 0xF00D,
             client: 0xCAFE,
-            epoch: 91,
-            watermark: 12,
+            epoch: u64::from(outcome == ForwardRegisterOutcome::Ok) * 91,
+            watermark: u64::from(outcome == ForwardRegisterOutcome::Ok) * 12,
             reserved: [0; 79],
             outcome,
         };
@@ -3066,6 +3288,17 @@ mod tests {
             result_zero_nonce.validate(),
             Err(ConsensusError::InvalidField(_))
         ));
+
+        let mut failed_with_bind = forward_register_result(ForwardRegisterOutcome::NotPrimary);
+        failed_with_bind.epoch = 91;
+        failed_with_bind.watermark = 12;
+        assert!(matches!(
+            failed_with_bind.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        failed_with_bind.epoch = 0;
+        failed_with_bind.watermark = 0;
+        assert_eq!(failed_with_bind.validate(), Ok(()));
     }
 
     // An unknown outcome is rejected by the bit-pattern check, one layer
@@ -3092,5 +3325,137 @@ mod tests {
         assert_eq!(ForwardRegisterOutcome::InProgress as u8, 4);
         assert_eq!(ForwardRegisterOutcome::Canceled as u8, 5);
         assert_eq!(ForwardRegisterOutcome::ClientIdOwnedByAnotherUser as u8, 6);
+    }
+
+    fn forward_logout() -> ForwardLogoutHeader {
+        let mut header = ForwardLogoutHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardLogout,
+            replica: 2,
+            reserved_frame: [0; 66],
+            client: 0xCAFE,
+            nonce: 0xF00D,
+            session: 91,
+            request: 12,
+            reserved: [0; 80],
+        };
+        header.seal();
+        header
+    }
+
+    fn forward_logout_result(outcome: ForwardLogoutOutcome) -> ForwardLogoutResultHeader {
+        let mut header = ForwardLogoutResultHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardLogoutResult,
+            replica: 0,
+            reserved_frame: [0; 66],
+            nonce: 0xF00D,
+            client: 0xCAFE,
+            commit: if outcome == ForwardLogoutOutcome::Ok {
+                92
+            } else {
+                0
+            },
+            reserved: [0; 87],
+            outcome,
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn forward_logout_headers_round_trip_and_validate() {
+        let forward = forward_logout();
+        assert_eq!(forward.verify_frame(), Ok(()));
+        assert_eq!(forward.validate(), Ok(()));
+
+        for outcome in [
+            ForwardLogoutOutcome::Ok,
+            ForwardLogoutOutcome::NotPrimary,
+            ForwardLogoutOutcome::PipelineFull,
+            ForwardLogoutOutcome::InProgress,
+            ForwardLogoutOutcome::Canceled,
+        ] {
+            let result = forward_logout_result(outcome);
+            assert_eq!(result.verify_frame(), Ok(()));
+            assert_eq!(result.validate(), Ok(()));
+            let mut bytes = aligned_zeroed(HEADER_SIZE);
+            bytes.copy_from_slice(bytemuck::bytes_of(&result));
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&bytes)
+                .expect("forward logout result is a valid generic header");
+            assert_eq!(generic.command, Command2::ForwardLogoutResult);
+        }
+    }
+
+    #[test]
+    fn forward_logout_validate_rejects_malformed_frames() {
+        let mut header = forward_logout();
+        header.client = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.nonce = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.session = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.request = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.reserved[0] = 1;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut result = forward_logout_result(ForwardLogoutOutcome::NotPrimary);
+        result.commit = 92;
+        assert!(matches!(
+            result.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+    }
+
+    #[test]
+    fn forward_logout_result_rejects_unknown_outcome() {
+        const OUTCOME_OFFSET: usize = std::mem::offset_of!(ForwardLogoutResultHeader, outcome);
+
+        let mut bytes = aligned_zeroed(HEADER_SIZE);
+        bytes.copy_from_slice(bytemuck::bytes_of(&forward_logout_result(
+            ForwardLogoutOutcome::Ok,
+        )));
+        bytes[OUTCOME_OFFSET] = 5;
+        assert!(bytemuck::checked::try_from_bytes::<ForwardLogoutResultHeader>(&bytes).is_err());
+    }
+
+    #[test]
+    fn forward_logout_outcome_discriminants_pinned() {
+        assert_eq!(ForwardLogoutOutcome::Ok as u8, 0);
+        assert_eq!(ForwardLogoutOutcome::NotPrimary as u8, 1);
+        assert_eq!(ForwardLogoutOutcome::PipelineFull as u8, 2);
+        assert_eq!(ForwardLogoutOutcome::InProgress as u8, 3);
+        assert_eq!(ForwardLogoutOutcome::Canceled as u8, 4);
     }
 }

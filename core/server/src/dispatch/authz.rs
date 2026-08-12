@@ -167,6 +167,38 @@ pub(super) async fn send_deny_reply<B, MJ, S, SB>(
     }
 }
 
+/// Deny a request from an unbound transport without disclosing the metadata
+/// commit frontier. The status is the only field a pre-authenticated caller
+/// needs, while the live commit would expose cluster write activity.
+#[allow(clippy::future_not_send)]
+pub(super) async fn send_unbound_deny_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    request_header: &RoutedRequestHeader,
+    status: u32,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let reply = build_deny_reply(request_header, transport_client_id, 0, 0, status);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            status,
+            error = %error,
+            operation = ?request_header.operation,
+            "failed to surface unbound request denial"
+        );
+    }
+}
+
 /// Run an unscoped non-replicated-read rule for the acting user. A `None` user
 /// id (only the pre-auth path, which serves ungated codes) fails closed.
 pub(super) fn authorize_uid<B, MJ, S, SB>(

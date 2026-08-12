@@ -35,7 +35,7 @@ use crate::consumer_group::{
 };
 use crate::dispatch::authz::{
     authorize_default_read, authorize_partition_op, authorize_partition_read, authorize_uid,
-    send_deny_reply, send_non_replicated_deny,
+    send_deny_reply, send_non_replicated_deny, send_unbound_deny_reply,
 };
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
@@ -84,10 +84,11 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
-    AckLevel, ClientVersionInfo, Command2, ConsensusHeader, EvictionReason, ForwardRegisterHeader,
-    ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE,
-    KIND_CONSUMER_GROUP, MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader,
-    RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
+    AckLevel, ClientVersionInfo, Command2, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
+    ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, KIND_CONSUMER_GROUP,
+    MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader, RoutedRequestHeader,
+    WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
 };
 use iggy_common::{
     IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression, SystemSnapshotType,
@@ -526,8 +527,8 @@ where
 /// shard has verified credentials and owns the session locally, and asks
 /// shard 0 (the metadata consensus owner) to run only the consensus
 /// proposal. Spawns a task so the awaiting peer is woken once the op
-/// commits; replies `None` on transient submit failure so the peer never
-/// blocks forever.
+/// commits. Submit failures are returned verbatim so the peer can preserve
+/// unknown-outcome retry semantics.
 pub(crate) fn make_metadata_submit_handler<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> shard::MetadataSubmitHandler
@@ -570,19 +571,33 @@ where
                     )
                     .await;
                 }
+                shard::MetadataSubmit::ForwardedLogout {
+                    vsr_client_id,
+                    session,
+                    request,
+                    nonce,
+                    origin_replica,
+                } => {
+                    answer_forwarded_logout(
+                        &shard,
+                        vsr_client_id,
+                        session,
+                        request,
+                        nonce,
+                        origin_replica,
+                    )
+                    .await;
+                }
                 shard::MetadataSubmit::Logout {
                     vsr_client_id,
                     session,
                     request,
                     reply,
                 } => {
-                    let commit = shard
-                        .plane
-                        .metadata()
-                        .submit_logout_in_process(vsr_client_id, session, request)
-                        .await
-                        .ok();
-                    let _ = reply.try_send(commit);
+                    let outcome =
+                        submit_logout_local_or_forward(&shard, vsr_client_id, session, request)
+                            .await;
+                    let _ = reply.try_send(outcome);
                 }
                 shard::MetadataSubmit::ClientRequest { request, reply } => {
                     let committed = match request.try_into_typed::<RoutedRequestHeader>() {
@@ -970,7 +985,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // so SDKs would tear down the very connection their login is
             // about to use. The status channel carries the error the same
             // way the request-checksum denial above does.
-            send_deny_reply(
+            send_unbound_deny_reply(
                 shard,
                 transport_client_id,
                 request.header(),
@@ -2479,7 +2494,7 @@ async fn answer_forwarded_register<B, MJ, S, SB>(
 /// The budget stays well under the SDK's response-read timeout on purpose: the
 /// client only replays a login while it is still reading, so a longer wait
 /// here turns a transient into a torn-down socket.
-const FORWARD_REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+const FORWARD_SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run the `Register` proposal for a login this node has already
 /// authenticated, wherever the metadata primary currently is. Shard 0 only.
@@ -2492,8 +2507,8 @@ const FORWARD_REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection all stay on the node the client dialed.
 ///
 /// The hop does not move any credential decision:
-/// - `verify_login_credentials` reads replicated user state, so it is
-///   equally valid here.
+/// - `verify_login_credentials` reads the backup's applied replicated user
+///   state.
 /// - `verify_pat_credentials` reads the same state, so a PAT minted on the
 ///   primary that has not replicated here yet is refused until it does.
 ///   Fail-closed on purpose, the same parity the HTTP forward keeps: it too
@@ -2501,6 +2516,13 @@ const FORWARD_REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 ///   unverified bearer.
 /// - `ClientIdOwnedByAnotherUser` stays a decision of the caught-up primary
 ///   and round-trips as a terminal refusal.
+///
+/// Verification is point-in-time on the backup. A password change, PAT
+/// revocation, or user deactivation committed on the primary but not yet
+/// applied on the backup can therefore admit a login during the backup's apply
+/// lag. The forward cannot complete while the backup is partitioned from the
+/// primary, which bounds this to a connected replica's replication lag. This
+/// is the same stale-read window as the existing HTTP forward.
 ///
 /// The session binds here before this node applies the commit locally. That
 /// is the window a primary-side login already has against every other node's
@@ -2538,7 +2560,7 @@ where
             .await;
     }
 
-    let nonce = shard.next_register_forward_nonce(self_replica);
+    let nonce = shard.next_forward_nonce(self_replica);
     let (reply, outcome) = shard::channel::<ForwardRegisterResultHeader>(1);
     shard.park_register_forward(nonce, vsr_client_id, reply);
     let forward =
@@ -2557,7 +2579,7 @@ where
         return Err(MetadataSubmitError::PrimaryUnreachable);
     }
 
-    match shard::bus_timeout(&shard.bus, FORWARD_REGISTER_TIMEOUT, outcome.recv()).await {
+    match shard::bus_timeout(&shard.bus, FORWARD_SUBMIT_TIMEOUT, outcome.recv()).await {
         Some(Ok(result)) => forward_register_result(&result),
         // Shard-0 teardown dropped the sender without answering.
         Some(Err(_)) => Err(MetadataSubmitError::Canceled),
@@ -2664,6 +2686,195 @@ fn build_forward_register_result_message(
     )
 }
 
+/// Answer a backup's forwarded Logout from the node it named primary.
+#[allow(clippy::future_not_send)]
+async fn answer_forwarded_logout<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    vsr_client_id: u128,
+    session: u64,
+    request: u64,
+    nonce: u128,
+    origin_replica: u8,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some((cluster, view, replica)) = shard
+        .plane
+        .metadata()
+        .consensus
+        .as_ref()
+        .map(|consensus| (consensus.cluster(), consensus.view(), consensus.replica()))
+    else {
+        warn!("ForwardedLogout submit reached a shard without metadata consensus");
+        return;
+    };
+    let outcome = shard
+        .plane
+        .metadata()
+        .submit_logout_in_process(vsr_client_id, session, request)
+        .await;
+    let result =
+        build_forward_logout_result_message(cluster, view, replica, vsr_client_id, nonce, &outcome);
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(origin_replica, result.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            origin_replica,
+            error = %error,
+            "failed to answer a forwarded logout"
+        );
+    }
+}
+
+/// Commit a Logout locally when this node is primary, otherwise forward it
+/// once to the primary named by the current normal view.
+#[allow(clippy::future_not_send)]
+async fn submit_logout_local_or_forward<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    vsr_client_id: u128,
+    session: u64,
+    request: u64,
+) -> Result<u64, MetadataSubmitError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
+        return Err(MetadataSubmitError::NotPrimary);
+    };
+    let (cluster, view, self_replica) =
+        (consensus.cluster(), consensus.view(), consensus.replica());
+    let target = consensus.primary_index(view);
+    if target == self_replica || !consensus.is_normal() {
+        return shard
+            .plane
+            .metadata()
+            .submit_logout_in_process(vsr_client_id, session, request)
+            .await;
+    }
+
+    let nonce = shard.next_forward_nonce(self_replica);
+    let (reply, outcome) = shard::channel::<ForwardLogoutResultHeader>(1);
+    shard.park_logout_forward(nonce, vsr_client_id, reply);
+    let forward = build_forward_logout_message(
+        cluster,
+        view,
+        self_replica,
+        vsr_client_id,
+        nonce,
+        session,
+        request,
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(target, forward.into_generic().into_frozen())
+        .await
+    {
+        shard.cancel_logout_forward(nonce, vsr_client_id);
+        warn!(
+            target,
+            error = %error,
+            "failed to forward logout to the metadata primary"
+        );
+        return Err(MetadataSubmitError::PrimaryUnreachable);
+    }
+
+    match shard::bus_timeout(&shard.bus, FORWARD_SUBMIT_TIMEOUT, outcome.recv()).await {
+        Some(Ok(result)) => forward_logout_result(&result),
+        Some(Err(_)) => Err(MetadataSubmitError::Canceled),
+        None => {
+            shard.cancel_logout_forward(nonce, vsr_client_id);
+            warn!(target, "forwarded logout timed out");
+            Err(MetadataSubmitError::ForwardTimedOut)
+        }
+    }
+}
+
+const fn forward_logout_result(
+    result: &ForwardLogoutResultHeader,
+) -> Result<u64, MetadataSubmitError> {
+    match result.outcome {
+        ForwardLogoutOutcome::Ok => Ok(result.commit),
+        ForwardLogoutOutcome::NotPrimary => Err(MetadataSubmitError::NotPrimary),
+        ForwardLogoutOutcome::PipelineFull => Err(MetadataSubmitError::PipelineFull),
+        ForwardLogoutOutcome::InProgress => Err(MetadataSubmitError::InProgress),
+        ForwardLogoutOutcome::Canceled => Err(MetadataSubmitError::Canceled),
+    }
+}
+
+const fn forward_logout_outcome(
+    outcome: &Result<u64, MetadataSubmitError>,
+) -> (u64, ForwardLogoutOutcome) {
+    match outcome {
+        Ok(commit) => (*commit, ForwardLogoutOutcome::Ok),
+        Err(MetadataSubmitError::NotPrimary) => (0, ForwardLogoutOutcome::NotPrimary),
+        Err(MetadataSubmitError::PipelineFull) => (0, ForwardLogoutOutcome::PipelineFull),
+        Err(MetadataSubmitError::InProgress) => (0, ForwardLogoutOutcome::InProgress),
+        Err(_) => (0, ForwardLogoutOutcome::Canceled),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+fn build_forward_logout_message(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    client: u128,
+    nonce: u128,
+    session: u64,
+    request: u64,
+) -> Message<ForwardLogoutHeader> {
+    Message::<ForwardLogoutHeader>::new(HEADER_SIZE).transmute_header(
+        |_, header: &mut ForwardLogoutHeader| {
+            header.command = Command2::ForwardLogout;
+            header.cluster = cluster;
+            header.view = view;
+            header.replica = replica;
+            header.client = client;
+            header.nonce = nonce;
+            header.session = session;
+            header.request = request;
+            header.size = HEADER_SIZE as u32;
+            header.seal();
+        },
+    )
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn build_forward_logout_result_message(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    client: u128,
+    nonce: u128,
+    result: &Result<u64, MetadataSubmitError>,
+) -> Message<ForwardLogoutResultHeader> {
+    let (commit, outcome) = forward_logout_outcome(result);
+    Message::<ForwardLogoutResultHeader>::new(HEADER_SIZE).transmute_header(
+        |_, header: &mut ForwardLogoutResultHeader| {
+            header.command = Command2::ForwardLogoutResult;
+            header.cluster = cluster;
+            header.view = view;
+            header.replica = replica;
+            header.client = client;
+            header.nonce = nonce;
+            header.commit = commit;
+            header.outcome = outcome;
+            header.size = HEADER_SIZE as u32;
+            header.seal();
+        },
+    )
+}
+
 /// Run the consensus `Register` proposal on the metadata owner (shard 0)
 /// and return the committed session.
 ///
@@ -2719,23 +2930,18 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return shard
-            .plane
-            .metadata()
-            .submit_logout_in_process(vsr_client_id, session, request)
-            .await;
+        return submit_logout_local_or_forward(shard, vsr_client_id, session, request).await;
     }
-    let (reply, rx) = shard::channel::<Option<u64>>(1);
+    let (reply, rx) = shard::channel::<Result<u64, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Logout {
         vsr_client_id,
         session,
         request,
         reply,
     });
-    match rx.recv().await {
-        Ok(Some(commit)) => Ok(commit),
-        _ => Err(MetadataSubmitError::Canceled),
-    }
+    rx.recv()
+        .await
+        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
 }
 
 /// Handle a client `DeleteSegments`: resolve the requested count to an offset
@@ -3125,7 +3331,7 @@ async fn handle_logout_request<B, MJ, S, SB>(
                 vsr_client_id,
                 session,
                 commit,
-                IggyError::TransientNotAccepted.as_code(),
+                transient_logout_code(&error).as_code(),
             );
             if let Err(send_error) = shard
                 .bus
@@ -3155,6 +3361,18 @@ async fn handle_logout_request<B, MJ, S, SB>(
             error = %error,
             "failed to send logout reply"
         );
+    }
+}
+
+/// Preserve the client identity when a Logout may already have entered the
+/// primary's pipeline. Moving an unknown-outcome replay to another connection
+/// could race a later Register and obscure whether the old epoch was removed.
+const fn transient_logout_code(error: &MetadataSubmitError) -> IggyError {
+    match error {
+        MetadataSubmitError::ForwardTimedOut
+        | MetadataSubmitError::InProgress
+        | MetadataSubmitError::Canceled => IggyError::TransientNotCommitted,
+        _ => IggyError::TransientNotAccepted,
     }
 }
 
@@ -4175,6 +4393,81 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn backup_forwards_logout_and_completes_on_the_primary_verdict() {
+        const CLIENT: u128 = 0xCAFE;
+        const SESSION: u64 = 41;
+        const REQUEST: u64 = 9;
+        const COMMIT: u64 = 42;
+
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        let logout = {
+            let shard = Rc::clone(&shard);
+            compio::runtime::spawn(async move {
+                submit_logout_local_or_forward(&shard, CLIENT, SESSION, REQUEST).await
+            })
+        };
+        await_forward(&bus).await;
+        let (target, forward) = bus.sole_replica_send::<ForwardLogoutHeader>();
+        assert_eq!(target, 0, "forward must address the view's primary");
+        assert_eq!(forward.command, Command2::ForwardLogout);
+        assert_eq!(forward.client, CLIENT);
+        assert_eq!(forward.session, SESSION);
+        assert_eq!(forward.request, REQUEST);
+        assert_eq!(forward.replica, 1);
+        assert_ne!(forward.nonce, 0);
+        assert_eq!(forward.verify_frame(), Ok(()));
+        assert_eq!(forward.validate(), Ok(()));
+
+        shard
+            .on_message(forward_logout_result_message(&forward, &Ok(COMMIT)))
+            .await;
+        assert_eq!(
+            logout.await.expect("the logout task ran to completion"),
+            Ok(COMMIT)
+        );
+    }
+
+    #[compio::test]
+    async fn unanswered_logout_forward_times_out_and_clears_the_waiter() {
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+
+        let outcome = submit_logout_local_or_forward(&shard, 0xCAFE, 41, 9).await;
+        assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
+
+        let (_, forward) = bus.sole_replica_send::<ForwardLogoutHeader>();
+        shard
+            .on_message(forward_logout_result_message(&forward, &Ok(42)))
+            .await;
+    }
+
+    #[test]
+    fn unknown_logout_outcomes_pin_the_session() {
+        for error in [
+            MetadataSubmitError::ForwardTimedOut,
+            MetadataSubmitError::InProgress,
+            MetadataSubmitError::Canceled,
+        ] {
+            assert_eq!(
+                transient_logout_code(&error),
+                IggyError::TransientNotCommitted
+            );
+        }
+        for error in [
+            MetadataSubmitError::NotPrimary,
+            MetadataSubmitError::PipelineFull,
+            MetadataSubmitError::PrimaryUnreachable,
+        ] {
+            assert_eq!(
+                transient_logout_code(&error),
+                IggyError::TransientNotAccepted
+            );
+        }
+    }
+
     /// The ownership refusal is the one terminal verdict, and it has to stay
     /// terminal across the hop or the SDK replays a login that cannot succeed.
     #[compio::test]
@@ -4416,6 +4709,21 @@ mod tests {
         .into_generic()
     }
 
+    fn forward_logout_result_message(
+        forward: &ForwardLogoutHeader,
+        outcome: &Result<u64, MetadataSubmitError>,
+    ) -> Message<GenericHeader> {
+        build_forward_logout_result_message(
+            forward.cluster,
+            forward.view,
+            0,
+            forward.client,
+            forward.nonce,
+            outcome,
+        )
+        .into_generic()
+    }
+
     /// The `GET_CLUSTER_METADATA` auth gate holds on every roster shape: it
     /// describes the private replica network, and a client that dialed a
     /// backup reaches the cluster by logging in there (the backup forwards
@@ -4434,6 +4742,7 @@ mod tests {
         const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
         const OP_OFFSET: usize = std::mem::offset_of!(ReplyHeader, op);
+        const COMMIT_OFFSET: usize = std::mem::offset_of!(ReplyHeader, commit);
 
         fn metadata_read() -> Message<GenericHeader> {
             let header_size = size_of::<RequestHeader>();
@@ -4513,6 +4822,9 @@ mod tests {
             );
             let op = u64::from_le_bytes(frame[OP_OFFSET..OP_OFFSET + 8].try_into().unwrap());
             assert_eq!(op, 0, "pre-auth deny carries no session, so op must be 0");
+            let commit =
+                u64::from_le_bytes(frame[COMMIT_OFFSET..COMMIT_OFFSET + 8].try_into().unwrap());
+            assert_eq!(commit, 0, "pre-auth deny must not disclose commit activity");
             drop(replies);
             bus.client_replies.borrow_mut().clear();
         }

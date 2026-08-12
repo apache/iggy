@@ -261,11 +261,51 @@ func TestConnect_RedirectsToTheLeaderAfterSigningIn(t *testing.T) {
 	assert.Equal(t, leader.address(), client.currentServerAddress)
 
 	onLeader := leader.recorded()
-	require.Len(t, onLeader, 1, "the sign-in replay is the only frame the leader saw")
+	require.Len(t, onLeader, 2, "the sign-in replay is followed by a leader re-check")
 	assert.Equal(t, vsr.OperationRegister, onLeader[0].operation())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), onLeader[1].code())
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(128), client.session.SessionID(),
 		"the leader's session superseded the follower's")
+}
+
+func TestConnect_RechecksLeadershipAfterTheRedirectedSignIn(t *testing.T) {
+	var leader *testListener
+	leader = listenVSR(t, nil, singleNodeHandler(t, func() string { return leader.address() }))
+
+	var intermediate *testListener
+	intermediate = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, intermediate.address(), leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 256)
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+
+	var follower *testListener
+	follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, follower.address(), intermediate.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 512)
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+
+	client := newDialingClient(t, follower.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+
+	assert.Equal(t, leader.address(), client.currentServerAddress)
+	assert.Equal(t, 1, follower.connections())
+	assert.Equal(t, 1, intermediate.connections())
+	assert.Equal(t, 1, leader.connections())
+	assert.True(t, client.session.Bound())
 }
 
 func TestConnect_KeepsTheConnectionWhenTheRosterHasOneNode(t *testing.T) {

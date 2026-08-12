@@ -128,32 +128,39 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 // register to the primary); this settlement decides where later requests
 // land, not whether the sign-in works. The redirect drops the fresh session
 // along with the socket, so the sign-in is replayed on the leader and its
-// identity supersedes the dialed node's. One hop is enough: the leader admits
-// logins locally.
+// identity supersedes the dialed node's. Leadership can move between the
+// roster read and the replay, so each freshly bound hop rechecks the roster
+// under the shared redirect budget.
 //
 // Returns nil when the client stays where it is.
 func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
-	// The roster read runs while register holds the sign-in lock, so it must
-	// not enter the reconnect path: the reconnect's automatic sign-in would
-	// deadlock on that lock. The connect scope fails it fast instead.
-	redirect, err := c.HandleLeaderRedirection(
-		context.WithValue(ctx, connectScoped{}, struct{}{}))
-	if err != nil || !redirect {
-		return nil, err
-	}
+	var settled *iggcon.IdentityInfo
+	for {
+		// The roster read runs while register holds the sign-in lock, so it must
+		// not enter the reconnect path: the reconnect's automatic sign-in would
+		// deadlock on that lock. The connect scope fails it fast instead.
+		redirect, err := c.HandleLeaderRedirection(
+			context.WithValue(ctx, connectScoped{}, struct{}{}))
+		if err != nil || !redirect {
+			return settled, err
+		}
 
-	// The replayed sign-in below owns the session; the redirected Connect
-	// must not sign in on its own, or the replay commits a second Register.
-	c.mtx.Lock()
-	c.skipAutoLoginOnce = true
-	c.mtx.Unlock()
-	if err := c.Connect(ctx); err != nil {
+		// The replayed sign-in below owns the session; the redirected Connect
+		// must not sign in on its own, or the replay commits a second Register.
 		c.mtx.Lock()
-		c.skipAutoLoginOnce = false
+		c.skipAutoLoginOnce = true
 		c.mtx.Unlock()
-		return nil, err
+		if err := c.Connect(ctx); err != nil {
+			c.mtx.Lock()
+			c.skipAutoLoginOnce = false
+			c.mtx.Unlock()
+			return nil, err
+		}
+		settled, err = c.signIn(ctx, code, body)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return c.signIn(ctx, code, body)
 }
 
 // endBoundSession logs out a live session before a re-login, so the server

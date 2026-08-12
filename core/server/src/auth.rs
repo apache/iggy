@@ -366,19 +366,19 @@ async fn send_login_transient_reply<B, MJ, S, SB>(
 /// left this node (primary unreachable). The client may re-issue it anywhere,
 /// including under a fresh identity after failing over to another node.
 ///
-/// A forward timeout is the one transient whose outcome is UNKNOWN, so it
-/// cannot ride that assertion. The primary absorbs a register it cannot serve
-/// yet with no deadline of its own, so a slow but healthy primary still
-/// commits it after this node has stopped waiting. `TransientNotCommitted`
-/// pins the replay to this connection and its client id, where a register
-/// that did commit rebinds its own client-table entry; re-issuing under a
-/// freshly minted id would instead orphan that entry until capacity eviction
-/// reclaims it.
+/// A forward timeout, an in-progress proposal, or a canceled proposal has an
+/// UNKNOWN outcome, so none can ride that assertion. `TransientNotCommitted`
+/// pins the replay to this connection and its client id, where a register that
+/// did commit rebinds its own client-table entry. Re-issuing under a freshly
+/// minted id would instead orphan that entry until capacity eviction reclaims
+/// it.
 const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
     match error {
-        LoginRegisterError::Transient(MetadataSubmitError::ForwardTimedOut) => {
-            IggyError::TransientNotCommitted
-        }
+        LoginRegisterError::Transient(
+            MetadataSubmitError::ForwardTimedOut
+            | MetadataSubmitError::InProgress
+            | MetadataSubmitError::Canceled,
+        ) => IggyError::TransientNotCommitted,
         _ => IggyError::TransientNotAccepted,
     }
 }
@@ -426,6 +426,31 @@ mod tests {
                 error.as_code(),
                 expected.as_code(),
                 "reason {reason:?} must surface as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_register_outcomes_pin_the_client_identity() {
+        for error in [
+            MetadataSubmitError::ForwardTimedOut,
+            MetadataSubmitError::InProgress,
+            MetadataSubmitError::Canceled,
+        ] {
+            assert_eq!(
+                transient_login_code(&LoginRegisterError::Transient(error)),
+                IggyError::TransientNotCommitted,
+            );
+        }
+        for error in [
+            MetadataSubmitError::NotPrimary,
+            MetadataSubmitError::NotCaughtUp,
+            MetadataSubmitError::PipelineFull,
+            MetadataSubmitError::PrimaryUnreachable,
+        ] {
+            assert_eq!(
+                transient_login_code(&LoginRegisterError::Transient(error)),
+                IggyError::TransientNotAccepted,
             );
         }
     }

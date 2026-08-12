@@ -42,6 +42,7 @@ const VSR_RESPONSE_TIMEOUT_MS = 30_000;
 const VSR_RETRY_INTERVAL_MS = 50;
 const LEADERLESS_WAIT_BUDGET_MS = 5_000;
 const LEADERLESS_POLL_INTERVAL_MS = 250;
+const MAX_LEADER_REDIRECTS = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 
@@ -418,8 +419,9 @@ export class CommandResponseStream extends EventEmitter {
    * auth-gated, so the topology cannot be inspected before a login binds a
    * session. The redirect drops that session along with the socket, so the
    * login is replayed on the leader and its answer supersedes the one from the
-   * node the client dialed. One hop is enough: the leader admits logins
-   * locally.
+   * node the client dialed. Leadership can move between the roster read and
+   * the replay, so each freshly bound hop rechecks the roster under a bounded
+   * redirect budget.
    *
    * @returns The leader's login response, or undefined when the client stays
    */
@@ -427,11 +429,23 @@ export class CommandResponseStream extends EventEmitter {
     loginCommand: number,
     loginPayload: Buffer
   ): Promise<CommandResponse | undefined> {
-    const leader = await this._readLeaderEndpoint();
-    if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
-      return undefined;
-    await this.connection.redirect(leader.host, leader.port);
-    return this.sendCommand(loginCommand, loginPayload, { last: false });
+    let settledResponse: CommandResponse | undefined;
+    for (let redirects = 0; redirects < MAX_LEADER_REDIRECTS; redirects += 1) {
+      const leader = await this._readLeaderEndpoint();
+      if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+        return settledResponse;
+      await this.connection.redirect(leader.host, leader.port);
+      settledResponse = await this.sendCommand(
+        loginCommand,
+        loginPayload,
+        { last: false }
+      );
+    }
+    debug(
+      `leader settlement reached its ${MAX_LEADER_REDIRECTS}-hop budget, ` +
+      'staying on the current node'
+    );
+    return settledResponse;
   }
 
   /**
