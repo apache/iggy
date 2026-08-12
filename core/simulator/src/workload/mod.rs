@@ -40,7 +40,7 @@ use crate::workload::ops::InFlight;
 use actions::Action;
 use auditor::{OnReply, ServerAuditor};
 use effect::SimCommand;
-use iggy_binary_protocol::{ReplyHeader, RequestHeader, result_code};
+use iggy_binary_protocol::{ReplyHeader, RoutedRequestHeader, result_code};
 use invariants::Invariants;
 use metadata::stm::result::result_code_recognized;
 use options::WorkloadOptions;
@@ -138,7 +138,10 @@ impl Workload {
     /// PRNG before `sample` runs, so they advance the trace even when `sample`
     /// returns `None` (a targeted outcome whose precondition is unmet, e.g. a
     /// duplicate-name target with an empty shadow). `samples_none` counts these.
-    pub fn build_request(&mut self, client: &SimClient) -> Option<(u8, Message<RequestHeader>)> {
+    pub fn build_request(
+        &mut self,
+        client: &SimClient,
+    ) -> Option<(u8, Message<RoutedRequestHeader>)> {
         if !self.client_idle(client.client_id()) {
             return None;
         }
@@ -167,7 +170,7 @@ impl Workload {
                 action,
                 input,
                 outcome,
-                request_namespace: header.namespace,
+                request_namespace: header.group,
             },
         );
         *self

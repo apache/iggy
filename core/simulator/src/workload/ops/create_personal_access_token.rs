@@ -19,7 +19,7 @@
 //! (a live token name). `InvalidExpiry` is not targeted; tokens never expire
 //! (expiry = 0).
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -56,7 +56,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.create_personal_access_token(&input.name, input.expiry)
 }
 

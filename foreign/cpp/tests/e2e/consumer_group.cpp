@@ -722,19 +722,21 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReflectsJoinedGroupMembersCou
     EXPECT_NE(groups[0].members_count, groups[1].members_count);
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentStreamReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list when the stream does not exist.");
+// The VSR server rejects consumer-group reads whose parent stream or topic is
+// absent with the legacy typed not-found; the legacy server answered them with
+// an empty list.
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when the stream does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentTopicReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list when the topic does not exist.");
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when the topic does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -742,9 +744,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentTopicReturnsEmpt
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsIsStableAcrossBackToBackCalls) {
@@ -836,8 +837,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReturnsCorrectNumberOfGroups)
     EXPECT_TRUE(groups_after_delete.empty());
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list after deleting the stream that owned the groups.");
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionThrows) {
+    RecordProperty("description", "Throws after deleting the stream that owned the groups.");
     const std::string stream_name       = GetRandomName();
     const std::string topic_name        = GetRandomName();
     const std::string first_group_name  = GetRandomName();
@@ -859,13 +860,12 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionReturnsEmp
     ForgetTrackedConsumerGroup(stream_name, topic_name, second_group_name);
     ForgetTrackedStream(stream_name);
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list after deleting the topic that owned the groups.");
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionThrows) {
+    RecordProperty("description", "Throws after deleting the topic that owned the groups.");
     const std::string stream_name       = GetRandomName();
     const std::string topic_name        = GetRandomName();
     const std::string first_group_name  = GetRandomName();
@@ -887,9 +887,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionReturnsEmpt
     ForgetTrackedConsumerGroup(stream_name, topic_name, first_group_name);
     ForgetTrackedConsumerGroup(stream_name, topic_name, second_group_name);
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
@@ -1134,7 +1133,10 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucc
         const auto recreated_group = client->create_consumer_group(make_string_identifier(stream_name),
                                                                    make_string_identifier(topic_name), group_name);
         TrackConsumerGroup(stream_name, topic_name, group_name);
-        ASSERT_EQ(recreated_group.id, 0u);
+        // The VSR server mints group ids monotonically; a recreate gets a
+        // fresh id (the deleted group held 0), unlike the legacy server which
+        // reused the freed slot.
+        ASSERT_GT(recreated_group.id, 0u);
         ASSERT_EQ(recreated_group.name, group_name);
         ASSERT_EQ(recreated_group.members_count, 0u);
         ASSERT_TRUE(recreated_group.members.empty());

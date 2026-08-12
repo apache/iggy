@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -159,14 +159,11 @@ readonly EXAMPLES_SERVER_TIMEOUT=300
 readonly EXAMPLES_STOP_TIMEOUT=5
 
 # Resolve and validate the server binary path.
-# Usage: resolve_server_binary [target] [binary_name] [cargo_features]
-# Sets global SERVER_BIN. binary_name defaults to iggy-server; vsr lanes
-# pass their server binary and the vsr feature (so the wire protocol
-# matches vsr-built clients).
+# Usage: resolve_server_binary [target] [binary_name]
+# Sets global SERVER_BIN. binary_name defaults to iggy-server.
 function resolve_server_binary() {
     local target="${1:-}"
     local binary="${2:-iggy-server}"
-    local features="${3:-}"
 
     if [ -n "${target}" ]; then
         SERVER_BIN="target/${target}/debug/${binary}"
@@ -178,9 +175,6 @@ function resolve_server_binary() {
         local build_command="cargo build --bin ${binary}"
         if [ -n "${target}" ]; then
             build_command="cargo build --target ${target} --bin ${binary}"
-        fi
-        if [ -n "${features}" ]; then
-            build_command="${build_command} --features ${features}"
         fi
         echo "Error: Server binary not found at ${SERVER_BIN}"
         echo "Please build the server binary before running this script:"
@@ -243,12 +237,14 @@ function start_tls_server() {
 
 # How wait_for_server_ready decides the server is up. "log" greps the startup
 # lines: the legacy "has started" and the VSR server "client listeners
-# started" (logged once the TCP socket is bound). "tcp" polls the listener
+# started" (logged once the TCP socket is bound); override via
+# SERVER_READY_PATTERN or the pattern arg. "tcp" polls the listener
 # instead for lanes that cannot rely on a startup line.
 : "${SERVER_READY_PROBE:=log}"
 : "${SERVER_READY_ADDRESS:=127.0.0.1:8090}"
 
 # Report whether the server is accepting work.
+# Usage: server_is_ready [pattern]
 function server_is_ready() {
     if [ "${SERVER_READY_PROBE}" = "tcp" ]; then
         local host="${SERVER_READY_ADDRESS%:*}"
@@ -257,7 +253,7 @@ function server_is_ready() {
         exec 3<&-
         return 0
     fi
-    grep -qE "has started|client listeners started" "${EXAMPLES_LOG_FILE}"
+    grep -qE "${1:-has started|client listeners started}" "${EXAMPLES_LOG_FILE}"
 }
 
 # Report whether the server this script started is still running.
@@ -269,9 +265,13 @@ function server_is_alive() {
 }
 
 # Block until the server is ready or the timeout elapses.
-# Usage: wait_for_server_ready [label]
+# Usage: wait_for_server_ready [label] [pattern]
+# The default log pattern matches both the legacy line ("has started") and
+# the vsr server line ("client listeners started"). Override via the
+# pattern arg or SERVER_READY_PATTERN.
 function wait_for_server_ready() {
     local label="${1:-Iggy}"
+    local pattern="${2:-${SERVER_READY_PATTERN:-has started|client listeners started}}"
     local elapsed=0
     while true; do
         # Liveness is checked first so a server that died leaves its log here
@@ -282,7 +282,7 @@ function wait_for_server_ready() {
             cat "${EXAMPLES_LOG_FILE}"
             exit 1
         fi
-        if server_is_ready; then
+        if server_is_ready "${pattern}"; then
             return 0
         fi
         if [ ${elapsed} -gt ${EXAMPLES_SERVER_TIMEOUT} ]; then

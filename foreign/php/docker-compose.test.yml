@@ -16,13 +16,15 @@
 # under the License.
 
 services:
+  # The PHP extension frames TCP with the VSR wire protocol only.
   iggy-server:
     build:
       context: ../..
       dockerfile: core/server/Dockerfile
       args:
         PROFILE: debug
-    command: ["--fresh", "--with-default-root-credentials"]
+    # The server takes only --replica-id; root credentials come from the env.
+    command: []
     container_name: iggy-server-php-test
     security_opt:
       - seccomp:unconfined
@@ -31,6 +33,8 @@ services:
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
     networks:
       - php-test-network
     ports:

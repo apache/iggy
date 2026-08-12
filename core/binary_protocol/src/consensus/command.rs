@@ -41,7 +41,7 @@ pub enum Command2 {
     StartView = 12,
     Eviction = 13,
 
-    // Replica-to-replica auth handshake (server-ng consensus plane).
+    // Replica-to-replica auth handshake (the server consensus plane).
     ReplicaHello = 14,
     ReplicaChallenge = 15,
     ReplicaFinish = 16,

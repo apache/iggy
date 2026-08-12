@@ -527,7 +527,7 @@ impl TransportConn for QuicTransportConn {
 /// Applies [`transport_config_from`] and disables 0-RTT; otherwise
 /// inherits upstream defaults including `migration: true`. No ALPN is
 /// advertised; protocol-version validation lives in the LOGIN command
-/// on the caller (server-ng).
+/// on the caller (the server).
 ///
 /// # Errors
 ///

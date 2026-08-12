@@ -19,7 +19,7 @@ use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
-use configs::server_ng::NgSystemConfig;
+use configs::server::ServerSystemConfig;
 use consensus::{ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
@@ -28,9 +28,9 @@ use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionsConfig};
+use server::bootstrap::{ShellHandlers, ShellShardHandle, wire_shell_handlers};
 use server_common::crypto;
-use server_common::sharding::{METADATA_CONSENSUS_NAMESPACE, ShardId};
-use server_ng::bootstrap::{ShellHandlers, ShellShardHandle, wire_shell_handlers};
+use server_common::sharding::{METADATA_GROUP, ShardId};
 use shard::shards_table::PapayaShardsTable;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -52,7 +52,7 @@ pub const SHELL_ROOT_PASSWORD: &str = "iggy";
 //
 // `PapayaShardsTable` (the production namespace -> shard routing table)
 // instead of the always-`None` `()` impl: each shard owns its own table
-// instance, exactly as server-ng wires it. Until rows are seeded the
+// instance, exactly as the server wires it. Until rows are seeded the
 // router falls back to the deterministic hash assignment, which at one
 // shard per replica always resolves to shard 0.
 pub type Replica = shard::IggyShard<
@@ -70,7 +70,7 @@ pub type Replica = shard::IggyShard<
 ///
 /// Shard 0 (the sole writer) mints one via `factory_bundle`; every peer shard
 /// rebuilds a reader-mode mirror from it with `from_factory_bundle`, exactly as
-/// server-ng bootstrap does with its `ServerNgMetadataBundle`.
+/// the server bootstrap does with its `ServerMetadataBundle`.
 /// `Clone + Send + Sync`.
 pub type SimMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
 
@@ -90,11 +90,11 @@ pub const SIM_INBOX_CAPACITY: usize = 8192;
 ///
 /// `shell` selects the dispatch handlers. Off is the fast path: inert
 /// no-ops, so the simulator drives raw client frames straight into
-/// `IggyShard::on_message`. On wires server-ng's real deferred dispatch
+/// `IggyShard::on_message`. On wires the server's real deferred dispatch
 /// handlers (via [`wire_shell_handlers`]), exactly as production does, so
 /// a client request runs as a task concurrent with the pump.
 ///
-/// Mirrors server-ng bootstrap's single-writer metadata: the consensus
+/// Mirrors the server bootstrap's single-writer metadata: the consensus
 /// group, journal, snapshot, and the only writable metadata STM live on
 /// shard 0. Shard 0 mints a [`SimMetadataBundle`] (returned as the second
 /// tuple element); every peer shard passes it back in as `reader_bundle`
@@ -126,7 +126,7 @@ pub fn new_shard(
     recovered_state: Option<VsrState>,
     incarnation: u128,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
-    // Metadata is single-writer, mirroring server-ng bootstrap. Shard 0 owns
+    // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
     // shard 0's factory bundle and sees committed metadata through the shared
     // left-right read handle (each apply `publish`es, bounding reader staleness
@@ -182,7 +182,7 @@ pub fn new_shard(
             CLUSTER_ID,
             replica_id,
             replica_count,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             SharedSimOutbox(Rc::clone(bus)),
             LocalPipeline::new(),
             clock.clone(),
@@ -193,7 +193,7 @@ pub fn new_shard(
         consensus.set_incarnation(incarnation);
         // View/log_view come from the durable superblock; op, commit, and the
         // last-prepare markers come from the retained WAL. Independent inputs,
-        // mirroring server-ng's restore_metadata_consensus.
+        // mirroring the server's restore_metadata_consensus.
         let last_header = metadata_journal
             .as_ref()
             .and_then(|journal| journal.last_header());
@@ -283,7 +283,9 @@ pub fn new_shard(
         messages_required_to_save: 1000,
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
         enforce_fsync: false, //Disable fsync for simulation
+        validate_checksum: true,
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        preallocate_segments: false,
         encryptor: None,
     };
 
@@ -314,7 +316,7 @@ pub fn new_shard(
         wire_shell_handlers(
             &SharedSimOutbox(Rc::clone(bus)),
             &shard_handle,
-            Arc::new(NgSystemConfig::default()),
+            Arc::new(ServerSystemConfig::default()),
             // Default-config PAT cap, like the system config above, so sim
             // ingress admits exactly what a default-configured server does.
             PersonalAccessTokenConfig::default().max_tokens_per_user,
