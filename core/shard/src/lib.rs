@@ -32,7 +32,7 @@ use consensus::{
     DvcSuffix, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
     STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, Status,
     VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank, dvc_header_kind,
-    encode_prepare_headers, verify_prepare_integrity,
+    encode_prepare_headers, restamp_prepare_view, verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -3553,7 +3553,6 @@ where
         ) else {
             return;
         };
-        let consensus = partition.consensus();
         let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
             tracing::warn!(
                 shard = self.id,
@@ -3563,13 +3562,17 @@ where
             );
             return;
         };
-        let actions = consensus.handle_start_view(PlaneKind::Partitions, &header, suffix_body);
+        let actions =
+            partition
+                .consensus()
+                .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
-        if adopted && let Some(pending) = consensus.pending_view_log() {
+        if adopted && let Some(pending) = partition.consensus().pending_view_log() {
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
             // journal this rewrites. Same position as the metadata arm's twin.
             reconcile_partition_view_divergence(self.id, partition, &pending).await;
         }
+        let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
         // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
@@ -4581,14 +4584,16 @@ where
     {
         let partitions = self.plane.partitions();
         let started = {
-            let Some(partition) = partitions.get_by_ns(&namespace) else {
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                 return;
             };
-            let consensus = partition.consensus();
-            if !consensus.is_primary_for_view(consensus.view()) {
+            if !partition
+                .consensus()
+                .is_primary_for_view(partition.consensus().view())
+            {
                 return;
             }
-            let Some(pending) = consensus.pending_view_log() else {
+            let Some(pending) = partition.consensus().pending_view_log() else {
                 return;
             };
             // Before the scan can mean anything: the repair ingest skips an op it
@@ -4596,6 +4601,7 @@ where
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
             reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            let consensus = partition.consensus();
             // Identity, not presence: see the metadata twin. The floor is the local
             // commit point, the partition twin of the metadata snapshot floor:
             // `evict_prefix` clears the header vec for the flushed (committed)
@@ -8476,16 +8482,15 @@ fn build_dvc_suffix(
 #[allow(clippy::future_not_send)]
 async fn reconcile_partition_view_divergence<B, SB>(
     shard: u16,
-    partition: &IggyPartition<B, SB>,
+    partition: &mut IggyPartition<B, SB>,
     pending: &MergedLog,
 ) where
     B: MessageBus,
     SB: journal::superblock::SuperblockStore,
 {
-    let consensus = partition.consensus();
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
-    let applied_floor = pending.commit_max.max(consensus.commit_min());
+    let applied_floor = pending.commit_max.max(partition.consensus().commit_min());
 
     let mut repairable_from: Option<u64> = None;
     for canonical in &pending.headers {
@@ -8498,11 +8503,11 @@ async fn reconcile_partition_view_divergence<B, SB>(
         if canonical.op <= applied_floor {
             tracing::error!(
                 shard,
-                namespace_raw = consensus.group(),
+                namespace_raw = partition.consensus().group(),
                 op = canonical.op,
-                view = consensus.view(),
+                view = partition.consensus().view(),
                 commit_max = pending.commit_max,
-                commit_min = consensus.commit_min(),
+                commit_min = partition.consensus().commit_min(),
                 local_checksum = local.checksum,
                 canonical_checksum = canonical.checksum,
                 "committed partition op {} disagrees with the view that just started; this \
@@ -8530,15 +8535,15 @@ async fn reconcile_partition_view_divergence<B, SB>(
     let Some(from_op) = repairable_from else {
         return;
     };
-    match partition.log.journal().inner.truncate_from(from_op).await {
+    match partition.truncate_uncommitted_from(from_op).await {
         Ok(removed) => {
             tracing::warn!(
                 shard,
-                namespace_raw = consensus.group(),
+                namespace_raw = partition.consensus().group(),
                 from_op,
                 removed,
                 op_head = pending.op_head,
-                view = consensus.view(),
+                view = partition.consensus().view(),
                 "dropped {removed} uncommitted partition entries from op {from_op} that \
                  disagreed with the view's log; the primary's retransmission refills the range"
             );
@@ -8546,7 +8551,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
         Err(error) => {
             tracing::error!(
                 shard,
-                namespace_raw = consensus.group(),
+                namespace_raw = partition.consensus().group(),
                 from_op,
                 %error,
                 "could not drop the diverging uncommitted partition entries from op \
@@ -8631,23 +8636,6 @@ fn view_header_at(view_headers: &[PrepareHeader], op: u64) -> Option<&PrepareHea
         return None;
     }
     Some(header)
-}
-
-/// Re-stamp a stored prepare with the current view before retransmission.
-/// After a view change the primary re-sends its uncommitted suffix as its
-/// own prepares (VSR), but the journal keeps the original view stamp and
-/// `replicate_preflight` fences `header.view < view` as deposed-primary
-/// traffic -- a verbatim replay of the stored bytes would be ignored
-/// forever, wedging the commit walk on every peer. The stored buffer is
-/// shared with the journal, so the patch runs on an owned copy.
-fn restamp_prepare_view(stored: &[u8], view: u32) -> Option<Frozen<MESSAGE_ALIGN>> {
-    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
-    let mut owned = server_common::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(stored);
-    owned.as_mut_slice()[VIEW_OFFSET..VIEW_OFFSET + std::mem::size_of::<u32>()]
-        .copy_from_slice(&view.to_ne_bytes());
-    Message::<GenericHeader>::try_from(owned)
-        .ok()
-        .map(Message::into_frozen)
 }
 
 /// Dispatch a list of `VsrAction`s by constructing the appropriate
@@ -8884,15 +8872,10 @@ async fn dispatch_vsr_actions<B, P, J>(
                         continue;
                     };
                     // Freeze the retransmit payload once; clone per target.
-                    let frozen = if prepare.header().view == current_view {
-                        prepare.into_generic().into_frozen()
-                    } else {
-                        let Some(restamped) =
-                            restamp_prepare_view(prepare.as_slice(), current_view)
-                        else {
-                            continue;
-                        };
-                        restamped
+                    let Some(frozen) =
+                        restamp_prepare_view(prepare.into_generic().into_frozen(), current_view)
+                    else {
+                        continue;
                     };
                     for replica in replicas {
                         send(*replica, frozen.clone()).await;
@@ -9036,15 +9019,8 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                     // above and avoids both the per-target 4 KiB memcpy
                     // and the prior `.expect` that would panic the shard
                     // on a corrupted journal entry.
-                    let prepare = if header.view == current_view {
-                        prepare
-                    } else {
-                        let Some(restamped) =
-                            restamp_prepare_view(prepare.as_slice(), current_view)
-                        else {
-                            continue;
-                        };
-                        restamped
+                    let Some(prepare) = restamp_prepare_view(prepare, current_view) else {
+                        continue;
                     };
                     for replica in replicas {
                         send(*replica, prepare.clone()).await;
