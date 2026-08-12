@@ -22,7 +22,7 @@
 //! 3. one `prng.random()` per payload to disambiguate body bytes
 
 use bytes::Bytes;
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -74,7 +74,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.send_messages(input.ns, &input.payloads)
 }
 

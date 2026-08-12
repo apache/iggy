@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -17,6 +17,9 @@
 # under the License.
 
 set -euo pipefail
+
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

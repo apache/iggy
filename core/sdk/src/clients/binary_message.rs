@@ -22,6 +22,7 @@ use iggy_common::MessageClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
+    SendMessagesResponse,
 };
 
 #[async_trait]
@@ -78,7 +79,7 @@ impl MessageClient for IggyClient {
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
-    ) -> Result<(), IggyError> {
+    ) -> Result<SendMessagesResponse, IggyError> {
         if messages.is_empty() {
             return Err(IggyError::InvalidMessagesCount);
         }

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.1"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -28,9 +28,6 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "README.md"
 publish = false
-
-[features]
-vsr = ["iggy/vsr"]
 
 [dependencies]
 async-trait = { workspace = true }

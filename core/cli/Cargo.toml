@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cli"
-version = "0.13.1-edge.1"
+version = "0.14.0-edge.1"
 edition = "2024"
 rust-version.workspace = true
 authors = ["bartosz.ciesla@gmail.com"]
@@ -51,7 +51,6 @@ login-session = [
     "dep:apple-native-keyring-store",
     "dep:windows-native-keyring-store",
 ]
-vsr = ["iggy/vsr"]
 
 [dependencies]
 anyhow = { workspace = true }

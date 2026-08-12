@@ -437,7 +437,7 @@ impl ClientTable {
 
     /// Resize the table to `max_clients` slots. Boot-only: reallocating a
     /// populated table would silently drop live sessions, so this must run
-    /// before any client registers (server-ng bootstrap applies the configured
+    /// before any client registers (the server bootstrap applies the configured
     /// `[metadata] clients_table_max` here).
     ///
     /// # Panics
@@ -1019,7 +1019,12 @@ impl From<Truncated> for ClientTableWireError {
 }
 
 /// Format tag for [`ClientTable::encode`]; bump on layout change.
-pub const CLIENT_TABLE_MAGIC: [u8; 4] = *b"ICT1";
+///
+/// That includes any `ReplyHeader` layout move -- cached replies are embedded
+/// as raw wire bytes, so an artifact written under an older header layout must
+/// be refused, not silently misread. `ICT2`: `status` sits at offset 216 (the
+/// pre-`ICT2` layout carried a `namespace` word before it).
+pub const CLIENT_TABLE_MAGIC: [u8; 4] = *b"ICT2";
 
 /// Per-entry fixed fields in the wire encoding: `client(u128) epoch(u64)
 /// user_id(u32) watermark(u64) watermark_checksum(u128) ring_len(u8)`.

@@ -20,6 +20,7 @@ use std::ops::{Deref, RangeInclusive};
 use std::rc::Rc;
 
 pub mod file_storage;
+pub mod local_gate;
 pub mod prepare_journal;
 pub mod superblock;
 
@@ -44,6 +45,25 @@ where
     fn remaining_capacity(&self) -> Option<usize> {
         None
     }
+
+    /// Remove every entry at or above `from_op`, returning how many went, and
+    /// leave the snapshot watermark where it is.
+    ///
+    /// Not `drain` with a different range: `drain` advances the watermark past what
+    /// it removed, which would mark the removed ops evictable when a suffix
+    /// truncation needs them refillable.
+    ///
+    /// Required, not defaulted: an `Unsupported` default hides a missing impl until
+    /// mid-view-change, where the caller can only wedge or start a view over a log it
+    /// cannot serve.
+    ///
+    /// # Errors
+    /// I/O error if the rewrite fails.
+    fn truncate_from(&self, from_op: u64) -> impl Future<Output = io::Result<usize>>;
+
+    /// Highest op the index holds. Not derivable from [`Self::header`]: a caller
+    /// looking for a suffix ABOVE some op has no bound to probe up to.
+    fn last_op(&self) -> Option<u64>;
 
     /// Remove entries with ops in `ops` from the journal,
     /// returning the removed entries sorted by op.

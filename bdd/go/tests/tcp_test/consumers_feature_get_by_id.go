@@ -53,7 +53,9 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
+			// The server resolves the path outside in, so the stream is what
+			// it reports as missing, not the group inside it.
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to get consumer from non-existing topic", func() {
@@ -68,7 +70,8 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
+			// The topic is the outermost part of the path that is missing.
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to get from non-existing consumer", func() {

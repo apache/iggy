@@ -35,6 +35,7 @@ public class IggyValidationException extends IggyServerException {
             IggyErrorCode.INVALID_COMMAND,
             IggyErrorCode.INVALID_FORMAT,
             IggyErrorCode.FEATURE_UNAVAILABLE,
+            IggyErrorCode.INVALID_IDENTIFIER,
             IggyErrorCode.CANNOT_PARSE_INT,
             IggyErrorCode.CANNOT_PARSE_SLICE,
             IggyErrorCode.CANNOT_PARSE_UTF8,

@@ -46,109 +46,91 @@ func (s *SendMessages) Code() Code {
 	return SendMessagesCode
 }
 
+// zeroIndex is the blank per-message index entry reserved ahead of the
+// message section and filled in as messages are appended.
+var zeroIndex [indexSize]byte
+
 func (s *SendMessages) MarshalBinary() ([]byte, error) {
-	for i, message := range s.Messages {
-		switch s.Compression {
-		case iggcon.MESSAGE_COMPRESSION_S2:
-			if len(message.Payload) < 32 {
-				break
-			}
-			s.Messages[i].Payload = s2.Encode(nil, message.Payload)
-			message.Header.PayloadLength = uint32(len(message.Payload))
-		case iggcon.MESSAGE_COMPRESSION_S2_BETTER:
-			if len(message.Payload) < 32 {
-				break
-			}
-			s.Messages[i].Payload = s2.EncodeBetter(nil, message.Payload)
-			message.Header.PayloadLength = uint32(len(message.Payload))
-		case iggcon.MESSAGE_COMPRESSION_S2_BEST:
-			if len(message.Payload) < 32 {
-				break
-			}
-			s.Messages[i].Payload = s2.EncodeBest(nil, message.Payload)
-			message.Header.PayloadLength = uint32(len(message.Payload))
-		}
-	}
-
-	streamIdBytes, err := s.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	topicIdBytes, err := s.TopicId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	partitioningBytes, err := s.Partitioning.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	metadataLenFieldSize := 4 // uint32
-	messageCount := len(s.Messages)
-	messagesCountFieldSize := 4 // uint32
-	metadataLen := len(streamIdBytes) +
-		len(topicIdBytes) +
-		len(partitioningBytes) +
-		messagesCountFieldSize
-	indexesSize := messageCount * indexSize
-	messageBytesCount := calculateMessageBytesCount(s.Messages)
-	totalSize := metadataLenFieldSize +
-		len(streamIdBytes) +
-		len(topicIdBytes) +
-		len(partitioningBytes) +
-		messagesCountFieldSize +
-		indexesSize +
-		messageBytesCount
-
-	bytes := make([]byte, totalSize)
-
-	position := 0
-
-	//metadata
-	binary.LittleEndian.PutUint32(bytes[:4], uint32(metadataLen))
-	position = 4
-	//ids
-	copy(bytes[position:position+len(streamIdBytes)], streamIdBytes)
-	position += len(streamIdBytes)
-	copy(bytes[position:position+len(topicIdBytes)], topicIdBytes)
-	position += len(topicIdBytes)
-
-	//partitioning
-	copy(bytes[position:position+len(partitioningBytes)], partitioningBytes)
-	position += len(partitioningBytes)
-	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(messageCount))
-	position += 4
-
-	currentIndexPosition := position
-	for i := 0; i < indexesSize; i++ {
-		bytes[position+i] = 0
-	}
-	position += indexesSize
-
-	msgSize := uint32(0)
-	for _, message := range s.Messages {
-		copy(bytes[position:position+iggcon.MessageHeaderSize], message.Header.ToBytes())
-		copy(bytes[position+iggcon.MessageHeaderSize:position+iggcon.MessageHeaderSize+int(message.Header.PayloadLength)], message.Payload)
-		position += iggcon.MessageHeaderSize + int(message.Header.PayloadLength)
-		copy(bytes[position:position+int(message.Header.UserHeaderLength)], message.UserHeaders)
-		position += int(message.Header.UserHeaderLength)
-
-		msgSize += iggcon.MessageHeaderSize + message.Header.PayloadLength + message.Header.UserHeaderLength
-
-		binary.LittleEndian.PutUint32(bytes[currentIndexPosition:currentIndexPosition+4], 0)
-		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+4:currentIndexPosition+8], uint32(msgSize))
-		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+8:currentIndexPosition+12], 0)
-		currentIndexPosition += indexSize
-	}
-
-	return bytes, nil
+	return s.AppendBinary(nil)
 }
 
-func calculateMessageBytesCount(messages []iggcon.IggyMessage) int {
-	count := 0
-	for _, msg := range messages {
-		count += iggcon.MessageHeaderSize + len(msg.Payload) + len(msg.UserHeaders)
+// AppendBinary encodes the batch straight into b: [metadata_length u32]
+// [stream id][topic id][partitioning][messages_count u32], the per-message
+// index section, then each message as header, payload, user headers.
+func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
+	s.compressPayloads()
+
+	metadataStart := len(b)
+	b = binary.LittleEndian.AppendUint32(b, 0)
+	var err error
+	if b, err = s.StreamId.AppendBinary(b); err != nil {
+		return b, err
 	}
-	return count
+	if b, err = s.TopicId.AppendBinary(b); err != nil {
+		return b, err
+	}
+	if b, err = s.Partitioning.AppendBinary(b); err != nil {
+		return b, err
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(s.Messages)))
+	metadataLength := len(b) - metadataStart - 4
+	binary.LittleEndian.PutUint32(b[metadataStart:], uint32(metadataLength))
+
+	indexesStart := len(b)
+	for range s.Messages {
+		b = append(b, zeroIndex[:]...)
+	}
+
+	msgSize := uint32(0)
+	for i := range s.Messages {
+		message := &s.Messages[i]
+		// The header lengths and the appended slices must agree, or every
+		// message boundary after a mismatch mis-frames; deriving both from
+		// the same slice makes the disagreement impossible.
+		message.Header.PayloadLength = uint32(len(message.Payload))
+		message.Header.UserHeaderLength = uint32(len(message.UserHeaders))
+		if b, err = message.Header.AppendBinary(b); err != nil {
+			return b, err
+		}
+		b = append(b, message.Payload...)
+		b = append(b, message.UserHeaders...)
+
+		msgSize += iggcon.MessageHeaderSize +
+			message.Header.PayloadLength + message.Header.UserHeaderLength
+		binary.LittleEndian.PutUint32(b[indexesStart+i*indexSize+4:], msgSize)
+	}
+
+	return b, nil
+}
+
+// compressPayloads compresses each payload in place. The header length is
+// updated through the slice index: writing it to a range copy would leave the
+// wire header claiming the uncompressed length, and the encoder would then
+// mis-frame every message that follows.
+func (s *SendMessages) compressPayloads() {
+	switch s.Compression {
+	case iggcon.MESSAGE_COMPRESSION_S2,
+		iggcon.MESSAGE_COMPRESSION_S2_BETTER,
+		iggcon.MESSAGE_COMPRESSION_S2_BEST:
+	default:
+		return
+	}
+
+	for i := range s.Messages {
+		payload := s.Messages[i].Payload
+		if len(payload) < 32 {
+			continue
+		}
+		switch s.Compression {
+		case iggcon.MESSAGE_COMPRESSION_S2:
+			s.Messages[i].Payload = s2.Encode(nil, payload)
+		case iggcon.MESSAGE_COMPRESSION_S2_BETTER:
+			s.Messages[i].Payload = s2.EncodeBetter(nil, payload)
+		case iggcon.MESSAGE_COMPRESSION_S2_BEST:
+			s.Messages[i].Payload = s2.EncodeBest(nil, payload)
+		}
+		s.Messages[i].Header.PayloadLength = uint32(len(s.Messages[i].Payload))
+	}
 }
 
 type PollMessages struct {

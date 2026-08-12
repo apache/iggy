@@ -72,21 +72,12 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_producer(harness).await;
 }
 
-// QUIC stays vsr-gated on an SDK gap: after the restart the QUIC client
-// redirects to the new leader, reconnects, and signs in, but the long-lived
-// consumer's polls then return nothing for the whole window -- the
-// post-reconnect request path wedges (QUIC also lacks the TCP client's
-// mid-connection failover). TCP and WebSocket run.
-#[cfg_attr(not(feature = "vsr"), iggy_harness(
-    test_client_transport = [Tcp, WebSocket, Quic],
-    server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
-        quic.max_idle_timeout = "500s",
-        quic.keep_alive_interval = "15s"
-    )
-))]
-#[cfg_attr(feature = "vsr", iggy_harness(
+// QUIC is excluded on an SDK gap: after the restart the QUIC client redirects
+// to the new leader, reconnects, and signs in, but the long-lived consumer's
+// polls then return nothing for the whole window -- the post-reconnect request
+// path wedges (QUIC also lacks the TCP client's mid-connection failover). TCP
+// and WebSocket run.
+#[iggy_harness(
     test_client_transport = [Tcp, WebSocket],
     server(
         tcp.socket.override_defaults = true,
@@ -94,7 +85,7 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
-))]
+)]
 async fn consumer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_consumer(harness).await;
 }
@@ -107,10 +98,8 @@ async fn single_message_restart_offset_zero(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_single_message_offset_zero_restart(harness).await;
 }
 
-// Full-cluster restart is vsr-only by construction: it exercises the rejoin
-// probe's election fallback across all replicas, which a single-process
-// legacy server has no equivalent of (plain restart covers it there).
-#[cfg(feature = "vsr")]
+// Exercises the rejoin probe's election fallback across all replicas, which a
+// plain single-node restart does not reach.
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true
@@ -119,10 +108,8 @@ async fn full_cluster_restart_recovers_and_serves(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_full_cluster_restart(harness).await;
 }
 
-// vsr-only: exercises `RangeEvicted` + the commit floor, which only exist
-// on the replicated plane (the rejoin window exceeds the peers' evicted
-// ring, so journal repair alone cannot cover it).
-#[cfg(feature = "vsr")]
+// Exercises `RangeEvicted` + the commit floor: the rejoin window exceeds the
+// peers' evicted ring, so journal repair alone cannot cover it.
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true
@@ -171,8 +158,8 @@ async fn restart_offset_skip(harness: &mut TestHarness) {
 /// Test configuration:
 /// - 8 producers total (2 per protocol: TCP, HTTP, QUIC, WebSocket)
 /// - All producers write to the same partition for maximum lock contention
-// Concurrency race test: under vsr it runs over the three VSR transports
-// (TCP/QUIC/WebSocket -- HTTP/REST carries no VSR framing), legacy runs all four.
+// Concurrency race test: runs over the three VSR transports (TCP/QUIC/
+// WebSocket -- HTTP/REST carries no VSR framing).
 #[iggy_harness(server(
     segment.size = "512B",
     message_saver.interval = "1s",

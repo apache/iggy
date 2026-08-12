@@ -35,7 +35,8 @@ public class IggyPublisherTests
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture Fixture { get; init; }
 
-    private async Task<TestStreamInfo> CreateTestStream(IIggyClient client, Protocol protocol, uint partitionsCount = 5)
+    private async Task<TestStreamInfo> CreateTestStream(IIggyClient client, Protocol protocol,
+        uint partitionsCount = 5)
     {
         var streamId = $"stream_{Guid.NewGuid()}_{protocol.ToString().ToLowerInvariant()}";
         var topicId = "test_topic";
@@ -50,9 +51,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -70,7 +69,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_NewClient_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = Fixture.GetIggyAddress(protocol);
+        var client = await Fixture.GetIggyAddressAsync(protocol);
 
         var stream = Guid.NewGuid().ToString();
         var topic = Guid.NewGuid().ToString();
@@ -91,9 +90,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -111,9 +108,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithoutInit_Should_Throw_PublisherNotInitializedException(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -132,9 +127,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_Should_SendMessages_Successfully(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -170,9 +163,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithEmptyList_Should_NotThrow(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -192,9 +183,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithStreamAutoCreate_Should_CreateStream(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var streamId = $"auto_stream_{Guid.NewGuid()}_{protocol.ToString().ToLowerInvariant()}";
         var topicId = "auto_topic";
@@ -221,9 +210,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithTopicAutoCreate_Should_CreateTopic(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var streamId = $"stream_{Guid.NewGuid()}_{protocol.ToString().ToLowerInvariant()}";
         var topicId = "auto_topic";
@@ -252,9 +239,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithoutAutoCreate_Should_Throw_WhenStreamNotExists(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var streamId = $"nonexistent_stream_{Guid.NewGuid()}";
         var topicId = "test_topic";
@@ -272,9 +257,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithoutAutoCreate_Should_Throw_WhenTopicNotExists(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var streamId = $"stream_{Guid.NewGuid()}_{protocol.ToString().ToLowerInvariant()}";
         var topicId = "nonexistent_topic";
@@ -295,9 +278,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithBackgroundSending_Should_SendMessages_Successfully(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -335,9 +316,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task WaitUntilAllSends_Should_WaitForPendingMessages(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -372,9 +351,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task WaitUntilAllSends_WithoutBackgroundSending_Should_ReturnImmediately(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -395,9 +372,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_ToMultiplePartitions_Should_DistributeMessages(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -442,9 +417,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithBalancedPartitioning_Should_DistributeAcrossPartitions(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol, 3);
 
@@ -486,9 +459,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_Should_NotThrow(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -505,9 +476,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -525,9 +494,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_WithoutInit_Should_NotThrow(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -544,9 +511,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task StreamId_Should_ReturnConfiguredStreamId(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -563,9 +528,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task TopicId_Should_ReturnConfiguredTopicId(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -582,9 +545,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_LargeMessageCount_Should_HandleCorrectly(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -622,9 +583,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendAsync_RentedBatch_WithBackgroundSending_Should_RoundTrip(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 
@@ -675,9 +634,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendAsync_SingleMessageRentedBatch_WithBackgroundSending_Should_RoundTrip(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStream(client, protocol);
 

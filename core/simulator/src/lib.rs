@@ -34,7 +34,6 @@ use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
 use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use iggy_common::IggyError;
-use journal::superblock::DynSuperblockStore;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
 use network::Network;
@@ -48,7 +47,8 @@ use server_common::Message;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::CONSENSUS_TICK_INTERVAL;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 
@@ -86,6 +86,14 @@ pub struct SimReplica {
     /// yet the run stays byte-identical on replay. See
     /// `VsrConsensus::set_incarnation`.
     pub metadata_incarnation: u128,
+    /// One durable superblock per partition group this replica has materialised,
+    /// harness-owned for the same reason as the metadata one: the bytes survive
+    /// the shards being dropped and rebuilt, so a re-materialised group recovers
+    /// the `(view, log_view)` it recorded instead of re-entering view 0. Without
+    /// a store the persist gate marks every view durable without writing, which
+    /// leaves the gate, its write-failure fence, and view recovery all
+    /// unexercised.
+    pub partition_superblocks: RefCell<HashMap<IggyNamespace, Rc<SimSuperblock>>>,
     /// Keeps each pump's stop channel alive; dropping one would end that
     /// pump gracefully, which is reserved for future shutdown/restart
     /// tests (crash uses `DetExecutor::abort` instead).
@@ -156,7 +164,7 @@ impl Simulator {
     }
 
     /// [`Simulator::new`] with `shards_per_replica` shards on every replica,
-    /// meshed exactly like server-ng bootstrap: metadata plane on shard 0,
+    /// meshed exactly like the server bootstrap: metadata plane on shard 0,
     /// partitions hash-assigned, one pump task per shard.
     ///
     /// # Panics
@@ -178,7 +186,7 @@ impl Simulator {
     }
 
     /// [`Simulator::with_shards`] with the deterministic dispatch shell on:
-    /// every shard wires server-ng's real dispatch handlers, so a client
+    /// every shard wires the server's real dispatch handlers, so a client
     /// request runs as a task the seeded executor interleaves with the
     /// pump. Off (the default) keeps the raw-`on_message` fast path.
     ///
@@ -268,7 +276,7 @@ impl Simulator {
             let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
             let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
             let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
-            // Single-writer metadata (mirrors server-ng bootstrap): shard 0
+            // Single-writer metadata (mirrors the server bootstrap): shard 0
             // builds the writable STM and mints a factory bundle; every peer
             // shard rebuilds a reader-mode mirror from it and sees committed
             // metadata through the shared read handle. Shards are built in index
@@ -280,9 +288,8 @@ impl Simulator {
                     .expect("mesh yields exactly one inbox per shard");
                 // Only shard 0 owns metadata consensus, so only it carries the
                 // superblock. Peer shards persist nothing.
-                let shard_superblock: Option<Rc<dyn DynSuperblockStore>> = if shard_idx == 0 {
-                    let sb: Rc<dyn DynSuperblockStore> = superblock.clone();
-                    Some(sb)
+                let shard_superblock = if shard_idx == 0 {
+                    Some(superblock.clone())
                 } else {
                     None
                 };
@@ -310,7 +317,7 @@ impl Simulator {
                     );
                 }
 
-                // Same wiring as server-ng bootstrap: one pump task per
+                // Same wiring as the server bootstrap: one pump task per
                 // shard, stopped only by the (held) stop channel or a
                 // crash abort.
                 let (stop_tx, stop_rx) = shard::channel::<()>(1);
@@ -327,6 +334,7 @@ impl Simulator {
                 superblock,
                 metadata_journal,
                 metadata_incarnation,
+                partition_superblocks: RefCell::new(HashMap::new()),
                 _stop_txs: stop_txs,
                 pump_tasks,
             });
@@ -360,29 +368,11 @@ impl Simulator {
     /// mesh construction caps it at `u16`).
     #[allow(clippy::cast_possible_truncation)]
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
-        for (i, replica) in self.replicas.iter_mut().enumerate() {
+        for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
             }
-            let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
-            let owner = calculate_shard_assignment(&namespace, shard_count);
-            replica.shards[usize::from(owner)].init_partition(namespace);
-            // Commit the namespace before stamping the rows: a partition the
-            // metadata plane never heard of is a shape production cannot
-            // produce, and the shard refuses to serve client traffic whose
-            // routing-row epoch it cannot match against a committed
-            // `created_revision`.
-            let streams = replica.shards[0].plane.metadata().mux_stm.streams();
-            streams.seed_namespace(namespace, namespace.inner());
-            let epoch = streams
-                .created_revision_for_namespace(namespace)
-                .expect("namespace committed by the seed above");
-            for shard in &replica.shards {
-                shard.shards_table().insert(
-                    namespace,
-                    PartitionLocation::new(ShardId::new(owner), epoch),
-                );
-            }
+            materialise_partition(replica, namespace);
         }
     }
 
@@ -751,6 +741,11 @@ impl Simulator {
         // incarnation and still in flight is ignored. Deterministic, so replay stays
         // byte-identical.
         let metadata_incarnation = self.replicas[idx].metadata_incarnation + 1;
+        // Partition superblocks carry forward too: a group re-materialised after
+        // the restart must recover its recorded view from the same store, exactly
+        // as a rebooted server partition reads the record in its directory.
+        let partition_superblocks =
+            std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
 
         // Recover the durable VSR state from the retained superblock before the
         // rebuild, as production reads it in restore_metadata_consensus.
@@ -771,9 +766,8 @@ impl Simulator {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
                 .expect("mesh yields exactly one inbox per shard");
-            let shard_superblock: Option<Rc<dyn DynSuperblockStore>> = if shard_idx == 0 {
-                let sb: Rc<dyn DynSuperblockStore> = superblock.clone();
-                Some(sb)
+            let shard_superblock = if shard_idx == 0 {
+                Some(superblock.clone())
             } else {
                 None
             };
@@ -814,9 +808,29 @@ impl Simulator {
             superblock,
             metadata_journal,
             metadata_incarnation,
+            partition_superblocks: RefCell::new(partition_superblocks),
             _stop_txs: stop_txs,
             pump_tasks,
         };
+
+        // Re-materialise every group this replica had before the crash, as a
+        // rebooted the server re-opens every partition directory it owns. This
+        // is what makes the carried-forward superblock load-bearing: the group
+        // recovers the `(view, log_view)` it recorded instead of re-entering
+        // view 0.
+        // SORTED: `HashMap` iteration order is seeded per process, and
+        // materialisation order is observable (shard init order, routing-row
+        // stamps), so replay would stop being byte-identical.
+        let mut materialised: Vec<IggyNamespace> = self.replicas[idx]
+            .partition_superblocks
+            .borrow()
+            .keys()
+            .copied()
+            .collect();
+        materialised.sort_unstable_by_key(IggyNamespace::inner);
+        for namespace in materialised {
+            materialise_partition(&self.replicas[idx], namespace);
+        }
 
         // Reconnect to the network and mark the replica live again.
         self.network
@@ -924,6 +938,46 @@ impl Simulator {
                 let consensus = partition.consensus();
                 Some(consensus.primary_index(consensus.view()))
             })
+    }
+}
+
+/// Materialises `namespace` on its hash-owning shard of one replica and stamps
+/// the routing row on every shard of that replica.
+///
+/// Shared by [`SimCluster::init_partition`] and the restart path: a rebooted
+/// server re-opens every partition directory it owns, so the sim has to
+/// re-materialise too, otherwise the superblock a restart carries forward is
+/// never read back and the recovered-view branch is dead code.
+fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
+    let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
+    let owner = calculate_shard_assignment(&namespace, shard_count);
+    // One store per group, minted on first materialisation and reused on every
+    // later one, so the recorded view survives a replica restart.
+    let superblock = Rc::clone(
+        replica
+            .partition_superblocks
+            .borrow_mut()
+            .entry(namespace)
+            .or_default(),
+    );
+    let recovered_state = superblock
+        .read_latest_sync()
+        .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
+    replica.shards[usize::from(owner)].init_partition(namespace, Some(superblock), recovered_state);
+    // Commit the namespace before stamping the rows: a partition the metadata
+    // plane never heard of is a shape production cannot produce, and the shard
+    // refuses to serve client traffic whose routing-row epoch it cannot match
+    // against a committed `created_revision`.
+    let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+    streams.seed_namespace(namespace, namespace.inner());
+    let epoch = streams
+        .created_revision_for_namespace(namespace)
+        .expect("namespace committed by the seed above");
+    for shard in &replica.shards {
+        shard.shards_table().insert(
+            namespace,
+            PartitionLocation::new(ShardId::new(owner), epoch),
+        );
     }
 }
 
@@ -1613,13 +1667,16 @@ mod tests {
         // shifts the trace. Re-lock on intentional changes; expect re-locks until
         // error discriminants and reply bodies stabilize the wire format.
         //
-        // Re-locked when the sim adopted METADATA_CONSENSUS_NAMESPACE (1<<63)
+        // Re-locked when the sim adopted METADATA_GROUP (1<<63)
         // for metadata requests and the metadata consensus group, replacing
         // the sim-only 0: reply headers and the per-group timeout-jitter seed
         // (replica_id ^ namespace) both changed. The old 0 only ever routed
         // correctly because `hash % 1 == 0` at one shard per replica.
+        // Re-locked again when replies stopped echoing a group id (the
+        // client wire lost its namespace field): the reply-hash tuple
+        // dropped that component.
         assert_eq!(
-            h1, 0x530D_499C_5DBE_A2BE,
+            h1, 0xCF1F_BC79_B44A_65F7,
             "workload reply hash drifted from locked baseline"
         );
     }
@@ -2265,15 +2322,7 @@ mod tests {
             }
             for reply in sim.step() {
                 let h = reply.header();
-                (
-                    h.client,
-                    h.request,
-                    h.op,
-                    h.commit,
-                    h.namespace,
-                    h.operation as u8,
-                )
-                    .hash(&mut hasher);
+                (h.client, h.request, h.op, h.commit, h.operation as u8).hash(&mut hasher);
                 let cmds = wl.on_reply(&reply);
                 apply_sim_commands(&mut sim, &cmds);
                 replies_seen += 1;
@@ -2300,6 +2349,18 @@ mod tests {
     /// without injected loss must keep the counters at zero; a non-zero
     /// value means an inbox silently shed a frame (undersized capacity or
     /// a routing bug), which would otherwise hide behind VSR retransmit.
+    ///
+    /// `park_overflow` is deliberately NOT excluded. The simulator never wires
+    /// the partition reconciler (`init_partition` mirrors its outcome directly),
+    /// so nothing here ever drains the park buffer: a parked frame is never
+    /// re-dispatched and never swept. A non-zero `park_overflow` in the simulator
+    /// therefore means frames were shed for a namespace that will never
+    /// materialise -- which is the very fault class this assert exists to catch,
+    /// not the back-pressure it would be in production.
+    ///
+    /// For the same reason the park buffer must be empty at quiescence: a frame
+    /// still parked here has no drainer, so it will neither be delivered nor
+    /// answered.
     fn assert_no_frame_drops(sim: &Simulator) {
         for (replica_idx, replica) in sim.replicas.iter().enumerate() {
             for (shard_idx, shard) in replica.shards.iter().enumerate() {
@@ -2307,6 +2368,11 @@ mod tests {
                     shard.metrics().frame_drops_value(),
                     0,
                     "replica {replica_idx} shard {shard_idx} dropped frames without injected loss"
+                );
+                assert!(
+                    shard.parked_namespaces().is_empty(),
+                    "replica {replica_idx} shard {shard_idx} left partition frames parked; the \
+                     simulator wires no reconciler, so nothing will deliver or answer them"
                 );
             }
         }
@@ -2547,7 +2613,7 @@ mod tests {
         sim.schedule_hash()
     }
 
-    /// Turning the dispatch shell on wires server-ng's real deferred
+    /// Turning the dispatch shell on wires the server's real deferred
     /// handlers on every shard. With no client traffic none of them is
     /// reached, so the consensus plane both replays deterministically and
     /// matches the shell-off schedule: the toggle is genuinely off the
@@ -2880,7 +2946,7 @@ mod tests {
             let header: &PrepareOkHeader = bytemuck::checked::from_bytes(
                 &packet.message.as_slice()[..std::mem::size_of::<PrepareOkHeader>()],
             );
-            header.namespace == BLOCKED_NS.load(Ordering::Relaxed)
+            header.group == BLOCKED_NS.load(Ordering::Relaxed)
         }
 
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
@@ -2936,13 +3002,16 @@ mod tests {
         // ns_b shares the client, the replicas, and the shard, but has its
         // own consensus group: it must commit while ns_a stays wedged.
         let msg = client.send_messages(ns_b, &[Bytes::from_static(b"independent")]);
+        // Replies no longer carry a group id; correlate by the request id
+        // this send was stamped with.
+        let ns_b_request = msg.header().request;
         sim.submit_request(client_id, 0, msg.into_generic());
         let mut independent_replies = 0usize;
         for _ in 0..100 {
             for reply in sim.step() {
                 assert_eq!(
-                    reply.header().namespace,
-                    ns_b.inner(),
+                    reply.header().request,
+                    ns_b_request,
                     "only ns_b may commit while ns_a's acks are blocked"
                 );
                 independent_replies += 1;
@@ -2961,7 +3030,9 @@ mod tests {
         let mut drained_replies = 0usize;
         for _ in 0..800 {
             for reply in sim.step() {
-                if reply.header().namespace == ns_a.inner() {
+                // Only ns_a replies are outstanding once ns_b committed
+                // above, so every reply counts toward the drain.
+                if reply.header().request != ns_b_request {
                     drained_replies += 1;
                 }
             }
@@ -3024,5 +3095,164 @@ mod tests {
         );
         oracle::assert_converged(&sim, &wl);
         assert_no_frame_drops(&sim);
+    }
+}
+
+#[cfg(test)]
+mod view_change_data_loss_tests {
+    //! A committed, client-acknowledged op must survive a view change even when
+    //! the replica that becomes primary is the one missing it.
+    //!
+    //! Without the sender's log suffix on the `DoViewChange`, the new primary adopts
+    //! the winner's op NUMBER, rebuilds its pipeline from its OWN journal, hits the
+    //! hole, and truncates the range as "decided lost" -- discarding an op journaled
+    //! on a quorum and already replied to. The next client op then reuses the number
+    //! and collides with the stale entry on the up-to-date backup.
+    //!
+    //! The hole here is punched at the commit point, so the assertion that catches a
+    //! regression is "the op came back", not "the head did not regress": with nothing
+    //! uncommitted there is no pipeline rebuild to truncate. The `dvc_merge` unit
+    //! tests cover the sequencer-truncation path directly.
+
+    use super::*;
+    use consensus::{Sequencer, Status};
+    use journal::Journal;
+
+    /// Whether a replica's shard-0 metadata consensus is a settled primary in a
+    /// view past the one that crashed.
+    fn is_new_metadata_primary(sim: &Simulator, replica: u8) -> bool {
+        sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|consensus| {
+                consensus.view() > 0
+                    && consensus.status() == Status::Normal
+                    && consensus.is_primary()
+            })
+    }
+
+    /// `(head op, commit_max)` of a replica's shard-0 metadata consensus.
+    fn metadata_progress(sim: &Simulator, replica: u8) -> (u64, u64) {
+        let consensus = sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus");
+        (
+            consensus.sequencer().current_sequence(),
+            consensus.commit_max(),
+        )
+    }
+
+    /// Whether a replica's metadata journal holds `op`.
+    fn metadata_holds(sim: &Simulator, replica: u8, op: u64) -> bool {
+        let journal = sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the metadata journal");
+        let slot = usize::try_from(op).expect("op fits usize");
+        Journal::header(journal.as_ref(), slot).is_some()
+    }
+
+    /// Drop `op` from a replica's metadata journal, leaving a hole.
+    fn metadata_forget(sim: &Simulator, replica: u8, op: u64) -> bool {
+        sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the metadata journal")
+            .forget_op(op)
+    }
+
+    #[test]
+    fn given_committed_op_missing_on_next_primary_when_primary_crashes_should_survive_view_change()
+    {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+
+        // Commit some metadata ops so there is a log to lose. Registering binds
+        // a session, and seeding a stream/topic/partition commits several more.
+        sim.register_client_with_primary(&client);
+        sim.seed_stream_topic_partition(IggyNamespace::new(1, 1, 0));
+        for _ in 0..200 {
+            sim.step();
+        }
+
+        // Replica 0 is primary for view 0, so replica 1 is primary-elect for view 1
+        // (view % replica_count): the replica whose hole decides the outcome.
+        let next_primary: u8 = 1;
+        let (_, committed) = metadata_progress(&sim, next_primary);
+        assert!(
+            committed > 0,
+            "the test needs committed metadata ops to be able to lose one"
+        );
+
+        // Every replica must hold the op: the point is that it IS recoverable, and
+        // only the incoming primary lacks it.
+        for replica in 0..replica_count {
+            assert!(
+                metadata_holds(&sim, replica, committed),
+                "replica {replica} must hold op {committed} before the hole is punched"
+            );
+        }
+
+        // Punch the hole: the incoming primary forgets an op its peers still hold.
+        assert!(
+            metadata_forget(&sim, next_primary, committed),
+            "op {committed} must have been present to forget"
+        );
+
+        sim.replica_crash(0);
+        for _ in 0..1500 {
+            sim.step();
+        }
+
+        // A primary must emerge among the survivors.
+        let primary = (1..replica_count)
+            .find(|&replica| is_new_metadata_primary(&sim, replica))
+            .expect("a metadata primary must be elected after the old one crashes");
+
+        let (head, commit_max) = metadata_progress(&sim, primary);
+
+        // The committed op must not have been discarded.
+        assert!(
+            head >= committed,
+            "the new primary's head ({head}) regressed below the committed op ({committed}); \
+             a committed, acknowledged op was discarded by the view change"
+        );
+        assert!(
+            commit_max >= committed,
+            "commit_max ({commit_max}) regressed below the committed op ({committed})"
+        );
+
+        // And back in the new primary's journal: the view change repaired the hole
+        // from a peer that offered the body, rather than declaring the op lost.
+        assert!(
+            metadata_holds(&sim, primary, committed),
+            "op {committed} must be repaired back into the new primary's journal"
+        );
     }
 }

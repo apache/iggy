@@ -35,17 +35,29 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /**
- * Async TCP implementation of personal access tokens client.
+ * Async TCP implementation of personal access tokens client. Login discovers
+ * the active cluster leader before sending the VSR Register operation.
  */
 public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
     private static final Logger log = LoggerFactory.getLogger(PersonalAccessTokensTcpClient.class);
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final LoginRoutingHook routingHook;
 
-    public PersonalAccessTokensTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public PersonalAccessTokensTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, LoginRoutingHook.NONE);
+    }
+
+    PersonalAccessTokensTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, LoginRoutingHook routingHook) {
+        this.connectionSupplier = connectionSupplier;
+        this.routingHook = routingHook;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -56,7 +68,7 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Creating personal access token: {}", name);
 
-        return connection
+        return connection()
                 .send(CommandCode.PersonalAccessToken.CREATE.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -73,7 +85,7 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Getting all personal access tokens");
 
-        return connection
+        return connection()
                 .send(CommandCode.PersonalAccessToken.GET_ALL.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -94,7 +106,7 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Deleting personal access token: {}", name);
 
-        return connection
+        return connection()
                 .send(CommandCode.PersonalAccessToken.DELETE.getValue(), payload)
                 .thenAccept(response -> {
                     response.release();
@@ -103,11 +115,15 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
     @Override
     public CompletableFuture<IdentityInfo> loginWithPersonalAccessToken(String token) {
+        return routingHook.loginOnLeader(() -> loginWithoutRedirect(token));
+    }
+
+    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String token) {
         var payload = BytesSerializer.toBytes(token);
 
         log.debug("Logging in with personal access token");
 
-        return connection
+        return connection()
                 .send(CommandCode.PersonalAccessToken.LOGIN.getValue(), payload)
                 .thenApply(response -> {
                     try {

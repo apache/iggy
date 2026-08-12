@@ -30,11 +30,11 @@ jackson2 = "2.22.1"
 commons-lang3 = "3.20.0"
 
 # HTTP Client
-httpclient5 = "5.6.2"
+httpclient5 = "5.6.3"
 
 # Logging
 slf4j = "2.0.18"
-logback = "1.5.38"
+logback = "1.6.1"
 
 # Testing
 junit = "6.1.2"
@@ -52,8 +52,8 @@ typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.8.0"
-shadow = "9.6.0"
+spotless = "8.9.0"
+shadow = "9.6.1"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"
 

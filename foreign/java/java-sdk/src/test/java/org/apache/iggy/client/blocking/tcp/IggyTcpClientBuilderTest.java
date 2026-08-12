@@ -92,21 +92,6 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     }
 
     @Test
-    void shouldCreateClientWithConnectionPoolSize() {
-        // Given: Builder with connection pool size
-        IggyTcpClient client = IggyTcpClient.builder()
-                .host(serverHost())
-                .port(serverTcpPort())
-                .connectionPoolSize(10)
-                .credentials("iggy", "iggy")
-                .buildAndLogin();
-
-        // Then: Should succeed
-        List<ClientInfo> clients = client.system().getClients();
-        assertThat(clients).isNotNull();
-    }
-
-    @Test
     void shouldCreateClientWithRetryPolicy() {
         // Given: Builder with exponential backoff retry policy
         IggyTcpClient client = IggyTcpClient.builder()
@@ -159,7 +144,6 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
                 .port(serverTcpPort())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .requestTimeout(Duration.ofSeconds(10))
-                .connectionPoolSize(10)
                 .retryPolicy(RetryPolicy.exponentialBackoff(3, Duration.ofMillis(100), Duration.ofSeconds(5), 2.0))
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
