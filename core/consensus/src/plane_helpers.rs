@@ -20,13 +20,70 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
-    RoutedRequestHeader, frame_body,
+    CHECKSUM_UNSEALED, Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RoutedRequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
-use server_common::{Message, iobuf::Owned};
-use std::mem::size_of;
-use std::ops::AsyncFnOnce;
+use server_common::{
+    MESSAGE_ALIGN, Message,
+    iobuf::{Frozen, Owned},
+};
+use std::{error::Error, fmt, mem::size_of, ops::AsyncFnOnce};
+
+/// Failure to route or forward a prepare through the replication chain.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ChainReplicationError {
+    MalformedPrepare,
+    UnexpectedCommand { command: Command2 },
+    CommittedPrepare { op: u64, commit_min: u64 },
+    SelfRoute { replica: u8 },
+    Transport(SendError),
+}
+
+impl ChainReplicationError {
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl fmt::Display for ChainReplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedPrepare => formatter.write_str("malformed prepare frame"),
+            Self::UnexpectedCommand { command } => {
+                write!(formatter, "expected prepare command, found {command:?}")
+            }
+            Self::CommittedPrepare { op, commit_min } => write!(
+                formatter,
+                "prepare op {op} is not above committed op {commit_min}"
+            ),
+            Self::SelfRoute { replica } => {
+                write!(
+                    formatter,
+                    "replication chain routes replica {replica} to itself"
+                )
+            }
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ChainReplicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SendError> for ChainReplicationError {
+    fn from(error: SendError) -> Self {
+        Self::Transport(error)
+    }
+}
 
 /// Shared pipeline-first request flow (metadata + partitions).
 ///
@@ -79,43 +136,137 @@ where
 ///
 /// # Errors
 ///
-/// Returns `SendError` if the bus fails to deliver to the next replica.
+/// Returns an error if the prepare cannot be routed or the bus cannot deliver
+/// it to the next replica.
 /// Callers decide error policy (VSR retransmits from WAL via prepare timeout).
-///
-/// # Panics
-/// - If `header.command` is not `Command2::Prepare`.
-/// - If `header.op <= consensus.commit_min()`.
-/// - If the computed next replica equals self.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: &Message<PrepareHeader>,
-) -> Result<(), SendError>
+) -> Result<(), ChainReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let header = *message.header();
+    let Some(next) = replication_target(consensus, message.header())? else {
+        return Ok(());
+    };
+    let frozen = message.deep_copy().into_generic().into_frozen();
+    consensus
+        .message_bus()
+        .send_to_replica(next, frozen)
+        .await
+        .map_err(Into::into)
+}
 
-    assert_eq!(header.command, Command2::Prepare);
-    assert!(header.op > consensus.commit_min());
+/// Forward an already validated frozen prepare to the next replica without
+/// copying its payload.
+///
+/// # Errors
+///
+/// Returns an error if the frame is malformed, cannot be routed, or the bus
+/// cannot deliver it to the next replica.
+#[allow(clippy::future_not_send)]
+pub async fn replicate_frozen_to_next_in_chain<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    message: Frozen<MESSAGE_ALIGN>,
+) -> Result<(), ChainReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header = frozen_prepare_header(&message)?;
+    let Some(next) = replication_target(consensus, &header)? else {
+        return Ok(());
+    };
+    consensus
+        .message_bus()
+        .send_to_replica(next, message)
+        .await
+        .map_err(Into::into)
+}
+
+fn frozen_prepare_header(
+    message: &Frozen<MESSAGE_ALIGN>,
+) -> Result<PrepareHeader, ChainReplicationError> {
+    let header_bytes = message
+        .as_slice()
+        .get(..size_of::<PrepareHeader>())
+        .ok_or(ChainReplicationError::MalformedPrepare)?;
+    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+        .copied()
+        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
+    header
+        .validate()
+        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
+    let frame_size =
+        usize::try_from(header.size).map_err(|_| ChainReplicationError::MalformedPrepare)?;
+    if !(size_of::<PrepareHeader>()..=message.len()).contains(&frame_size) {
+        return Err(ChainReplicationError::MalformedPrepare);
+    }
+    Ok(header)
+}
+
+fn replication_target<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    header: &PrepareHeader,
+) -> Result<Option<u8>, ChainReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    if header.command != Command2::Prepare {
+        return Err(ChainReplicationError::UnexpectedCommand {
+            command: header.command,
+        });
+    }
+    let commit_min = consensus.commit_min();
+    if header.op <= commit_min {
+        return Err(ChainReplicationError::CommittedPrepare {
+            op: header.op,
+            commit_min,
+        });
+    }
 
     let next = (consensus.replica() + 1) % consensus.replica_count();
     let primary = consensus.primary_index(header.view);
 
     if next == primary {
-        return Ok(());
+        return Ok(None);
     }
 
-    assert_ne!(next, consensus.replica());
+    if next == consensus.replica() {
+        return Err(ChainReplicationError::SelfRoute {
+            replica: consensus.replica(),
+        });
+    }
+    Ok(Some(next))
+}
 
-    // Chain replication to the next replica is N=1, so the freeze-once
-    // trick does not apply: the caller has already appended `message` to
-    // its local journal (durability-before-ack) and kept a reference for
-    // this forward, so we deep_copy a fresh Frozen here. Future refactor
-    // could freeze once and share the backing with the journal path.
-    let frozen = message.deep_copy().into_generic().into_frozen();
-    consensus.message_bus().send_to_replica(next, frozen).await
+/// Re-stamp a stored prepare with the current view before retransmission.
+/// The prepare identity excludes `view`, so the payload and operation identity
+/// remain unchanged.
+#[must_use]
+pub fn restamp_prepare_view(
+    stored: Frozen<MESSAGE_ALIGN>,
+    view: u32,
+) -> Option<Frozen<MESSAGE_ALIGN>> {
+    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
+
+    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+        stored.as_slice().get(..size_of::<PrepareHeader>())?,
+    )
+    .ok()?;
+    if header.view == view {
+        return Some(stored);
+    }
+
+    let mut owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(stored.as_slice());
+    owned.as_mut_slice()[VIEW_OFFSET..VIEW_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&view.to_ne_bytes());
+    Message::<GenericHeader>::try_from(owned)
+        .ok()
+        .map(Message::into_frozen)
 }
 
 /// Recompute a prepare's integrity fields and report the first that disagrees.
@@ -917,6 +1068,83 @@ mod tests {
             restamped.identity_checksum(),
             "view must not participate in a prepare's identity"
         );
+    }
+
+    #[test]
+    fn given_matching_view_when_restamping_should_reuse_frozen_prepare() {
+        let message = prepare_message(9, 7, 11).transmute_header(|old, new: &mut PrepareHeader| {
+            *new = old;
+            new.view = 4;
+        });
+        let frozen = message.into_frozen();
+        let original_ptr = frozen.as_slice().as_ptr();
+
+        let restamped = restamp_prepare_view(frozen, 4).expect("valid prepare");
+        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &restamped[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+
+        assert_eq!(restamped.as_slice().as_ptr(), original_ptr);
+        assert_eq!(header.view, 4);
+    }
+
+    #[test]
+    fn given_new_view_when_restamping_should_only_change_view() {
+        let message = prepare_message(9, 7, 11).transmute_header(|old, new: &mut PrepareHeader| {
+            *new = old;
+            new.view = 4;
+            new.client = 17;
+            new.request = 23;
+        });
+        let expected_identity = message.header().identity_checksum();
+        let expected_op = message.header().op;
+        let expected_client = message.header().client;
+        let expected_request = message.header().request;
+
+        let restamped = restamp_prepare_view(message.into_frozen(), 12).expect("valid prepare");
+        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &restamped[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+
+        assert_eq!(header.view, 12);
+        assert_eq!(header.identity_checksum(), expected_identity);
+        assert_eq!(header.op, expected_op);
+        assert_eq!(header.client, expected_client);
+        assert_eq!(header.request, expected_request);
+    }
+
+    #[test]
+    fn given_truncated_buffer_when_restamping_should_reject() {
+        let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
+
+        assert!(restamp_prepare_view(malformed, 1).is_none());
+    }
+
+    #[test]
+    fn given_truncated_buffer_when_reading_frozen_prepare_should_reject() {
+        let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
+
+        assert!(matches!(
+            frozen_prepare_header(&malformed),
+            Err(ChainReplicationError::MalformedPrepare)
+        ));
+    }
+
+    #[test]
+    fn given_committed_prepare_when_selecting_replication_target_should_reject() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = prepare_message(0, 0, 0);
+
+        assert!(matches!(
+            replication_target(&consensus, prepare.header()),
+            Err(ChainReplicationError::CommittedPrepare {
+                op: 0,
+                commit_min: 0
+            })
+        ));
     }
 
     #[test]
