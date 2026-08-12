@@ -78,15 +78,16 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
     }
 
     @Test
-    @DisplayName("should allow only bootstrap commands before login")
-    void shouldAllowOnlyBootstrapCommandsBeforeLogin() throws Exception {
+    @DisplayName("should allow only ping before login")
+    void shouldAllowOnlyPingBeforeLogin() throws Exception {
         // when
         var ping = client.system().ping().get(5, TimeUnit.SECONDS);
-        var metadata = client.system().getClusterMetadata().get(5, TimeUnit.SECONDS);
 
         // then
         assertThat(ping).isEqualTo("pong");
-        assertThat(metadata).isNotNull();
+        assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(IggyNotConnectedException.class);
         assertThatThrownBy(() -> client.streams().getStreams().get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
                 .hasCauseInstanceOf(IggyNotConnectedException.class);

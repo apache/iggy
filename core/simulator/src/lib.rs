@@ -3115,8 +3115,10 @@ mod view_change_data_loss_tests {
     //! tests cover the sequencer-truncation path directly.
 
     use super::*;
+    use crate::executor::yield_once;
     use consensus::{Sequencer, Status};
     use journal::Journal;
+    use message_bus::MessageBus;
 
     /// Whether a replica's shard-0 metadata consensus is a settled primary in a
     /// view past the one that crashed.
@@ -3253,6 +3255,133 @@ mod view_change_data_loss_tests {
         assert!(
             metadata_holds(&sim, primary, committed),
             "op {committed} must be repaired back into the new primary's journal"
+        );
+    }
+
+    /// A client submit landing inside the new primary's view-start superblock
+    /// persist must not corrupt the pipeline.
+    ///
+    /// `start_pending_view` flips the replica into a Normal primary
+    /// synchronously and defers the rebuild of the inherited uncommitted
+    /// suffix; the persist then suspends the pump. A register admitted in that
+    /// window used to mint the next op into the still-empty pipeline, and the
+    /// deferred rebuild panicked pushing the inherited op beneath it
+    /// ("sequence must be sequential"); the same empty pipeline also blinded
+    /// the register dedup, admitting an inherited in-flight register twice.
+    /// The suspension is real on disk-backed stores (an fsync) and is restored
+    /// here with `set_yield_writes`.
+    #[test]
+    fn given_a_register_inside_the_view_start_persist_when_the_pipeline_rebuilds_should_commit_once()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let settled_client: u128 = 1;
+        let straggler_client: u128 = 2;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 2,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            [settled_client, straggler_client].into_iter(),
+            network_opts,
+        );
+
+        let client = SimClient::new(settled_client);
+        sim.register_client_with_primary(&client);
+        for _ in 0..100 {
+            sim.step();
+        }
+        let (baseline_head, baseline_commit) = metadata_progress(&sim, 1);
+        assert_eq!(
+            baseline_head, baseline_commit,
+            "the cluster must be quiescent before the straggler is staged"
+        );
+
+        // Stage the inherited suffix: the straggler's register reaches the
+        // next primary's journal, then the old primary dies before the commit
+        // makes it back.
+        let straggler = SimClient::new(straggler_client);
+        sim.submit_request(straggler_client, 0, straggler.register().into_generic());
+        let mut staged = None;
+        for _ in 0..200 {
+            sim.step();
+            let (head, commit_max) = metadata_progress(&sim, 1);
+            if head > baseline_head && commit_max < head {
+                staged = Some(head);
+                break;
+            }
+        }
+        let staged =
+            staged.expect("the register must reach the next primary's journal before it commits");
+
+        // Both survivors' next persists suspend once, opening the window a
+        // real fsync has.
+        sim.replicas[1].superblock.set_yield_writes();
+        sim.replicas[2].superblock.set_yield_writes();
+        sim.replica_crash(0);
+
+        // The straggler's retry loop, as the server runs it: `dispatch` spawns
+        // the in-process submit on its own task, which is what can interleave
+        // with the parked pump. The sim's wire path processes requests inside
+        // the pump itself, so the window is only reachable from a spawned
+        // task. A plain once-per-step retry is never ready inside the drain
+        // where the pump flips to primary and suspends on the persist, so
+        // each tick wake spends a small budget of yield-separated attempts:
+        // the yields land the retry between the pump's polls, one of which is
+        // the suspended view-start persist.
+        let registered = std::rc::Rc::new(std::cell::Cell::new(false));
+        let submit_shard = std::rc::Rc::clone(&sim.replicas[1].shards[0]);
+        let submit_flag = std::rc::Rc::clone(&registered);
+        sim.executor.spawn(async move {
+            loop {
+                for _ in 0..32 {
+                    match submit_shard
+                        .plane
+                        .metadata()
+                        .submit_register_in_process(straggler_client, 0)
+                        .await
+                    {
+                        Ok(_) => {
+                            submit_flag.set(true);
+                            return;
+                        }
+                        Err(error) if error.is_transient() => yield_once().await,
+                        Err(_) => return,
+                    }
+                }
+                submit_shard
+                    .bus
+                    .sleep(std::time::Duration::from_millis(10))
+                    .await;
+            }
+        });
+
+        for _ in 0..1500 {
+            sim.step();
+            if registered.get() {
+                break;
+            }
+        }
+        assert!(
+            registered.get(),
+            "the straggler's login must complete after the failover"
+        );
+
+        let primary = (1..replica_count)
+            .find(|&replica| is_new_metadata_primary(&sim, replica))
+            .expect("a metadata primary must be elected after the old one crashes");
+        let (_, commit_max) = metadata_progress(&sim, primary);
+        assert!(
+            commit_max >= staged,
+            "the inherited op ({staged}) must commit under the new primary \
+             (commit_max = {commit_max})"
         );
     }
 }

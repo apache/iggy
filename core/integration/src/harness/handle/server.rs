@@ -1027,6 +1027,23 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
+            if std::thread::panicking() {
+                // Ahead of the full dump, which buries these lines under the
+                // complete stdout of every node.
+                eprintln!("Iggy server panicked:\n{report}");
+            } else {
+                // A dead task leaves the process alive and the test green;
+                // failing here is the only thing that surfaces it. The panic
+                // unwinds out of this `Drop` before the dump below runs, so
+                // print this node's logs first.
+                let (stdout, stderr) =
+                    super::common::collect_logs(&self.stdout_path, &self.stderr_path);
+                eprintln!("Iggy server stdout:\n{stdout}");
+                eprintln!("Iggy server stderr:\n{stderr}");
+                panic!("Iggy server panicked:\n{report}");
+            }
+        }
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
 }

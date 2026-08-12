@@ -1563,20 +1563,22 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
     EXPECT_TRUE(found_after);
 }
 
-TEST_F(LowLevelE2E_Client, GetClusterMetadataBeforeLoginSucceeds) {
-    RecordProperty(
-        "description",
-        "Serves get_cluster_metadata to a connected but unauthenticated client, and rejects it without a connection.");
+TEST_F(LowLevelE2E_Client, GetClusterMetadataBeforeLoginThrows) {
+    RecordProperty("description",
+                   "Rejects get_cluster_metadata before connect, after connect but before login, and after disconnect, "
+                   "and serves it once authenticated.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
     ASSERT_NO_THROW(client->connect());
-    // By design pre-login on the VSR server: an SDK must read the roster to
-    // find the primary before it can authenticate (redirect bootstrap).
+    // The roster is private, so the read is auth-gated. No pre-login read is
+    // needed: a client that dialed a backup logs in there and the server
+    // forwards the register to the primary.
+    ASSERT_THROW(client->get_cluster_metadata(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     iggy::ffi::ClusterMetadata metadata{};
     ASSERT_NO_THROW({ metadata = client->get_cluster_metadata(); });
-    ASSERT_EQ(metadata.nodes.size(), 1u);
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_GE(metadata.nodes.size(), 1u);
     ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
 }

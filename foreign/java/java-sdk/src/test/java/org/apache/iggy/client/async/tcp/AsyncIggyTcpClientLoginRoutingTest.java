@@ -41,7 +41,7 @@ class AsyncIggyTcpClientLoginRoutingTest {
     private static final IdentityInfo SECOND_IDENTITY = new IdentityInfo(2L, Optional.empty());
 
     @Test
-    void shouldLoginOnceAfterAllLeaderRedirects() {
+    void shouldLoginAfterEveryLeaderRedirect() {
         var client = new TestClient();
         client.enqueueLeader(new ConnectionInfo("leader-a", 8091));
         client.enqueueLeader(new ConnectionInfo("leader-b", 8092));
@@ -56,10 +56,11 @@ class AsyncIggyTcpClientLoginRoutingTest {
                 .join();
 
         assertThat(identity).isEqualTo(FIRST_IDENTITY);
-        assertThat(attempts).hasValue(1);
+        assertThat(attempts).hasValue(3);
         assertThat(client.retargets)
                 .containsExactly(new ConnectionInfo("leader-a", 8091), new ConnectionInfo("leader-b", 8092));
-        assertThat(client.events).containsExactly("discover", "retarget", "discover", "retarget", "discover", "login");
+        assertThat(client.events)
+                .containsExactly("login", "discover", "retarget", "login", "discover", "retarget", "login", "discover");
     }
 
     @Test
@@ -78,14 +79,14 @@ class AsyncIggyTcpClientLoginRoutingTest {
             return CompletableFuture.completedFuture(SECOND_IDENTITY);
         });
 
-        assertThat(client.events).containsExactly("discover", "first-login");
+        assertThat(client.events).containsExactly("first-login");
         assertThat(secondLogin).isNotDone();
 
         firstAttempt.complete(FIRST_IDENTITY);
 
         assertThat(firstLogin.join()).isEqualTo(FIRST_IDENTITY);
         assertThat(secondLogin.join()).isEqualTo(SECOND_IDENTITY);
-        assertThat(client.events).containsExactly("discover", "first-login", "discover", "second-login");
+        assertThat(client.events).containsExactly("first-login", "discover", "second-login", "discover");
     }
 
     @Test
@@ -105,7 +106,7 @@ class AsyncIggyTcpClientLoginRoutingTest {
         assertThatThrownBy(failedLogin::join)
                 .isInstanceOf(CompletionException.class)
                 .hasCause(routingFailure);
-        assertThat(failedAttemptCount).hasValue(0);
+        assertThat(failedAttemptCount).hasValue(1);
         assertThat(nextLogin.join()).isEqualTo(SECOND_IDENTITY);
     }
 

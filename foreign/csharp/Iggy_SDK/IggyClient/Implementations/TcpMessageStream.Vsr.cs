@@ -389,7 +389,11 @@ public sealed partial class TcpMessageStream
         }
 
         var leaderAddress = ServerAddress.HostPort(currentLeaderNode.Ip, currentLeaderNode.Endpoints.Tcp);
-        if (ServerAddress.IsSame(leaderAddress, _currentAddress))
+        // Compare against the endpoint the socket resolved, not the configured string: a client
+        // configured with a hostname is otherwise never "on" the leader the roster names by IP,
+        // and every login would reconnect it to the node it is already talking to.
+        var connectedAddress = _currentRemoteAddress.Length > 0 ? _currentRemoteAddress : _currentAddress;
+        if (ServerAddress.IsSame(leaderAddress, connectedAddress))
         {
             Interlocked.Exchange(ref _leaderRedirectCount, 0);
             return false;

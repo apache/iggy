@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
 use iggy_common::ClusterClient;
 use iggy_common::{
     ClusterMetadata, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
@@ -25,6 +26,17 @@ use tracing::{debug, info, warn};
 
 /// Maximum number of leader redirections to prevent infinite loops
 const MAX_LEADER_REDIRECTS: u8 = 3;
+
+/// An auth-gated `get_cluster_metadata` read denied before sign-in.
+///
+/// The read is public API, so an unauthenticated caller can reach the gate on
+/// any transport. Reconnecting cannot repair it: `connect()` would re-issue
+/// the same unauthenticated read forever, so every transport must fail such a
+/// request fast instead of entering its reconnect path. One definition, since
+/// a transport missing this rule livelocks its reconnect loop.
+pub(crate) fn is_unauthenticated_metadata_probe(code: u32, error: &IggyError) -> bool {
+    code == GET_CLUSTER_METADATA_CODE && matches!(error, IggyError::Unauthenticated)
+}
 
 /// Check if we need to redirect to leader and return the leader address if redirection is needed
 pub async fn check_and_redirect_to_leader<C: ClusterClient>(
@@ -61,6 +73,16 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                         tokio::time::sleep(LEADERLESS_POLL_INTERVAL).await;
                     }
                 }
+            }
+            // The read is auth-gated everywhere, and this check runs after
+            // sign-in, so an unauthenticated answer means the session died
+            // between the two. Proceed on the current node and let the
+            // caller's next request surface the eviction.
+            Err(IggyError::Unauthenticated) => {
+                debug!(
+                    "Cluster metadata answered Unauthenticated; the session is gone, connection will continue on server node {current_address}"
+                );
+                return Ok(None);
             }
             Err(e) => {
                 warn!(
@@ -206,6 +228,22 @@ impl Default for LeaderRedirectionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_unauthenticated_cluster_metadata_is_a_pre_login_probe() {
+        assert!(is_unauthenticated_metadata_probe(
+            GET_CLUSTER_METADATA_CODE,
+            &IggyError::Unauthenticated,
+        ));
+        assert!(!is_unauthenticated_metadata_probe(
+            GET_CLUSTER_METADATA_CODE,
+            &IggyError::Disconnected,
+        ));
+        assert!(!is_unauthenticated_metadata_probe(
+            GET_CLUSTER_METADATA_CODE + 1,
+            &IggyError::Unauthenticated,
+        ));
+    }
 
     #[test]
     fn test_is_same_address() {
