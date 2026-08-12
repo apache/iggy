@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "common/codec.rs"]
+mod codec;
+
 use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_METADATA, BrokerAdvertise, handle_request,
 };
-use iggy_gateway_kafka::protocol::codec::Encoder;
+
+use codec::Encoder;
 
 #[test]
 fn golden_apiversions_v1_response_fixture() {

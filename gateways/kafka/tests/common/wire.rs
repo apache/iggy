@@ -16,11 +16,15 @@
 // under the License.
 
 //! Kafka wire request builders aligned with SCOPE.md / protocol spec.
+//!
+//! Callers must also declare `#[path = "common/codec.rs"] mod codec;` at their own crate root -
+//! this file borrows that module via `super::codec` rather than redeclaring it, since `rustc`
+//! rejects loading the same file as two distinct modules in one crate.
 #![allow(dead_code)]
 
 use bytes::Bytes;
 
-use iggy_gateway_kafka::protocol::codec::Encoder;
+use super::codec::Encoder;
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[

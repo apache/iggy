@@ -21,9 +21,10 @@
 use std::path::PathBuf;
 
 use bytes::Bytes;
+use kafka_protocol::messages::RequestHeader;
+use kafka_protocol::protocol::Decodable;
 
-use iggy_gateway_kafka::protocol::codec::Decoder;
-use iggy_gateway_kafka::protocol::header::{RequestHeader, request_header_version};
+use iggy_gateway_kafka::protocol::header::request_header_version;
 
 pub fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/kafka-tool/kafka_messages")
@@ -83,11 +84,8 @@ pub fn load_fixture_body_or_skip(api_key: i16, api_name: &str, version: i16) -> 
 
 /// Strip the 4-byte length prefix and Kafka request header from a framed message.
 pub fn extract_body_from_framed_message(api_key: i16, api_version: i16, data: &[u8]) -> Bytes {
-    let frame = Bytes::copy_from_slice(&data[4..]);
+    let mut frame = Bytes::copy_from_slice(&data[4..]);
     let hdr_ver = request_header_version(api_key, api_version);
-    let mut decoder = Decoder::new(frame);
-    RequestHeader::decode_from(&mut decoder, hdr_ver).expect("fixture request header must decode");
-    decoder
-        .read_bytes(decoder.remaining())
-        .expect("fixture request body must decode")
+    RequestHeader::decode(&mut frame, hdr_ver).expect("fixture request header must decode");
+    frame
 }

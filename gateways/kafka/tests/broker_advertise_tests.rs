@@ -17,11 +17,15 @@
 
 //! `BrokerAdvertise` parsing and metadata reflection.
 
+#[path = "common/codec.rs"]
+mod codec;
+
 use std::net::SocketAddr;
 
 use iggy_gateway_kafka::ServerConfig;
 use iggy_gateway_kafka::protocol::api::{API_KEY_METADATA, BrokerAdvertise, handle_request};
-use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
+
+use codec::{Decoder, Encoder};
 
 #[test]
 fn default_matches_standard_gateway_port() {

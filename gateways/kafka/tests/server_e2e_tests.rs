@@ -17,6 +17,8 @@
 
 //! End-to-end TCP tests through `KafkaServer` (full request/response cycle).
 
+#[path = "common/codec.rs"]
+mod codec;
 #[path = "common/fixtures.rs"]
 mod fixtures;
 #[path = "common/server.rs"]
@@ -34,8 +36,8 @@ use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NOT_LEADER_OR_FOLLOWER,
 };
-use iggy_gateway_kafka::protocol::codec::Decoder;
 
+use codec::Decoder;
 use fixtures::load_fixture_body_or_skip;
 use server::spawn_test_server;
 use std::time::Duration;
@@ -227,10 +229,14 @@ async fn e2e_produce_v3_acks_one_still_returns_response() {
     assert!(!resp_body.is_empty());
 }
 
-// ── ListOffsets v0 wire shape (old_style_offsets array, not bare i64) ───────
+// ── ListOffsets v0 (no encodable representation in kafka_protocol) ─────────
 
 #[tokio::test]
-async fn e2e_list_offsets_v0_unsupported_version_no_trailing_bytes() {
+async fn e2e_list_offsets_v0_closes_connection() {
+    // `kafka_protocol` has no encoder for ListOffsets v0's legacy `old_style_offsets` shape
+    // (it predates the schema the crate generates from - see `responses::encode_list_offsets_error_response`),
+    // so a v0 request - already below the firewall's min=1 - now closes instead of getting the
+    // pre-migration downgraded response.
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -247,27 +253,11 @@ async fn e2e_list_offsets_v0_unsupported_version_no_trailing_bytes() {
         .await
         .expect("write list offsets v0");
 
-    let payload =
-        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_secs(2))
-            .await
-            .expect("ListOffsets v0 should still get an error response");
-
-    let (_corr, body) = parse_response_payload(API_KEY_LIST_OFFSETS, 0, payload);
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    d.read_nullable_string().unwrap();
-    assert_eq!(d.read_i32().unwrap(), 1);
-    let _partition_index = d.read_i32().expect("partition_index");
-    let _error_code = d.read_i16().expect("error_code");
-    let offset_count = d.read_i32().expect("old_style_offsets array length");
-    assert!(
-        offset_count >= 0,
-        "old_style_offsets count must be non-negative, got {offset_count}"
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "ListOffsets v0 has no encodable response shape and must close"
     );
-    for _ in 0..offset_count {
-        d.read_i64().expect("old_style_offsets entry");
-    }
-    assert_eq!(d.remaining(), 0);
 }
 
 // ── Metadata topic name echo (must not hardcode a placeholder topic name) ──

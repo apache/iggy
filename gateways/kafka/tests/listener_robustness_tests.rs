@@ -17,6 +17,8 @@
 
 //! TCP listener robustness - framing, pipelining, concurrency, edge cases.
 
+#[path = "common/codec.rs"]
+mod codec;
 #[path = "common/server.rs"]
 mod server;
 #[path = "common/tcp.rs"]
@@ -35,8 +37,8 @@ use iggy_gateway_kafka::ServerConfig;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_FETCH, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
 };
-use iggy_gateway_kafka::protocol::codec::Decoder;
 
+use codec::Decoder;
 use server::{spawn_test_server, spawn_test_server_with_config};
 use tcp::{
     ByteRead, build_request_frame, concat_frames, parse_response_payload, read_byte_with_timeout,
@@ -499,12 +501,14 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
 // ── Corrupt body survives on the connection (no disconnect) ────────────────
 
 #[tokio::test]
-async fn corrupt_produce_body_e2e_returns_error_without_disconnect() {
+async fn corrupt_produce_body_e2e_stays_silent_without_disconnect() {
+    // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes whether
+    // `acks` was nonzero (unlike the pre-migration field-by-field decoder, which could still
+    // answer with INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure
+    // now stays silent - see `api::handle_produce_request` - but must not drop the connection.
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    // acks is readable (=1), so the client expects an error response; the topics array is
-    // truncated, forcing INVALID_REQUEST.
     let bad = build_request_frame(
         API_KEY_PRODUCE,
         3,
@@ -515,13 +519,11 @@ async fn corrupt_produce_body_e2e_returns_error_without_disconnect() {
         ],
     );
     stream.write_all(&bad).await.expect("corrupt produce");
-    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert!(
-        scan_for_error_code(
-            &parse_response_payload(API_KEY_PRODUCE, 3, payload).1,
-            ERROR_INVALID_REQUEST
-        ),
-        "corrupt Produce must surface INVALID_REQUEST"
+        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "corrupt Produce must stay silent, not respond with an error"
     );
 
     let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 392, Some("scope-test"), &[]);
@@ -529,7 +531,8 @@ async fn corrupt_produce_body_e2e_returns_error_without_disconnect() {
     let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert_eq!(
         parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
-        392
+        392,
+        "connection must stay usable after the silent corrupt Produce"
     );
 }
 

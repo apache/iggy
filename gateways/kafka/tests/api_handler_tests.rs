@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "common/codec.rs"]
+mod codec;
 #[path = "common/fixtures.rs"]
 mod fixtures;
 #[path = "common/scope.rs"]
@@ -32,9 +34,8 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
     handle_request, is_supported_version, supported_api_ranges,
 };
-use iggy_gateway_kafka::protocol::codec::Decoder;
-use iggy_gateway_kafka::protocol::requests::{ProduceDecodeResult, decode_produce_request};
 
+use codec::Decoder;
 use fixtures::load_fixture_body_or_skip;
 use scope::default_broker;
 use tcp::{build_metadata_legacy_request, build_produce_v3_body};
@@ -194,21 +195,21 @@ fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
 }
 
 #[test]
-fn produce_malformed_body_with_acks_one_returns_invalid_request() {
+fn produce_malformed_body_with_acks_one_stays_silent() {
+    // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes `acks`
+    // (unlike the pre-migration field-by-field decoder, which could still answer with
+    // INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure now stays
+    // silent rather than risk desyncing an acks=0 fire-and-forget client's correlation stream.
     let body = Bytes::from_static(&[
         0xff, 0xff, // null transactional_id
         0x00, 0x01, // acks = 1
         0x00, 0x00, 0x03, 0xe8, // timeout_ms
         0x00, 0x00, 0x00, 0x01, // one topic
     ]);
-    let response = handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
-        .expect_response("acks=1 malformed produce should get error response");
-    let mut d = Decoder::new(response);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+    assert!(
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
+        "malformed Produce body must stay silent regardless of acks"
+    );
 }
 
 #[test]
@@ -694,12 +695,11 @@ fn create_topics_stub_response_returns_not_controller() {
 // ── Produce acks=0 (broker must stay silent even on a malformed body) ──────
 
 #[test]
-fn produce_acks_zero_malformed_body_decode_carries_acks() {
+fn produce_acks_zero_malformed_body_stays_silent() {
+    // topics array declares 1 element but no topic data follows - decode fails after acks=0
+    // was on the wire, though `kafka_protocol`'s one-shot decode no longer exposes that acks
+    // was read. The handler must stay silent regardless.
     let body = build_produce_v3_body(0, 1);
-    match decode_produce_request(3, body.clone()) {
-        ProduceDecodeResult::Err { acks: Some(0), .. } => {}
-        other => panic!("expected decode error with acks=0, got {other:?}"),
-    }
     assert!(
         handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
         "handler must not respond when acks=0 even if decode fails after acks"

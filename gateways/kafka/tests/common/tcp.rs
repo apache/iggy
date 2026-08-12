@@ -16,6 +16,10 @@
 // under the License.
 
 //! TCP round-trip helpers - compiled into each integration test binary via `#[path]`.
+//!
+//! Callers must also declare `#[path = "common/codec.rs"] mod codec;` at their own crate root -
+//! this file borrows that module via `super::codec` rather than redeclaring it, since `rustc`
+//! rejects loading the same file as two distinct modules in one crate.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -26,8 +30,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time;
 
-use iggy_gateway_kafka::protocol::codec::Decoder;
 use iggy_gateway_kafka::protocol::header::{request_header_version, response_header_version};
+
+use super::codec::{self, Decoder};
 
 /// Build a complete length-prefixed Kafka request frame (header + body).
 pub fn build_request_frame(
@@ -38,16 +43,17 @@ pub fn build_request_frame(
     body: &[u8],
 ) -> Bytes {
     let hdr_ver = request_header_version(api_key, api_version);
-    let mut enc = iggy_gateway_kafka::protocol::codec::Encoder::with_capacity(64 + body.len());
+    let mut enc = codec::Encoder::with_capacity(64 + body.len());
     enc.write_i16(api_key);
     enc.write_i16(api_version);
     enc.write_i32(correlation_id);
+    // client_id is the legacy NULLABLE_STRING at every header version, even v2 - only the
+    // trailing tagged-fields section is new for the "flexible" header. Kafka's RequestHeader
+    // schema never made client_id itself a compact string.
+    enc.write_nullable_string(client_id)
+        .expect("test client_id fits i16");
     if hdr_ver >= 2 {
-        enc.write_compact_nullable_string(client_id);
         enc.write_empty_tagged_fields();
-    } else {
-        enc.write_nullable_string(client_id)
-            .expect("test client_id fits i16");
     }
     enc.write_bytes(body);
 

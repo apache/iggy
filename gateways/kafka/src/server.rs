@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use kafka_protocol::messages::RequestHeader;
+use kafka_protocol::protocol::Decodable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast};
@@ -30,10 +32,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request};
-use crate::protocol::codec::Decoder;
-use crate::protocol::header::{
-    RequestHeader, ResponseHeader, request_header_version, response_header_version,
-};
+use crate::protocol::header::{request_header_version, response_header_version};
 use std::io;
 
 const READ_CHUNK: usize = 65536;
@@ -286,23 +285,25 @@ async fn handle_connection(
         let req_hdr_ver = request_header_version(api_key, api_version);
         let resp_hdr_ver = response_header_version(api_key, api_version);
 
-        // `request_header_version` only ever returns 1 or 2, both of which `decode_from`
-        // handles, so its `UnsupportedHeaderVersion` arm is unreachable here; any decode error
-        // is a malformed header and closes the connection.
-        let mut decoder = Decoder::new(frame);
-        let req = RequestHeader::decode_from(&mut decoder, req_hdr_ver)?;
+        // `request_header_version` only ever returns 1 or 2, both of which `RequestHeader`
+        // supports, so `decode` cannot fail on the version argument itself; any error here is a
+        // malformed header and closes the connection.
+        let mut body = frame;
+        let req = RequestHeader::decode(&mut body, req_hdr_ver)
+            .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
 
         debug!(
             %peer,
-            api_key = req.api_key,
-            api_version = req.api_version,
+            api_key = req.request_api_key,
+            api_version = req.request_api_version,
             correlation_id = req.correlation_id,
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
 
-        let body = decoder.read_bytes(decoder.remaining())?;
-        let outcome = handle_request(req.api_key, req.api_version, body, &broker);
+        // `RequestHeader::decode` advances `body` past the header fields it consumed via
+        // `Buf::advance`, so `body` is already exactly the request payload.
+        let outcome = handle_request(req.request_api_key, req.request_api_version, body, &broker);
         if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
             return Ok(());
         }
@@ -357,19 +358,16 @@ async fn dispatch_outcome(
         HandleOutcome::Close => {
             warn!(
                 %peer,
-                api_key = req.api_key,
-                api_version = req.api_version,
+                api_key = req.request_api_key,
+                api_version = req.request_api_version,
                 "closing connection: no parseable response for this request"
             );
             Ok(true)
         }
         HandleOutcome::Respond(body_response) => {
-            let resp_header = ResponseHeader {
-                correlation_id: req.correlation_id,
-            };
             send_response(
                 stream,
-                &resp_header,
+                req.correlation_id,
                 resp_hdr_ver,
                 body_response,
                 config.write_timeout,
@@ -380,16 +378,24 @@ async fn dispatch_outcome(
     }
 }
 
+/// Response header size for a given header version: v0 is `correlation_id` only (4 bytes); v1
+/// adds an empty tagged-fields byte (5 bytes). Kept inline rather than through
+/// `kafka_protocol::messages::ResponseHeader` - that type's `Encodable` impl needs its own
+/// `BytesMut` allocation, defeating the single-allocation framing this function exists for.
+const fn response_header_size(header_version: i16) -> usize {
+    if header_version >= 1 { 5 } else { 4 }
+}
+
 /// Write a single length-prefixed Kafka frame using one allocation.
 /// Avoids the separate header-encode + payload-concat + length-prefix allocations.
 async fn send_response(
     stream: &mut TcpStream,
-    header: &ResponseHeader,
+    correlation_id: i32,
     header_version: i16,
     body: Bytes,
     write_timeout: Duration,
 ) -> Result<()> {
-    let header_size = ResponseHeader::encoded_size(header_version);
+    let header_size = response_header_size(header_version);
     let payload_size = header_size + body.len();
     let payload_len_i32 =
         i32::try_from(payload_size).map_err(|_| KafkaProtocolError::FrameTooLarge {
@@ -398,7 +404,10 @@ async fn send_response(
         })?;
     let mut prefix = BytesMut::with_capacity(4 + header_size);
     prefix.put_i32(payload_len_i32);
-    header.encode_into(&mut prefix, header_version);
+    prefix.put_i32(correlation_id);
+    if header_version >= 1 {
+        prefix.put_u8(0); // empty tagged fields
+    }
     let mut frame = prefix.freeze().chain(body);
     timeout(write_timeout, stream.write_all_buf(&mut frame))
         .await
@@ -517,14 +526,11 @@ mod tests {
     #[tokio::test]
     async fn send_response_writes_header_and_body() {
         let (mut client, mut server) = tcp_pair().await;
-        let header = ResponseHeader {
-            correlation_id: 0x0102_0304,
-        };
         let body = [9u8, 8, 7];
 
         send_response(
             &mut server,
-            &header,
+            0x0102_0304,
             1,
             Bytes::copy_from_slice(&body),
             Duration::from_secs(1),
@@ -774,14 +780,11 @@ mod tests {
     #[tokio::test]
     async fn send_response_v0_writes_correlation_id_only() {
         let (mut client, mut server) = tcp_pair().await;
-        let header = ResponseHeader {
-            correlation_id: 0x0000_00AB,
-        };
         let body = [5u8, 6, 7];
 
         send_response(
             &mut server,
-            &header,
+            0x0000_00AB,
             0,
             Bytes::copy_from_slice(&body),
             Duration::from_secs(1),

@@ -17,6 +17,8 @@
 
 //! Version negotiation firewall - boundary tests for every scoped API key.
 
+#[path = "common/codec.rs"]
+mod codec;
 #[path = "common/fixtures.rs"]
 mod fixtures;
 #[path = "common/scope.rs"]
@@ -40,8 +42,8 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
     supported_api_ranges,
 };
-use iggy_gateway_kafka::protocol::codec::Decoder;
 
+use codec::Decoder;
 use fixtures::{fixture_exists, load_fixture_body, load_fixture_body_or_skip};
 use scope::{SCOPED_API_KEYS, default_broker};
 use server::spawn_test_server;
@@ -228,40 +230,33 @@ async fn e2e_metadata_above_max_version_closes_tcp_connection() {
 }
 
 #[test]
-fn produce_unsupported_version_returns_well_formed_error_response() {
+fn produce_below_min_version_with_nonzero_acks_closes_connection() {
+    // Produce v2 is below both the firewall min (3) and `kafka_protocol`'s schema floor (3-13)
+    // - no encodable response exists at this version, so a client expecting a reply (acks != 0)
+    // gets a close instead of the pre-migration downgraded error response. acks=0 still keeps
+    // the connection open - see `produce_advertises_min_zero_but_firewall_rejects_below_v3` and
+    // `api::handle_produce_request`'s hand-peeked acks path.
     let body = handle_request(
         API_KEY_PRODUCE,
         2,
         build_produce_v2_body(1, 0),
         &default_broker(),
-    )
-    .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    let _ = d.read_i64().unwrap();
-    let _ = d.read_i64().unwrap();
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.remaining(), 0);
+    );
+    assert!(
+        body.is_close(),
+        "Produce v2 with acks != 0 has no encodable response shape and must close"
+    );
 }
 
 #[test]
-fn fetch_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_FETCH, 3, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_i64().unwrap(), 0);
-    assert_eq!(d.read_nullable_bytes().unwrap(), None);
-    assert_eq!(d.remaining(), 0);
+fn fetch_below_min_version_closes_connection() {
+    // Fetch v3 is below both the firewall min (4) and `kafka_protocol`'s schema floor (4-18) -
+    // no encodable response exists at this version, so this closes instead of the
+    // pre-migration downgraded error response.
+    assert!(
+        handle_request(API_KEY_FETCH, 3, Bytes::new(), &default_broker()).is_close(),
+        "Fetch v3 has no encodable response shape and must close"
+    );
 }
 
 #[test]
@@ -298,29 +293,25 @@ fn list_offsets_unsupported_version_above_max_closes_connection() {
 }
 
 #[test]
-fn list_offsets_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0); // partition index
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_i32().unwrap(), 0); // old_style_offsets empty array (v0 wire)
-    assert_eq!(d.remaining(), 0);
+fn list_offsets_v0_closes_connection() {
+    // `kafka_protocol` has no encoder for ListOffsets v0's legacy `old_style_offsets` shape (it
+    // predates the schema the crate generates from), so a v0 request - already below the
+    // firewall's min=1 - now closes instead of getting the pre-migration downgraded response.
+    assert!(
+        handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker()).is_close(),
+        "ListOffsets v0 has no encodable response shape and must close"
+    );
 }
 
 #[test]
-fn create_topics_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_CREATE_TOPICS, 1, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_nullable_string().unwrap(), None);
-    assert_eq!(d.remaining(), 0);
+fn create_topics_below_min_version_closes_connection() {
+    // CreateTopics v1 is below both the firewall min (2) and `kafka_protocol`'s schema floor
+    // (2-7) - no encodable response exists at this version, so this closes instead of the
+    // pre-migration downgraded error response.
+    assert!(
+        handle_request(API_KEY_CREATE_TOPICS, 1, Bytes::new(), &default_broker()).is_close(),
+        "CreateTopics v1 has no encodable response shape and must close"
+    );
 }
 
 #[test]
@@ -359,23 +350,21 @@ fn supported_fetch_versions_accept_valid_fixture() {
 }
 
 #[test]
-fn corrupt_produce_body_returns_invalid_request_error() {
-    // null transactional_id, acks=1, timeout=0, then a truncated topics array: acks is readable,
-    // so the client expects (and gets) an error response.
+fn corrupt_produce_body_with_acks_stays_silent() {
+    // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes `acks`
+    // (unlike the pre-migration field-by-field decoder, which could still answer with
+    // INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure now stays
+    // silent regardless of whether acks was readable before the truncation.
     let body = Bytes::from_static(&[
         0xFF, 0xFF, // null transactional_id
         0x00, 0x01, // acks = 1
         0x00, 0x00, 0x00, 0x00, // timeout_ms = 0
         0xFF, 0xFF, 0xFF, // truncated topics count
     ]);
-    let resp = handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(resp);
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0);
-    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+    assert!(
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
+        "malformed Produce body must stay silent regardless of acks"
+    );
 }
 
 #[test]
@@ -404,73 +393,15 @@ fn corrupt_fetch_body_returns_invalid_request_error() {
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-// ── ListOffsets v0 wire shape (old_style_offsets array, not bare i64) ───────
-
-/// Parse one `ListOffsets` v0 partition entry the way a v0 Kafka client would.
-fn parse_list_offsets_v0_partition(d: &mut Decoder) {
-    let _partition_index = d.read_i32().expect("partition_index");
-    let _error_code = d.read_i16().expect("error_code");
-    let offset_count = d.read_i32().expect("old_style_offsets array length");
-    assert!(
-        offset_count >= 0,
-        "old_style_offsets count must be non-negative, got {offset_count}"
-    );
-    for _ in 0..offset_count {
-        d.read_i64().expect("old_style_offsets entry");
-    }
-}
+// ── ListOffsets v0 (no encodable representation in kafka_protocol) ─────────
 
 #[test]
-fn list_offsets_v0_unsupported_version_is_parseable_by_v0_clients() {
-    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-
-    assert_eq!(d.read_i32().unwrap(), 1, "topics array length");
-    assert_eq!(
-        d.read_nullable_string().unwrap(),
-        Some(String::new()),
-        "placeholder topic name"
-    );
-    assert_eq!(d.read_i32().unwrap(), 1, "partitions array length");
-
-    parse_list_offsets_v0_partition(&mut d);
-
-    assert_eq!(
-        d.remaining(),
-        0,
-        "v0 client must consume the full error response without trailing bytes"
-    );
-}
-
-#[test]
-fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
+fn list_offsets_v0_with_topic_closes_connection() {
     let request_body = build_list_offsets_v0_request_with_topic_t();
-    let body = handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-
-    assert_eq!(d.read_i32().unwrap(), 1);
-    d.read_nullable_string().unwrap();
-    assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0, "partition index");
-    assert_eq!(
-        d.read_i16().unwrap(),
-        ERROR_UNSUPPORTED_VERSION,
-        "partition error code"
-    );
-
-    // partition_index and error_code were already asserted above; only the
-    // trailing old_style_offsets array remains for this single partition.
-    let offset_count = d.read_i32().expect("old_style_offsets array length");
     assert!(
-        offset_count >= 0,
-        "old_style_offsets count must be non-negative, got {offset_count}"
+        handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker()).is_close(),
+        "ListOffsets v0 has no encodable response shape and must close, even with a well-formed body"
     );
-    for _ in 0..offset_count {
-        d.read_i64().expect("old_style_offsets entry");
-    }
-    assert_eq!(d.remaining(), 0);
 }
 
 // ── Comprehensive scoped-API coverage (correlation id, boundary versions) ──
@@ -654,14 +585,17 @@ async fn each_scoped_api_above_max_version_e2e_closes_or_kip511() {
 }
 
 #[tokio::test]
-async fn each_scoped_api_below_min_version_e2e_keeps_connection() {
+async fn each_scoped_api_below_min_version_e2e_closes_except_api_versions() {
+    // Every scoped API's firewall min was chosen at or above `kafka_protocol`'s own schema
+    // floor for that message (Produce 3, Fetch 4, ListOffsets 1's encoder actually starts at 1
+    // but the crate's schema floor is 1 too - see below - Metadata 0, CreateTopics 2), so
+    // `min_ver - 1` has no encodable response under the crate and closes for every API except
+    // ApiVersions, which always answers per KIP-511 regardless of version validity.
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     for &(api_key, name, min_ver, _max_ver) in SCOPED_API_KEYS {
         let below = min_ver - 1;
-        // Produce is decoded before the firewall check (to honor acks=0 silence), so it needs a
-        // body with a readable acks; the other APIs reject on version before touching the body.
         let body = request_body_for_scoped_api(api_key, name, below);
         let frame = build_request_frame(
             api_key,
@@ -674,22 +608,24 @@ async fn each_scoped_api_below_min_version_e2e_keeps_connection() {
             .write_all(&frame)
             .await
             .unwrap_or_else(|_| panic!("write {name} v{below}"));
-        if api_key == API_KEY_METADATA {
-            assert_eq!(
-                read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
-                ByteRead::Closed,
-                "Metadata v{below} must close the connection"
+
+        if api_key == API_KEY_API_VERSIONS {
+            let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+            assert!(
+                !payload.is_empty(),
+                "ApiVersions v{below} must still respond per KIP-511"
             );
-            stream = TcpStream::connect(addr)
-                .await
-                .expect("reconnect after Metadata close");
             continue;
         }
-        let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-        assert!(
-            !payload.is_empty(),
-            "{name} v{below} must still respond on wire"
+
+        assert_eq!(
+            read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+            ByteRead::Closed,
+            "{name} v{below} has no encodable response shape and must close"
         );
+        stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|_| panic!("reconnect after {name} close"));
     }
 
     let ok = build_request_frame(API_KEY_API_VERSIONS, 1, 88_888, Some("scope-test"), &[]);
@@ -713,19 +649,30 @@ fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
     assert!(!is_supported_version(API_KEY_PRODUCE, 0));
     assert!(!is_supported_version(API_KEY_PRODUCE, 2));
 
-    let body = handle_request(
-        API_KEY_PRODUCE,
-        2,
-        build_produce_v2_body(1, 0),
-        &default_broker(),
-    )
-    .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    let _topics = d.read_i32().unwrap();
-    let _name = d.read_nullable_string().unwrap();
-    let _parts = d.read_i32().unwrap();
-    assert_eq!(d.read_i32().unwrap(), 0, "partition index");
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
+    // acks=0 must keep the connection open even though no response is encodable at v2 - the
+    // fire-and-forget wire-protocol rule outranks "no parseable response" here.
+    assert!(
+        handle_request(
+            API_KEY_PRODUCE,
+            2,
+            build_produce_v2_body(0, 0),
+            &default_broker(),
+        )
+        .is_no_response(),
+        "Produce v2 acks=0 must stay silent, not close"
+    );
+
+    // acks != 0 has no encodable response at v2 and must close instead.
+    assert!(
+        handle_request(
+            API_KEY_PRODUCE,
+            2,
+            build_produce_v2_body(1, 0),
+            &default_broker(),
+        )
+        .is_close(),
+        "Produce v2 acks != 0 has no encodable response shape and must close"
+    );
 }
 
 // ── Unsupported-version e2e paths for remaining scoped APIs ─────────────────
@@ -750,13 +697,20 @@ async fn list_offsets_v7_unsupported_e2e_closes_connection() {
 }
 
 #[tokio::test]
-async fn create_topics_v1_unsupported_e2e_returns_error() {
+async fn create_topics_v1_unsupported_e2e_closes_connection() {
+    // CreateTopics v1 is below both the firewall min (2) and `kafka_protocol`'s schema floor
+    // (2-7) - no encodable response exists at this version.
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(addr, API_KEY_CREATE_TOPICS, 1, 380, &[]).await;
-    assert_eq!(corr, 380);
-    assert!(
-        scan_for_error_code(&body, ERROR_UNSUPPORTED_VERSION),
-        "CreateTopics v1 must be rejected"
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let frame = build_request_frame(API_KEY_CREATE_TOPICS, 1, 380, Some("scope-test"), &[]);
+    stream
+        .write_all(&frame)
+        .await
+        .expect("write create topics v1");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "CreateTopics v1 has no encodable response shape and must close"
     );
 }
 

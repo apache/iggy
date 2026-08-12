@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "common/codec.rs"]
+mod codec;
+
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use iggy_gateway_kafka::protocol::codec::Encoder;
+use codec::Encoder;
 use iggy_gateway_kafka::server::read_frame;
 
 async fn tcp_pair() -> (TcpStream, TcpStream) {

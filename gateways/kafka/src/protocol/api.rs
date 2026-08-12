@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use kafka_protocol::messages::api_versions_response::ApiVersion;
+use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
+use kafka_protocol::messages::{
+    ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateTopicsRequest, FetchRequest,
+    ListOffsetsRequest, MetadataRequest, MetadataResponse, ProduceRequest, TopicName,
+};
+use kafka_protocol::protocol::{Decodable, StrBytes};
 
 use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::codec::{Decoder, Encoder, PREALLOC_HINT};
-use crate::protocol::requests::{
-    ProduceDecodeResult, decode_create_topics_request, decode_fetch_request,
-    decode_list_offsets_request, decode_produce_request,
-};
 use crate::protocol::responses::{
     encode_create_topics_error_response, encode_create_topics_response,
     encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
-    encode_list_offsets_response, encode_produce_error_response, encode_produce_response,
+    encode_list_offsets_response, encode_message, encode_produce_error_response,
+    encode_produce_response,
 };
 
 pub const API_KEY_PRODUCE: i16 = 0;
@@ -48,9 +51,6 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
-
-/// Sentinel for `topic_authorized_operations` / `cluster_authorized_operations` when ACLs are not supported.
-const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -162,70 +162,88 @@ pub fn handle_request(
     handle_other_request(api_key, api_version, body, broker)
 }
 
+/// Decode `T` from the whole request body and reject unconsumed trailing bytes.
+///
+/// `kafka_protocol`'s `Decodable` stops once it has read the fields its schema defines; it does
+/// not know (or care) whether the caller handed it an exact-length body, so the trailing-bytes
+/// check has to live here.
+fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
+    let value =
+        T::decode(&mut body, version).map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
+    if body.has_remaining() {
+        return Err(KafkaProtocolError::Malformed(
+            "unexpected trailing bytes in request body".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding
+/// fails rather than propagating - there is no parseable response to send in that case.
+fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
+    match result {
+        Ok(body) => HandleOutcome::Respond(body),
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode {api_name} response; closing connection");
+            HandleOutcome::Close
+        }
+    }
+}
+
 /// Produce is the only request the wire protocol allows to go unanswered
 /// (`acks=0`), so it gets its own path that may return [`HandleOutcome::NoResponse`].
 ///
-/// The firewall check runs AFTER decoding `acks`, not before: `ApiVersions` advertises
+/// The firewall check runs AFTER decoding the request, not before: `ApiVersions` advertises
 /// Produce min=0 (see [`advertised_min_version`]) while the firewall's real floor is 3, so a
 /// spec-compliant client can legitimately send Produce v0-2 with `acks=0`. Rejecting those
 /// versions before reading `acks` would send an error response the client never expects,
 /// desyncing the next correlation id it reads.
 fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
     // Above the encoder max there is no response parseable at the client's version, so close
-    // rather than decode (same policy the other APIs apply). Below-min versions still decode so
-    // acks=0 fire-and-forget clients stay silent per the advertised min=0.
+    // rather than decode (same policy the other APIs apply).
     if api_version > supported_max_version(API_KEY_PRODUCE).unwrap_or(i16::MAX) {
         return HandleOutcome::Close;
     }
-    match decode_produce_request(api_version, body) {
+    // `kafka_protocol`'s ProduceRequest/ProduceResponse schemas only go back to v3, so v0-2
+    // (still advertised as the min in ApiVersions per KAFKA-18659) can be neither decoded nor
+    // encoded by the crate - there is no parseable response at these versions regardless of
+    // body content. `acks` is always the first i16 on the wire there (`transactional_id` was
+    // added in v3), so it's peeked by hand: acks=0 must keep the connection open per the wire
+    // protocol's fire-and-forget rule even though no response can ever be encoded for it.
+    if api_version < 3 {
+        let acks = match body.get(0..2) {
+            Some(&[hi, lo]) => Some(i16::from_be_bytes([hi, lo])),
+            _ => None,
+        };
+        return match acks {
+            Some(0) | None => HandleOutcome::NoResponse,
+            Some(_) => unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
+                encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
+            }),
+        };
+    }
+    match decode_exhaustive::<ProduceRequest>(api_version, body) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
-        ProduceDecodeResult::Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
-        ProduceDecodeResult::Ok(req) => {
+        Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
+        Ok(req) => {
             if !is_supported_version(API_KEY_PRODUCE, api_version) {
                 return unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
                     encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
                 });
             }
-            HandleOutcome::Respond(encode_produce_response(api_version, &req))
+            respond_or_close(encode_produce_response(api_version, &req), "Produce")
         }
-        ProduceDecodeResult::Err {
-            acks: Some(0),
-            error,
-        } => {
-            tracing::warn!(
-                "Failed to decode Produce request with acks=0 (no response): {:?}",
-                error
-            );
+        Err(error) => {
+            // `kafka_protocol` decodes the whole request in one shot; a failure anywhere gives
+            // no partial-field access, so `acks` is unknowable here (unlike the pre-migration
+            // field-by-field decoder, which could still know `acks` on a later-field failure).
+            // Responding risks desyncing an acks=0 fire-and-forget client's correlation stream,
+            // so every Produce decode failure now stays silent - a behavior change from the
+            // hand-rolled decoder, which answered with INVALID_REQUEST when `acks` was known and
+            // nonzero.
+            tracing::warn!(%error, "failed to decode Produce request (no response)");
             HandleOutcome::NoResponse
-        }
-        ProduceDecodeResult::Err { acks: None, error } => {
-            // Decode failed before `acks` was read (malformed transactional_id or a truncated
-            // frame). Whether the client wants a response is unknowable, and an error response
-            // would desync an acks=0 fire-and-forget client's correlation stream. Frames are
-            // length-delimited, so the malformed frame does not affect the next frame's boundary;
-            // stay silent and keep the connection usable rather than risk that desync.
-            tracing::warn!(
-                "Failed to decode Produce request before acks was read (no response): {:?}",
-                error
-            );
-            HandleOutcome::NoResponse
-        }
-        ProduceDecodeResult::Err {
-            acks: Some(_),
-            error,
-        } => {
-            tracing::warn!("Failed to decode Produce request: {:?}", error);
-            if is_supported_version(API_KEY_PRODUCE, api_version) {
-                HandleOutcome::Respond(encode_produce_error_response(
-                    api_version,
-                    ERROR_INVALID_REQUEST,
-                ))
-            } else {
-                unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
-                    encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
-                })
-            }
         }
     }
 }
@@ -237,13 +255,13 @@ fn handle_other_request(
     broker: &BrokerAdvertise,
 ) -> HandleOutcome {
     match api_key {
-        API_KEY_API_VERSIONS => handle_api_versions(api_version, &body),
+        API_KEY_API_VERSIONS => handle_api_versions(api_version, body),
         API_KEY_METADATA => handle_metadata(api_version, body, broker),
         API_KEY_FETCH => handle_versioned_request(
             API_KEY_FETCH,
             api_version,
             body,
-            decode_fetch_request,
+            decode_exhaustive::<FetchRequest>,
             encode_fetch_response,
             encode_fetch_error_response,
             "Fetch",
@@ -252,7 +270,7 @@ fn handle_other_request(
             API_KEY_LIST_OFFSETS,
             api_version,
             body,
-            decode_list_offsets_request,
+            decode_exhaustive::<ListOffsetsRequest>,
             encode_list_offsets_response,
             encode_list_offsets_error_response,
             "ListOffsets",
@@ -261,7 +279,7 @@ fn handle_other_request(
             API_KEY_CREATE_TOPICS,
             api_version,
             body,
-            decode_create_topics_request,
+            decode_exhaustive::<CreateTopicsRequest>,
             encode_create_topics_response,
             encode_create_topics_error_response,
             "CreateTopics",
@@ -272,21 +290,26 @@ fn handle_other_request(
     }
 }
 
-fn handle_api_versions(api_version: i16, body: &Bytes) -> HandleOutcome {
-    if is_supported_version(API_KEY_API_VERSIONS, api_version) {
-        match decode_api_versions_request(api_version, body) {
-            Ok(()) => HandleOutcome::Respond(encode_api_versions_response(api_version, ERROR_NONE)),
-            Err(e) => {
-                tracing::warn!("Failed to decode ApiVersions request: {:?}", e);
-                HandleOutcome::Respond(encode_api_versions_response(
-                    api_version,
-                    ERROR_INVALID_REQUEST,
-                ))
-            }
-        }
-    } else {
+fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
+    if !is_supported_version(API_KEY_API_VERSIONS, api_version) {
         // KIP-511: reply with v0 when the requested version is not understood.
-        HandleOutcome::Respond(encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION))
+        return respond_or_close(
+            encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION),
+            "ApiVersions",
+        );
+    }
+    match decode_exhaustive::<ApiVersionsRequest>(api_version, body) {
+        Ok(_) => respond_or_close(
+            encode_api_versions_response(api_version, ERROR_NONE),
+            "ApiVersions",
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to decode ApiVersions request");
+            respond_or_close(
+                encode_api_versions_response(api_version, ERROR_INVALID_REQUEST),
+                "ApiVersions",
+            )
+        }
     }
 }
 
@@ -302,18 +325,16 @@ fn handle_metadata(api_version: i16, body: Bytes, broker: &BrokerAdvertise) -> H
         );
         return HandleOutcome::Close;
     }
-    match decode_metadata_request(api_version, body) {
-        Ok(topics) => HandleOutcome::Respond(encode_metadata_response(
-            api_version,
-            &topics,
-            broker,
-            ERROR_NONE,
-        )),
-        Err(e) => {
+    match decode_metadata_topics(api_version, body) {
+        Ok(topics) => respond_or_close(
+            encode_metadata_response(api_version, &topics, broker, ERROR_NONE),
+            "Metadata",
+        ),
+        Err(error) => {
             // Metadata has no top-level error field; a malformed body cannot carry
             // INVALID_REQUEST in a version-correct way for every client. Close.
             tracing::warn!(
-                ?e,
+                %error,
                 api_version,
                 "Failed to decode Metadata request; closing connection"
             );
@@ -327,16 +348,16 @@ fn handle_versioned_request<T>(
     api_version: i16,
     body: Bytes,
     decode: impl FnOnce(i16, Bytes) -> Result<T>,
-    encode_ok: impl FnOnce(i16, &T) -> Bytes,
-    encode_err: impl Fn(i16, i16) -> Bytes,
+    encode_ok: impl FnOnce(i16, &T) -> Result<Bytes>,
+    encode_err: impl Fn(i16, i16) -> Result<Bytes>,
     api_name: &str,
 ) -> HandleOutcome {
     if is_supported_version(api_key, api_version) {
         match decode(api_version, body) {
-            Ok(req) => HandleOutcome::Respond(encode_ok(api_version, &req)),
-            Err(e) => {
-                tracing::warn!("Failed to decode {api_name} request: {:?}", e);
-                HandleOutcome::Respond(encode_err(api_version, ERROR_INVALID_REQUEST))
+            Ok(req) => respond_or_close(encode_ok(api_version, &req), api_name),
+            Err(error) => {
+                tracing::warn!(%error, "Failed to decode {api_name} request");
+                respond_or_close(encode_err(api_version, ERROR_INVALID_REQUEST), api_name)
             }
         }
     } else {
@@ -349,15 +370,20 @@ fn handle_versioned_request<T>(
 /// Unsupported-version policy for APIs whose encoders only implement up to
 /// [`ApiVersionRange::max_version`].
 ///
-/// - `api_version > max`: Close. Encoding at the client's raw version would omit later-version
-///   fields (`CreateTopics` v7 `TopicId`, Produce v13 UUID topic, …) and the client could not
-///   parse the intended `UNSUPPORTED_VERSION` body.
-/// - `api_version < min` but still within encoder capability: Respond with an error shaped for
-///   that version (e.g. `ListOffsets` v0 `old_style_offsets`, Produce v0–2).
+/// - `api_version > max`: Close. `SUPPORTED_RANGES` is the governance boundary, not just an
+///   encoding-capability limit - `kafka_protocol` can often encode versions above our firewall
+///   max just fine, but responding there would silently widen what this gateway accepts.
+/// - `api_version < min`: Respond with an error shaped for that version when `kafka_protocol`
+///   can encode it, otherwise `encode` fails and [`respond_or_close`] closes instead. In
+///   practice every `SUPPORTED_RANGES` min was chosen at or above the oldest version
+///   `kafka_protocol` implements for that message, so this always closes today (e.g.
+///   `ListOffsets` v0's legacy `old_style_offsets` shape predates the crate's schema) - kept
+///   generic rather than hard-coded so a future `kafka_protocol` upgrade that widens a schema's
+///   floor is picked up automatically instead of silently staying on `Close`.
 fn unsupported_version_response(
     api_key: i16,
     api_version: i16,
-    encode: impl FnOnce(i16) -> Bytes,
+    encode: impl FnOnce(i16) -> Result<Bytes>,
 ) -> HandleOutcome {
     let max_version = SUPPORTED_RANGES
         .iter()
@@ -372,7 +398,7 @@ fn unsupported_version_response(
         );
         return HandleOutcome::Close;
     }
-    HandleOutcome::Respond(encode(api_version))
+    respond_or_close(encode(api_version), "unsupported-version")
 }
 
 #[must_use]
@@ -405,49 +431,28 @@ pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
     }
 }
 
-fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
-    let flexible = api_version >= 3;
-    let ranges = SUPPORTED_RANGES;
-    let mut e = Encoder::with_capacity(128);
-
-    e.write_i16(error_code);
-
-    if flexible {
-        e.write_varint((ranges.len() + 1) as u64);
-        for r in ranges {
-            e.write_i16(r.api_key);
-            e.write_i16(advertised_min_version(r.api_key, r.min_version));
-            e.write_i16(r.max_version);
-            e.write_empty_tagged_fields();
-        }
-    } else {
-        e.write_i32(i32::try_from(ranges.len()).expect("supported range table is small"));
-        for r in ranges {
-            e.write_i16(r.api_key);
-            e.write_i16(advertised_min_version(r.api_key, r.min_version));
-            e.write_i16(r.max_version);
-        }
-    }
-
-    if api_version >= 1 {
-        e.write_i32(0);
-    }
-
-    if flexible {
-        e.write_empty_tagged_fields();
-    }
-
-    e.freeze()
+fn encode_api_versions_response(api_version: i16, error_code: i16) -> Result<Bytes> {
+    let api_keys = SUPPORTED_RANGES
+        .iter()
+        .map(|r| {
+            ApiVersion::default()
+                .with_api_key(r.api_key)
+                .with_min_version(advertised_min_version(r.api_key, r.min_version))
+                .with_max_version(r.max_version)
+        })
+        .collect();
+    let resp = ApiVersionsResponse::default()
+        .with_error_code(error_code)
+        .with_api_keys(api_keys);
+    encode_message(&resp, api_version, 128)
 }
 
 fn encode_metadata_response(
     response_version: i16,
-    topics: &[String],
+    topics: &[StrBytes],
     broker: &BrokerAdvertise,
     topic_error_override: i16,
-) -> Bytes {
-    let flexible = response_version >= 9;
-    let topics_count = topics.len();
+) -> Result<Bytes> {
     // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
     // or a forced override (unused today; kept for symmetry with other encoders).
     let topic_error = if topic_error_override == ERROR_NONE {
@@ -456,249 +461,98 @@ fn encode_metadata_response(
         topic_error_override
     };
 
-    let mut e = Encoder::with_capacity(256);
+    let response_topics = topics
+        .iter()
+        .map(|name| {
+            MetadataResponseTopic::default()
+                .with_error_code(topic_error)
+                .with_name(Some(TopicName(name.clone())))
+        })
+        .collect();
 
-    if response_version >= 3 {
-        e.write_i32(0); // throttle_time_ms (Metadata v3+)
-    }
+    let broker_entry = MetadataResponseBroker::default()
+        .with_node_id(BrokerId(1))
+        .with_host(StrBytes::from_string(broker.host.clone()))
+        .with_port(broker.port);
 
-    if flexible {
-        e.write_varint(2); // one broker (N+1)
-        e.write_i32(1);
-        e.write_compact_nullable_string(Some(&broker.host));
-        e.write_i32(broker.port);
-        e.write_compact_nullable_string(None); // rack
-        e.write_empty_tagged_fields();
+    let resp = MetadataResponse::default()
+        .with_brokers(vec![broker_entry])
+        .with_controller_id(BrokerId(1))
+        .with_topics(response_topics);
 
-        e.write_compact_nullable_string(None); // cluster_id (v2+)
-        e.write_i32(1); // controller_id (v1+)
-
-        e.write_varint((topics_count + 1) as u64);
-        for name in topics {
-            e.write_i16(topic_error);
-            e.write_compact_nullable_string(Some(name));
-            e.write_bool(false); // is_internal (v1+)
-            e.write_varint(1); // empty partitions array
-            e.write_i32(AUTHORIZED_OPS_UNKNOWN); // topic_authorized_operations (v8+)
-            e.write_empty_tagged_fields();
-        }
-        e.write_i32(AUTHORIZED_OPS_UNKNOWN); // cluster_authorized_operations (v8+)
-        e.write_empty_tagged_fields();
-    } else {
-        e.write_i32(1); // brokers array length
-        e.write_i32(1); // node_id
-        // broker.host is bounded to i16::MAX at BrokerAdvertise::from_server_config, so the
-        // unchecked writer cannot exceed the length prefix - same guarantee the flexible path
-        // relies on for its compact string.
-        e.write_nullable_string_unchecked(Some(&broker.host));
-        e.write_i32(broker.port);
-        if response_version >= 1 {
-            e.write_nullable_string_unchecked(None); // rack
-        }
-
-        if response_version >= 2 {
-            e.write_nullable_string_unchecked(None); // cluster_id
-        }
-        if response_version >= 1 {
-            e.write_i32(1); // controller_id - must come before topics array
-        }
-
-        e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));
-        for name in topics {
-            e.write_i16(topic_error);
-            e.write_nullable_string_unchecked(Some(name));
-            if response_version >= 1 {
-                e.write_bool(false); // is_internal
-            }
-            e.write_i32(0); // partitions array (empty)
-            if response_version >= 8 {
-                e.write_i32(AUTHORIZED_OPS_UNKNOWN); // topic_authorized_operations
-            }
-        }
-        if response_version >= 8 {
-            e.write_i32(AUTHORIZED_OPS_UNKNOWN); // cluster_authorized_operations
-        }
-    }
-
-    e.freeze()
-}
-
-/// Decodes an `ApiVersions` request body.
-///
-/// v0–v2 have an empty body. v3+ requires `ClientSoftwareName`, `ClientSoftwareVersion`,
-/// and tagged fields (KIP-511 flexible encoding).
-fn decode_api_versions_request(api_version: i16, body: &Bytes) -> Result<()> {
-    if api_version < 3 {
-        if !body.is_empty() {
-            return Err(KafkaProtocolError::UnexpectedTrailingBytes);
-        }
-        return Ok(());
-    }
-    let mut d = Decoder::new(body.clone());
-    let _client_software_name = d.read_compact_string()?;
-    let _client_software_version = d.read_compact_string()?;
-    d.read_tagged_fields()?;
-    if d.remaining() != 0 {
-        return Err(KafkaProtocolError::UnexpectedTrailingBytes);
-    }
-    Ok(())
+    encode_message(&resp, response_version, 256)
 }
 
 /// Decodes a Metadata request body so the response can echo topic names.
 ///
-/// Every Metadata version requires at least the topics array count on the wire — an empty
-/// body is malformed, not "all topics". A null topics array (`-1` legacy / `varint=0`
-/// compact) means "all topics" and decodes to an empty list for this stub. Remaining
-/// version-gated fields (`AllowAutoTopicCreation`, authorized-ops flags, tagged fields)
-/// are consumed so truncated flexible bodies are rejected.
-pub(crate) fn decode_metadata_request(api_version: i16, body: Bytes) -> Result<Vec<String>> {
-    if body.is_empty() {
-        return Err(KafkaProtocolError::BufferUnderflow {
-            needed: 1,
-            remaining: 0,
-        });
-    }
-    let mut d = Decoder::new(body);
-    let flexible = api_version >= 9;
-    let topics_count = if flexible {
-        // Metadata topics is a nullable compact array ("all topics" when null).
-        d.read_compact_array_count_nullable()?
-    } else {
-        d.read_i32_array_count_nullable()?
-    };
-
-    let mut topics = Vec::with_capacity(topics_count.min(PREALLOC_HINT));
-    for _ in 0..topics_count {
-        if flexible && api_version >= 10 {
-            // MetadataRequestTopic.topic_id: 16-byte UUID before name (v10+).
-            let _topic_id = d.read_bytes(16)?;
-        }
-        let name = if flexible {
-            d.read_compact_nullable_string()?
-                .ok_or(KafkaProtocolError::NullTopicName)?
-        } else {
-            d.read_nullable_string()?
-                .ok_or(KafkaProtocolError::NullTopicName)?
-        };
-        topics.push(name);
-        if flexible {
-            d.read_tagged_fields()?;
-        }
-    }
-
-    // allow_auto_topic_creation (v4+)
-    if api_version >= 4 {
-        let _allow_auto_topic_creation = d.read_bool()?;
-    }
-    // include_cluster_authorized_operations (v8–v10; removed in v11)
-    if (8..=10).contains(&api_version) {
-        let _include_cluster_authorized_operations = d.read_bool()?;
-    }
-    // include_topic_authorized_operations (v8+)
-    if api_version >= 8 {
-        let _include_topic_authorized_operations = d.read_bool()?;
-    }
-    if flexible {
-        d.read_tagged_fields()?;
-    }
-    if d.remaining() != 0 {
-        return Err(KafkaProtocolError::UnexpectedTrailingBytes);
-    }
-
-    Ok(topics)
-}
-
-/// Compatibility alias used by existing unit tests.
-#[cfg(test)]
-pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> Result<Vec<String>> {
-    decode_metadata_request(api_version, body)
+/// A null topics array (`-1` legacy / `varint=0` compact) means "all topics" and decodes to an
+/// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
+/// name to echo, so it errors rather than silently dropping the topic from the response.
+fn decode_metadata_topics(api_version: i16, body: Bytes) -> Result<Vec<StrBytes>> {
+    let req = decode_exhaustive::<MetadataRequest>(api_version, body)?;
+    req.topics
+        .unwrap_or_default()
+        .into_iter()
+        .map(|topic| {
+            topic
+                .name
+                .map(|name| name.0)
+                .ok_or(KafkaProtocolError::NullTopicName)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::codec::Encoder;
 
     #[test]
-    fn decode_metadata_request_topics_legacy_null_topic_name_fails() {
+    fn decode_metadata_topics_legacy_null_topic_name_fails() {
         let body = Bytes::from_static(&[
             0x00, 0x00, 0x00, 0x01, // one topic
             0xff, 0xff, // null topic name
         ]);
-        let err = decode_metadata_request_topics(body, 0).unwrap_err();
+        let err = decode_metadata_topics(0, body).unwrap_err();
         assert!(matches!(err, KafkaProtocolError::NullTopicName));
     }
 
     #[test]
-    fn decode_metadata_request_topics_legacy_null_array_means_all_topics() {
+    fn decode_metadata_topics_legacy_null_array_means_all_topics() {
         // -1 is the spec-defined "all topics" sentinel for the legacy i32 array count, not a
-        // malformed request - must decode to an empty list, not InvalidArrayLength.
+        // malformed request - must decode to an empty list.
         let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
-        let topics = decode_metadata_request_topics(body, 0).unwrap();
+        let topics = decode_metadata_topics(0, body).unwrap();
         assert!(topics.is_empty());
     }
 
     #[test]
-    fn decode_metadata_request_topics_legacy_other_negative_counts_still_fail() {
-        // Only -1 is the null sentinel; any other negative count is genuinely malformed.
-        let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xfe]); // -2
-        let err = decode_metadata_request_topics(body, 0).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::InvalidArrayLength(-2)));
+    fn decode_metadata_topics_empty_body_is_malformed() {
+        assert!(decode_metadata_topics(0, Bytes::new()).is_err());
     }
 
     #[test]
-    fn decode_metadata_request_topics_flexible_v10_truncated_topic_id_fails() {
-        let mut enc = Encoder::with_capacity(8);
-        enc.write_varint(2); // one topic
-        enc.write_bytes(&[0u8; 8]); // truncated topic_id, should be 16 bytes
-        let err = decode_metadata_request_topics(enc.freeze(), 10).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
-    }
-
-    #[test]
-    fn decode_metadata_request_topics_flexible_invalid_utf8_fails() {
-        let mut enc = Encoder::with_capacity(16);
-        enc.write_varint(2); // one topic
-        enc.write_varint(2); // string len = 1
-        enc.write_u8(0xff); // invalid utf-8
-        enc.write_empty_tagged_fields(); // per-topic tagged
-        enc.write_bool(true); // allow_auto_topic_creation
-        enc.write_bool(false); // include_cluster_authorized_operations
-        enc.write_bool(false); // include_topic_authorized_operations
-        enc.write_empty_tagged_fields(); // top-level tagged
-        let err = decode_metadata_request_topics(enc.freeze(), 9).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::InvalidUtf8));
-    }
-
-    #[test]
-    fn decode_metadata_request_empty_body_is_malformed() {
-        let err = decode_metadata_request(0, Bytes::new()).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
-    }
-
-    #[test]
-    fn decode_metadata_request_flexible_truncated_after_topics_fails() {
+    fn decode_metadata_topics_flexible_truncated_after_topics_fails() {
         // topics = null (all topics) but missing allow_auto / auth flags / tagged fields.
         let body = Bytes::from_static(&[0x00]);
-        let err = decode_metadata_request(9, body).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+        assert!(decode_metadata_topics(9, body).is_err());
     }
 
     #[test]
     fn decode_api_versions_v3_requires_software_fields() {
-        let err = decode_api_versions_request(3, &Bytes::new()).unwrap_err();
-        assert!(matches!(
-            err,
-            KafkaProtocolError::BufferUnderflow { .. } | KafkaProtocolError::NullCompactString
-        ));
+        assert!(decode_exhaustive::<ApiVersionsRequest>(3, Bytes::new()).is_err());
     }
 
     #[test]
     fn decode_api_versions_v3_accepts_valid_body() {
-        let mut enc = Encoder::with_capacity(32);
-        enc.write_compact_nullable_string(Some("iggy-test"));
-        enc.write_compact_nullable_string(Some("0.1.0"));
-        enc.write_empty_tagged_fields();
-        decode_api_versions_request(3, &enc.freeze()).unwrap();
+        // Hand-encoded rather than round-tripped through `ApiVersionsRequest::encode`: encoding
+        // is gated behind the crate's "client" feature, which this broker-only binary doesn't
+        // enable.
+        let body = Bytes::from_static(&[
+            0x0a, b'i', b'g', b'g', b'y', b'-', b't', b'e', b's',
+            b't', // compact string (len 9)
+            0x06, b'0', b'.', b'1', b'.', b'0', // compact string (len 5)
+            0x00, // empty tagged fields
+        ]);
+        decode_exhaustive::<ApiVersionsRequest>(3, body).unwrap();
     }
 }

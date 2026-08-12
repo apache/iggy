@@ -204,30 +204,6 @@ fn gateway_verify_registry() -> Vec<(i16, &'static str, i16, i16)> {
 //   header v2: [client_id: COMPACT_NULLABLE_STRING] [request_header_tagged_fields]
 //   [payload: bytes]
 
-fn write_unsigned_varint(buf: &mut BytesMut, mut value: u64) {
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        buf.put_u8(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
-fn write_compact_nullable_string(buf: &mut BytesMut, value: Option<&str>) {
-    match value {
-        None => write_unsigned_varint(buf, 0),
-        Some(s) => {
-            write_unsigned_varint(buf, (s.len() + 1) as u64);
-            buf.put_slice(s.as_bytes());
-        }
-    }
-}
-
 fn frame_request(
     api_key: i16,
     api_version: i16,
@@ -240,12 +216,13 @@ fn frame_request(
     header.put_i16(api_key);
     header.put_i16(api_version);
     header.put_i32(correlation_id);
+    // client_id is the legacy NULLABLE_STRING at every header version, even the "flexible" v2 -
+    // only the trailing tagged-fields section is new there. Kafka's RequestHeader schema never
+    // made client_id itself a compact string.
+    header.put_i16(i16::try_from(client_id.len()).expect("client_id fits i16"));
+    header.put_slice(client_id.as_bytes());
     if flexible {
-        write_compact_nullable_string(&mut header, Some(client_id));
         header.put_u8(0); // empty request-header tagged fields
-    } else {
-        header.put_i16(i16::try_from(client_id.len()).expect("client_id fits i16"));
-        header.put_slice(client_id.as_bytes());
     }
 
     let blen = header.len() + payload.len();

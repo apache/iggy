@@ -16,314 +16,253 @@
 // under the License.
 
 //! Kafka response encoders (stub implementations).
+//!
+//! Wire encoding (field order, version gating, compact vs. legacy shapes) is
+//! `kafka_protocol`'s responsibility; everything here is stub *policy* - which placeholder
+//! values and error codes a request gets back before the Iggy bridge lands.
 
-#![allow(clippy::doc_markdown)]
+use bytes::{Bytes, BytesMut};
+use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
+use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+use kafka_protocol::messages::list_offsets_response::{
+    ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+};
+use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
+use kafka_protocol::messages::{
+    CreateTopicsRequest, CreateTopicsResponse, FetchRequest, FetchResponse, ListOffsetsRequest,
+    ListOffsetsResponse, ProduceRequest, ProduceResponse,
+};
+use kafka_protocol::protocol::Encodable;
 
+use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE, ERROR_NOT_CONTROLLER,
     ERROR_NOT_LEADER_OR_FOLLOWER,
 };
-use crate::protocol::codec::Encoder;
-use crate::protocol::requests::{
-    CreatableTopic, CreateTopicsRequest, FetchPartition, FetchRequest, FetchTopic,
-    ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic, ProducePartitionData,
-    ProduceRequest, ProduceTopicData,
-};
-use bytes::Bytes;
+
+/// Encode a `kafka_protocol` message, mapping its `anyhow::Error` (the crate has no stable
+/// decode/encode error taxonomy) to a variant callers can log or fold into [`HandleOutcome::Close`].
+///
+/// [`HandleOutcome::Close`]: crate::protocol::api::HandleOutcome::Close
+pub(crate) fn encode_message<T: Encodable>(
+    msg: &T,
+    version: i16,
+    capacity: usize,
+) -> Result<Bytes> {
+    let mut buf = BytesMut::with_capacity(capacity);
+    msg.encode(&mut buf, version)
+        .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
+    Ok(buf.freeze())
+}
+
+// ── Produce ──────────────────────────────────────────────────────────────────
 
 /// Well-formed Produce response with a single placeholder topic/partition.
-#[must_use]
-pub fn encode_produce_error_response(version: i16, error_code: i16) -> Bytes {
-    let topics = vec![ProduceTopicData {
-        topic: String::new(), // TODO topic name will be populated in the end to end functional completion
-        partitions: vec![ProducePartitionData {
-            partition: 0,
-            records: None,
-        }],
-    }];
-    encode_produce_response_inner(version, &topics, error_code)
-}
-#[must_use]
-pub fn encode_produce_response(version: i16, req: &ProduceRequest) -> Bytes {
-    // Stub: discard payload and return a retriable error so clients keep data locally
-    // until the Iggy bridge lands (do not advertise silent success).
-    encode_produce_response_inner(version, &req.topics, ERROR_NOT_LEADER_OR_FOLLOWER)
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_produce_error_response(version: i16, error_code: i16) -> Result<Bytes> {
+    let resp = ProduceResponse::default().with_responses(vec![
+        TopicProduceResponse::default()
+            .with_partition_responses(vec![produce_partition_response(0, error_code)]),
+    ]);
+    encode_message(&resp, version, 512)
 }
 
-fn encode_produce_response_inner(
-    version: i16,
-    topics: &[ProduceTopicData],
-    partition_error: i16,
-) -> Bytes {
-    let flexible = version >= 9;
-    let mut e = Encoder::with_capacity(512);
-
-    if flexible {
-        e.write_varint((topics.len() + 1) as u64);
-    } else {
-        e.write_i32(i32::try_from(topics.len()).expect("topic count bounded"));
-    }
-
-    for topic in topics {
-        if flexible {
-            e.write_compact_nullable_string(Some(&topic.topic));
-        } else {
-            e.write_nullable_string_unchecked(Some(&topic.topic));
-        }
-
-        if flexible {
-            e.write_varint((topic.partitions.len() + 1) as u64);
-        } else {
-            e.write_i32(i32::try_from(topic.partitions.len()).expect("partition count bounded"));
-        }
-
-        for p in &topic.partitions {
-            e.write_i32(p.partition);
-            e.write_i16(partition_error);
-            e.write_i64(0);
-            if version >= 2 {
-                e.write_i64(-1);
-            }
-            if version >= 5 {
-                e.write_i64(0);
-            }
-            if version >= 8 {
-                if flexible {
-                    e.write_varint(1);
-                    e.write_compact_nullable_string(None);
-                } else {
-                    e.write_i32(0);
-                    e.write_nullable_string_unchecked(None);
-                }
-            }
-            if flexible {
-                e.write_empty_tagged_fields();
-            }
-        }
-
-        if flexible {
-            e.write_empty_tagged_fields();
-        }
-    }
-
-    if version >= 1 {
-        e.write_i32(0);
-    }
-    if flexible {
-        e.write_empty_tagged_fields();
-    }
-
-    e.freeze()
+/// Stub: discard the payload and return a retriable error so clients keep data locally until
+/// the Iggy bridge lands (do not advertise silent success).
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_produce_response(version: i16, req: &ProduceRequest) -> Result<Bytes> {
+    let responses = req
+        .topic_data
+        .iter()
+        .map(|topic| {
+            TopicProduceResponse::default()
+                .with_name(topic.name.clone())
+                .with_partition_responses(
+                    topic
+                        .partition_data
+                        .iter()
+                        .map(|p| produce_partition_response(p.index, ERROR_NOT_LEADER_OR_FOLLOWER))
+                        .collect(),
+                )
+        })
+        .collect();
+    let resp = ProduceResponse::default().with_responses(responses);
+    encode_message(&resp, version, 512)
 }
+
+fn produce_partition_response(index: i32, error_code: i16) -> PartitionProduceResponse {
+    PartitionProduceResponse::default()
+        .with_index(index)
+        .with_error_code(error_code)
+        .with_log_start_offset(0)
+}
+
+// ── Fetch ────────────────────────────────────────────────────────────────────
 
 /// Well-formed Fetch response. Uses top-level `error_code` at v7+, or a single
 /// placeholder topic/partition with per-partition `error_code` below v7.
-#[must_use]
-pub fn encode_fetch_error_response(version: i16, error_code: i16) -> Bytes {
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_fetch_error_response(version: i16, error_code: i16) -> Result<Bytes> {
     if version >= 7 {
-        return encode_fetch_response_inner(version, &[], Some(error_code), error_code);
+        return encode_fetch_response_inner(version, Vec::new(), error_code);
     }
-
-    let topics = vec![FetchTopic {
-        topic: String::new(),
-        partitions: vec![FetchPartition {
-            partition: 0,
-            fetch_offset: 0,
-            partition_max_bytes: 1,
-        }],
-    }];
-    encode_fetch_response_inner(version, &topics, Some(ERROR_NONE), error_code)
+    // No top-level error field below v7; the error surfaces on the placeholder partition instead.
+    let topics = vec![
+        FetchableTopicResponse::default()
+            .with_partitions(vec![fetch_partition_response(0, error_code)]),
+    ];
+    encode_fetch_response_inner(version, topics, ERROR_NONE)
 }
-#[must_use]
-pub fn encode_fetch_response(version: i16, req: &FetchRequest) -> Bytes {
-    // Stub: discard payload and return a retriable error so clients don't mistake
-    // "no real data yet" for a genuinely empty partition (same philosophy as Produce).
-    encode_fetch_response_inner(
-        version,
-        &req.topics,
-        Some(ERROR_NONE),
-        ERROR_NOT_LEADER_OR_FOLLOWER,
-    )
+
+/// Stub: discard the payload and return a retriable error so clients don't mistake "no real
+/// data yet" for a genuinely empty partition (same philosophy as Produce).
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_fetch_response(version: i16, req: &FetchRequest) -> Result<Bytes> {
+    let topics = req
+        .topics
+        .iter()
+        .map(|topic| {
+            FetchableTopicResponse::default()
+                .with_topic(topic.topic.clone())
+                .with_partitions(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|p| {
+                            fetch_partition_response(p.partition, ERROR_NOT_LEADER_OR_FOLLOWER)
+                        })
+                        .collect(),
+                )
+        })
+        .collect();
+    encode_fetch_response_inner(version, topics, ERROR_NONE)
 }
 
 fn encode_fetch_response_inner(
     version: i16,
-    topics: &[crate::protocol::requests::FetchTopic],
-    top_level_error: Option<i16>,
-    partition_error: i16,
-) -> Bytes {
-    let flexible = version >= 12;
-    let mut e = Encoder::with_capacity(512);
-
-    if version >= 1 {
-        e.write_i32(0);
-    }
-    if version >= 7 {
-        e.write_i16(top_level_error.unwrap_or(ERROR_NONE));
-        e.write_i32(0);
-    }
-
-    if flexible {
-        e.write_varint((topics.len() + 1) as u64);
-    } else {
-        e.write_i32(i32::try_from(topics.len()).expect("topic count bounded"));
-    }
-
-    for topic in topics {
-        if flexible {
-            e.write_compact_nullable_string(Some(&topic.topic));
-        } else {
-            e.write_nullable_string_unchecked(Some(&topic.topic));
-        }
-
-        if flexible {
-            e.write_varint((topic.partitions.len() + 1) as u64);
-        } else {
-            e.write_i32(i32::try_from(topic.partitions.len()).expect("partition count bounded"));
-        }
-
-        for partition in &topic.partitions {
-            e.write_i32(partition.partition);
-            e.write_i16(partition_error);
-            e.write_i64(0); // high_watermark
-            if version >= 4 {
-                e.write_i64(0); // last_stable_offset
-            }
-            if version >= 5 {
-                e.write_i64(0); // log_start_offset
-            }
-            if version >= 4 {
-                if flexible {
-                    e.write_varint(1); // empty aborted_transactions
-                } else {
-                    e.write_i32(0); // empty aborted_transactions
-                }
-            }
-            if version >= 11 {
-                e.write_i32(-1); // preferred_read_replica
-            }
-            if flexible {
-                e.write_compact_nullable_bytes(None);
-            } else {
-                e.write_null_bytes();
-            }
-            if flexible {
-                e.write_empty_tagged_fields();
-            }
-        }
-
-        if flexible {
-            e.write_empty_tagged_fields();
-        }
-    }
-
-    if flexible {
-        e.write_empty_tagged_fields();
-    }
-
-    e.freeze()
+    topics: Vec<FetchableTopicResponse>,
+    top_level_error: i16,
+) -> Result<Bytes> {
+    let resp = FetchResponse::default()
+        .with_error_code(top_level_error)
+        .with_responses(topics);
+    encode_message(&resp, version, 512)
 }
 
-/// Well-formed ListOffsets response with a single placeholder topic/partition.
-#[must_use]
-pub fn encode_list_offsets_error_response(version: i16, error_code: i16) -> Bytes {
-    let topics = vec![ListOffsetsTopic {
-        topic: String::new(),
-        partitions: vec![ListOffsetsPartition {
-            partition: 0,
-            timestamp: -1,
-        }],
-    }];
-    encode_list_offsets_response_inner(version, &topics, error_code)
+fn fetch_partition_response(partition: i32, error_code: i16) -> PartitionData {
+    PartitionData::default()
+        .with_partition_index(partition)
+        .with_error_code(error_code)
+        .with_last_stable_offset(0)
+        .with_log_start_offset(0)
+        .with_records(None)
 }
-#[must_use]
-pub fn encode_list_offsets_response(version: i16, req: &ListOffsetsRequest) -> Bytes {
-    // Stub: discard payload and return a retriable error, matching Produce/Fetch - a genuine
-    // offset lookup requires the same partition-leadership the stub doesn't have yet.
-    encode_list_offsets_response_inner(version, &req.topics, ERROR_NOT_LEADER_OR_FOLLOWER)
+
+// ── ListOffsets ──────────────────────────────────────────────────────────────
+
+/// Well-formed `ListOffsets` response with a single placeholder topic/partition.
+///
+/// `kafka_protocol` has no encodable representation for `ListOffsets` v0 (the legacy
+/// `old_style_offsets` shape predates the schema this crate generates from); a v0 request now
+/// falls through [`super::api::unsupported_version_response`]'s encode-failure path to `Close`
+/// instead of the pre-migration downgraded response.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version` (always the
+/// case for `version == 0`).
+pub fn encode_list_offsets_error_response(version: i16, error_code: i16) -> Result<Bytes> {
+    let topics = vec![
+        ListOffsetsTopicResponse::default()
+            .with_partitions(vec![list_offsets_partition_response(0, error_code)]),
+    ];
+    encode_list_offsets_response_inner(version, topics)
+}
+
+/// Stub: discard the payload and return a retriable error, matching Produce/Fetch - a genuine
+/// offset lookup requires the same partition-leadership the stub doesn't have yet.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_list_offsets_response(version: i16, req: &ListOffsetsRequest) -> Result<Bytes> {
+    let topics = req
+        .topics
+        .iter()
+        .map(|topic| {
+            ListOffsetsTopicResponse::default()
+                .with_name(topic.name.clone())
+                .with_partitions(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|p| {
+                            list_offsets_partition_response(
+                                p.partition_index,
+                                ERROR_NOT_LEADER_OR_FOLLOWER,
+                            )
+                        })
+                        .collect(),
+                )
+        })
+        .collect();
+    encode_list_offsets_response_inner(version, topics)
 }
 
 fn encode_list_offsets_response_inner(
     version: i16,
-    topics: &[crate::protocol::requests::ListOffsetsTopic],
-    partition_error: i16,
-) -> Bytes {
-    let flexible = version >= 6;
-    let mut e = Encoder::with_capacity(256);
-
-    if version >= 2 {
-        e.write_i32(0);
-    }
-
-    if flexible {
-        e.write_varint((topics.len() + 1) as u64);
-    } else {
-        e.write_i32(i32::try_from(topics.len()).expect("topic count bounded"));
-    }
-
-    for topic in topics {
-        if flexible {
-            e.write_compact_nullable_string(Some(&topic.topic));
-        } else {
-            e.write_nullable_string_unchecked(Some(&topic.topic));
-        }
-
-        if flexible {
-            e.write_varint((topic.partitions.len() + 1) as u64);
-        } else {
-            e.write_i32(i32::try_from(topic.partitions.len()).expect("partition count bounded"));
-        }
-
-        for partition in &topic.partitions {
-            e.write_i32(partition.partition);
-            e.write_i16(partition_error);
-
-            if version == 0 {
-                // v0 has no `timestamp`/`offset` fields; it returns the legacy
-                // `old_style_offsets` ARRAY (i32 count + i64 entries) instead.
-                // Empty since this stub never resolves a real offset.
-                e.write_i32(0);
-            } else {
-                e.write_i64(-1); // timestamp: -1 = not available (Kafka sentinel)
-                e.write_i64(0); // offset
-                if version >= 4 {
-                    e.write_i32(-1); // leader_epoch
-                }
-            }
-            if flexible {
-                e.write_empty_tagged_fields();
-            }
-        }
-
-        if flexible {
-            e.write_empty_tagged_fields();
-        }
-    }
-
-    if flexible {
-        e.write_empty_tagged_fields();
-    }
-
-    e.freeze()
+    topics: Vec<ListOffsetsTopicResponse>,
+) -> Result<Bytes> {
+    let resp = ListOffsetsResponse::default().with_topics(topics);
+    encode_message(&resp, version, 256)
 }
 
-/// Well-formed CreateTopics response with a single placeholder topic.
-#[must_use]
-pub fn encode_create_topics_error_response(version: i16, error_code: i16) -> Bytes {
-    let topics = vec![CreatableTopic {
-        name: String::new(),
-        num_partitions: 1,
-        replication_factor: 1,
-        has_assignments: false,
-    }];
+fn list_offsets_partition_response(
+    partition: i32,
+    error_code: i16,
+) -> ListOffsetsPartitionResponse {
+    ListOffsetsPartitionResponse::default()
+        .with_partition_index(partition)
+        .with_error_code(error_code)
+}
+
+// ── CreateTopics ─────────────────────────────────────────────────────────────
+
+/// Well-formed `CreateTopics` response with a single placeholder topic.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_create_topics_error_response(version: i16, error_code: i16) -> Result<Bytes> {
+    let topics = vec![
+        CreatableTopic::default()
+            .with_num_partitions(1)
+            .with_replication_factor(1),
+    ];
     encode_create_topics_response_inner(version, &topics, error_code)
 }
-#[must_use]
-pub fn encode_create_topics_response(version: i16, req: &CreateTopicsRequest) -> Bytes {
+
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_create_topics_response(version: i16, req: &CreateTopicsRequest) -> Result<Bytes> {
     encode_create_topics_response_inner(version, &req.topics, ERROR_NONE)
 }
 
-/// Resolve per-topic CreateTopics error.
+/// Resolve per-topic `CreateTopics` error.
 ///
 /// KIP-464: `num_partitions = -1` / `replication_factor = -1` mean broker default when either
 /// (a) the version is v4+, or (b) the topic carries a manual partition assignment (valid on
@@ -335,7 +274,7 @@ const fn create_topics_topic_error(version: i16, topic: &CreatableTopic, forced_
         return forced_error;
     }
 
-    let broker_default_ok = version >= 4 || topic.has_assignments;
+    let broker_default_ok = version >= 4 || !topic.assignments.is_empty();
 
     let partitions_ok = if broker_default_ok {
         topic.num_partitions == -1 || topic.num_partitions > 0
@@ -362,52 +301,18 @@ fn encode_create_topics_response_inner(
     version: i16,
     topics: &[CreatableTopic],
     topic_error: i16,
-) -> Bytes {
-    let flexible = version >= 5;
-    let mut e = Encoder::with_capacity(256);
-
-    if version >= 2 {
-        e.write_i32(0);
-    }
-
-    if flexible {
-        e.write_varint((topics.len() + 1) as u64);
-    } else {
-        e.write_i32(i32::try_from(topics.len()).expect("topic count bounded"));
-    }
-
-    for topic in topics {
-        if flexible {
-            e.write_compact_nullable_string(Some(&topic.name));
-        } else {
-            e.write_nullable_string_unchecked(Some(&topic.name));
-        }
-
-        let error_code = create_topics_topic_error(version, topic, topic_error);
-        e.write_i16(error_code);
-
-        if version >= 1 {
-            if flexible {
-                e.write_compact_nullable_string(None);
-            } else {
-                e.write_nullable_string_unchecked(None);
-            }
-        }
-
-        if version >= 5 {
-            e.write_i32(topic.num_partitions);
-            e.write_i16(topic.replication_factor);
-            e.write_varint(1);
-        }
-
-        if flexible {
-            e.write_empty_tagged_fields();
-        }
-    }
-
-    if flexible {
-        e.write_empty_tagged_fields();
-    }
-
-    e.freeze()
+) -> Result<Bytes> {
+    let results = topics
+        .iter()
+        .map(|topic| {
+            CreatableTopicResult::default()
+                .with_name(topic.name.clone())
+                .with_error_code(create_topics_topic_error(version, topic, topic_error))
+                .with_error_message(None)
+                .with_num_partitions(topic.num_partitions)
+                .with_replication_factor(topic.replication_factor)
+        })
+        .collect();
+    let resp = CreateTopicsResponse::default().with_topics(results);
+    encode_message(&resp, version, 256)
 }

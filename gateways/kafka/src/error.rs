@@ -30,30 +30,14 @@ pub enum KafkaProtocolError {
         max_bytes: usize,
         actual_bytes: usize,
     },
-    #[error("invalid utf8 string")]
-    InvalidUtf8,
-    #[error("varint overflows 64 bits")]
-    InvalidVarint,
-    #[error("unsupported request header version: {0}")]
-    UnsupportedHeaderVersion(i16),
-    #[error("invalid array length: {0}")]
-    InvalidArrayLength(i32),
-    #[error("collection length {count} exceeds maximum {max}")]
-    CollectionTooLarge { count: usize, max: usize },
-    #[error("request element budget exceeded: {count} more requested, {remaining} remaining")]
-    RequestElementBudgetExceeded { count: usize, remaining: usize },
-    #[error("string length {length} exceeds i16::MAX")]
-    StringTooLong { length: usize },
+    /// Metadata's per-topic `name` is nullable on the wire (v10+ allows topic-id-only lookups),
+    /// but this stub only echoes names back, so a null name has no response to build.
     #[error("null topic name in request")]
     NullTopicName,
-    /// Compact-array prefix `0` is Kafka's null encoding; invalid for non-nullable arrays.
-    #[error("null compact array where a non-null array is required")]
-    NullCompactArray,
-    /// Compact-string prefix `0` is null; invalid where a non-null string is required.
-    #[error("null compact string where a non-null string is required")]
-    NullCompactString,
-    #[error("unexpected bytes remaining in request body")]
-    UnexpectedTrailingBytes,
+    /// Wraps a `kafka_protocol` decode/encode failure (`anyhow::Error`, no stable variant
+    /// taxonomy on the wire-format crate's side).
+    #[error("malformed request: {0}")]
+    Malformed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

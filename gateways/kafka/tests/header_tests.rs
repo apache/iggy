@@ -15,111 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! `request_header_version` / `response_header_version` are thin wrappers around
+//! `kafka_protocol::messages::ApiKey` (see `src/protocol/header.rs`); decoding/encoding the
+//! header bytes themselves is `kafka_protocol::messages::RequestHeader`/`ResponseHeader`'s own
+//! tested responsibility, not re-tested here. These tests cover the gateway-specific policy
+//! layered on top: the unknown-API-key fallback and the `ApiVersions` response-header special case.
+
 use kafka_protocol::messages::ApiKey;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_PRODUCE,
 };
-use iggy_gateway_kafka::protocol::codec::Encoder;
-use iggy_gateway_kafka::protocol::header::{
-    RequestHeader, ResponseHeader, request_header_version, response_header_version,
-};
-
-// ── Request header v1 (non-flexible) ───────────────────────────────────────
-
-#[test]
-fn request_header_v1_decodes() {
-    let mut enc = Encoder::with_capacity(64);
-    enc.write_i16(18); // api_key: ApiVersions
-    enc.write_i16(2); // api_version
-    enc.write_i32(101);
-    enc.write_nullable_string(Some("kafka-cli")).unwrap();
-    let bytes = enc.freeze();
-
-    let header = RequestHeader::decode(bytes, 1).expect("decode should succeed");
-    assert_eq!(header.api_key, 18);
-    assert_eq!(header.api_version, 2);
-    assert_eq!(header.correlation_id, 101);
-    assert_eq!(header.client_id.as_deref(), Some("kafka-cli"));
-}
-
-#[test]
-fn request_header_v1_null_client_id() {
-    let mut enc = Encoder::with_capacity(32);
-    enc.write_i16(18);
-    enc.write_i16(1);
-    enc.write_i32(5);
-    enc.write_nullable_string(None).unwrap();
-    let bytes = enc.freeze();
-
-    let header = RequestHeader::decode(bytes, 1).unwrap();
-    assert_eq!(header.client_id, None);
-}
-
-// ── Request header v2 (flexible - compact client_id + tagged fields) ───────
-
-#[test]
-fn request_header_v2_decodes() {
-    let mut enc = Encoder::with_capacity(64);
-    enc.write_i16(18); // api_key: ApiVersions
-    enc.write_i16(3); // api_version (flexible threshold for ApiVersions is 3)
-    enc.write_i32(202);
-    enc.write_compact_nullable_string(Some("my-client"));
-    enc.write_empty_tagged_fields();
-    let bytes = enc.freeze();
-
-    let header = RequestHeader::decode(bytes, 2).expect("flexible decode should succeed");
-    assert_eq!(header.api_key, 18);
-    assert_eq!(header.api_version, 3);
-    assert_eq!(header.correlation_id, 202);
-    assert_eq!(header.client_id.as_deref(), Some("my-client"));
-}
-
-#[test]
-fn request_header_v2_null_client_id() {
-    let mut enc = Encoder::with_capacity(32);
-    enc.write_i16(18);
-    enc.write_i16(3);
-    enc.write_i32(303);
-    enc.write_compact_nullable_string(None);
-    enc.write_empty_tagged_fields();
-    let bytes = enc.freeze();
-
-    let header = RequestHeader::decode(bytes, 2).unwrap();
-    assert_eq!(header.client_id, None);
-}
-
-// ── Response header encode ──────────────────────────────────────────────────
-
-#[test]
-fn response_header_v0_encodes_correlation_id_only() {
-    let header = ResponseHeader { correlation_id: 77 };
-    let bytes = header.encode(0);
-    assert_eq!(bytes.as_ref(), &[0, 0, 0, 77]);
-}
-
-#[test]
-fn response_header_v1_encodes_correlation_id_plus_tagged_fields() {
-    let header = ResponseHeader { correlation_id: 1 };
-    let bytes = header.encode(1);
-    // [0,0,0,1] correlation_id + [0x00] empty tagged fields
-    assert_eq!(bytes.as_ref(), &[0, 0, 0, 1, 0x00]);
-}
-
-// ── Header version lookup ───────────────────────────────────────────────────
+use iggy_gateway_kafka::protocol::header::{request_header_version, response_header_version};
 
 /// Flexible-encoding threshold per API key (mirrors `protocol/header.rs`; cross-checked against
 /// the independent `kafka-protocol` crate below rather than trusted on its own).
+///
+/// Keys 4-7 (LeaderAndIsr/StopReplica/UpdateMetadata/ControlledShutdown) are inter-broker-only
+/// APIs `kafka_protocol` 0.17 does not implement (`ApiKey::try_from` fails for them), so this
+/// gateway's wrapper always falls back to header v1 for them - `i16::MAX`, not their legacy
+/// threshold from the pre-migration hand-rolled table.
 const API_KEY_FLEXIBLE_FROM: &[(i16, i16)] = &[
     (0, 9),
     (1, 12),
     (2, 6),
     (3, 9),
-    (4, 4),
-    (5, 2),
-    (6, 6),
-    (7, 3),
+    (4, i16::MAX),
+    (5, i16::MAX),
+    (6, i16::MAX),
+    (7, i16::MAX),
     (8, 8),
     (9, 6),
     (10, 3),
@@ -139,7 +64,10 @@ const API_KEY_FLEXIBLE_FROM: &[(i16, i16)] = &[
     (24, 3),
     (25, 3),
     (26, 3),
-    (27, 1),
+    // WriteTxnMarkers' only valid versions are 1-2 (no v0 on the real wire) and both are
+    // flexible; `kafka_protocol` encodes this as an unconditional header v2, matching the `0`
+    // ("always flexible") arm below rather than a real threshold.
+    (27, 0),
     (28, 3),
     (29, 2),
     (30, 2),
@@ -222,8 +150,16 @@ fn request_header_version_hits_every_api_key_match_arm() {
                 assert_eq!(request_header_version(api_key, i16::MAX - 1), 1);
             }
             threshold => {
-                assert_eq!(request_header_version(api_key, threshold - 1), 1);
-                assert_eq!(request_header_version(api_key, threshold), 2);
+                assert_eq!(
+                    request_header_version(api_key, threshold - 1),
+                    1,
+                    "api_key={api_key} threshold={threshold}"
+                );
+                assert_eq!(
+                    request_header_version(api_key, threshold),
+                    2,
+                    "api_key={api_key} threshold={threshold}"
+                );
             }
         }
     }
@@ -325,54 +261,6 @@ fn request_header_version_always_flexible_keys_use_v2() {
 fn request_header_version_unknown_api_defaults_to_v1() {
     assert_eq!(request_header_version(999, 0), 1);
     assert_eq!(request_header_version(-1, 12), 1);
-}
-
-#[test]
-fn request_header_decode_rejects_unsupported_version() {
-    let bytes = Encoder::with_capacity(0).freeze();
-    let err = RequestHeader::decode(bytes, 99).unwrap_err();
-    assert!(matches!(
-        err,
-        iggy_gateway_kafka::error::KafkaProtocolError::UnsupportedHeaderVersion(99)
-    ));
-}
-
-#[test]
-fn request_header_v1_truncated_payload_fails() {
-    let mut enc = Encoder::with_capacity(8);
-    enc.write_i16(18);
-    enc.write_i16(1);
-    let err = RequestHeader::decode(enc.freeze(), 1).unwrap_err();
-    assert!(err.to_string().contains("buffer underflow"));
-}
-
-#[test]
-fn request_header_v2_truncated_before_tagged_fields_fails() {
-    let mut enc = Encoder::with_capacity(16);
-    enc.write_i16(18);
-    enc.write_i16(3);
-    enc.write_i32(303);
-    enc.write_compact_nullable_string(Some("c"));
-    let err = RequestHeader::decode(enc.freeze(), 2).unwrap_err();
-    assert!(err.to_string().contains("buffer underflow"));
-}
-
-#[test]
-fn response_header_encode_into_matches_encode() {
-    let header = ResponseHeader {
-        correlation_id: 1234,
-    };
-    let encoded = header.encode(1);
-    let mut buf = bytes::BytesMut::new();
-    header.encode_into(&mut buf, 1);
-    assert_eq!(buf.freeze(), encoded);
-}
-
-#[test]
-fn response_header_encoded_size_matches_versions() {
-    assert_eq!(ResponseHeader::encoded_size(0), 4);
-    assert_eq!(ResponseHeader::encoded_size(1), 5);
-    assert_eq!(ResponseHeader::encoded_size(2), 5);
 }
 
 // ── Flexible-encoding boundaries (SCOPE.md) ─────────────────────────────────
