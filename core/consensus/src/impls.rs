@@ -265,10 +265,20 @@ impl PipelineEntry {
 #[derive(Debug)]
 pub struct RequestEntry {
     pub message: Message<RoutedRequestHeader>,
-    // TODO: populate from monotonic clock at push, promote to `pub` for
-    // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
-    #[allow(dead_code)]
-    pub(crate) received_at: u64,
+    /// When the request was parked, in microseconds from the consensus-injected
+    /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
+    /// [`VsrConsensus::push_queued_request`] stamps it, which is the only path
+    /// that parks an entry in production.
+    ///
+    /// Read against `clock_realtime_micros` at promotion for the queue wait:
+    /// what age-based shedding would filter on, and the queueing half of
+    /// end-to-end commit latency.
+    ///
+    /// Deliberately the plain clock read rather than
+    /// [`VsrConsensus::next_monotonic_timestamp`]: this must not consume the
+    /// prepare-stamping monotonic sequence, or parking a request would perturb
+    /// the timestamps replicated to every backup.
+    pub received_at: u64,
     /// In-process reply subscriber, carried through the queue so promotion
     /// can hand it to the pipeline entry (see [`PipelineEntry::with_sender`]).
     /// `None` = network path. Dropping a queued entry (view-change reset,
@@ -307,6 +317,22 @@ impl RequestEntry {
     /// Take the reply sender for hand-off to the promoted pipeline entry.
     pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
         self.reply_sender.take()
+    }
+}
+
+impl<B, P> VsrConsensus<B, P>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry, Request = RequestEntry>,
+{
+    /// Park a request that could not take a prepare slot, stamping its arrival
+    /// time so the promotion side can measure how long it waited.
+    ///
+    /// # Errors
+    /// The entry itself, when the request queue is at its depth bound.
+    pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
+        entry.received_at = self.clock_realtime_micros();
+        self.pipeline.borrow_mut().push_request(entry)
     }
 }
 
@@ -1532,15 +1558,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow()
             .entry_by_op_and_checksum(op, checksum)
             .is_some()
-    }
-
-    /// Park a request that could not take a prepare slot. `Err` hands it back
-    /// when the request queue is also full.
-    ///
-    /// # Errors
-    /// The entry itself, when the request queue is at its depth bound.
-    pub fn push_queued_request(&self, entry: P::Request) -> Result<(), P::Request> {
-        self.pipeline.borrow_mut().push_request(entry)
     }
 
     /// Promote the oldest parked request, if any.
@@ -4687,6 +4704,36 @@ mod vsr_consensus_tests {
     }
 
     use crate::drain_committable_prefix;
+    use iggy_binary_protocol::Operation;
+
+    /// Clock frozen at a fixed instant, so a stamp read off it is assertable.
+    struct FrozenClock(u64);
+
+    impl clock::Clock for FrozenClock {
+        type Realtime = IggyTimestamp;
+
+        fn realtime(&self) -> Self::Realtime {
+            IggyTimestamp::from(self.0)
+        }
+    }
+
+    /// A client request as the admission path hands it to the request queue.
+    #[allow(clippy::cast_possible_truncation)]
+    fn client_request(client: u128) -> Message<RoutedRequestHeader> {
+        Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>()).transmute_header(
+            |_, new| {
+                *new = RoutedRequestHeader {
+                    command: Command2::Request,
+                    size: size_of::<RoutedRequestHeader>() as u32,
+                    client,
+                    session: 1,
+                    request: 1,
+                    operation: Operation::CreateStream,
+                    ..Default::default()
+                };
+            },
+        )
+    }
 
     /// Whether the prepare retransmit timer is armed.
     fn prepare_ticking(consensus: &VsrConsensus<StageNoopBus>) -> bool {
@@ -4727,6 +4774,40 @@ mod vsr_consensus_tests {
         assert!(
             !prepare_ticking(&consensus),
             "draining the last prepare disarms the timer without waiting for it to fire"
+        );
+    }
+
+    #[test]
+    fn parking_a_request_stamps_its_arrival_from_the_injected_clock() {
+        // The queue wait is `clock_realtime_micros() - received_at` at promotion,
+        // so the stamp has to come from the same injected clock (virtual under
+        // the simulator) and must not consume the prepare-stamping monotonic
+        // sequence.
+        const NOW: u64 = 4_242;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            0,
+            StageNoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::new(Rc::new(FrozenClock(NOW))),
+        );
+        consensus.init();
+        let before = consensus.next_monotonic_timestamp();
+
+        consensus
+            .push_queued_request(RequestEntry::new(client_request(1)))
+            .expect("empty request queue accepts one");
+
+        let entry = consensus
+            .pop_queued_request()
+            .expect("the just-parked request");
+        assert_eq!(entry.received_at, NOW, "stamped from the injected clock");
+        assert_eq!(
+            consensus.next_monotonic_timestamp(),
+            before + 1,
+            "parking must not consume the prepare-stamping monotonic sequence"
         );
     }
 
