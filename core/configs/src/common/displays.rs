@@ -200,8 +200,8 @@ impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ size_bytes: {}, cache_indexes: {}, archive_expired: {} }}",
-            self.size, self.cache_indexes, self.archive_expired,
+            "{{ size_bytes: {}, preallocate: {}, cache_indexes: {}, archive_expired: {} }}",
+            self.size, self.preallocate, self.cache_indexes, self.archive_expired,
         )
     }
 }

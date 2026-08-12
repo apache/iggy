@@ -1463,6 +1463,7 @@ mod tests {
                 enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: config.system.segment.size,
+                preallocate_segments: false,
                 encryptor: None,
             },
         );

@@ -350,6 +350,7 @@ impl Default for SegmentConfig {
     fn default() -> SegmentConfig {
         SegmentConfig {
             size: SERVER_CONFIG.system.segment.size.parse().unwrap(),
+            preallocate: SERVER_CONFIG.system.segment.preallocate,
             cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
         }

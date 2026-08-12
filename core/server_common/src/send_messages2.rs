@@ -548,8 +548,9 @@ pub fn convert_request_message(
     // fields and `decode_batch_slice` only lower-bounds the frame. A suffix past
     // `batch_length` is covered by no checksum, still rides the buffer to disk,
     // and desyncs the segment walk that advances by `batch_length`.
-    match decode_batch_slice(body).map(|batch| batch.header.total_size()) {
-        Ok(batch_length) if body.len() == batch_length => Ok(message),
+    match decode_batch_slice(body) {
+        Ok(batch) if batch.message_count() == 0 => Err(IggyError::InvalidCommand),
+        Ok(batch) if body.len() == batch.header.total_size() => Ok(message),
         Ok(_) => Err(IggyError::InvalidCommand),
         Err(_) => transcode_legacy_request(namespace, body, request_header, checksum),
     }
@@ -575,6 +576,9 @@ fn transcode_legacy_request(
     checksum: ChecksumMode,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let (message_count, messages) = legacy_messages_slice(body)?;
+    if message_count == 0 {
+        return Err(IggyError::InvalidCommand);
+    }
     let mut parsed = Vec::with_capacity(message_count as usize);
     let mut origin_timestamp = u64::MAX;
     let mut cursor = 0usize;
@@ -762,15 +766,13 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyEr
 ///
 /// INVARIANT: `bytes` MUST be node-local self-stamped -
 /// [`stamp_prepare_for_persistence`] recomputed the batch checksum over the
-/// exact blob on THIS node - or already integrity-checked at their network
+/// exact blob on the local node - or already integrity-checked at network
 /// ingress. There is no consensus-layer blob validation: the `PrepareHeader`
-/// integrity fields are inert zeros. A replicated `SendMessages` prepare is
-/// gated per-message on receipt by [`verify_received_send_messages`], and a
-/// repaired prepare is validated via [`decode_prepare_slice`]; both run BEFORE
-/// the bytes reach any trusted decode. NEVER call this on unvalidated network
-/// bytes - it would let a corrupted blob pass undetected. The full-body
-/// per-message checksum pass dominates produce-path CPU, so trusted call sites
-/// that only read header meta skip it.
+/// integrity fields are inert zeros. Replicated and repaired prepares are
+/// validated via [`decode_prepare_slice`] before the bytes reach any trusted
+/// decode. Calling this on unvalidated network bytes would let a corrupted blob
+/// pass undetected. The full-body per-message checksum pass dominates
+/// produce-path CPU, so trusted call sites that only read header meta skip it.
 ///
 /// # Errors
 ///
@@ -858,35 +860,6 @@ pub fn stamp_prepare_for_persistence(
     command.batch_checksum = calculate_batch_checksum(&command, blob);
     command.encode_into(&mut bytes[header_offset..header_offset + COMMAND_HEADER_SIZE]);
     Ok((message, command, command.message_count))
-}
-
-/// Verify every per-message checksum in a received `SendMessages` prepare.
-///
-/// The FIRST blob-integrity check on the replicated path: the `PrepareHeader`
-/// integrity fields are inert zeros and the batch checksum is recomputed
-/// locally at stamp, so transit corruption of a message body would otherwise
-/// reach apply undetected. Backups call this before journaling a replicated
-/// prepare; on a mismatch the caller fails closed (drop, no `PrepareOk`) and the
-/// primary retransmits on prepare-timeout.
-///
-/// The stored `batch_checksum` is not consulted (a received prepare is
-/// pre-stamp, `base_offset` / `base_timestamp` zero): integrity rests on the
-/// per-message checksums, recomputed over the stamp-invariant cover
-/// (`header[8..48] || payload || user_headers`), which excludes the 256B command
-/// header, so it holds whether or not this node has stamped yet. Shares the
-/// frame walk with the validating decoders via
-/// [`verify_and_recompute_batch_checksum`], discarding its recomputed batch
-/// value.
-///
-/// # Errors
-///
-/// [`IggyError::InvalidCommand`] if the records do not tile `message_count`
-/// exactly (a length-field corruption desyncs the walk);
-/// [`IggyError::InvalidMessageChecksum`] on the first per-message mismatch.
-pub fn verify_received_send_messages(bytes: &[u8]) -> Result<(), IggyError> {
-    let batch = decode_prepare_slice_trusted(bytes)?;
-    verify_and_recompute_batch_checksum(&batch)?;
-    Ok(())
 }
 
 fn legacy_messages_slice(body: &[u8]) -> Result<(u32, &[u8]), IggyError> {
@@ -1233,49 +1206,13 @@ mod tests {
     }
 
     /// `[PrepareHeader][256B batch header][blob]` carrying real per-message
-    /// records + checksums from the production encoder, left pre-stamp
-    /// (`base_offset` / `base_timestamp` zero) as a follower receives it.
+    /// records and checksums from the production encoder, with the initial zero
+    /// base offset and timestamp.
     fn prepare_with_messages(messages: &IggyMessages2) -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
             SendMessages2Owned::from_messages(namespace, messages).expect("build send batch");
         prepare_from_owned(&owned)
-    }
-
-    #[test]
-    fn verify_received_send_messages_accepts_clean_batch() {
-        let owned = prepare_with_messages(&sample_messages());
-        verify_received_send_messages(owned.as_slice())
-            .expect("a clean batch passes the receive gate");
-    }
-
-    #[test]
-    fn verify_received_send_messages_rejects_flipped_payload_byte() {
-        let mut owned = prepare_with_messages(&sample_messages());
-        // First payload begins right after the first message's 48B header.
-        let payload_index = PREPARE_SPLIT_POINT + MESSAGE_HEADER_SIZE;
-        owned.as_mut_slice()[payload_index] ^= 0xFF;
-        assert!(
-            matches!(
-                verify_received_send_messages(owned.as_slice()),
-                Err(IggyError::InvalidMessageChecksum(..))
-            ),
-            "a flipped payload byte must fail the per-message checksum",
-        );
-    }
-
-    #[test]
-    fn verify_received_send_messages_rejects_flipped_stored_checksum() {
-        let mut owned = prepare_with_messages(&sample_messages());
-        // The first message's stored checksum is the first 8 bytes of the blob.
-        owned.as_mut_slice()[PREPARE_SPLIT_POINT] ^= 0xFF;
-        assert!(
-            matches!(
-                verify_received_send_messages(owned.as_slice()),
-                Err(IggyError::InvalidMessageChecksum(..))
-            ),
-            "a flipped stored checksum must fail the per-message check",
-        );
     }
 
     #[test]
@@ -1455,6 +1392,29 @@ mod tests {
     }
 
     #[test]
+    fn convert_request_message_rejects_empty_canonical_and_legacy_batches() {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let messages = IggyMessages2::with_capacity(0);
+        let canonical = SendMessages2Owned::from_messages(namespace, &messages)
+            .expect("build empty canonical batch");
+        let mut canonical_body = vec![0; canonical.header.total_size()];
+        canonical
+            .header
+            .encode_into(&mut canonical_body[..COMMAND_HEADER_SIZE]);
+        let legacy_body = legacy_send_messages_body(&messages);
+
+        for mode in [ChecksumMode::Compute, ChecksumMode::Skip] {
+            let canonical_result =
+                convert_request_message(namespace, legacy_request_message(&canonical_body), mode);
+            assert!(matches!(canonical_result, Err(IggyError::InvalidCommand)));
+
+            let legacy_result =
+                convert_request_message(namespace, legacy_request_message(&legacy_body), mode);
+            assert!(matches!(legacy_result, Err(IggyError::InvalidCommand)));
+        }
+    }
+
+    #[test]
     fn convert_request_message_transcodes_legacy_to_canonical_bytes() {
         // Golden: the fused legacy transcode must emit the exact canonical batch
         // the native builder (`from_messages`) produces for the same messages -
@@ -1607,8 +1567,7 @@ mod tests {
         Message::try_from(buffer).expect("request message is valid")
     }
 
-    /// The replicated counterpart: a pre-stamp `Prepare` whose `size` covers
-    /// `junk` past `batch_length`.
+    /// A `Prepare` whose `size` covers `junk` past `batch_length`.
     fn prepare_with_trailing_bytes(junk: &[u8]) -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
@@ -1666,18 +1625,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_received_send_messages_rejects_trailing_bytes_past_batch_length() {
-        // Replica ingest boundary. The gate clamps the blob to `batch_length`
-        // before verifying, so without an exact-frame check a primary could plant
-        // bytes that no per-message checksum covers on every backup.
+    fn decode_prepare_slice_rejects_trailing_bytes_past_batch_length() {
+        // Replica ingest must reject bytes beyond `batch_length` because no
+        // per-message checksum covers them.
         for junk in TRAILING_JUNK_CASES {
             let owned = prepare_with_trailing_bytes(junk);
-            let result = verify_received_send_messages(owned.as_slice());
-            assert!(
-                matches!(result, Err(IggyError::InvalidCommand)),
-                "{} trailing bytes must fail the receive gate, got {result:?}",
-                junk.len(),
-            );
             assert!(
                 matches!(
                     decode_prepare_slice(owned.as_slice()),
