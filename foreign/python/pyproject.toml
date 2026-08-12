@@ -99,7 +99,7 @@ select = [
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
-    "pytest>=9.0.3,<10.0",
+    "pytest>=9.1.1,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",
     "pytest-xdist>=3.0,<4.0",
@@ -120,7 +120,7 @@ dev = [
 all = [
     "maturin>=1.14.1,<2.0",
     "pyrefly>=1.2.0",
-    "pytest>=9.0.3,<10.0",
+    "pytest>=9.1.1,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",
     "pytest-xdist>=3.0,<4.0",
