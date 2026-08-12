@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! TCP listener schema.
+
 use configs::ConfigEnv;
 use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};

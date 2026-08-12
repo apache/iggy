@@ -163,7 +163,7 @@ where
     /// The simulator's dispatch shell uses this to drive `SimClient` requests
     /// through the real `on_client_request` path (auth, session binding,
     /// consensus submit, reply) instead of the raw `dispatch` routing the
-    /// shell-off fast path takes. No production caller: a `-p iggy-server-ng`
+    /// shell-off fast path takes. No production caller: a `-p iggy-server`
     /// build excludes the `simulator` feature and this method.
     #[cfg(any(test, feature = "simulator"))]
     pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
@@ -572,7 +572,7 @@ where
                 // Only shard 0 owns the metadata consensus group, and
                 // `forward_metadata_submit` always addresses shard 0, so a
                 // non-zero shard here is a routing bug. The handler (wired
-                // by server-ng) replies `None` on the carried sender if it
+                // by the server) replies `None` on the carried sender if it
                 // cannot submit, so the awaiting peer never blocks forever.
                 debug_assert_eq!(
                     self.id, 0,
@@ -583,7 +583,7 @@ where
             LifecycleFrame::ListClients { reply } => {
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
-                // (wired by server-ng) reads this shard's `SessionManager`
+                // (wired by the server) reads this shard's `SessionManager`
                 // and pushes the list over `reply`.
                 (self.on_list_clients)(reply);
             }
@@ -594,7 +594,7 @@ where
             } => {
                 // Addressed to the shard owning `namespace` (the sender
                 // resolved it via the shards table). The handler (wired by
-                // server-ng) runs the read against this shard's partitions
+                // the server) runs the read against this shard's partitions
                 // plane and pushes the result over `reply`; a dropped
                 // sender means the read is skipped and the gather side
                 // times out.

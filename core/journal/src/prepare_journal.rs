@@ -66,7 +66,7 @@ pub(crate) const SLOT_COUNT: usize = 1024;
 
 /// Default in-memory index size, in slots. Overridable per journal via
 /// [`PrepareJournal::open_with_slots`] (operator knob: `[metadata]
-/// journal_slots` in the server-ng config).
+/// journal_slots` in the server config).
 pub const DEFAULT_SLOT_COUNT: usize = SLOT_COUNT;
 
 /// Error type for journal operations.
@@ -391,7 +391,7 @@ impl PrepareJournal {
     /// `slot_count` bounds how many committed-but-unsnapshotted entries the
     /// journal holds before a forced checkpoint must reclaim WAL space; the
     /// caller owns keeping it above its checkpoint margin + prepare-queue
-    /// depth (validated at config load for the server-ng `[metadata]` knob).
+    /// depth (validated at config load for the server `[metadata]` knob).
     ///
     /// # Errors
     /// Returns `JournalError::Io` if the WAL file cannot be opened or read,

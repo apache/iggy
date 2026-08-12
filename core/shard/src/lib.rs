@@ -32,7 +32,7 @@ use consensus::{
     DvcSuffix, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
     STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, Status,
     VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank, dvc_header_kind,
-    encode_prepare_headers, verify_prepare_integrity,
+    encode_prepare_headers, restamp_prepare_view, verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -217,7 +217,7 @@ pub enum MetadataSubmit {
 
 /// Handler shard 0 runs for an inbound [`MetadataSubmit`].
 ///
-/// server-ng wires it to `submit_register_in_process` /
+/// The server wires it to `submit_register_in_process` /
 /// `submit_logout_in_process` / `submit_request_in_process` and sends the
 /// result back over the frame's `reply` sender. A peer shard (no consensus)
 /// must never receive this frame.
@@ -250,7 +250,7 @@ pub struct ConnectedClientInfo {
 }
 
 /// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
-/// server-ng wires it to read the shard's `SessionManager` and push its
+/// The server wires it to read the shard's `SessionManager` and push its
 /// connected clients back over the carried reply sender.
 pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
 
@@ -333,7 +333,7 @@ pub enum PartitionReadReply {
 }
 
 /// Handler the owning shard runs for an inbound
-/// [`LifecycleFrame::PartitionRead`]. server-ng wires it to its partitions
+/// [`LifecycleFrame::PartitionRead`]. The server wires it to its partitions
 /// plane; the handler pushes the result back over the carried reply sender.
 pub type PartitionReadHandler =
     Rc<dyn Fn(IggyNamespace, PartitionRead, Sender<PartitionReadReply>)>;
@@ -729,7 +729,7 @@ impl ShardFrame {
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
 ///
-/// Runtime default; server-ng overrides the live ceiling per shard from
+/// Runtime default; the server overrides the live ceiling per shard from
 /// `[cluster] repair_chunk_max` at bootstrap.
 pub const REPAIR_CHUNK_MAX: u64 = 128;
 
@@ -866,7 +866,7 @@ const SEGMENT_SIZE_CEILING_BYTES: u64 = 1 << 30;
 /// The most one segment can overshoot its size cap: rotation checks the cap
 /// AFTER appending, so a segment closes at most one maximum-size batch past it.
 ///
-/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: server-ng never
+/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: the server never
 /// enforces the latter (its only enforcement sites are the legacy server and the
 /// SDK batch types), so the largest appendable batch is whatever the message bus
 /// will frame. This tracks the shipped `message_bus.max_message_size` default; an
@@ -879,7 +879,7 @@ const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// Mirrors `[partition] transfer_artifact_bytes_max`. Free const so the config
 /// crate's copy can be pinned to it by a `const _: () = assert!(..)` at the
-/// server-ng build edge, the way every other runtime default is.
+/// server build edge, the way every other runtime default is.
 pub const PARTITION_ARTIFACT_LEN_DEFAULT: u64 =
     SEGMENT_SIZE_CEILING_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
 
@@ -1187,13 +1187,13 @@ where
     on_metadata_submit: MetadataSubmitHandler,
 
     /// Handler for inbound [`LifecycleFrame::ListClients`] broadcast
-    /// queries. Every shard receives these (not just shard 0); server-ng
+    /// queries. Every shard receives these (not just shard 0); the server
     /// wires it to its per-shard `SessionManager`. Defaults to a no-op for
     /// the simulator stub ctor.
     on_list_clients: ListClientsHandler,
 
     /// Handler for inbound [`LifecycleFrame::PartitionRead`] queries.
-    /// server-ng wires it to this shard's partitions plane. Defaults to a
+    /// The server wires it to this shard's partitions plane. Defaults to a
     /// no-op for the simulator stub ctor.
     on_partition_read: PartitionReadHandler,
 
@@ -1289,30 +1289,30 @@ where
     shard_park_shedding: Cell<bool>,
 
     /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
-    /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
+    /// to [`REPAIR_CHUNK_MAX`]; the server overrides it from
     /// `[cluster] repair_chunk_max` at bootstrap.
     repair_chunk_max: Cell<u64>,
 
     /// Live stalled-repair retry threshold in consensus ticks. Defaults to
-    /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
+    /// [`partitions::REPAIR_RETRY_TICKS`]; the server overrides it from
     /// `[cluster] repair_retry_interval` at bootstrap.
     repair_retry_ticks: Cell<u32>,
 
     /// Live `[partition] transfer_served_cache_bytes_max`: the byte budget for
     /// segment payloads this shard keeps resident to serve chunk requests.
-    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; server-ng
+    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; the server
     /// overrides it at bootstrap.
     served_segment_cache_bytes_max: Cell<u64>,
 
     /// Live `[partition] transfer_artifact_bytes_max`: the alloc ceiling for one
     /// RECEIVED artifact. Defaults to [`PARTITION_ARTIFACT_LEN_DEFAULT`];
-    /// server-ng overrides it at bootstrap.
+    /// the server overrides it at bootstrap.
     partition_artifact_len_max: Cell<u64>,
 
     /// Live `[message_bus] max_message_size`. Bounds a served state chunk: a
     /// frame above this is rejected by the RECEIVING transport, which tears
     /// down the whole replica connection. Defaults to a value that leaves
-    /// [`STATE_CHUNK_LEN`] usable; server-ng overrides it at bootstrap.
+    /// [`STATE_CHUNK_LEN`] usable; the server overrides it at bootstrap.
     bus_max_message_size: Cell<usize>,
 
     /// Consecutive metadata state-transfer rounds that made no progress.
@@ -3175,7 +3175,7 @@ where
     /// production runtime path; bootstrap recovery uses `load_partition`),
     /// so it must never run in production. VSR replica id comes from
     /// `PartitionConsensusConfig`, not `self.id` (the local shard index). A
-    /// `-p iggy-server-ng` build excludes the `simulator` feature and this
+    /// `-p iggy-server` build excludes the `simulator` feature and this
     /// method; `cargo build --workspace` compiles it in but with no
     /// production caller.
     /// `superblock` is this group's durable `(view, log_view)` store. Passing
@@ -3553,7 +3553,6 @@ where
         ) else {
             return;
         };
-        let consensus = partition.consensus();
         let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
             tracing::warn!(
                 shard = self.id,
@@ -3563,13 +3562,17 @@ where
             );
             return;
         };
-        let actions = consensus.handle_start_view(PlaneKind::Partitions, &header, suffix_body);
+        let actions =
+            partition
+                .consensus()
+                .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
-        if adopted && let Some(pending) = consensus.pending_view_log() {
+        if adopted && let Some(pending) = partition.consensus().pending_view_log() {
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
             // journal this rewrites. Same position as the metadata arm's twin.
             reconcile_partition_view_divergence(self.id, partition, &pending).await;
         }
+        let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
         // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
@@ -4581,14 +4584,16 @@ where
     {
         let partitions = self.plane.partitions();
         let started = {
-            let Some(partition) = partitions.get_by_ns(&namespace) else {
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                 return;
             };
-            let consensus = partition.consensus();
-            if !consensus.is_primary_for_view(consensus.view()) {
+            if !partition
+                .consensus()
+                .is_primary_for_view(partition.consensus().view())
+            {
                 return;
             }
-            let Some(pending) = consensus.pending_view_log() else {
+            let Some(pending) = partition.consensus().pending_view_log() else {
                 return;
             };
             // Before the scan can mean anything: the repair ingest skips an op it
@@ -4596,10 +4601,23 @@ where
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
             reconcile_partition_view_divergence(self.id, partition, &pending).await;
-            // Identity, not presence: see the metadata twin.
+            let consensus = partition.consensus();
+            // Identity, not presence: see the metadata twin. The floor is the local
+            // commit point, the partition twin of the metadata snapshot floor:
+            // `evict_prefix` clears the header vec for the flushed (committed)
+            // prefix, so a survivor that flushes on every commit holds NO resident
+            // header for the op the merged window opens on. Demanding one parks the
+            // primary-elect in `ViewChange` forever, and the rotation lands
+            // primaryship on whichever replica still has its window resident -- a
+            // fresh rejoiner with nothing but repair-ingested entries, which then
+            // cannot serve the state transfer it itself needs. A committed op
+            // cannot diverge from the merged log, and its bytes stay serveable
+            // from the evicted ring or the flushed segments.
             let missing = {
                 let journal = partition.log.journal();
-                first_op_not_covered(&pending, 0, |op| journal.inner.header_by_op(op))
+                first_op_not_covered(&pending, consensus.commit_min(), |op| {
+                    journal.inner.header_by_op(op)
+                })
             };
             if let Some(missing_op) = missing {
                 tracing::debug!(
@@ -6650,6 +6668,10 @@ where
                         h.artifact = header.artifact;
                         h.offset = header.offset;
                         h.size = total_size as u32;
+                        // `StateChunk` is `FRAME_SEALED`: the receiver's router
+                        // drops an unsealed frame before any handler sees it, so
+                        // a missing seal starves the pull silently.
+                        h.seal();
                     },
                 ))))
             };
@@ -8460,16 +8482,15 @@ fn build_dvc_suffix(
 #[allow(clippy::future_not_send)]
 async fn reconcile_partition_view_divergence<B, SB>(
     shard: u16,
-    partition: &IggyPartition<B, SB>,
+    partition: &mut IggyPartition<B, SB>,
     pending: &MergedLog,
 ) where
     B: MessageBus,
     SB: journal::superblock::SuperblockStore,
 {
-    let consensus = partition.consensus();
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
-    let applied_floor = pending.commit_max.max(consensus.commit_min());
+    let applied_floor = pending.commit_max.max(partition.consensus().commit_min());
 
     let mut repairable_from: Option<u64> = None;
     for canonical in &pending.headers {
@@ -8482,11 +8503,11 @@ async fn reconcile_partition_view_divergence<B, SB>(
         if canonical.op <= applied_floor {
             tracing::error!(
                 shard,
-                namespace_raw = consensus.group(),
+                namespace_raw = partition.consensus().group(),
                 op = canonical.op,
-                view = consensus.view(),
+                view = partition.consensus().view(),
                 commit_max = pending.commit_max,
-                commit_min = consensus.commit_min(),
+                commit_min = partition.consensus().commit_min(),
                 local_checksum = local.checksum,
                 canonical_checksum = canonical.checksum,
                 "committed partition op {} disagrees with the view that just started; this \
@@ -8514,15 +8535,15 @@ async fn reconcile_partition_view_divergence<B, SB>(
     let Some(from_op) = repairable_from else {
         return;
     };
-    match partition.log.journal().inner.truncate_from(from_op).await {
+    match partition.truncate_uncommitted_from(from_op).await {
         Ok(removed) => {
             tracing::warn!(
                 shard,
-                namespace_raw = consensus.group(),
+                namespace_raw = partition.consensus().group(),
                 from_op,
                 removed,
                 op_head = pending.op_head,
-                view = consensus.view(),
+                view = partition.consensus().view(),
                 "dropped {removed} uncommitted partition entries from op {from_op} that \
                  disagreed with the view's log; the primary's retransmission refills the range"
             );
@@ -8530,7 +8551,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
         Err(error) => {
             tracing::error!(
                 shard,
-                namespace_raw = consensus.group(),
+                namespace_raw = partition.consensus().group(),
                 from_op,
                 %error,
                 "could not drop the diverging uncommitted partition entries from op \
@@ -8565,8 +8586,13 @@ const fn header_is_view_entry(local: &PrepareHeader, canonical: &PrepareHeader) 
 ///
 /// Covers every op the merged log names, including headers inherited from senders
 /// behind the canonical `log_view`, which sit below the canonical window where header
-/// repair cannot walk back to them. `repair_floor` drops the ones compacted under a
-/// snapshot, which no repair can put back.
+/// repair cannot walk back to them. `repair_floor` drops the ops whose journal entry
+/// is legitimately gone AND whose identity is already settled: on the metadata plane
+/// ops compacted under a snapshot, on the partition plane ops at or below the local
+/// commit point, whose flushed entries `evict_prefix` moves out of the header vec.
+/// Neither can diverge from the merged log (a committed or compacted op is the
+/// quorum's op), and no repair puts the journal entry back, so demanding one parks
+/// the view change forever.
 fn first_op_not_covered(
     pending: &MergedLog,
     repair_floor: u64,
@@ -8583,7 +8609,7 @@ fn first_op_not_covered(
             .find(|header| header.op == op)
             .is_none_or(|canonical| header_is_view_entry(&local, canonical))
     };
-    (pending.commit_max.max(1)..=pending.op_head)
+    (pending.commit_max.max(1).max(repair_floor + 1)..=pending.op_head)
         .find(|op| !held(*op))
         .or_else(|| {
             pending
@@ -8610,23 +8636,6 @@ fn view_header_at(view_headers: &[PrepareHeader], op: u64) -> Option<&PrepareHea
         return None;
     }
     Some(header)
-}
-
-/// Re-stamp a stored prepare with the current view before retransmission.
-/// After a view change the primary re-sends its uncommitted suffix as its
-/// own prepares (VSR), but the journal keeps the original view stamp and
-/// `replicate_preflight` fences `header.view < view` as deposed-primary
-/// traffic -- a verbatim replay of the stored bytes would be ignored
-/// forever, wedging the commit walk on every peer. The stored buffer is
-/// shared with the journal, so the patch runs on an owned copy.
-fn restamp_prepare_view(stored: &[u8], view: u32) -> Option<Frozen<MESSAGE_ALIGN>> {
-    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
-    let mut owned = server_common::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(stored);
-    owned.as_mut_slice()[VIEW_OFFSET..VIEW_OFFSET + std::mem::size_of::<u32>()]
-        .copy_from_slice(&view.to_ne_bytes());
-    Message::<GenericHeader>::try_from(owned)
-        .ok()
-        .map(Message::into_frozen)
 }
 
 /// Dispatch a list of `VsrAction`s by constructing the appropriate
@@ -8863,15 +8872,10 @@ async fn dispatch_vsr_actions<B, P, J>(
                         continue;
                     };
                     // Freeze the retransmit payload once; clone per target.
-                    let frozen = if prepare.header().view == current_view {
-                        prepare.into_generic().into_frozen()
-                    } else {
-                        let Some(restamped) =
-                            restamp_prepare_view(prepare.as_slice(), current_view)
-                        else {
-                            continue;
-                        };
-                        restamped
+                    let Some(frozen) =
+                        restamp_prepare_view(prepare.into_generic().into_frozen(), current_view)
+                    else {
+                        continue;
                     };
                     for replica in replicas {
                         send(*replica, frozen.clone()).await;
@@ -9015,15 +9019,8 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                     // above and avoids both the per-target 4 KiB memcpy
                     // and the prior `.expect` that would panic the shard
                     // on a corrupted journal entry.
-                    let prepare = if header.view == current_view {
-                        prepare
-                    } else {
-                        let Some(restamped) =
-                            restamp_prepare_view(prepare.as_slice(), current_view)
-                        else {
-                            continue;
-                        };
-                        restamped
+                    let Some(prepare) = restamp_prepare_view(prepare, current_view) else {
+                        continue;
                     };
                     for replica in replicas {
                         send(*replica, prepare.clone()).await;
@@ -9206,6 +9203,35 @@ mod view_coverage_tests {
             held.iter().find(|header| header.op == op).copied()
         });
         assert_eq!(missing, Some(99));
+    }
+
+    #[test]
+    fn given_an_evicted_committed_window_when_floored_should_start_the_view() {
+        // The wedge behind the partition_state_transfer regressions: a survivor
+        // that flushes on every commit holds NO resident journal header (the
+        // flush evicts them), so a merged window opening on its own committed op
+        // reads as a hole nothing can fill -- no repair re-journals a committed
+        // op. The floor (local commit point) must count it as covered, or the
+        // primary-elect parks in `ViewChange` forever and the rotation hands
+        // primaryship to an empty rejoiner that then cannot be served the state
+        // transfer it needs.
+        let pending = MergedLog {
+            op_head: 256,
+            commit_max: 256,
+            headers: vec![sealed(256, 1)],
+            committed_elsewhere: Vec::new(),
+        };
+        let nothing_resident = |_: u64| None;
+        assert_eq!(
+            first_op_not_covered(&pending, 0, nothing_resident),
+            Some(256),
+            "unfloored, the evicted committed op reads as an unfillable hole"
+        );
+        assert_eq!(
+            first_op_not_covered(&pending, 256, nothing_resident),
+            None,
+            "floored at the local commit point, the view starts"
+        );
     }
 }
 

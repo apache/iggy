@@ -61,7 +61,6 @@ members = [
     "core/partitions",
     "core/sdk",
     "core/server",
-    "core/server-ng",
     "core/server_common",
     "core/shard",
     "core/shard_allocator",
@@ -295,7 +294,6 @@ serde_with = { version = "3.21.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.5.0"
 server = { path = "core/server" }
-server-ng = { path = "core/server-ng" }
 server_common = { path = "core/server_common" }
 shard = { path = "core/shard" }
 shard_allocator = { path = "core/shard_allocator" }

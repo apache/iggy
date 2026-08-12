@@ -641,7 +641,7 @@ pub fn apply_committed_prepare<M>(
 /// Late-bound callback invoked after every committed op on shard 0's metadata
 /// commit path (via `gated_apply`, including a gated no-op).
 ///
-/// Wired by server-ng bootstrap once the metadata bundle has broadcast;
+/// Wired by the server bootstrap once the metadata bundle has broadcast;
 /// receives the committed [`Operation`] so the recipient can filter (the
 /// partition reconciliation loop only cares about partition-shaped
 /// events). Wrapped in [`RefCell`] for late binding; the per-shard
@@ -660,7 +660,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// the WAL at all. They receive a `MetadataHandoff::Waiter` factory
     /// bundle from shard 0 over the bootstrap broadcast channel and
     /// reconstruct `mux_stm` from the in-memory snapshot it carries (see
-    /// `server-ng/src/bootstrap.rs` `await_metadata_bundle` /
+    /// `server/src/bootstrap.rs` `await_metadata_bundle` /
     /// `broadcast_metadata_bundle`).
     pub journal: Option<J>,
     /// `Some` on shard 0, `None` on other shards.
@@ -728,7 +728,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// after `gated_apply` returns (including a gated `Unauthorized` no-op that
     /// never reaches [`crate::stm::StateMachine::update`]) in both
     /// [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
-    /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
+    /// [`Self::set_commit_notifier`] runs (the server bootstrap on shard
     /// 0 sets it; peer shards and tests leave it `None`).
     commit_notifier: RefCell<Option<CommitNotifier>>,
     /// Resolved byte value for `MaxTopicSize::ServerDefault` (`0` on the
@@ -3124,7 +3124,7 @@ where
             return;
         };
         // Serialize whole checkpoints against each other. In-process metadata submits
-        // each run on their own spawned task (`bus.spawn` in server-ng's metadata submit
+        // each run on their own spawned task (`bus.spawn` in the server's metadata submit
         // handler), so at the checkpoint margin two can enter here concurrently; without
         // this lock they would run concurrent `persist_snapshot`s over the single
         // `snapshot.bin` and concurrently `drain` the WAL, which rewrites through a

@@ -26,16 +26,12 @@ use crate::harness::handle::{
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
-#[cfg(feature = "vsr")]
 use iggy_common::Client;
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "vsr")]
 use std::time::{Duration, Instant};
-#[cfg(feature = "vsr")]
 use tokio::time::{sleep, timeout};
-#[cfg(feature = "vsr")]
 use tracing::warn;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -154,20 +150,13 @@ impl TestHarness {
             self.jwks_server = Some(mock_server);
         }
 
-        // Legacy single-server harness: plain start, no cluster readiness.
-        #[cfg(not(feature = "vsr"))]
-        for server in &mut self.servers {
-            server.start()?;
-        }
-
-        // Cluster startup (vsr) can hit a transient replica-handshake blip that
+        // Cluster startup can hit a transient replica-handshake blip that
         // leaves the mesh incomplete (a peer link drops mid-handshake, so a
         // node never reaches "all peers connected"). Rather than fail the whole
         // test on a startup blip, retry spawn + mesh-readiness a few times,
         // tearing down and respawning between attempts. `ServerHandle::start`
         // truncates the captured stdout (`File::create`), so the readiness
         // log-grep never matches a stale marker from a prior attempt.
-        #[cfg(feature = "vsr")]
         {
             const CLUSTER_STARTUP_ATTEMPTS: usize = 3;
             for attempt in 1..=CLUSTER_STARTUP_ATTEMPTS {
@@ -219,7 +208,6 @@ impl TestHarness {
         Ok(())
     }
 
-    #[cfg(feature = "vsr")]
     async fn wait_for_cluster_ready(&self) -> Result<(), TestBinaryError> {
         {
             if self.servers.len() <= 1 {

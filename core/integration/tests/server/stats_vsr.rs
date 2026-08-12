@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stats against server-ng (vsr): `clients_count` must report the cross-shard
+//! Stats against the server (vsr): `clients_count` must report the cross-shard
 //! connected-client total gathered by the `ListClients` broadcast, not the
 //! hardcoded 0 the sync single-shard read used to answer.
 

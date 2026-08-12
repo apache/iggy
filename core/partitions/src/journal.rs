@@ -189,11 +189,11 @@ where
     /// Running byte total of the buffers held by `evicted_ring`.
     evicted_ring_bytes: Cell<u64>,
     /// Entry-count ceiling for `evicted_ring`. Defaults to
-    /// [`EVICTED_RING_CAPACITY`]; server-ng overrides it from config at
+    /// [`EVICTED_RING_CAPACITY`]; the server overrides it from config at
     /// partition build.
     evicted_ring_capacity: Cell<usize>,
     /// Byte ceiling for `evicted_ring`. Defaults to
-    /// [`EVICTED_RING_BYTES_MAX`]; server-ng overrides it from config at
+    /// [`EVICTED_RING_BYTES_MAX`]; the server overrides it from config at
     /// partition build.
     evicted_ring_bytes_max: Cell<u64>,
     /// Single-replica groups have nobody to repair; retaining evicted
