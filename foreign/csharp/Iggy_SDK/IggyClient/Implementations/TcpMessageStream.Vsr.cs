@@ -370,11 +370,12 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
         }
 
         var leaderAddress = ServerAddress.HostPort(currentLeaderNode.Ip, currentLeaderNode.Endpoints.Tcp);
-        // Compare against the endpoint the socket resolved, not the configured string: a client
-        // configured with a hostname is otherwise never "on" the leader the roster names by IP,
-        // and every login would reconnect it to the node it is already talking to.
-        var connectedAddress = _currentRemoteAddress.Length > 0 ? _currentRemoteAddress : _currentAddress;
-        if (ServerAddress.IsSame(leaderAddress, connectedAddress))
+        // The roster may name the leader by either side of this connection: the address the client dialed
+        // (a hostname, an advertised_address) or the endpoint the socket resolved to. IsSame does no DNS
+        // resolution, so a match on either means the client is already on the leader; checking only one
+        // side redirect-loops the other kind of roster.
+        if (ServerAddress.IsSame(leaderAddress, _currentAddress)
+            || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _currentRemoteAddress)))
         {
             return false;
         }
@@ -469,8 +470,8 @@ public sealed partial class TcpMessageStream : ISessionEpochProvider
     }
 
     /// <summary>
-    ///     Sends a consensus-framed request: the body is written right after the 256-byte consensus header -
-    ///     two writes, no concatenation.
+    ///     Sends a consensus-framed request: small frames go out as a single coalesced write, larger bodies
+    ///     as a second write straight from the caller's buffer.
     /// </summary>
     /// <remarks>
     ///     One deadline bounds the whole request across transient replays AND leader failovers. Login and

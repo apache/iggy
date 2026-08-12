@@ -43,8 +43,16 @@ internal sealed class VsrConnection : IDisposable
     /// </summary>
     private readonly Action<VsrConnection> _onDropped;
 
+    /// <summary>
+    ///     Frames up to this size go out as one write: header and body coalesced in
+    ///     <see cref="_requestFrameBuffer" />. With Nagle disabled every write is its own segment (and its own
+    ///     TLS record under a wrapping stream), so the second write a small request would pay is measurable
+    ///     even against the round trip the lockstep protocol already costs.
+    /// </summary>
+    private const int CoalescedFrameLimit = 4096;
+
     private readonly byte[] _replyHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
-    private readonly byte[] _requestHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
+    private readonly byte[] _requestFrameBuffer = new byte[CoalescedFrameLimit];
     private readonly int _requestTimeoutMs;
 
     /// <summary>The session identity requests on this connection encode from.</summary>
@@ -80,7 +88,7 @@ internal sealed class VsrConnection : IDisposable
     /// <summary>
     ///     One attempt on this connection: encode the header, write the frame, and replay it - same session,
     ///     same request id - while the server answers transiently. The caller must hold the sending lock,
-    ///     which also guards the reuse of the per-connection header buffer.
+    ///     which also guards the reuse of the per-connection frame buffer.
     /// </summary>
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, CancellationToken token)
@@ -90,7 +98,14 @@ internal sealed class VsrConnection : IDisposable
 
         try
         {
-            VsrHeader.EncodeRequestHeader(_requestHeaderBuffer, _session, code, body.Span);
+            VsrHeader.EncodeRequestHeader(_requestFrameBuffer, _session, code, body.Span);
+
+            var frameSize = VsrHeader.HEADER_SIZE + body.Length;
+            var coalesced = frameSize <= CoalescedFrameLimit;
+            if (coalesced)
+            {
+                body.Span.CopyTo(_requestFrameBuffer.AsSpan(VsrHeader.HEADER_SIZE));
+            }
 
             encoded = true;
 
@@ -104,13 +119,15 @@ internal sealed class VsrConnection : IDisposable
                     token.ThrowIfCancellationRequested();
                     requestStarted = true;
 
-                    // Header and body go out as two writes, straight from the buffers they were encoded into:
-                    // no frame-sized rent and no copy. The server frames by the announced size, and the
-                    // lockstep protocol already pays a full round trip per request, so the extra segment a
-                    // small request costs (with Nagle disabled) is noise against the reply wait.
-                    await _stream.WriteAsync(_requestHeaderBuffer, token);
-                    if (!body.IsEmpty)
+                    if (coalesced)
                     {
+                        await _stream.WriteAsync(_requestFrameBuffer.AsMemory(0, frameSize), token);
+                    }
+                    else
+                    {
+                        // A large body goes out straight from the buffer it was serialised into: no
+                        // frame-sized rent and no copy, at the price of a second segment.
+                        await _stream.WriteAsync(_requestFrameBuffer.AsMemory(0, VsrHeader.HEADER_SIZE), token);
                         await _stream.WriteAsync(body, token);
                     }
 

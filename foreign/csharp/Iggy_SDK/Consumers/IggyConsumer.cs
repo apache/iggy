@@ -533,7 +533,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private async Task OnClientConnectionStateChangedAsync(ConnectionStateChangedEventArgs e)
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
-        
+
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
             return;
