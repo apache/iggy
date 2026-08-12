@@ -2181,8 +2181,31 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Advance to `view + 1` and start a view change (own SVC counted).
     fn start_election(&self, plane: PlaneKind, reason: ViewChangeReason) -> Vec<VsrAction> {
+        self.enter_view_change(plane, self.view.get() + 1, reason)
+    }
+
+    /// Enter `Status::ViewChange` at `new_view`: count this replica's own SVC,
+    /// arm the view-change timers, and schedule the SVC broadcast.
+    ///
+    /// The own-SVC bookkeeping is a direct insert rather than an SVC delivered to
+    /// self through the loopback. Deciding to change view is a local state
+    /// transition, not a message this replica happens to address to itself, and
+    /// it has to be atomic with the view/status writes above it: a self-message
+    /// would land on a later pump drain, leaving a window where the replica has
+    /// entered a view change without counting itself. On a solo group that window
+    /// IS the whole quorum. `PrepareOk` loops through the loopback because it
+    /// genuinely is a message to a peer that happens to be this replica.
+    ///
+    /// The three callers that used to inline this sequence were the actual
+    /// duplication: an election timeout, an SVC for a higher view, and a DVC for
+    /// a higher view, differing only in `reason`.
+    fn enter_view_change(
+        &self,
+        plane: PlaneKind,
+        new_view: u32,
+        reason: ViewChangeReason,
+    ) -> Vec<VsrAction> {
         let old_view = self.view.get();
-        let new_view = old_view + 1;
 
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
@@ -2485,47 +2508,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If SVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
-            let old_view = self.view.get();
-            self.view.set(msg_view);
-            self.status.set(Status::ViewChange);
-            self.reset_view_change_state();
-            self.sent_own_start_view_change.set(true);
-            self.start_view_change_from_all_replicas
-                .borrow_mut()
-                .insert(self.replica as usize);
-
-            // Update timeouts
-            {
-                let mut timeouts = self.timeouts.borrow_mut();
-                timeouts.stop(TimeoutKind::NormalHeartbeat);
-                timeouts.start(TimeoutKind::StartViewChangeMessage);
-                timeouts.start(TimeoutKind::ViewChangeStatus);
-                timeouts.start(TimeoutKind::RequestStartViewMessage);
-            }
-
-            emit_sim_event(
-                SimEventKind::ViewChangeStarted,
-                &ViewChangeLogEvent {
-                    replica: ReplicaLogContext::from_consensus(self, plane),
-                    old_view,
-                    new_view: msg_view,
-                    reason: ViewChangeReason::ReceivedStartViewChange,
-                },
-            );
-
-            // Send our own SVC
-            let action = VsrAction::SendStartViewChange {
-                view: msg_view,
-                group: self.group,
-            };
-            emit_sim_event(
-                SimEventKind::ControlMessageScheduled,
-                &ControlActionLogEvent::from_vsr_action(
-                    ReplicaLogContext::from_consensus(self, plane),
-                    &action,
-                ),
-            );
-            actions.push(action);
+            actions.extend(self.enter_view_change(
+                plane,
+                msg_view,
+                ViewChangeReason::ReceivedStartViewChange,
+            ));
         }
 
         // Record the SVC from sender
@@ -2687,47 +2674,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If DVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
-            let old_view = self.view.get();
-            self.view.set(msg_view);
-            self.status.set(Status::ViewChange);
-            self.reset_view_change_state();
-            self.sent_own_start_view_change.set(true);
-            self.start_view_change_from_all_replicas
-                .borrow_mut()
-                .insert(self.replica as usize);
-
-            // Update timeouts
-            {
-                let mut timeouts = self.timeouts.borrow_mut();
-                timeouts.stop(TimeoutKind::NormalHeartbeat);
-                timeouts.start(TimeoutKind::StartViewChangeMessage);
-                timeouts.start(TimeoutKind::ViewChangeStatus);
-                timeouts.start(TimeoutKind::RequestStartViewMessage);
-            }
-
-            emit_sim_event(
-                SimEventKind::ViewChangeStarted,
-                &ViewChangeLogEvent {
-                    replica: ReplicaLogContext::from_consensus(self, plane),
-                    old_view,
-                    new_view: msg_view,
-                    reason: ViewChangeReason::ReceivedDoViewChange,
-                },
-            );
-
-            // Send our own SVC
-            let action = VsrAction::SendStartViewChange {
-                view: msg_view,
-                group: self.group,
-            };
-            emit_sim_event(
-                SimEventKind::ControlMessageScheduled,
-                &ControlActionLogEvent::from_vsr_action(
-                    ReplicaLogContext::from_consensus(self, plane),
-                    &action,
-                ),
-            );
-            actions.push(action);
+            actions.extend(self.enter_view_change(
+                plane,
+                msg_view,
+                ViewChangeReason::ReceivedDoViewChange,
+            ));
         }
 
         // Only the primary candidate processes DVCs for quorum
@@ -3644,8 +3595,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Enqueue a self-addressed message for processing in the next loopback drain.
     ///
-    /// Currently only `PrepareOk` messages are routed here (via `send_or_loopback`).
-    // TODO: Route SVC/DVC self-messages through loopback once VsrAction dispatch is implemented.
+    /// Only `PrepareOk` reaches here (via `send_or_loopback`), and deliberately:
+    /// it is a message to a peer that happens to be this replica, so a one-drain
+    /// delay costs nothing. A replica's own SVC/DVC is not that shape -- it is the
+    /// local decision to change view, recorded synchronously with the view and
+    /// status writes in [`Self::enter_view_change`]. Routing it here instead would
+    /// leave a window where the replica has entered a view change without counting
+    /// itself, which on a solo group is the entire quorum.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
         assert!(
             self.loopback_queue.borrow().len() < self.prepare_queue_max,
