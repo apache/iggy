@@ -461,6 +461,15 @@ where
         }
     });
 
+    // Popping through the pipeline directly bypasses
+    // `VsrConsensus::pop_committed_prepare`, so re-establish the prepare
+    // timeout's ticking-iff-non-empty invariant here: an emptied pipeline
+    // disarms it, and a remaining head becomes the entry the timer measures,
+    // timed from now rather than inheriting the drained entry's elapsed ticks.
+    if !drained.is_empty() {
+        consensus.sync_prepare_timeout();
+    }
+
     drained
 }
 

@@ -1221,7 +1221,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.set(Status::Normal);
         let mut timeouts = self.timeouts.borrow_mut();
         if self.is_primary() {
-            timeouts.start(TimeoutKind::Prepare);
+            // Prepare is deliberately NOT armed here: a fresh primary has an
+            // empty pipeline and nothing to retransmit, and the timer is owned by
+            // the pipeline's edges from this point on ("ticking iff the pipeline
+            // is non-empty", see `sync_prepare_timeout`). The first
+            // `push_prepare_entry` arms it, timed from that push rather than from
+            // boot.
             timeouts.start(TimeoutKind::CommitMessage);
         } else {
             timeouts.start(TimeoutKind::NormalHeartbeat);
@@ -1553,7 +1558,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// [`Self::push_prepare_entry`]; between the two the invariant is "ticking
     /// iff the pipeline is non-empty".
     pub fn pop_committed_prepare(&self) -> Option<P::Entry> {
-        self.pipeline.borrow_mut().pop()
+        let popped = self.pipeline.borrow_mut().pop();
+        if popped.is_some() {
+            self.sync_prepare_timeout();
+        }
+        popped
     }
 
     /// Drop every in-flight prepare and parked request, and disarm the prepare
@@ -1561,6 +1570,23 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// is nothing left here to retransmit).
     pub fn clear_pipeline(&self) {
         self.pipeline.borrow_mut().clear();
+        self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
+    }
+
+    /// Re-establish "prepare timeout ticking iff the pipeline is non-empty".
+    ///
+    /// Stops the timer on an empty pipeline; otherwise restarts it so it times
+    /// the current oldest entry from now. Exposed for the plane-side drains that
+    /// pop through [`Pipeline`] directly (`drain_committable_prefix`) rather than
+    /// through [`Self::pop_committed_prepare`].
+    pub fn sync_prepare_timeout(&self) {
+        let empty = self.pipeline.borrow().is_empty();
+        let mut timeouts = self.timeouts.borrow_mut();
+        if empty {
+            timeouts.stop(TimeoutKind::Prepare);
+        } else {
+            timeouts.reset(TimeoutKind::Prepare);
+        }
     }
 
     /// Push a pre-built [`PipelineEntry`]; start prepare timeout if idle.
@@ -2317,17 +2343,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Only acts on the primary in normal status with a non-empty pipeline.
     /// Resets the timeout with backoff on each firing.
     fn handle_prepare_timeout(&self) -> Vec<VsrAction> {
-        // TODO(prepare-timeout): tighten the timer lifecycle: disarm in
-        // the ack path the moment quorum drains the pipeline and rearm
-        // for the next-oldest prepare when one commits with others still
-        // pending, giving the invariant "ticking iff pipeline non-empty"
-        // and a timeout that always measures the current oldest
-        // prepare's age. Ours arms once per idle->busy transition and
-        // disarms lazily below, so a prepare pushed late into an armed
-        // window can be retransmitted before it is `PREPARE_TICKS` old.
-        // Also worth special-casing "all remote acks present, own
-        // journal write is the laggard" by retrying the local write
-        // instead of retransmitting.
+        // The timer's lifecycle is maintained at the pipeline's own edges
+        // (`push_prepare_entry` arms, `sync_prepare_timeout` disarms on empty and
+        // restarts on a new head), so by the time this fires the timer is already
+        // measuring the current oldest prepare rather than inheriting a drained
+        // entry's elapsed ticks. The stop below is now a backstop for a pipeline
+        // emptied by a path that skipped that maintenance, not the primary
+        // disarm.
+        //
+        // TODO(prepare-timeout): special-case "all remote acks present, own
+        // journal write is the laggard" by retrying the local write instead of
+        // retransmitting to peers that already acked.
         //
         // Every early return below must stop or back off the timeout.
         // `fired()` stays true until the timer is rearmed, so returning
@@ -4658,6 +4684,64 @@ mod vsr_consensus_tests {
     /// and the parent chain ahead of the journal append.
     fn pipeline(consensus: &VsrConsensus<StageNoopBus>, message: &Message<PrepareHeader>) {
         consensus.pipeline_message(PlaneKind::Metadata, message);
+    }
+
+    use crate::drain_committable_prefix;
+
+    /// Whether the prepare retransmit timer is armed.
+    fn prepare_ticking(consensus: &VsrConsensus<StageNoopBus>) -> bool {
+        consensus.timeouts.borrow().is_ticking(TimeoutKind::Prepare)
+    }
+
+    #[test]
+    fn prepare_timeout_ticks_exactly_while_the_pipeline_is_non_empty() {
+        // The lifecycle invariant: armed by the first push, disarmed the moment
+        // the pipeline drains. Previously it armed at `init` on an empty pipeline
+        // and only disarmed lazily, when the timeout itself fired and found
+        // nothing to retransmit.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(
+            !prepare_ticking(&consensus),
+            "a fresh primary has nothing to retransmit"
+        );
+
+        let first = projected_prepare(1, 0);
+        pipeline(&consensus, &first);
+        assert!(prepare_ticking(&consensus), "the first push arms the timer");
+
+        let second = projected_prepare(2, 0);
+        pipeline(&consensus, &second);
+
+        // Committing the head leaves op 2 in flight, so the timer stays armed --
+        // now measuring op 2 rather than carrying op 1's elapsed ticks.
+        consensus.advance_commit_max(1);
+        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert!(
+            prepare_ticking(&consensus),
+            "a remaining prepare keeps the timer armed"
+        );
+
+        consensus.advance_commit_max(2);
+        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert!(
+            !prepare_ticking(&consensus),
+            "draining the last prepare disarms the timer without waiting for it to fire"
+        );
+    }
+
+    #[test]
+    fn clearing_the_pipeline_disarms_the_prepare_timeout() {
+        // A view change re-prepares from the new primary, so nothing left here is
+        // worth retransmitting.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        pipeline(&consensus, &projected_prepare(1, 0));
+        assert!(prepare_ticking(&consensus));
+
+        consensus.clear_pipeline();
+        assert!(consensus.pipeline_is_empty());
+        assert!(!prepare_ticking(&consensus));
     }
 
     #[test]
