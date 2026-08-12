@@ -9553,10 +9553,12 @@ dependencies = [
  "iggy_common",
  "journal",
  "message_bus",
+ "nix",
  "papaya",
  "ringbuffer",
  "server_common",
  "smallvec",
+ "tempfile",
  "tokio",
  "tracing",
 ]

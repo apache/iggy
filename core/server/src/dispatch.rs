@@ -3394,6 +3394,7 @@ mod tests {
                 enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
                 encryptor: None,
             },
         );
@@ -3513,6 +3514,7 @@ mod tests {
                 enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
                 encryptor: None,
             },
         );
@@ -3637,6 +3639,7 @@ mod tests {
                 enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
                 encryptor: None,
             },
         );
@@ -3700,6 +3703,7 @@ mod tests {
                 enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
                 encryptor: None,
             },
         );

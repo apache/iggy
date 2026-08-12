@@ -1749,6 +1749,7 @@ async fn build_shard_for_thread(
             enforce_fsync: config.system.partition.enforce_fsync,
             validate_checksum: config.system.partition.validate_checksum,
             segment_size: config.system.segment.size,
+            preallocate_segments: config.system.segment.preallocate,
             encryptor,
         },
         owned_partitions_capacity,
@@ -2549,6 +2550,11 @@ async fn hydrate_partition_log(
                     messages_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
+                    config
+                        .system
+                        .segment
+                        .preallocate
+                        .then_some(config.system.segment.size),
                 )
                 .await
                 .map_err(|source| {
