@@ -76,10 +76,10 @@ func (m *ClusterMetadata) UnmarshalBinary(data []byte) error {
 	if err := binary.Read(r, binary.LittleEndian, &nameLen); err != nil {
 		return err
 	}
-	if int(nameLen) > r.Len() {
+	if uint64(nameLen) > uint64(r.Len()) {
 		return errors.New("invalid name length")
 	}
-	nameb := make([]byte, nameLen)
+	nameb := make([]byte, int(nameLen))
 	if _, err := r.Read(nameb); err != nil {
 		return err
 	}

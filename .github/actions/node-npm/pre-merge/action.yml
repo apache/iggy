@@ -82,8 +82,6 @@ runs:
           echo "Warning: dist directory not found after build"
         fi
       shell: bash
-
-
     - name: Test
       if: inputs.task == 'test'
       run: |
@@ -97,12 +95,8 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        # Node e2e asserts full cluster metadata (2 nodes from
-        # config.toml's [[cluster.nodes]] list), so cluster mode must be
-        # on. --replica-id picks the current node out of that list.
-        replica-id: "0"
-      env:
-        IGGY_CLUSTER_ENABLED: "true"
+        cargo-bin: iggy-server
+        wait-timeout-seconds: "90"
 
     - name: E2E tests
       if: inputs.task == 'e2e'
@@ -110,23 +104,29 @@ runs:
         cd foreign/node
         mkdir -p ../../reports/node-coverage/e2e
         npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
-      env:
-        IGGY_SERVER_HOST: 127.0.0.1
-        IGGY_SERVER_TCP_PORT: 8090
       shell: bash
 
-    - name: Stop Iggy server (plain)
+    - name: Stop Iggy server
       if: always() && inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-stop
       with:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Upload server logs
+      if: always() && inputs.task == 'e2e'
+      uses: actions/upload-artifact@v7
+      with:
+        name: iggy-node-server-logs
+        path: ${{ steps.iggy.outputs.log_file }}
+        if-no-files-found: ignore
+
     - name: Start Iggy server (TLS)
       id: iggy-tls
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
+        cargo-bin: iggy-server
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:

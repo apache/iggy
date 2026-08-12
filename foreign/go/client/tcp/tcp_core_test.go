@@ -18,472 +18,551 @@
 package tcp
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
-	"log/slog"
-	"net"
-	"strings"
 	"testing"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
+	"github.com/apache/iggy/foreign/go/internal/vsr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// emptyWireReq is an 8-byte wire payload for a zero-code request with empty body:
-// [length-le32=4][code-le32=0]. Reused across tests that don't care about the body.
-var emptyWireReq = []byte{4, 0, 0, 0, 0, 0, 0, 0}
-
-// newTestClient creates an IggyTcpClient backed by an in-memory net.Pipe connection.
-// Returns the client and the server-side end of the pipe; caller must close the server conn.
-func newTestClient(t *testing.T) (*IggyTcpClient, net.Conn) {
+func numericIdentifier(t *testing.T, id uint32) iggcon.Identifier {
 	t.Helper()
-	serverConn, clientConn := net.Pipe()
-	c := &IggyTcpClient{
-		conn:           clientConn,
-		transportState: iggcon.TransportStateConnected,
-		sessionState:   iggcon.SessionStateUnauthenticated,
-		logger:         slog.New(slog.DiscardHandler),
-	}
-	t.Cleanup(func() {
-		err := clientConn.Close()
-		if err != nil {
-			t.Errorf("error closing client connection: %v", err)
-		}
-	})
-	t.Cleanup(func() {
-		err := serverConn.Close()
-		if err != nil {
-			t.Errorf("error closing server connection: %v", err)
-		}
-	})
-	return c, serverConn
+	identifier, err := iggcon.NewIdentifier(id)
+	require.NoError(t, err)
+	return identifier
 }
 
-func TestSendAndFetchResponse_NilContext(t *testing.T) {
-	c, _ := newTestClient(t)
-	_, err := c.sendWireAndFetchResponse(nil, emptyWireReq) //nolint:staticcheck
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !errors.Is(err, ierror.ErrNilContext) {
-		t.Errorf("got %v, want %v", err, ierror.ErrNilContext)
-	}
+func TestExchange_RejectsANilContext(t *testing.T) {
+	client, _ := newPipeClient(t)
+
+	_, err := client.SendBinaryRequest(nil, uint32(command.PingCode), nil) //nolint:staticcheck
+	assert.ErrorIs(t, err, ierror.ErrNilContext)
 }
 
-func TestSendAndFetchResponse_ContextErrors(t *testing.T) {
-	canceledCtx, cancel := context.WithCancel(context.Background())
+func TestExchange_ReportsAContextThatIsAlreadyDone(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-
-	expiredCtx, expiredCancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	expired, expiredCancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer expiredCancel()
 
 	tests := []struct {
-		name    string
-		ctx     context.Context
-		wantErr error
+		name string
+		ctx  context.Context
+		want error
 	}{
-		{
-			name:    "canceled",
-			ctx:     canceledCtx,
-			wantErr: context.Canceled,
-		},
-		{
-			name:    "expired",
-			ctx:     expiredCtx,
-			wantErr: context.DeadlineExceeded,
-		},
+		{name: "cancelled", ctx: cancelled, want: context.Canceled},
+		{name: "expired", ctx: expired, want: context.DeadlineExceeded},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, _ := newTestClient(t)
-
-			// server does not respond, but it doesn't matter.
-			// ctx.Err() should fire before any I/O is attempted.
-			_, err := c.sendWireAndFetchResponse(tt.ctx, emptyWireReq)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("got %v, want %v", err, tt.wantErr)
-			}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, _ := newPipeClient(t)
+			_, err := client.SendBinaryRequest(test.ctx, uint32(command.PingCode), nil)
+			assert.ErrorIs(t, err, test.want)
 		})
 	}
 }
 
-func TestSendAndFetchResponse_DeadlineTimeout(t *testing.T) {
-	c, _ := newTestClient(t)
+func TestExchange_RefusesToSendWhileNotConnected(t *testing.T) {
+	tests := []struct {
+		name  string
+		state iggcon.TransportState
+		want  error
+	}{
+		{name: "shutdown", state: iggcon.TransportStateShutdown, want: ierror.ErrClientShutdown},
+		{name: "disconnected", state: iggcon.TransportStateDisconnected, want: ierror.ErrNotConnected},
+		{name: "connecting", state: iggcon.TransportStateConnecting, want: ierror.ErrNotConnected},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, _ := newPipeClient(t)
+			client.transportState = test.state
+			client.config.reconnection.enabled = false
 
-	// server intentionally does not read or write, causing the client to block
-	// until the context deadline fires and SetDeadline triggers a timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+			assert.ErrorIs(t, err, test.want)
+		})
+	}
+}
+
+func TestExchange_SendsAFrameTheServerCanRead(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, []byte{1, 2, 3})
+	})
+
+	response, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{1, 2, 3}, response)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 1)
+	assert.Equal(t, vsr.OperationNonReplicated, recorded[0].operation())
+	assert.Equal(t, uint32(command.PingCode), recorded[0].code())
+	assert.Equal(t, uint64(100), recorded[0].sessionID())
+	assert.False(t, recorded[0].clientID().IsZero())
+}
+
+func TestExchange_ForwardsAVendorCodeInTheReservedField(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, nil)
+	})
+
+	_, err := client.SendBinaryRequest(context.Background(), 60000, []byte{7, 7})
+	require.NoError(t, err)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 1)
+	assert.Equal(t, uint32(60000), recorded[0].code())
+	assert.Equal(t, []byte{7, 7}, recorded[0].payload)
+}
+
+func TestExchange_KeepsRepeatedVendorCodesFromGappingMetadataRequestIDs(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, read request) []byte {
+		if read.operation() == vsr.OperationCreateStream {
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		}
+		return replyFrame(vsr.OperationNonReplicated, nil)
+	})
+
+	for range 3 {
+		_, err := client.SendBinaryRequest(context.Background(), 60000, nil)
+		require.NoError(t, err)
+	}
+	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+	require.NoError(t, err)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 4)
+	for index := range 3 {
+		assert.Equal(t, uint64(1), recorded[index].requestID(),
+			"a non-replicated request reads the watermark without consuming it")
+	}
+	assert.Equal(t, uint64(1), recorded[3].requestID(),
+		"the metadata request still takes the first id")
+}
+
+func TestSendBinaryRequest_RejectsSessionControlCodesWithoutWriting(t *testing.T) {
+	codes := []command.Code{
+		command.LoginUserCode,
+		command.LogoutUserCode,
+		command.LoginRegisterCode,
+		command.LoginWithAccessTokenCode,
+		command.LoginRegisterWithPATCode,
+	}
+	for _, code := range codes {
+		client, serverConn := newPipeClient(t)
+		server := serve(serverConn, func(_ int, _ request) []byte {
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		})
+
+		_, err := client.SendBinaryRequest(context.Background(), uint32(code), nil)
+		assert.ErrorIs(t, err, ierror.ErrInvalidCommand, "code %d", code)
+		assert.Empty(t, server.recorded(), "code %d reached the wire", code)
+	}
+}
+
+func TestExchange_StripsTheResultSectionOfAMetadataReply(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	payload := []byte{9, 8, 7}
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationCreateStream, append(resultSection(), payload...))
+	})
+
+	response, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+	require.NoError(t, err)
+	assert.Equal(t, payload, response)
+}
+
+func TestExchange_SurfacesACommittedRejection(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationCreateStream,
+			resultSection(uint32(ierror.StreamNameAlreadyExistsCode)))
+	})
+
+	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+	assert.ErrorIs(t, err, ierror.FromCode(ierror.StreamNameAlreadyExistsCode))
+}
+
+func TestExchange_SurfacesAHeaderStatusAndIgnoresTheBody(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	serve(serverConn, func(_ int, _ request) []byte {
+		// A denial ships no body, so a decoder that read one would misparse.
+		return statusReplyFrame(vsr.OperationCreateStream,
+			uint32(ierror.UnauthorizedCode), []byte{0xFF, 0xFF, 0xFF, 0xFF})
+	})
+
+	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+	assert.ErrorIs(t, err, ierror.ErrUnauthorized)
+}
+
+func TestExchange_ReplaysTheIdenticalFrameWhileTheServerAnswersNotCommitted(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(index int, _ request) []byte {
+		if index < 2 {
+			return statusReplyFrame(vsr.OperationCreateStream,
+				uint32(ierror.TransientNotCommittedCode), nil)
+		}
+		return replyFrame(vsr.OperationCreateStream, resultSection())
+	})
+
+	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+	require.NoError(t, err)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 3)
+	assert.Equal(t, recorded[0].header, recorded[1].header,
+		"a replay must carry the same client and request id for the server to deduplicate it")
+	assert.Equal(t, recorded[0].header, recorded[2].header)
+	assert.Equal(t, recorded[0].payload, recorded[2].payload)
+}
+
+func TestExchange_GivesUpOnNotCommittedWhenTheBudgetExpires(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return statusReplyFrame(vsr.OperationCreateStream,
+			uint32(ierror.TransientNotCommittedCode), nil)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	_, err := c.sendWireAndFetchResponse(ctx, emptyWireReq)
-	if err == nil {
-		t.Fatal("expected timeout error, got nil")
-	}
-
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("got %v, want context.DeadlineExceeded", err)
-	}
-	// After a timeout, the connection should be invalidated.
-	if c.transportState != iggcon.TransportStateDisconnected {
-		t.Errorf("expected state %v, got %v", iggcon.TransportStateDisconnected, c.transportState)
-	}
-
-	// TODO: revisit after reconnect implementation
+	_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-func TestSendAndFetchResponse_CancelDuringIO(t *testing.T) {
-	c, _ := newTestClient(t)
+func TestExchange_EscalatesNotAcceptedToALeaderRecheck(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	// A single-node roster short-circuits the redirect, so the request keeps
+	// replaying on this connection until the caller's budget runs out.
+	server := serve(serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, "127.0.0.1:8090")
+		}
+		return statusReplyFrame(vsr.OperationCreateStream,
+			uint32(ierror.TransientNotAcceptedCode), nil)
+	})
 
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client.config.reconnection.enabled = false
+
+	_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
+	require.Error(t, err)
+
+	var sawMetadata bool
+	for _, recorded := range server.recorded() {
+		if recorded.code() == uint32(command.GetClusterMetadataCode) {
+			sawMetadata = true
+		}
+	}
+	assert.True(t, sawMetadata, "the client re-checked leadership")
+}
+
+func TestExchange_ResetsTheSessionOnAnEviction(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	before := client.session.ClientID()
+	serve(serverConn, func(_ int, _ request) []byte {
+		return evictionFrame(vsr.EvictionStaleClient, 0, 0)
+	})
+
+	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+	assert.ErrorIs(t, err, ierror.ErrStaleClient)
+
+	var eviction *vsr.EvictionError
+	assert.ErrorAs(t, err, &eviction)
+	assert.False(t, client.session.Bound(), "the fence no longer holds")
+	assert.NotEqual(t, before, client.session.ClientID(), "a new identity is minted")
+	assert.Equal(t, iggcon.SessionStateUnauthenticated, client.sessionState)
+}
+
+func TestExchange_MapsEveryEvictionReasonThatReachesTheCaller(t *testing.T) {
+	tests := []struct {
+		reason vsr.EvictionReason
+		want   error
+	}{
+		{reason: vsr.EvictionInvalidCredentials, want: ierror.ErrInvalidCredentials},
+		{reason: vsr.EvictionInvalidToken, want: ierror.ErrInvalidPersonalAccessToken},
+		{reason: vsr.EvictionMalformedLogin, want: ierror.ErrInvalidFormat},
+		{reason: vsr.EvictionInvalidRequestBody, want: ierror.ErrInvalidCommand},
+	}
+	for _, test := range tests {
+		client, serverConn := newPipeClient(t)
+		client.config.reconnection.enabled = false
+		serve(serverConn, func(_ int, _ request) []byte {
+			return evictionFrame(test.reason, 0, 0)
+		})
+
+		_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+		assert.ErrorIs(t, err, test.want, "reason %d", test.reason)
+	}
+}
+
+func TestExchange_InvalidatesTheConnectionOnAFrameShorterThanItsHeader(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	serve(serverConn, func(_ int, _ request) []byte {
+		frame := replyFrame(vsr.OperationNonReplicated, nil)
+		binary.LittleEndian.PutUint32(frame[frameOffsetSize:], vsr.HeaderSize-1)
+		return frame
+	})
+
+	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState,
+		"the stream is at an unknown boundary, so the connection is dropped")
+}
+
+func TestExchange_RejectsAFrameAboveTheTransportLimitWithoutReadingItsBody(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	serve(serverConn, func(_ int, _ request) []byte {
+		frame := replyFrame(vsr.OperationNonReplicated, nil)
+		binary.LittleEndian.PutUint32(frame[frameOffsetSize:], vsr.MaxFrameSize+1)
+		return frame
+	})
+
+	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+}
+
+func TestExchange_InvalidatesTheConnectionWhenTheReplyIsCutShort(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	serve(serverConn, func(_ int, _ request) []byte {
+		_ = serverConn.Close()
+		return nil
+	})
+
+	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+	assert.ErrorIs(t, err, ierror.ErrDisconnected)
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+}
+
+func TestExchange_InvalidatesTheConnectionWhenTheContextIsCancelledMidRead(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
 	ctx, cancel := context.WithCancel(context.Background())
-
-	// Cancel the context after a short delay to unblock the I/O.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
+	serve(serverConn, func(_ int, _ request) []byte {
 		cancel()
-	}()
+		return nil
+	})
 
-	// Server does not respond, so the client blocks until the context is cancelled.
-	_, err := c.sendWireAndFetchResponse(ctx, emptyWireReq)
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+}
+
+func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	confirmations := binary.LittleEndian.AppendUint32(nil, 1)
+	confirmations = binary.LittleEndian.AppendUint32(confirmations, 3)
+	confirmations = binary.LittleEndian.AppendUint32(confirmations, 2)
+	confirmations = binary.LittleEndian.AppendUint32(confirmations, 1)
+	confirmations = binary.LittleEndian.AppendUint64(confirmations, 42)
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationSendMessages, confirmations)
+	})
+
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	response, err := client.SendMessages(context.Background(),
+		numericIdentifier(t, 3), numericIdentifier(t, 2),
+		iggcon.PartitionId(1), []iggcon.IggyMessage{message})
+	require.NoError(t, err)
+
+	assert.Equal(t, []iggcon.SendMessagesConfirmation{
+		{StreamId: 3, TopicId: 2, PartitionId: 1, BaseOffset: 42},
+	}, response.Confirmations)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 1)
+	assert.Equal(t, vsr.OperationSendMessages, recorded[0].operation())
+	assert.Equal(t, uint32(1), recorded[0].partitionID(t))
+	assert.Equal(t, uint64(1), recorded[0].requestID(),
+		"a partition request reads the watermark without consuming it")
+}
+
+func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	serve(serverConn, func(_ int, _ request) []byte {
+		// The server answers a replicated request on a dead session with an
+		// empty status-0 reply. Nothing was written, so reading it as a
+		// successful send would silently drop the batch.
+		return replyFrame(vsr.OperationSendMessages, nil)
+	})
+
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	_, err = client.SendMessages(context.Background(),
+		numericIdentifier(t, 1), numericIdentifier(t, 1),
+		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
+}
+
+func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
+	})
+
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	response, err := client.SendMessages(context.Background(),
+		numericIdentifier(t, 1), numericIdentifier(t, 1),
+		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+	require.NoError(t, err)
+	assert.Empty(t, response.Confirmations)
+}
+
+// zeroConfirmations builds a confirmation section with a zero entry count.
+func zeroConfirmations() []byte {
+	return binary.LittleEndian.AppendUint32(nil, 0)
+}
+
+func TestSendMessages_DegradesAnUnreadableConfirmationBody(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	serve(serverConn, func(_ int, _ request) []byte {
+		// The batch already committed, so a decode failure must not surface as
+		// an error a caller would retry into a duplicate write.
+		return replyFrame(vsr.OperationSendMessages, []byte{1, 0, 0, 0, 0xFF})
+	})
+
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	response, err := client.SendMessages(context.Background(),
+		numericIdentifier(t, 1), numericIdentifier(t, 1),
+		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+	require.NoError(t, err)
+	assert.Empty(t, response.Confirmations)
+}
+
+func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, read request) []byte {
+		if read.operation() == vsr.OperationSendMessages {
+			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
+		}
+		return replyFrame(vsr.OperationNonReplicated, topicDetailsBody(t, 4))
+	})
+
+	key, err := iggcon.EntityIdString("order-key-1")
+	require.NoError(t, err)
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+
+	_, err = client.SendMessages(context.Background(),
+		numericIdentifier(t, 1), numericIdentifier(t, 1), key, []iggcon.IggyMessage{message})
+	require.NoError(t, err)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 2)
+	assert.Equal(t, uint32(command.GetTopicCode), recorded[0].code())
+	// 0x0D3FE0E1 modulo four partitions.
+	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
+}
+
+func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, read request) []byte {
+		if read.operation() == vsr.OperationSendMessages {
+			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
+		}
+		return replyFrame(vsr.OperationNonReplicated, topicDetailsBody(t, 3))
+	})
+
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	for range 4 {
+		_, err = client.SendMessages(context.Background(),
+			numericIdentifier(t, 1), numericIdentifier(t, 1),
+			iggcon.None(), []iggcon.IggyMessage{message})
+		require.NoError(t, err)
 	}
 
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("got %v, want context.Canceled", err)
+	var partitions []uint32
+	for _, recorded := range server.recorded() {
+		if recorded.operation() == vsr.OperationSendMessages {
+			partitions = append(partitions, recorded.partitionID(t))
+		}
 	}
-	// Connection should be invalidated after the I/O error.
-	if c.transportState != iggcon.TransportStateDisconnected {
-		t.Errorf("expected state %v, got %v", iggcon.TransportStateDisconnected, c.transportState)
+	assert.Equal(t, []uint32{0, 1, 2, 0}, partitions)
+
+	metadataRequests := 0
+	for _, recorded := range server.recorded() {
+		if recorded.code() == uint32(command.GetTopicCode) {
+			metadataRequests++
+		}
+	}
+	assert.Equal(t, 1, metadataRequests, "the partition count is cached after the first read")
+}
+
+func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationSendMessages, nil)
+	})
+
+	_, err := client.SendMessages(context.Background(),
+		numericIdentifier(t, 1), numericIdentifier(t, 1), iggcon.PartitionId(0), nil)
+	assert.ErrorIs(t, err, ierror.ErrInvalidMessagesCount)
+	assert.Empty(t, server.recorded())
+}
+
+func TestCanReplay_RefusesOnlyReplicatedRequestsWithAnUnknownOutcome(t *testing.T) {
+	tests := []struct {
+		name string
+		code uint32
+		err  error
+		want bool
+	}{
+		{name: "register replays by design",
+			code: uint32(command.LoginRegisterCode), err: ierror.ErrDisconnected, want: true},
+		{name: "non-replicated read replays",
+			code: uint32(command.PingCode), err: ierror.ErrDisconnected, want: true},
+		{name: "replicated write never sent replays",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrNotConnected, want: true},
+		{name: "replicated write refused by the server replays",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrUnauthenticated, want: true},
+		{name: "replicated write on a stale client replays",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrStaleClient, want: true},
+		{name: "replicated write with a lost reply is refused",
+			code: uint32(command.CreateStreamCode), err: ierror.ErrDisconnected, want: false},
+		{name: "send with a lost reply is refused",
+			code: uint32(command.SendMessagesCode), err: ierror.ErrDisconnected, want: false},
+		{name: "token mint with a lost reply is refused",
+			code: uint32(command.CreateAccessTokenCode), err: ierror.ErrDisconnected, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, canReplay(test.code, test.err))
+		})
 	}
 }
 
-// serverRespond is a test helper that reads the full request from the pipe
-// and writes back a response with the given status code and payload.
-func serverRespond(t *testing.T, serverConn net.Conn, status uint32, payload []byte) {
+// topicDetailsBody builds the reply body of GetTopic for a topic with the
+// given partition count and no partitions listed.
+func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	t.Helper()
-	_ = serverRespondCapture(t, serverConn, status, payload)
-}
 
-// serverRespondCapture is like serverRespond but returns the request bytes
-// (4-byte command code followed by the marshaled body) it read off the pipe.
-// Returns nil if the read or write fails.
-func serverRespondCapture(t *testing.T, serverConn net.Conn, status uint32, payload []byte) []byte {
-	t.Helper()
-
-	var lengthBuf [RequestInitialBytesLength]byte
-	if _, err := serverConn.Read(lengthBuf[:]); err != nil {
-		t.Errorf("server: read request length: %v", err)
-		return nil
-	}
-	reqLen := int(binary.LittleEndian.Uint32(lengthBuf[:]))
-	req := make([]byte, reqLen)
-	if _, err := serverConn.Read(req); err != nil {
-		t.Errorf("server: read request body: %v", err)
-		return nil
-	}
-
-	resp := make([]byte, 8+len(payload))
-	binary.LittleEndian.PutUint32(resp[0:4], status)
-	binary.LittleEndian.PutUint32(resp[4:8], uint32(len(payload)))
-	copy(resp[8:], payload)
-	if _, err := serverConn.Write(resp); err != nil {
-		t.Errorf("server: write response: %v", err)
-		return nil
-	}
-	return req
-}
-
-func TestSendAndFetchResponse_ErrorStatus(t *testing.T) {
-	c, serverConn := newTestClient(t)
-
-	go serverRespond(t, serverConn, uint32(ierror.UnauthenticatedCode), nil)
-
-	_, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	// Should return the iggy error corresponding to the status code.
-	if !errors.Is(err, ierror.ErrUnauthenticated) {
-		t.Errorf("got %v, want %v", err, ierror.ErrUnauthenticated)
-	}
-	// Connection should remain healthy after an application-level error.
-	if c.transportState != iggcon.TransportStateConnected {
-		t.Errorf("expected state %v, got %v", iggcon.TransportStateConnected, c.transportState)
-	}
-}
-
-func TestSendAndFetchResponse_SuccessEmptyBody(t *testing.T) {
-	c, serverConn := newTestClient(t)
-
-	go serverRespond(t, serverConn, 0, nil)
-
-	result, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 0 {
-		t.Errorf("expected empty result, got %d bytes", len(result))
-	}
-	if c.transportState != iggcon.TransportStateConnected {
-		t.Errorf("expected state %v, got %v", iggcon.TransportStateConnected, c.transportState)
-	}
-}
-
-func TestSendAndFetchResponse_SuccessWithBody(t *testing.T) {
-	c, serverConn := newTestClient(t)
-
-	body := []byte("hello iggy")
-	go serverRespond(t, serverConn, 0, body)
-
-	result, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(result) != string(body) {
-		t.Errorf("got %q, want %q", result, body)
-	}
-	if c.transportState != iggcon.TransportStateConnected {
-		t.Errorf("expected state %v, got %v", iggcon.TransportStateConnected, c.transportState)
-	}
-}
-
-func TestNewIggyTcpClient_StoresProvidedLogger(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-
-	c := NewIggyTcpClient(logger)
-
-	c.logger.Info("transport probe", slog.String("source", "tcp"))
-
-	output := buf.String()
-	if !strings.Contains(output, "transport probe") {
-		t.Errorf("expected logger output to contain 'transport probe', got: %q", output)
-	}
-	if !strings.Contains(output, "source=tcp") {
-		t.Errorf("expected logger output to contain 'source=tcp', got: %q", output)
-	}
-}
-
-func TestLoginUser_LoginAndLogout(t *testing.T) {
-	c, serverConn := newTestClient(t)
-
-	identity := make([]byte, 4)
-	binary.LittleEndian.PutUint32(identity, 42)
-
-	go func() {
-		serverRespond(t, serverConn, 0, identity)
-		// login always probes for a leader afterwards; it must be answered or the call blocks.
-		serverRespond(t, serverConn, uint32(ierror.FeatureUnavailableCode), nil)
-		serverRespond(t, serverConn, 0, nil)
-	}()
-
-	ctx := context.Background()
-	info, err := c.LoginUser(ctx, "iggy", "iggy")
-	if err != nil {
-		t.Fatalf("unexpected login error: %v", err)
-	}
-	if info.UserId != 42 {
-		t.Errorf("got user id %d, want 42", info.UserId)
-	}
-	if c.sessionState != iggcon.SessionStateAuthenticated {
-		t.Errorf("expected session %v after login, got %v", iggcon.SessionStateAuthenticated, c.sessionState)
-	}
-
-	if err := c.LogoutUser(ctx); err != nil {
-		t.Fatalf("unexpected logout error: %v", err)
-	}
-	if c.sessionState != iggcon.SessionStateUnauthenticated {
-		t.Errorf("expected session %v after logout, got %v", iggcon.SessionStateUnauthenticated, c.sessionState)
-	}
-}
-
-func TestLoginUser_RejectedReloginKeepsExistingSession(t *testing.T) {
-	c, serverConn := newTestClient(t)
-	c.sessionState = iggcon.SessionStateAuthenticated
-
-	go serverRespond(t, serverConn, uint32(ierror.InvalidCredentialsCode), nil)
-
-	_, err := c.LoginUser(context.Background(), "other-user", "wrong-password")
-	if err == nil {
-		t.Fatal("expected login error, got nil")
-	}
-	if !errors.Is(err, ierror.ErrInvalidCredentials) {
-		t.Errorf("got %v, want %v", err, ierror.ErrInvalidCredentials)
-	}
-	// The server rejects the login before touching the existing session,
-	// so the client must keep reporting the session it still has.
-	if c.sessionState != iggcon.SessionStateAuthenticated {
-		t.Errorf("expected session to stay authenticated after rejected relogin, got %v", c.sessionState)
-	}
-}
-
-var errCloseFailed = errors.New("close failed")
-
-// failingCloseConn is a connection whose Close always fails, standing in for a
-// socket whose teardown reports an error the client cannot act on.
-type failingCloseConn struct {
-	net.Conn
-	closes int
-}
-
-func (f *failingCloseConn) Close() error {
-	f.closes++
-	return errCloseFailed
-}
-
-func TestShutdown_FailedCloseStillCompletesTeardown(t *testing.T) {
-	c, _ := newTestClient(t)
-	conn := &failingCloseConn{Conn: c.conn}
-	c.conn = conn
-
-	if err := c.shutdown(); !errors.Is(err, errCloseFailed) {
-		t.Fatalf("got %v, want %v", err, errCloseFailed)
-	}
-	if c.transportState != iggcon.TransportStateShutdown {
-		t.Errorf("expected state %v, got %v", iggcon.TransportStateShutdown, c.transportState)
-	}
-	if c.conn != nil {
-		t.Error("expected the closed connection to be dropped")
-	}
-
-	if err := c.shutdown(); err != nil {
-		t.Errorf("expected the second shutdown to be a no-op, got %v", err)
-	}
-	if conn.closes != 1 {
-		t.Errorf("expected the connection to be closed once, got %d", conn.closes)
-	}
-}
-
-func TestDisconnect_ShutdownClientIsNotResurrected(t *testing.T) {
-	c, _ := newTestClient(t)
-
-	if err := c.shutdown(); err != nil {
-		t.Fatalf("unexpected shutdown error: %v", err)
-	}
-	if err := c.disconnect(); err != nil {
-		t.Fatalf("unexpected disconnect error: %v", err)
-	}
-
-	if c.transportState != iggcon.TransportStateShutdown {
-		t.Errorf("expected state to stay %v, got %v", iggcon.TransportStateShutdown, c.transportState)
-	}
-
-	_, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
-	if !errors.Is(err, ierror.ErrClientShutdown) {
-		t.Errorf("got %v, want %v", err, ierror.ErrClientShutdown)
-	}
-}
-
-func TestSendBinaryRequest_FrameLayoutAndSuccess(t *testing.T) {
-	c, serverConn := newTestClient(t)
-	const code = uint32(60_000)
-	payload := []byte{0xAA, 0xBB, 0xCC}
-	body := []byte("opaque response")
-
-	type capturedFrame struct {
-		length uint32
-		code   uint32
-		body   []byte
-	}
-	captured := make(chan capturedFrame, 1)
-	go func() {
-		var lengthBuf [RequestInitialBytesLength]byte
-		if _, err := serverConn.Read(lengthBuf[:]); err != nil {
-			t.Errorf("server: read request length: %v", err)
-			return
-		}
-		length := binary.LittleEndian.Uint32(lengthBuf[:])
-		req := make([]byte, length)
-		if _, err := serverConn.Read(req); err != nil {
-			t.Errorf("server: read request body: %v", err)
-			return
-		}
-		captured <- capturedFrame{
-			length: length,
-			code:   binary.LittleEndian.Uint32(req[:4]),
-			body:   req[4:],
-		}
-
-		resp := make([]byte, 8+len(body))
-		binary.LittleEndian.PutUint32(resp[0:4], 0)
-		binary.LittleEndian.PutUint32(resp[4:8], uint32(len(body)))
-		copy(resp[8:], body)
-		if _, err := serverConn.Write(resp); err != nil {
-			t.Errorf("server: write response: %v", err)
-		}
-	}()
-
-	result, err := c.SendBinaryRequest(context.Background(), code, payload)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(result) != string(body) {
-		t.Errorf("got response %q, want %q", result, body)
-	}
-
-	frame := <-captured
-	wantLength := uint32(4 + len(payload))
-	if frame.length != wantLength {
-		t.Errorf("got length prefix=%d, want %d", frame.length, wantLength)
-	}
-	if frame.code != code {
-		t.Errorf("got code=%d, want %d", frame.code, code)
-	}
-	if !bytes.Equal(frame.body, payload) {
-		t.Errorf("got payload=%v, want %v", frame.body, payload)
-	}
-}
-
-func TestSendBinaryRequest_ErrorStatus(t *testing.T) {
-	c, serverConn := newTestClient(t)
-
-	go serverRespond(t, serverConn, uint32(ierror.InvalidCommandCode), nil)
-
-	_, err := c.SendBinaryRequest(context.Background(), 60_000, nil)
-	if !errors.Is(err, ierror.ErrInvalidCommand) {
-		t.Errorf("got %v, want %v", err, ierror.ErrInvalidCommand)
-	}
-}
-
-func TestSendBinaryRequest_SessionControlGuard(t *testing.T) {
-	c, serverConn := newTestClient(t)
-
-	wrote := make(chan struct{})
-	go func() {
-		buf := make([]byte, 1)
-		if _, err := serverConn.Read(buf); err == nil {
-			close(wrote)
-		}
-	}()
-
-	guardedCodes := []uint32{
-		uint32(command.LoginUserCode),
-		uint32(command.LogoutUserCode),
-		uint32(command.LoginRegisterCode),
-		uint32(command.LoginWithAccessTokenCode),
-		uint32(command.LoginRegisterWithPATCode),
-	}
-	for _, guardedCode := range guardedCodes {
-		_, err := c.SendBinaryRequest(context.Background(), guardedCode, nil)
-		if !errors.Is(err, ierror.ErrInvalidCommand) {
-			t.Errorf("code %d: got %v, want %v", guardedCode, err, ierror.ErrInvalidCommand)
-		}
-	}
-
-	select {
-	case <-wrote:
-		t.Fatal("expected no bytes to be written to the wire for session-control codes")
-	case <-time.After(50 * time.Millisecond):
-	}
+	const nameOffset = 50
+	name := "orders"
+	body := make([]byte, nameOffset+1+len(name))
+	binary.LittleEndian.PutUint32(body[0:4], 1)
+	binary.LittleEndian.PutUint32(body[12:16], partitionsCount)
+	body[nameOffset] = byte(len(name))
+	copy(body[nameOffset+1:], name)
+	return body
 }

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_binary_protocol"
-version = "0.10.3-edge.2"
+version = "0.11.0-edge.1"
 description = "Wire protocol types and codec for the Iggy binary protocol. Shared between server and SDK."
 edition = "2024"
 rust-version.workspace = true
@@ -35,6 +35,7 @@ bytes = { workspace = true }
 enumset = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
+twox-hash = { workspace = true }
 
 [dev-dependencies]
 aligned-vec = { workspace = true }

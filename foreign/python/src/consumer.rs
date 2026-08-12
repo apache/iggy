@@ -16,7 +16,6 @@
 // under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
@@ -28,7 +27,7 @@ use iggy::prelude::{
     IggyError, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
-use pyo3::types::{PyDelta, PyDeltaAccess};
+use pyo3::types::PyDelta;
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
@@ -39,12 +38,12 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
+use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
 use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
-/// It wraps the RustIggyConsumer and provides asynchronous functionality
-/// through the contained runtime.
+/// It provides asynchronous functionality through the contained runtime.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyConsumer {
@@ -94,8 +93,7 @@ impl IggyConsumer {
 
     /// Stores the provided offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-    /// if the operation fails.
+    /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
         &self,
@@ -116,8 +114,7 @@ impl IggyConsumer {
 
     /// Deletes the offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-    /// if the operation fails.
+    /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
         &self,
@@ -137,7 +134,7 @@ impl IggyConsumer {
 
     /// Asynchronously iterate over `ReceiveMessage`s.
     /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-    /// or a `PyRuntimeError` on failure.
+    /// or a `RuntimeError` on failure.
     /// Note: This method does not currently support `AutoCommit.After`.
     /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
     /// only the interval part is applied; the `after` mode is ignored.
@@ -149,7 +146,7 @@ impl IggyConsumer {
     }
 
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-    /// Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+    /// Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,
@@ -429,26 +426,27 @@ pub enum AutoCommit {
     After(AutoCommitAfter),
 }
 
-impl From<&AutoCommit> for RustAutoCommit {
-    fn from(val: &AutoCommit) -> RustAutoCommit {
-        match val {
+impl TryFrom<&AutoCommit> for RustAutoCommit {
+    type Error = PyErr;
+
+    fn try_from(val: &AutoCommit) -> PyResult<RustAutoCommit> {
+        Ok(match val {
             AutoCommit::Disabled() => RustAutoCommit::Disabled,
-            AutoCommit::Interval(delta) => {
-                let duration = py_delta_to_iggy_duration(delta);
-                RustAutoCommit::Interval(duration)
-            }
+            AutoCommit::Interval(delta) => RustAutoCommit::Interval(auto_commit_interval(delta)?),
             AutoCommit::IntervalOrWhen(delta, when) => {
-                let duration = py_delta_to_iggy_duration(delta);
-                RustAutoCommit::IntervalOrWhen(duration, when.into())
+                RustAutoCommit::IntervalOrWhen(auto_commit_interval(delta)?, when.into())
             }
             AutoCommit::IntervalOrAfter(delta, after) => {
-                let duration = py_delta_to_iggy_duration(delta);
-                RustAutoCommit::IntervalOrAfter(duration, after.into())
+                RustAutoCommit::IntervalOrAfter(auto_commit_interval(delta)?, after.into())
             }
             AutoCommit::When(when) => RustAutoCommit::When(when.into()),
             AutoCommit::After(after) => RustAutoCommit::After(after.into()),
-        }
+        })
     }
+}
+
+fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<IggyDuration> {
+    reject_zero(py_delta_to_iggy_duration(delta)?, "AutoCommit interval")
 }
 
 /// The auto-commit mode for storing the offset on the server.
@@ -515,13 +513,4 @@ impl PyStubType for AutoCommitAfter {
     fn type_output() -> TypeInfo {
         TypeInfo::unqualified("AutoCommitAfter")
     }
-}
-
-pub fn py_delta_to_iggy_duration(delta1: &Py<PyDelta>) -> IggyDuration {
-    Python::attach(|py| {
-        let delta = delta1.bind(py);
-        let seconds = (delta.get_days() * 60 * 60 * 24 + delta.get_seconds()) as u64;
-        let nanos = (delta.get_microseconds() * 1_000) as u32;
-        IggyDuration::new(Duration::new(seconds, nanos))
-    })
 }

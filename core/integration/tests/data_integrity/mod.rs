@@ -15,30 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Requires state transfer: the 5 MB bench fill is thousands of ops while the
-// partition journal's evicted ring retains only the last 4096, so a restarted
-// replica's rejoin window exceeds what journal repair can serve. The commit
-// floor lets recovered segments stand in for the evicted prefix, but the
-// sub-floor stats/offset seeding this test asserts (exact messages_count /
-// size_bytes across the restart) is state transfer's job.
-#[cfg(not(feature = "vsr"))]
+// Partially vsr-gated inside the module: the remaining gates cover
+// `flush_unsaved_buffer`, which the server answers `FeatureUnavailable` and
+// which the eager-flush server envs replace under vsr. The bench-fill test
+// itself runs under vsr since PARTITION-plane state transfer landed, but the
+// harness spawns `iggy-bench` off disk with no cargo build-graph edge, so the
+// binary must be freshly built or a stale build hangs on login.
 mod verify_after_server_restart;
 mod verify_user_login_after_restart;
 
 // Not restart-based: it creates a user + PAT, stops the server, and greps the
-// data dir for plaintext. No replica catch-up needed, and server-ng hashes the
+// data dir for plaintext. No replica catch-up needed, and the server hashes the
 // password / PAT before either reaches the WAL, so it runs under vsr too.
 mod verify_no_plaintext_credentials_on_disk;
 
-// The cooperative-rebalance matrix runs under vsr too: it exercises server-ng's
-// consumer-group rebalancing (a VSR feature). Green at 95/95.
+// The cooperative-rebalance matrix exercises the server's consumer-group
+// rebalancing (a VSR capability). Green at 95/95.
 mod verify_consumer_group_partition_assignment;
 
 // Cross-replica on-disk data identity is VSR-only.
-#[cfg(feature = "vsr")]
 mod verify_cluster_replica_data_identical;
 
 // Auto-commit offset replication is inherently a multi-node (VSR) property: the
 // backup only holds the offset if the poll's auto-commit rode consensus.
-#[cfg(feature = "vsr")]
 mod verify_auto_commit_offset_replicates;

@@ -17,9 +17,9 @@
 
 //! Tests for message retention policies (time-based and size-based).
 //!
-//! Configuration: 100KB segment size, 100ms cleaner interval, instant flush.
+//! Configuration: 10KiB segment size, 100ms cleaner interval, instant flush.
 //! Message size: 64B header + 936B payload = 1KB per message.
-//! Therefore: 100 messages = 1 segment, 101+ messages = 2+ segments.
+//! Therefore a segment holds 9 messages and every ~10 messages rotates one.
 
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -48,7 +48,13 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    // The whole send burst has to land inside this window: expiry runs off each
+    // message's own timestamp, so a produce run that outlives it gets its
+    // oldest segments reclaimed before the pre-expiry poll ever runs. A 3-node
+    // vsr cluster in a debug build pays a consensus round-trip plus an fsync
+    // per request, which is what pushed the old one-message-per-request loop
+    // past the old 2s window.
+    let expiry = Duration::from_secs(4);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -70,18 +76,24 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 110 messages (1KB each) to create 2 segments (100KB segment size)
+    // Send 110 messages (1KB each) in batches, spanning several 10KiB segments.
+    // Batched rather than one request per message: the burst must fit inside
+    // `expiry` with room to spare, and each request costs a round-trip.
     let payload = make_payload('A');
-    let total_messages = 110;
+    let total_messages: usize = 110;
+    let batch_size = 10;
 
-    for i in 0..total_messages {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
-
-        let mut messages = vec![message];
+    for chunk_start in (0..total_messages).step_by(batch_size) {
+        let mut messages: Vec<IggyMessage> = (chunk_start
+            ..total_messages.min(chunk_start + batch_size))
+            .map(|i| {
+                IggyMessage::builder()
+                    .id(i as u128)
+                    .payload(payload.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
         client
             .send_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
@@ -117,7 +129,7 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
 
     assert_eq!(
         polled_before.messages.len(),
-        total_messages as usize,
+        total_messages,
         "Should poll all messages before expiry"
     );
 
@@ -345,16 +357,24 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 110 messages to create 2 segments (under size threshold, but will expire)
+    // Send 110 messages to create 2 segments (under size threshold, but will
+    // expire). Batched so the burst finishes well inside `expiry`: a per-message
+    // request pays a consensus round-trip plus an fsync, and a loop that
+    // outlives the window has its head reclaimed before the count below.
     let payload = make_payload('C');
-    for i in 0..110 {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
-
-        let mut messages = vec![message];
+    let total_messages: usize = 110;
+    let batch_size = 10;
+    for chunk_start in (0..total_messages).step_by(batch_size) {
+        let mut messages: Vec<IggyMessage> = (chunk_start
+            ..total_messages.min(chunk_start + batch_size))
+            .map(|i| {
+                IggyMessage::builder()
+                    .id(i as u128)
+                    .payload(payload.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
         client
             .send_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
@@ -412,19 +432,25 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     let topic_id = topic.id;
 
     let payload = make_payload('D');
-    let messages_per_partition = 110;
+    let messages_per_partition: usize = 110;
+    let batch_size = 10;
 
-    // Send messages to all partitions
+    // Send messages to all partitions. Batched: a per-message request costs a
+    // consensus round-trip plus an fsync, and `PARTITIONS_COUNT` × 110 of those
+    // outlive `expiry`, so the cleaner would reclaim the first partition's
+    // sealed segments before the last one had even been written.
     for partition_id in 0..PARTITIONS_COUNT {
-        for i in 0..messages_per_partition {
-            let msg_id = partition_id as u128 * 1000 + i as u128;
-            let message = IggyMessage::builder()
-                .id(msg_id)
-                .payload(payload.clone())
-                .build()
-                .unwrap();
-
-            let mut messages = vec![message];
+        for chunk_start in (0..messages_per_partition).step_by(batch_size) {
+            let mut messages: Vec<IggyMessage> = (chunk_start
+                ..messages_per_partition.min(chunk_start + batch_size))
+                .map(|i| {
+                    IggyMessage::builder()
+                        .id(partition_id as u128 * 1000 + i as u128)
+                        .payload(payload.clone())
+                        .build()
+                        .unwrap()
+                })
+                .collect();
             client
                 .send_messages(
                     &Identifier::named(STREAM_NAME).unwrap(),
@@ -582,7 +608,7 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 /// Scenario:
 /// 1. Send 300 messages (3 segments at 100KB each)
 /// 2. Consumer reads only 50 messages (stored offset ~49, within segment 0)
-/// 3. Wait for all segments to expire (2s expiry)
+/// 3. Wait for all segments to expire (4s expiry)
 /// 4. Verify consumer can still poll Next() and get contiguous offsets
 ///
 /// On unfixed code: the cleaner deletes segments 0+1 (expired, consumer offset
@@ -594,7 +620,12 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     let stream = client.create_stream(TEST_STREAM).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    // Expiry must outlast the send + first-poll phase. If segments expire
+    // before the consumer commits its first offset, there is no barrier yet
+    // and the cleaner legally deletes them, breaking the premise: the poll
+    // below then starts at the earliest surviving offset instead of 0.
+    // The sends are batched for the same reason (see below).
+    let expiry = Duration::from_secs(4);
     let topic = client
         .create_topic(
             &Identifier::named(TEST_STREAM).unwrap(),
@@ -616,21 +647,29 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .display()
         .to_string();
 
-    // Send 300 messages (1KB each) -> 3 sealed segments + active
+    // Send 300 messages (1KB each) -> 3 sealed segments + active. Batched:
+    // one request per message costs a consensus round-trip plus an fsync each,
+    // which on a 3-node debug cluster runs the burst well past `expiry`.
     let payload = make_payload('B');
     let total_messages = 300u32;
-    for i in 0..total_messages {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(payload.clone())
-            .build()
-            .unwrap();
+    let batch_size = 10u32;
+    for chunk_start in (0..total_messages).step_by(batch_size as usize) {
+        let mut messages: Vec<IggyMessage> = (chunk_start
+            ..total_messages.min(chunk_start + batch_size))
+            .map(|i| {
+                IggyMessage::builder()
+                    .id(i as u128)
+                    .payload(payload.clone())
+                    .build()
+                    .unwrap()
+            })
+            .collect();
         client
             .send_messages(
                 &Identifier::named(TEST_STREAM).unwrap(),
                 &Identifier::named(TEST_TOPIC).unwrap(),
                 &Partitioning::partition_id(PARTITION_ID),
-                &mut [message],
+                &mut messages,
             )
             .await
             .unwrap();

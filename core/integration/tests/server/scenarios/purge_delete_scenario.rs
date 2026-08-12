@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::{POLL_CONVERGENCE_TIMEOUT, POLL_RETRY_INTERVAL};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::Credentials;
@@ -30,44 +31,22 @@ const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
 
-/// Payload chosen so IGGY_MESSAGE_HEADER_SIZE + payload = 1000B per message on disk.
-///
-/// Rotation mechanics (with segment.size = 5KiB = 5120B, messages_required_to_save = 1):
-///   `is_full()` checks `size >= 5120` BEFORE persisting the current message.
-///   After 6 persisted messages (6000B >= 5120) the next arrival sees is_full=true,
-///   gets persisted into the same segment, then rotation fires.
-///   Result: 7 messages per sealed segment (7000B on disk).
+/// The server persists the actual `SendMessages2` batch framing: a 256-byte
+/// command header per append (each send below is a single-message batch) plus
+/// a 48-byte per-message header, and a 24-byte sparse index entry per flush
+/// (one per message with messages_required_to_save = 1). See
+/// `server_common::send_messages2` and `stream_size_validation_scenario`.
 const PAYLOAD_SIZE: usize = 936;
-#[cfg(not(feature = "vsr"))]
-const MESSAGE_ON_DISK_SIZE: u64 = IGGY_MESSAGE_HEADER_SIZE as u64 + PAYLOAD_SIZE as u64;
-#[cfg(not(feature = "vsr"))]
-const INDEX_SIZE_PER_MSG: u64 = INDEX_SIZE as u64;
-// server-ng persists the actual `SendMessages2` batch framing: a 256-byte
-// command header per append (each send below is a single-message batch) plus
-// a 48-byte per-message header, and a 24-byte sparse index entry per flush
-// (one per message with messages_required_to_save = 1). See
-// `server_common::send_messages2` and `stream_size_validation_scenario`.
-#[cfg(feature = "vsr")]
 const NG_BATCH_HEADER_SIZE: u64 = 256;
-#[cfg(feature = "vsr")]
 const NG_MESSAGE_HEADER_SIZE: u64 = 48;
-#[cfg(feature = "vsr")]
 const MESSAGE_ON_DISK_SIZE: u64 =
     NG_BATCH_HEADER_SIZE + NG_MESSAGE_HEADER_SIZE + PAYLOAD_SIZE as u64;
-#[cfg(feature = "vsr")]
 const INDEX_SIZE_PER_MSG: u64 = 24;
 const TOTAL_MESSAGES: u32 = 25;
 
-/// 3 sealed segments (7 msgs each) + 1 active (4 msgs at offsets 21-24).
-#[cfg(not(feature = "vsr"))]
-const EXPECTED_SEGMENT_OFFSETS: &[u64] = &[0, 7, 14, 21];
-#[cfg(not(feature = "vsr"))]
-const MSGS_PER_SEALED_SEGMENT: u64 = 7;
 /// 5 sealed segments (5 msgs each at 1240B on disk; the post-append size
 /// check seals at 6200B >= 5KiB) + 1 empty active segment at offset 25.
-#[cfg(feature = "vsr")]
 const EXPECTED_SEGMENT_OFFSETS: &[u64] = &[0, 5, 10, 15, 20, 25];
-#[cfg(feature = "vsr")]
 const MSGS_PER_SEALED_SEGMENT: u64 = 5;
 
 /// Single consumer barrier: oldest-first deletion, barrier advancement, and edge cases.
@@ -158,11 +137,29 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
     // reflect the true partition max (24), not messages_count - 1 (17).
     {
         let max_offset = (TOTAL_MESSAGES - 1) as u64;
-        let offset_info = client
-            .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
-            .await
-            .unwrap()
-            .expect("consumer offset must exist after segment deletion");
+        // Short poll, not a one-shot read: the restart cells reconnect, and a
+        // read issued before the SDK settles on the leader can land on a replica
+        // that has not applied the offset op yet, which answers "no offset"
+        // rather than redirecting. Measured sub-millisecond on every converging
+        // run, so 2s is a transient allowance -- an offset that is genuinely
+        // gone still fails here.
+        let offset_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let offset_info = loop {
+            // A read racing the SDK's post-restart re-sign-in answers
+            // `Unauthenticated`; retry it inside the window like an absent
+            // offset rather than panicking on the Result.
+            if let Ok(Some(info)) = client
+                .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
+                .await
+            {
+                break info;
+            }
+            assert!(
+                std::time::Instant::now() < offset_deadline,
+                "consumer offset must exist after segment deletion"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
         assert_eq!(offset_info.stored_offset, stored_offset);
         assert_eq!(
             offset_info.current_offset,
@@ -283,7 +280,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         std::slice::from_ref(&active_segment_offset),
     )
     .await;
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
     assert_segment_file_sizes(
         &partition_path,
         std::slice::from_ref(&active_segment_offset),
@@ -373,18 +370,9 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
 
     let partition_path = partition_path(&data_path, stream_id, topic_id);
 
-    // server-ng's per-message on-disk framing differs from legacy, so the
-    // segment boundaries are not hardcodable. Capture the real layout once;
-    // legacy still verifies it matches the calculated offsets + file sizes.
+    // Capture the real layout rather than hardcoding boundaries: this path
+    // only needs a sealed segment plus the active one.
     let layout = get_sorted_segment_offsets(&partition_path);
-    #[cfg(not(feature = "vsr"))]
-    {
-        assert_eq!(
-            layout, EXPECTED_SEGMENT_OFFSETS,
-            "Segment layout must match calculated offsets"
-        );
-        assert_segment_file_sizes(&partition_path, EXPECTED_SEGMENT_OFFSETS);
-    }
     assert!(
         layout.len() >= 2,
         "expected at least one sealed segment plus the active one, got {layout:?}"
@@ -404,11 +392,9 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         maybe_restart(harness, restart_server).await;
 
         let first_surviving = layout[i + 1];
-        // server-ng deletes asynchronously (metadata commit -> reconciler);
-        // legacy deletes synchronously. Converge before asserting.
+        // Deletion is asynchronous (metadata commit -> reconciler), so
+        // converge before asserting.
         await_segment_layout(&partition_path, &layout[i + 1..]).await;
-        #[cfg(not(feature = "vsr"))]
-        assert_segment_file_sizes(&partition_path, &layout[i + 1..]);
         await_polled_offsets(
             &client,
             &stream_ident,
@@ -422,7 +408,7 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
     // Only the active segment remains — delete is a no-op
     let active = *layout.last().expect("layout is non-empty");
     await_segment_layout(&partition_path, std::slice::from_ref(&active)).await;
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
 
     client
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
@@ -430,8 +416,6 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         .unwrap();
 
     await_segment_layout(&partition_path, std::slice::from_ref(&active)).await;
-    #[cfg(not(feature = "vsr"))]
-    assert_segment_file_sizes(&partition_path, std::slice::from_ref(&active));
     await_polled_offsets(
         &client,
         &stream_ident,
@@ -580,7 +564,7 @@ pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
         [*EXPECTED_SEGMENT_OFFSETS.last().unwrap()],
         "Only active segment remains after consuming all messages"
     );
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
 
     // Cleanup: consumer group auto-managed, just delete stream resources
     drop(consumer);
@@ -818,7 +802,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .unwrap();
     maybe_restart(harness, restart_server).await;
     await_segment_layout(&partition_path, &active_only).await;
-    assert_no_orphaned_segment_files(&partition_path, 1);
+    assert_no_orphaned_segment_files(&partition_path, 1).await;
 
     // Cleanup: drop high-level consumer, delete stream resources
     drop(fast_consumer);
@@ -863,15 +847,6 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     send_messages(&client, &stream_ident, &topic_ident, TOTAL_MESSAGES).await;
 
     let partition_path = partition_path(&data_path, stream_id, topic_id);
-
-    // Exact layout is legacy-framing-specific; the purge outcome asserted below
-    // (offsets cleared, files deleted, partition reset to a single empty segment
-    // at offset 0, new messages from offset 0) is framing-agnostic.
-    #[cfg(not(feature = "vsr"))]
-    assert_eq!(
-        get_sorted_segment_offsets(&partition_path),
-        EXPECTED_SEGMENT_OFFSETS
-    );
 
     // --- Store individual consumer offset at 13 ---
     let consumer = Consumer {
@@ -956,14 +931,16 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     // Verify offset files exist on disk
     let consumers_dir = format!("{partition_path}/offsets/consumers");
     let groups_dir = format!("{partition_path}/offsets/groups");
-    assert!(
-        !is_dir_empty(&consumers_dir),
-        "Consumer offset file must exist before purge"
-    );
-    assert!(
-        !is_dir_empty(&groups_dir),
-        "Consumer group offset file must exist before purge"
-    );
+    await_dir_not_empty(
+        &consumers_dir,
+        "Consumer offset file must exist before purge",
+    )
+    .await;
+    await_dir_not_empty(
+        &groups_dir,
+        "Consumer group offset file must exist before purge",
+    )
+    .await;
 
     // --- Purge topic ---
     // Drop high-level consumer before purge to release group membership
@@ -972,57 +949,89 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
         .purge_topic(&stream_ident, &topic_ident)
         .await
         .unwrap();
+    // Sampled BEFORE the restart: if the purge already drained the offset
+    // directories, a restart may not resurrect them, and the assert below stays
+    // instant even in the restart cells. Only the kill-lands-mid-purge case
+    // earns a tolerance.
+    let drained_before_restart = is_dir_empty(&consumers_dir) && is_dir_empty(&groups_dir);
     maybe_restart(harness, restart_server).await;
 
-    // server-ng purges asynchronously (metadata commit -> reconciler -> pump);
-    // legacy purges synchronously. The pump's purge resets the partition to a
-    // single segment at offset 0 and clears consumer offsets + files in the
-    // same frame, so converging on the [0] layout means the whole purge landed.
-    #[cfg(feature = "vsr")]
+    // Purge is asynchronous (metadata commit -> reconciler -> pump). The
+    // pump's purge resets the partition to a single segment at offset 0 and
+    // clears consumer offsets + files in the same frame, so converging on the
+    // [0] layout means the whole purge landed.
     await_segment_layout(&partition_path, &[0]).await;
 
-    // --- Verify consumer offsets cleared ---
-    let consumer_offset = client
-        .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
-        .await
-        .unwrap();
-    assert!(
-        consumer_offset.is_none(),
-        "Consumer offset must be cleared after purge"
-    );
-
-    let group_offset = client
-        .get_consumer_offset(
-            &group_consumer_ref,
-            &stream_ident,
-            &topic_ident,
-            Some(PARTITION_ID),
+    // --- Verify consumer offsets cleared (memory + disk) ---
+    // ZERO tolerance everywhere except one cell: restart where the kill landed
+    // mid-purge. There boot plants the [0] layout itself (fencing a torn
+    // chain, or recovering an already-drained directory) with the offset files
+    // still present, so the layout gate above is satisfied BEFORE the
+    // reconciler's re-purge clears them (the kill preceded the purge.gen
+    // record, so boot hydrates the old generation and the reconciler
+    // re-purges). Everywhere else the pump clears
+    // offsets and files in the SAME frame that plants the layout, and a poll
+    // would hide a regression that clears them one frame late. Kept short --
+    // a client-visible stale offset after purge-then-restart is a real
+    // (bounded) window, not something to paper over with a long tolerance.
+    // 5s, not 2s: the re-purge after a restart is floor-bounded by the
+    // reconciler's 1s PERIODIC tick, not by a wake -- measured at 1.06-1.11s in
+    // isolation against 0.5-0.8ms for every non-restart cell. 2s left under one
+    // tick of slack, so metadata repair under load pushed it over. Still a
+    // bounded window on purpose: widen only with a measurement, and if this
+    // starts needing more, the wake is missing rather than the budget too small.
+    let poll_window = if restart_server && !drained_before_restart {
+        std::time::Duration::from_secs(5)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let offsets_deadline = std::time::Instant::now() + poll_window;
+    loop {
+        // Errors retry inside the window instead of panicking: the restart cells
+        // reconnect mid-loop, so the first read after the server comes back can
+        // answer `Unauthenticated` while the SDK is still re-signing in. A
+        // transient here is "not converged yet", not a verdict.
+        let reads = futures::future::join(
+            client.get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID)),
+            client.get_consumer_offset(
+                &group_consumer_ref,
+                &stream_ident,
+                &topic_ident,
+                Some(PARTITION_ID),
+            ),
         )
-        .await
-        .unwrap();
-    assert!(
-        group_offset.is_none(),
-        "Consumer group offset must be cleared after purge"
-    );
-
-    // --- Verify offset files deleted from disk ---
-    let consumer_files: Vec<_> = read_dir(&consumers_dir)
-        .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
-        .unwrap_or_default();
-    let group_files: Vec<_> = read_dir(&groups_dir)
-        .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
-        .unwrap_or_default();
-    assert!(
-        consumer_files.is_empty(),
-        "Consumer offset files must be deleted after purge, found: {consumer_files:?}"
-    );
-    assert!(
-        group_files.is_empty(),
-        "Consumer group offset files must be deleted after purge, found: {group_files:?}"
-    );
+        .await;
+        let (Ok(consumer_offset), Ok(group_offset)) = reads else {
+            assert!(
+                std::time::Instant::now() < offsets_deadline,
+                "consumer offset reads never succeeded after purge: {reads:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            continue;
+        };
+        let consumer_files: Vec<_> = read_dir(&consumers_dir)
+            .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+            .unwrap_or_default();
+        let group_files: Vec<_> = read_dir(&groups_dir)
+            .map(|e| e.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+            .unwrap_or_default();
+        if consumer_offset.is_none()
+            && group_offset.is_none()
+            && consumer_files.is_empty()
+            && group_files.is_empty()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < offsets_deadline,
+            "consumer offsets must be cleared after purge: consumer={consumer_offset:?} \
+             group={group_offset:?} consumer_files={consumer_files:?} group_files={group_files:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     // --- Verify partition reset: single empty segment at offset 0 ---
-    assert_fresh_empty_partition(&partition_path);
+    assert_fresh_empty_partition(&partition_path).await;
 
     // --- Verify new messages start at offset 0 ---
     let new_msg_count = 3u32;
@@ -1063,6 +1072,156 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     client.delete_stream(&stream_ident).await.unwrap();
 }
 
+/// Messages appended AFTER a purge must survive a restart: the purge's
+/// applied generation is durable (`purge.gen`), so boot re-hydrates it and
+/// the reconciler does not re-apply the (still-committed) purge over the
+/// post-purge data. Without that file a restart re-reads applied=0 against
+/// the replayed committed generation and silently wipes the new messages on
+/// its first pass.
+pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
+    let client = build_root_client(harness);
+    client.connect().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream_ident = Identifier::named(STREAM_NAME).unwrap();
+    client
+        .create_topic(
+            &stream_ident,
+            TOPIC_NAME,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    let topic_ident = Identifier::named(TOPIC_NAME).unwrap();
+
+    send_messages(&client, &stream_ident, &topic_ident, 10).await;
+    client
+        .purge_topic(&stream_ident, &topic_ident)
+        .await
+        .unwrap();
+    // The poll going empty is the barrier, not the segment layout: 10 messages
+    // never rotate the default 1.07 GB segment, so the directory holds one
+    // `0.log` before AND after the purge and a layout gate on `[0]` passes on
+    // its first read, before the purge has applied. `purge_topic` returns on
+    // the metadata commit while the reconciler stages the reset and the pump
+    // applies it, so an unsynchronized send races that window and is either
+    // wiped or fenced below the purge floor -- silently, since the offset it
+    // was acked at never becomes visible.
+    poll_exactly(&client, &stream_ident, &topic_ident, 0).await;
+
+    send_messages(&client, &stream_ident, &topic_ident, 3).await;
+    poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
+
+    maybe_restart(harness, true).await;
+
+    // Ride out the boot reconcile pass: an un-hydrated applied generation
+    // would re-purge asynchronously, so an immediate poll could still see
+    // the messages a moment before they vanish.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let polled = poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
+    let offsets: Vec<u64> = polled.messages.iter().map(|m| m.header.offset).collect();
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2],
+        "post-purge messages must survive the restart at their offsets"
+    );
+}
+
+/// Journal-resident messages must not resurface after a purge: with the
+/// flush threshold too high to ever persist, the purged batches stay in the
+/// in-memory journal as consensus history, and the graceful-shutdown flush
+/// walks them again. The purge floor must fence them out of the segment so
+/// the restart recovers only the post-purge appends.
+pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
+    let client = build_root_client(harness);
+    client.connect().await.unwrap();
+
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream_ident = Identifier::named(STREAM_NAME).unwrap();
+    client
+        .create_topic(
+            &stream_ident,
+            TOPIC_NAME,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    let topic_ident = Identifier::named(TOPIC_NAME).unwrap();
+
+    send_messages(&client, &stream_ident, &topic_ident, 5).await;
+    poll_exactly(&client, &stream_ident, &topic_ident, 5).await;
+
+    client
+        .purge_topic(&stream_ident, &topic_ident)
+        .await
+        .unwrap();
+    // The purge is asynchronous and the segments are empty both before and
+    // after it (nothing ever flushed), so the poll going empty IS the
+    // convergence signal: it proves the resident poll tier was sealed.
+    poll_exactly(&client, &stream_ident, &topic_ident, 0).await;
+
+    send_messages(&client, &stream_ident, &topic_ident, 3).await;
+    let polled = poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
+    let offsets: Vec<u64> = polled.messages.iter().map(|m| m.header.offset).collect();
+    assert_eq!(offsets, vec![0, 1, 2], "post-purge appends restart at 0");
+
+    // Graceful restart: shutdown force-flushes the committed journal, whose
+    // front still holds the five fenced pre-purge batches.
+    maybe_restart(harness, true).await;
+
+    let polled = poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
+    let offsets: Vec<u64> = polled.messages.iter().map(|m| m.header.offset).collect();
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2],
+        "purged resident batches must not resurface through the shutdown \
+         flush or recovery"
+    );
+}
+
+/// Poll from offset 0 with headroom (count 100) until exactly `expected`
+/// messages are served, so an extra resurfaced message fails the count
+/// instead of being cropped by the poll size. Panics after
+/// [`POLL_CONVERGENCE_TIMEOUT`] with the last observed count.
+async fn poll_exactly(
+    client: &IggyClient,
+    stream_ident: &Identifier,
+    topic_ident: &Identifier,
+    expected: usize,
+) -> PolledMessages {
+    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    loop {
+        let polled = client
+            .poll_messages(
+                stream_ident,
+                topic_ident,
+                Some(PARTITION_ID),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                100,
+                false,
+            )
+            .await
+            .unwrap();
+        if polled.messages.len() == expected {
+            return polled;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "poll did not converge to {expected} messages, last saw {}",
+            polled.messages.len()
+        );
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
+}
+
 /// Wait until the server-visible stored offset for `consumer` reaches
 /// `expected`. Auto-commit stores are issued by a detached SDK task and
 /// applied on the partition's owning shard, so the only ordering guarantee
@@ -1091,11 +1250,9 @@ async fn await_stored_offset(
 
 /// Wait for the partition's on-disk segment layout to converge to `expected`.
 ///
-/// server-ng's `DeleteSegments` is eventually-consistent: the client call
-/// returns after the metadata `TruncatePartition` commit, and the partition
-/// reconciler performs the on-disk deletion on its next pass. Legacy deletes
-/// synchronously, so it asserts immediately.
-#[cfg(feature = "vsr")]
+/// `DeleteSegments` is eventually-consistent: the client call returns after
+/// the metadata `TruncatePartition` commit, and the partition reconciler
+/// performs the on-disk deletion on its next pass.
 async fn await_segment_layout(partition_path: &str, expected: &[u64]) {
     for _ in 0..200 {
         if get_sorted_segment_offsets(partition_path).as_slice() == expected {
@@ -1112,24 +1269,14 @@ async fn await_segment_layout(partition_path: &str, expected: &[u64]) {
 
 /// Assert the layout stays at `expected` when no deletion must happen.
 ///
-/// The vsr side sleeps past a reconciler pass first, since an erroneous
-/// deletion would land asynchronously; legacy deletes synchronously, so an
-/// immediate assert suffices.
+/// Sleeps past a reconciler pass first, since an erroneous deletion would
+/// land asynchronously.
 async fn assert_layout_stable(partition_path: &str, expected: &[u64]) {
-    #[cfg(feature = "vsr")]
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert_eq!(
         get_sorted_segment_offsets(partition_path).as_slice(),
         expected,
         "segment layout must remain unchanged"
-    );
-}
-
-#[cfg(not(feature = "vsr"))]
-async fn await_segment_layout(partition_path: &str, expected: &[u64]) {
-    assert_eq!(
-        get_sorted_segment_offsets(partition_path).as_slice(),
-        expected
     );
 }
 
@@ -1231,7 +1378,10 @@ async fn poll_all_offsets(
         kind: ConsumerKind::Consumer,
         id: Identifier::numeric(99).unwrap(),
     };
-    let polled = client
+    // An errored poll reads as "nothing yet" so the caller's retry loop keeps
+    // going: the restart cells reconnect mid-scenario and the first poll after
+    // the server returns can answer `Unauthenticated` while the SDK re-signs in.
+    client
         .poll_messages(
             stream_ident,
             topic_ident,
@@ -1242,8 +1392,8 @@ async fn poll_all_offsets(
             false,
         )
         .await
-        .unwrap();
-    polled.messages.iter().map(|m| m.header.offset).collect()
+        .map(|polled| polled.messages.iter().map(|m| m.header.offset).collect())
+        .unwrap_or_default()
 }
 
 /// Asserts that each segment's `.log` and `.index` files have the exact expected size.
@@ -1301,6 +1451,21 @@ fn get_sorted_segment_offsets(partition_path: &str) -> Vec<u64> {
     offsets
 }
 
+/// Wait until `dir` contains at least one entry, panicking with `context`
+/// once [`POLL_CONVERGENCE_TIMEOUT`] expires.
+///
+/// A stored consumer offset is served from memory as soon as the store is
+/// acked, while the offset file is created asynchronously, so a single-shot
+/// existence check can run ahead of the flush. An offset that is never
+/// flushed still fails once the deadline expires.
+async fn await_dir_not_empty(dir: &str, context: &str) {
+    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    while is_dir_empty(dir) {
+        assert!(std::time::Instant::now() < deadline, "{context}");
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
+}
+
 fn is_dir_empty(dir: &str) -> bool {
     read_dir(dir)
         .map(|mut entries| entries.next().is_none())
@@ -1309,12 +1474,12 @@ fn is_dir_empty(dir: &str) -> bool {
 
 /// Asserts the partition directory contains exactly one .log and one .index file at offset 0,
 /// both with size 0 — the expected state after a full purge or segment reset.
-fn assert_fresh_empty_partition(partition_path: &str) {
-    assert_eq!(
-        get_sorted_segment_offsets(partition_path),
-        [0],
-        "Partition must contain a single segment at offset 0"
-    );
+///
+/// Awaits the layout rather than reading once: a state-transfer install unlinks
+/// the old chain before planting the replacement, so a replica that learns the
+/// purge that way exposes a window with no `.log` at all.
+async fn assert_fresh_empty_partition(partition_path: &str) {
+    await_segment_layout(partition_path, &[0]).await;
     assert_eq!(
         count_files_with_ext(partition_path, INDEX_EXTENSION),
         1,
@@ -1335,20 +1500,28 @@ fn assert_fresh_empty_partition(partition_path: &str) {
     );
 }
 
-/// Asserts no orphaned segment files remain after deletion.
-/// `get_sorted_segment_offsets` only checks .log files — this additionally verifies
-/// that the .index file count matches, catching stale .index files left behind.
-fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: usize) {
-    let log_count = count_files_with_ext(partition_path, LOG_EXTENSION);
-    let index_count = count_files_with_ext(partition_path, INDEX_EXTENSION);
-    assert_eq!(
-        log_count, expected_count,
-        "Expected {expected_count} .log files, found {log_count}"
-    );
-    assert_eq!(
-        index_count, expected_count,
-        "Expected {expected_count} .index files, found {index_count}"
-    );
+/// Asserts no orphaned segment files remain after deletion, polling until the
+/// counts converge or [`POLL_CONVERGENCE_TIMEOUT`] expires.
+///
+/// `get_sorted_segment_offsets` only checks .log files -- this additionally
+/// verifies that the .index file count matches, catching stale .index files
+/// left behind. The server unlinks a segment's .log and .index files across
+/// separate awaits, so a layout that already converged on .log files can
+/// transiently show one extra .index file.
+async fn assert_no_orphaned_segment_files(partition_path: &str, expected_count: usize) {
+    let deadline = std::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    loop {
+        let log_count = count_files_with_ext(partition_path, LOG_EXTENSION);
+        let index_count = count_files_with_ext(partition_path, INDEX_EXTENSION);
+        if log_count == expected_count && index_count == expected_count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Expected {expected_count} .log and .index files, found {log_count} .log and {index_count} .index"
+        );
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
 }
 
 fn count_files_with_ext(dir: &str, ext: &str) -> usize {

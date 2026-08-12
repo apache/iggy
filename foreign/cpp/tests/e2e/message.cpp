@@ -47,8 +47,14 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
         messages.push_back(std::move(msg));
     }
 
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+    iggy::ffi::SendMessagesResponse sent;
+    ASSERT_NO_THROW(sent = client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                 "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    ASSERT_EQ(sent.confirmations.size(), 1u)
+        << "The VSR server reports the written partition's offsets, so a single-partition send "
+        << "must carry exactly one confirmation";
+    EXPECT_EQ(sent.confirmations.front().partition_id, 0u);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(1), "offset", 0, 100, false);

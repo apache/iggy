@@ -18,7 +18,7 @@
 //! Runtime tunables for the message bus.
 //!
 //! Single source of truth for these knobs is the on-disk schema
-//! [`configs::server_ng::ServerNgConfig`]. The bus consumes that
+//! [`configs::server::ServerConfig`]. The bus consumes that
 //! schema at construction (see [`crate::IggyMessageBus::with_config`])
 //! and converts the schema-typed fields
 //! ([`iggy_common::IggyDuration`] / [`iggy_common::IggyByteSize`])
@@ -26,14 +26,12 @@
 //! fields directly without per-call conversion.
 //!
 //! The WebSocket frame-layer config the bus consumes lives under the
-//! `[message_bus]` block (`ws_max_message_size`, `ws_max_frame_size`,
-//! `ws_write_buffer_size`, `ws_accept_unmasked_frames`). The schema's
-//! separate `[websocket]` block configures the legacy WS listener and
-//! is not read by the bus; the bus owns its own WS ceiling because the
-//! SDK-client plane has different cardinality and burst characteristics
-//! than the legacy listener (see `configs::server_ng_config::message_bus`).
-//! [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig)
-//! builds [`WebSocketConfig`] from those fields once at boot.
+//! schema's `[websocket]` block (buffer sizes, message / frame
+//! ceilings, unmasked-frame acceptance): the bus IS the server's
+//! WS / WSS install path, so the listener section carries the frame
+//! tuning (see `configs::websocket`).
+//! [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig)
+//! folds that section into [`WebSocketConfig`] once at boot.
 //!
 //! Liveness detection is NOT done via TCP keepalive on the bus: SDK
 //! clients manage their own keepalive policy at the application layer,
@@ -41,17 +39,17 @@
 //! than by `SO_KEEPALIVE`.
 //!
 //! Neither plane is authenticated at the bus layer: identity and
-//! credential checks belong to the caller (`core/server-ng`) via
+//! credential checks belong to the caller (`core/server`) via
 //! `LOGIN_*` commands. This struct therefore carries no secret /
 //! token-source state.
 
 pub use compio::ws::tungstenite::protocol::WebSocketConfig;
 
-use configs::server_ng::ServerNgConfig;
+use configs::server::ServerConfig;
 use std::time::Duration;
 
 /// Pre-converted QUIC transport tuning derived from
-/// [`ServerNgConfig::quic`](configs::ng_quic::QuicConfig).
+/// [`ServerConfig::quic`](configs::quic::QuicConfig).
 ///
 /// Threaded into [`crate::transports::quic::transport_config_from`] at
 /// every bind site so the schema's `[quic]` block actually drives
@@ -111,8 +109,8 @@ pub const IOV_MAX_LIMIT: usize = 512;
 /// Pre-converted runtime tunables in effect on a `IggyMessageBus`
 /// instance.
 ///
-/// Built from a fully-validated [`ServerNgConfig`] via
-/// [`From<&ServerNgConfig>`] at boot. All fields are runtime-typed
+/// Built from a fully-validated [`ServerConfig`] via
+/// [`From<&ServerConfig>`] at boot. All fields are runtime-typed
 /// (`Duration`, `usize`, `tungstenite::WebSocketConfig`) so hot paths
 /// read them directly without `.get_duration()` / `.as_bytes_u64()`
 /// conversion.
@@ -179,10 +177,9 @@ pub struct MessageBusConfig {
     /// Threaded into `compio_ws::accept_async_with_config` on the WS
     /// install path and into `WssTransportConn::ws_handshake` for WSS.
     /// Built once at boot by `build_ws_config` (see the
-    /// [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig) impl below)
-    /// from the bus-owned `ws_*` fields under `[message_bus]`. The
-    /// schema's `[websocket]` block is intentionally NOT consulted
-    /// here; see this module's preamble for the rationale.
+    /// [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig) impl below)
+    /// from the schema's `[websocket]` section, the live frame-tuning
+    /// source for the server's WS plane.
     ///
     /// The [`WebSocketConfig`] type is re-exported from `compio_ws`'s
     /// vendored `tungstenite` so callers do not need a direct dep on
@@ -190,23 +187,23 @@ pub struct MessageBusConfig {
     pub ws_config: WebSocketConfig,
 
     /// QUIC transport tuning, pre-converted from
-    /// [`ServerNgConfig::quic`](configs::ng_quic::QuicConfig) at boot.
+    /// [`ServerConfig::quic`](configs::quic::QuicConfig) at boot.
     pub quic: QuicTuning,
 }
 
-impl From<&ServerNgConfig> for MessageBusConfig {
-    fn from(cfg: &ServerNgConfig) -> Self {
+impl From<&ServerConfig> for MessageBusConfig {
+    fn from(cfg: &ServerConfig) -> Self {
         let bus = &cfg.message_bus;
-        // Production load goes through `ServerNgConfig::validate()`, which
+        // Production load goes through `ServerConfig::validate()`, which
         // already exercises `bus.validate()`. This debug-assert catches
-        // direct callers (tests, simulators) that build a `ServerNgConfig`
+        // direct callers (tests, simulators) that build a `ServerConfig`
         // by hand and forget to validate before converting.
         debug_assert!(
             <configs::message_bus::MessageBusConfig as iggy_common::Validatable<
                 configs::ConfigurationError,
             >>::validate(bus)
             .is_ok(),
-            "MessageBusConfig::from(&ServerNgConfig) called on an unvalidated bus config",
+            "MessageBusConfig::from(&ServerConfig) called on an unvalidated bus config",
         );
         Self {
             max_batch: bus.max_batch,
@@ -222,13 +219,13 @@ impl From<&ServerNgConfig> for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
-            ws_config: build_ws_config(bus),
+            ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
         }
     }
 }
 
-/// Convert the schema's [`configs::ng_quic::QuicConfig`]
+/// Convert the schema's [`configs::quic::QuicConfig`]
 /// (`IggyByteSize` / `IggyDuration` typed) into the runtime
 /// [`QuicTuning`] (plain integer / `Duration` fields).
 ///
@@ -238,7 +235,7 @@ impl From<&ServerNgConfig> for MessageBusConfig {
 /// `unwrap_or` arms below are still bounded saturations that keep
 /// the build unconditionally infallible if a future caller skips
 /// validation in dev / test code.
-fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
+fn build_quic_tuning(quic: &configs::quic::QuicConfig) -> QuicTuning {
     QuicTuning {
         max_concurrent_bidi_streams: u32::try_from(quic.max_concurrent_bidi_streams)
             .unwrap_or(u32::MAX),
@@ -254,12 +251,12 @@ fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
 
 impl Default for QuicTuning {
     /// Mirrors the `[quic]` defaults in
-    /// `core/server-ng/config.toml`: 64 MiB send/receive windows,
+    /// `core/server/config.toml`: 64 MiB send/receive windows,
     /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KiB
     /// datagram send buffer, single bidi stream per peer.
     ///
     /// Intended for tests and direct callers; production builds
-    /// derive the field from [`ServerNgConfig`] so the values stay in
+    /// derive the field from [`ServerConfig`] so the values stay in
     /// lock-step with the on-disk schema.
     fn default() -> Self {
         Self {
@@ -274,27 +271,36 @@ impl Default for QuicTuning {
     }
 }
 
-/// Fold the bus's `ws_*` schema knobs into a single
+/// Fold the schema's `[websocket]` frame-tuning knobs into a single
 /// [`tungstenite::WebSocketConfig`].
 ///
-/// Each `Some` overrides the tungstenite default; `None` keeps the
-/// crate-wide default. Conversion to `usize` saturates on platforms
-/// where `IggyByteSize` would overflow, but the schema validator
-/// already constrains all sizes to fit in `u64`, and on supported
-/// targets `usize` is at least 32 bits, so saturation is unreachable
-/// in practice.
-fn build_ws_config(bus: &configs::message_bus::MessageBusConfig) -> WebSocketConfig {
+/// The standalone `tungstenite` crate may be a different major version
+/// than the one re-exported by `compio_ws`, so the conversion lives in
+/// this crate (next to the `compio_ws` dependency) and constructs the
+/// config through the re-export to guarantee type compatibility.
+///
+/// Each `Some` overrides the compio-ws default; `None` keeps it.
+/// Conversion to `usize` saturates on platforms where `IggyByteSize`
+/// would overflow, but on supported targets `usize` is at least 32
+/// bits, so saturation is unreachable in practice.
+fn build_ws_config(websocket: &configs::websocket::WebSocketConfig) -> WebSocketConfig {
     let mut ws = WebSocketConfig::default();
-    if let Some(sz) = bus.ws_max_message_size {
-        ws = ws.max_message_size(Some(byte_size_to_usize(sz)));
+    if let Some(sz) = websocket.read_buffer_size {
+        ws = ws.read_buffer_size(byte_size_to_usize(sz));
     }
-    if let Some(sz) = bus.ws_max_frame_size {
-        ws = ws.max_frame_size(Some(byte_size_to_usize(sz)));
-    }
-    if let Some(sz) = bus.ws_write_buffer_size {
+    if let Some(sz) = websocket.write_buffer_size {
         ws = ws.write_buffer_size(byte_size_to_usize(sz));
     }
-    ws.accept_unmasked_frames(bus.ws_accept_unmasked_frames)
+    if let Some(sz) = websocket.max_write_buffer_size {
+        ws = ws.max_write_buffer_size(byte_size_to_usize(sz));
+    }
+    if let Some(sz) = websocket.max_message_size {
+        ws = ws.max_message_size(Some(byte_size_to_usize(sz)));
+    }
+    if let Some(sz) = websocket.max_frame_size {
+        ws = ws.max_frame_size(Some(byte_size_to_usize(sz)));
+    }
+    ws.accept_unmasked_frames(websocket.accept_unmasked_frames)
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -305,7 +311,7 @@ fn byte_size_to_usize(sz: iggy_common::IggyByteSize) -> usize {
 
 impl Default for MessageBusConfig {
     fn default() -> Self {
-        Self::from(&ServerNgConfig::default())
+        Self::from(&ServerConfig::default())
     }
 }
 
@@ -315,13 +321,13 @@ mod tests {
 
     /// `QuicTuning::default()` carries hand-coded literals that must
     /// match the schema-derived path through
-    /// `From<&ServerNgConfig> for MessageBusConfig`. If the embedded
+    /// `From<&ServerConfig> for MessageBusConfig`. If the embedded
     /// TOML or the literals drift, every test that uses
     /// `QuicTuning::default()` (e.g. `quic_client_roundtrip`) silently
     /// observes different bytes than production. Pin both sides here.
     #[test]
     fn quic_tuning_default_matches_schema() {
-        let schema_quic = MessageBusConfig::from(&ServerNgConfig::default()).quic;
+        let schema_quic = MessageBusConfig::from(&ServerConfig::default()).quic;
         let literal = QuicTuning::default();
 
         assert_eq!(

@@ -191,6 +191,37 @@ impl KindGroup {
     }
 }
 
+/// Single-select topology filter. `None` cluster field means a single-node run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TopologyFilter {
+    #[default]
+    All,
+    SingleNode,
+    Cluster,
+}
+
+impl TopologyFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::SingleNode => "Single node",
+            Self::Cluster => "Cluster",
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::All, Self::SingleNode, Self::Cluster]
+    }
+
+    pub fn matches(self, benchmark: &BenchmarkReportLight) -> bool {
+        match self {
+            Self::All => true,
+            Self::SingleNode => benchmark.cluster.is_none(),
+            Self::Cluster => benchmark.cluster.is_some(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiState {
     pub selected_measurement: MeasurementType,
@@ -203,6 +234,7 @@ pub struct UiState {
     pub sidebar_search: String,
     pub sidebar_sort: SidebarSort,
     pub sidebar_kind_filter: HashSet<KindGroup>,
+    pub topology_filter: TopologyFilter,
     pub hardware_filter: Option<String>,
     pub gitref_filter: Option<String>,
 }
@@ -220,6 +252,7 @@ impl Default for UiState {
             sidebar_search: String::new(),
             sidebar_sort: SidebarSort::default(),
             sidebar_kind_filter: HashSet::new(),
+            topology_filter: TopologyFilter::default(),
             hardware_filter: None,
             gitref_filter: None,
         }
@@ -245,6 +278,7 @@ pub enum UiAction {
     SetSidebarSearch(String),
     SetSidebarSort(SidebarSort),
     ToggleKindFilter(KindGroup),
+    SetTopologyFilter(TopologyFilter),
     SetHardwareFilter(Option<String>),
     SetGitrefFilter(Option<String>),
 }
@@ -349,6 +383,10 @@ impl Reducible for UiState {
                     ..(*self).clone()
                 }
             }
+            UiAction::SetTopologyFilter(filter) => UiState {
+                topology_filter: filter,
+                ..(*self).clone()
+            },
         };
         next.into()
     }
@@ -380,6 +418,7 @@ pub fn use_ui() -> UseReducerHandle<UiState> {
 mod tests {
     use super::*;
     use bench_dashboard_shared::BenchmarkGroupMetricsLight;
+    use bench_report::cluster::{BenchmarkClusterInfo, BenchmarkClusterNode};
     use bench_report::group_metrics_kind::GroupMetricsKind;
     use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
 
@@ -511,6 +550,22 @@ mod tests {
         assert!(!KindGroup::EndToEnd.matches(BenchmarkKind::BalancedProducer));
     }
 
+    #[test]
+    fn given_topology_filter_when_matching_should_split_single_node_from_cluster() {
+        let single = benchmark_with(1, 0, 1, 1, 0, 0.0, 0.0);
+        let mut clustered = benchmark_with(1, 0, 1, 1, 0, 0.0, 0.0);
+        clustered.cluster = Some(cluster_info(3));
+
+        assert!(TopologyFilter::All.matches(&single));
+        assert!(TopologyFilter::All.matches(&clustered));
+
+        assert!(TopologyFilter::SingleNode.matches(&single));
+        assert!(!TopologyFilter::SingleNode.matches(&clustered));
+
+        assert!(!TopologyFilter::Cluster.matches(&single));
+        assert!(TopologyFilter::Cluster.matches(&clustered));
+    }
+
     fn benchmark_with(
         producers: u32,
         consumers: u32,
@@ -534,6 +589,19 @@ mod tests {
             latency_distribution: None,
         });
         report
+    }
+
+    fn cluster_info(nodes: usize) -> BenchmarkClusterInfo {
+        BenchmarkClusterInfo {
+            name: "vsr".to_string(),
+            nodes: (0..nodes)
+                .map(|index| BenchmarkClusterNode {
+                    name: format!("node-{index}"),
+                    role: if index == 0 { "leader" } else { "follower" }.to_string(),
+                    status: "healthy".to_string(),
+                })
+                .collect(),
+        }
     }
 
     fn summary_with(throughput_mb_s: f64, p99_ms: f64) -> BenchmarkGroupMetricsSummary {

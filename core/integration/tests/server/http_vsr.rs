@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! HTTP data-plane gate for server-ng: produce, poll, and consumer-offset
+//! HTTP data-plane gate for the server: produce, poll, and consumer-offset
 //! routes exercised over raw `reqwest` (not the SDK HTTP client) so the wire
 //! contract itself is under test - exact status codes, the
-//! `x-iggy-durability` header, the body-size cap, and cross-request isolation
+//! `iggy-durability` header, the body-size cap, and cross-request isolation
 //! of concurrent produces on one login session.
 
 use crate::server::http_client::HttpClient;
@@ -36,7 +36,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
+// Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 
 /// Explicit consumer id shared by the offset store body and the read/delete
@@ -44,7 +44,7 @@ const PARTITION_ID: u32 = 0;
 /// (`Consumer::default()` would carry numeric id 0, not 1).
 const CONSUMER_ID: u32 = 1;
 
-const DURABILITY_HEADER: &str = "x-iggy-durability";
+const DURABILITY_HEADER: &str = "iggy-durability";
 const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
 const DURABILITY_NONE: &str = "none";
 
@@ -615,6 +615,17 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
         StatusCode::PAYLOAD_TOO_LARGE,
         "oversized body must be rejected"
     );
+    // The cap rejects the body unread, so the connection cannot be reused: the
+    // reply must say so, or the client pools a socket the server stopped
+    // reading and the next request on it fails on a clean EOF.
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close"),
+        "a 413 must close the connection rather than let the client pool it"
+    );
 
     // The rejection must not poison the listener: a normal produce still commits.
     let normal = text_message(1, "small-after-large".to_string());
@@ -815,7 +826,7 @@ async fn given_valid_access_token_when_refreshing_should_issue_working_token_wit
         "the refreshed token must authenticate"
     );
 
-    // Stateless by design: server-ng has no replicated revocation list (P3), so
+    // Stateless by design: the server has no replicated revocation list (P3), so
     // refreshing never invalidates the token it was minted from - the old token
     // lives to its natural exp. Deliberate, not a bug; the same posture as
     // logout, which ends a session without revoking its bearer.

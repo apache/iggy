@@ -70,6 +70,9 @@ bdd/
 # Run only leader_redirection
 ../scripts/run-bdd-tests.sh all leader_redirection
 
+# Every suite runs against iggy-server. Build the binaries first:
+#   cargo build --bin iggy-server --bin iggy
+
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
 ```

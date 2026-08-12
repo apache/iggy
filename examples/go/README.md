@@ -4,7 +4,7 @@ This directory contains comprehensive sample applications that showcase various 
 
 ## Running Examples
 
-To run any example, first start the server with `cargo run --bin iggy-server` and then run the desired example.
+To run any example, first start a VSR server and then run the desired example.
 
 For server configuration options and help:
 
@@ -47,7 +47,9 @@ go run ./getting-started/consumer/main.go --tcp-server-address localhost:8090 --
 
 All examples can be executed directly from the repository. Follow these steps:
 
-1. **Start the Iggy server**: `cargo run --bin iggy-server`
+1. **Start the Iggy server**: the Go SDK speaks the VSR wire protocol, so the
+   examples need a VSR server.
+   `cargo run --bin iggy-server`
 2. **Run desired example**: `go run ./xxx/xxx/main.go`
 3. **Check source code**: Examples include detailed comments explaining concepts and usage patterns
 

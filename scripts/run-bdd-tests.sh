@@ -38,6 +38,9 @@ usage(){
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
   log ""
+  log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
+  log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
+  log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
   log "  $0 rust basic_messaging         # run only basic_messaging for Rust"
@@ -86,6 +89,7 @@ trap cleanup EXIT INT TERM
 
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
+log "🗳️ Server: iggy-server"
 if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
@@ -94,7 +98,7 @@ run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
-      rust-bdd|go-bdd|csharp-bdd) ;;
+      rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
         if [ "$SDK" = "all" ]; then
           log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"

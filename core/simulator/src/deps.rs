@@ -19,6 +19,7 @@ use crate::executor::TimerHandle;
 use clock::Clock;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{IggyTimestamp, variadic};
+use journal::superblock::{SuperblockContents, SuperblockStore};
 use journal::{Journal, JournalHandle, Storage};
 use metadata::MuxStateMachine;
 use metadata::stm::stream::Streams;
@@ -99,6 +100,10 @@ pub struct SimJournal<S: Storage> {
     headers: UnsafeCell<HashMap<u64, PrepareHeader>>,
     offsets: UnsafeCell<HashMap<u64, usize>>,
     write_offset: Cell<usize>,
+    /// Highest op appended, `None` when empty. Tracked so a restart reads the
+    /// retained head in O(1) without scanning `headers` (see
+    /// [`SimJournal::last_op`]).
+    last_op: Cell<Option<u64>>,
     /// Debug-only single-accessor tripwire. `entry` / `append` hold a
     /// [`JournalAccessGuard`] across their whole body, including the storage
     /// `.await`, so if a suspending storage tier ever let a second task touch
@@ -115,6 +120,7 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             headers: UnsafeCell::new(HashMap::new()),
             offsets: UnsafeCell::new(HashMap::new()),
             write_offset: Cell::new(0),
+            last_op: Cell::new(None),
             #[cfg(debug_assertions)]
             accessing: Cell::new(false),
         }
@@ -170,6 +176,47 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     where
         Self: 'a;
 
+    fn last_op(&self) -> Option<u64> {
+        self.last_op.get()
+    }
+
+    /// Drop the suffix, so a simulated backup whose entries disagree with a started
+    /// view reconciles the way a real one does. Mirrors
+    /// `PrepareJournal::truncate_from`, whose watermark stays put; here it never moves.
+    async fn truncate_from(&self, from_op: u64) -> std::io::Result<usize> {
+        if from_op == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+            ));
+        }
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let headers = unsafe { &mut *self.headers.get() };
+        let offsets = unsafe { &mut *self.offsets.get() };
+        let doomed: Vec<u64> = headers
+            .keys()
+            .copied()
+            .filter(|op| *op >= from_op)
+            .collect();
+        for op in &doomed {
+            headers.remove(op);
+            offsets.remove(op);
+        }
+        self.last_op.set(headers.keys().copied().max());
+        Ok(doomed.len())
+    }
+
+    /// The simulated journal retains everything for the run, so nothing is
+    /// ever superseded by a snapshot. Answered explicitly (the trait has no
+    /// default) so a simulated state transfer has to opt into a watermark
+    /// rather than silently inherit one that never moves.
+    fn snapshot_op(&self) -> u64 {
+        0
+    }
+
+    fn set_snapshot_op(&self, _op: u64) {}
+
     // TODO(hubcio): validate that the caller's checksum matches the stored
     // header - currently this looks up by op only, ignoring the checksum.
     // A real journal implementation must reject mismatches.
@@ -224,6 +271,8 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         unsafe { &mut *self.headers.get() }.insert(header.op, header);
         unsafe { &mut *self.offsets.get() }.insert(header.op, offset);
         self.write_offset.set(offset + bytes_written);
+        let head = self.last_op.get().map_or(header.op, |op| op.max(header.op));
+        self.last_op.set(Some(head));
         Ok(())
     }
 
@@ -242,8 +291,139 @@ impl JournalHandle for SimJournal<MemStorage> {
     }
 }
 
+impl SimJournal<MemStorage> {
+    /// Highest op appended, `None` when empty. Survives a restart because the
+    /// harness retains the whole journal behind an `Rc`.
+    #[must_use]
+    pub const fn last_op(&self) -> Option<u64> {
+        self.last_op.get()
+    }
+
+    /// Forget one op, leaving a hole exactly where a lost prepare would.
+    ///
+    /// Tests only. The alternative is choreographing `Prepare`, `Commit` and
+    /// `RepairPrepare` drops on a directed link until a replica falls behind, which
+    /// is fragile to tune; the scenarios are about what a replica does with a hole,
+    /// not how it got one.
+    ///
+    /// `last_op` is deliberately left alone: a hole below the head must not look like
+    /// a shorter log, since that is the state a view change has to survive.
+    pub fn forget_op(&self, op: u64) -> bool {
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let headers = unsafe { &mut *self.headers.get() };
+        let offsets = unsafe { &mut *self.offsets.get() };
+        offsets.remove(&op);
+        headers.remove(&op).is_some()
+    }
+
+    /// The committed watermark to restore after a restart, mirroring
+    /// `metadata::recover`. On a solo cluster every appended op commits the instant
+    /// it is durable, so the head IS the commit point; otherwise the highest
+    /// `commit` any journaled prepare stamped, a lower bound, since a prepare
+    /// records the primary's commit point at send time, so the true point may be one
+    /// op higher and re-commits on rejoin.
+    #[must_use]
+    pub fn recovery_commit_watermark(&self, solo: bool) -> u64 {
+        if solo {
+            return self.last_op.get().unwrap_or(0);
+        }
+        let headers = unsafe { &*self.headers.get() };
+        headers
+            .values()
+            .map(|header| header.commit)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The head prepare's header, `None` when empty. Restores the last-prepare
+    /// checksum (hash-chain continuity) and the prepare-timestamp floor at restart,
+    /// mirroring `restore_metadata_consensus`.
+    #[must_use]
+    pub fn last_header(&self) -> Option<PrepareHeader> {
+        let head = self.last_op.get()?;
+        let headers = unsafe { &*self.headers.get() };
+        headers.get(&head).copied()
+    }
+
+    /// Read the entry at `op` synchronously, for off-executor WAL replay at restart.
+    /// Mirrors [`Journal::entry`] without the never-suspending `MemStorage` await, so
+    /// it needs no [`JournalAccessGuard`]: a synchronous read offers no suspension
+    /// point for another task to interleave on.
+    ///
+    /// # Panics
+    /// If the bytes at `op` do not decode as a prepare message, meaning the retained
+    /// WAL is corrupt, which is a harness bug since the sim has no torn writes.
+    #[must_use]
+    pub fn entry_sync(&self, op: u64) -> Option<Message<PrepareHeader>> {
+        let headers = unsafe { &*self.headers.get() };
+        let offsets = unsafe { &*self.offsets.get() };
+        let header = headers.get(&op)?;
+        let offset = *offsets.get(&op)?;
+        let data = self.storage.data.borrow();
+        let end = offset.checked_add(header.size as usize)?;
+        let buffer = data.get(offset..end)?.to_vec();
+        let message = Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("prepare buffer must contain a valid prepare message");
+        Some(message)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SimSnapshot {}
+
+/// In-memory superblock for the simulator.
+///
+/// Held by the harness behind an `Rc` so its bytes survive a replica being dropped
+/// and rebuilt across a restart. RAM has no torn writes, so it holds only the latest
+/// payload, with none of the framing or checksum `PingPongSuperblock` adds.
+#[derive(Debug, Default)]
+pub struct SimSuperblock {
+    latest: RefCell<Option<Vec<u8>>>,
+    /// Fault injection: when set, every [`SuperblockStore::write`] errors and
+    /// persists nothing, so `persist_superblock_if_needed` returns `false` and the
+    /// shard withholds the view-scoped send. Proves the split-brain gate, that a
+    /// replica never sends in a view it has not durably recorded.
+    fail_writes: Cell<bool>,
+}
+
+impl SimSuperblock {
+    /// Latest persisted payload, read synchronously. The harness reads this off the
+    /// executor at restart, so no `block_on` is needed.
+    #[must_use]
+    pub fn read_latest_sync(&self) -> Option<Vec<u8>> {
+        self.latest.borrow().clone()
+    }
+
+    /// Make every subsequent write fail, a persistent write fault, so the durability
+    /// gate withholds view-scoped sends. See [`Self::fail_writes`].
+    pub fn set_fail_writes(&self) {
+        self.fail_writes.set(true);
+    }
+}
+
+#[allow(clippy::future_not_send)]
+impl SuperblockStore for SimSuperblock {
+    async fn write(&self, payload: &[u8]) -> std::io::Result<()> {
+        if self.fail_writes.get() {
+            return Err(std::io::Error::other("sim superblock write fault"));
+        }
+        *self.latest.borrow_mut() = Some(payload.to_vec());
+        Ok(())
+    }
+
+    async fn read_latest(&self) -> std::io::Result<SuperblockContents> {
+        // RAM has no torn writes and the sim never injects an unreadable record, so
+        // the payload is either present or was never written.
+        Ok(self
+            .latest
+            .borrow()
+            .as_ref()
+            .map_or(SuperblockContents::Empty, |payload| {
+                SuperblockContents::Present(payload.clone())
+            }))
+    }
+}
 
 /// Type alias for simulator state machine
 pub type SimMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;

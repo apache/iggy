@@ -448,40 +448,32 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsReflectsLoggedOutSessionAsUnauthenticated) {
-    RecordProperty("description",
-                   "Keeps a logged out session visible in get_clients and get_client, but marks it unauthenticated.");
+    RecordProperty("description", "Drops a logged out session from get_clients and reports it missing in get_client.");
     iggy::ffi::Client *first_client  = GetLoggedInClient();
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    iggy::ffi::ClientInfoDetails logged_out_client{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_logout;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
+    // The VSR server drops the client-table entry on logout (an unauthenticated
+    // session is not tracked), unlike the legacy server which kept it visible
+    // without a user id.
     ASSERT_NO_THROW(first_client->logout_user());
-    ASSERT_NO_THROW({
-        clients_after_logout = second_client->get_clients();
-        logged_out_client    = second_client->get_client(first_me.client_id);
-    });
-
-    bool found_first = false;
-    for (const auto &client : clients_after_logout) {
-        if (client.client_id != first_me.client_id) {
-            continue;
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
+            break;
         }
-
-        found_first = true;
-        EXPECT_FALSE(client.has_user_id);
-        EXPECT_EQ(static_cast<std::string>(client.address), static_cast<std::string>(first_me.address));
-        EXPECT_EQ(static_cast<std::string>(client.transport), static_cast<std::string>(first_me.transport));
-        break;
-    }
-
-    EXPECT_TRUE(found_first);
-    EXPECT_EQ(logged_out_client.client_id, first_me.client_id);
-    EXPECT_FALSE(logged_out_client.has_user_id);
-    EXPECT_EQ(static_cast<std::string>(logged_out_client.address), static_cast<std::string>(first_me.address));
-    EXPECT_EQ(static_cast<std::string>(logged_out_client.transport), static_cast<std::string>(first_me.transport));
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
+    ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
@@ -567,9 +559,12 @@ TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
     ASSERT_THROW(client->get_stats(), std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingPartition) {
+// The VSR server has no unsaved-buffer primitive (writes are journaled at
+// commit); FLUSH_UNSAVED_BUFFER denies typed with FeatureUnavailable even for
+// resolvable targets.
+TEST_F(LowLevelE2E_Client, FlushUnsavedBufferThrowsForExistingPartition) {
     RecordProperty("description",
-                   "Creates a stream and topic, sends one message, and flushes the partition buffer successfully.");
+                   "Rejects flush_unsaved_buffer with the feature-unavailable error for an existing partition.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -585,13 +580,14 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingPartition) {
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingEmptyPartition) {
-    RecordProperty("description",
-                   "Succeeds when flush_unsaved_buffer is called for an existing partition with no unsaved messages.");
+TEST_F(LowLevelE2E_Client, FlushUnsavedBufferThrowsForExistingEmptyPartition) {
+    RecordProperty(
+        "description",
+        "Rejects flush_unsaved_buffer with the feature-unavailable error for a partition with no unsaved messages.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -602,8 +598,8 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingEmptyPartition) 
     ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
                                          0, "server_default"));
 
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, FlushUnsavedBufferBeforeLoginThrows) {
@@ -694,8 +690,9 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferAfterTopicDeletedThrows) {
         std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceSucceeds) {
-    RecordProperty("description", "Allows flush_unsaved_buffer to be called twice in a row for the same partition.");
+TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceThrows) {
+    RecordProperty("description",
+                   "Rejects flush_unsaved_buffer with the feature-unavailable error consistently across repeat calls.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -711,10 +708,10 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceSucceeds) {
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, FlushUnsavedBufferWithInvalidPartitionIdsThrows) {
@@ -1566,15 +1563,19 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
     EXPECT_TRUE(found_after);
 }
 
-TEST_F(LowLevelE2E_Client, GetClusterMetadataBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Client, GetClusterMetadataBeforeLoginSucceeds) {
     RecordProperty(
         "description",
-        "Rejects get_cluster_metadata before connect, after connect but before login, and after disconnect.");
+        "Serves get_cluster_metadata to a connected but unauthenticated client, and rejects it without a connection.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
     ASSERT_NO_THROW(client->connect());
-    ASSERT_THROW(client->get_cluster_metadata(), std::exception);
+    // By design pre-login on the VSR server: an SDK must read the roster to
+    // find the primary before it can authenticate (redirect bootstrap).
+    iggy::ffi::ClusterMetadata metadata{};
+    ASSERT_NO_THROW({ metadata = client->get_cluster_metadata(); });
+    ASSERT_EQ(metadata.nodes.size(), 1u);
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
@@ -1631,6 +1632,8 @@ TEST_F(LowLevelE2E_Client, PingSucceedsForNewConnection) {
     RecordProperty("description", "Successfully pings the server from a fresh unauthenticated client session.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
+    // The VSR client has no lazy connect; ping still needs no authentication.
+    ASSERT_NO_THROW(client->connect());
     ASSERT_NO_THROW(client->ping());
 }
 

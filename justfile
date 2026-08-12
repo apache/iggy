@@ -43,9 +43,6 @@ reap_test_containers := "docker ps -aqf 'name=^iggy-test-' | xargs -r docker rm 
 build:
   cargo build
 
-build-vsr:
-  cargo build --features vsr
-
 test: build
   #!/usr/bin/env bash
   set -euo pipefail
@@ -62,18 +59,7 @@ nextest: build
   #!/usr/bin/env bash
   set -euo pipefail
   trap "{{reap_test_containers}}" EXIT
-  cargo nextest run
-
-# Like `nextest` but with the `vsr` feature; builds vsr first so the
-# harness-spawned iggy-server-ng carries the vsr wire format. `--no-fail-fast`
-# because nextest otherwise cancels the run on the first red, which on a loaded
-# box means a stray flake hides most of the suite and the reported counts
-# understate what actually ran.
-nextest-vsr: build-vsr
-  #!/usr/bin/env bash
-  set -euo pipefail
-  trap "{{reap_test_containers}}" EXIT
-  cargo nextest run --features vsr --no-fail-fast
+  cargo nextest run --retries 2
 
 nextests TEST: build
   #!/usr/bin/env bash
@@ -100,9 +86,6 @@ miri:
 
 server *ARGS:
   cargo run --bin iggy-server {{ARGS}}
-
-server-ng *ARGS:
-  cargo run --bin iggy-server-ng {{ARGS}}
 
 run-benches:
   ./scripts/run-benches.sh

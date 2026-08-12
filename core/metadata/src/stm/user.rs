@@ -205,6 +205,18 @@ impl UsersInner {
         tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
         tokens
     }
+
+    /// Count of live personal access tokens for one user.
+    ///
+    /// Single-map read for the ingress-side create cap; the sibling
+    /// `personal_access_tokens_of` allocates and sorts, too heavy for a
+    /// per-request check.
+    #[must_use]
+    pub fn pat_count_of(&self, user_id: UserId) -> usize {
+        self.personal_access_tokens
+            .get(&user_id)
+            .map_or(0, |user_tokens| user_tokens.len())
+    }
 }
 
 impl Users {
@@ -255,7 +267,7 @@ impl Users {
             "root username length {length} outside {MIN_USERNAME_LENGTH}..={MAX_USERNAME_LENGTH}; fix IGGY_ROOT_USERNAME"
         );
 
-        // Boot-only invariant: server-ng calls this before listeners and
+        // Boot-only invariant: the server calls this before listeners and
         // consensus traffic start, on shard 0 initialization. The read/apply
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
@@ -559,11 +571,11 @@ impl StateHandler for ChangePasswordRequest {
         };
 
         // An empty `new_password` is the primary's signal that the caller's
-        // current password did not match (see server-ng
+        // current password did not match (see the server
         // `verify_and_rewrite_change_password`): the accept path always
         // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
         // here (rather than denying pre-consensus) commits the op as a no-op,
-        // keeping the client's request sequence contiguous in the ClientTable.
+        // recording the request id in the ClientTable so a retry of it dedups.
         if self.new_password.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
@@ -731,6 +743,11 @@ pub struct PermissionerSnapshot {
 }
 
 /// Snapshot representation for the Users state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items`, `personal_access_tokens`, and the permissioner's maps stay ordered
+/// (`Vec` / `BTreeMap`) even though the runtime holds them in `AHashMap`s. Swapping
+/// any to an unordered map breaks the checkpoint checksum cross-check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsersSnapshot {
     pub items: Vec<(usize, UserSnapshot)>,
@@ -806,10 +823,29 @@ impl Snapshotable for Users {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        Ok(UsersInner::inner_from_snapshot(snapshot).into())
+    }
+}
+
+impl UsersInner {
+    /// Rebuild from a snapshot section IN PLACE (state transfer), absorbed on
+    /// both left-right buffers.
+    ///
+    /// Nothing here is shared across buffers the way `StreamsInner`'s stats
+    /// registry is, so a wholesale replace is correct.
+    pub(crate) fn restore_in_place(&mut self, snapshot: UsersSnapshot) {
+        *self = Self::inner_from_snapshot(snapshot);
+    }
+
+    /// Build a complete `UsersInner` from a snapshot section. Shared by
+    /// wrapper construction ([`Snapshotable::from_snapshot`]) and the
+    /// in-place restore command (state transfer), which absorbs it on both
+    /// left-right buffers.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn inner_from_snapshot(snapshot: UsersSnapshot) -> Self {
         let mut index: AHashMap<Arc<str>, UserId> = AHashMap::new();
         let mut user_entries: Vec<(usize, User)> = Vec::new();
 
@@ -869,7 +905,7 @@ impl Snapshotable for Users {
                 .init_permissions_for_user(user_id as UserId, user.permissions.as_deref().cloned());
         }
 
-        let inner = UsersInner {
+        Self {
             index,
             items,
             personal_access_tokens,
@@ -877,8 +913,7 @@ impl Snapshotable for Users {
             personal_access_token_expiry_index,
             permissioner,
             last_result: None,
-        };
-        Ok(inner.into())
+        }
     }
 }
 
@@ -948,6 +983,32 @@ mod tests {
 
         assert!(users.personal_access_tokens[&5].is_empty());
         assert!(users.personal_access_token_index.is_empty());
+    }
+
+    #[test]
+    fn pat_count_of_tracks_create_and_delete() {
+        let mut users = UsersInner::new();
+        assert_eq!(users.pat_count_of(9), 0);
+
+        for (name, hash_byte) in [("first", b'a'), ("second", b'b')] {
+            CreatePersonalAccessTokenRequest {
+                user_id: 9,
+                name: WireName::new(name).unwrap(),
+                expiry: 0,
+                token_hash: [hash_byte; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, IggyTimestamp::now());
+        }
+        assert_eq!(users.pat_count_of(9), 2);
+        assert_eq!(users.pat_count_of(1), 0, "count is scoped per user");
+
+        DeletePersonalAccessTokenRequest {
+            user_id: 9,
+            name: WireName::new("first").unwrap(),
+            only_if_expired: false,
+        }
+        .apply(&mut users, IggyTimestamp::now());
+        assert_eq!(users.pat_count_of(9), 1);
     }
 
     #[test]

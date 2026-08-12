@@ -17,19 +17,15 @@
 
 extern crate self as configs;
 
+mod common;
 mod configs_impl;
 mod server_config;
-mod server_ng_config;
+pub use common::{COMPONENT, cache_indexes, defaults, displays, http, system, validators};
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
     FileConfigProvider, TypedEnvProvider, parse_env_value_to_json,
 };
 pub use server_config::{
-    COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
-    tcp, validators, websocket,
-};
-pub use server_ng_config::{
-    COMPONENT_NG, message_bus, metadata as ng_metadata, quic as ng_quic, server_ng,
-    sharding as ng_sharding, tcp as ng_tcp, websocket as ng_websocket,
+    cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,
 };

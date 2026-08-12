@@ -18,11 +18,115 @@
 package util
 
 import (
+	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// metadataClient answers GetClusterMetadata and panics on anything else, so a
+// test fails loudly if CheckAndRedirectToLeader starts calling more.
+type metadataClient struct {
+	iggcon.Client
+	metadata *iggcon.ClusterMetadata
+	err      error
+}
+
+func (c *metadataClient) GetClusterMetadata(context.Context) (*iggcon.ClusterMetadata, error) {
+	return c.metadata, c.err
+}
+
+func clusterNode(ip string, port uint16, role iggcon.ClusterNodeRole, status iggcon.ClusterNodeStatus) iggcon.ClusterNode {
+	return iggcon.ClusterNode{
+		Name:      ip,
+		IP:        ip,
+		Role:      role,
+		Status:    status,
+		Endpoints: iggcon.TransportEndpoints{Tcp: port},
+	}
+}
+
+func checkRedirect(t *testing.T, client iggcon.Client, current string) (string, []string, error) {
+	t.Helper()
+	return CheckAndRedirectToLeader(
+		context.Background(), client, current, iggcon.Tcp, slog.New(slog.DiscardHandler))
+}
+
+func TestCheckAndRedirectToLeader_PointsAFollowerConnectionAtTheLeader(t *testing.T) {
+	client := &metadataClient{metadata: &iggcon.ClusterMetadata{
+		Name: "cluster",
+		Nodes: []iggcon.ClusterNode{
+			clusterNode("10.0.0.1", 8090, iggcon.RoleLeader, iggcon.Healthy),
+			clusterNode("10.0.0.2", 8090, iggcon.RoleFollower, iggcon.Healthy),
+		},
+	}}
+
+	leader, addresses, err := checkRedirect(t, client, "10.0.0.2:8090")
+	require.NoError(t, err)
+	assert.Equal(t, "10.0.0.1:8090", leader)
+	assert.Equal(t, []string{"10.0.0.1:8090", "10.0.0.2:8090"}, addresses)
+}
+
+func TestCheckAndRedirectToLeader_KeepsAConnectionThatIsAlreadyOnTheLeader(t *testing.T) {
+	client := &metadataClient{metadata: &iggcon.ClusterMetadata{
+		Nodes: []iggcon.ClusterNode{
+			clusterNode("10.0.0.1", 8090, iggcon.RoleLeader, iggcon.Healthy),
+			clusterNode("10.0.0.2", 8090, iggcon.RoleFollower, iggcon.Healthy),
+		},
+	}}
+
+	leader, _, err := checkRedirect(t, client, "10.0.0.1:8090")
+	require.NoError(t, err)
+	assert.Empty(t, leader)
+}
+
+func TestCheckAndRedirectToLeader_NeverRedirectsASingleNodeCluster(t *testing.T) {
+	client := &metadataClient{metadata: &iggcon.ClusterMetadata{
+		Nodes: []iggcon.ClusterNode{
+			clusterNode("10.0.0.1", 8090, iggcon.RoleLeader, iggcon.Healthy),
+		},
+	}}
+
+	leader, addresses, err := checkRedirect(t, client, "10.0.0.9:8090")
+	require.NoError(t, err)
+	assert.Empty(t, leader)
+	assert.Equal(t, []string{"10.0.0.1:8090"}, addresses)
+}
+
+func TestCheckAndRedirectToLeader_StaysPutWhenNoHealthyLeaderExists(t *testing.T) {
+	client := &metadataClient{metadata: &iggcon.ClusterMetadata{
+		Nodes: []iggcon.ClusterNode{
+			clusterNode("10.0.0.1", 8090, iggcon.RoleLeader, iggcon.Unreachable),
+			clusterNode("10.0.0.2", 8090, iggcon.RoleFollower, iggcon.Healthy),
+		},
+	}}
+
+	leader, addresses, err := checkRedirect(t, client, "10.0.0.2:8090")
+	require.NoError(t, err)
+	assert.Empty(t, leader, "an unhealthy leader is not a redirect target")
+	assert.Equal(t, []string{"10.0.0.2:8090"}, addresses,
+		"only healthy nodes are reconnect candidates")
+}
+
+func TestCheckAndRedirectToLeader_SwallowsAMetadataFailure(t *testing.T) {
+	client := &metadataClient{err: ierror.ErrDisconnected}
+
+	leader, addresses, err := checkRedirect(t, client, "10.0.0.1:8090")
+	assert.NoError(t, err, "the connection continues on the current node")
+	assert.Empty(t, leader)
+	assert.Empty(t, addresses)
+}
+
+func TestCheckAndRedirectToLeader_PropagatesACancelledContext(t *testing.T) {
+	client := &metadataClient{err: context.Canceled}
+
+	_, _, err := checkRedirect(t, client, "10.0.0.1:8090")
+	assert.ErrorIs(t, err, context.Canceled)
+}
 
 func TestIsSameAddress(t *testing.T) {
 	cases := []struct {
@@ -35,6 +139,11 @@ func TestIsSameAddress(t *testing.T) {
 		{"localhost", "localhost:8090", "127.0.0.1:8090", true},
 		{"different port", "127.0.0.1:8090", "127.0.0.1:8091", false},
 		{"different ip", "192.168.1.1:8090", "127.0.0.1:8090", false},
+		{"ipv6 spellings", "[::1]:8090", "[0:0:0:0:0:0:0:1]:8090", true},
+		{"same hostname", "IGGY.local:8090", "iggy.local:8090", true},
+		// Hostnames compare lexically: this path runs during failover, where
+		// a resolver lookup could block with no deadline.
+		{"hostname versus its ip", "iggy.local:8090", "10.0.0.1:8090", false},
 	}
 
 	for _, tc := range cases {

@@ -17,7 +17,6 @@
 
 use crate::tcp::tcp_stream::ConnectionStream;
 use async_trait::async_trait;
-#[cfg(feature = "vsr")]
 use bytes::BytesMut;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
@@ -40,7 +39,6 @@ impl TcpTlsConnectionStream {
         }
     }
 
-    #[cfg(feature = "vsr")]
     pub async fn read_buf(&mut self, buf: &mut BytesMut, len: usize) -> Result<(), IggyError> {
         let target_len = buf.len() + len;
         while buf.len() < target_len {

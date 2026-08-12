@@ -58,7 +58,9 @@ describe('e2e -> consumer-stream', async () => {
   it('e2e -> consumer-stream::send-messages', async () => {
     for (let i = 0; i < ct; i += 100) {
       await sendSomeMessages(c.clientProvider)(
-        streamName, topicName, Partitioning.MessageKey(`k-${i % 300}`)
+        streamName,
+        topicName,
+        Partitioning.PartitionId((i / 100) % 3)
       );
     }
   });

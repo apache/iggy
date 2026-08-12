@@ -20,10 +20,10 @@ use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     process::{Command, Stdio},
     thread::{self, panicking},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -31,6 +31,13 @@ const BENCH_FILES_PREFIX: &str = "bench_";
 const MESSAGE_BATCHES: u64 = 100;
 const MESSAGES_PER_BATCH: u64 = 100;
 const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
+// Generous for a few MB of traffic even in debug builds, and deliberately
+// UNDER nextest's harness timeout (`.config/nextest.toml` sigkills at
+// 60s x 5): a longer wait here would never fire, taking the capture dump and
+// the stale-binary hint below with it. Exists because a stale prebuilt
+// iggy-bench speaking an outdated protocol hangs both sides silently
+// instead of erroring.
+const BENCH_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub fn run_bench_and_wait_for_finish(
     server_addr: &str,
@@ -102,48 +109,40 @@ pub fn run_bench_and_wait_for_finish(
     }
 
     let mut child = command.spawn().unwrap();
-    let result = child.wait().unwrap();
-
-    // Cleanup
-    if let Ok(output) = child.wait_with_output() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(stderr_file_path) = &stderr_file_path {
-            OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(stderr_file_path)
-                .unwrap()
-                .write_all(stderr.as_bytes())
-                .unwrap();
+    let deadline = Instant::now() + BENCH_WAIT_TIMEOUT;
+    // A timeout does NOT panic here: doing so jumped over the capture dump and
+    // the temp-file cleanup below, so every timed-out run leaked both files and
+    // printed only stderr -- while iggy-bench writes its progress to stdout,
+    // the one capture that explains a hang. The verdict is the assert at the end.
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break None;
+            }
+            None => thread::sleep(Duration::from_millis(200)),
         }
+    };
 
-        if let Some(stdout_file_path) = &stdout_file_path {
-            OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(stdout_file_path)
-                .unwrap()
-                .write_all(stdout.as_bytes())
-                .unwrap();
-        }
-    } else {
-        panic!("Failed to get output from iggy-bench");
-    }
-
-    if panicking() {
-        if let Some(stdout_file_path) = &stdout_file_path {
-            eprintln!(
-                "Iggy bench stdout:\n{}",
-                fs::read_to_string(stdout_file_path).unwrap()
-            );
-        }
-
-        if let Some(stderr_file_path) = &stderr_file_path {
-            eprintln!(
-                "Iggy bench stderr:\n{}",
-                fs::read_to_string(stderr_file_path).unwrap()
-            );
+    // Nothing to drain, by construction: both branches above redirect the
+    // child's stdout and stderr -- to files, or inherited under
+    // `IGGY_TEST_VERBOSE` -- so no pipe exists for the poll loop to deadlock
+    // against. The old `wait_with_output` capture here could only ever return
+    // empty buffers for the same reason; the captures the failure path prints
+    // are the redirect FILES.
+    let failed = timed_out || status.is_none_or(|status| !status.success());
+    if failed || panicking() {
+        for (stream, path) in [("stdout", &stdout_file_path), ("stderr", &stderr_file_path)] {
+            if let Some(path) = path {
+                eprintln!(
+                    "Iggy bench {stream}:\n{}",
+                    fs::read_to_string(path).unwrap_or_default()
+                );
+            }
         }
     }
 
@@ -154,7 +153,13 @@ pub fn run_bench_and_wait_for_finish(
         fs::remove_file(stderr_file_path).unwrap();
     }
 
-    assert!(result.success());
+    assert!(
+        !timed_out,
+        "iggy-bench did not finish within {BENCH_WAIT_TIMEOUT:?}; the harness \
+         spawns the prebuilt binary, so make sure iggy-bench was rebuilt \
+         alongside the server (a stale binary hangs instead of erroring)"
+    );
+    assert!(status.is_some_and(|status| status.success()));
 }
 
 pub fn get_random_path() -> String {

@@ -30,6 +30,67 @@ npm i --save apache-iggy
 
 ## basic usage
 
+### Response frame limit
+
+**Compatibility note:** response frames larger than `maxResponseFrameSize` (default 64 MiB) are rejected and close the connection. Raise the limit in the client configuration when polling very large batches.
+
+### VSR framing
+
+The SDK speaks the VSR wire protocol exclusively and requires an Iggy VSR
+server:
+
+```typescript
+import { SimpleClient, getRawClient } from "apache-iggy";
+
+const config = {
+  transport: "TCP" as const,
+  options: { host: "127.0.0.1", port: 8090 },
+  credentials: { username: "iggy", password: "iggy" },
+};
+const client = new SimpleClient(getRawClient(config));
+const stats = await client.system.getStats();
+```
+
+Codes absent from the SDK command table use `Operation::NonReplicated` and
+carry the command code in the request header's reserved field. The server
+remains authoritative for classifying or rejecting extension commands.
+
+Sends must use explicit `Partitioning.PartitionId` partitioning: the client
+routes each request to a partition-scoped namespace, so broker-side balancing
+(`Partitioning.Balanced`) and key hashing (`Partitioning.MessageKey`) are
+rejected before the request is sent.
+<!-- TODO(hubcio): Balanced and MessageKey partitioning to be implemented;
+not decided yet whether it'll be on server side or client side. -->
+
+VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
+
+VSR authentication translates the existing password and personal-access-token
+login APIs into the register handshake required by the consensus protocol. A
+disconnect or eviction invalidates the session, and later work must register a
+new session. Transient not-committed responses retry the exact encoded request
+within one bounded deadline. A disconnected mutation is never replayed under a
+new session.
+
+When the server's `[heartbeat]` eviction is enabled, configure the client's `heartbeatInterval` below the server heartbeat interval. Client heartbeats are disabled when `heartbeatInterval` is unset.
+
+`sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
+
+```typescript
+import { ResponseError } from "apache-iggy";
+
+try {
+  await client.sendBinaryRequest(60_000, Buffer.from("opaque request"));
+} catch (error) {
+  if (error instanceof ResponseError) {
+    console.error(error.commandCode, error.errorCode);
+  }
+}
+```
+
+The client includes its npm package version and the binary protocol crate
+version in VSR registration. An incompatible server rejects registration with
+a protocol-version error instead of accepting a mismatched wire contract.
+
 ```ts
 import { Client } from "apache-iggy";
 
@@ -60,7 +121,8 @@ npm run build
 
 ### test
 
-note: use env var `IGGY_TCP_ADDRESS="host:port"` to set server address for bdd and e2e tests.
+note: use env var `IGGY_TCP_ADDRESS="host:port"` to set the server
+address for bdd and e2e tests.
 
 #### unit tests
 

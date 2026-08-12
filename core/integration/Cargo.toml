@@ -22,8 +22,11 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+# `rust-s3`'s lib target is `s3`, so machete greps for `rust_s3`, never finds
+# it, and reports the crate unused. It is used (`use s3::{Bucket, Region}` in
+# the connector S3 fixture); removing it breaks the whole test build.
 [package.metadata.cargo-machete]
-ignored = ["cfg_aliases"]
+ignored = ["cfg_aliases", "rust-s3"]
 
 # Some tests are failing in CI due to lack of IPv6 interfaces
 # inside the docker containers. This is a temporary workaround (hopefully).
@@ -31,7 +34,6 @@ ignored = ["cfg_aliases"]
 ci-qemu = []
 default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
-vsr = ["iggy/vsr"]
 
 [dependencies]
 assert_cmd = { workspace = true }
@@ -43,6 +45,9 @@ bytes = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
+# Decodes a metadata replica's durable `VsrState` off disk in the superblock
+# recovery test.
+consensus = { workspace = true }
 ctor = { workspace = true }
 deltalake = { workspace = true }
 dtor = { workspace = true }
@@ -58,6 +63,9 @@ iggy_common = { workspace = true }
 # `build_label` function — keeping the test and production label format in lock-step.
 iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
+# Locates and decodes the on-disk superblock slot files in the recovery test
+# (`SLOT_FILE_NAMES`, `decode_slots`).
+journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
 lazy_static = { workspace = true }
@@ -80,7 +88,6 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
-server = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }

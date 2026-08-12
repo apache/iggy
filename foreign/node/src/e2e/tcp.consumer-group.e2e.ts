@@ -88,12 +88,12 @@ describe('e2e -> consumer-group', async () => {
   it('e2e -> consumer-stream::send-messages', async () => {
     const ct = 1000;
     const mn = 200;
-    for (let i = 0; i <= ct; i += mn) {
+    for (let i = 0; i < ct; i += mn) {
       assert.ok(await c.message.send({
         streamId: streamName,
         topicId: topicName,
         messages: generateMessages(mn),
-        partition: Partitioning.MessageKey(`key-${ i % 300 }`)
+        partition: Partitioning.PartitionId((i / mn) % 3)
       }));
     }
     payloadLength = ct;

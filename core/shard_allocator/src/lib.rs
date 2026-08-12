@@ -28,6 +28,7 @@ use cpu_allocation::{CpuAllocation, NumaConfig, allowed_cpus};
 use hwlocality::Topology;
 use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;
+#[cfg(target_os = "linux")]
 use hwlocality::memory::binding::{MemoryBindingFlags, MemoryBindingPolicy};
 use hwlocality::object::types::ObjectType::{self, NUMANode};
 #[cfg(target_os = "linux")]
@@ -236,34 +237,43 @@ impl ShardInfo {
 
     /// Pin the calling thread's memory to this shard's NUMA node so
     /// allocations stay local and fast. Does nothing if no node is set.
+    /// On non-Linux this does nothing (no-op), mirroring [`Self::bind_cpu`].
     pub fn bind_memory(&self) -> Result<(), ShardingError> {
-        if let Some(node_id) = self.numa_node {
-            let topology = Topology::new().map_err(|err| ShardingError::TopologyDetection {
-                msg: err.to_string(),
-            })?;
-
-            let node = topology
-                .objects_with_type(ObjectType::NUMANode)
-                .nth(node_id)
-                .ok_or(ShardingError::InvalidNode {
-                    requested: node_id,
-                    available: topology.objects_with_type(ObjectType::NUMANode).count(),
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(node_id) = self.numa_node {
+                let topology = Topology::new().map_err(|err| ShardingError::TopologyDetection {
+                    msg: err.to_string(),
                 })?;
 
-            if let Some(nodeset) = node.nodeset() {
-                topology
-                    .bind_memory(
-                        nodeset,
-                        MemoryBindingPolicy::Bind,
-                        MemoryBindingFlags::THREAD | MemoryBindingFlags::STRICT,
-                    )
-                    .map_err(|err| {
-                        tracing::error!("Failed to bind memory {:?}", err);
-                        ShardingError::BindingFailed
+                let node = topology
+                    .objects_with_type(ObjectType::NUMANode)
+                    .nth(node_id)
+                    .ok_or(ShardingError::InvalidNode {
+                        requested: node_id,
+                        available: topology.objects_with_type(ObjectType::NUMANode).count(),
                     })?;
 
-                info!("Memory bound to NUMA node {node_id}");
+                if let Some(nodeset) = node.nodeset() {
+                    topology
+                        .bind_memory(
+                            nodeset,
+                            MemoryBindingPolicy::Bind,
+                            MemoryBindingFlags::THREAD | MemoryBindingFlags::STRICT,
+                        )
+                        .map_err(|err| {
+                            tracing::error!("Failed to bind memory {:?}", err);
+                            ShardingError::BindingFailed
+                        })?;
+
+                    info!("Memory bound to NUMA node {node_id}");
+                }
             }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::debug!("NUMA memory binding skipped on non-Linux platform");
         }
 
         Ok(())

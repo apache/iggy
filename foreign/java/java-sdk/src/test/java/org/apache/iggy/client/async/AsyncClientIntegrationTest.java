@@ -27,6 +27,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -218,7 +219,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages in concurrent batches
-            List<CompletableFuture<Void>> sendFutures = new ArrayList<>();
+            List<CompletableFuture<SendMessagesResponse>> sendFutures = new ArrayList<>();
             for (int batch = 0; batch < 10; batch++) {
                 List<Message> batchMessages = new ArrayList<>();
                 for (int i = 0; i < 10; i++) {

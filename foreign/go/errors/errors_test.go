@@ -21,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestIggyError_Error(t *testing.T) {
@@ -39,6 +42,93 @@ func TestIggyError_Error(t *testing.T) {
 				t.Errorf("Error() = %v, want %v", got, c.expected)
 			}
 		})
+	}
+}
+
+func TestIggyError_ConsensusErrors(t *testing.T) {
+	cases := []struct {
+		err      IggyError
+		sentinel error
+		code     Code
+		message  string
+	}{
+		{
+			err:      TransientNotCommitted{},
+			sentinel: ErrTransientNotCommitted,
+			code:     TransientNotCommittedCode,
+			message:  "request transiently not committed; retry",
+		},
+		{
+			err:      TransientNotAccepted{},
+			sentinel: ErrTransientNotAccepted,
+			code:     TransientNotAcceptedCode,
+			message:  "request transiently not accepted; retry, on any replica",
+		},
+		{
+			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
+			sentinel: ErrConsumerGroupPartitionNotOwned,
+			code:     ConsumerGroupPartitionNotOwnedCode,
+			message:  "consumer group member with client id: 4 does not own partition: 9 at the current generation (rebalance in progress).",
+		},
+		{
+			err:      IncompatibleProtocolVersion{ClientVersion: 1, ServerVersionMin: 2, ServerVersionMax: 3},
+			sentinel: ErrIncompatibleProtocolVersion,
+			code:     IncompatibleProtocolVersionCode,
+			message:  "incompatible binary protocol version: client 1, server accepts [2, 3]",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.message, func(t *testing.T) {
+			if c.err.Code() != c.code {
+				t.Errorf("Code() = %v, want %v", c.err.Code(), c.code)
+			}
+			if c.err.Error() != c.message {
+				t.Errorf("Error() = %q, want %q", c.err.Error(), c.message)
+			}
+			if !errors.Is(c.err, c.sentinel) {
+				t.Errorf("errors.Is(%v, sentinel) = false, want true", c.err)
+			}
+			if resolved := FromCode(c.code); resolved.Code() != c.code {
+				t.Errorf("FromCode(%d).Code() = %v, want %v", c.code, resolved.Code(), c.code)
+			}
+		})
+	}
+}
+
+func TestFromCode_FallsBackToTheGenericError(t *testing.T) {
+	if resolved := FromCode(Code(0xFFFFFF)); !errors.Is(resolved, ErrError) {
+		t.Errorf("FromCode(unknown) = %v, want ErrError", resolved)
+	}
+}
+
+// TestFromCode_ResolvesEveryDeclaredCode drives FromCode from errors.yaml,
+// the same source errors_gen.go is generated from, so a case that resolves to
+// the wrong error fails without hand-listing two hundred codes.
+func TestFromCode_ResolvesEveryDeclaredCode(t *testing.T) {
+	raw, err := os.ReadFile("errors.yaml")
+	if err != nil {
+		t.Fatalf("reading errors.yaml: %v", err)
+	}
+	var declared []struct {
+		Name string `yaml:"name"`
+		Code Code   `yaml:"code"`
+	}
+	if err := yaml.Unmarshal(raw, &declared); err != nil {
+		t.Fatalf("parsing errors.yaml: %v", err)
+	}
+	if len(declared) < 200 {
+		t.Fatalf("only %d declared errors, the yaml did not parse fully", len(declared))
+	}
+
+	for _, entry := range declared {
+		resolved := FromCode(entry.Code)
+		if resolved.Code() != entry.Code {
+			t.Errorf("FromCode(%d) resolves to code %d (%s)",
+				entry.Code, resolved.Code(), entry.Name)
+		}
+		if resolved.Error() == "" {
+			t.Errorf("FromCode(%d) has an empty message (%s)", entry.Code, entry.Name)
+		}
 	}
 }
 

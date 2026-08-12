@@ -98,15 +98,13 @@ public class OffsetTests
         // For HTTP, a separate TCP client joins (HTTP is stateless and doesn't track membership).
         if (protocol == Protocol.Tcp)
         {
-            await client.JoinConsumerGroupAsync(
-                Identifier.String(streamName),
+            await client.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
         }
         else
         {
-            var tcpClient = await Fixture.CreateTcpClient();
-            await tcpClient.JoinConsumerGroupAsync(
-                Identifier.String(streamName),
+            var tcpClient = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
+            await tcpClient.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
         }
 
@@ -126,15 +124,13 @@ public class OffsetTests
 
         if (protocol == Protocol.Tcp)
         {
-            await client.JoinConsumerGroupAsync(
-                Identifier.String(streamName),
+            await client.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
         }
         else
         {
-            var tcpClient = await Fixture.CreateTcpClient();
-            await tcpClient.JoinConsumerGroupAsync(
-                Identifier.String(streamName),
+            var tcpClient = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
+            await tcpClient.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
         }
 
@@ -161,15 +157,13 @@ public class OffsetTests
 
         if (protocol == Protocol.Tcp)
         {
-            await client.JoinConsumerGroupAsync(
-                Identifier.String(streamName),
+            await client.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
         }
         else
         {
-            var tcpClient = await Fixture.CreateTcpClient();
-            await tcpClient.JoinConsumerGroupAsync(
-                Identifier.String(streamName),
+            var tcpClient = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
+            await tcpClient.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
         }
 
@@ -195,8 +189,7 @@ public class OffsetTests
         await client.CreateConsumerGroupAsync(Identifier.String(streamName),
             Identifier.String(topicName), "test_consumer_group");
 
-        await client.JoinConsumerGroupAsync(
-            Identifier.String(streamName),
+        await client.JoinConsumerGroupAsync(Identifier.String(streamName),
             Identifier.String(topicName), Identifier.String("test_consumer_group"));
 
         await client.StoreOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(streamName),

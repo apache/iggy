@@ -249,9 +249,7 @@ public class IggyTypedPublisherTests
 
         // Encryption is configured on the client. The publisher uses an encrypting client; a plain client polls
         // to prove the wire bytes are ciphertext, then decrypts manually.
-        var encryptingClient = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient(encryptor: encryptor)
-            : await Fixture.CreateHttpClient(encryptor: encryptor);
+        var encryptingClient = await Fixture.CreateAuthenticatedClient(protocol, encryptor: encryptor);
         var plainClient = await Client(protocol);
         var stream = await CreateTestStream(plainClient, protocol);
 
@@ -292,9 +290,7 @@ public class IggyTypedPublisherTests
 
     private async Task<IIggyClient> Client(Protocol protocol)
     {
-        return protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
+        return await Fixture.CreateAuthenticatedClient(protocol);
     }
 
     // Base fluent methods return the non-generic builder, so apply them as statements to keep the typed Build().

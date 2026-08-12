@@ -173,7 +173,7 @@ func SendMessage(cli iggcon.Client, producerNumber, messagesCount, messagesBatch
 	for i := 0; i < messagesBatch; i++ {
 		startTime := time.Now()
 		topicIdentifier, _ := iggcon.NewIdentifier(uint32(topicId))
-		_ = cli.SendMessages(
+		_, _ = cli.SendMessages(
 			context.Background(),
 			streamId,
 			topicIdentifier,

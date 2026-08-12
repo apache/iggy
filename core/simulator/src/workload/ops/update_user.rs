@@ -18,7 +18,7 @@
 //! `UpdateUser` op. Targets `Ok` (rename live user to fresh name) or
 //! `UserNotFound` (fabricated user). `UsernameAlreadyExists` not targeted.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -74,7 +74,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.update_user(&input.user, input.new_username.as_deref(), input.status)
 }
 

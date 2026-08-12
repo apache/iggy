@@ -28,6 +28,7 @@ cpu_allocation = { workspace = true }
 err_trail = { workspace = true }
 figment = { workspace = true }
 iggy_common = { workspace = true }
+ipnet = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,4 +37,3 @@ server_common = { workspace = true }
 static-toml = { workspace = true }
 strum = { workspace = true }
 tracing = { workspace = true }
-tungstenite = { workspace = true }

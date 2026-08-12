@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteConsumerGroup` op. Targets `Ok` (a live group) or `NotFound` (a live
-//! stream/topic with a fabricated group name).
+//! `DeleteConsumerGroup` op.
+//!
+//! Targets `Ok` (a live group), `StreamNotFound` (a fabricated parent
+//! stream), `TopicNotFound` (a live stream with a fabricated topic) or
+//! `ConsumerGroupNotFound` (a live stream/topic with a fabricated group
+//! name), mirroring the legacy resolution ladder.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -36,7 +40,12 @@ pub struct Input {
     pub group: String,
 }
 
-pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::NotFound];
+pub const OUTCOMES: &[Outcome] = &[
+    Outcome::Ok,
+    Outcome::StreamNotFound,
+    Outcome::TopicNotFound,
+    Outcome::ConsumerGroupNotFound,
+];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -52,7 +61,20 @@ pub fn sample(
                 topic,
                 group,
             }),
-        Outcome::NotFound => {
+        Outcome::StreamNotFound => Some(Input {
+            stream: shadow.fabricate_absent_name("stream"),
+            topic: shadow.fabricate_absent_name("topic"),
+            group: shadow.fabricate_absent_name("cg"),
+        }),
+        Outcome::TopicNotFound => {
+            let stream = shadow.pick_stream_name(prng)?;
+            Some(Input {
+                stream,
+                topic: shadow.fabricate_absent_name("topic"),
+                group: shadow.fabricate_absent_name("cg"),
+            })
+        }
+        Outcome::ConsumerGroupNotFound => {
             let (stream, topic) = shadow.pick_topic_pair(prng)?;
             Some(Input {
                 stream,
@@ -64,7 +86,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.delete_consumer_group(&input.stream, &input.topic, &input.group)
 }
 
@@ -85,6 +107,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
             topic: input.topic.clone(),
             name: input.group.clone(),
         },
-        Outcome::NotFound => Effect::None,
+        Outcome::StreamNotFound | Outcome::TopicNotFound | Outcome::ConsumerGroupNotFound => {
+            Effect::None
+        }
     }
 }

@@ -40,7 +40,7 @@ use crate::workload::ops::InFlight;
 use actions::Action;
 use auditor::{OnReply, ServerAuditor};
 use effect::SimCommand;
-use iggy_binary_protocol::{ReplyHeader, RequestHeader, result_code};
+use iggy_binary_protocol::{ReplyHeader, RoutedRequestHeader, result_code};
 use invariants::Invariants;
 use metadata::stm::result::result_code_recognized;
 use options::WorkloadOptions;
@@ -138,7 +138,10 @@ impl Workload {
     /// PRNG before `sample` runs, so they advance the trace even when `sample`
     /// returns `None` (a targeted outcome whose precondition is unmet, e.g. a
     /// duplicate-name target with an empty shadow). `samples_none` counts these.
-    pub fn build_request(&mut self, client: &SimClient) -> Option<(u8, Message<RequestHeader>)> {
+    pub fn build_request(
+        &mut self,
+        client: &SimClient,
+    ) -> Option<(u8, Message<RoutedRequestHeader>)> {
         if !self.client_idle(client.client_id()) {
             return None;
         }
@@ -167,7 +170,7 @@ impl Workload {
                 action,
                 input,
                 outcome,
-                request_namespace: header.namespace,
+                request_namespace: header.group,
             },
         );
         *self
@@ -203,7 +206,7 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
 
-        // Decode the committed result code. Metadata replies carry a TB-style
+        // Decode the committed result code. Metadata replies carry a
         // result section (see `ApplyReply::to_reply_body`); partition-plane
         // replies do not, hence the `is_metadata` gate.
         let committed_code = if header.operation.is_metadata() {
@@ -233,7 +236,7 @@ impl Workload {
             };
             // The state machine only commits codes its own result enum declares,
             // so an unrecognized one is a server bug (a race still yields a
-            // declared code). TB's "classify never guesses".
+            // declared code). Classify never guesses.
             assert!(
                 result_code_recognized(header.operation, code),
                 "metadata op {:?} returned unrecognized result code {code} \

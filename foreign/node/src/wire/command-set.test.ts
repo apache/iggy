@@ -39,9 +39,7 @@ const mockRawClient = (): RawClient => ({
 });
 
 describe('CommandAPI.sendBinaryRequest', () => {
-
   describe('session-control guard', () => {
-
     [
       COMMAND_CODE.LoginUser,
       COMMAND_CODE.LogoutUser,
@@ -57,7 +55,6 @@ describe('CommandAPI.sendBinaryRequest', () => {
         );
       });
     });
-
   });
 
   it('forwards a custom code and opaque payload to sendCommand', async () => {
@@ -65,9 +62,10 @@ describe('CommandAPI.sendBinaryRequest', () => {
     const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
     const expectedResponse = Buffer.from('opaque response');
     const raw = mockRawClient();
-    raw.sendCommand = async (code, sentPayload) => {
+    raw.sendCommand = async (code, sentPayload, options) => {
       assert.equal(code, customCode);
       assert.deepEqual(sentPayload, payload);
+      assert.equal(options, undefined);
       return {
         status: 0,
         length: expectedResponse.length,
@@ -88,7 +86,7 @@ describe('CommandAPI.sendBinaryRequest', () => {
       return { status: 0, length: 1, data: Buffer.alloc(0) };
     };
 
-    const request = new SimpleClient(raw).sendBinaryRequest(60_000, payload);
+    const request = new SimpleClient(raw).sendBinaryRequest(60_001, payload);
     payload.fill(0);
 
     await request;
@@ -109,5 +107,4 @@ describe('CommandAPI.sendBinaryRequest', () => {
 
     assert.deepEqual(response, Buffer.alloc(0));
   });
-
 });

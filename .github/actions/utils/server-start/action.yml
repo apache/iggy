@@ -114,7 +114,11 @@ runs:
           fi
           if [[ ! -x "$OUT" ]]; then
             echo "Building $NAME with cargo ($PROFILE)…"
-            cargo build --locked --bin "$NAME" $([[ "$PROFILE" == "release" ]] && echo "--release")
+            CARGO_ARGS=(build --locked --bin "$NAME")
+            if [[ "$PROFILE" == "release" ]]; then
+              CARGO_ARGS+=(--release)
+            fi
+            cargo "${CARGO_ARGS[@]}"
           fi
           BIN_PATH="$OUT"
         else

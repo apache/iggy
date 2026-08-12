@@ -121,7 +121,6 @@ components:
       - "rust-cluster"
     paths:
       - "core/server/**"
-      - "core/server-ng/**"
 
   rust-cluster:
     depends_on:
@@ -176,7 +175,7 @@ components:
       - "machete"
       - "test-1"
       - "test-2"
-      - "compat"
+      - "test-3"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
@@ -261,6 +260,11 @@ components:
       - "foreign/go/**"
       - "bdd/go/**"
       - "examples/go/**"
+      # The SDK compiles against the VSR wire contract, so a change to the
+      # protocol crate or the VSR server must rerun it.
+      - "core/binary_protocol/**"
+      - "core/server/**"
+    # VSR is the only protocol the Go SDK speaks, so there is no separate lane.
     tasks: ["lint", "test", "build", "e2e"]
 
   sdk-java:
@@ -347,6 +351,9 @@ components:
     paths:
       - "bdd/go/**"
       - "bdd/scenarios/**"
+      # The Go suites run against the VSR server, so its sources gate them.
+      - "core/binary_protocol/**"
+      - "core/server/**"
     tasks: ["bdd-go", "bdd-go-race"]
 
   bdd-node:

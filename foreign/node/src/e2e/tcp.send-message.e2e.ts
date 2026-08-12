@@ -48,7 +48,9 @@ describe('e2e -> message', async () => {
   };
 
   it('e2e -> message::send', async () => {
-    assert.ok(await c.message.send(msg));
+    const { confirmations } = await c.message.send(msg);
+    assert.equal(confirmations.length, 1);
+    assert.equal(confirmations[0].partitionId, partitionId);
   });
 
   it('e2e -> message::poll/last', async () => {
@@ -160,6 +162,17 @@ describe('e2e -> message', async () => {
       partitionId
     });
     assert.deepEqual(offset, { partitionId: 0, currentOffset: 5n, storedOffset: 2n });
+  });
+
+  it('e2e -> message::send/next batch', async () => {
+    const { confirmations } = await c.message.send({
+      ...msg,
+      messages: generateMessages(3)
+    });
+    // Landing behind the already committed batch is the part no placeholder
+    // confirmation could reproduce.
+    assert.equal(confirmations.length, 1);
+    assert.equal(confirmations[0].baseOffset, BigInt(msg.messages.length));
   });
 
   it('e2e -> message::cleanup', async () => {
