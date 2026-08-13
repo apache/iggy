@@ -45,7 +45,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 
 			// send test messages
 			messages := createDefaultMessages()
-			err := client.SendMessages(
+			_, err := client.SendMessages(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
@@ -129,7 +129,10 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 				&partitionId,
 			)
 
-			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
+			// A consumer-offset request is routed by its packed namespace, so
+			// the shard that answers reports a missing resource rather than
+			// naming the group.
+			itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
 		})
 
 		ginkgo.Context("and attempts to delete an offset from a non-existing stream", func() {
@@ -143,7 +146,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 				randomU32Identifier(),
 				randomU32Identifier(),
 				&partitionId)
-			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
 		})
 	})
 

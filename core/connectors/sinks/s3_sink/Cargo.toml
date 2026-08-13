@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_s3_sink"
-version = "0.4.0"
+version = "0.5.0-edge.2"
 description = "Iggy S3 sink connector for writing stream messages to Amazon S3 and S3-compatible stores"
 edition = "2024"
 license = "Apache-2.0"
@@ -28,6 +28,12 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
+
+# `rust-s3`'s lib target is `s3`, so machete greps for `rust_s3`, never finds
+# it, and reports the crate unused. It is used throughout (`use s3::{Bucket,
+# Region}`); removing it does not compile.
+[package.metadata.cargo-machete]
+ignored = ["rust-s3"]
 
 [lib]
 crate-type = ["cdylib", "lib"]

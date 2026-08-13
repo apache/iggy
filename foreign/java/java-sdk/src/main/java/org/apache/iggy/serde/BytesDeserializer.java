@@ -21,10 +21,17 @@ package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.cluster.ClusterMetadata;
+import org.apache.iggy.cluster.ClusterNode;
+import org.apache.iggy.cluster.ClusterNodeRole;
+import org.apache.iggy.cluster.ClusterNodeStatus;
+import org.apache.iggy.cluster.TransportEndpoints;
 import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
+import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
@@ -32,6 +39,8 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.SendConfirmation;
+import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.Partition;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
@@ -67,6 +76,10 @@ import java.util.Optional;
  * Provides deserialization of ByteBuf to domain objects according to Iggy wire protocol.
  */
 public final class BytesDeserializer {
+
+    private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
+    private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
+    private static final int MIN_CLUSTER_NODE_BYTES = 18;
 
     private BytesDeserializer() {}
 
@@ -169,11 +182,50 @@ public final class BytesDeserializer {
         return new ConsumerGroup(groupId, name, partitionsCount, membersCount);
     }
 
+    public static ConsumerGroupAssignment readConsumerGroupAssignment(ByteBuf response) {
+        // The generation is a monotonic rebalance counter compared only for
+        // equality, so reading the u64 as a signed long is safe.
+        var generation = response.readLongLE();
+        var partitionsCount = response.readUnsignedIntLE();
+        int capacity = validatedCollectionSize(
+                partitionsCount,
+                response.readableBytes(),
+                CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES,
+                "Consumer group partitions count");
+        List<Long> partitions = new ArrayList<>(capacity);
+        for (long i = 0; i < partitionsCount; i++) {
+            partitions.add(response.readUnsignedIntLE());
+        }
+        return new ConsumerGroupAssignment(generation, partitions);
+    }
+
     public static ConsumerOffsetInfo readConsumerOffsetInfo(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
         var storedOffset = readU64AsBigInteger(response);
         return new ConsumerOffsetInfo(partitionId, currentOffset, storedOffset);
+    }
+
+    public static SendMessagesResponse readSendMessagesResponse(ByteBuf response) {
+        if (!response.isReadable()) {
+            return SendMessagesResponse.empty();
+        }
+        var confirmationsCount = response.readUnsignedIntLE();
+        int capacity = validatedCollectionSize(
+                confirmationsCount, response.readableBytes(), SEND_CONFIRMATION_BYTES, "Send confirmations count");
+        var confirmations = new ArrayList<SendConfirmation>(capacity);
+        for (long i = 0; i < confirmationsCount; i++) {
+            var streamId = response.readUnsignedIntLE();
+            var topicId = response.readUnsignedIntLE();
+            var partitionId = response.readUnsignedIntLE();
+            var baseOffset = readU64AsBigInteger(response);
+            confirmations.add(new SendConfirmation(streamId, topicId, partitionId, baseOffset));
+        }
+        if (response.isReadable()) {
+            throw new IggyMalformedResponseException(
+                    "send messages response has " + response.readableBytes() + " trailing bytes");
+        }
+        return new SendMessagesResponse(confirmations);
     }
 
     public static PolledMessages readPolledMessages(ByteBuf response) {
@@ -349,6 +401,33 @@ public final class BytesDeserializer {
         return new ConsumerGroupInfo(streamId, topicId, groupId);
     }
 
+    public static ClusterMetadata readClusterMetadata(ByteBuf response) {
+        var name = readU32PrefixedString(response, "cluster name");
+        var nodesCount = response.readUnsignedIntLE();
+        if (nodesCount > response.readableBytes() / MIN_CLUSTER_NODE_BYTES) {
+            throw new IggyMalformedResponseException("Cluster nodes count " + nodesCount
+                    + " exceeds remaining payload of " + response.readableBytes() + " bytes");
+        }
+        List<ClusterNode> nodes = new ArrayList<>(toInt(nodesCount));
+        for (int i = 0; i < nodesCount; i++) {
+            nodes.add(readClusterNode(response));
+        }
+        return new ClusterMetadata(name, nodes);
+    }
+
+    public static ClusterNode readClusterNode(ByteBuf response) {
+        var name = readU32PrefixedString(response, "cluster node name");
+        var ip = readU32PrefixedString(response, "cluster node ip");
+        var tcpPort = response.readUnsignedShortLE();
+        var quicPort = response.readUnsignedShortLE();
+        var httpPort = response.readUnsignedShortLE();
+        var websocketPort = response.readUnsignedShortLE();
+        var role = ClusterNodeRole.fromCode(response.readUnsignedByte());
+        var status = ClusterNodeStatus.fromCode(response.readUnsignedByte());
+        return new ClusterNode(
+                name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
+    }
+
     public static UserInfoDetails readUserInfoDetails(ByteBuf response) {
         var userInfo = readUserInfo(response);
 
@@ -446,6 +525,26 @@ public final class BytesDeserializer {
         var expiry = readU64AsBigInteger(response);
         Optional<BigInteger> expiryOptional = expiry.equals(BigInteger.ZERO) ? Optional.empty() : Optional.of(expiry);
         return new PersonalAccessTokenInfo(name, expiryOptional);
+    }
+
+    private static String readU32PrefixedString(ByteBuf buffer, String field) {
+        if (buffer.readableBytes() < Integer.BYTES) {
+            throw new IggyMalformedResponseException("Missing length prefix for " + field);
+        }
+        var length = buffer.readUnsignedIntLE();
+        if (length > buffer.readableBytes()) {
+            throw new IggyMalformedResponseException("Length " + length + " for " + field
+                    + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
+        }
+        return buffer.readCharSequence(toInt(length), StandardCharsets.UTF_8).toString();
+    }
+
+    private static int validatedCollectionSize(long count, int readableBytes, int entryBytes, String field) {
+        if (count > readableBytes / entryBytes) {
+            throw new IggyMalformedResponseException(
+                    field + " " + count + " exceeds remaining payload of " + readableBytes + " bytes");
+        }
+        return Math.toIntExact(count);
     }
 
     static BigInteger readU64AsBigInteger(ByteBuf buffer) {

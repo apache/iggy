@@ -92,15 +92,7 @@ impl std::fmt::Debug for ServerHandle {
 
 impl ServerHandle {
     fn default_server_binary() -> &'static str {
-        #[cfg(feature = "vsr")]
-        {
-            "iggy-server-ng"
-        }
-
-        #[cfg(not(feature = "vsr"))]
-        {
-            "iggy-server"
-        }
+        "iggy-server"
     }
 
     fn launched_binary(&self) -> String {
@@ -184,10 +176,46 @@ impl ServerHandle {
     /// a late joiner that misses early ops.
     #[must_use]
     pub fn replica_mesh_complete(&self) -> bool {
+        self.stdout_contains("replica mesh complete")
+    }
+
+    /// True once this node's stdout log contains `marker`. Spec tests use
+    /// this to pin server-side behavior that has no client-visible effect on
+    /// this node (e.g. a follower completing a state transfer).
+    #[must_use]
+    pub fn stdout_contains(&self, marker: &str) -> bool {
+        self.stdout_occurrences(marker) > 0
+    }
+
+    /// Number of times `marker` appears in this node's stdout log. The log
+    /// file is TRUNCATED on every (re)start (it captures one process run),
+    /// so counts never carry across a restart; a marker seen after
+    /// `restart_server` was logged by the new process.
+    ///
+    /// ANSI escape sequences are stripped before matching: the server colors
+    /// its tracing fields, so a `key=value` marker never matches the raw
+    /// bytes (`key\x1b[0m\x1b[2m=\x1b[0m value`).
+    #[must_use]
+    pub fn stdout_occurrences(&self, marker: &str) -> usize {
         self.stdout_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .is_some_and(|log| log.contains("replica mesh complete"))
+            .map_or(0, |log| strip_ansi(&log).matches(marker).count())
+    }
+
+    /// This node's stdout log with ANSI escapes stripped, the same text
+    /// [`Self::stdout_occurrences`] matches against. Empty when the log is
+    /// missing or unreadable.
+    ///
+    /// For callers that need to PARSE a marker's fields (`checkpoint_op=193`
+    /// reaches the file as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`) rather
+    /// than just count occurrences of it.
+    #[must_use]
+    pub fn stdout_plain(&self) -> String {
+        self.stdout_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map_or_else(String::new, |log| strip_ansi(&log))
     }
 
     /// Returns a `ClientBuilder` using the test transport.
@@ -801,13 +829,9 @@ impl TestBinary for ServerHandle {
             // trusts (rcgen self-signed certs share the same subject DN), which
             // rustls rejects as `BadSignature`. Generate only when absent so all
             // nodes and clients share one keypair; this also keeps the
-            // certificate stable across a restart. The legacy single-node
-            // harness keeps its regenerate-per-start behavior.
-            #[cfg(feature = "vsr")]
+            // certificate stable across a restart.
             let should_generate = !(cert_dir.join("test_cert.pem").exists()
                 && cert_dir.join("test_key.pem").exists());
-            #[cfg(not(feature = "vsr"))]
-            let should_generate = true;
             if should_generate {
                 generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
                     TestBinaryError::InvalidState {
@@ -858,13 +882,6 @@ impl TestBinary for ServerHandle {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
         command.envs(&self.envs);
-
-        // Legacy clustering elects node 0 externally and requires explicit followers.
-        // VSR/server-ng elects its own primary and should see symmetric node startup.
-        #[cfg(not(feature = "vsr"))]
-        if self.server_id > 0 {
-            command.arg("--follower");
-        }
 
         // `--replica-id` is the single identity input expected by the
         // server when cluster mode is enabled; all other cluster config is
@@ -978,14 +995,76 @@ impl Restartable for ServerHandle {
     }
 }
 
+impl ServerHandle {
+    /// Stop this node, delete its data directory, then start it again -- a
+    /// node that rejoins the cluster with no on-disk history, as a fresh
+    /// operator-provisioned replacement or a wiped disk does.
+    ///
+    /// Distinct from [`Restartable::restart`], which preserves the WAL and so
+    /// exercises the recovery-with-history path. The empty data directory is
+    /// what forces the state-transfer join: local recovery has nothing, and
+    /// the committed prefix the node missed no longer exists as WAL entries on
+    /// the peers that checkpointed it.
+    pub fn restart_from_clean_slate(&mut self) -> Result<(), TestBinaryError> {
+        self.stop_dependents()?;
+        self.stop()?;
+
+        let data_path = self.data_path();
+        if data_path.exists() {
+            fs::remove_dir_all(&data_path).map_err(|source| TestBinaryError::FileSystemError {
+                path: data_path,
+                source,
+            })?;
+        }
+
+        self.start()
+    }
+}
+
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         // Reap the child before `port_reserver` drops: `Child::drop` detaches
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
+            if std::thread::panicking() {
+                // Ahead of the full dump, which buries these lines under the
+                // complete stdout of every node.
+                eprintln!("Iggy server panicked:\n{report}");
+            } else {
+                // A dead task leaves the process alive and the test green;
+                // failing here is the only thing that surfaces it. The panic
+                // unwinds out of this `Drop` before the dump below runs, so
+                // print this node's logs first.
+                let (stdout, stderr) =
+                    super::common::collect_logs(&self.stdout_path, &self.stderr_path);
+                eprintln!("Iggy server stdout:\n{stdout}");
+                eprintln!("Iggy server stderr:\n{stderr}");
+                panic!("Iggy server panicked:\n{report}");
+            }
+        }
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
+}
+
+/// Drop ANSI escape sequences (`ESC [ ... <letter>`) so log markers match
+/// the text an operator sees, not the color codes around it.
+fn strip_ansi(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(current) = chars.next() {
+        if current == '\u{1b}' {
+            for escaped in chars.by_ref() {
+                if escaped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(current);
+        }
+    }
+    out
 }
 
 fn generate_test_certificates(cert_dir: &str) -> Result<(), Box<dyn std::error::Error>> {

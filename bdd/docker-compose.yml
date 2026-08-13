@@ -170,14 +170,16 @@ services:
       - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+      - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
     command:
       - sh
       - -c
       - |
         case "$$BDD_FEATURE" in
-          basic_messaging) export CUCUMBER_FILTER_TAGS='@basic-messaging' ;;
-          raw_command)     export CUCUMBER_FILTER_TAGS='@raw-command' ;;
+          basic_messaging)    export CUCUMBER_FILTER_TAGS='@basic-messaging' ;;
+          leader_redirection) export CUCUMBER_FILTER_TAGS='@requires-leader-awareness' ;;
+          raw_command)        export CUCUMBER_FILTER_TAGS='@raw-command' ;;
         esac
         gradle --no-daemon test
     networks:

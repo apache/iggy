@@ -32,7 +32,6 @@ describe('VSR request header', () => {
       client,
       request: 0x0102030405060708n,
       operation: 2,
-      namespace: 0x8877665544332211n,
       session: 0x1020304050607080n,
       nonReplicatedCode: 60_001
     });
@@ -54,10 +53,6 @@ describe('VSR request header', () => {
     );
     assert.equal(header.readUInt8(REQUEST_OFFSET.operation), 2);
     assert.equal(
-      header.readBigUInt64LE(REQUEST_OFFSET.namespace),
-      0x8877665544332211n
-    );
-    assert.equal(
       header.readBigUInt64LE(REQUEST_OFFSET.session),
       0x1020304050607080n
     );
@@ -71,7 +66,6 @@ describe('VSR request header', () => {
       client: 1n,
       request: 0n,
       operation: 1,
-      namespace: 1n << 63n,
       session: 0n
     });
     const expected = Buffer.alloc(HEADER_SIZE);
@@ -79,7 +73,6 @@ describe('VSR request header', () => {
     expected.writeUInt8(Command2.Request, REQUEST_OFFSET.command);
     expected.writeBigUInt64LE(1n, REQUEST_OFFSET.client);
     expected.writeUInt8(1, REQUEST_OFFSET.operation);
-    expected.writeBigUInt64LE(1n << 63n, REQUEST_OFFSET.namespace);
     assert.deepEqual(header, expected);
   });
 
@@ -90,7 +83,6 @@ describe('VSR request header', () => {
       client: maximum << 64n | maximum,
       request: maximum,
       operation: 160,
-      namespace: maximum,
       session: maximum
     });
     assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.request), maximum);

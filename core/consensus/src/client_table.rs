@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::ReplyHeader;
+use crate::le_cursor::{LeCursor, Truncated, split_verified_trailer};
 use iggy_binary_protocol::consensus::ConsensusError;
+use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use serde::{Deserialize, Serialize};
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen, iobuf::Owned};
+use server_common::{
+    MESSAGE_ALIGN, Message,
+    iobuf::{Frozen, Owned},
+};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::mem::size_of;
@@ -395,11 +399,14 @@ pub enum CommitReply {
 /// metadata checkpoint, so sessions registered below the snapshot floor survive
 /// a restart that drained the WAL prefix they committed in.
 ///
-/// ## Known gaps
+/// ## Serialization (wire)
 ///
-/// - **Serialization**: encode/decode for rejoin slice-fetch and state
-///   transfer TODO (IGGY-137). The checkpoint form above is local-recovery
-///   only; it is not a wire format.
+/// [`Self::encode`] / [`Self::decode`] carry the table across state transfer
+/// (a rejoin behind the peers' retained floor replaces its table with the
+/// primary's copy). Deterministic: slot-order walk over apply-derived state,
+/// so every caught-up replica encodes identical bytes. Distinct from the
+/// checkpoint form above: that one is local-recovery durability, this one is
+/// the transfer wire format.
 #[derive(Debug)]
 pub struct ClientTable {
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
@@ -430,7 +437,7 @@ impl ClientTable {
 
     /// Resize the table to `max_clients` slots. Boot-only: reallocating a
     /// populated table would silently drop live sessions, so this must run
-    /// before any client registers (server-ng bootstrap applies the configured
+    /// before any client registers (the server bootstrap applies the configured
     /// `[metadata] clients_table_max` here).
     ///
     /// # Panics
@@ -944,6 +951,265 @@ impl ClientTable {
     }
 }
 
+/// Failure decoding the state-transfer WIRE encoding of a client table
+/// ([`ClientTable::encode`] / [`ClientTable::decode`]).
+///
+/// Distinct from [`ClientTableDecodeError`], which covers the msgpack
+/// CHECKPOINT encoding read off local disk. The two formats validate the same
+/// invariants against differently-trusted inputs: a checkpoint is this node's
+/// own bytes, while these arrive from a peer.
+#[derive(Debug)]
+pub enum ClientTableWireError {
+    /// Byte stream ended mid-field.
+    Truncated,
+    /// Leading magic is not [`CLIENT_TABLE_MAGIC`].
+    BadMagic,
+    /// Trailing hash does not match the content.
+    ChecksumMismatch { expected: u64, actual: u64 },
+    /// Encoded entry count exceeds [`CLIENTS_TABLE_SLOT_MAX`], the allocation
+    /// ceiling no valid table can reach.
+    TooManyEntries { count: u32, max: usize },
+    /// A cached reply's bytes do not parse as a valid reply message.
+    InvalidReply,
+    /// An entry carries an empty reply ring (violates the never-empty
+    /// invariant registration establishes).
+    EmptyRing,
+    /// Two entries claim the same `client_id`. Indexing them would leave one
+    /// slot occupied but unindexed, which desynchronizes the capacity check in
+    /// [`ClientTable::commit_register`] from the actual occupancy.
+    DuplicateClientId { slot: usize, client_id: u128 },
+    /// A reply ring longer than [`REPLY_RING_CAPACITY`]. `push_latest` only
+    /// evicts on equality, so an over-capacity ring grows without bound, and
+    /// `encode` writes its length as a `u8`.
+    RingTooLong { slot: usize, len: u8, max: usize },
+}
+
+impl std::fmt::Display for ClientTableWireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "encoded client table truncated"),
+            Self::BadMagic => write!(f, "encoded client table has wrong magic"),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "client table checksum mismatch: expected {expected:#018x}, actual {actual:#018x}"
+            ),
+            Self::TooManyEntries { count, max } => {
+                write!(f, "encoded client table holds {count} entries, max {max}")
+            }
+            Self::InvalidReply => write!(f, "encoded client table holds an invalid cached reply"),
+            Self::EmptyRing => write!(f, "encoded client table entry has an empty reply ring"),
+            Self::DuplicateClientId { slot, client_id } => write!(
+                f,
+                "encoded client table repeats client {client_id} at entry {slot}"
+            ),
+            Self::RingTooLong { slot, len, max } => write!(
+                f,
+                "encoded client table entry {slot} has a {len}-reply ring, max {max}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClientTableWireError {}
+
+impl From<Truncated> for ClientTableWireError {
+    fn from(_: Truncated) -> Self {
+        Self::Truncated
+    }
+}
+
+/// Format tag for [`ClientTable::encode`]; bump on layout change.
+///
+/// That includes any `ReplyHeader` layout move -- cached replies are embedded
+/// as raw wire bytes, so an artifact written under an older header layout must
+/// be refused, not silently misread. `ICT2`: `status` sits at offset 216 (the
+/// pre-`ICT2` layout carried a `namespace` word before it).
+pub const CLIENT_TABLE_MAGIC: [u8; 4] = *b"ICT2";
+
+/// Per-entry fixed fields in the wire encoding: `client(u128) epoch(u64)
+/// user_id(u32) watermark(u64) watermark_checksum(u128) ring_len(u8)`.
+const ENCODED_ENTRY_FIXED_LEN: usize = size_of::<u128>()
+    + size_of::<u64>()
+    + size_of::<u32>()
+    + size_of::<u64>()
+    + size_of::<u128>()
+    + size_of::<u8>();
+
+impl ClientTable {
+    /// Encode the table for state transfer.
+    ///
+    /// Layout (all little-endian): `magic(4) count(u32)` then per entry in
+    /// slot order `client(u128) epoch(u64) user_id(u32) watermark(u64)
+    /// watermark_checksum(u128) ring_len(u8) [reply_len(u32) reply_bytes]*`,
+    /// terminated by an `XxHash3_64(8)` over everything before it.
+    ///
+    /// Slot order makes the bytes deterministic across caught-up replicas
+    /// that reached this state the same way. Not a cross-replica byte
+    /// identity: entries compact into `0..count` here, so a replica that
+    /// installed a transfer re-slots its clients and later registrations land
+    /// elsewhere than on a replica that never did.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn encode(&self) -> Vec<u8> {
+        // Size exactly rather than guess: each cached reply is a full wire
+        // message, so at the default client cap a guessed reservation is off by
+        // orders of magnitude and costs several reallocs of a multi-MB buffer
+        // on the serving primary's pump, once per offer build.
+        let entries = self.slots.iter().flatten();
+        let reserved = CLIENT_TABLE_MAGIC.len()
+            + size_of::<u32>()
+            + entries
+                .map(|entry| {
+                    ENCODED_ENTRY_FIXED_LEN
+                        + entry
+                            .ring
+                            .iter()
+                            .map(|reply| size_of::<u32>() + reply.bytes.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + size_of::<u64>();
+        let mut out = Vec::with_capacity(reserved);
+        out.extend_from_slice(&CLIENT_TABLE_MAGIC);
+        out.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
+        for (slot_idx, slot) in self.slots.iter().enumerate() {
+            let Some(entry) = slot else { continue };
+            debug_assert_eq!(self.index.get(&entry.client_id), Some(&slot_idx));
+            out.extend_from_slice(&entry.client_id.to_le_bytes());
+            out.extend_from_slice(&entry.epoch.to_le_bytes());
+            out.extend_from_slice(&entry.user_id.to_le_bytes());
+            out.extend_from_slice(&entry.watermark.to_le_bytes());
+            out.extend_from_slice(&entry.watermark_checksum.to_le_bytes());
+            out.push(entry.ring.len() as u8);
+            for reply in &entry.ring {
+                let bytes = reply.bytes.as_slice();
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+        debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
+        let trailer = crate::state_manifest::state_artifact_checksum(&out);
+        out.extend_from_slice(&trailer.to_le_bytes());
+        out
+    }
+
+    /// Decode a table encoded by [`Self::encode`] into a fresh table of at
+    /// least `min_slots` capacity, grown to the received entry count.
+    ///
+    /// Growing mirrors [`Self::from_snapshot`]: a serving primary can
+    /// legitimately hold more live sessions than this node's configured cap
+    /// (its own table grew from a checkpoint, or it runs a larger cap), and a
+    /// cold-boot receiver sits at exactly the raw config value -- rejecting on
+    /// the local cap would make such a join fail deterministically.
+    ///
+    /// The denormalized `latest_commit` is rebuilt from the decoded ring's
+    /// back, not trusted from the wire, so it cannot drift from the ring.
+    ///
+    /// # Errors
+    /// [`ClientTableWireError`] on truncation, magic/checksum mismatch, an
+    /// entry count past [`CLIENTS_TABLE_SLOT_MAX`], a duplicate `client_id`,
+    /// an out-of-range ring length, or an undecodable cached reply.
+    ///
+    /// # Panics
+    /// Unreachable: slice-to-array conversions are length-checked first.
+    pub fn decode(bytes: &[u8], min_slots: usize) -> Result<Self, ClientTableWireError> {
+        let content = split_verified_trailer(bytes).map_err(|mismatch| match mismatch {
+            Some((expected, actual)) => ClientTableWireError::ChecksumMismatch { expected, actual },
+            None => ClientTableWireError::Truncated,
+        })?;
+
+        let mut reader = LeCursor::new(content);
+        if reader.take(CLIENT_TABLE_MAGIC.len())? != CLIENT_TABLE_MAGIC {
+            return Err(ClientTableWireError::BadMagic);
+        }
+        let count = reader.u32()?;
+        // Bound the allocation on the same slot ceiling `from_snapshot` uses;
+        // `count` is a peer-supplied u32 and this is the only check between it
+        // and `Self::new`'s eager Vec resize.
+        if count as usize > CLIENTS_TABLE_SLOT_MAX {
+            return Err(ClientTableWireError::TooManyEntries {
+                count,
+                max: CLIENTS_TABLE_SLOT_MAX,
+            });
+        }
+
+        let mut table = Self::new(min_slots.max(count as usize));
+        for slot_idx in 0..count as usize {
+            let client_id = reader.u128()?;
+            let epoch = reader.u64()?;
+            let user_id = reader.u32()?;
+            let watermark = reader.u64()?;
+            let watermark_checksum = reader.u128()?;
+            let ring_len = reader.u8()?;
+            if ring_len == 0 {
+                return Err(ClientTableWireError::EmptyRing);
+            }
+            // The artifact checksum only proves the bytes survived transit; it
+            // says nothing about the peer that computed them. An over-capacity
+            // ring is admitted forever after (`push_latest` evicts only on
+            // equality) and eventually wraps `encode`'s `u8` length, making
+            // this table permanently un-transferable onward.
+            if usize::from(ring_len) > REPLY_RING_CAPACITY {
+                return Err(ClientTableWireError::RingTooLong {
+                    slot: slot_idx,
+                    len: ring_len,
+                    max: REPLY_RING_CAPACITY,
+                });
+            }
+            let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
+            for _ in 0..ring_len {
+                let reply_len = reader.u32()? as usize;
+                let reply_bytes = reader.take(reply_len)?;
+                let owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(reply_bytes);
+                let message = Message::<GenericHeader>::try_from(owned)
+                    .map_err(|_| ClientTableWireError::InvalidReply)?
+                    .try_into_typed::<ReplyHeader>()
+                    .map_err(|_| ClientTableWireError::InvalidReply)?;
+                ring.push_back(CachedReply::from_message(message));
+            }
+            let latest_commit = ring
+                .back()
+                .expect("ring_len checked non-zero above")
+                .header()
+                .commit;
+            table.slots[slot_idx] = Some(ClientEntry {
+                epoch,
+                user_id,
+                watermark,
+                watermark_checksum,
+                ring,
+                client_id,
+                latest_commit,
+            });
+            // Reject rather than overwrite, as the checkpoint decoder does. An
+            // overwrite leaves the displaced slot occupied but unindexed, and
+            // `commit_register` sizes its eviction check off `index.len()`: a
+            // full table would then skip eviction, find no free slot, and
+            // panic the shard.
+            if let Some(first_slot) = table.index.insert(client_id, slot_idx) {
+                return Err(ClientTableWireError::DuplicateClientId {
+                    slot: first_slot,
+                    client_id,
+                });
+            }
+        }
+        if !reader.remaining().is_empty() {
+            return Err(ClientTableWireError::Truncated);
+        }
+        Ok(table)
+    }
+
+    /// Slot capacity, i.e. the largest table this one can absorb from a peer.
+    ///
+    /// Sized at construction from the configured cap, then raised by
+    /// [`Self::from_snapshot`] to cover any slot the checkpoint holds, so this
+    /// can exceed `[metadata] clients_table_max`.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 impl ClientEntry {
     /// Latest committed reply (register or app op).
     ///
@@ -985,6 +1251,7 @@ mod tests {
     /// assert on it (see `register_stores_user_id` for the accessor check).
     const TEST_USER_ID: u32 = 7;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn make_register_reply(client: u128, commit: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
         let mut msg = Message::<ReplyHeader>::new(header_size);
@@ -996,9 +1263,10 @@ mod tests {
             client,
             request: REGISTER_REQUEST_ID,
             commit,
+            // Real size so codec-roundtripped replies re-parse.
+            size: header_size as u32,
             command: Command2::Reply,
             operation: Operation::Register,
-            size: header_size as u32,
             ..ReplyHeader::default()
         };
         msg
@@ -1008,6 +1276,7 @@ mod tests {
         make_reply_with_checksum(client, request, commit, 0)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn make_reply_with_checksum(
         client: u128,
         request: u64,
@@ -1025,9 +1294,10 @@ mod tests {
             request,
             commit,
             request_checksum,
+            // Real size so codec-roundtripped replies re-parse.
+            size: header_size as u32,
             command: Command2::Reply,
             operation: Operation::SendMessages,
-            size: header_size as u32,
             ..ReplyHeader::default()
         };
         msg
@@ -1705,6 +1975,200 @@ mod tests {
         assert!(matches!(
             table.check_request(2, 20, 1, 0),
             RequestStatus::Fenced { .. }
+        ));
+    }
+
+    // Codec tests
+
+    // State transfer ships the table as bytes; the decoded table must answer
+    // every dedup question identically to the original.
+    #[test]
+    fn encode_decode_roundtrip_preserves_dedup_state() {
+        let mut table = ClientTable::new(10);
+        table.commit_register(1, 11, make_register_reply(1, 10));
+        table.commit_reply(1, make_reply_with_checksum(1, 1, 11, 0xAA));
+        table.commit_reply(1, make_reply_for(1, 2, 12));
+        // Rebind at op 20: fence moves to 20, watermark preserved.
+        table.commit_register(1, 22, make_register_reply(1, 20));
+        table.commit_register(2, 33, make_register_reply(2, 30));
+
+        let encoded = table.encode();
+        let decoded = ClientTable::decode(&encoded, 10).expect("roundtrip decodes");
+
+        assert_eq!(decoded.count(), 2);
+        assert_eq!(decoded.get_epoch(1), Some(20));
+        assert_eq!(decoded.get_user_id(1), Some(22));
+        assert_eq!(decoded.get_watermark(1), Some(2));
+        assert_eq!(decoded.get_epoch(2), Some(30));
+        match decoded.check_request(1, 20, 2, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 2, "latest reply survives");
+                assert_eq!(cached.header().commit, 12, "original bytes survive");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        assert!(matches!(
+            decoded.check_request(1, 20, 1, 0xBB),
+            RequestStatus::ChecksumMismatch { request: 1 }
+        ));
+        assert!(matches!(
+            decoded.check_request(1, 10, 1, 0),
+            RequestStatus::Fenced { .. }
+        ));
+
+        // Deterministic bytes: encoding the decoded table reproduces them.
+        assert_eq!(decoded.encode(), encoded);
+    }
+
+    // The denormalized `latest_commit` is rebuilt from the ring on decode, so
+    // eviction ranks a transferred table exactly like the original.
+    #[test]
+    fn decode_rebuilds_eviction_ranking() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
+        table.commit_reply(100, make_reply_for(100, 1, 30));
+
+        let mut decoded = ClientTable::decode(&table.encode(), 2).expect("roundtrip decodes");
+        // 200 (latest commit 20) is older than 100 (latest commit 30).
+        decoded.commit_register(300, TEST_USER_ID, make_register_reply(300, 40));
+        assert!(decoded.get_reply(100).is_some());
+        assert!(decoded.get_reply(200).is_none(), "200 was the oldest");
+        assert!(decoded.get_reply(300).is_some());
+    }
+
+    #[test]
+    fn decode_rejects_corruption() {
+        let mut table = ClientTable::new(4);
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        let encoded = table.encode();
+
+        // Flipped content byte -> checksum mismatch.
+        let mut flipped = encoded.clone();
+        flipped[8] ^= 0xFF;
+        assert!(matches!(
+            ClientTable::decode(&flipped, 4),
+            Err(ClientTableWireError::ChecksumMismatch { .. })
+        ));
+
+        // Truncation.
+        assert!(matches!(
+            ClientTable::decode(&encoded[..encoded.len() - 1], 4),
+            Err(ClientTableWireError::ChecksumMismatch { .. } | ClientTableWireError::Truncated)
+        ));
+
+        let empty = ClientTable::new(4).encode();
+        assert_eq!(
+            ClientTable::decode(&empty, 4)
+                .expect("empty table decodes")
+                .count(),
+            0
+        );
+    }
+
+    /// Re-stamp a hand-edited body so it passes the trailer check and the
+    /// per-field validations are what the decode actually exercises.
+    fn reseal(mut content: Vec<u8>) -> Vec<u8> {
+        let trailer = crate::state_manifest::state_artifact_checksum(&content);
+        content.extend_from_slice(&trailer.to_le_bytes());
+        content
+    }
+
+    // A duplicate client_id would collapse the index onto one slot, leaving the
+    // other occupied but unindexed. `commit_register` sizes its eviction check
+    // off `index.len()`, so a full table would then skip eviction, find no free
+    // slot, and panic the shard.
+    #[test]
+    fn decode_rejects_a_duplicate_client_id() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10));
+        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20));
+        let encoded = table.encode();
+
+        // Rewrite the second entry's client_id to match the first. Entries are
+        // fixed-width up to their ring, and both rings hold one register reply
+        // of equal length, so the second entry starts at a computable offset.
+        let content = &encoded[..encoded.len() - size_of::<u64>()];
+        let header_len = CLIENT_TABLE_MAGIC.len() + size_of::<u32>();
+        let reply_len = (content.len() - header_len - 2 * ENCODED_ENTRY_FIXED_LEN) / 2;
+        let second = header_len + ENCODED_ENTRY_FIXED_LEN + reply_len;
+        let mut duped = content.to_vec();
+        duped[second..second + size_of::<u128>()].copy_from_slice(&7u128.to_le_bytes());
+
+        assert!(matches!(
+            ClientTable::decode(&reseal(duped), 2),
+            Err(ClientTableWireError::DuplicateClientId { client_id: 7, .. })
+        ));
+    }
+
+    // A serving primary can hold more live sessions than this node's cap: a
+    // cold-boot receiver sits at the raw config value, so rejecting on it
+    // would make a join under cap reduction fail deterministically. Decode
+    // grows to the received count instead, as `from_snapshot` does.
+    #[test]
+    fn decode_grows_capacity_to_the_received_count() {
+        let mut table = ClientTable::new(2);
+        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10));
+        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20));
+        let encoded = table.encode();
+
+        let grown = ClientTable::decode(&encoded, 1).expect("decode grows past the local floor");
+        assert_eq!(grown.count(), 2);
+        assert_eq!(grown.capacity(), 2);
+
+        let floored = ClientTable::decode(&encoded, 8).expect("floor kept when larger");
+        assert_eq!(floored.capacity(), 8);
+    }
+
+    // The received count is the only bound between a peer-supplied u32 and the
+    // eager slot allocation, so it must stop at the same ceiling
+    // `from_snapshot` enforces.
+    #[test]
+    fn decode_rejects_a_count_past_the_slot_ceiling() {
+        let mut table = ClientTable::new(1);
+        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10));
+        let encoded = table.encode();
+
+        let content = &encoded[..encoded.len() - size_of::<u64>()];
+        let mut oversized = content.to_vec();
+        let count_at = CLIENT_TABLE_MAGIC.len();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            oversized[count_at..count_at + size_of::<u32>()]
+                .copy_from_slice(&(CLIENTS_TABLE_SLOT_MAX as u32 + 1).to_le_bytes());
+        }
+
+        assert!(matches!(
+            ClientTable::decode(&reseal(oversized), 1),
+            Err(ClientTableWireError::TooManyEntries {
+                max: CLIENTS_TABLE_SLOT_MAX,
+                ..
+            })
+        ));
+    }
+
+    // `push_latest` evicts only on equality, so an over-capacity ring is
+    // admitted permanently and grows on every later reply until `encode`'s u8
+    // length wraps and the table stops being transferable at all.
+    #[test]
+    fn decode_rejects_a_ring_longer_than_capacity() {
+        let mut table = ClientTable::new(1);
+        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10));
+        let encoded = table.encode();
+
+        let content = &encoded[..encoded.len() - size_of::<u64>()];
+        let mut oversized = content.to_vec();
+        // ring_len is the last fixed field of the entry.
+        let ring_len_at = CLIENT_TABLE_MAGIC.len() + size_of::<u32>() + ENCODED_ENTRY_FIXED_LEN - 1;
+        assert_eq!(oversized[ring_len_at], 1, "entry's ring holds one reply");
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            oversized[ring_len_at] = REPLY_RING_CAPACITY as u8 + 1;
+        }
+
+        assert!(matches!(
+            ClientTable::decode(&reseal(oversized), 1),
+            Err(ClientTableWireError::RingTooLong { .. })
         ));
     }
 }

@@ -17,15 +17,15 @@
 
 //! Runtime validation and resolution of config paths to environment variables.
 
-use configs::ConfigEnvMappings;
-use server::configs::server::ServerConfig;
+use configs::server::ServerConfig;
+use configs::{ConfigEnvMappings, EnvVarMapping};
 use std::collections::HashMap;
 
 /// Resolve config paths to environment variable names.
 ///
 /// Takes a map of dot-notation config paths (e.g., "segment.size") and their values,
-/// validates them against the `ServerConfig` mappings, and returns the corresponding
-/// environment variable names with values.
+/// validates them against the `ServerConfig` mappings, and returns the
+/// corresponding environment variable names with values.
 ///
 /// # Implicit defaults
 ///
@@ -51,8 +51,8 @@ pub fn resolve_config_paths(
             path.as_str()
         };
 
-        let mapping = ServerConfig::find_by_config_path(resolved_path)
-            .or_else(|| ServerConfig::find_by_config_path(&format!("system.{}", resolved_path)));
+        let mapping = find_mapping(resolved_path)
+            .or_else(|| find_mapping(&format!("system.{}", resolved_path)));
 
         match mapping {
             Some(m) => {
@@ -91,30 +91,28 @@ pub fn resolve_config_paths(
     }
 
     // Auto-enable override_defaults when socket settings are customized
-    if needs_tcp_socket_override
-        && let Some(m) = ServerConfig::find_by_config_path("tcp.socket.override_defaults")
-    {
+    if needs_tcp_socket_override && let Some(m) = find_mapping("tcp.socket.override_defaults") {
         env_vars
             .entry(m.env_name.to_string())
             .or_insert_with(|| "true".to_string());
     }
-    if needs_quic_socket_override
-        && let Some(m) = ServerConfig::find_by_config_path("quic.socket.override_defaults")
-    {
+    if needs_quic_socket_override && let Some(m) = find_mapping("quic.socket.override_defaults") {
         env_vars
             .entry(m.env_name.to_string())
             .or_insert_with(|| "true".to_string());
     }
     // Auto-enable encryption when key is set
-    if needs_encryption_enabled
-        && let Some(m) = ServerConfig::find_by_config_path("system.encryption.enabled")
-    {
+    if needs_encryption_enabled && let Some(m) = find_mapping("system.encryption.enabled") {
         env_vars
             .entry(m.env_name.to_string())
             .or_insert_with(|| "true".to_string());
     }
 
     Ok(env_vars)
+}
+
+fn find_mapping(path: &str) -> Option<&'static EnvVarMapping> {
+    ServerConfig::find_by_config_path(path)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -179,7 +177,7 @@ fn find_similar_paths(unknown: &str) -> Vec<String> {
         })
         .collect();
 
-    candidates.sort_by_key(|(_, score)| *score);
+    candidates.sort_by_key(|(path, score)| (*score, *path));
 
     candidates
         .into_iter()

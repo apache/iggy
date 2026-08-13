@@ -23,8 +23,9 @@ use consensus::{
     ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
     build_reply_message_with,
 };
-use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
+use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_common::IggyError;
+use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use journal::superblock::{
     PingPongSuperblock, SLOT_FILE_NAMES, SuperblockContents, SuperblockStore,
@@ -307,6 +308,13 @@ pub struct RecoveredMetadata<M> {
     /// they stay journal-only until the recovered primary re-replicates them
     /// (or a backup sees the commit point advance past them).
     pub last_journaled_op: Option<u64>,
+    /// First op replay could not connect to its predecessor, `None` when the
+    /// replayed range is one unbroken chain.
+    ///
+    /// `Some(op)` means entries at and above `op` were truncated and must come back
+    /// from the cluster. `last_journaled_op` stops below it, which keeps the restored
+    /// head, the re-pipeline range, and the recovery barrier honest.
+    pub chain_break_op: Option<u64>,
 }
 
 /// Recover metadata state from disk.
@@ -434,9 +442,15 @@ where
     // state. One that merely lags a newer, atomically-complete snapshot is accepted,
     // since `commit_max` is a recovery lower bound and the WAL suffix re-commits.
     //
-    // TODO(state-transfer): there is no metadata state transfer yet, so refusing boot
-    // is the only sound response. Once it lands, fetch the checkpoint from a healthy
-    // replica here instead of erroring.
+    // Metadata state transfer exists now, and refusing boot here is still the right
+    // answer rather than a gap waiting on it. What this check catches is LOCAL
+    // durability damage -- a lost snapshot write, or a torn/corrupt one -- not a
+    // replica that merely fell behind the cluster. Transfer repairs the second, and
+    // does so post-boot once consensus has a view and a live primary to pull from;
+    // wiring it in here would silently re-sync over a failing disk instead of
+    // surfacing it. The operator remedy is to clear the metadata directory, after
+    // which the node rejoins through the ordinary transfer path (covered by
+    // `restart_from_clean_slate` and the fresh-late-join spec).
     let snapshot_op = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
     verify_checkpoint_pairing(
         recovered_state.as_ref(),
@@ -505,9 +519,12 @@ where
     //
     // A warning and not a refusal, deliberately: each journaled prepare stamps the
     // primary's commit point as of its SEND, so the derived watermark is a lower bound
-    // and trails `commit_max` on a perfectly healthy node. Only state transfer can turn
-    // this into a decision, which is why the field has no other reader (see the
-    // TODO(state-transfer) above).
+    // and trails `commit_max` on a perfectly healthy node. That is also why state
+    // transfer landing does not promote this into a trigger -- the comparison cannot
+    // separate "behind" from "healthy", so arming on it would make every restart
+    // transfer. The triggers that do fire are post-boot and precise: journal repair
+    // answering `RangeEvicted` (the gap is provably below a peer's retained floor), a
+    // StartView adopted while awaiting a target, and the same-view heartbeat backstop.
     if let Some(state) = recovered_state.as_ref()
         && state.commit_max > commit_watermark
     {
@@ -536,10 +553,35 @@ where
 
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
+    let mut chain_break_op: Option<u64> = None;
+    let mut previous: Option<PrepareHeader> = None;
     for header in &headers_to_replay {
-        // TODO: Check hash chain integrity against `previous_header`. On a
-        // same-view break, stop replay here and mark the remaining entries for
-        // repair via VSR instead of panicking.
+        // Stop at the first op that does not connect to the one before it. Applying
+        // across a hole replays effects onto a state machine that never saw the
+        // missing op, and nothing downstream re-checks it.
+        //
+        // The WAL scan does not cover this: it only fires on CONSECUTIVE ops with
+        // both ends sealed, so a gap reaches here. The first replayed op is exempt,
+        // since a snapshot records no checksum for its parent to chain to.
+        if let Some(previous) = previous {
+            let gap = previous.op + 1 != header.op;
+            let broken_chain = previous.checksum != CHECKSUM_UNSEALED
+                && header.checksum != CHECKSUM_UNSEALED
+                && header.parent != previous.checksum;
+            if gap || broken_chain {
+                tracing::error!(
+                    op = header.op,
+                    previous_op = previous.op,
+                    gap,
+                    broken_chain,
+                    "metadata WAL does not connect at this op; stopping replay and dropping the \
+                     suffix for VSR repair"
+                );
+                chain_break_op = Some(header.op);
+                break;
+            }
+        }
+        previous = Some(*header);
 
         last_journaled_op = Some(header.op);
         if header.op > commit_watermark {
@@ -617,6 +659,22 @@ where
         last_applied_op = Some(header.op);
     }
 
+    // `truncate_from`, never `drain`: the removed ops must stay refillable, so the
+    // snapshot watermark stays put. Leaving them resident would make `append` refuse
+    // the slot, failing repair on exactly the ops it exists to fix.
+    if let Some(break_op) = chain_break_op {
+        let removed = journal
+            .truncate_from(break_op)
+            .await
+            .map_err(RecoveryError::Io)?;
+        tracing::warn!(
+            break_op,
+            removed,
+            last_journaled_op,
+            "dropped the disconnected metadata WAL suffix; the cluster re-supplies these ops"
+        );
+    }
+
     Ok(RecoveredMetadata {
         journal,
         snapshot,
@@ -627,6 +685,7 @@ where
         client_table,
         last_applied_op,
         last_journaled_op,
+        chain_break_op,
     })
 }
 
@@ -772,6 +831,7 @@ mod tests {
             commit_max: 100,
             checkpoint_op,
             checkpoint_checksum,
+            offset_frontier: 0,
         }
     }
 
@@ -964,6 +1024,130 @@ mod tests {
         assert_eq!(recovered.last_applied_op, Some(2));
         assert_eq!(recovered.last_journaled_op, Some(3));
         assert_eq!(recovered.journal.last_op(), Some(3));
+    }
+
+    /// A prepare sealed the way a live primary seals one: `parent` chains to the
+    /// previous op's identity and `checksum` is that identity.
+    fn make_chained_prepare(op: u64, commit: u64, parent: u128) -> Message<PrepareHeader> {
+        let mut message = make_prepare_with_commit(op, commit, 32);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut message.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.parent = parent;
+        let checksum = header.identity_checksum();
+        header.checksum = checksum;
+        message
+    }
+
+    #[compio::test]
+    async fn recover_stops_at_a_gap_and_drops_the_disconnected_suffix() {
+        // Ops 1-3 then 5: op 4 never landed. Replaying 5 over a state machine that
+        // never saw 4 diverges silently, and the WAL scan waves this through --
+        // its chain check only fires on CONSECUTIVE ops, since a gap is also what
+        // ordinary compaction leaves behind.
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for op in 1..=3u64 {
+                journal
+                    .append(make_prepare_with_commit(op, op, 32))
+                    .await
+                    .unwrap();
+            }
+            journal
+                .append(make_prepare_with_commit(5, 5, 32))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.chain_break_op, Some(5));
+        assert_eq!(
+            recovered.last_applied_op,
+            Some(3),
+            "op 5 must not apply across the hole at op 4"
+        );
+        assert_eq!(
+            recovered.last_journaled_op,
+            Some(3),
+            "the restored head stops below the break, so nothing re-pipelines it"
+        );
+        assert_eq!(
+            recovered.journal.last_op(),
+            Some(3),
+            "the disconnected entry is dropped so repair can journal the cluster's op 5"
+        );
+        assert_eq!(
+            recovered.journal.snapshot_op(),
+            0,
+            "truncating a suffix must leave the watermark, or the ops stop being refillable"
+        );
+    }
+
+    #[compio::test]
+    async fn recover_stops_at_a_broken_chain_between_consecutive_ops() {
+        // Consecutive and sealed on both ends, but op 3 names a parent that is not
+        // op 2: a fork left by a crash mid view change. Ops are appended out of
+        // ascending file order so the scan's own chain check does not fire first.
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            let first = make_chained_prepare(1, 1, 0);
+            let first_checksum = first.header().checksum;
+            journal.append(first).await.unwrap();
+            let second = make_chained_prepare(2, 2, first_checksum);
+            journal.append(second).await.unwrap();
+            // Parent of a prepare that is not op 2.
+            journal
+                .append(make_chained_prepare(3, 3, 0xdead_beef))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+        )
+        .await;
+
+        // The WAL scan reaches this first and refuses boot: consecutive ops, both
+        // sealed, chain broken, with no entry after it is only a tail. Either
+        // outcome is a refusal to apply the fork; what must never happen is a
+        // clean recovery that replayed op 3.
+        match recovered {
+            Err(RecoveryError::Journal(_) | RecoveryError::Io(_)) => {}
+            Ok(recovered) => {
+                assert!(
+                    recovered.last_applied_op < Some(3),
+                    "op 3 forks the chain and must not be applied"
+                );
+            }
+            Err(other) => panic!("unexpected recovery error: {other:?}"),
+        }
     }
 
     #[compio::test]

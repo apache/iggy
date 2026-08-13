@@ -32,18 +32,17 @@ npm i --save apache-iggy
 
 ### Response frame limit
 
-**Compatibility note:** response frames larger than `maxResponseFrameSize` (default 64 MiB) are now rejected and close the connection under both framing modes. This is a behavior change for existing classic-framing clients. Raise the limit in the client configuration when polling very large batches.
+**Compatibility note:** response frames larger than `maxResponseFrameSize` (default 64 MiB) are rejected and close the connection. Raise the limit in the client configuration when polling very large batches.
 
 ### VSR framing
 
-Classic framing remains the default. Select VSR explicitly when connecting to
-an Iggy VSR server:
+The SDK speaks the VSR wire protocol exclusively and requires an Iggy VSR
+server:
 
 ```typescript
 import { SimpleClient, getRawClient } from "apache-iggy";
 
 const config = {
-  protocol: "vsr" as const,
   transport: "TCP" as const,
   options: { host: "127.0.0.1", port: 8090 },
   credentials: { username: "iggy", password: "iggy" },
@@ -52,16 +51,18 @@ const client = new SimpleClient(getRawClient(config));
 const stats = await client.system.getStats();
 ```
 
-VSR is a runtime protocol choice in Node.js, not a build feature. Codes absent
-from the SDK command table use `Operation::NonReplicated` and carry the command
-code in the request header's reserved field. The server remains authoritative
-for classifying or rejecting extension commands.
+Codes absent from the SDK command table use `Operation::NonReplicated` and
+carry the command code in the request header's reserved field. The server
+remains authoritative for classifying or rejecting extension commands.
 
-The same npm package supports both framing modes. VSR currently supports TCP
-only and restricts `Client` to one pooled connection because authentication,
-request sequencing, and consumer-group assignments belong to one consensus
-session. Configurations requesting VSR over TLS or more than one pooled
-connection fail before a socket is opened.
+Sends must use explicit `Partitioning.PartitionId` partitioning: the client
+routes each request to a partition-scoped namespace, so broker-side balancing
+(`Partitioning.Balanced`) and key hashing (`Partitioning.MessageKey`) are
+rejected before the request is sent.
+<!-- TODO(hubcio): Balanced and MessageKey partitioning to be implemented;
+not decided yet whether it'll be on server side or client side. -->
+
+VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 
 VSR authentication translates the existing password and personal-access-token
 login APIs into the register handshake required by the consensus protocol. A
@@ -72,7 +73,7 @@ new session.
 
 When the server's `[heartbeat]` eviction is enabled, configure the client's `heartbeatInterval` below the server heartbeat interval. Client heartbeats are disabled when `heartbeatInterval` is unset.
 
-`sendBinaryRequest(code, payload)` has the same signature under classic and VSR framing. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them. Classic request bytes remain unchanged.
+`sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
 ```typescript
 import { ResponseError } from "apache-iggy";

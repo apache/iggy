@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_clickhouse_sink"
-version = "0.1.0"
+version = "0.2.0-edge.2"
 description = "Iggy ClickHouse sink connector for streaming messages into ClickHouse"
 edition = "2024"
 license = "Apache-2.0"

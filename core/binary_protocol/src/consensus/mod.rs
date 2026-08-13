@@ -45,10 +45,14 @@ mod reply_result;
 pub use command::Command2;
 pub use error::ConsensusError;
 pub use header::{
-    CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader, EvictionReason,
-    GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN,
-    RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
-    RequestStartViewHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    CHECKSUM_UNSEALED, CommitHeader, ConsensusHeader, DVC_HEADERS_MAX, DoViewChangeHeader,
+    EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
+    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader,
+    RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
+    StartViewHeader, StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
     read_size_field,
 };
 pub use operation::Operation;

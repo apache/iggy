@@ -20,6 +20,7 @@ use std::ops::{Deref, RangeInclusive};
 use std::rc::Rc;
 
 pub mod file_storage;
+pub mod local_gate;
 pub mod prepare_journal;
 pub mod superblock;
 
@@ -45,6 +46,25 @@ where
         None
     }
 
+    /// Remove every entry at or above `from_op`, returning how many went, and
+    /// leave the snapshot watermark where it is.
+    ///
+    /// Not `drain` with a different range: `drain` advances the watermark past what
+    /// it removed, which would mark the removed ops evictable when a suffix
+    /// truncation needs them refillable.
+    ///
+    /// Required, not defaulted: an `Unsupported` default hides a missing impl until
+    /// mid-view-change, where the caller can only wedge or start a view over a log it
+    /// cannot serve.
+    ///
+    /// # Errors
+    /// I/O error if the rewrite fails.
+    fn truncate_from(&self, from_op: u64) -> impl Future<Output = io::Result<usize>>;
+
+    /// Highest op the index holds. Not derivable from [`Self::header`]: a caller
+    /// looking for a suffix ABOVE some op has no bound to probe up to.
+    fn last_op(&self) -> Option<u64>;
+
     /// Remove entries with ops in `ops` from the journal,
     /// returning the removed entries sorted by op.
     ///
@@ -60,6 +80,22 @@ where
     ) -> impl Future<Output = io::Result<Vec<Self::Entry>>> {
         async { Ok(Vec::new()) }
     }
+
+    /// Snapshot watermark: entries at or below it are evictable. `0` for
+    /// journals without snapshot bookkeeping.
+    ///
+    /// Required rather than defaulted, and paired with
+    /// [`Self::set_snapshot_op`]: a wrapper that forwards one while inheriting
+    /// the other is silently broken in one direction and panics in the other
+    /// (an implementation whose setter asserts monotonicity would see a getter
+    /// stuck at `0` hand it a watermark below the real one). Journals without
+    /// snapshot bookkeeping answer `0` and no-op the setter EXPLICITLY.
+    fn snapshot_op(&self) -> u64;
+
+    /// Advance the snapshot watermark (see [`Self::snapshot_op`]). State
+    /// transfer uses this to mark pre-transfer residents superseded by the
+    /// installed snapshot.
+    fn set_snapshot_op(&self, op: u64);
 }
 
 // TODO: Move to other crate.

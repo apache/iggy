@@ -71,8 +71,6 @@
 //! work later settles on an explicit resume handshake, adjust `resume_request`
 //! to speak it -- but it must stay credential-bearing.
 
-#![cfg(feature = "vsr")]
-
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
@@ -80,7 +78,6 @@ use iggy_binary_protocol::consensus::{
     Command2, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
 };
-use iggy_binary_protocol::namespace::METADATA_CONSENSUS_NAMESPACE;
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -236,7 +233,7 @@ async fn given_live_session_when_unauthenticated_peer_presents_it_should_refuse_
     .await;
 }
 
-fn tcp_addr(harness: &TestHarness) -> SocketAddr {
+pub(super) fn tcp_addr(harness: &TestHarness) -> SocketAddr {
     harness
         .server()
         .tcp_addr()
@@ -247,7 +244,7 @@ fn tcp_addr(harness: &TestHarness) -> SocketAddr {
 /// way a leader-aware SDK re-routes: after a node restart in a cluster the
 /// primary may be any survivor, and only the primary commits (or answers
 /// dedup for) replicated requests.
-fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
+pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
     (0..harness.cluster_size())
         .map(|node| {
             harness
@@ -258,7 +255,7 @@ fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn create_stream_payload(name: &str) -> Bytes {
+pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
     }
@@ -278,10 +275,6 @@ fn request_header(
         client: CLIENT_ID,
         session,
         request,
-        namespace: match operation {
-            Operation::Register => METADATA_CONSENSUS_NAMESPACE,
-            _ => 0,
-        },
         ..Default::default()
     }
 }
@@ -291,7 +284,7 @@ fn request_header(
 /// so the pre-restart request must reuse the returned stream. Replays on
 /// transient rejections: right after boot the single node may not have
 /// elected itself yet.
-async fn register(addr: SocketAddr) -> (TcpStream, u64) {
+pub(super) async fn register(addr: SocketAddr) -> (TcpStream, u64) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
@@ -338,7 +331,7 @@ async fn login_on(stream: &mut TcpStream) -> Option<u64> {
 /// Send one replicated metadata request on the registered connection and
 /// require a committed success within `COMMIT_BUDGET`. Returns the committed
 /// reply so a later replay can be compared against it byte for byte.
-async fn commit_request(
+pub(super) async fn commit_request(
     stream: &mut TcpStream,
     session: u64,
     request: u64,
@@ -373,7 +366,7 @@ async fn commit_request(
 /// Every attempt uses a fresh connection, both because the old one died with
 /// the node and so an unanswered frame cannot desync the next attempt. Panics
 /// with the last observed failure mode when the budget runs out.
-async fn resume_request(
+pub(super) async fn resume_request(
     addrs: &[SocketAddr],
     session: u64,
     request: u64,
@@ -383,6 +376,7 @@ async fn resume_request(
     let deadline = Instant::now() + RESUME_BUDGET;
     let mut last_failure = "the listener never came back".to_string();
     let mut attempt = 0usize;
+    let mut authenticated_attempts = Vec::new();
     while Instant::now() < deadline {
         let addr = addrs[attempt % addrs.len()];
         attempt += 1;
@@ -445,6 +439,10 @@ async fn resume_request(
                 );
             }
         }
+        // Backups can forward Register even though they cannot serve the
+        // following metadata write. Keep each authenticated socket alive so
+        // its disconnect cleanup cannot race the next rebind with a Logout.
+        authenticated_attempts.push(stream);
         sleep(RETRY_PAUSE).await;
     }
     panic!(
@@ -513,7 +511,7 @@ enum Verdict {
 /// The header is boxed to keep it off the stack in `Verdict`/`Exchange`: at
 /// `HEADER_SIZE` inline it dwarfs every other variant.
 #[derive(Debug)]
-struct CommittedReply {
+pub(super) struct CommittedReply {
     header: Box<[u8; HEADER_SIZE]>,
     payload: Bytes,
 }

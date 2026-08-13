@@ -114,7 +114,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         let name = entry.name;
 
         // ================================================================
-        // SKIPPED COMMANDS (11 total)
+        // SKIPPED COMMANDS
         // ================================================================
         // No auth required
         if matches!(
@@ -127,17 +127,10 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         ) {
             continue;
         }
-        // server-ng serves `GetClusterMetadata` pre-auth so a client can
-        // locate the cluster leader before signing in; the legacy server
-        // still auth-gates it.
-        #[cfg(feature = "vsr")]
-        if code == GET_CLUSTER_METADATA_CODE {
-            continue;
-        }
         // Stateful - not supported on HTTP. `SYNC_CONSUMER_GROUP` is
         // SDK-internal (issued during poll partition resolution), with no
         // top-level client method to invoke unauthenticated here; its auth
-        // gate is exercised through the server-ng dispatch allowlist instead.
+        // gate is exercised through the server dispatch allowlist instead.
         if matches!(
             code,
             JOIN_CONSUMER_GROUP_CODE | LEAVE_CONSUMER_GROUP_CODE | SYNC_CONSUMER_GROUP_CODE
@@ -153,7 +146,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         }
         // v2 consumer-offset ops are registered in the dispatch table for the
         // consensus/simulator pathway but are not wired into the legacy binary
-        // server's dispatch. They'll move into server-ng alongside the rest of
+        // server's dispatch. They'll move into the server alongside the rest of
         // the v2 surface; re-enable these codes here once that lands.
         if matches!(
             code,
@@ -171,6 +164,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_ME_CODE => client.get_me().await.map(|_| ()),
             GET_CLIENT_CODE => client.get_client(1).await.map(|_| ()),
             GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
+
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
 
             // Users
@@ -265,6 +259,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                         &mut msgs,
                     )
                     .await
+                    .map(|_| ())
             }
             POLL_MESSAGES_CODE => client
                 .poll_messages(

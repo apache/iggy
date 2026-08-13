@@ -49,6 +49,8 @@ ublish = "ublish"
 # Valid English prefix in hyphenated compounds ("mis-strides", "mis-decoded");
 # typos tokenizes on the hyphen and misreads the prefix as "miss"/"mist"
 mis = "mis"
+# CVE Numbering Authority; the ASF Security Team is the CNA for Apache projects
+CNA = "CNA"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]

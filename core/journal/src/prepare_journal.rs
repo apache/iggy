@@ -18,7 +18,7 @@
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
-use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
+use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command2, PrepareHeader};
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
@@ -66,7 +66,7 @@ pub(crate) const SLOT_COUNT: usize = 1024;
 
 /// Default in-memory index size, in slots. Overridable per journal via
 /// [`PrepareJournal::open_with_slots`] (operator knob: `[metadata]
-/// journal_slots` in the server-ng config).
+/// journal_slots` in the server config).
 pub const DEFAULT_SLOT_COUNT: usize = SLOT_COUNT;
 
 /// Error type for journal operations.
@@ -391,7 +391,7 @@ impl PrepareJournal {
     /// `slot_count` bounds how many committed-but-unsnapshotted entries the
     /// journal holds before a forced checkpoint must reclaim WAL space; the
     /// caller owns keeping it above its checkpoint margin + prepare-queue
-    /// depth (validated at config load for the server-ng `[metadata]` knob).
+    /// depth (validated at config load for the server `[metadata]` knob).
     ///
     /// # Errors
     /// Returns `JournalError::Io` if the WAL file cannot be opened or read,
@@ -412,7 +412,7 @@ impl PrepareJournal {
         Self::scan(storage, snapshot_op, slot_count).await
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn scan(
         storage: FileStorage,
         snapshot_op: u64,
@@ -423,6 +423,8 @@ impl PrepareJournal {
         let mut offsets: Vec<Option<u64>> = vec![None; slot_count];
         let mut last_op: Option<u64> = None;
         let mut unsealed_entries: u64 = 0;
+        // Previous entry's `(op, checksum)`, for the parent-chain check.
+        let mut chain_previous: Option<(u64, u128)> = None;
         let mut pos: u64 = 0;
         let mut header_buf = vec![0u8; HEADER_SIZE];
         // Reused 16-aligned scratch (PrepareHeader has u128 fields). Avoids
@@ -477,14 +479,57 @@ impl PrepareJournal {
             // verify against and is skipped, not rejected: see
             // [`CHECKSUM_BODY_UNSEALED`].
             //
-            // TODO(wal-integrity): the header `checksum` and its `parent` chain stay
-            // unverified, since the producer does not seal them yet (blocked on
-            // re-sealing re-stamped retransmits), so a bit-flip in a
-            // structurally-valid header field slips through. Recovery derives
-            // `commit_watermark = max(header.commit)`, so a flipped `commit` makes it
-            // apply prepared-but-uncommitted ops as committed, the very ops a view
-            // change may have truncated cluster-wide, diverging this replica. Seal
-            // and verify the header checksum + parent chain.
+            // The header's own integrity field is checked first, since a flipped
+            // header field is the more dangerous of the two: recovery derives
+            // `commit_watermark = max(header.commit)`, so a corrupted `commit` applies
+            // uncommitted ops as committed, diverging from the group. `size` and `op`
+            // are equally load-bearing for the scan itself.
+            if header.checksum != CHECKSUM_UNSEALED && header.identity_checksum() != header.checksum
+            {
+                if pos + entry_size < file_len {
+                    return Err(JournalError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "interior WAL corruption at pos {pos} (op {}, operation {:?}): \
+                             prepare header checksum mismatch with {} bytes of entries \
+                             following; refusing to truncate and discard the committed suffix",
+                            header.op,
+                            header.operation,
+                            file_len - (pos + entry_size),
+                        ),
+                    )));
+                }
+                truncate_or_fail(&storage, pos, "prepare header checksum mismatch at tail").await?;
+                break;
+            }
+
+            // The hash chain, checked only where meaningful: consecutive ops with both
+            // ends sealed. A gap means compaction dropped the predecessor, and an
+            // unsealed end has nothing to chain from, so neither is evidence of damage.
+            if let Some((previous_op, previous_checksum)) = chain_previous
+                && previous_op + 1 == header.op
+                && previous_checksum != CHECKSUM_UNSEALED
+                && header.parent != previous_checksum
+            {
+                if pos + entry_size < file_len {
+                    return Err(JournalError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "interior WAL corruption at pos {pos}: op {} does not chain to op \
+                             {previous_op} (parent {} != {previous_checksum}) with {} bytes of \
+                             entries following; refusing to truncate and discard the committed \
+                             suffix",
+                            header.op,
+                            header.parent,
+                            file_len - (pos + entry_size),
+                        ),
+                    )));
+                }
+                truncate_or_fail(&storage, pos, "prepare parent chain break at tail").await?;
+                break;
+            }
+            chain_previous = Some((header.op, header.checksum));
+
             if header.checksum_body == CHECKSUM_BODY_UNSEALED {
                 // Skip the body read too, so a WAL written entirely by a pre-sealing
                 // build scans without touching its payload.
@@ -576,6 +621,11 @@ impl PrepareJournal {
     /// Highest op number in the index, or `None` if empty.
     pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    /// Current snapshot watermark: entries at or below it are evictable.
+    pub const fn snapshot_op(&self) -> u64 {
+        self.snapshot_op.get()
     }
 
     /// How many entries the opening scan replayed unverified
@@ -692,9 +742,139 @@ impl PrepareJournal {
     clippy::future_not_send
 )]
 impl Journal<FileStorage> for PrepareJournal {
+    fn last_op(&self) -> Option<u64> {
+        self.last_op.get()
+    }
+
+    /// Remove every entry at or above `from_op`, leaving the snapshot floor where
+    /// it is. Returns how many entries went.
+    ///
+    /// Deliberately not `drain`, which compacts a committed prefix and advances
+    /// `snapshot_op` past its range. Doing that to a suffix would declare everything
+    /// below the head snapshotted, letting `append` evict live entries repair cannot
+    /// put back, when those ops are exactly the ones that must stay refillable.
+    ///
+    /// For the one caller that needs it: a backup whose uncommitted entries disagree
+    /// with the log a view change settled on. They cannot be corrected in place, and
+    /// journal repair skips their ops as already-present, so dropping them is what
+    /// lets the primary's retransmission refill the range.
+    ///
+    /// # Errors
+    /// I/O error if the rewrite fails. Past the rename the journal is poisoned on any
+    /// failure, as in `drain`: serving a pre-truncation offset or appending at a stale
+    /// `write_offset` is worse than a hard stop. `from_op` must be at least 1.
+    async fn truncate_from(&self, from_op: u64) -> io::Result<usize> {
+        if let Some(state) = self.poisoned.get() {
+            return Err(Self::poisoned_io_error(state));
+        }
+        if from_op == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+            ));
+        }
+        // Shares the drain guard: both rewrite the same WAL through the same tmp
+        // path, so letting them overlap would race the swap.
+        if self.drain_in_flight.replace(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "drain or truncate already in flight: concurrent rewrites would race the WAL",
+            ));
+        }
+        let _guard = DrainInFlightGuard(&self.drain_in_flight);
+
+        let mut removed = 0usize;
+        let mut live: Vec<(PrepareHeader, u64)> = Vec::new();
+        {
+            let headers = self.headers.borrow();
+            let offsets = self.offsets.borrow();
+            for slot in 0..self.slot_count {
+                if let (Some(header), Some(offset)) = (&headers[slot], offsets[slot]) {
+                    if header.op >= from_op {
+                        removed += 1;
+                    } else {
+                        live.push((*header, offset));
+                    }
+                }
+            }
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+        live.sort_unstable_by_key(|(header, _)| header.op);
+
+        let wal_path = self.storage.path();
+        let tmp_path = wal_path.with_extension("wal.tmp");
+        let tmp_guard = TmpFileGuard::new(tmp_path.clone());
+        {
+            let mut tmp = compio::fs::File::create(&tmp_path).await?;
+            let mut write_pos: u64 = 0;
+            for (header, old_offset) in &live {
+                let size = header.size as usize;
+                let buf = vec![0u8; size];
+                let buf = self.storage.read_at(*old_offset, buf).await?;
+                let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
+                result?;
+                write_pos += size as u64;
+            }
+            tmp.sync_all().await?;
+        }
+
+        // COMMIT POINT, same as `drain`: past the rename the on-disk WAL is the new
+        // one while the in-memory index still describes the old layout, so every
+        // fallible step below poisons rather than serving stale offsets.
+        compio::fs::rename(&tmp_path, wal_path).await?;
+        tmp_guard.defuse();
+
+        if let Some(parent) = wal_path.parent() {
+            let dir = match compio::fs::File::open(parent).await {
+                Ok(dir) => dir,
+                Err(error) => {
+                    return Err(self.poison("truncate_from: open parent dir for fsync", error));
+                }
+            };
+            if let Err(error) = dir.sync_all().await {
+                return Err(self.poison("truncate_from: parent dir fsync", error));
+            }
+        }
+        if let Err(error) = self.storage.reopen().await {
+            return Err(self.poison("truncate_from: storage reopen after rename", error));
+        }
+
+        // `snapshot_op` is deliberately untouched. See the doc comment.
+        let mut headers = self.headers.borrow_mut();
+        let mut offsets = self.offsets.borrow_mut();
+        let mut pos: u64 = 0;
+        for (header, _) in &live {
+            let slot = slot_for_op(header.op, self.slot_count);
+            offsets[slot] = Some(pos);
+            pos += u64::from(header.size);
+        }
+        for slot in 0..self.slot_count {
+            if let Some(header) = &headers[slot]
+                && header.op >= from_op
+            {
+                headers[slot] = None;
+                offsets[slot] = None;
+            }
+        }
+        // Unlike a prefix drain, removing a suffix moves the head.
+        self.last_op.set(live.last().map(|(header, _)| header.op));
+
+        Ok(removed)
+    }
+
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a> = Ref<'a, PrepareHeader>;
+
+    fn snapshot_op(&self) -> u64 {
+        Self::snapshot_op(self)
+    }
+
+    fn set_snapshot_op(&self, op: u64) {
+        Self::set_snapshot_op(self, op);
+    }
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = self.headers.borrow();
@@ -1032,6 +1212,257 @@ mod tests {
         header.checksum_body = checksum_body;
 
         Message::try_from(buffer).unwrap()
+    }
+
+    /// A prepare with both integrity fields sealed and its parent chained, as a live
+    /// producer writes them. `make_entry` leaves `checksum` zero, read as unsealed.
+    fn make_identity_sealed_prepare(
+        op: u64,
+        body_size: usize,
+        parent: u128,
+    ) -> Message<PrepareHeader> {
+        let mut message = make_prepare(op, body_size);
+        let bytes = message.as_mut_slice();
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut bytes[..HEADER_SIZE]);
+        header.parent = parent;
+        header.view = 1;
+        let checksum = header.identity_checksum();
+        header.checksum = checksum;
+        message
+    }
+
+    /// Byte offset of `field_offset` within the entry for `op`, at a fixed stride.
+    const fn header_field_offset(op: u64, body_size: usize, field_offset: usize) -> usize {
+        (op as usize - 1) * (HEADER_SIZE + body_size) + field_offset
+    }
+
+    #[compio::test]
+    async fn truncate_from_removes_the_suffix_and_keeps_the_snapshot_floor() {
+        // The property that makes this not-a-drain: the floor must not move, or the
+        // removed ops become evictable and repair can never put them back.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=5u64 {
+            journal
+                .append(make_prepare(op, 64).deep_copy())
+                .await
+                .unwrap();
+        }
+        assert_eq!(journal.last_op(), Some(5));
+        let floor_before = journal.snapshot_op();
+
+        let removed = journal.truncate_from(3).await.unwrap();
+        assert_eq!(removed, 3, "ops 3, 4 and 5 must go");
+        assert_eq!(
+            journal.snapshot_op(),
+            floor_before,
+            "truncating a suffix must not advance the snapshot floor"
+        );
+        assert_eq!(
+            journal.last_op(),
+            Some(2),
+            "the head follows the truncation"
+        );
+        for op in 1..=2u64 {
+            assert!(
+                journal.header(op as usize).is_some(),
+                "op {op} must survive"
+            );
+        }
+        for op in 3..=5u64 {
+            assert!(
+                journal.header(op as usize).is_none(),
+                "op {op} must be gone"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn truncate_from_leaves_a_refillable_range() {
+        // The whole point: after truncation the ops can be appended again. A raised
+        // floor would either reject that or silently evict a live entry.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=4u64 {
+            journal
+                .append(make_prepare(op, 64).deep_copy())
+                .await
+                .unwrap();
+        }
+        journal.truncate_from(3).await.unwrap();
+
+        for op in 3..=4u64 {
+            journal
+                .append(make_prepare(op, 64).deep_copy())
+                .await
+                .expect("a truncated op must be appendable again");
+        }
+        assert_eq!(journal.last_op(), Some(4));
+        assert!(journal.header(3).is_some());
+        assert!(journal.header(4).is_some());
+    }
+
+    #[compio::test]
+    async fn truncate_from_survives_reopen() {
+        // The rewrite has to be durable, not just reflected in the index.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let mut parent = 0u128;
+            for op in 1..=4u64 {
+                let entry = make_identity_sealed_prepare(op, BODY, parent);
+                parent = entry.header().checksum;
+                journal.append(entry.deep_copy()).await.unwrap();
+            }
+            assert_eq!(journal.truncate_from(3).await.unwrap(), 2);
+        }
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(2),
+            "the truncation must be on disk, not only in the index"
+        );
+        assert!(journal.header(3).is_none());
+    }
+
+    #[compio::test]
+    async fn scan_accepts_a_sealed_and_chained_wal() {
+        // Everything below only means something if the happy path still opens.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let mut parent = 0u128;
+            for op in 1..=3u64 {
+                let entry = make_identity_sealed_prepare(op, BODY, parent);
+                parent = entry.header().checksum;
+                journal.append(entry.deep_copy()).await.unwrap();
+            }
+        }
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(journal.last_op(), Some(3));
+        assert_eq!(
+            journal.unsealed_entry_count(),
+            0,
+            "sealed entries must not be counted as unsealed"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_truncates_tail_entry_with_header_checksum_mismatch() {
+        // A flipped `commit` leaves the header structurally valid, so only the identity
+        // checksum catches it. Recovery derives its watermark from `max(header.commit)`,
+        // so an undetected flip applies prepared-but-uncommitted ops as committed.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let first = make_identity_sealed_prepare(1, BODY, 0);
+            let parent = first.header().checksum;
+            journal.append(first.deep_copy()).await.unwrap();
+            journal
+                .append(make_identity_sealed_prepare(2, BODY, parent).deep_copy())
+                .await
+                .unwrap();
+        }
+
+        let commit_offset =
+            header_field_offset(2, BODY, std::mem::offset_of!(PrepareHeader, commit));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[commit_offset] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(1),
+            "a header-checksum mismatch on the tail entry must truncate it"
+        );
+        assert!(journal.header(2).is_none());
+    }
+
+    #[compio::test]
+    async fn scan_refuses_boot_on_interior_header_checksum_mismatch() {
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let mut parent = 0u128;
+            for op in 1..=3u64 {
+                let entry = make_identity_sealed_prepare(op, BODY, parent);
+                parent = entry.header().checksum;
+                journal.append(entry.deep_copy()).await.unwrap();
+            }
+        }
+
+        let commit_offset =
+            header_field_offset(2, BODY, std::mem::offset_of!(PrepareHeader, commit));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[commit_offset] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = PrepareJournal::open(&path, 0).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("interior WAL corruption"),
+            "an interior header flip must refuse boot rather than discard the \
+             committed suffix, got: {message}"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_detects_a_parent_chain_break() {
+        // Both entries are individually well sealed; only the link is wrong. Catching
+        // this is what makes the log a chain rather than a bag of valid records.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal
+                .append(make_identity_sealed_prepare(1, BODY, 0).deep_copy())
+                .await
+                .unwrap();
+            // Op 2 chains to a parent that is not op 1's checksum.
+            journal
+                .append(make_identity_sealed_prepare(2, BODY, 0xDEAD_BEEF).deep_copy())
+                .await
+                .unwrap();
+        }
+
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(1),
+            "op 2 does not chain to op 1 and must be truncated as a torn tail"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_skips_verification_for_unsealed_entries() {
+        // A WAL from a pre-sealing build must still open: `checksum` reads as the
+        // unsealed sentinel, so neither the identity nor the chain is checked.
+        const BODY: usize = 32;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            for op in 1..=2u64 {
+                journal
+                    .append(make_unsealed_prepare(op, BODY).deep_copy())
+                    .await
+                    .unwrap();
+            }
+        }
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(journal.last_op(), Some(2));
     }
 
     #[compio::test]

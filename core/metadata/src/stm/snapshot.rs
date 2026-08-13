@@ -42,6 +42,21 @@ pub enum SnapshotError {
     ChecksumMismatch { expected: u128, actual: u128 },
     /// Snapshot file is too short to contain a valid checksum.
     Truncated { size: u64 },
+    /// A state-transfer descriptor's frontiers contradict its artifacts: a
+    /// `commit_op` below the snapshot the same offer ships, or a client-table
+    /// frontier above that commit point. Both are impossible from a
+    /// caught-up-primary offer, so the install is refused and the receiver falls
+    /// back to journal repair rather than moving its frontiers off a bad
+    /// manifest.
+    IncoherentManifest {
+        snapshot_seq: u64,
+        commit_op: u64,
+        table_frontier: u64,
+    },
+    /// The snapshot was written under a different format version. Refuse it
+    /// rather than reinterpret embedded raw bytes (the client table's cached
+    /// replies are wire `ReplyHeader` frames) under the wrong layout.
+    UnsupportedVersion { found: u32, supported: u32 },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -82,6 +97,24 @@ impl fmt::Display for SnapshotError {
                     "snapshot file truncated: {size} bytes (too short for checksum)"
                 )
             }
+            Self::IncoherentManifest {
+                snapshot_seq,
+                commit_op,
+                table_frontier,
+            } => {
+                write!(
+                    f,
+                    "incoherent state transfer manifest: snapshot at op {snapshot_seq}, \
+                     commit_op {commit_op}, table frontier {table_frontier}"
+                )
+            }
+            Self::UnsupportedVersion { found, supported } => {
+                write!(
+                    f,
+                    "unsupported metadata snapshot version {found}; this build reads only \
+                     version {supported}"
+                )
+            }
         }
     }
 }
@@ -92,7 +125,10 @@ impl std::error::Error for SnapshotError {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
-            Self::ChecksumMismatch { .. } | Self::Truncated { .. } => None,
+            Self::ChecksumMismatch { .. }
+            | Self::Truncated { .. }
+            | Self::IncoherentManifest { .. }
+            | Self::UnsupportedVersion { .. } => None,
         }
     }
 }
@@ -114,10 +150,17 @@ impl From<std::io::Error> for SnapshotError {
 /// replicas with identical state must serialize identically. Regression guards:
 /// `stream::tests::populated_streams_snapshot_reencode_is_byte_stable` and
 /// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
+/// Current [`MetadataSnapshot::version`]. Bump whenever the serialized form
+/// changes meaning without changing shape -- in particular the client table's
+/// cached replies, which are embedded as raw `ReplyHeader` wire bytes msgpack
+/// cannot introspect. Version 2: `status` sits at reply-header offset 216
+/// (version 1 carried a `namespace` word before it).
+pub const METADATA_SNAPSHOT_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
-    /// Snapshot format version for forward/backward compatibility.
-    /// TODO(krishvishal): Properly handle versioning for snapshot. This is a placeholder for now.
+    /// Snapshot format version; [`MetadataSnapshot::decode`] refuses any other
+    /// value (see [`METADATA_SNAPSHOT_VERSION`]).
     pub version: u32,
     /// Timestamp when the snapshot was created (microseconds since epoch).
     pub created_at: u64,
@@ -147,7 +190,7 @@ impl MetadataSnapshot {
     #[must_use]
     pub const fn new(sequence_number: u64) -> Self {
         Self {
-            version: 1,
+            version: METADATA_SNAPSHOT_VERSION,
             // Deterministic placeholder. The real creation time is stamped by
             // `Snapshot::create` from the consensus-injected clock (see
             // `VsrConsensus::clock_realtime_micros`) so a replayed simulator
@@ -172,9 +215,18 @@ impl MetadataSnapshot {
     /// Decode a snapshot from msgpack bytes.
     ///
     /// # Errors
-    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails.
+    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails,
+    /// or `SnapshotError::UnsupportedVersion` if the snapshot was written
+    /// under a different format version.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)
+        let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
+        if snapshot.version != METADATA_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion {
+                found: snapshot.version,
+                supported: METADATA_SNAPSHOT_VERSION,
+            });
+        }
+        Ok(snapshot)
     }
 }
 
@@ -261,6 +313,41 @@ pub trait RestoreSnapshot<S>: Sized {
     fn restore_snapshot(snapshot: &S) -> Result<Self, SnapshotError>;
 }
 
+/// Restore a LIVE state machine from a snapshot without reconstructing it.
+///
+/// [`RestoreSnapshot`] builds a fresh instance -- boot-time only, because a
+/// running system shares read handles (left-right factories) across shards
+/// that a swap would orphan. This variant replaces the state THROUGH the
+/// existing write handle (an absorbed `RestoreSnapshot` command), so every
+/// reader observes the restored state on its next read. State transfer
+/// installs with this.
+#[allow(clippy::missing_errors_doc)]
+pub trait RestoreSnapshotInPlace<S> {
+    /// Replace this state machine's contents from the snapshot.
+    fn restore_snapshot_in_place(&self, snapshot: &S) -> Result<(), SnapshotError>;
+
+    /// Whether this state machine can restore from `snapshot`, WITHOUT
+    /// mutating anything.
+    ///
+    /// A mux restores its halves one at a time, so a snapshot missing the
+    /// second half would otherwise leave the first restored and the second on
+    /// pre-transfer state -- a split the caller cannot undo, because the
+    /// transferred snapshot was already persisted and its pairing seeded.
+    /// Every half agrees here before any half mutates.
+    fn check_restorable(&self, snapshot: &S) -> Result<(), SnapshotError>;
+}
+
+/// Base case for the recursive tuple pattern - unit type terminates the recursion.
+impl<S> RestoreSnapshotInPlace<S> for () {
+    fn restore_snapshot_in_place(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    fn check_restorable(&self, _snapshot: &S) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+}
+
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
 impl<S> FillSnapshot<S> for () {
     fn fill_snapshot(&self, _snapshot: &mut S) -> Result<(), SnapshotError> {
@@ -316,6 +403,49 @@ macro_rules! impl_fill_restore {
                 Self::from_snapshot(snap)
             }
         }
+
+        impl $crate::stm::snapshot::RestoreSnapshotInPlace<$crate::stm::snapshot::MetadataSnapshot>
+            for $wrapper
+        {
+            fn restore_snapshot_in_place(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                paste::paste! {
+                    let snap = snapshot.$field.clone().ok_or_else(|| {
+                        SnapshotError::Deserialize(rmp_serde::decode::Error::custom(
+                            format_args!("Snapshot Restore Error: {}", stringify!($field)),
+                        ))
+                    })?;
+                    self.inner
+                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap))
+                        .map_err(|err| {
+                            SnapshotError::Io(std::io::Error::other(format!(
+                                "in-place restore on a reader-only state machine: {err}"
+                            )))
+                        })
+                }
+            }
+
+            fn check_restorable(
+                &self,
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
+            ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
+                use serde::de::Error as _;
+                use $crate::stm::snapshot::SnapshotError;
+                if snapshot.$field.is_none() {
+                    return Err(SnapshotError::Deserialize(
+                        rmp_serde::decode::Error::custom(format_args!(
+                            "Snapshot Restore Error: {}",
+                            stringify!($field)
+                        )),
+                    ));
+                }
+                Ok(())
+            }
+        }
     };
 }
 
@@ -336,6 +466,25 @@ mod tests {
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
         assert!(decoded.client_table.is_none());
+    }
+
+    // The client table's cached replies are embedded as raw `ReplyHeader`
+    // wire bytes msgpack cannot introspect, so a snapshot from a different
+    // format version must be refused, never reinterpreted under the current
+    // header layout.
+    #[test]
+    fn decode_refuses_a_snapshot_from_another_format_version() {
+        let mut snapshot = MetadataSnapshot::new(42);
+        snapshot.version = METADATA_SNAPSHOT_VERSION - 1;
+
+        let encoded = snapshot.encode().unwrap();
+        assert!(matches!(
+            MetadataSnapshot::decode(&encoded),
+            Err(SnapshotError::UnsupportedVersion {
+                found,
+                supported: METADATA_SNAPSHOT_VERSION,
+            }) if found == METADATA_SNAPSHOT_VERSION - 1
+        ));
     }
 
     #[test]
