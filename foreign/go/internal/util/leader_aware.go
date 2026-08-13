@@ -25,12 +25,40 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
+// How long a transiently leaderless cluster is polled for an elected leader
+// before proceeding on the current node anyway. Vars, not consts, so tests
+// can shrink the budget.
+var (
+	leaderlessWaitBudget   = 5 * time.Second
+	leaderlessPollInterval = 250 * time.Millisecond
+)
+
+// leaderOutcome is one leader-check verdict from a cluster-metadata snapshot.
+type leaderOutcome int
+
+const (
+	// The current node is the leader (or the cluster is single-node).
+	leaderIsCurrent leaderOutcome = iota
+	// A healthy leader exists elsewhere; reconnect to it.
+	redirectToLeader
+	// No healthy leader is marked (e.g. mid-election).
+	noLeader
+)
+
 // CheckAndRedirectToLeader queries the client for cluster metadata and returns
 // an address to redirect to (empty string means no redirection needed).
+//
+// A cluster can be transiently leaderless: a restarted node cedes the
+// primaryship its stale view assigns it, and until the peers' election
+// completes the roster reports no leader. That window is roughly one
+// heartbeat timeout; poll through it instead of proceeding leaderless (a
+// replicated request against a non-primary replays for its whole read
+// timeout).
 func CheckAndRedirectToLeader(
 	ctx context.Context,
 	c iggcon.Client,
@@ -40,30 +68,59 @@ func CheckAndRedirectToLeader(
 ) (string, []string, error) {
 	logger.Debug("Checking cluster metadata for leader detection")
 
-	meta, err := c.GetClusterMetadata(ctx)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	deadline := time.Now().Add(leaderlessWaitBudget)
+	for {
+		meta, err := c.GetClusterMetadata(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return "", nil, err
+			}
+			// The read is auth-gated, so an Unauthenticated answer means the
+			// session died between the sign-in and this check. Like any other
+			// failure it keeps the current node; the caller's next request
+			// surfaces the eviction.
+			logger.Warn(
+				"Failed to get cluster metadata, connection will continue on server node",
+				"error", err,
+				"current_address", currentAddress,
+			)
+			return "", nil, nil
+		}
+
+		logger.Debug(
+			"Got cluster metadata",
+			"nodes", len(meta.Nodes),
+			"cluster", meta.Name,
+		)
+		addresses, err := clusterAddresses(meta, transport)
+		if err != nil {
 			return "", nil, err
 		}
-		logger.Warn(
-			"Failed to get cluster metadata, connection will continue on server node",
-			"error", err,
-			"current_address", currentAddress,
-		)
-		return "", nil, nil
+		outcome, leader, err := processClusterMetadata(meta, currentAddress, transport, logger)
+		if err != nil {
+			return "", nil, err
+		}
+		switch outcome {
+		case redirectToLeader:
+			return leader, addresses, nil
+		case leaderIsCurrent:
+			return "", addresses, nil
+		case noLeader:
+			if time.Now().After(deadline) {
+				logger.Warn(
+					"No active leader found in cluster metadata within the wait budget, connection will continue on server node",
+					"wait_budget", leaderlessWaitBudget,
+					"current_address", currentAddress,
+				)
+				return "", addresses, nil
+			}
+			select {
+			case <-ctx.Done():
+				return "", nil, ctx.Err()
+			case <-time.After(leaderlessPollInterval):
+			}
+		}
 	}
-
-	logger.Debug(
-		"Got cluster metadata",
-		"nodes", len(meta.Nodes),
-		"cluster", meta.Name,
-	)
-	addresses, err := clusterAddresses(meta, transport)
-	if err != nil {
-		return "", nil, err
-	}
-	leader, err := processClusterMetadata(meta, currentAddress, transport, logger)
-	return leader, addresses, err
 }
 
 func clusterAddresses(metadata *iggcon.ClusterMetadata, transport iggcon.Protocol) ([]string, error) {
@@ -82,13 +139,13 @@ func clusterAddresses(metadata *iggcon.ClusterMetadata, transport iggcon.Protoco
 	return addresses, nil
 }
 
-func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (string, error) {
+func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (leaderOutcome, string, error) {
 	if len(metadata.Nodes) == 1 {
 		logger.Debug(
 			"Single-node cluster detected, no leader redirection needed",
 			"node", metadata.Nodes[0].Name,
 		)
-		return "", nil
+		return leaderIsCurrent, "", nil
 	}
 
 	var leader *iggcon.ClusterNode
@@ -101,16 +158,12 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 	}
 
 	if leader == nil {
-		logger.Warn(
-			"No active leader found in cluster metadata, connection will continue on server node",
-			"current_address", currentAddress,
-		)
-		return "", nil
+		return noLeader, "", nil
 	}
 
 	leaderAddress, err := clusterNodeAddress(leader, transport)
 	if err != nil {
-		return "", err
+		return leaderIsCurrent, "", err
 	}
 	logger.Debug(
 		"Found leader node",
@@ -125,11 +178,11 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 			"current_address", currentAddress,
 			"leader_address", leaderAddress,
 		)
-		return leaderAddress, nil
+		return redirectToLeader, leaderAddress, nil
 	}
 
 	logger.Debug("Already connected to leader", "current_address", currentAddress)
-	return "", nil
+	return leaderIsCurrent, "", nil
 }
 
 func clusterNodeAddress(node *iggcon.ClusterNode, transport iggcon.Protocol) (string, error) {

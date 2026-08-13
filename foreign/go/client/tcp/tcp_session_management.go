@@ -44,13 +44,8 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 	return c.register(ctx, uint32(command.LoginRegisterWithPATCode), body)
 }
 
-// register runs the sign-in handshake and binds the session the server
-// assigned. Leadership is already settled by the connect flow, so no
-// redirection happens here.
-//
-// A failed sign-in never writes the session state: a server-side reject leaves
-// the existing session untouched, and a connection that dies mid-attempt is
-// already reset by invalidateConnLocked.
+// register runs the sign-in handshake, binds the session the server assigned,
+// and settles the connection on the cluster leader.
 func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
 	// One sign-in at a time. BeginRegister runs inside the exchange lock but
 	// Bind runs after it, so two interleaved sign-ins would let the second
@@ -66,6 +61,28 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 		return nil, err
 	}
 
+	identity, err := c.signIn(ctx, code, body)
+	if err != nil {
+		return nil, err
+	}
+
+	settled, err := c.settleOnLeader(ctx, code, body)
+	if err != nil {
+		return nil, err
+	}
+	if settled != nil {
+		return settled, nil
+	}
+	return identity, nil
+}
+
+// signIn runs one sign-in exchange on the current connection and binds the
+// session the server assigned.
+//
+// A failed sign-in never writes the session state: a server-side reject leaves
+// the existing session untouched, and a connection that dies mid-attempt is
+// already reset by invalidateConnLocked.
+func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 	frame := append(reserveHeader(*bp), body...)
@@ -101,6 +118,49 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 		slog.String("client_address", c.clientAddress),
 		slog.String("server_version", registered.ServerVersion))
 	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
+}
+
+// settleOnLeader moves a freshly signed-in session to the cluster leader.
+//
+// Only the leader accepts replicated commands, and the roster read is
+// auth-gated, so the topology cannot be inspected before a login binds a
+// session. A login dialed at a backup still succeeds (the server forwards the
+// register to the primary); this settlement decides where later requests
+// land, not whether the sign-in works. The redirect drops the fresh session
+// along with the socket, so the sign-in is replayed on the leader and its
+// identity supersedes the dialed node's. Leadership can move between the
+// roster read and the replay, so each freshly bound hop rechecks the roster
+// under the shared redirect budget.
+//
+// Returns nil when the client stays where it is.
+func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+	var settled *iggcon.IdentityInfo
+	for {
+		// The roster read runs while register holds the sign-in lock, so it must
+		// not enter the reconnect path: the reconnect's automatic sign-in would
+		// deadlock on that lock. The connect scope fails it fast instead.
+		redirect, err := c.HandleLeaderRedirection(
+			context.WithValue(ctx, connectScoped{}, struct{}{}))
+		if err != nil || !redirect {
+			return settled, err
+		}
+
+		// The replayed sign-in below owns the session; the redirected Connect
+		// must not sign in on its own, or the replay commits a second Register.
+		c.mtx.Lock()
+		c.skipAutoLoginOnce = true
+		c.mtx.Unlock()
+		if err := c.Connect(ctx); err != nil {
+			c.mtx.Lock()
+			c.skipAutoLoginOnce = false
+			c.mtx.Unlock()
+			return nil, err
+		}
+		settled, err = c.signIn(ctx, code, body)
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // endBoundSession logs out a live session before a re-login, so the server

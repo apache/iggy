@@ -19,8 +19,8 @@
 //!
 //! Verifies password + PAT credentials locally, then runs the consensus
 //! `Register` proposal on the metadata owner; terminal failures are
-//! surfaced as typed `Eviction` frames, transient ones as
-//! `TransientNotAccepted` replay hints.
+//! surfaced as typed `Eviction` frames, transient ones as result-framed
+//! replay hints.
 
 use crate::bootstrap::{ShellBus, ShellShard};
 use crate::dispatch::{send_login_eviction, submit_register_on_owner};
@@ -36,6 +36,7 @@ use iggy_common::defaults::{
 use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use server_common::crypto;
@@ -211,7 +212,9 @@ where
         sessions
             .borrow_mut()
             .record_sdk_info(transport_client_id, sdk_info);
-        let commit = current_metadata_commit(shard);
+        // A lagging backup's commit_max can sit below the epoch this session
+        // already bound; never advertise a commit behind the session itself.
+        let commit = current_metadata_commit(shard).max(session);
         let reply =
             build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
         let _ = shard
@@ -256,7 +259,10 @@ where
         }
     }
 
-    let commit = current_metadata_commit(shard);
+    // `session` IS the register's commit op, and on a backup that forwarded
+    // the proposal the local applied commit still lags it. Reporting the
+    // lower number would make one frame contradict itself.
+    let commit = current_metadata_commit(shard).max(session);
     let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
     let send_result = shard
         .bus
@@ -278,10 +284,10 @@ where
 ///
 /// A transient consensus failure ([`LoginRegisterError::is_terminal`] is
 /// `false`) means the cluster could not commit *right now* (a freshly booted
-/// primary still catching up, or a cross-shard submit canceled). Staying
-/// silent lets the SDK read-timeout replay once the primary is caught up;
-/// replying empty would surface as a hard `InvalidFormat` decode failure and
-/// break the replay.
+/// primary still catching up, or a cross-shard submit canceled). Those get a
+/// result-framed replay hint instead of silence, so the SDK replays at once
+/// rather than waiting out its read-timeout; replying empty would surface as
+/// a hard `InvalidFormat` decode failure and break the replay.
 ///
 /// Terminal auth errors (`InvalidCredentials` / `InvalidToken` /
 /// `UserInactive` / `Session`) fast-fail with a typed `Eviction` frame so the
@@ -309,24 +315,28 @@ pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
         )
         .await;
     } else {
-        // Transient consensus failure (not-caught-up / not-primary / pipeline
-        // full): send the explicit `TransientNotAccepted` frame instead of
-        // staying silent, so the SDK replays the login immediately rather than
-        // waiting out its read-timeout. Same contract as a transient metadata
-        // request -- nothing committed, so the replayed Register is idempotent.
-        send_login_transient_reply(shard, transport_client_id, request_header).await;
+        // Which code the hint carries is what tells the client whether the
+        // replay may move to another node: see `transient_login_code`.
+        send_login_transient_reply(
+            shard,
+            transport_client_id,
+            request_header,
+            transient_login_code(error),
+        )
+        .await;
     }
 }
 
-/// Result-framed `TransientNotAccepted` Reply on a transient (non-terminal)
-/// failed Register. The SDK decodes the nonzero result code and replays the
-/// same login on the same connection. Only call for transient errors -- see
+/// Result-framed transient Reply on a non-terminal failed Register. The SDK
+/// decodes the nonzero result code and replays the same login on the same
+/// connection. Only call for transient errors -- see
 /// [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
 async fn send_login_transient_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RoutedRequestHeader,
+    code: IggyError,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -335,14 +345,7 @@ async fn send_login_transient_reply<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
-    // `TransientNotAccepted`: a login/register replay is safe under any
-    // session (a duplicate register mints a fresh session and the server
-    // evicts the abandoned one), so the client may fail over freely.
-    let reply = build_result_rejection_reply(
-        request_header,
-        commit,
-        IggyError::TransientNotAccepted.as_code(),
-    );
+    let reply = build_result_rejection_reply(request_header, commit, code.as_code());
     if let Err(error) = shard
         .bus
         .send_to_client(transport_client_id, reply.into_generic().into_frozen())
@@ -353,6 +356,30 @@ async fn send_login_transient_reply<B, MJ, S, SB>(
             error = %error,
             "failed to send login transient reply"
         );
+    }
+}
+
+/// Wire code for a transient (non-terminal) login/register failure.
+///
+/// `TransientNotAccepted` asserts nothing was committed: the register never
+/// entered a pipeline (not primary / not caught up / pipeline full) or never
+/// left this node (primary unreachable). The client may re-issue it anywhere,
+/// including under a fresh identity after failing over to another node.
+///
+/// A forward timeout, an in-progress proposal, or a canceled proposal has an
+/// UNKNOWN outcome, so none can ride that assertion. `TransientNotCommitted`
+/// pins the replay to this connection and its client id, where a register that
+/// did commit rebinds its own client-table entry. Re-issuing under a freshly
+/// minted id would instead orphan that entry until capacity eviction reclaims
+/// it.
+const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
+    match error {
+        LoginRegisterError::Transient(
+            MetadataSubmitError::ForwardTimedOut
+            | MetadataSubmitError::InProgress
+            | MetadataSubmitError::Canceled,
+        ) => IggyError::TransientNotCommitted,
+        _ => IggyError::TransientNotAccepted,
     }
 }
 
@@ -399,6 +426,31 @@ mod tests {
                 error.as_code(),
                 expected.as_code(),
                 "reason {reason:?} must surface as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_register_outcomes_pin_the_client_identity() {
+        for error in [
+            MetadataSubmitError::ForwardTimedOut,
+            MetadataSubmitError::InProgress,
+            MetadataSubmitError::Canceled,
+        ] {
+            assert_eq!(
+                transient_login_code(&LoginRegisterError::Transient(error)),
+                IggyError::TransientNotCommitted,
+            );
+        }
+        for error in [
+            MetadataSubmitError::NotPrimary,
+            MetadataSubmitError::NotCaughtUp,
+            MetadataSubmitError::PipelineFull,
+            MetadataSubmitError::PrimaryUnreachable,
+        ] {
+            assert_eq!(
+                transient_login_code(&LoginRegisterError::Transient(error)),
+                IggyError::TransientNotAccepted,
             );
         }
     }

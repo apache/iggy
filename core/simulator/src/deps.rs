@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::executor::TimerHandle;
+use crate::executor::{TimerHandle, yield_once};
 use clock::Clock;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{IggyTimestamp, variadic};
@@ -385,6 +385,12 @@ pub struct SimSuperblock {
     /// shard withholds the view-scoped send. Proves the split-brain gate, that a
     /// replica never sends in a view it has not durably recorded.
     fail_writes: Cell<bool>,
+    /// Fault injection: when set, every [`SuperblockStore::write`] suspends once
+    /// before completing. A real superblock persist is an fsync-wide suspension
+    /// point; the default in-memory write completes on first poll, so nothing can
+    /// interleave with a persist and every schedule-sensitive bug behind one is
+    /// invisible to the simulator. The yield restores the window.
+    yield_writes: Cell<bool>,
 }
 
 impl SimSuperblock {
@@ -400,6 +406,12 @@ impl SimSuperblock {
     pub fn set_fail_writes(&self) {
         self.fail_writes.set(true);
     }
+
+    /// Make every subsequent write suspend once before completing, so tasks that
+    /// are ready at persist time interleave with it. See [`Self::yield_writes`].
+    pub fn set_yield_writes(&self) {
+        self.yield_writes.set(true);
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -407,6 +419,9 @@ impl SuperblockStore for SimSuperblock {
     async fn write(&self, payload: &[u8]) -> std::io::Result<()> {
         if self.fail_writes.get() {
             return Err(std::io::Error::other("sim superblock write fault"));
+        }
+        if self.yield_writes.get() {
+            yield_once().await;
         }
         *self.latest.borrow_mut() = Some(payload.to_vec());
         Ok(())
