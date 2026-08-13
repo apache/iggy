@@ -1275,7 +1275,7 @@ mod tests {
         .expect("Failed to create record batch");
 
         assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 9);
+        assert_eq!(record_batch.num_columns(), 10);
 
         let columns = record_batch.schema();
         let columns: HashSet<&str> = columns.fields().iter().map(|f| f.name().as_ref()).collect();
@@ -1334,7 +1334,7 @@ mod tests {
         .expect("Failed to create record batch");
 
         assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 2);
+        assert_eq!(record_batch.num_columns(), 3);
 
         let columns = record_batch.schema();
         let columns: HashSet<&str> = columns.fields().iter().map(|f| f.name().as_ref()).collect();
