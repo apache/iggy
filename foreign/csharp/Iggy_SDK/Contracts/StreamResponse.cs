@@ -17,6 +17,7 @@
 
 
 using System.Text.Json.Serialization;
+using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
@@ -62,4 +63,10 @@ public sealed class StreamResponse
     ///     List of topics in the stream.
     /// </summary>
     public IEnumerable<TopicResponse> Topics { get; init; } = [];
+
+    /// <summary>
+    ///     Options attached to the stream at creation. TCP transport only.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
 }

@@ -23,6 +23,7 @@ use crate::error::IggyError;
 use crate::utils::expiry::IggyExpiry;
 use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `CreateTopic` command is used to create a new topic in a stream.
 /// It has additional payload:
@@ -51,6 +52,10 @@ pub struct CreateTopic {
     pub replication_factor: Option<u8>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
+    /// Additional topic options as string key-values, parsed by the server
+    /// with the same rules as its config file. Unknown keys are rejected.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 impl Default for CreateTopic {
@@ -63,6 +68,7 @@ impl Default for CreateTopic {
             max_topic_size: MaxTopicSize::ServerDefault,
             replication_factor: None,
             name: "topic".to_string(),
+            options: BTreeMap::new(),
         }
     }
 }

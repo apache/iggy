@@ -657,20 +657,37 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
+    // replicationFactor is kept for API compatibility but is gone from the wire protocol.
     internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
         CompressionAlgorithm compressionAlgorithm, byte? replicationFactor, ulong messageExpiry,
         ulong maxTopicSize)
     {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 23 + name.Length];
+        var options = new Dictionary<HeaderKey, HeaderValue>();
+        if (compressionAlgorithm != CompressionAlgorithm.None)
+        {
+            options[HeaderKey.FromString("compression_algorithm")]
+                = HeaderValue.FromString(compressionAlgorithm.ToString().ToLowerInvariant());
+        }
+
+        if (messageExpiry != 0)
+        {
+            options[HeaderKey.FromString("message_expiry")] = HeaderValue.FromUInt64(messageExpiry);
+        }
+
+        if (maxTopicSize != 0)
+        {
+            options[HeaderKey.FromString("max_topic_size")] = HeaderValue.FromUInt64(maxTopicSize);
+        }
+
+        var optionsLength = HeadersByteLength(options);
+        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 4 + 1 + name.Length + optionsLength];
         bytes.WriteBytesFromIdentifier(streamId);
         var position = 2 + streamId.Length;
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionCount);
-        bytes[position + 4] = (byte)compressionAlgorithm;
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 5)..(position + 13)], messageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 13)..(position + 21)], maxTopicSize);
-        bytes[position + 21] = replicationFactor ?? 0;
-        bytes[position + 22] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 23)..]);
+        position += 4;
+        bytes[position] = (byte)name.Length;
+        Encoding.UTF8.GetBytes(name, bytes[(position + 1)..(position + 1 + name.Length)]);
+        WriteHeadersTo(bytes[(position + 1 + name.Length)..], options);
         return bytes.ToArray();
     }
 

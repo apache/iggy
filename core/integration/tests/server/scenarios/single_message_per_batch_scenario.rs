@@ -50,11 +50,15 @@ pub async fn run(harness: &TestHarness, duration_secs: u64) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // Flush threshold far past what this test sends, so the
+            // messages accumulate in the journal instead of reaching a segment
+            // on the send path -- the delayed persistence under test.
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(10_000),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

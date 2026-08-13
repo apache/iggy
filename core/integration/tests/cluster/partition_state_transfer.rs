@@ -51,6 +51,10 @@ const STORED_CONSUMER_OFFSET: u64 = 17;
 /// 16 MiB pull completed in ~120ms on a release build, inside one marker
 /// poll). Also enough commits (> ring capacity 64) that the fresh
 /// rejoiner's floor refuses.
+/// Segment cap for the multi-artifact spec: small enough that the 64 MiB bulky
+/// seed spans several sealed segments, so the install runs from a manifest with
+/// one spill per artifact rather than a single segment.
+const SEGMENT_SIZE_MULTI_ARTIFACT: u64 = 8 * 1024 * 1024;
 const BULKY_MESSAGES_COUNT: u32 = 256;
 const BULKY_PAYLOAD_LEN: usize = 256 * 1024;
 /// Poll for the kill gate: the serving marker appears at descriptor-serve
@@ -85,8 +89,7 @@ const MARKER_POLL: Duration = Duration::from_millis(200);
     cluster_nodes = 3,
     server(
         system.sharding.cpu_allocation = "0..1",
-        partition.evicted_ring_capacity = "64",
-        system.partition.messages_required_to_save = "1"
+        partition.evicted_ring_capacity = "64"
     )
 )]
 async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_partition(
@@ -190,8 +193,7 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
     cluster_nodes = 3,
     server(
         system.sharding.cpu_allocation = "0..1",
-        partition.evicted_ring_capacity = "64",
-        system.partition.messages_required_to_save = "1"
+        partition.evicted_ring_capacity = "64"
     )
 )]
 async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_partition(
@@ -204,7 +206,7 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
         .root_client_for_node(0)
         .await
         .expect("connect a root client to the node");
-    seed_topic(&client).await;
+    seed_topic(&client, None).await;
     produce(&client, 40).await;
     sleep(Duration::from_secs(1)).await;
     harness.stop_node(2).expect("stop node 2");
@@ -242,12 +244,10 @@ async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_p
     cluster_nodes = 3,
     server(
         system.sharding.cpu_allocation = "0..1",
-        partition.evicted_ring_capacity = "64",
-        system.partition.messages_required_to_save = "1",
-        system.segment.size = "8MiB"
+        partition.evicted_ring_capacity = "64"
     )
 )]
-// The 8 MiB segment cap makes the 64 MiB bulky seed span several sealed
+// The topic's 8 MiB segment cap makes the 64 MiB bulky seed span several sealed
 // segments, so unlike the other specs (single-segment under the default 1 GiB
 // cap) this one installs from a MULTI-ARTIFACT manifest, one spill per artifact.
 // The installed segment count at the end is what asserts that. The re-armed
@@ -261,7 +261,7 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
         .root_client_for_node(0)
         .await
         .expect("connect a root client to the node");
-    seed_topic(&client).await;
+    seed_topic(&client, Some(SEGMENT_SIZE_MULTI_ARTIFACT)).await;
     // Bulky payloads so the pull spans many 256 KiB chunks: the kill below
     // must land while the transfer is provably in flight, and a small
     // partition finishes inside the marker-poll latency, leaving the
@@ -357,7 +357,12 @@ async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClien
     None
 }
 
-async fn seed_topic(client: &IggyClient) {
+/// `segment_size` is `None` for the specs that only need the default cap; the
+/// multi-artifact spec passes one small enough that its bulky seed spans
+/// several sealed segments. `messages_required_to_save = 1` is the forcing
+/// function every spec here shares: each commit flushes and ring-evicts, which
+/// is what marches `repair_retained_from` forward.
+async fn seed_topic(client: &IggyClient, segment_size: Option<u64>) {
     client
         .create_stream(STREAM_NAME)
         .await
@@ -366,11 +371,13 @@ async fn seed_topic(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).expect("stream identifier"),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                segment_size: segment_size.map(IggyByteSize::from),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic with one partition");
@@ -413,7 +420,7 @@ async fn produce_bulky(client: &IggyClient, count: u32, payload_len: usize) {
 }
 
 async fn seed_partition(client: &IggyClient) {
-    seed_topic(client).await;
+    seed_topic(client, None).await;
     produce(client, MESSAGES_COUNT).await;
     assert_eq!(
         poll_count(client, MESSAGES_COUNT).await,

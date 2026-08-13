@@ -82,6 +82,9 @@ pub struct CreateTopic {
     #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
     pub compression_algorithm: Option<String>,
 
+    // Accepted but ignored since CreateTopic stopped carrying
+    // replication_factor; kept so the tool schema stays stable.
+    #[allow(dead_code)]
     #[schemars(description = "replication factor (optional, must be greater than 0)")]
     pub replication_factor: Option<u8>,
 

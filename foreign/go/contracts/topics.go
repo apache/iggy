@@ -41,16 +41,18 @@ type UpdateTopicRequest struct {
 }
 
 type Topic struct {
-	Id                   uint32   `json:"id"`
-	CreatedAt            uint64   `json:"createdAt"`
-	Name                 string   `json:"name"`
-	Size                 uint64   `json:"size"`
-	MessageExpiry        Duration `json:"messageExpiry"`
-	CompressionAlgorithm uint8    `json:"compressionAlgorithm"`
-	MaxTopicSize         uint64   `json:"maxTopicSize"`
-	ReplicationFactor    uint8    `json:"replicationFactor"`
-	MessagesCount        uint64   `json:"messagesCount"`
-	PartitionsCount      uint32   `json:"partitionsCount"`
+	Id                   uint32                 `json:"id"`
+	CreatedAt            uint64                 `json:"createdAt"`
+	Name                 string                 `json:"name"`
+	Size                 uint64                 `json:"size"`
+	MessageExpiry        Duration               `json:"messageExpiry"`
+	CompressionAlgorithm uint8                  `json:"compressionAlgorithm"`
+	MaxTopicSize         uint64                 `json:"maxTopicSize"`
+	ReplicationFactor    uint8                  `json:"replicationFactor"`
+	MessagesCount        uint64                 `json:"messagesCount"`
+	PartitionsCount      uint32                 `json:"partitionsCount"`
+	Options              map[string]HeaderValue `json:"options,omitempty"`
+	DerivedOptions       map[string]HeaderValue `json:"derivedOptions,omitempty"`
 }
 
 type TopicDetails struct {

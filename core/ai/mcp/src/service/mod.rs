@@ -16,10 +16,11 @@
 // under the License.
 
 use iggy::prelude::{
-    ClusterClient, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
-    IggyError, IggyMessage, IggyTimestamp, MessageClient, PartitionClient, Partitioning,
-    PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
-    SystemClient, SystemSnapshotType, TopicClient, UserClient, UserStatus,
+    ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
+    Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize,
+    MessageClient, PartitionClient, Partitioning, PersonalAccessTokenClient, PollingKind,
+    PollingStrategy, SegmentClient, StreamClient, SystemClient, SystemSnapshotType, TopicClient,
+    TopicCreateOptions, UserClient, UserStatus,
 };
 use requests::*;
 use rmcp::{
@@ -148,7 +149,7 @@ impl IggyService {
             name,
             partitions_count,
             compression_algorithm,
-            replication_factor,
+            replication_factor: _,
             message_expiry,
             max_size,
         }): Parameters<CreateTopic>,
@@ -166,11 +167,17 @@ impl IggyService {
                 .create_topic(
                     &id(&stream_id)?,
                     &name,
-                    partitions_count,
-                    compression_algorithm,
-                    replication_factor,
-                    message_expiry,
-                    max_size,
+                    &TopicCreateOptions {
+                        partitions_count: Some(partitions_count),
+                        compression_algorithm: (compression_algorithm
+                            != CompressionAlgorithm::default())
+                        .then_some(compression_algorithm),
+                        message_expiry: (message_expiry != IggyExpiry::ServerDefault)
+                            .then_some(message_expiry),
+                        max_topic_size: (max_size != MaxTopicSize::ServerDefault)
+                            .then_some(max_size),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await,
         )

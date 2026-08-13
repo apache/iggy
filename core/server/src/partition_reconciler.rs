@@ -641,7 +641,7 @@ async fn reconcile_additions(
         // built, not once per committed partition every pass. A topic that
         // vanished between the target snapshot and this read defers to the
         // next pass.
-        let Some(partition_stats) = fetch_partition_stats(ctx, ns) else {
+        let Some((partition_stats, topic_runtime)) = fetch_partition_stats(ctx, ns) else {
             continue;
         };
 
@@ -650,6 +650,7 @@ async fn reconcile_additions(
             ns,
             partition_stats,
             epoch,
+            topic_runtime,
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
@@ -1049,17 +1050,23 @@ fn current_revision(ctx: &ReconcilerCtx) -> u64 {
 fn fetch_partition_stats(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
-) -> Option<Arc<iggy_common::PartitionStats>> {
+) -> Option<(
+    Arc<iggy_common::PartitionStats>,
+    iggy_common::TopicRuntimeOptions,
+)> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(ns.stream_id())?;
         let topic = stream.topics.get(ns.topic_id())?;
         // Get-or-create in the shared registry so the owning shard's counters
         // are the same `Arc` every shard's `get_topic` reply reads.
-        Some(inner.stats_registry.partition(
-            ns.stream_id(),
-            ns.topic_id(),
-            ns.partition_id(),
-            topic.stats.clone(),
+        Some((
+            inner.stats_registry.partition(
+                ns.stream_id(),
+                ns.topic_id(),
+                ns.partition_id(),
+                topic.stats.clone(),
+            ),
+            iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
         ))
     })
 }
@@ -1176,7 +1183,7 @@ mod tests {
     };
     use iggy_binary_protocol::{
         Command2, GenericHeader, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader,
-        WireIdentifier,
+        WireIdentifier, WireOptions,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1325,6 +1332,7 @@ mod tests {
     fn seed_stream(mux: &TestMux, op: u64, name: &str) {
         let req = CreateStreamRequest {
             name: WireName::new(name).expect("test stream name fits WireName"),
+            options: WireOptions::empty(),
         };
         mux.update(build_prepare(op, Operation::CreateStream, &req))
             .expect("CreateStream apply succeeds");
@@ -1341,14 +1349,11 @@ mod tests {
         let req = CreateTopicWithAssignmentsRequest {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
-                partitions_count: u32::try_from(assignments.len())
-                    .expect("partitions count fits u32"),
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
+                partitions_count: 1,
                 name: WireName::new(name).expect("test topic name fits WireName"),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: assignments,
         };
         mux.update(build_prepare(
@@ -1462,7 +1467,7 @@ mod tests {
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
                 validate_checksum: true,
-                segment_size: config.system.segment.size,
+                segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
                 encryptor: None,
             },
@@ -1649,7 +1654,7 @@ mod tests {
         // `ensure_initial_segment` plants exactly one segment per build and
         // folds it into the namespace's shared stats, so this counter is the
         // observable that separates them.
-        let stats = fetch_partition_stats(&ctx, ns).expect("materialised namespace has stats");
+        let (stats, _) = fetch_partition_stats(&ctx, ns).expect("materialised namespace has stats");
         assert_eq!(
             stats.segments_count_inconsistent(),
             1,
@@ -1686,12 +1691,13 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
-        let stats = fetch_partition_stats(&ctx, ns).expect("committed namespace has stats");
+        let (stats, _) = fetch_partition_stats(&ctx, ns).expect("committed namespace has stats");
         let live = build_partition_fresh(
             &config,
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
+            iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
             1,
@@ -1720,6 +1726,7 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
+            iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
             1,

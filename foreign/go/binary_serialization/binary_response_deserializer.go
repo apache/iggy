@@ -57,8 +57,10 @@ func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
 	if err != nil {
 		return nil, err
 	}
-	topics := make([]iggcon.Topic, 0)
-	for pos < len(payload) {
+	// Count-driven: a topic element carries variable-length options blocks,
+	// so "consume until the buffer ends" no longer delimits it.
+	topics := make([]iggcon.Topic, 0, stream.TopicsCount)
+	for i := uint32(0); i < stream.TopicsCount; i++ {
 		topic, readBytes, err := DeserializeToTopic(payload, pos)
 		if err != nil {
 			return nil, err
@@ -110,14 +112,18 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, erro
 	messagesCount := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	nameLength := int(payload[position+32])
 
-	totalSize := streamFixedSize + nameLength
-	if remaining < totalSize {
+	if remaining < streamFixedSize+nameLength {
 		return iggcon.Stream{}, 0, fmt.Errorf(
 			"not enough data to read stream name: need %d bytes, got %d",
-			totalSize, remaining)
+			streamFixedSize+nameLength, remaining)
 	}
 
 	name := string(payload[position+33 : position+33+nameLength])
+
+	options, optionsSize, err := deserializeOptions(payload, position+streamFixedSize+nameLength)
+	if err != nil {
+		return iggcon.Stream{}, 0, fmt.Errorf("failed to read stream options: %w", err)
+	}
 
 	return iggcon.Stream{
 		Id:            id,
@@ -126,7 +132,36 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, erro
 		SizeBytes:     sizeBytes,
 		MessagesCount: messagesCount,
 		CreatedAt:     createdAt,
-	}, totalSize, nil
+		Options:       options,
+	}, streamFixedSize + nameLength + optionsSize, nil
+}
+
+// deserializeOptions reads a u32-length-prefixed options TLV block at
+// position and returns the decoded options with the total bytes consumed
+// (prefix included). A zero-length block decodes to a nil map.
+func deserializeOptions(payload []byte, position int) (map[string]iggcon.HeaderValue, int, error) {
+	if len(payload) < position+4 {
+		return nil, 0, errors.New("not enough data to read options length")
+	}
+	optionsLength := int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	if len(payload) < position+4+optionsLength {
+		return nil, 0, fmt.Errorf(
+			"not enough data to read options block: need %d bytes, got %d",
+			optionsLength, len(payload)-position-4)
+	}
+	if optionsLength == 0 {
+		return nil, 4, nil
+	}
+
+	entries, err := iggcon.DeserializeHeaders(payload[position+4 : position+4+optionsLength])
+	if err != nil {
+		return nil, 0, err
+	}
+	options := make(map[string]iggcon.HeaderValue, len(entries))
+	for _, entry := range entries {
+		options[string(entry.Key.Value)] = entry.Value
+	}
+	return options, 4 + optionsLength, nil
 }
 
 // pollBatchHeaderLength covers [partition_id u32][current_offset u64][count u32].
@@ -220,11 +255,21 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 }
 
 func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
-	topics := make([]iggcon.Topic, 0)
-	length := len(payload)
-	position := 0
+	if len(payload) < 4 {
+		return nil, fmt.Errorf(
+			"not enough data to read topics count: need 4 bytes, got %d", len(payload))
+	}
+	topicsCount := binary.LittleEndian.Uint32(payload[0:4])
+	position := 4
 
-	for position < length {
+	// The declared count is server-controlled; the allocation hint is capped
+	// by what the body could possibly hold.
+	maxTopics := (len(payload) - position) / topicMinimumSize
+	if int(topicsCount) < maxTopics {
+		maxTopics = int(topicsCount)
+	}
+	topics := make([]iggcon.Topic, 0, maxTopics)
+	for i := uint32(0); i < topicsCount; i++ {
 		topic, readBytes, err := DeserializeToTopic(payload, position)
 		if err != nil {
 			return nil, err
@@ -256,7 +301,23 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 	}, nil
 }
 
+// topicFixedSize covers the fields before the name:
+// id + created_at + partitions_count + message_expiry + compression +
+// max_topic_size + size_bytes + messages_count + name_len.
+const topicFixedSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 // 50 bytes
+
+// topicMinimumSize is the smallest possible topic element: fixed fields plus
+// the two u32 options-length prefixes (explicit and derived), both zero.
+const topicMinimumSize = topicFixedSize + 4 + 4
+
 func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error) {
+	remaining := len(payload) - position
+	if remaining < topicFixedSize {
+		return iggcon.Topic{}, 0, fmt.Errorf(
+			"not enough data to read topic header: need %d bytes, got %d",
+			topicFixedSize, remaining)
+	}
+
 	topic := iggcon.Topic{}
 	topic.Id = binary.LittleEndian.Uint32(payload[position : position+4])
 	topic.CreatedAt = binary.LittleEndian.Uint64(payload[position+4 : position+12])
@@ -264,14 +325,35 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	topic.MessageExpiry = iggcon.Duration(binary.LittleEndian.Uint64(payload[position+16 : position+24]))
 	topic.CompressionAlgorithm = payload[position+24]
 	topic.MaxTopicSize = binary.LittleEndian.Uint64(payload[position+25 : position+33])
-	topic.ReplicationFactor = payload[position+33]
-	topic.Size = binary.LittleEndian.Uint64(payload[position+34 : position+42])
-	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+42 : position+50])
+	topic.Size = binary.LittleEndian.Uint64(payload[position+33 : position+41])
+	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+41 : position+49])
+	// Replication factor left the wire protocol together with the old fixed
+	// layout; every topic reports the single-copy default.
+	topic.ReplicationFactor = 1
 
-	nameLength := int(payload[position+50])
-	topic.Name = string(payload[position+51 : position+51+nameLength])
+	nameLength := int(payload[position+49])
+	if remaining < topicFixedSize+nameLength {
+		return iggcon.Topic{}, 0, fmt.Errorf(
+			"not enough data to read topic name: need %d bytes, got %d",
+			topicFixedSize+nameLength, remaining)
+	}
+	topic.Name = string(payload[position+50 : position+50+nameLength])
 
-	readBytes := 4 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 1 + 1 + nameLength
+	readBytes := topicFixedSize + nameLength
+	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Topic{}, 0, fmt.Errorf("failed to read topic options: %w", err)
+	}
+	topic.Options = options
+	readBytes += optionsSize
+
+	derivedOptions, derivedSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Topic{}, 0, fmt.Errorf("failed to read topic derived options: %w", err)
+	}
+	topic.DerivedOptions = derivedOptions
+	readBytes += derivedSize
+
 	return topic, readBytes, nil
 }
 
@@ -395,6 +477,7 @@ func DeserializeUser(payload []byte) (*iggcon.UserInfoDetails, error) {
 		CreatedAt: response.CreatedAt,
 		Username:  response.Username,
 		Status:    response.Status,
+		Options:   response.Options,
 	}
 	if hasPermissions == 1 {
 		permissionLength := binary.LittleEndian.Uint32(payload[position+1 : position+5])
@@ -521,12 +604,18 @@ func deserializeToUser(payload []byte, position int) (*iggcon.UserInfo, int, err
 	username := string(payload[position+14 : position+14+int(usernameLength)])
 
 	readBytes := 4 + 8 + 1 + 1 + int(usernameLength)
+	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read user options: %w", err)
+	}
+	readBytes += optionsSize
 
 	return &iggcon.UserInfo{
 		Id:        id,
 		CreatedAt: createdAt,
 		Status:    userStatus,
 		Username:  username,
+		Options:   options,
 	}, readBytes, nil
 }
 

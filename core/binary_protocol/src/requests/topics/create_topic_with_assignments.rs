@@ -17,23 +17,34 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
+use crate::primitives::options::WireOptions;
 use crate::primitives::partition_assignment::CreatedPartitionAssignment;
 use crate::requests::topics::CreateTopicRequest;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 fn usize_to_u32(value: usize, context: &str) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| panic!("{context} exceeds u32"))
 }
 
+/// Internal create-topic form the admitting primary replicates.
+///
+/// `request` carries the client's explicit options verbatim; `derived_options`
+/// carries the values the primary resolved from server defaults for keys the
+/// client did not send. Splitting the two preserves per-key provenance across
+/// replication, so `GetTopic` can distinguish client-pinned settings from
+/// defaults filled at creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTopicWithAssignmentsRequest {
     pub request: CreateTopicRequest,
+    pub derived_options: WireOptions,
     pub partitions: Vec<CreatedPartitionAssignment>,
 }
 
 impl WireEncode for CreateTopicWithAssignmentsRequest {
     fn encoded_size(&self) -> usize {
         4 + self.request.encoded_size()
+            + 4
+            + self.derived_options.encoded_size()
             + 4
             + self
                 .partitions
@@ -48,6 +59,11 @@ impl WireEncode for CreateTopicWithAssignmentsRequest {
             "create topic request size",
         ));
         self.request.encode(buf);
+        buf.put_u32_le(usize_to_u32(
+            self.derived_options.encoded_size(),
+            "create topic derived options size",
+        ));
+        self.derived_options.encode(buf);
         buf.put_u32_le(usize_to_u32(
             self.partitions.len(),
             "create topic partition count",
@@ -72,8 +88,22 @@ impl WireDecode for CreateTopicWithAssignmentsRequest {
         }
 
         let request = CreateTopicRequest::decode_from(&buf[request_start..request_end])?;
-        let partitions_count = read_u32_le(buf, request_end)? as usize;
-        let mut offset = request_end + 4;
+
+        let derived_size = read_u32_le(buf, request_end)? as usize;
+        let derived_start = request_end + 4;
+        let derived_end = derived_start + derived_size;
+        if buf.len() < derived_end {
+            return Err(WireError::UnexpectedEof {
+                offset: derived_start,
+                need: derived_size,
+                have: buf.len().saturating_sub(derived_start),
+            });
+        }
+        let derived_options =
+            WireOptions::from_bytes(Bytes::copy_from_slice(&buf[derived_start..derived_end]))?;
+
+        let partitions_count = read_u32_le(buf, derived_end)? as usize;
+        let mut offset = derived_end + 4;
         let mut partitions = Vec::with_capacity(partitions_count);
         for _ in 0..partitions_count {
             let (partition, consumed) = CreatedPartitionAssignment::decode(&buf[offset..])?;
@@ -84,6 +114,7 @@ impl WireDecode for CreateTopicWithAssignmentsRequest {
         Ok((
             Self {
                 request,
+                derived_options,
                 partitions,
             },
             offset,
@@ -97,8 +128,17 @@ mod tests {
     use crate::WireIdentifier;
     use crate::codec::{WireDecode, WireEncode};
     use crate::primitives::identifier::WireName;
+    use crate::primitives::options::WireOptions;
     use crate::primitives::partition_assignment::CreatedPartitionAssignment;
+    use crate::primitives::user_headers::encode_user_headers;
     use crate::requests::topics::CreateTopicRequest;
+    use bytes::BytesMut;
+
+    fn options_block(entries: &[(u8, &[u8], u8, &[u8])]) -> WireOptions {
+        let mut buf = BytesMut::new();
+        encode_user_headers(entries, &mut buf);
+        WireOptions::from_bytes(buf.freeze()).unwrap()
+    }
 
     #[test]
     fn roundtrip() {
@@ -106,12 +146,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(1),
                 partitions_count: 2,
-                compression_algorithm: 1,
-                message_expiry: 3600,
-                max_topic_size: 1024,
-                replication_factor: 1,
                 name: WireName::new("events").unwrap(),
+                options: options_block(&[(2, b"message_expiry", 2, b"7 days")]),
             },
+            derived_options: options_block(&[(2, b"max_topic_size", 12, &1024u64.to_le_bytes())]),
             partitions: vec![
                 CreatedPartitionAssignment {
                     partition_id: 0,
@@ -122,6 +160,24 @@ mod tests {
                     consensus_group_id: 2,
                 },
             ],
+        };
+        let bytes = request.to_bytes();
+        let (decoded, consumed) = CreateTopicWithAssignmentsRequest::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn roundtrip_with_empty_blocks() {
+        let request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(7),
+                partitions_count: 0,
+                name: WireName::new("bare").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![],
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = CreateTopicWithAssignmentsRequest::decode(&bytes).unwrap();

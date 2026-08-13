@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
+    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic,
+    TopicCreateOptions, TopicDetails,
 };
 use async_trait::async_trait;
 
@@ -38,17 +39,15 @@ pub trait TopicClient {
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError>;
     /// Create a new topic.
     ///
-    /// Authentication is required, and the permission to manage the topics.
-    #[allow(clippy::too_many_arguments)]
+    /// Every knob rides `options`; an absent key resolves against the
+    /// server's defaults at admission, so a future key costs no signature
+    /// change here. Authentication is required, and the permission to manage
+    /// the topics.
     async fn create_topic(
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError>;
     /// Update a topic by unique ID or name.
     ///

@@ -58,6 +58,7 @@ use iggy_binary_protocol::{PrepareOkHeader, RoutedRequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
+    TopicRuntimeOptions,
 };
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
@@ -89,7 +90,8 @@ use tracing::{debug, warn};
 //
 // Note: there is no per-client write dedup at the partition plane.
 // `SendMessages` retries are at-least-once and may commit multiple times.
-// Consumers handle duplicate messages via `server_common::MessageDeduplicator`
+// Duplicate suppression is a consensus-layer concern: the VSR client table
+// dedups by request id (at-most-once), so the data plane needs no message-id set.
 // (message-id based) if they care.
 pub struct IggyPartition<B = IggyMessageBus, SB = PingPongSuperblock>
 where
@@ -123,6 +125,11 @@ where
     /// `None` only for in-memory (simulated) partitions.
     pub(crate) partition_dir: Option<String>,
     pub(crate) consumer_offset_enforce_fsync: bool,
+    /// This topic's runtime knobs, resolved at topic admission and carried
+    /// here by the builder. Every `None` field falls back to the shard-wide
+    /// `PartitionsConfig` value (simulator and tests build partitions with
+    /// no resolved options at all).
+    pub(crate) runtime_options: TopicRuntimeOptions,
     /// In-flight journal repair:
     /// set when the recovery handshake finds this replica behind the group's
     /// commit frontier, cleared when `RepairDone` completes the walk.
@@ -465,6 +472,7 @@ where
             consumer_group_offsets_path: None,
             partition_dir: None,
             consumer_offset_enforce_fsync: false,
+            runtime_options: TopicRuntimeOptions::default(),
             repair: None,
             recovered_durable_offset: None,
             installed_frontier: None,
@@ -994,6 +1002,59 @@ where
     #[must_use]
     pub const fn transfer_attempts(&self) -> u32 {
         self.transfer_attempts
+    }
+
+    /// Install this topic's runtime knobs, as resolved at topic admission.
+    /// Unset fields keep the shard-wide configured values.
+    pub const fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
+        self.runtime_options = runtime_options;
+    }
+
+    #[must_use]
+    pub const fn runtime_options(&self) -> TopicRuntimeOptions {
+        self.runtime_options
+    }
+
+    /// Segment size this partition rolls at: the per-topic value when the
+    /// topic was created with one, else the shard-wide configured size.
+    #[must_use]
+    pub fn effective_segment_size(&self, config: &PartitionsConfig) -> IggyByteSize {
+        self.runtime_options
+            .segment_size
+            .unwrap_or(config.segment_size)
+    }
+
+    /// Whether this partition's writes fsync.
+    #[must_use]
+    pub fn effective_enforce_fsync(&self, config: &PartitionsConfig) -> bool {
+        self.runtime_options
+            .enforce_fsync
+            .unwrap_or(config.enforce_fsync)
+    }
+
+    /// Message-count threshold that flushes this partition's journal.
+    #[must_use]
+    pub fn effective_messages_required_to_save(&self, config: &PartitionsConfig) -> u32 {
+        self.runtime_options
+            .messages_required_to_save
+            .unwrap_or(config.messages_required_to_save)
+    }
+
+    /// Whether this partition's segments reserve their bytes on open.
+    #[must_use]
+    pub fn effective_preallocate_segments(&self, config: &PartitionsConfig) -> bool {
+        self.runtime_options
+            .preallocate_segments
+            .unwrap_or(config.preallocate_segments)
+    }
+
+    /// Byte threshold that flushes this partition's journal.
+    #[must_use]
+    pub fn effective_size_of_messages_required_to_save(&self, config: &PartitionsConfig) -> u64 {
+        self.runtime_options
+            .size_of_messages_required_to_save
+            .unwrap_or(config.size_of_messages_required_to_save)
+            .as_bytes_u64()
     }
 
     pub fn configure_consumer_offset_storage(
@@ -2804,9 +2865,9 @@ where
         // only" - safe, since the flush still writes only committed bytes.
         let is_full = self.log.active_segment().is_full();
         let unsaved_messages_count_exceeded =
-            journal_info.messages_count >= config.messages_required_to_save;
+            journal_info.messages_count >= self.effective_messages_required_to_save(config);
         let unsaved_messages_size_exceeded = journal_info.size.as_bytes_u64()
-            >= config.size_of_messages_required_to_save.as_bytes_u64();
+            >= self.effective_size_of_messages_required_to_save(config);
         let should_persist =
             is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
         if !force && !should_persist {
@@ -3669,7 +3730,10 @@ where
         active_segment.sealed = true;
         let start_offset = active_segment.end_offset + 1;
 
-        let segment = Segment::new(start_offset, config.segment_size);
+        let segment_size = self.effective_segment_size(config);
+        let enforce_fsync = self.effective_enforce_fsync(config);
+        let preallocate_segments = self.effective_preallocate_segments(config);
+        let segment = Segment::new(start_offset, segment_size);
         // `PartitionsConfig::get_messages_path` is a stub (`/tmp/iggy_stub`);
         // the partition's real directory is only known to the server config
         // that created the initial segment, so derive the rotated paths from
@@ -3704,8 +3768,8 @@ where
             &index_path,
             0,
             0,
-            config.enforce_fsync,
-            config.enforce_fsync,
+            enforce_fsync,
+            enforce_fsync,
             false,
         )
         .await
@@ -3719,9 +3783,9 @@ where
             MessagesWriter::new(
                 &messages_path,
                 messages_size_bytes,
-                config.enforce_fsync,
+                enforce_fsync,
                 false,
-                config.preallocate_segments.then_some(config.segment_size),
+                preallocate_segments.then_some(segment_size),
             )
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
@@ -3732,7 +3796,7 @@ where
             .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
             .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+            IggyIndexWriter::new(&index_path, index_size_bytes, enforce_fsync, false)
                 .await
                 .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
@@ -3950,14 +4014,17 @@ where
                 )
             },
         );
-        let segment = Segment::new(start_offset, config.segment_size);
+        let segment_size = self.effective_segment_size(config);
+        let enforce_fsync = self.effective_enforce_fsync(config);
+        let preallocate_segments = self.effective_preallocate_segments(config);
+        let segment = Segment::new(start_offset, segment_size);
         let storage = SegmentStorage::new(
             &messages_path,
             &index_path,
             0,
             0,
-            config.enforce_fsync,
-            config.enforce_fsync,
+            enforce_fsync,
+            enforce_fsync,
             false,
         )
         .await
@@ -3971,9 +4038,9 @@ where
             MessagesWriter::new(
                 &messages_path,
                 messages_size_bytes,
-                config.enforce_fsync,
+                enforce_fsync,
                 false,
-                config.preallocate_segments.then_some(config.segment_size),
+                preallocate_segments.then_some(segment_size),
             )
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
@@ -3984,7 +4051,7 @@ where
             .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
             .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+            IggyIndexWriter::new(&index_path, index_size_bytes, enforce_fsync, false)
                 .await
                 .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );

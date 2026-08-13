@@ -46,11 +46,13 @@ async fn create_topic_with(
         .create_topic(
             stream_id,
             name,
-            partitions_count,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            max_topic_size,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
+                    .then_some(max_topic_size),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
 }

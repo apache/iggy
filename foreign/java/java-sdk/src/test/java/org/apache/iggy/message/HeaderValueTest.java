@@ -26,6 +26,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.math.BigInteger;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -141,6 +142,30 @@ class HeaderValueTest {
 
         assertThat(headerValue.kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(headerValue.value()).isEqualTo(new byte[] {-1, -1, -1, -1});
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-1", "18446744073709551616"})
+    void fromUint64ThrowsIggyInvalidArgumentExceptionWhenValueOutOfBounds(String value) {
+        assertThatThrownBy(() -> HeaderValue.fromUint64(new BigInteger(value)))
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void fromUint64ReturnsExpectedHeaderValueWhenValueIsValid() {
+        var maxUint64 = new BigInteger("18446744073709551615");
+        var headerValue = HeaderValue.fromUint64(maxUint64);
+
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Uint64);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1, -1, -1, -1, -1, -1, -1, -1});
+        assertThat(headerValue.asUint64()).isEqualTo(maxUint64);
+    }
+
+    @Test
+    void fromUint64EncodesLittleEndian() {
+        var headerValue = HeaderValue.fromUint64(BigInteger.valueOf(258));
+
+        assertThat(headerValue.value()).isEqualTo(new byte[] {2, 1, 0, 0, 0, 0, 0, 0});
     }
 
     @Test

@@ -18,6 +18,7 @@
 
 using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
@@ -84,4 +85,16 @@ public sealed class TopicResponse
     ///     List of partitions in the topic.
     /// </summary>
     public IEnumerable<PartitionResponse>? Partitions { get; init; }
+
+    /// <summary>
+    ///     Options explicitly set by the client at topic creation. TCP transport only.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
+
+    /// <summary>
+    ///     Options resolved from server defaults at topic creation. TCP transport only.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }
 }

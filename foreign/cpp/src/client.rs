@@ -25,7 +25,7 @@ use iggy::prelude::{
     IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient, Partitioning,
     Permissions as RustPermissions, PollingStrategy, SegmentClient,
     SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
-    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
+    SystemSnapshotType as RustSystemSnapshotType, TopicClient, TopicCreateOptions, UserClient,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -399,7 +399,9 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
+        // Kept in the FFI signature so the C++ header stays put, but the
+        // protocol no longer carries a replication factor.
+        let _ = replication_factor;
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -421,18 +423,24 @@ impl Client {
             })?,
         };
 
+        // `None` is what tells admission to resolve the server default, so the
+        // sentinels the string parsers produce must collapse back to it.
+        let options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            compression_algorithm: (rust_compression_algorithm
+                != RustCompressionAlgorithm::default())
+            .then_some(rust_compression_algorithm),
+            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
+                .then_some(rust_message_expiry),
+            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
+                .then_some(rust_max_topic_size),
+            ..TopicCreateOptions::default()
+        };
+
         RUNTIME.block_on(async {
             let topic_details = self
                 .inner
-                .create_topic(
-                    &rust_stream_id,
-                    &topic_name,
-                    partitions_count,
-                    rust_compression_algorithm,
-                    rust_replication_factor,
-                    rust_message_expiry,
-                    rust_max_topic_size,
-                )
+                .create_topic(&rust_stream_id, &topic_name, &options)
                 .await
                 .map_err(|error| {
                     format!(

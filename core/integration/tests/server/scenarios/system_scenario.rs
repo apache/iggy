@@ -123,11 +123,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -150,7 +150,6 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.messages_count, 0);
     assert_eq!(topic.message_expiry, IggyExpiry::NeverExpire);
     assert_eq!(topic.max_topic_size, MaxTopicSize::Unlimited);
-    assert_eq!(topic.replication_factor, 1);
 
     // 11. Get topic details by ID. The owning shards materialize fresh
     // partitions asynchronously after the commit, but the reply reports the
@@ -213,11 +212,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await;
     assert!(create_topic_result.is_err());
@@ -630,7 +629,6 @@ pub async fn run(harness: &TestHarness) {
         CompressionAlgorithm::Gzip
     );
     assert_eq!(updated_topic.max_topic_size, updated_max_topic_size);
-    assert_eq!(updated_topic.replication_factor, updated_replication_factor);
 
     // 39. Purge the existing topic and ensure it has no messages
     client
@@ -761,11 +759,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(&stream_name).unwrap(),
             &topic_name,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

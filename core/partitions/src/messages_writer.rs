@@ -22,7 +22,6 @@ use compio::{
 use iggy_common::{IggyByteSize, IggyError};
 use server_common::iobuf::Frozen;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsFd;
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -66,9 +65,6 @@ impl MessagesWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if let Some(preallocate_size) = preallocate_size {
-            #[cfg(target_os = "linux")]
-            preallocate_file(&file, file_path, preallocate_size.as_bytes_u64()).await;
-            #[cfg(not(target_os = "linux"))]
             preallocate_file(&file, file_path, preallocate_size.as_bytes_u64());
         }
 
@@ -162,7 +158,7 @@ impl MessagesWriter {
 }
 
 #[cfg(target_os = "linux")]
-async fn preallocate_file(file: &File, file_path: &str, len: u64) {
+fn preallocate_file(file: &File, file_path: &str, len: u64) {
     let Ok(len) = i64::try_from(len) else {
         warn!(
             target: "iggy.partitions.storage",
@@ -173,27 +169,16 @@ async fn preallocate_file(file: &File, file_path: &str, len: u64) {
         return;
     };
 
-    let file = match file.as_fd().try_clone_to_owned() {
-        Ok(file) => file,
-        Err(error) => {
-            warn!(
-                target: "iggy.partitions.storage",
-                file = file_path,
-                preallocate_len = len,
-                %error,
-                "file descriptor duplication failed, using buffered allocation"
-            );
-            return;
-        }
-    };
-
-    // Remote filesystems can make fallocate block. The duplicated descriptor
-    // lets the blocking pool reserve extents without stalling the shard thread.
-    let result = compio::runtime::spawn_blocking(move || {
-        fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len)
-    })
-    .await;
-    if let Err(error) = result {
+    // Runs INLINE on the shard thread, deliberately. Shard executors disable
+    // the blocking fallback pool (`thread_pool_limit(0)` in
+    // `server_common::executor`), so `spawn_blocking` does not park a task --
+    // compio panics the shard outright with "the thread pool is needed but no
+    // worker thread is running". `FALLOC_FL_KEEP_SIZE` is a metadata-only
+    // extent reservation, microseconds on a local filesystem, which is the
+    // deployment this reservation exists for. A network filesystem can make it
+    // block; there it is better to turn the topic's `preallocate_segments`
+    // option off than to reintroduce a pool the runtime does not have.
+    if let Err(error) = fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len) {
         warn!(
             target: "iggy.partitions.storage",
             file = file_path,

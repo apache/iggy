@@ -109,6 +109,7 @@ impl HttpSessionExt for HttpClient {
             max_topic_size: MaxTopicSize::ServerDefault,
             replication_factor: None,
             name: topic.to_string(),
+            options: Default::default(),
         };
         let response = self
             .client
@@ -118,10 +119,17 @@ impl HttpSessionExt for HttpClient {
             .send()
             .await
             .expect("create topic request");
+        // Body included on failure: a 500 from a serialization fault names
+        // itself only there, and status alone sent this down a long detour.
+        let status = response.status();
+        let body = if status.is_success() {
+            String::new()
+        } else {
+            response.text().await.unwrap_or_default()
+        };
         assert!(
-            response.status().is_success(),
-            "create topic failed: {}",
-            response.status()
+            status.is_success(),
+            "create topic failed: {status} body={body}"
         );
     }
 

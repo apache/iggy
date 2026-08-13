@@ -81,7 +81,9 @@ use iggy_binary_protocol::consensus::{
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName};
+use iggy_binary_protocol::{
+    ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName, WireOptions,
+};
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use secrecy::SecretString;
@@ -258,6 +260,7 @@ pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
 pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
+        options: WireOptions::empty(),
     }
     .to_bytes()
 }

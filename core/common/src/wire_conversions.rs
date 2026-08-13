@@ -26,9 +26,10 @@ use crate::{
     ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
     ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
     GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, IdentityInfo, IggyByteSize,
-    IggyError, IggyExpiry, MaxTopicSize, Partition, Permissions, PersonalAccessTokenInfo,
-    RawPersonalAccessToken, Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails,
-    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
+    IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, Partition, Permissions,
+    PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream, StreamDetails,
+    StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints, UserInfo,
+    UserInfoDetails, UserStatus,
 };
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
@@ -70,16 +71,19 @@ const WIRE_NO_USER_ID: u32 = u32::MAX;
 // Streams
 // ---------------------------------------------------------------------------
 
-impl From<StreamResponse> for Stream {
-    fn from(w: StreamResponse) -> Self {
-        Self {
+impl TryFrom<StreamResponse> for Stream {
+    type Error = IggyError;
+
+    fn try_from(w: StreamResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: w.id,
             created_at: w.created_at.into(),
             name: w.name.to_string(),
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
             topics_count: w.topics_count,
-        }
+            options: resource_options_from_wire(&w.options, true)?,
+        })
     }
 }
 
@@ -101,14 +105,19 @@ impl TryFrom<GetStreamResponse> for StreamDetails {
             messages_count: w.stream.messages_count,
             topics_count: w.stream.topics_count,
             topics,
+            options: resource_options_from_wire(&w.stream.options, true)?,
         })
     }
 }
 
-pub fn streams_from_wire(w: GetStreamsResponse) -> Vec<Stream> {
-    let mut streams: Vec<Stream> = w.streams.into_iter().map(Stream::from).collect();
+pub fn streams_from_wire(w: GetStreamsResponse) -> Result<Vec<Stream>, IggyError> {
+    let mut streams: Vec<Stream> = w
+        .streams
+        .into_iter()
+        .map(Stream::try_from)
+        .collect::<Result<_, _>>()?;
     streams.sort_by_key(|s| s.id);
-    streams
+    Ok(streams)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +133,7 @@ impl TryFrom<TopicHeader> for Topic {
             v => v.into(),
         };
         let max_topic_size: MaxTopicSize = w.max_topic_size.into();
+        let options = resource_options_from_wire_split(&w.options, &w.derived_options)?;
         Ok(Self {
             id: w.id,
             created_at: w.created_at.into(),
@@ -134,7 +144,10 @@ impl TryFrom<TopicHeader> for Topic {
             message_expiry,
             compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)?,
             max_topic_size,
-            replication_factor: w.replication_factor,
+            // Inert since the wire dropped the byte; removed outright once
+            // the client trait surface is reworked.
+            replication_factor: 1,
+            options,
         })
     }
 }
@@ -172,6 +185,7 @@ impl TryFrom<GetTopicResponse> for TopicDetails {
             replication_factor: topic.replication_factor,
             partitions_count: topic.partitions_count,
             partitions,
+            options: topic.options,
         })
     }
 }
@@ -199,6 +213,7 @@ impl TryFrom<UserResponse> for UserInfo {
             created_at: w.created_at.into(),
             status: UserStatus::from_code(w.status)?,
             username: w.username.to_string(),
+            options: resource_options_from_wire(&w.options, true)?,
         })
     }
 }
@@ -215,6 +230,7 @@ impl TryFrom<UserDetailsResponse> for UserInfoDetails {
             status: user.status,
             username: user.username,
             permissions,
+            options: user.options,
         })
     }
 }
@@ -797,6 +813,127 @@ pub(crate) fn user_headers_from_validated_slice(
         );
     }
     Ok(headers)
+}
+
+// -- Options conversions --
+
+/// Decode a `DescribeOptions` response into domain option specs.
+///
+/// # Errors
+///
+/// Returns `IggyError::InvalidHeaderKind` when an entry carries an unknown
+/// canonical kind code.
+pub fn option_specs_from_wire(
+    wire: iggy_binary_protocol::responses::system::DescribeOptionsResponse,
+) -> Result<Vec<OptionSpec>, IggyError> {
+    wire.entries
+        .into_iter()
+        .map(|entry| {
+            Ok(OptionSpec {
+                key: entry.key.to_string(),
+                kind: HeaderKind::from_code(entry.kind)?,
+                default_value: entry.default_value.to_vec(),
+                description: entry.description,
+            })
+        })
+        .collect()
+}
+
+/// Decode a [`WireOptions`] block into domain resource options.
+///
+/// Every decoded entry is marked with the given `explicit` flag; the wire
+/// block carries no per-entry provenance. Admission calls this once for the
+/// client block (`explicit == true`) and fills defaults separately.
+///
+/// # Errors
+///
+/// Returns `IggyError::InvalidHeaderKey` / `InvalidHeaderValue` when a kind
+/// code has no domain meaning or a fixed-size kind carries a mismatched
+/// payload. The wire layer accepts unknown kinds for forwarding; interpreting
+/// them into the domain requires known semantics.
+pub fn resource_options_from_wire(
+    wire: &iggy_binary_protocol::WireOptions,
+    explicit: bool,
+) -> Result<ResourceOptions, IggyError> {
+    let headers = user_headers_from_validated_slice(wire.as_bytes())?;
+    Ok(headers
+        .into_iter()
+        .map(|(key, value)| (key, OptionValue { value, explicit }))
+        .collect())
+}
+
+/// Merge response-side `(explicit, derived)` wire blocks back into domain
+/// resource options, restoring per-key provenance. Explicit wins on a key
+/// collision (which a well-formed response never produces).
+///
+/// # Errors
+///
+/// Same contract as [`resource_options_from_wire`].
+pub fn resource_options_from_wire_split(
+    explicit: &iggy_binary_protocol::WireOptions,
+    derived: &iggy_binary_protocol::WireOptions,
+) -> Result<ResourceOptions, IggyError> {
+    let mut options = resource_options_from_wire(derived, false)?;
+    options.extend(resource_options_from_wire(explicit, true)?);
+    Ok(options)
+}
+
+/// Split domain resource options into `(explicit, derived)` wire blocks,
+/// the response-side layout that preserves per-key provenance.
+#[must_use]
+pub fn resource_options_to_wire_split(
+    options: &ResourceOptions,
+) -> (
+    iggy_binary_protocol::WireOptions,
+    iggy_binary_protocol::WireOptions,
+) {
+    let derived: ResourceOptions = options
+        .iter()
+        .filter(|(_, option)| !option.explicit)
+        .map(|(key, option)| (key.clone(), option.clone()))
+        .collect();
+    (
+        resource_options_to_wire(options, true),
+        resource_options_to_wire(&derived, false),
+    )
+}
+
+/// Encode domain resource options into a [`WireOptions`] block.
+///
+/// With `explicit_only`, derived entries are skipped, which is what lets a
+/// client round-trip a create exactly without pinning server defaults.
+pub fn resource_options_to_wire(
+    options: &ResourceOptions,
+    explicit_only: bool,
+) -> iggy_binary_protocol::WireOptions {
+    use bytes::{BufMut, BytesMut};
+    use iggy_binary_protocol::WireOptions;
+
+    let entries: Vec<(&HeaderKey, &OptionValue)> = options
+        .iter()
+        .filter(|(_, option)| option.explicit || !explicit_only)
+        .collect();
+    if entries.is_empty() {
+        return WireOptions::empty();
+    }
+    let size: usize = entries
+        .iter()
+        .map(|(key, option)| 1 + 4 + key.as_bytes().len() + 1 + 4 + option.value.as_bytes().len())
+        .sum();
+    let mut buf = BytesMut::with_capacity(size);
+    for (key, option) in entries {
+        buf.put_u8(key.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(key.as_bytes().len() as u32);
+        buf.put_slice(key.as_bytes());
+        buf.put_u8(option.value.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(option.value.as_bytes().len() as u32);
+        buf.put_slice(option.value.as_bytes());
+    }
+    // Encoded from valid HeaderKey entries in BTreeMap order: structurally
+    // valid TLV, string keys, sorted, no duplicates.
+    WireOptions::from_validated(buf.freeze())
 }
 
 #[cfg(test)]

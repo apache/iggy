@@ -24,8 +24,8 @@ use iggy::prelude::Client;
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::IggyMessage;
-use iggy::prelude::MaxTopicSize;
 use iggy::prelude::Partitioning;
+use iggy::prelude::TopicCreateOptions;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_common::Stats;
 use predicates::str::{contains, starts_with};
@@ -74,11 +74,11 @@ impl IggyCmdTestCase for TestStatsCmd {
             .create_topic(
                 &stream_id,
                 "topic",
-                5,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(5),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());
@@ -184,11 +184,11 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
             .create_topic(
                 &self.stream_id.try_into().unwrap(),
                 "topic",
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

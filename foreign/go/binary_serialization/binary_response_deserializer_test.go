@@ -89,8 +89,9 @@ func TestDeserializeFetchMessages_EmptyPayload(t *testing.T) {
 }
 
 func encodeStream(id uint32, createdAt uint64, topicsCount uint32, sizeBytes, messagesCount uint64, name string) []byte {
+	// Trailing 4 zero bytes: the u32 length prefix of an empty options block.
 	nameBytes := []byte(name)
-	buf := make([]byte, streamFixedSize+len(nameBytes))
+	buf := make([]byte, streamFixedSize+len(nameBytes)+4)
 	binary.LittleEndian.PutUint32(buf[0:4], id)
 	binary.LittleEndian.PutUint64(buf[4:12], createdAt)
 	binary.LittleEndian.PutUint32(buf[12:16], topicsCount)
@@ -150,6 +151,41 @@ func TestDeserializeToStream_TruncatedName(t *testing.T) {
 	_, _, err := DeserializeToStream(buf, 0)
 	if err == nil {
 		t.Fatal("expected error for truncated name, got nil")
+	}
+}
+
+func TestDeserializeToStream_TruncatedOptions(t *testing.T) {
+	full := encodeStream(1, 100, 0, 0, 0, "s")
+	for cut := 1; cut <= 4; cut++ {
+		_, _, err := DeserializeToStream(full[:len(full)-cut], 0)
+		if err == nil {
+			t.Fatalf("expected error for options prefix cut by %d bytes, got nil", cut)
+		}
+	}
+}
+
+func TestDeserializeToStream_WithOptions(t *testing.T) {
+	options := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("future_key")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("value")},
+	}})
+	payload := encodeStream(7, 500, 0, 0, 0, "with-options")
+	binary.LittleEndian.PutUint32(payload[len(payload)-4:], uint32(len(options)))
+	payload = append(payload, options...)
+
+	stream, readBytes, err := DeserializeToStream(payload, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readBytes != len(payload) {
+		t.Fatalf("readBytes = %d, want %d", readBytes, len(payload))
+	}
+	value, ok := stream.Options["future_key"]
+	if !ok {
+		t.Fatalf("Options = %v, want key %q", stream.Options, "future_key")
+	}
+	if value.Kind != iggcon.String || string(value.Value) != "value" {
+		t.Errorf("Options[future_key] = %+v, want String %q", value, "value")
 	}
 }
 

@@ -400,6 +400,10 @@ pub enum IggyError {
     InvalidBatchChecksum(u64, u64, u64) = 4039,
     #[error("Invalid header kind code: {0}")]
     InvalidHeaderKind(u8) = 4040,
+    #[error("Unsupported option key: {0}")]
+    UnsupportedOptionKey(String) = 4041,
+    #[error("Invalid option value for key: {0}")]
+    InvalidOptionValue(String) = 4042,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]

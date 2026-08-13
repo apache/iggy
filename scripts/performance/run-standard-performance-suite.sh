@@ -68,8 +68,11 @@ get_env_vars() {
 
     # Specific env vars based on bench type
     case "$bench_type" in
+    # fsync is a topic creation option (`enforce_fsync`) now, not server config,
+    # and iggy-bench exposes no flag for it, so this variant currently differs
+    # from plain no_cache only by name.
     *"no_cache_fsync"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC=true")
+        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
         ;;
     *"only_cache"*)
         env_vars+=("IGGY_SYSTEM_CACHE_SIZE=9GB")

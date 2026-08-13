@@ -113,6 +113,7 @@ impl ClientExt for HttpClient {
             max_topic_size: MaxTopicSize::ServerDefault,
             replication_factor: None,
             name: topic.to_string(),
+            options: Default::default(),
         };
         let response = self
             .post_json(

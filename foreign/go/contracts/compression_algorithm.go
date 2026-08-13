@@ -23,3 +23,12 @@ const (
 	CompressionAlgorithmNone CompressionAlgorithm = 1
 	CompressionAlgorithmGzip CompressionAlgorithm = 2
 )
+
+func (c CompressionAlgorithm) String() string {
+	switch c {
+	case CompressionAlgorithmGzip:
+		return "gzip"
+	default:
+		return "none"
+	}
+}

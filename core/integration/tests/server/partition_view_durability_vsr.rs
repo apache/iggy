@@ -77,11 +77,11 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic with one partition");

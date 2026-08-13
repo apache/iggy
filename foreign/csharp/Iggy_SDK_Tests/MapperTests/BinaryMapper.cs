@@ -146,7 +146,9 @@ public sealed class BinaryMapper
     public void MapStream_ReturnsValidStreamResponse()
     {
         // Arrange
-        var (id, topicsCount, sizeBytes, messagesCount, name, createdAt) = StreamFactory.CreateStreamsResponseFields();
+        var (id, _, sizeBytes, messagesCount, name, createdAt) = StreamFactory.CreateStreamsResponseFields();
+        // Topics are decoded count-driven, so the header count must match the appended topics.
+        var topicsCount = 1;
         var streamPayload
             = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
         var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1,
@@ -159,7 +161,6 @@ public sealed class BinaryMapper
             topicSizeBytes1,
             messagesCountTopic1,
             createdAt,
-            replicationFactor,
             maxTopicSize,
             1);
 
@@ -199,16 +200,18 @@ public sealed class BinaryMapper
                 replicationFactor1, maxTopicSize1) =
             TopicFactory.CreateTopicResponseFields();
         var payload1 = BinaryFactory.CreateTopicPayload(id1, partitionsCount1, messageExpiry1, name1,
-            sizeBytesTopic1, messagesCountTopic1, createdAt, replicationFactor1, maxTopicSize1, 1);
+            sizeBytesTopic1, messagesCountTopic1, createdAt, maxTopicSize1, 1);
         var (id2, partitionsCount2, name2, messageExpiry2, sizeBytesTopic2, messagesCountTopic2, createdAt2,
                 replicationFactor2, maxTopicSize2) =
             TopicFactory.CreateTopicResponseFields();
         var payload2 = BinaryFactory.CreateTopicPayload(id2, partitionsCount2, messageExpiry2, name2,
-            sizeBytesTopic2, messagesCountTopic2, createdAt2, replicationFactor2, maxTopicSize2, 2);
+            sizeBytesTopic2, messagesCountTopic2, createdAt2, maxTopicSize2, 2);
 
-        var combinedPayload = new byte[payload1.Length + payload2.Length];
-        payload1.CopyTo(combinedPayload.AsSpan());
-        payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
+        // GetTopics replies start with the topics count.
+        var combinedPayload = new byte[4 + payload1.Length + payload2.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(combinedPayload.AsSpan(0, 4), 2);
+        payload1.CopyTo(combinedPayload.AsSpan(4));
+        payload2.CopyTo(combinedPayload.AsSpan(4 + payload1.Length));
 
         // Act
         IReadOnlyList<TopicResponse> responses = Mappers.BinaryMapper.MapTopics(combinedPayload);
@@ -241,7 +244,7 @@ public sealed class BinaryMapper
         var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2, replicationFactor
             , maxTopicSize) = TopicFactory.CreateTopicResponseFields();
         var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
-            sizeBytes, messagesCount, createdAt2, replicationFactor, maxTopicSize, 1);
+            sizeBytes, messagesCount, createdAt2, maxTopicSize, 1);
 
         var combinedPayload = new byte[topicPayload.Length];
         topicPayload.CopyTo(combinedPayload.AsSpan());

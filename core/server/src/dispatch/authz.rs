@@ -29,9 +29,9 @@ use std::rc::Rc;
 
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -254,6 +254,9 @@ where
         // Self-scoped: lists only the caller's own tokens, so there is no
         // permissioner rule to run (legacy runs none either).
         GET_PERSONAL_ACCESS_TOKENS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
+        // Static catalog plus node defaults; nothing resource-scoped to gate
+        // beyond authentication.
+        DESCRIBE_OPTIONS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
         GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,

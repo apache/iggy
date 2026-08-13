@@ -350,7 +350,14 @@ impl ServerHandle {
             self.set_tls_envs("WEBSOCKET", &tls);
         }
 
-        // Extra envs from config (includes resolved config paths from macro)
+        // Extra envs from config (includes resolved config paths from macro).
+        // Validated first: a name no config leaf reads is a silent no-op, and
+        // a test that believes it configured the server but did not is worse
+        // than one that fails to start.
+        if let Err(report) = crate::harness::config::validate_env_var_names(&self.config.extra_envs)
+        {
+            panic!("invalid extra_envs for the test server:\n{report}");
+        }
         for (k, v) in &self.config.extra_envs {
             self.envs.insert(k.clone(), v.clone());
         }

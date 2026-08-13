@@ -140,11 +140,14 @@ pub trait Benchmarkable: Send {
                 .create_topic(
                     &stream_id,
                     &topic_name,
-                    partitions_count,
-                    CompressionAlgorithm::default(),
-                    None,
-                    message_expiry,
-                    max_topic_size,
+                    &TopicCreateOptions {
+                        partitions_count: Some(partitions_count),
+                        message_expiry: (message_expiry != IggyExpiry::ServerDefault)
+                            .then_some(message_expiry),
+                        max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
+                            .then_some(max_topic_size),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await?;
         }

@@ -134,7 +134,7 @@ namespace Iggy {
          * @param int|null $max_topic_size
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $replication_factor = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $replication_factor = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?bool $enforce_fsync = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
 
         /**
          * Deletes a stream by id or name.

@@ -21,7 +21,8 @@ use async_trait::async_trait;
 use core::fmt;
 use iggy_common::Client;
 use iggy_common::create_topic::CreateTopic;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicCreateOptions};
+use std::collections::BTreeMap;
 use tracing::{Level, event};
 
 pub struct CreateTopicCmd {
@@ -29,6 +30,7 @@ pub struct CreateTopicCmd {
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
     replication_factor: u8,
+    raw_options: BTreeMap<String, String>,
 }
 
 impl CreateTopicCmd {
@@ -41,6 +43,7 @@ impl CreateTopicCmd {
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
+        raw_options: BTreeMap<String, String>,
     ) -> Self {
         Self {
             create_topic: CreateTopic {
@@ -51,10 +54,12 @@ impl CreateTopicCmd {
                 message_expiry,
                 max_topic_size,
                 replication_factor: Some(replication_factor),
+                options: raw_options.clone(),
             },
             message_expiry,
             max_topic_size,
             replication_factor,
+            raw_options,
         }
     }
 }
@@ -70,11 +75,19 @@ impl CliCommand for CreateTopicCmd {
             .create_topic(
                 &self.create_topic.stream_id,
                 &self.create_topic.name,
-                self.create_topic.partitions_count,
-                self.create_topic.compression_algorithm,
-                self.create_topic.replication_factor,
-                self.create_topic.message_expiry,
-                self.create_topic.max_topic_size,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.create_topic.partitions_count),
+                    compression_algorithm: (self.create_topic.compression_algorithm
+                        != CompressionAlgorithm::default())
+                    .then_some(self.create_topic.compression_algorithm),
+                    message_expiry: (self.create_topic.message_expiry != IggyExpiry::ServerDefault)
+                        .then_some(self.create_topic.message_expiry),
+                    max_topic_size: (self.create_topic.max_topic_size
+                        != MaxTopicSize::ServerDefault)
+                        .then_some(self.create_topic.max_topic_size),
+                    raw: self.raw_options.clone(),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .with_context(|| {

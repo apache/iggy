@@ -300,6 +300,13 @@ Options:
 {CLAP_INDENT}
           [default: 1]
 
+      --set <KEY=VALUE>
+          Additional topic option as key=value, repeatable
+{CLAP_INDENT}
+          Values are sent as strings and parsed by the server with the same rules
+          as its config file (e.g. --set segment_size=128MiB). The server rejects
+          keys it does not support; discover them with the options catalog.
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -331,6 +338,7 @@ Options:
   -t, --topic-id <TOPIC_ID>                      Topic ID to create
   -m, --max-topic-size <MAX_TOPIC_SIZE>          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
   -r, --replication-factor <REPLICATION_FACTOR>  Replication factor for the topic [default: 1]
+      --set <KEY=VALUE>                          Additional topic option as key=value, repeatable
   -h, --help                                     Print help (see more with '--help')
 "#,
             ),

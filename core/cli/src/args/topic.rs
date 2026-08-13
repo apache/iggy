@@ -125,6 +125,24 @@ pub(crate) struct TopicCreateArgs {
     /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
+    /// Additional topic option as key=value, repeatable
+    ///
+    /// Values are sent as strings and parsed by the server with the same rules
+    /// as its config file (e.g. --set segment_size=128MiB). The server rejects
+    /// keys it does not support; discover them with the options catalog.
+    #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value, verbatim_doc_comment)]
+    pub(crate) set: Vec<(String, String)>,
+}
+
+/// Parse one `--set key=value` occurrence.
+fn parse_key_value(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got: {raw}"))?;
+    if key.is_empty() || value.is_empty() {
+        return Err(format!("expected non-empty KEY=VALUE, got: {raw}"));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 #[derive(Debug, Clone, Args)]

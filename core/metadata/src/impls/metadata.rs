@@ -46,10 +46,12 @@ use iggy_binary_protocol::{
     Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireName,
 };
-use iggy_common::IggyError;
-use iggy_common::UserId;
 use iggy_common::calculate_checksum;
 use iggy_common::variadic;
+use iggy_common::{
+    IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, TopicCreateOptions, TopicRuntimeDefaults,
+    UserId, topic_option_keys, validate_topic_segment_size,
+};
 use journal::local_gate::LocalGate;
 use journal::superblock::{
     PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
@@ -743,6 +745,22 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
     /// Defaults to never-expire, matching the shipped server config.
     default_message_expiry: Cell<u64>,
+    /// Resolved byte value an absent `segment_size` option takes at
+    /// admission. Same resolution discipline as the two defaults above; set
+    /// from `system.segment.size` at bootstrap
+    /// ([`Self::set_default_segment_size`]). Defaults to 1 GiB, matching the
+    /// shipped server config.
+    default_segment_size: Cell<u64>,
+    /// Ceiling for an explicit per-topic `segment_size`
+    /// ([`Self::set_max_topic_segment_size`]). Defaults to 1 GiB.
+    max_topic_segment_size: Cell<u64>,
+    /// Configured fallbacks for the remaining per-topic runtime knobs,
+    /// resolved into the derived-options block at admission exactly like the
+    /// sizes above. Seeded from `[system.partition]` at bootstrap.
+    default_enforce_fsync: Cell<bool>,
+    default_messages_required_to_save: Cell<u32>,
+    default_size_of_messages_required_to_save: Cell<u64>,
+    default_preallocate_segments: Cell<bool>,
     /// Client-table mutations at or below this op are already reflected in a
     /// state-transferred table, so the tail-repair commit walk must skip
     /// them (re-running `commit_register` would double-bump epochs). `0`
@@ -792,6 +810,12 @@ where
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
             default_message_expiry: Cell::new(u64::MAX),
+            default_segment_size: Cell::new(1024 * 1024 * 1024),
+            max_topic_segment_size: Cell::new(1024 * 1024 * 1024),
+            default_enforce_fsync: Cell::new(false),
+            default_messages_required_to_save: Cell::new(1000),
+            default_size_of_messages_required_to_save: Cell::new(1024 * 1024),
+            default_preallocate_segments: Cell::new(true),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
         }
@@ -919,6 +943,70 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// shard 0's copy feeds admission.
     pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
         self.default_message_expiry.set(message_expiry_micros);
+    }
+
+    /// Micros value an absent `message_expiry` option resolves to on this
+    /// node. Read by the options catalog (`DescribeOptions`).
+    #[must_use]
+    pub const fn default_message_expiry(&self) -> u64 {
+        self.default_message_expiry.get()
+    }
+
+    /// Install the resolved byte value an absent `segment_size` option
+    /// resolves to at admission. The server bootstrap calls this with
+    /// `system.segment.size`; only shard 0's copy feeds admission.
+    pub fn set_default_segment_size(&self, segment_size_bytes: u64) {
+        self.default_segment_size.set(segment_size_bytes);
+    }
+
+    /// Byte value an absent `segment_size` option resolves to on this node.
+    /// Read by admission and the options catalog (`DescribeOptions`).
+    #[must_use]
+    pub const fn default_segment_size(&self) -> u64 {
+        self.default_segment_size.get()
+    }
+
+    /// Install the largest per-topic `segment_size` this node admits: the
+    /// smaller of the global segment maximum and the state-transfer artifact
+    /// budget minus one bus frame. Seeded at bootstrap.
+    pub fn set_max_topic_segment_size(&self, ceiling_bytes: u64) {
+        self.max_topic_segment_size.set(ceiling_bytes);
+    }
+
+    /// Largest per-topic `segment_size` this node admits.
+    #[must_use]
+    pub const fn max_topic_segment_size(&self) -> u64 {
+        self.max_topic_segment_size.get()
+    }
+
+    /// Install this node's `[system.partition]` fallbacks for the remaining
+    /// per-topic runtime knobs. Seeded at bootstrap on every shard;
+    /// only shard 0's copy feeds admission.
+    pub fn set_partition_runtime_defaults(
+        &self,
+        enforce_fsync: bool,
+        messages_required_to_save: u32,
+        size_of_messages_required_to_save: u64,
+        preallocate_segments: bool,
+    ) {
+        self.default_enforce_fsync.set(enforce_fsync);
+        self.default_messages_required_to_save
+            .set(messages_required_to_save);
+        self.default_size_of_messages_required_to_save
+            .set(size_of_messages_required_to_save);
+        self.default_preallocate_segments.set(preallocate_segments);
+    }
+
+    /// This node's configured fallbacks for the per-topic runtime knobs.
+    /// Read by admission and the options catalog (`DescribeOptions`).
+    #[must_use]
+    pub const fn partition_runtime_defaults(&self) -> (bool, u32, u64, bool) {
+        (
+            self.default_enforce_fsync.get(),
+            self.default_messages_required_to_save.get(),
+            self.default_size_of_messages_required_to_save.get(),
+            self.default_preallocate_segments.get(),
+        )
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -3282,17 +3370,61 @@ where
 
         match header.operation {
             Operation::CreateTopic => {
-                let mut request = WireCreateTopicRequest::decode_from(body)
+                let request = WireCreateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                // Resolve the `ServerDefault` sentinel (0) against server config
-                // here, at primary admission, so the replicated payload carries a
-                // concrete size and every replica commits the same value.
-                if request.max_topic_size == 0 {
-                    request.max_topic_size = self.default_max_topic_size.get();
+                // Resolve every absent catalog key against server config here,
+                // at primary admission, so the replicated payload carries
+                // concrete values and every replica commits the same state
+                // regardless of local config. The client's explicit block is
+                // forwarded verbatim; resolved defaults ride a separate
+                // derived block, preserving per-key provenance for `GetTopic`.
+                let explicit = TopicCreateOptions::parse(&request.options)?;
+                let resolved_segment_size = explicit
+                    .segment_size
+                    .unwrap_or_else(|| IggyByteSize::from(self.default_segment_size.get()));
+                let resolved_max_topic_size = explicit
+                    .max_topic_size
+                    .unwrap_or_else(|| MaxTopicSize::from(self.default_max_topic_size.get()));
+                // Backstop for the transport-side typed checks: an explicit
+                // segment size outside its bounds, or a topic cap below one
+                // segment, must never enter the WAL.
+                if let Some(segment_size) = explicit.segment_size {
+                    validate_topic_segment_size(
+                        segment_size.as_bytes_u64(),
+                        self.max_topic_segment_size.get(),
+                    )?;
                 }
-                if request.message_expiry == 0 {
-                    request.message_expiry = self.default_message_expiry.get();
+                if resolved_max_topic_size.as_bytes_u64() < resolved_segment_size.as_bytes_u64() {
+                    return Err(IggyError::InvalidOptionValue(
+                        topic_option_keys::MAX_TOPIC_SIZE.to_string(),
+                    ));
                 }
+                let derived_options = explicit.derived_block(
+                    explicit.compression_algorithm.unwrap_or_default(),
+                    explicit
+                        .message_expiry
+                        .unwrap_or_else(|| IggyExpiry::from(self.default_message_expiry.get())),
+                    resolved_max_topic_size,
+                    TopicRuntimeDefaults {
+                        segment_size: resolved_segment_size,
+                        enforce_fsync: explicit
+                            .enforce_fsync
+                            .unwrap_or_else(|| self.default_enforce_fsync.get()),
+                        messages_required_to_save: explicit
+                            .messages_required_to_save
+                            .unwrap_or_else(|| self.default_messages_required_to_save.get()),
+                        size_of_messages_required_to_save: explicit
+                            .size_of_messages_required_to_save
+                            .unwrap_or_else(|| {
+                                IggyByteSize::from(
+                                    self.default_size_of_messages_required_to_save.get(),
+                                )
+                            }),
+                        preallocate_segments: explicit
+                            .preallocate_segments
+                            .unwrap_or_else(|| self.default_preallocate_segments.get()),
+                    },
+                );
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -3308,6 +3440,7 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let body = PersistedCreateTopicRequest {
                     request,
+                    derived_options,
                     partitions,
                 }
                 .to_bytes();
@@ -3919,6 +4052,7 @@ mod tests {
     use crate::stm::stream::Streams;
     use crate::stm::user::Users;
     use consensus::LocalPipeline;
+    use iggy_binary_protocol::WireOptions;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_common::variadic;
     use journal::prepare_journal::PrepareJournal;
@@ -4289,11 +4423,8 @@ mod tests {
         let body = CreateTopicRequest {
             stream_id: WireIdentifier::numeric(1),
             partitions_count: 1,
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new("t").unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();
@@ -4354,10 +4485,10 @@ mod tests {
 
     #[test]
     fn prepare_request_stamps_create_topic_message_expiry_default() {
-        // A `CreateTopic` carrying the `ServerDefault` sentinel (0) must be
-        // rewritten at primary admission to the configured default, so the
-        // replicated prepare -- and thus every replica's commit -- holds a
-        // concrete expiry. Mirrors the `max_topic_size` sentinel resolution.
+        // A `CreateTopic` without an explicit `message_expiry` option must be
+        // resolved at primary admission to the configured default, riding the
+        // derived block, so the replicated prepare -- and thus every
+        // replica's commit -- holds a concrete expiry.
         const CLIENT: u128 = 1;
         const SESSION: u64 = 10;
         const ACTING_USER: u32 = 7;
@@ -4370,16 +4501,28 @@ mod tests {
             register_reply(CLIENT, SESSION),
         );
 
-        // `create_topic_request` builds the body with `message_expiry == 0`.
+        // `create_topic_request` builds the body with no options at all.
         let prepare = plane
             .prepare_request(create_topic_request(CLIENT, ACTING_USER))
             .expect("CreateTopic is client-allowed");
         let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
         let persisted = PersistedCreateTopicRequest::decode_from(body)
             .expect("create topic with assignments prepare must decode");
+        assert!(
+            persisted.request.options.is_empty(),
+            "the client's explicit block is forwarded verbatim"
+        );
+        let derived = iggy_common::TopicCreateOptions::parse(&persisted.derived_options)
+            .expect("derived block parses against the catalog");
         assert_eq!(
-            persisted.request.message_expiry, CONFIGURED_EXPIRY_MICROS,
-            "ServerDefault expiry must be stamped to the configured default at admission"
+            derived.message_expiry,
+            Some(iggy_common::IggyExpiry::from(CONFIGURED_EXPIRY_MICROS)),
+            "ServerDefault expiry must be resolved into the derived block at admission"
+        );
+        assert_eq!(
+            persisted.partitions.len(),
+            1,
+            "absent partitions_count defaults to one partition"
         );
     }
 
@@ -4561,6 +4704,7 @@ mod tests {
     ) -> Message<RoutedRequestHeader> {
         let body = iggy_binary_protocol::requests::streams::CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();

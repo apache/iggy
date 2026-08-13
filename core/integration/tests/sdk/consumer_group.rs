@@ -53,11 +53,11 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

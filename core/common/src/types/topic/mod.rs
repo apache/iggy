@@ -17,6 +17,7 @@
 
 use crate::CompressionAlgorithm;
 use crate::Partition;
+use crate::ResourceOptions;
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::expiry::IggyExpiry;
 use crate::utils::timestamp::IggyTimestamp;
@@ -57,6 +58,10 @@ pub struct Topic {
     pub messages_count: u64,
     /// The total number of partitions in the topic.
     pub partitions_count: u32,
+    /// Creation options: client-explicit keys plus admission-derived
+    /// defaults, distinguished by each entry's `explicit` flag.
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }
 
 /// `TopicDetails` represents the detailed information about the topic.
@@ -96,4 +101,8 @@ pub struct TopicDetails {
     pub partitions_count: u32,
     /// The collection of partitions in the topic.
     pub partitions: Vec<Partition>,
+    /// Creation options: client-explicit keys plus admission-derived
+    /// defaults, distinguished by each entry's `explicit` flag.
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }

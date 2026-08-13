@@ -23,6 +23,12 @@ import (
 	"github.com/apache/iggy/foreign/go/contracts"
 )
 
+const (
+	topicOptionCompressionAlgorithm = "compression_algorithm"
+	topicOptionMessageExpiry        = "message_expiry"
+	topicOptionMaxTopicSize         = "max_topic_size"
+)
+
 type CreateTopic struct {
 	StreamId             iggcon.Identifier           `json:"streamId"`
 	PartitionsCount      uint32                      `json:"partitionsCount"`
@@ -30,7 +36,9 @@ type CreateTopic struct {
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
 	Name                 string                      `json:"name"`
-	ReplicationFactor    *uint8                      `json:"replicationFactor"`
+	// ReplicationFactor is no longer part of the wire protocol; it is kept
+	// for API compatibility and ignored during serialization.
+	ReplicationFactor *uint8 `json:"replicationFactor"`
 }
 
 func (t *CreateTopic) Code() Code {
@@ -38,58 +46,55 @@ func (t *CreateTopic) Code() Code {
 }
 
 func (t *CreateTopic) MarshalBinary() ([]byte, error) {
-	if t.ReplicationFactor == nil {
-		t.ReplicationFactor = new(uint8)
-	}
-
 	streamIdBytes, err := t.StreamId.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
 	nameBytes := []byte(t.Name)
+	optionsBytes := iggcon.GetHeadersBytes(t.options())
 
-	totalLength := len(streamIdBytes) + // StreamId
-		4 + // PartitionsCount
-		1 + // CompressionAlgorithm
-		8 + // MessageExpiry
-		8 + // MaxTopicSize
-		1 + // ReplicationFactor
-		1 + // Name length
-		len(nameBytes) // Name
-	bytes := make([]byte, totalLength)
-
-	position := 0
-
-	// StreamId
-	copy(bytes[position:], streamIdBytes)
-	position += len(streamIdBytes)
-
-	// PartitionsCount
-	binary.LittleEndian.PutUint32(bytes[position:], t.PartitionsCount)
-	position += 4
-
-	// CompressionAlgorithm
-	bytes[position] = byte(t.CompressionAlgorithm)
-	position++
-
-	// MessageExpiry
-	binary.LittleEndian.PutUint64(bytes[position:], uint64(t.MessageExpiry))
-	position += 8
-
-	// MaxTopicSize
-	binary.LittleEndian.PutUint64(bytes[position:], t.MaxTopicSize)
-	position += 8
-
-	// ReplicationFactor
-	bytes[position] = *t.ReplicationFactor
-	position++
-
-	// Name
-	bytes[position] = byte(len(nameBytes))
-	position++
-	copy(bytes[position:], nameBytes)
+	bytes := make([]byte, 0, len(streamIdBytes)+4+1+len(nameBytes)+len(optionsBytes))
+	bytes = append(bytes, streamIdBytes...)
+	bytes = binary.LittleEndian.AppendUint32(bytes, t.PartitionsCount)
+	bytes = append(bytes, byte(len(nameBytes)))
+	bytes = append(bytes, nameBytes...)
+	bytes = append(bytes, optionsBytes...)
 
 	return bytes, nil
+}
+
+// options builds the trailing options block. partitions_count is not an
+// option: it fills the command's own fixed field. Keys carrying the
+// server-default sentinel (expiry 0, size 0, compression none) are omitted so
+// the server derives them and returns them as derived entries.
+func (t *CreateTopic) options() []iggcon.HeaderEntry {
+	var options []iggcon.HeaderEntry
+	if name := t.CompressionAlgorithm.String(); name != "none" {
+		options = append(options, stringOption(topicOptionCompressionAlgorithm, name))
+	}
+	if t.MessageExpiry != 0 {
+		options = append(options, uint64Option(topicOptionMessageExpiry, uint64(t.MessageExpiry)))
+	}
+	if t.MaxTopicSize != 0 {
+		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
+	}
+	return options
+}
+
+func uint64Option(key string, value uint64) iggcon.HeaderEntry {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, value)
+	return iggcon.HeaderEntry{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: buf},
+	}
+}
+
+func stringOption(key string, value string) iggcon.HeaderEntry {
+	return iggcon.HeaderEntry{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+	}
 }
 
 type GetTopic struct {

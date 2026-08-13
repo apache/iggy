@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{IggyByteSize, IggyTimestamp, Topic};
+use crate::{IggyByteSize, IggyTimestamp, ResourceOptions, Topic};
 use serde::{Deserialize, Serialize};
 
 /// `Stream` represents the highest level of logical separation of data.
@@ -40,6 +40,9 @@ pub struct Stream {
     pub messages_count: u64,
     /// The total number of topics in the stream.
     pub topics_count: u32,
+    /// Creation options, all client-explicit (streams have no derived keys).
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }
 
 /// `StreamDetails` represents the detailed information about the stream.
@@ -67,4 +70,7 @@ pub struct StreamDetails {
     pub topics_count: u32,
     /// The collection of topics in the stream.
     pub topics: Vec<Topic>,
+    /// Creation options, all client-explicit (streams have no derived keys).
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }

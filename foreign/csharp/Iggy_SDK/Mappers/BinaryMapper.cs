@@ -112,7 +112,8 @@ internal static class BinaryMapper
                 Id = response.Id,
                 CreatedAt = response.CreatedAt,
                 Username = response.Username,
-                Status = response.Status
+                Status = response.Status,
+                Options = response.Options
             };
         }
 
@@ -122,7 +123,8 @@ internal static class BinaryMapper
             CreatedAt = response.CreatedAt,
             Username = response.Username,
             Status = response.Status,
-            Permissions = null
+            Permissions = null,
+            Options = response.Options
         };
     }
 
@@ -228,13 +230,16 @@ internal static class BinaryMapper
         var usernameLength = payload[position + 13];
         var username = Encoding.UTF8.GetString(payload[(position + 14)..(position + 14 + usernameLength)]);
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
+        var options = MapOptions(payload, position + readBytes, out var optionsReadBytes);
+        readBytes += optionsReadBytes;
 
         return (new UserResponse
         {
             Id = id,
             CreatedAt = createdAt,
             Status = userStatus,
-            Username = username
+            Username = username,
+            Options = options
         },
             readBytes);
     }
@@ -740,6 +745,45 @@ internal static class BinaryMapper
         return false;
     }
 
+    private static Dictionary<HeaderKey, HeaderValue> MapOptions(ReadOnlySpan<byte> payload, int position,
+        out int readBytes)
+    {
+        var optionsLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        readBytes = 4 + optionsLength;
+
+        var options = new Dictionary<HeaderKey, HeaderValue>();
+        var cursor = position + 4;
+        var end = position + 4 + optionsLength;
+        while (cursor < end)
+        {
+            var keyKind = MapHeaderKind(payload[cursor]);
+            cursor += 1;
+            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[cursor..(cursor + 4)]);
+            cursor += 4;
+            var key = payload[cursor..(cursor + keyLength)].ToArray();
+            cursor += keyLength;
+
+            var valueKind = MapHeaderKind(payload[cursor]);
+            cursor += 1;
+            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[cursor..(cursor + 4)]);
+            cursor += 4;
+            var value = payload[cursor..(cursor + valueLength)].ToArray();
+            cursor += valueLength;
+
+            options[new HeaderKey
+            {
+                Kind = keyKind,
+                Value = key
+            }] = new HeaderValue
+            {
+                Kind = valueKind,
+                Value = value
+            };
+        }
+
+        return options;
+    }
+
     internal static IReadOnlyList<StreamResponse> MapStreams(ReadOnlySpan<byte> payload)
     {
         List<StreamResponse> streams = new();
@@ -800,10 +844,11 @@ internal static class BinaryMapper
     internal static StreamResponse MapStream(ReadOnlySpan<byte> payload)
     {
         var (stream, position) = MapToStream(payload, 0);
-        List<TopicResponse> topics = new();
-        var length = payload.Length;
 
-        while (position < length)
+        // Count-driven: topic elements carry variable-length options blocks,
+        // so "consume until the buffer ends" no longer delimits them.
+        List<TopicResponse> topics = new(stream.TopicsCount);
+        for (var i = 0; i < stream.TopicsCount; i++)
         {
             var (topic, readBytes) = MapToTopic(payload, position);
             topics.Add(topic);
@@ -818,7 +863,8 @@ internal static class BinaryMapper
             Topics = topics,
             CreatedAt = stream.CreatedAt,
             MessagesCount = stream.MessagesCount,
-            Size = stream.Size
+            Size = stream.Size,
+            Options = stream.Options
         };
     }
 
@@ -833,6 +879,8 @@ internal static class BinaryMapper
 
         var name = Encoding.UTF8.GetString(payload[(position + 33)..(position + 33 + nameLength)]);
         var readBytes = 4 + 4 + 8 + 8 + 8 + 1 + nameLength;
+        var options = MapOptions(payload, position + readBytes, out var optionsReadBytes);
+        readBytes += optionsReadBytes;
 
         return (
             new StreamResponse
@@ -842,17 +890,18 @@ internal static class BinaryMapper
                 Name = name,
                 Size = sizeBytes,
                 MessagesCount = messagesCount,
-                CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime
+                CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
+                Options = options
             }, readBytes);
     }
 
     internal static IReadOnlyList<TopicResponse> MapTopics(ReadOnlySpan<byte> payload)
     {
-        List<TopicResponse> topics = new();
-        var length = payload.Length;
-        var position = 0;
+        var topicsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
+        List<TopicResponse> topics = new((int)topicsCount);
+        var position = 4;
 
-        while (position < length)
+        for (var i = 0; i < topicsCount; i++)
         {
             var (topic, readBytes) = MapToTopic(payload, position);
             topics.Add(topic);
@@ -887,7 +936,9 @@ internal static class BinaryMapper
             Size = topic.Size,
             ReplicationFactor = topic.ReplicationFactor,
             MaxTopicSize = topic.MaxTopicSize,
-            Partitions = partitions
+            Partitions = partitions,
+            Options = topic.Options,
+            DerivedOptions = topic.DerivedOptions
         };
     }
 
@@ -899,12 +950,15 @@ internal static class BinaryMapper
         var messageExpiry = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var compressionAlgorithm = payload[position + 24];
         var maxTopicSize = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 25)..(position + 33)]);
-        var replicationFactor = payload[position + 33];
-        var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 34)..(position + 42)]);
-        var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 42)..(position + 50)]);
-        var nameLength = (int)payload[position + 50];
-        var name = Encoding.UTF8.GetString(payload[(position + 51)..(position + 51 + nameLength)]);
-        var readBytes = 4 + 8 + 4 + 8 + 1 + 8 + 1 + 8 + 8 + 1 + name.Length;
+        var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 33)..(position + 41)]);
+        var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 41)..(position + 49)]);
+        var nameLength = (int)payload[position + 49];
+        var name = Encoding.UTF8.GetString(payload[(position + 50)..(position + 50 + nameLength)]);
+        var readBytes = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + nameLength;
+        var options = MapOptions(payload, position + readBytes, out var optionsReadBytes);
+        readBytes += optionsReadBytes;
+        var derivedOptions = MapOptions(payload, position + readBytes, out var derivedOptionsReadBytes);
+        readBytes += derivedOptionsReadBytes;
 
         return (
             new TopicResponse
@@ -917,8 +971,11 @@ internal static class BinaryMapper
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
                 MessageExpiry = DurationHelpers.FromDuration(messageExpiry),
-                ReplicationFactor = replicationFactor,
-                MaxTopicSize = maxTopicSize
+                // Replication factor is gone from the wire protocol.
+                ReplicationFactor = 1,
+                MaxTopicSize = maxTopicSize,
+                Options = options,
+                DerivedOptions = derivedOptions
             }, readBytes);
     }
 

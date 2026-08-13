@@ -171,6 +171,10 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_CLIENT_CODE => client.get_client(1).await.map(|_| ()),
             GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
+            DESCRIBE_OPTIONS_CODE => client
+                .describe_options(OptionsScope::Topic)
+                .await
+                .map(|_| ()),
 
             // Users
             GET_USER_CODE => client.get_user(&ctx.user_id).await.map(|_| ()),
@@ -212,11 +216,11 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 .create_topic(
                     &ctx.stream_id,
                     "x",
-                    1,
-                    CompressionAlgorithm::None,
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
+                    &TopicCreateOptions {
+                        partitions_count: Some(1),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .map(|_| ()),
@@ -405,11 +409,11 @@ async fn setup_test_resources(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");

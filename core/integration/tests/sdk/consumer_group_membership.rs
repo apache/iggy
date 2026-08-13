@@ -67,11 +67,11 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -189,11 +189,11 @@ async fn given_join_and_leave_failures_when_sent_over_the_wire_should_return_leg
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

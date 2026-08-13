@@ -27,6 +27,7 @@ use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -466,9 +467,19 @@ impl IggyClient {
     ///     name: Topic name as `str`.
     ///     partitions_count: Number of partitions as `int`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
-    ///     replication_factor: Replication factor as `int | None`.
+    ///     replication_factor: Accepted and ignored; no longer part of the protocol.
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+    ///     segment_size: Per-topic segment size in bytes as `int | None`.
+    ///     enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+    ///     messages_required_to_save: Message-count flush threshold as `int | None`.
+    ///     size_of_messages_required_to_save: Byte flush threshold as `int | None`.
+    ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
+    ///     options: Additional option keys as `dict[str, str] | None`, sent
+    ///         verbatim so a newer server key can be set from this build.
+    ///
+    /// Every option left as `None` resolves against the server default at
+    /// admission.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is created.
@@ -477,7 +488,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -499,24 +510,45 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
             &MaxTopicSize,
         >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] segment_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enforce_fsync: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        messages_required_to_save: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        size_of_messages_required_to_save: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] preallocate_segments: Option<
+            bool,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
+        let _ = replication_factor;
         let (compression_algorithm, expiry, max_size) =
             resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
+
+        let topic_options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            // `None` is what tells admission to resolve the server default, so
+            // the sentinels the resolver returns must collapse back to it.
+            compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+                .then_some(compression_algorithm),
+            message_expiry: (expiry != RustIggyExpiry::ServerDefault).then_some(expiry),
+            max_topic_size: (max_size != RustMaxTopicSize::ServerDefault).then_some(max_size),
+            segment_size: segment_size.map(IggyByteSize::from),
+            enforce_fsync,
+            messages_required_to_save,
+            size_of_messages_required_to_save: size_of_messages_required_to_save
+                .map(IggyByteSize::from),
+            preallocate_segments,
+            raw: options.unwrap_or_default(),
+        };
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             inner
-                .create_topic(
-                    &stream,
-                    &name,
-                    partitions_count,
-                    compression_algorithm,
-                    replication_factor,
-                    expiry,
-                    max_size,
-                )
+                .create_topic(&stream, &name, &topic_options)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())

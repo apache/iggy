@@ -67,7 +67,7 @@ internal sealed class BinaryFactory
         ulong messagesCount, ulong createdAt)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
-        var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length;
+        var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length + 4;
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
@@ -76,15 +76,16 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), messagesCount);
         payload[32] = (byte)nameBytes.Length;
         nameBytes.CopyTo(payload.AsSpan(33));
+        // Empty length-prefixed options block.
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(33 + nameBytes.Length), 0);
         return payload;
     }
 
     internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, uint messageExpiry, string name,
-        ulong sizeBytes, ulong messagesCount, ulong createdAt, byte replicationFactor, ulong maxTopicSize,
-        int compressionType)
+        ulong sizeBytes, ulong messagesCount, ulong createdAt, ulong maxTopicSize, int compressionType)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
-        var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + 1 + name.Length;
+        var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + nameBytes.Length + 4 + 4;
 
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
@@ -93,11 +94,13 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), messageExpiry);
         payload[24] = (byte)compressionType;
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(25), maxTopicSize);
-        payload[33] = replicationFactor;
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(34), sizeBytes);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(42), messagesCount);
-        payload[50] = (byte)nameBytes.Length;
-        nameBytes.CopyTo(payload.AsSpan(51));
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(33), sizeBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(41), messagesCount);
+        payload[49] = (byte)nameBytes.Length;
+        nameBytes.CopyTo(payload.AsSpan(50));
+        // Empty length-prefixed explicit and derived options blocks.
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(50 + nameBytes.Length), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(54 + nameBytes.Length), 0);
         return payload;
     }
 

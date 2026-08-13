@@ -453,7 +453,10 @@ macro_rules! impl_fill_restore {
 mod tests {
     use super::*;
     use crate::stm::stream::{PartitionSnapshot, StatsSnapshot, StreamSnapshot, TopicSnapshot};
-    use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+    use crate::stm::user::UserSnapshot;
+    use iggy_common::{
+        CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, ResourceOptions,
+    };
 
     #[test]
     fn test_metadata_snapshot_roundtrip() {
@@ -511,7 +514,6 @@ mod tests {
                             id: 0,
                             name: "topic".to_string(),
                             created_at: ts,
-                            replication_factor: 1,
                             message_expiry: IggyExpiry::default(),
                             compression_algorithm: CompressionAlgorithm::default(),
                             max_topic_size: MaxTopicSize::default(),
@@ -533,8 +535,10 @@ mod tests {
                             // roundtrip assert below proves the field survives
                             // instead of matching a default.
                             next_consumer_group_id: 5,
+                            options: ResourceOptions::default(),
                         },
                     )],
+                    options: ResourceOptions::default(),
                 },
             )],
         });
@@ -564,38 +568,39 @@ mod tests {
         assert_eq!(topic.next_consumer_group_id, 5);
     }
 
+    fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {
+        use iggy_common::UserStatus;
+        UserSnapshot {
+            id,
+            username: username.to_string(),
+            password_hash: password_hash.to_string(),
+            status: UserStatus::Active,
+            created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            permissions: None,
+            options: ResourceOptions::default(),
+        }
+    }
+
+    fn stream_snapshot_fixture(id: usize, name: &str, stats: StatsSnapshot) -> StreamSnapshot {
+        StreamSnapshot {
+            id,
+            name: name.to_string(),
+            created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            stats,
+            topics: vec![],
+            options: ResourceOptions::default(),
+        }
+    }
+
     #[test]
     fn roundtrip_with_slab_gaps() {
         use crate::stm::stream::StreamsSnapshot;
-        use crate::stm::user::{PermissionerSnapshot, UserSnapshot, UsersSnapshot};
-        use iggy_common::UserStatus;
-
-        let ts = IggyTimestamp::from(1_694_968_446_131_680_u64);
+        use crate::stm::user::{PermissionerSnapshot, UsersSnapshot};
 
         let users_snap = UsersSnapshot {
             items: vec![
-                (
-                    0,
-                    UserSnapshot {
-                        id: 0,
-                        username: "alice".to_string(),
-                        password_hash: "hash_a".to_string(),
-                        status: UserStatus::Active,
-                        created_at: ts,
-                        permissions: None,
-                    },
-                ),
-                (
-                    2,
-                    UserSnapshot {
-                        id: 2,
-                        username: "charlie".to_string(),
-                        password_hash: "hash_c".to_string(),
-                        status: UserStatus::Active,
-                        created_at: ts,
-                        permissions: None,
-                    },
-                ),
+                (0, user_snapshot_fixture(0, "alice", "hash_a")),
+                (2, user_snapshot_fixture(2, "charlie", "hash_c")),
             ],
             personal_access_tokens: vec![],
             permissioner: PermissionerSnapshot {
@@ -613,31 +618,27 @@ mod tests {
             items: vec![
                 (
                     0,
-                    StreamSnapshot {
-                        id: 0,
-                        name: "stream-0".to_string(),
-                        created_at: ts,
-                        stats: StatsSnapshot {
+                    stream_snapshot_fixture(
+                        0,
+                        "stream-0",
+                        StatsSnapshot {
                             size_bytes: 100,
                             messages_count: 10,
                             segments_count: 1,
                         },
-                        topics: vec![],
-                    },
+                    ),
                 ),
                 (
                     3,
-                    StreamSnapshot {
-                        id: 3,
-                        name: "stream-3".to_string(),
-                        created_at: ts,
-                        stats: StatsSnapshot {
+                    stream_snapshot_fixture(
+                        3,
+                        "stream-3",
+                        StatsSnapshot {
                             size_bytes: 200,
                             messages_count: 20,
                             segments_count: 2,
                         },
-                        topics: vec![],
-                    },
+                    ),
                 ),
             ],
         };

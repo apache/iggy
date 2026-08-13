@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{Topic, TopicDetails};
+use iggy_common::{DEFAULT_PARTITIONS_COUNT, Topic, TopicCreateOptions, TopicDetails};
 
 #[async_trait]
 impl TopicClient for HttpClient {
@@ -65,11 +65,7 @@ impl TopicClient for HttpClient {
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
         let response = self
             .post(
@@ -77,11 +73,14 @@ impl TopicClient for HttpClient {
                 &CreateTopic {
                     stream_id: stream_id.clone(),
                     name: name.to_string(),
-                    partitions_count,
-                    compression_algorithm,
-                    replication_factor,
-                    message_expiry,
-                    max_topic_size,
+                    partitions_count: options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT),
+                    compression_algorithm: options.compression_algorithm.unwrap_or_default(),
+                    replication_factor: None,
+                    message_expiry: options.message_expiry.unwrap_or(IggyExpiry::ServerDefault),
+                    max_topic_size: options
+                        .max_topic_size
+                        .unwrap_or(MaxTopicSize::ServerDefault),
+                    options: options.raw.clone(),
                 },
             )
             .await?;

@@ -49,7 +49,9 @@ use iggy_common::defaults::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
+use iggy_common::{
+    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, TopicRuntimeOptions, variadic,
+};
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
@@ -1125,8 +1127,28 @@ async fn shard_main(
     metadata.seed_checkpoint_ref(checkpoint_seed.0, checkpoint_seed.1);
     // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
     // message expiry) at create admission; responses echo stored values verbatim.
-    metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
-    metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
+    metadata.set_default_max_topic_size(iggy_common::DEFAULT_MAX_TOPIC_SIZE);
+    metadata.set_default_message_expiry(iggy_common::DEFAULT_MESSAGE_EXPIRY);
+    metadata.set_default_segment_size(iggy_common::DEFAULT_SEGMENT_SIZE);
+    // Per-topic segment ceiling: the smaller of the global segment maximum
+    // and the state-transfer artifact budget minus one bus frame (a segment
+    // may close one whole batch past its cap; an artifact ceiling below that
+    // refuses a legal segment and livelocks the partition's rejoin).
+    metadata.set_max_topic_segment_size(
+        configs::validators::SEGMENT_MAX_SIZE_BYTES.min(
+            config
+                .partition
+                .transfer_artifact_bytes_max
+                .as_bytes_u64()
+                .saturating_sub(config.message_bus.max_message_size.as_bytes_u64()),
+        ),
+    );
+    metadata.set_partition_runtime_defaults(
+        iggy_common::DEFAULT_ENFORCE_FSYNC,
+        iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+        iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+        iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+    );
     // Keep the forced-checkpoint margin >= the configured prepare-queue
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).
@@ -1741,15 +1763,14 @@ async fn build_shard_for_thread(
     let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
-            messages_required_to_save: config.system.partition.messages_required_to_save,
-            size_of_messages_required_to_save: config
-                .system
-                .partition
-                .size_of_messages_required_to_save,
-            enforce_fsync: config.system.partition.enforce_fsync,
+            messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: IggyByteSize::from(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
             validate_checksum: config.system.partition.validate_checksum,
-            segment_size: config.system.segment.size,
-            preallocate_segments: config.system.segment.preallocate,
+            segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
         },
         owned_partitions_capacity,
@@ -1778,7 +1799,13 @@ async fn build_shard_for_thread(
                             partition.id,
                             topic.stats.clone(),
                         );
-                        owned.push((stream.id, topic_id, stats, partition.clone()));
+                        owned.push((
+                            stream.id,
+                            topic_id,
+                            stats,
+                            partition.clone(),
+                            TopicRuntimeOptions::from_resource_options(&topic.options),
+                        ));
                     } else {
                         shards_table.insert(
                             namespace,
@@ -1798,7 +1825,7 @@ async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
-    for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
+    for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
         validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = match load_partition(
@@ -1806,6 +1833,7 @@ async fn build_shard_for_thread(
             namespace,
             Arc::clone(&partition_stats),
             &partition_metadata,
+            topic_runtime,
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
@@ -1874,6 +1902,7 @@ async fn build_shard_for_thread(
                     namespace,
                     partition_stats,
                     partition_metadata.created_revision,
+                    topic_runtime,
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
@@ -2343,23 +2372,21 @@ fn restore_metadata_consensus(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn load_partition(
+/// Build the ticked-and-bounded consensus a loaded partition group joins
+/// with; the fresh-create path configures its own inside
+/// `build_partition_fresh`.
+fn loaded_partition_consensus(
     config: &ServerConfig,
     namespace: IggyNamespace,
-    stats: Arc<PartitionStats>,
-    partition_metadata: &Partition,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
-) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
-    let stream_id = namespace.stream_id();
-    let topic_id = namespace.topic_id();
-    let partition_id = namespace.partition_id();
+) -> VsrConsensus<Rc<IggyMessageBus>> {
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let mut consensus = VsrConsensus::new(
+    let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
@@ -2374,6 +2401,72 @@ async fn load_partition(
     consensus.set_view_change_status_ticks(view_change_status_ticks(config));
     consensus.set_request_start_view_ticks(request_start_view_ticks(config));
     consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
+    consensus
+}
+
+/// Recover this partition's persisted segment chain, stamping each segment
+/// with the topic's effective segment size (the per-topic value when the
+/// topic was created with one, else the shard-wide configured size).
+async fn recover_partition_segments(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    runtime_options: TopicRuntimeOptions,
+    stats: &PartitionStats,
+) -> Result<Vec<RecoveredSegment>, ServerError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
+    let segment_size = runtime_options
+        .segment_size
+        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let enforce_fsync = runtime_options
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
+    load_persisted_segments(
+        config,
+        stream_id,
+        topic_id,
+        partition_id,
+        segment_size,
+        enforce_fsync,
+        stats,
+    )
+    .await
+    .map_err(|source| {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            error = %source,
+            "failed to load partition log during server bootstrap"
+        );
+        source
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_partition(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    stats: Arc<PartitionStats>,
+    partition_metadata: &Partition,
+    runtime_options: TopicRuntimeOptions,
+    cluster_id: u128,
+    self_replica_id: u8,
+    replica_count: u8,
+    bus: Rc<IggyMessageBus>,
+) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
+    let mut consensus = loaded_partition_consensus(
+        config,
+        namespace,
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        bus,
+    );
 
     // (view, log_view) come from the group's durable superblock when present;
     // a present but unverifiable record already refused boot inside
@@ -2422,20 +2515,10 @@ async fn load_partition(
     // regress persisted `base_timestamp`.
 
     let recovered_segments =
-        load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    error = %source,
-                    "failed to load partition log during server bootstrap"
-                );
-                source
-            })?;
+        recover_partition_segments(config, namespace, runtime_options, &stats).await?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
@@ -2451,7 +2534,6 @@ async fn load_partition(
     partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
-        config,
         stream_id,
         topic_id,
         partition_id,
@@ -2511,14 +2593,31 @@ async fn load_partition(
     Ok(partition)
 }
 
+/// Reopen writers over a recovered segment chain.
+///
+/// Takes no `&ServerConfig`: every knob it needs is the partition's own
+/// resolved topic option now, which is the whole point of the per-topic move.
 async fn hydrate_partition_log(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerConfig,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
     recovered_segments: Vec<RecoveredSegment>,
 ) -> Result<(), ServerError> {
+    // The partition's own resolved knobs, not the shard-wide config: a topic
+    // created with `enforce_fsync` or a per-topic `segment_size` must get them
+    // on the writers reopened over its recovered chain too, or a restart would
+    // silently drop back to the node defaults.
+    let runtime = partition.runtime_options();
+    let enforce_fsync = runtime
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
+    let segment_size = runtime
+        .segment_size
+        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let preallocate_segments = runtime
+        .preallocate_segments
+        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
     for RecoveredSegment { segment, storage } in recovered_segments {
         partition
             .log
@@ -2548,13 +2647,9 @@ async fn hydrate_partition_log(
                 MessagesWriter::new(
                     &messages_reader.path(),
                     messages_size_counter,
-                    config.system.partition.enforce_fsync,
+                    enforce_fsync,
                     true,
-                    config
-                        .system
-                        .segment
-                        .preallocate
-                        .then_some(config.system.segment.size),
+                    preallocate_segments.then_some(segment_size),
                 )
                 .await
                 .map_err(|source| {
@@ -2570,24 +2665,19 @@ async fn hydrate_partition_log(
                 })?,
             ));
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
-                IggyIndexWriter::new(
-                    &index_path,
-                    index_size_counter,
-                    config.system.partition.enforce_fsync,
-                    true,
-                )
-                .await
-                .map_err(|source| {
-                    error!(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        path = %index_path,
-                        error = %source,
-                        "failed to initialize persisted sparse index writer"
-                    );
-                    source
-                })?,
+                IggyIndexWriter::new(&index_path, index_size_counter, enforce_fsync, true)
+                    .await
+                    .map_err(|source| {
+                        error!(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            path = %index_path,
+                            error = %source,
+                            "failed to initialize persisted sparse index writer"
+                        );
+                        source
+                    })?,
             ));
         }
     }

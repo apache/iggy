@@ -20,8 +20,11 @@ import type { CommandResponse } from '../../client/client.type.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+import { serializeOptions, type OptionEntry } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
 import {
   isValidCompressionAlgorithm, CompressionAlgorithm,
+  compressionAlgorithmName,
   deserializeTopic,
   type Topic,
   type CompressionAlgorithm as CompressionAlgorithmT
@@ -44,13 +47,25 @@ export type CreateTopic = {
   messageExpiry?: bigint,
   /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize?: bigint,
-  /** Replication factor (1-255) */
+  /** Segment size in bytes: 512-byte multiple between 1 MiB and 1 GiB */
+  segmentSize?: bigint,
+  /** Fsync every write instead of leaving it to the page cache */
+  enforceFsync?: boolean,
+  /** Message count that triggers a save (must be non-zero) */
+  messagesRequiredToSave?: number,
+  /** Accumulated message bytes that trigger a save */
+  sizeOfMessagesRequiredToSave?: bigint,
+  /** Preallocate segment files when the topic is created */
+  preallocateSegments?: boolean,
+  /** Ignored: replication factor is no longer part of the protocol */
   replicationFactor?: number
 };
 
 /**
  * Create topic command definition.
  * Creates a new topic within a stream.
+ * Layout: `[stream_id][partitions_count:u32_le][name_len:u8][name]`
+ * followed by the options TLV block running to the end of the payload.
  */
 export const CREATE_TOPIC = {
   code: COMMAND_CODE.CreateTopic,
@@ -62,32 +77,74 @@ export const CREATE_TOPIC = {
     compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
-    replicationFactor = 1
+    segmentSize,
+    enforceFsync,
+    messagesRequiredToSave,
+    sizeOfMessagesRequiredToSave,
+    preallocateSegments
   }: CreateTopic
   ) => {
     // Topic ID is now auto-assigned by the server, not sent in the protocol
     const streamIdentifier = serializeIdentifier(streamId);
     const bName = Buffer.from(name)
 
-    if (replicationFactor < 1 || replicationFactor > 255)
-      throw new Error('Topic replication factor should be between 1 and 255');
     if (bName.length < 1 || bName.length > 255)
       throw new Error('Topic name should be between 1 and 255 bytes');
     if(!isValidCompressionAlgorithm(compressionAlgorithm))
       throw new Error(`createTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
 
-    const b = Buffer.allocUnsafe(4 + 1 + 8 + 8 + 1 + 1);
+    // partitions_count rides the command's own fixed field, never the
+    // options block: the server rejects it as an unsupported option key.
+    // Server-default sentinels (expiry 0, size 0, compression none) and
+    // unset optionals are omitted so the server resolves them from its own
+    // config and reports them back as derived options.
+    const options: OptionEntry[] = [];
+    if (compressionAlgorithm !== CompressionAlgorithm.None)
+      options.push({
+        key: 'compression_algorithm',
+        value: HeaderValue.String(compressionAlgorithmName(compressionAlgorithm))
+      });
+    if (messageExpiry !== 0n)
+      options.push({
+        key: 'message_expiry', value: HeaderValue.Uint64(messageExpiry)
+      });
+    if (maxTopicSize !== 0n)
+      options.push({
+        key: 'max_topic_size', value: HeaderValue.Uint64(maxTopicSize)
+      });
+    if (segmentSize !== undefined)
+      options.push({
+        key: 'segment_size', value: HeaderValue.Uint64(segmentSize)
+      });
+    if (enforceFsync !== undefined)
+      options.push({
+        key: 'enforce_fsync', value: HeaderValue.Bool(enforceFsync)
+      });
+    if (messagesRequiredToSave !== undefined)
+      options.push({
+        key: 'messages_required_to_save',
+        value: HeaderValue.Uint32(messagesRequiredToSave)
+      });
+    if (sizeOfMessagesRequiredToSave !== undefined)
+      options.push({
+        key: 'size_of_messages_required_to_save',
+        value: HeaderValue.Uint64(sizeOfMessagesRequiredToSave)
+      });
+    if (preallocateSegments !== undefined)
+      options.push({
+        key: 'preallocate_segments',
+        value: HeaderValue.Bool(preallocateSegments)
+      });
+
+    const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
-    b.writeUInt8(compressionAlgorithm, 4);
-    b.writeBigUInt64LE(messageExpiry, 5); // 0 is unlimited
-    b.writeBigUInt64LE(maxTopicSize, 13); // optional, 0 is null
-    b.writeUInt8(replicationFactor, 21); // must be > 0
-    b.writeUInt8(bName.length, 22);
+    b.writeUInt8(bName.length, 4);
 
     return Buffer.concat([
       streamIdentifier,
       b,
       bName,
+      serializeOptions(options),
     ]);
   },
 

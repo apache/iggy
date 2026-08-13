@@ -28,6 +28,7 @@ import org.apache.iggy.cluster.TransportEndpoints;
 import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
@@ -37,6 +38,7 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
+import java.util.Map;
 
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfoDetails;
@@ -87,11 +89,21 @@ class BytesDeserializerTest {
         writeU64(buffer, BigInteger.ZERO); // message expiry
         buffer.writeByte(CompressionAlgorithm.None.asCode()); // compression
         writeU64(buffer, BigInteger.valueOf(10000)); // max topic size
-        buffer.writeByte(1); // replication factor
         writeU64(buffer, BigInteger.valueOf(500)); // size
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
         buffer.writeBytes("test".getBytes());
+        // Non-empty explicit options block: skipping it must leave the buffer
+        // positioned at the derived block.
+        writeOptionsBlock(
+                buffer, Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
+        writeOptionsBlock(buffer, Map.of()); // derived options
+    }
+
+    private static void writeOptionsBlock(ByteBuf buffer, Map<HeaderKey, HeaderValue> options) {
+        var optionsTlv = BytesSerializer.toBytes(options);
+        buffer.writeIntLE(optionsTlv.readableBytes());
+        buffer.writeBytes(optionsTlv);
     }
 
     private static void writePartitionData(ByteBuf buffer) {
@@ -163,6 +175,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(100)); // messages count
             buffer.writeByte(11); // name length
             buffer.writeBytes("test-stream".getBytes(StandardCharsets.UTF_8));
+            writeOptionsBlock(buffer, Map.of());
 
             // when
             var stream = readStreamBase(buffer);
@@ -186,6 +199,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(100));
             buffer.writeByte(6);
             buffer.writeBytes("stream".getBytes());
+            writeOptionsBlock(buffer, Map.of());
             // Write one topic
             writeTopicData(buffer);
 
@@ -803,6 +817,7 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode()); // status
             buffer.writeByte(4); // username length
             buffer.writeBytes("user".getBytes());
+            writeOptionsBlock(buffer, Map.of());
 
             // when
             var userInfo = readUserInfo(buffer);
@@ -823,7 +838,8 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode());
             buffer.writeByte(5);
             buffer.writeBytes("admin".getBytes());
-            buffer.writeBoolean(false); // no permissions
+            writeOptionsBlock(buffer, Map.of());
+            buffer.writeIntLE(0); // no-permissions marker: u32_le(0)
 
             // when
             var userInfoDetails = readUserInfoDetails(buffer);
@@ -842,6 +858,7 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode());
             buffer.writeByte(5);
             buffer.writeBytes("admin".getBytes());
+            writeOptionsBlock(buffer, Map.of());
             buffer.writeBoolean(true); // has permissions
             buffer.writeIntLE(10); // permissions length (ignored but required)
             // Write global permissions (10 booleans)

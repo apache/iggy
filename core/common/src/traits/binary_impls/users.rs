@@ -21,7 +21,6 @@ use crate::{
     BinaryClient, ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions,
     UserClient, UserInfo, UserInfoDetails, UserStatus,
 };
-use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
 use iggy_binary_protocol::codes::{
@@ -35,6 +34,7 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
+use iggy_binary_protocol::{WireName, WireOptions};
 use secrecy::SecretString;
 
 #[async_trait::async_trait]
@@ -87,6 +87,7 @@ impl<B: BinaryClient> UserClient for B {
                     password: password.to_string(),
                     status: status.as_code(),
                     permissions: wire_perms,
+                    options: WireOptions::empty(),
                 }
                 .to_bytes(),
             )

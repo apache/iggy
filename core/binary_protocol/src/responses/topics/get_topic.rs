@@ -19,7 +19,6 @@ use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::responses::streams::get_stream::TopicHeader;
 use bytes::{BufMut, BytesMut};
-use std::borrow::Cow;
 
 /// Partition details within a `GetTopic` response.
 ///
@@ -114,18 +113,14 @@ impl WireEncode for GetTopicResponse {
 impl WireDecode for GetTopicResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (topic, mut pos) = TopicHeader::decode(buf)?;
-        let mut partitions = Vec::new();
-        while pos < buf.len() {
+        // Count-driven so the element stays delimited even when embedded in a
+        // larger payload; the header's variable-length options blocks removed
+        // the old "everything after the header is partitions" property.
+        let mut partitions = Vec::with_capacity(topic.partitions_count as usize);
+        for _ in 0..topic.partitions_count {
             let (partition, consumed) = PartitionResponse::decode(&buf[pos..])?;
             pos += consumed;
             partitions.push(partition);
-        }
-        if partitions.len() != topic.partitions_count as usize {
-            return Err(WireError::Validation(Cow::Owned(format!(
-                "topic.partitions_count={} but decoded {} partitions",
-                topic.partitions_count,
-                partitions.len()
-            ))));
         }
         Ok((Self { topic, partitions }, pos))
     }
@@ -134,7 +129,7 @@ impl WireDecode for GetTopicResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WireName;
+    use crate::{WireName, WireOptions};
 
     fn sample_topic(partitions_count: u32) -> TopicHeader {
         TopicHeader {
@@ -144,10 +139,11 @@ mod tests {
             message_expiry: 0,
             compression_algorithm: 1,
             max_topic_size: 0,
-            replication_factor: 1,
             size_bytes: 2048,
             messages_count: 200,
             name: WireName::new("my-topic").unwrap(),
+            options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 

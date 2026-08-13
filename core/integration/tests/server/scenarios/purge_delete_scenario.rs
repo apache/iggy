@@ -31,12 +31,22 @@ const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
 
+/// Smallest segment a topic may declare (`iggy_common::MIN_TOPIC_SEGMENT_SIZE`).
+/// The layout below is built around it: a segment size is a per-topic creation
+/// option now, and sub-MiB values are refused at admission, so the message
+/// volume carries what a 5 KiB segment used to.
+const SEGMENT_SIZE: u64 = 1024 * 1024;
+
 /// The server persists the actual `SendMessages2` batch framing: a 256-byte
 /// command header per append (each send below is a single-message batch) plus
 /// a 48-byte per-message header, and a 24-byte sparse index entry per flush
 /// (one per message with messages_required_to_save = 1). See
 /// `server_common::send_messages2` and `stream_size_validation_scenario`.
-const PAYLOAD_SIZE: usize = 936;
+///
+/// Sized so five messages seal a [`SEGMENT_SIZE`] segment and four do not:
+/// 4 * 220304 = 881216 < 1 MiB <= 5 * 220304 = 1101520. Must stay a multiple
+/// of 4, since `send_messages` fills the payload with a 4-byte pattern.
+const PAYLOAD_SIZE: usize = 220_000;
 const NG_BATCH_HEADER_SIZE: u64 = 256;
 const NG_MESSAGE_HEADER_SIZE: u64 = 48;
 const MESSAGE_ON_DISK_SIZE: u64 =
@@ -44,10 +54,50 @@ const MESSAGE_ON_DISK_SIZE: u64 =
 const INDEX_SIZE_PER_MSG: u64 = 24;
 const TOTAL_MESSAGES: u32 = 25;
 
-/// 5 sealed segments (5 msgs each at 1240B on disk; the post-append size
-/// check seals at 6200B >= 5KiB) + 1 empty active segment at offset 25.
+/// 5 sealed segments (5 msgs each at 220304B on disk; the post-append size
+/// check seals at 1101520B >= 1MiB) + 1 empty active segment at offset 25.
 const EXPECTED_SEGMENT_OFFSETS: &[u64] = &[0, 5, 10, 15, 20, 25];
 const MSGS_PER_SEALED_SEGMENT: u64 = 5;
+
+/// Topic knobs the on-disk layout assertions depend on: segments that roll
+/// every five messages, and a flush per message so an append is in the
+/// segment (and its 24-byte index entry) before the next assertion reads it.
+fn layout_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        segment_size: Some(IggyByteSize::from(SEGMENT_SIZE)),
+        enforce_fsync: Some(true),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
+/// Topic knobs for the purge-durability scenario: a flush per message so both
+/// the pre- and post-purge appends reach a segment, and the default segment
+/// size so the handful of messages never rotates.
+fn flushing_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
+/// Topic knobs that keep every append journal-resident: both flush thresholds
+/// sit far past what the scenario sends, so nothing ever reaches a segment.
+/// The byte threshold has to move too -- it defaults to 1 MiB and would flush
+/// on its own long before the message count threshold trips.
+fn journal_resident_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        messages_required_to_save: Some(10_000),
+        size_of_messages_required_to_save: Some(IggyByteSize::from(1024 * 1024 * 1024u64)),
+        ..TopicCreateOptions::default()
+    }
+}
 
 /// Single consumer barrier: oldest-first deletion, barrier advancement, and edge cases.
 ///
@@ -65,11 +115,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -96,14 +142,14 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
 
     // --- Consumer offset barrier ---
     //
-    // stored_offset = 7 (start of segment 1). Segment 0 end_offset = 6 <= 7 → deletable.
-    // Segment 1 end_offset = 13 > 7 → protected by barrier.
+    // stored_offset = 5 (start of segment 1). Segment 0 end_offset = 4 <= 5 → deletable.
+    // Segment 1 end_offset = 9 > 5 → protected by barrier.
     let consumer = Consumer {
         kind: ConsumerKind::Consumer,
         id: Identifier::numeric(1).unwrap(),
     };
-    let stored_offset = EXPECTED_SEGMENT_OFFSETS[1]; // 7
-    let seg1_end_offset = EXPECTED_SEGMENT_OFFSETS[2] - 1; // 13
+    let stored_offset = EXPECTED_SEGMENT_OFFSETS[1]; // 5
+    let seg1_end_offset = EXPECTED_SEGMENT_OFFSETS[2] - 1; // 9
     client
         .store_consumer_offset(
             &consumer,
@@ -133,8 +179,8 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
     )
     .await;
 
-    // After deleting segment 0 (7 messages removed): current_offset must still
-    // reflect the true partition max (24), not messages_count - 1 (17).
+    // After deleting segment 0 (5 messages removed): current_offset must still
+    // reflect the true partition max (24), not messages_count - 1 (19).
     {
         let max_offset = (TOTAL_MESSAGES - 1) as u64;
         // Short poll, not a one-shot read: the restart cells reconnect, and a
@@ -206,12 +252,12 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         &stream_ident,
         &topic_ident,
         (2 * MSGS_PER_SEALED_SEGMENT..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-        "Messages 14..25 survive",
+        "Messages 10..25 survive",
     )
     .await;
 
-    // After deleting segments 0 and 1 (14 messages removed): current_offset
-    // must still be 24, not messages_count - 1 (10).
+    // After deleting segments 0 and 1 (10 messages removed): current_offset
+    // must still be 24, not messages_count - 1 (14).
     {
         let max_offset = (TOTAL_MESSAGES - 1) as u64;
         let offset_info = client
@@ -245,7 +291,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .unwrap();
     assert_eq!(
         polled_next.messages[0].header.offset, EXPECTED_SEGMENT_OFFSETS[2],
-        "Next poll resumes at offset 14 (first message after stored_offset 13)"
+        "Next poll resumes at offset 10 (first message after stored_offset 9)"
     );
 
     // --- delete(0) is a no-op ---
@@ -353,11 +399,7 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -448,11 +490,7 @@ pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -593,11 +631,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -831,11 +865,7 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -1084,15 +1114,7 @@ pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
     client.create_stream(STREAM_NAME).await.unwrap();
     let stream_ident = Identifier::named(STREAM_NAME).unwrap();
     client
-        .create_topic(
-            &stream_ident,
-            TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
+        .create_topic(&stream_ident, TOPIC_NAME, &flushing_topic_options())
         .await
         .unwrap();
     let topic_ident = Identifier::named(TOPIC_NAME).unwrap();
@@ -1142,15 +1164,7 @@ pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
     client.create_stream(STREAM_NAME).await.unwrap();
     let stream_ident = Identifier::named(STREAM_NAME).unwrap();
     client
-        .create_topic(
-            &stream_ident,
-            TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
+        .create_topic(&stream_ident, TOPIC_NAME, &journal_resident_topic_options())
         .await
         .unwrap();
     let topic_ident = Identifier::named(TOPIC_NAME).unwrap();

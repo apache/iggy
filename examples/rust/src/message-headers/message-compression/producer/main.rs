@@ -44,11 +44,12 @@ async fn main() -> Result<(), IggyError> {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,                           // Number of partitions.
-            CompressionAlgorithm::None, // NOTE: This configures the compression on the server, not the actual messages in transit!
-            None,                       // Replication factor.
-            IggyExpiry::NeverExpire,    // Time until messages expire on the server.
-            MaxTopicSize::ServerDefault, // Defined in server/config.toml. Defaults to "unlimited".
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                // Time until messages expire on the server.
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("Topic was NOT created! Start a fresh server to run this example.");

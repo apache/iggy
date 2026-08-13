@@ -148,8 +148,9 @@ var goHeaderOffsets = map[string]map[string]int{
 }
 
 // unimplementedCommandCodes are protocol codes the Go SDK deliberately does
-// not declare. FlushUnsavedBuffer has no Go client method.
-var unimplementedCommandCodes = []uint32{102}
+// not declare. DescribeOptions and FlushUnsavedBuffer have no Go client
+// method.
+var unimplementedCommandCodes = []uint32{13, 102}
 
 // rustFieldLayout is the size and alignment of every field type the consensus
 // headers use, enough to recompute their repr(C) offsets.

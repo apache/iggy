@@ -80,6 +80,8 @@ public final class BytesDeserializer {
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
     private static final int MIN_CLUSTER_NODE_BYTES = 18;
+    // 50-byte fixed part + empty name + two u32 options-block length prefixes.
+    private static final int MIN_TOPIC_BYTES = 58;
 
     private BytesDeserializer() {}
 
@@ -91,6 +93,7 @@ public final class BytesDeserializer {
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
+        skipOptionsBlock(response, "stream options");
 
         return new StreamBase(streamId, createdAt, name, size.toString(), messagesCount, topicsCount);
     }
@@ -98,8 +101,12 @@ public final class BytesDeserializer {
     public static StreamDetails readStreamDetails(ByteBuf response) {
         var streamBase = readStreamBase(response);
 
-        List<Topic> topics = new ArrayList<>();
-        while (response.isReadable()) {
+        // Count-driven: a topic element carries variable-length options
+        // blocks, so "consume until the buffer ends" no longer delimits it.
+        int topicsCount = validatedCollectionSize(
+                streamBase.topicsCount(), response.readableBytes(), MIN_TOPIC_BYTES, "Stream topics count");
+        List<Topic> topics = new ArrayList<>(topicsCount);
+        for (int i = 0; i < topicsCount; i++) {
             topics.add(readTopic(response));
         }
 
@@ -134,11 +141,14 @@ public final class BytesDeserializer {
         var messageExpiry = readU64AsBigInteger(response);
         var compressionAlgorithmCode = response.readByte();
         var maxTopicSize = readU64AsBigInteger(response);
-        var replicationFactor = response.readByte();
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
+        skipOptionsBlock(response, "topic explicit options");
+        skipOptionsBlock(response, "topic derived options");
+        // The replication factor left the wire format; the model field stays
+        // for API compatibility and reports the only value a topic can have.
         return new Topic(
                 topicId,
                 createdAt,
@@ -147,7 +157,7 @@ public final class BytesDeserializer {
                 messageExpiry,
                 CompressionAlgorithm.fromCode(compressionAlgorithmCode),
                 maxTopicSize,
-                (short) replicationFactor,
+                (short) 1,
                 messagesCount,
                 partitionsCount);
     }
@@ -435,6 +445,10 @@ public final class BytesDeserializer {
         if (response.readBoolean()) {
             var permissions = readPermissions(response);
             permissionsOptional = Optional.of(permissions);
+        } else {
+            // No-permissions marker is u32_le(0): the flag byte above was its
+            // first byte, skip the remaining three zero bytes.
+            response.skipBytes(3);
         }
 
         return new UserInfoDetails(userInfo, permissionsOptional);
@@ -509,6 +523,7 @@ public final class BytesDeserializer {
         var usernameLength = response.readByte();
         var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8)
                 .toString();
+        skipOptionsBlock(response, "user options");
         return new UserInfo(userId, createdAt, status, username);
     }
 
@@ -525,6 +540,18 @@ public final class BytesDeserializer {
         var expiry = readU64AsBigInteger(response);
         Optional<BigInteger> expiryOptional = expiry.equals(BigInteger.ZERO) ? Optional.empty() : Optional.of(expiry);
         return new PersonalAccessTokenInfo(name, expiryOptional);
+    }
+
+    private static void skipOptionsBlock(ByteBuf buffer, String field) {
+        if (buffer.readableBytes() < Integer.BYTES) {
+            throw new IggyMalformedResponseException("Missing length prefix for " + field);
+        }
+        var optionsLength = buffer.readUnsignedIntLE();
+        if (optionsLength > buffer.readableBytes()) {
+            throw new IggyMalformedResponseException("Length " + optionsLength + " for " + field
+                    + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
+        }
+        buffer.skipBytes(toInt(optionsLength));
     }
 
     private static String readU32PrefixedString(ByteBuf buffer, String field) {

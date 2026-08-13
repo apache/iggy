@@ -44,7 +44,7 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
-    WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
+    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
 };
 use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
 use secrecy::SecretString;
@@ -236,6 +236,7 @@ impl SimClient {
     pub fn create_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
         let wire = CreateStreamRequest {
             name: WireName::new(name).expect("stream name must be valid"),
+            options: WireOptions::empty(),
         };
         let payload = wire.to_bytes();
 
@@ -284,11 +285,8 @@ impl SimClient {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(name).expect("topic name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateTopic, &wire.to_bytes())
     }
@@ -428,6 +426,7 @@ impl SimClient {
             password: password.to_string(),
             status,
             permissions: None,
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateUser, &wire.to_bytes())
     }

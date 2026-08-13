@@ -34,6 +34,8 @@ use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 // keep the imports under the same gate so a production build does not see them
 // as unused. The test module re-imports them independently.
 #[cfg(any(test, feature = "simulator"))]
+use iggy_binary_protocol::primitives::options::WireOptions;
+#[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -58,9 +60,10 @@ use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
+use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire_split};
 use iggy_common::{
-    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, StreamStats,
-    TopicStats,
+    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, ResourceOptions,
+    StreamStats, TopicCreateOptions, TopicStats,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::IggyNamespace;
@@ -144,7 +147,6 @@ pub struct TopicSnapshot {
     pub id: usize,
     pub name: String,
     pub created_at: IggyTimestamp,
-    pub replication_factor: u8,
     pub message_expiry: IggyExpiry,
     pub compression_algorithm: CompressionAlgorithm,
     pub max_topic_size: MaxTopicSize,
@@ -158,6 +160,8 @@ pub struct TopicSnapshot {
     pub consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
     #[serde(default)]
     pub next_consumer_group_id: u64,
+    #[serde(default)]
+    pub options: ResourceOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -165,10 +169,13 @@ pub struct Topic {
     pub id: usize,
     pub name: Arc<str>,
     pub created_at: IggyTimestamp,
-    pub replication_factor: u8,
     pub message_expiry: IggyExpiry,
     pub compression_algorithm: CompressionAlgorithm,
     pub max_topic_size: MaxTopicSize,
+    /// Resolved creation options: the client's explicit keys plus the
+    /// defaults derived at admission. `partitions_count` is never stored
+    /// here; the partitions vec is the authority.
+    pub options: ResourceOptions,
 
     pub stats: Arc<TopicStats>,
     pub partitions: Vec<Partition>,
@@ -197,10 +204,10 @@ impl Default for Topic {
             id: 0,
             name: Arc::from(""),
             created_at: IggyTimestamp::default(),
-            replication_factor: 1,
             message_expiry: IggyExpiry::default(),
             compression_algorithm: CompressionAlgorithm::default(),
             max_topic_size: MaxTopicSize::default(),
+            options: ResourceOptions::new(),
             stats: Arc::new(TopicStats::default()),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -215,7 +222,6 @@ impl Topic {
     pub fn new(
         name: Arc<str>,
         created_at: IggyTimestamp,
-        replication_factor: u8,
         message_expiry: IggyExpiry,
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
@@ -225,10 +231,10 @@ impl Topic {
             id: 0,
             name,
             created_at,
-            replication_factor,
             message_expiry,
             compression_algorithm,
             max_topic_size,
+            options: ResourceOptions::new(),
             stats: Arc::new(TopicStats::new(stream_stats)),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -275,6 +281,8 @@ pub struct StreamSnapshot {
     pub created_at: IggyTimestamp,
     pub stats: StatsSnapshot,
     pub topics: Vec<(usize, TopicSnapshot)>,
+    #[serde(default)]
+    pub options: ResourceOptions,
 }
 
 #[derive(Debug)]
@@ -282,6 +290,7 @@ pub struct Stream {
     pub id: usize,
     pub name: Arc<str>,
     pub created_at: IggyTimestamp,
+    pub options: ResourceOptions,
 
     pub stats: Arc<StreamStats>,
     pub topics: Slab<Topic>,
@@ -294,6 +303,7 @@ impl Default for Stream {
             id: 0,
             name: Arc::from(""),
             created_at: IggyTimestamp::default(),
+            options: ResourceOptions::default(),
             stats: Arc::new(StreamStats::default()),
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -307,6 +317,7 @@ impl Clone for Stream {
             id: self.id,
             name: self.name.clone(),
             created_at: self.created_at,
+            options: self.options.clone(),
             stats: self.stats.clone(),
             topics: self.topics.clone(),
             topic_index: self.topic_index.clone(),
@@ -321,6 +332,7 @@ impl Stream {
             id: 0,
             name,
             created_at,
+            options: ResourceOptions::new(),
             stats: Arc::new(StreamStats::default()),
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -333,6 +345,7 @@ impl Stream {
             id: 0,
             name,
             created_at,
+            options: ResourceOptions::new(),
             stats,
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -1328,6 +1341,7 @@ impl Streams {
                     CreateStreamRequest {
                         name: WireName::new(format!("sim-stream-{slab}"))
                             .expect("sim stream name is valid"),
+                        options: WireOptions::empty(),
                     },
                     IggyTimestamp::from(1),
                 ))
@@ -1368,13 +1382,11 @@ impl Streams {
                             stream_id: stream_wire.clone(),
                             partitions_count: u32::try_from(partitions.len())
                                 .expect("sim partition count fits u32"),
-                            compression_algorithm: 0,
-                            message_expiry: 0,
-                            max_topic_size: 0,
-                            replication_factor: 1,
                             name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
                                 .expect("sim topic name is valid"),
+                            options: WireOptions::empty(),
                         },
+                        derived_options: WireOptions::empty(),
                         partitions,
                     },
                     IggyTimestamp::from(1),
@@ -1495,6 +1507,9 @@ impl StateHandler for CreateStreamRequest {
         if state.index.contains_key(&name_arc) {
             return ApplyReply::err(CreateStreamResult::NameAlreadyExists);
         }
+        let Ok(options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(CreateStreamResult::InvalidOptionValue);
+        };
 
         // Share one `Arc<StreamStats>` across both left-right buffers via the
         // registry (see `StatsRegistry`). The id the next insert will use is
@@ -1505,6 +1520,7 @@ impl StateHandler for CreateStreamRequest {
             id,
             name: name_arc.clone(),
             created_at: timestamp,
+            options,
             stats: stream_stats,
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -1525,6 +1541,7 @@ impl StateHandler for CreateStreamRequest {
                     size_bytes: 0,
                     messages_count: 0,
                     name: self.name.clone(),
+                    options: self.options.clone(),
                 },
                 topics: Vec::new(),
             }
@@ -1659,23 +1676,43 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
 
-        let replication_factor = if self.request.replication_factor == 0 {
-            1
-        } else {
-            self.request.replication_factor
+        // Both blocks were validated and resolved at admission; a parse
+        // failure here means an unknown value kind reached a committed op,
+        // which commits as a deterministic rejection rather than a panic.
+        let (Ok(explicit), Ok(derived)) = (
+            TopicCreateOptions::parse(&self.request.options),
+            TopicCreateOptions::parse(&self.derived_options),
+        ) else {
+            return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
         };
+        let (Ok(explicit_map), Ok(derived_map)) = (
+            resource_options_from_wire(&self.request.options, true),
+            resource_options_from_wire(&self.derived_options, false),
+        ) else {
+            return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
+        };
+        // Explicit wins on collision. `partitions_count` cannot appear here at
+        // all: it is a fixed field of the command, not an option key.
+        let mut options = derived_map;
+        options.extend(explicit_map);
 
         let topic = Topic {
             id: topic_id,
             name: name_arc.clone(),
             created_at: timestamp,
-            replication_factor,
-            message_expiry: IggyExpiry::from(self.request.message_expiry),
-            compression_algorithm: CompressionAlgorithm::from_code(
-                self.request.compression_algorithm,
-            )
-            .unwrap_or_default(),
-            max_topic_size: MaxTopicSize::from(self.request.max_topic_size),
+            message_expiry: explicit
+                .message_expiry
+                .or(derived.message_expiry)
+                .unwrap_or(IggyExpiry::ServerDefault),
+            compression_algorithm: explicit
+                .compression_algorithm
+                .or(derived.compression_algorithm)
+                .unwrap_or_default(),
+            max_topic_size: explicit
+                .max_topic_size
+                .or(derived.max_topic_size)
+                .unwrap_or(MaxTopicSize::ServerDefault),
+            options,
             stats: topic_stats,
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -1705,7 +1742,11 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let Some(topic) = stream.topics.get(topic_id) else {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
-        ApplyReply::ok(encode_create_topic_reply(&self.request, topic_id, topic))
+        ApplyReply::ok(encode_create_topic_reply(
+            &self.request.name,
+            topic_id,
+            topic,
+        ))
     }
 }
 
@@ -1714,28 +1755,26 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
 /// reply deserializes without a schema break. Returns empty bytes on a
 /// `u32` overflow (same contract as a validation rejection) rather than
 /// saturating to `u32::MAX`.
-fn encode_create_topic_reply(
-    request: &CreateTopicRequest,
-    topic_id: usize,
-    topic: &Topic,
-) -> Bytes {
+fn encode_create_topic_reply(name: &WireName, topic_id: usize, topic: &Topic) -> Bytes {
     let Ok(topic_id_u32) = u32::try_from(topic_id) else {
         return Bytes::new();
     };
     let Ok(partitions_count_u32) = u32::try_from(topic.partitions.len()) else {
         return Bytes::new();
     };
+    let (options, derived_options) = resource_options_to_wire_split(&topic.options);
     let header = TopicHeader {
         id: topic_id_u32,
         created_at: topic.created_at.into(),
         partitions_count: partitions_count_u32,
-        message_expiry: request.message_expiry,
-        compression_algorithm: request.compression_algorithm,
-        max_topic_size: request.max_topic_size,
-        replication_factor: topic.replication_factor,
+        message_expiry: u64::from(topic.message_expiry),
+        compression_algorithm: topic.compression_algorithm.as_code(),
+        max_topic_size: u64::from(topic.max_topic_size),
         size_bytes: 0,
         messages_count: 0,
-        name: request.name.clone(),
+        name: name.clone(),
+        options,
+        derived_options,
     };
     let Ok(partitions_resp) = topic
         .partitions
@@ -1799,9 +1838,8 @@ impl StateHandler for UpdateTopicRequest {
             CompressionAlgorithm::from_code(self.compression_algorithm).unwrap_or_default();
         topic.message_expiry = IggyExpiry::from(self.message_expiry);
         topic.max_topic_size = MaxTopicSize::from(self.max_topic_size);
-        if self.replication_factor != 0 {
-            topic.replication_factor = self.replication_factor;
-        }
+        // `replication_factor` still rides the update wire layout but is
+        // inert: nothing stores it since topics dropped the field.
         stream.topic_index.insert(new_name_arc, topic_id);
         ApplyReply::ok(Bytes::new())
     }
@@ -2037,10 +2075,10 @@ impl Snapshotable for Streams {
                                     id: topic.id,
                                     name: topic.name.to_string(),
                                     created_at: topic.created_at,
-                                    replication_factor: topic.replication_factor,
                                     message_expiry: topic.message_expiry,
                                     compression_algorithm: topic.compression_algorithm,
                                     max_topic_size: topic.max_topic_size,
+                                    options: topic.options.clone(),
                                     stats: StatsSnapshot {
                                         size_bytes: t_size,
                                         messages_count: t_msgs,
@@ -2082,6 +2120,7 @@ impl Snapshotable for Streams {
                                 segments_count,
                             },
                             topics,
+                            options: stream.options.clone(),
                         },
                     )
                 })
@@ -2158,10 +2197,10 @@ impl StreamsInner {
                     id: topic_snap.id,
                     name: topic_name.clone(),
                     created_at: topic_snap.created_at,
-                    replication_factor: topic_snap.replication_factor,
                     message_expiry: topic_snap.message_expiry,
                     compression_algorithm: topic_snap.compression_algorithm,
                     max_topic_size: topic_snap.max_topic_size,
+                    options: topic_snap.options,
                     stats: topic_stats,
                     partitions: topic_snap
                         .partitions
@@ -2207,6 +2246,7 @@ impl StreamsInner {
                 id: stream_snap.id,
                 name: stream_name.clone(),
                 created_at: stream_snap.created_at,
+                options: stream_snap.options,
                 stats: stream_stats,
                 topics,
                 topic_index,
@@ -2269,8 +2309,102 @@ mod tests {
     fn create_stream(inner: &mut StreamsInner, name: &str) {
         let request = CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         };
         let _ = StateHandler::apply(&request, inner, IggyTimestamp::now());
+    }
+
+    #[test]
+    fn create_topic_stores_merged_options_and_typed_fields() {
+        use iggy_common::{HeaderKey, HeaderKind, TopicCreateOptions, topic_option_keys};
+        use std::str::FromStr;
+
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        // Client explicitly pins message_expiry; admission derives the rest.
+        let explicit = TopicCreateOptions {
+            message_expiry: Some(IggyExpiry::from(5_000_000u64)),
+            partitions_count: Some(1),
+            ..TopicCreateOptions::default()
+        };
+        let derived = TopicCreateOptions {
+            max_topic_size: Some(MaxTopicSize::from(10_000_000_000u64)),
+            compression_algorithm: Some(CompressionAlgorithm::None),
+            ..TopicCreateOptions::default()
+        };
+        let request = CreateTopicWithAssignmentsRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("t").unwrap(),
+                options: explicit.to_wire(),
+            },
+            derived_options: derived.to_wire(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::from(1));
+        assert_eq!(reply.code, 0, "create must succeed");
+
+        let stream = inner.items.get(0).unwrap();
+        let (_, topic) = stream.topics.iter().next().unwrap();
+        assert_eq!(topic.message_expiry, IggyExpiry::from(5_000_000u64));
+        assert_eq!(topic.max_topic_size, MaxTopicSize::from(10_000_000_000u64));
+        assert_eq!(topic.compression_algorithm, CompressionAlgorithm::None);
+
+        // partitions_count is create-consumed, never persisted.
+        assert_eq!(topic.options.len(), 3);
+        let expiry_key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).unwrap();
+        let expiry = topic.options.get(&expiry_key).unwrap();
+        assert!(expiry.explicit, "client-sent key keeps its provenance");
+        assert_eq!(expiry.value.kind(), HeaderKind::Uint64);
+        let size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
+        assert!(
+            !topic.options.get(&size_key).unwrap().explicit,
+            "derived key is marked derived"
+        );
+    }
+
+    #[test]
+    fn create_stream_options_survive_snapshot_roundtrip() {
+        use crate::stm::snapshot::FillSnapshot;
+        use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
+
+        let mut headers = bytes::BytesMut::new();
+        encode_user_headers(&[(2, b"future_key", 2, b"future_value")], &mut headers);
+        let request = CreateStreamRequest {
+            name: WireName::new("stream-with-options").unwrap(),
+            options: WireOptions::from_bytes(headers.freeze()).unwrap(),
+        };
+
+        let streams = Streams::default();
+        streams
+            .inner
+            .try_apply(StreamsCommand::CreateStream(
+                request,
+                IggyTimestamp::from(1),
+            ))
+            .expect("create stream applies");
+
+        let mut snapshot = MetadataSnapshot::new(1);
+        streams.fill_snapshot(&mut snapshot).unwrap();
+        let encoded = snapshot.encode().unwrap();
+        let decoded = MetadataSnapshot::decode(&encoded).unwrap();
+        let restored: Streams = crate::stm::snapshot::RestoreSnapshot::restore_snapshot(&decoded)
+            .expect("streams section restores");
+
+        let restored_options = restored.read(|inner| {
+            let (_, stream) = inner.items.iter().next().expect("stream restored");
+            stream.options.clone()
+        });
+        assert_eq!(restored_options.len(), 1);
+        let (key, option) = restored_options.iter().next().unwrap();
+        assert_eq!(key.as_bytes(), b"future_key");
+        assert_eq!(option.value.as_bytes(), b"future_value");
+        assert!(option.explicit);
     }
 
     fn make_topic_request(
@@ -2281,11 +2415,8 @@ mod tests {
         WireCreateTopicRequest {
             stream_id: WireIdentifier::numeric(stream_id),
             partitions_count,
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
     }
 
@@ -2307,6 +2438,7 @@ mod tests {
             for topic_name in ["logs", "events"] {
                 let create_topic = CreateTopicWithAssignmentsRequest {
                     request: make_topic_request(stream_id, 2, topic_name),
+                    derived_options: WireOptions::empty(),
                     partitions: vec![
                         CreatedPartitionAssignment {
                             partition_id: 0,
@@ -2374,6 +2506,7 @@ mod tests {
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 2, "topic"),
+            derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
                     partition_id: 0,
@@ -2401,6 +2534,7 @@ mod tests {
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 2, "topic"),
+            derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
                     partition_id: 0,
@@ -2455,6 +2589,7 @@ mod tests {
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 2, "topic"),
+            derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
                     partition_id: 0,
@@ -2488,6 +2623,7 @@ mod tests {
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 2, "topic"),
+            derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
                     partition_id: 0,
@@ -2582,6 +2718,7 @@ mod tests {
             create_stream(&mut inner, "stream");
             let create_topic = CreateTopicWithAssignmentsRequest {
                 request: make_topic_request(0, partitions_count, "topic"),
+                derived_options: WireOptions::empty(),
                 partitions: (0..partitions_count)
                     .map(|partition_id| CreatedPartitionAssignment {
                         partition_id,
@@ -2636,6 +2773,7 @@ mod tests {
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 1, "topic"),
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,
@@ -2734,6 +2872,7 @@ mod tests {
         let mut inner = inner_with_registered_partition();
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 1, "metrics"),
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 2,
@@ -2831,6 +2970,7 @@ mod tests {
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 1, "logs"),
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,
@@ -2918,6 +3058,7 @@ mod tests {
 
         let body = CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
         let header_size = size_of::<PrepareHeader>();
@@ -2943,6 +3084,7 @@ mod tests {
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: make_topic_request(0, 1, "logs"),
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,

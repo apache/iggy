@@ -27,6 +27,7 @@ use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::IggyByteSize;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
+use iggy::prelude::TopicCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -40,7 +41,6 @@ struct TestTopicUpdateCmd {
     compression_algorithm: CompressionAlgorithm,
     message_expiry: Option<Vec<String>>,
     max_topic_size: MaxTopicSize,
-    replication_factor: u8,
     topic_new_name: String,
     topic_new_compression_algorithm: CompressionAlgorithm,
     topic_new_message_expiry: Option<Vec<String>>,
@@ -60,7 +60,6 @@ impl TestTopicUpdateCmd {
         compression_algorithm: CompressionAlgorithm,
         message_expiry: Option<Vec<String>>,
         max_topic_size: MaxTopicSize,
-        replication_factor: u8,
         topic_new_name: String,
         topic_new_compression_algorithm: CompressionAlgorithm,
         topic_new_message_expiry: Option<Vec<String>>,
@@ -77,7 +76,6 @@ impl TestTopicUpdateCmd {
             compression_algorithm,
             message_expiry,
             max_topic_size,
-            replication_factor,
             topic_new_name,
             topic_new_compression_algorithm,
             topic_new_message_expiry,
@@ -138,11 +136,17 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
             .create_topic(
                 &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
-                1,
-                self.compression_algorithm,
-                Some(self.replication_factor),
-                message_expiry,
-                self.max_topic_size,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    compression_algorithm: (self.compression_algorithm
+                        != CompressionAlgorithm::default())
+                    .then_some(self.compression_algorithm),
+                    message_expiry: (message_expiry != IggyExpiry::ServerDefault)
+                        .then_some(message_expiry),
+                    max_topic_size: (self.max_topic_size != MaxTopicSize::ServerDefault)
+                        .then_some(self.max_topic_size),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());
@@ -246,7 +250,6 @@ pub async fn should_be_successful() {
             Default::default(),
             None,
             MaxTopicSize::ServerDefault,
-            1,
             String::from("new_name"),
             CompressionAlgorithm::Gzip,
             None,
@@ -265,7 +268,6 @@ pub async fn should_be_successful() {
             Default::default(),
             None,
             MaxTopicSize::ServerDefault,
-            1,
             String::from("testing"),
             CompressionAlgorithm::Gzip,
             None,
