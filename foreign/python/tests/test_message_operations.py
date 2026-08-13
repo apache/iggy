@@ -1246,3 +1246,118 @@ class TestMessageOperations:
         assert [
             message.payload().decode("utf-8") for message in next_messages
         ] == existing_messages + new_messages
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_distinct_consumers_keeps_offsets_independent(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test each consumer owns its offset, so both see the whole partition."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"Consumer isolation {i} - {unique_name()}" for i in range(3)]
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(message) for message in test_messages],
+        )
+
+        for consumer_name in ("isolation-consumer-a", "isolation-consumer-b"):
+            polled_messages = await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Single(consumer_name),
+                partition_id=partition_id,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+            assert [
+                message.payload().decode("utf-8") for message in polled_messages
+            ] == test_messages
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_shared_consumer_splits_the_partition(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test two polls under the same consumer share one stored offset."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"Shared consumer {i} - {unique_name()}" for i in range(3)]
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(message) for message in test_messages],
+        )
+
+        first_poll = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("shared-consumer"),
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+        assert [
+            message.payload().decode("utf-8") for message in first_poll
+        ] == test_messages
+
+        second_poll = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("shared-consumer"),
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+        assert second_poll == []
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_consumer_group_reads_assigned_partitions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a group member polls its assignment when no partition is given."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+        test_messages = [f"Group polling {i} - {unique_name()}" for i in range(3)]
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=0,
+            messages=[Message(message) for message in test_messages],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Group(group_name),
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+        assert [
+            message.payload().decode("utf-8") for message in polled_messages
+        ] == test_messages
