@@ -21,10 +21,10 @@ use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
-    AutoCommitWhen as RustAutoCommitWhen, ConsumerGroup as RustConsumerGroup,
-    ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyDuration,
-    IggyError, ReceivedMessage,
+    AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
+    ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
+    IggyDuration, IggyError, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::PyDelta;
@@ -211,6 +211,29 @@ impl IggyConsumer {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
+        })
+    }
+}
+
+/// The consumer polling the messages. It selects both the consumer kind and the
+/// identifier the server keys the stored offset on.
+#[derive(Clone)]
+#[gen_stub_pyclass_complex_enum]
+#[pyclass(from_py_object)]
+pub enum Consumer {
+    /// A regular consumer, owning its offset on the polled partition.
+    Single { id: PyIdentifier },
+    /// A member of the consumer group, sharing the group's offset.
+    Group { id: PyIdentifier },
+}
+
+impl TryFrom<&Consumer> for RustConsumer {
+    type Error = PyErr;
+
+    fn try_from(value: &Consumer) -> PyResult<RustConsumer> {
+        Ok(match value {
+            Consumer::Single { id } => RustConsumer::new(Identifier::try_from(id.clone())?),
+            Consumer::Group { id } => RustConsumer::group(Identifier::try_from(id.clone())?),
         })
     }
 }

@@ -24,8 +24,8 @@ use pyo3::{
 };
 use pyo3_stub_gen::impl_stub_type;
 
-#[derive(FromPyObject, IntoPyObject)]
-pub(crate) enum PyIdentifier {
+#[derive(Clone, FromPyObject, IntoPyObject)]
+pub enum PyIdentifier {
     #[pyo3(transparent, annotation = "str")]
     String(String),
     #[pyo3(transparent, annotation = "int")]

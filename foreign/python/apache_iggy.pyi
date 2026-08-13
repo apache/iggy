@@ -30,6 +30,7 @@ __all__ = [
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
@@ -250,6 +251,36 @@ class AutoCommitWhen:
         ) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+class Consumer:
+    r"""
+    The consumer polling the messages. It selects both the consumer kind and the
+    identifier the server keys the stored offset on.
+    """
+
+    @typing.final
+    class Single(Consumer):
+        r"""
+        A regular consumer, owning its offset on the polled partition.
+        """
+
+        __match_args__ = ("id",)
+        @property
+        def id(self) -> builtins.str | builtins.int: ...
+        def __new__(cls, id: builtins.str | builtins.int) -> Consumer.Single: ...
+
+    @typing.final
+    class Group(Consumer):
+        r"""
+        A member of the consumer group, sharing the group's offset.
+        """
+
+        __match_args__ = ("id",)
+        @property
+        def id(self) -> builtins.str | builtins.int: ...
+        def __new__(cls, id: builtins.str | builtins.int) -> Consumer.Group: ...
 
     ...
 
