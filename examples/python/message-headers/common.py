@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from apache_iggy import (
+    Consumer,
     HeaderKey,
     HeaderValue,
     IggyClient,
@@ -177,11 +178,14 @@ async def produce_messages(client: IggyClient, build_headers: HeadersBuilder) ->
     logger.info(f"Sent {sent_batches} batches of messages, exiting.")
 
 
-async def consume_messages(client: IggyClient, handle_message: MessageHandler) -> None:
+async def consume_messages(
+    client: IggyClient, handle_message: MessageHandler, consumer_name: str
+) -> None:
     interval = 0.5
     logger.info(
         f"Messages will be consumed from stream: {STREAM_NAME}, "
         f"topic: {TOPIC_NAME}, partition: {PARTITION_ID} "
+        f"as consumer: {consumer_name} "
         f"with interval {interval * 1000} ms."
     )
     consumed_batches = 0
@@ -192,6 +196,7 @@ async def consume_messages(client: IggyClient, handle_message: MessageHandler) -
             polled_messages = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
+                consumer=Consumer.Single(consumer_name),
                 partition_id=PARTITION_ID,
                 polling_strategy=PollingStrategy.Next(),
                 count=MESSAGES_PER_BATCH,

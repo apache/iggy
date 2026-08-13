@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use crate::config::PyClientConfig;
 use crate::consumer::{
-    AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
-    IggyConsumer,
+    AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
+    ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
@@ -963,20 +963,24 @@ impl IggyClient {
     }
 
     /// Polls for messages from the specified topic and partition.
+    /// Omitting `partition_id` reads partition 0 for a regular consumer, and
+    /// polls the member's assigned partitions for a consumer group.
     /// Returns a list of received messages or a RuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (stream, topic, *, consumer, polling_strategy, count, auto_commit, partition_id = None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(
         &self,
         py: Python<'a>,
         stream: PyIdentifier,
         topic: PyIdentifier,
-        partition_id: u32,
+        consumer: &PyConsumer,
         polling_strategy: &PollingStrategy,
         count: u32,
         auto_commit: bool,
+        partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let consumer = RustConsumer::default();
+        let consumer = RustConsumer::try_from(consumer)?;
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
         let strategy: RustPollingStrategy = polling_strategy.into();
@@ -988,7 +992,7 @@ impl IggyClient {
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(partition_id),
+                    partition_id,
                     &consumer,
                     &strategy,
                     count,
@@ -996,6 +1000,7 @@ impl IggyClient {
                 )
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let partition_id = polled_messages.partition_id;
             let messages = polled_messages
                 .messages
                 .into_iter()

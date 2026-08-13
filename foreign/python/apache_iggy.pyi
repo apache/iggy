@@ -1307,13 +1307,17 @@ class IggyClient:
         self,
         stream: builtins.str | builtins.int,
         topic: builtins.str | builtins.int,
-        partition_id: builtins.int,
+        *,
+        consumer: Consumer,
         polling_strategy: PollingStrategy,
         count: builtins.int,
         auto_commit: builtins.bool,
+        partition_id: builtins.int | None = None,
     ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
         Polls for messages from the specified topic and partition.
+        Omitting `partition_id` reads partition 0 for a regular consumer, and
+        polls the member's assigned partitions for a consumer group.
         Returns a list of received messages or a RuntimeError on failure.
         """
     def consumer_group(

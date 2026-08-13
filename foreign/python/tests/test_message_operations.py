@@ -21,6 +21,7 @@ import uuid
 import pytest
 
 from apache_iggy import (
+    Consumer,
     HeaderKey,
     HeaderValue,
     IggyClient,
@@ -58,6 +59,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -93,6 +95,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -136,6 +139,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -170,6 +174,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -226,6 +231,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -276,6 +282,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -318,6 +325,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -619,6 +627,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -660,6 +669,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -699,6 +709,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -735,6 +746,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=1,
@@ -769,6 +781,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -806,6 +819,7 @@ class TestMessageOperations:
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
+                consumer=Consumer.Single(1),
                 partition_id=partition_id,
                 polling_strategy=PollingStrategy.First(),
                 count=0,
@@ -843,6 +857,7 @@ class TestMessageOperations:
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
+                consumer=Consumer.Single(1),
                 partition_id=1,
                 polling_strategy=PollingStrategy.First(),
                 count=1,
@@ -875,6 +890,7 @@ class TestMessageOperations:
         last_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -909,6 +925,7 @@ class TestMessageOperations:
         last_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=2,
@@ -945,6 +962,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -955,6 +973,7 @@ class TestMessageOperations:
         offset_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=start_offset),
             count=10,
@@ -991,6 +1010,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1001,6 +1021,7 @@ class TestMessageOperations:
         offset_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=offset_beyond_newest),
             count=10,
@@ -1036,6 +1057,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1046,6 +1068,7 @@ class TestMessageOperations:
         timestamp_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Timestamp(value=start_timestamp),
             count=10,
@@ -1084,6 +1107,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1094,6 +1118,7 @@ class TestMessageOperations:
         timestamp_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Timestamp(value=timestamp_after_newest),
             count=10,
@@ -1130,6 +1155,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1150,6 +1176,7 @@ class TestMessageOperations:
         next_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
             count=10,
@@ -1188,6 +1215,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1208,6 +1236,7 @@ class TestMessageOperations:
         next_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
             count=10,
