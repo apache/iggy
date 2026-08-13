@@ -1567,8 +1567,17 @@ impl StateHandler for UpdateStreamRequest {
             return ApplyReply::err(UpdateStreamResult::NameAlreadyExists);
         }
 
+        // Decoded before any mutation: a malformed block must leave the stream
+        // untouched rather than half-renamed.
+        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(UpdateStreamResult::InvalidOptionValue);
+        };
+
         state.index.remove(&stream.name);
         stream.name = new_name_arc.clone();
+        // Patch, never replace: keys the client did not send keep their
+        // current value, so a client that predates a key cannot erase it.
+        stream.options.extend(updated_options);
         state.index.insert(new_name_arc, stream_id);
         ApplyReply::ok(Bytes::new())
     }
@@ -1832,14 +1841,21 @@ impl StateHandler for UpdateTopicRequest {
             return ApplyReply::err(UpdateTopicResult::NameAlreadyExists);
         }
 
+        // Decoded before any mutation: a malformed block must leave the topic
+        // untouched rather than half-renamed.
+        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
+        };
+
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
         topic.compression_algorithm =
             CompressionAlgorithm::from_code(self.compression_algorithm).unwrap_or_default();
         topic.message_expiry = IggyExpiry::from(self.message_expiry);
         topic.max_topic_size = MaxTopicSize::from(self.max_topic_size);
-        // `replication_factor` still rides the update wire layout but is
-        // inert: nothing stores it since topics dropped the field.
+        // Patch, never replace: keys the client did not send keep their
+        // current value, so a client that predates a key cannot erase it.
+        topic.options.extend(updated_options);
         stream.topic_index.insert(new_name_arc, topic_id);
         ApplyReply::ok(Bytes::new())
     }

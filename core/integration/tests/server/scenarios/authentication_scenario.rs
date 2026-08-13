@@ -184,7 +184,11 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 .await
                 .map(|_| ()),
             DELETE_USER_CODE => client.delete_user(&ctx.user_id).await,
-            UPDATE_USER_CODE => client.update_user(&ctx.user_id, Some("x"), None).await,
+            UPDATE_USER_CODE => {
+                client
+                    .update_user(&ctx.user_id, Some("x"), None, &UserUpdateOptions::default())
+                    .await
+            }
             UPDATE_PERMISSIONS_CODE => client.update_permissions(&ctx.user_id, None).await,
             CHANGE_PASSWORD_CODE => client.change_password(&ctx.user_id, "old", "new").await,
 
@@ -203,7 +207,11 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_STREAMS_CODE => client.get_streams().await.map(|_| ()),
             CREATE_STREAM_CODE => client.create_stream("x").await.map(|_| ()),
             DELETE_STREAM_CODE => client.delete_stream(&ctx.stream_id).await,
-            UPDATE_STREAM_CODE => client.update_stream(&ctx.stream_id, "x").await,
+            UPDATE_STREAM_CODE => {
+                client
+                    .update_stream(&ctx.stream_id, "x", &StreamUpdateOptions::default())
+                    .await
+            }
             PURGE_STREAM_CODE => client.purge_stream(&ctx.stream_id).await,
 
             // Topics
@@ -232,9 +240,9 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                         &ctx.topic_id,
                         "x",
                         CompressionAlgorithm::None,
-                        None,
                         IggyExpiry::NeverExpire,
                         MaxTopicSize::ServerDefault,
+                        &TopicUpdateOptions::default(),
                     )
                     .await
             }

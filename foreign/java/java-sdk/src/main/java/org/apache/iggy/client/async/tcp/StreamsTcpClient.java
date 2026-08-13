@@ -36,6 +36,9 @@ import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
+import java.util.Map;
+import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderValue;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
@@ -105,6 +108,9 @@ public class StreamsTcpClient implements StreamsClient {
 
         payload.writeBytes(idBytes);
         payload.writeBytes(BytesSerializer.toBytes(name));
+        // Trailing options block. Streams have no catalog keys yet, so the
+        // server rejects every key; the empty block is the extension point.
+        payload.writeBytes(BytesSerializer.toBytes(Map.<HeaderKey, HeaderValue>of()));
 
         return connection().send(CommandCode.Stream.UPDATE.getValue(), payload).thenAccept(ReferenceCounted::release);
     }

@@ -17,6 +17,8 @@
 //
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
+import { serializeOptions, type OptionEntry } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
@@ -43,7 +45,7 @@ export type UpdateTopic = {
   messageExpiry?: bigint,
   /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize?: bigint,
-  /** Replication factor (1-255) */
+  /** Replication factor (1-255), carried as a topic option */
   replicationFactor?: number,
 };
 
@@ -61,7 +63,7 @@ export const UPDATE_TOPIC = {
     compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
-    replicationFactor = 1,
+    replicationFactor,
   }: UpdateTopic) => {
     const streamIdentifier = serializeIdentifier(streamId);
     const topicIdentifier = serializeIdentifier(topicId);
@@ -72,18 +74,27 @@ export const UPDATE_TOPIC = {
     if(!isValidCompressionAlgorithm(compressionAlgorithm))
       throw new Error(`createTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
 
-    const b = Buffer.allocUnsafe(8 + 8 + 1 + 1 + 1);
+    // Only the updatable subset may ride an update; the server rejects the
+    // create-time knobs by name.
+    const options: OptionEntry[] = [];
+    if (replicationFactor !== undefined)
+      options.push({
+        key: 'replication_factor',
+        value: HeaderValue.Uint8(replicationFactor)
+      });
+
+    const b = Buffer.allocUnsafe(8 + 8 + 1 + 1);
     b.writeUInt8(compressionAlgorithm, 0);
     b.writeBigUInt64LE(messageExpiry, 1); // 0 is unlimited ???
     b.writeBigUInt64LE(maxTopicSize, 9); // optional, 0 is null
-    b.writeUInt8(replicationFactor, 17); // must be > 0
-    b.writeUInt8(bName.length, 18);
+    b.writeUInt8(bName.length, 17);
 
     return Buffer.concat([
       streamIdentifier,
       topicIdentifier,
       b,
       bName,
+      serializeOptions(options),
     ]);
   },
 

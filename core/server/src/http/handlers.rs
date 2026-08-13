@@ -106,8 +106,9 @@ use iggy_common::{
     ConsumerGroupDetails, ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, IggyExpiry,
     MaxTopicSize, OptionSpec, OptionsScope, PersonalAccessTokenInfo, PollMessages, PolledMessages,
     RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails,
-    TokenInfo, Topic, TopicCreateOptions, TopicDetails, UserInfo, UserInfoDetails, Validatable,
-    validate_topic_segment_size,
+    StreamUpdateOptions, TokenInfo, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    UPDATABLE_STREAM_OPTION_KEYS, UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS,
+    UserInfo, UserInfoDetails, UserUpdateOptions, Validatable, validate_topic_segment_size,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -118,7 +119,8 @@ use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
-    resolve_consumer_offset_request, resolve_poll_request, validate_topic_bounds,
+    resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
+    validate_topic_bounds,
 };
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
@@ -763,10 +765,19 @@ pub(in crate::http) async fn update_stream(
     Json(command): Json<UpdateStream>,
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let wire_options = StreamUpdateOptions {
+        raw: command.options,
+    }
+    .to_wire();
+    // Same pre-consensus gate the TCP ingress applies: a key this command may
+    // not change is denied here by name rather than riding a log entry.
+    validate_option_keys(&wire_options, UPDATABLE_STREAM_OPTION_KEYS)
+        .map_err(WriteError::Rejected)?;
     let request = UpdateStreamRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
+        options: wire_options,
     };
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
@@ -899,15 +910,24 @@ pub(in crate::http) async fn update_topic(
     let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
     // Also rejects replication_factor == Some(0), which `WireName` cannot see.
     command.validate().map_err(WriteError::Rejected)?;
+    let wire_options = TopicUpdateOptions {
+        replication_factor: command.replication_factor,
+        raw: command.options,
+    }
+    .to_wire();
+    // Same pre-consensus gate the TCP ingress applies: a key this command may
+    // not change is denied here by name rather than riding a log entry.
+    validate_option_keys(&wire_options, UPDATABLE_TOPIC_OPTION_KEYS)
+        .map_err(WriteError::Rejected)?;
     let request = UpdateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
         compression_algorithm: command.compression_algorithm.as_code(),
         message_expiry: command.message_expiry.into(),
         max_topic_size: command.max_topic_size.into(),
-        replication_factor: command.replication_factor.unwrap_or(0),
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
+        options: wire_options,
     };
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
@@ -1459,6 +1479,12 @@ pub(in crate::http) async fn update_user(
     let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
     // Rejects an oversized replacement username; a no-op when username is absent.
     command.validate().map_err(WriteError::Rejected)?;
+    let user_update_options = UserUpdateOptions {
+        raw: command.options,
+    }
+    .to_wire();
+    validate_option_keys(&user_update_options, UPDATABLE_USER_OPTION_KEYS)
+        .map_err(WriteError::Rejected)?;
     let request = UpdateUserRequest {
         user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
         username: command
@@ -1468,6 +1494,7 @@ pub(in crate::http) async fn update_user(
             .transpose()
             .map_err(|_| WriteError::Rejected(IggyError::InvalidUsername))?,
         status: command.status.map(|status| status.as_code()),
+        options: user_update_options,
     };
     let body = request.to_bytes();
     SendWrapper::new(submit_write(

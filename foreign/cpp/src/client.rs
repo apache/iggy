@@ -24,8 +24,9 @@ use iggy::prelude::{
     IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
     IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient, Partitioning,
     Permissions as RustPermissions, PollingStrategy, SegmentClient,
-    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
-    SystemSnapshotType as RustSystemSnapshotType, TopicClient, TopicCreateOptions, UserClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient, StreamUpdateOptions,
+    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
+    TopicCreateOptions, TopicUpdateOptions, UserClient,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -179,7 +180,12 @@ impl Client {
 
         RUNTIME.block_on(async {
             self.inner
-                .update_stream(&rust_stream_id, &stream_name)
+                // Streams have no option keys yet.
+                .update_stream(
+                    &rust_stream_id,
+                    &stream_name,
+                    &StreamUpdateOptions::default(),
+                )
                 .await
                 .map_err(|error| {
                     format!(
@@ -399,9 +405,7 @@ impl Client {
                 )
             })?,
         };
-        // Kept in the FFI signature so the C++ header stays put, but the
-        // protocol no longer carries a replication factor.
-        let _ = replication_factor;
+        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -434,6 +438,7 @@ impl Client {
                 .then_some(rust_message_expiry),
             max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
                 .then_some(rust_max_topic_size),
+            replication_factor: rust_replication_factor,
             ..TopicCreateOptions::default()
         };
 
@@ -533,6 +538,11 @@ impl Client {
                 ));
             }
         };
+        // Replication factor rides the options block now, not a fixed field.
+        let update_options = TopicUpdateOptions {
+            replication_factor: rust_replication_factor,
+            ..TopicUpdateOptions::default()
+        };
         let rust_max_topic_size = match max_topic_size.as_str() {
             "" | "server_default" | "0" => RustMaxTopicSize::ServerDefault,
             _ => RustMaxTopicSize::from_str(&max_topic_size).map_err(|error| {
@@ -549,9 +559,9 @@ impl Client {
                     &rust_topic_id,
                     &topic_name,
                     rust_compression_algorithm,
-                    rust_replication_factor,
                     rust_message_expiry,
                     rust_max_topic_size,
+                    &update_options,
                 )
                 .await
                 .map_err(|error| {

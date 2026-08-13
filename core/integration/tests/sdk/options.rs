@@ -18,6 +18,7 @@
 use iggy::prelude::*;
 use iggy_common::{OptionsScope, topic_option_keys};
 use integration::iggy_harness;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 #[iggy_harness]
@@ -259,4 +260,148 @@ async fn given_explicit_expiry_when_creating_topic_should_echo_provenance(harnes
     // partitions_count never reaches the options map: it is a command field.
     let partitions_key = HeaderKey::from_str("partitions_count").unwrap();
     assert!(!details.options.contains_key(&partitions_key));
+}
+
+#[iggy_harness]
+async fn given_update_options_when_updating_topic_should_patch_not_replace(harness: &TestHarness) {
+    let client = harness.root_client().await.unwrap();
+    client.create_stream("update-stream").await.unwrap();
+    let stream = Identifier::named("update-stream").unwrap();
+    let topic = Identifier::named("update-topic").unwrap();
+
+    client
+        .create_topic(
+            &stream,
+            "update-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                segment_size: Some(IggyByteSize::from(1024 * 1024u64)),
+                enforce_fsync: Some(true),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // A create-time knob is refused by name: nothing re-pushes it to the
+    // partitions, so storing it would read as applied and not be.
+    let create_only = client
+        .update_topic(
+            &stream,
+            &topic,
+            "update-topic",
+            CompressionAlgorithm::None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+            &TopicUpdateOptions {
+                raw: BTreeMap::from([(
+                    topic_option_keys::SEGMENT_SIZE.to_string(),
+                    "2MiB".to_string(),
+                )]),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await;
+    assert!(create_only.is_err(), "segment_size must be create-only");
+
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            "update-topic",
+            CompressionAlgorithm::None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+            &TopicUpdateOptions {
+                replication_factor: Some(4),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let details = client
+        .get_topic(&stream, &topic)
+        .await
+        .unwrap()
+        .expect("topic exists");
+    assert_eq!(details.replication_factor, 4);
+
+    // The keys the update did not mention keep the values create resolved.
+    for (key, expected_explicit) in [
+        (topic_option_keys::REPLICATION_FACTOR, true),
+        (topic_option_keys::SEGMENT_SIZE, true),
+        (topic_option_keys::ENFORCE_FSYNC, true),
+        (topic_option_keys::PREALLOCATE_SEGMENTS, false),
+    ] {
+        let option = details
+            .options
+            .get(&HeaderKey::from_str(key).unwrap())
+            .unwrap_or_else(|| panic!("{key} survives the update"));
+        assert_eq!(option.explicit, expected_explicit, "{key} provenance");
+    }
+    let segment_key = HeaderKey::from_str(topic_option_keys::SEGMENT_SIZE).unwrap();
+    let segment = details.options.get(&segment_key).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(segment.value.as_bytes().try_into().unwrap()),
+        1024 * 1024,
+        "an update must not reset a key it never sent"
+    );
+}
+
+#[iggy_harness]
+async fn given_unknown_key_when_updating_stream_or_user_should_reject(harness: &TestHarness) {
+    let client = harness.root_client().await.unwrap();
+    client.create_stream("opt-stream").await.unwrap();
+
+    // Streams and users have no catalog keys yet, so the update blocks exist
+    // as the extension point and reject every key by name rather than storing
+    // one nothing reads.
+    let stream_rejected = client
+        .update_stream(
+            &Identifier::named("opt-stream").unwrap(),
+            "opt-stream",
+            &StreamUpdateOptions {
+                raw: BTreeMap::from([("future_key".to_string(), "1".to_string())]),
+            },
+        )
+        .await;
+    assert!(stream_rejected.is_err(), "unknown stream key must reject");
+
+    // An empty block still succeeds: that is the plain rename path.
+    client
+        .update_stream(
+            &Identifier::named("opt-stream").unwrap(),
+            "opt-stream-renamed",
+            &StreamUpdateOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    client
+        .create_user("opt-user", "secret123", UserStatus::Active, None)
+        .await
+        .unwrap();
+    let user = Identifier::named("opt-user").unwrap();
+    let user_rejected = client
+        .update_user(
+            &user,
+            Some("opt-user"),
+            None,
+            &UserUpdateOptions {
+                raw: BTreeMap::from([("future_key".to_string(), "1".to_string())]),
+            },
+        )
+        .await;
+    assert!(user_rejected.is_err(), "unknown user key must reject");
+
+    client
+        .update_user(
+            &user,
+            Some("opt-user-renamed"),
+            None,
+            &UserUpdateOptions::default(),
+        )
+        .await
+        .unwrap();
 }

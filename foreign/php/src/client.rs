@@ -126,8 +126,7 @@ impl IggyClient {
     /// Creates a topic.
     ///
     /// Every option left null resolves against the server default at admission.
-    /// `replication_factor` is accepted and ignored: the protocol no longer
-    /// carries one.
+    /// `replication_factor` rides the options block rather than a fixed field.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -144,7 +143,6 @@ impl IggyClient {
         size_of_messages_required_to_save: Option<u64>,
         preallocate_segments: Option<bool>,
     ) -> PhpResult {
-        let _ = replication_factor;
         let compression_algorithm = match compression_algorithm {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
             None => CompressionAlgorithm::default(),
@@ -170,6 +168,7 @@ impl IggyClient {
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
             preallocate_segments,
+            replication_factor,
             ..TopicCreateOptions::default()
         };
 

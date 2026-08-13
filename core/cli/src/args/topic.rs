@@ -190,6 +190,12 @@ pub(crate) struct TopicUpdateArgs {
     /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
+    /// Additional topic option as key=value, repeatable
+    ///
+    /// Only keys an update may change are accepted; the create-time knobs are
+    /// rejected with the key name. Discover them with the options catalog.
+    #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value, verbatim_doc_comment)]
+    pub(crate) set: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -19,7 +19,7 @@ use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
 use crate::{
     BinaryClient, ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions,
-    UserClient, UserInfo, UserInfoDetails, UserStatus,
+    UserClient, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
@@ -112,6 +112,7 @@ impl<B: BinaryClient> UserClient for B {
         user_id: &Identifier,
         username: Option<&str>,
         status: Option<UserStatus>,
+        options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         let wire_id = identifier_to_wire(user_id)?;
@@ -125,6 +126,7 @@ impl<B: BinaryClient> UserClient for B {
                 user_id: wire_id,
                 username: wire_username,
                 status: status.map(|s| s.as_code()),
+                options: options.to_wire(),
             }
             .to_bytes(),
         )

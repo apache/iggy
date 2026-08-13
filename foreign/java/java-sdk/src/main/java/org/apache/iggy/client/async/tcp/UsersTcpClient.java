@@ -38,6 +38,9 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
+import java.util.Map;
+import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderValue;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
@@ -115,6 +118,9 @@ public class UsersTcpClient implements UsersClient {
                     payload.writeByte(s.asCode());
                 },
                 () -> payload.writeByte(0));
+        // Trailing options block. Users have no catalog keys yet, so the
+        // server rejects every key; the empty block is the extension point.
+        payload.writeBytes(toBytes(Map.<HeaderKey, HeaderValue>of()));
 
         return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
     }

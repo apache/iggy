@@ -46,6 +46,8 @@ use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
+#[cfg(feature = "login-session")]
+use iggy_cli::commands::cli_command::DIAGNOSTIC_TARGET;
 use iggy_cli::commands::cli_command::{CliCommand, PRINT_TARGET};
 use iggy_cli::commands::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
@@ -118,6 +120,7 @@ fn get_command(
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(
                 args.stream_id.clone(),
                 args.name.clone(),
+                args.set.iter().cloned().collect(),
             )),
             StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
             StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
@@ -146,6 +149,7 @@ fn get_command(
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
                 args.replication_factor,
+                args.set.iter().cloned().collect(),
             )),
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
@@ -383,7 +387,7 @@ async fn main() -> Result<(), IggyCmdError> {
     // token-name lookup) sees the backend regardless of code-path ordering.
     #[cfg(feature = "login-session")]
     if let Err(e) = ensure_default_store() {
-        tracing::warn!(target: PRINT_TARGET, "keyring backend unavailable: {e}");
+        tracing::warn!(target: DIAGNOSTIC_TARGET, "keyring backend unavailable: {e}");
     }
 
     let command = args.command.clone().unwrap();

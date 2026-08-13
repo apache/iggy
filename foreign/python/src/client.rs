@@ -287,7 +287,13 @@ impl IggyClient {
 
         future_into_py(py, async move {
             inner
-                .update_user(&user_id, username.as_deref(), status)
+                .update_user(
+                    &user_id,
+                    username.as_deref(),
+                    status,
+                    // Users have no option keys yet.
+                    &UserUpdateOptions::default(),
+                )
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
@@ -467,7 +473,7 @@ impl IggyClient {
     ///     name: Topic name as `str`.
     ///     partitions_count: Number of partitions as `int`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
-    ///     replication_factor: Accepted and ignored; no longer part of the protocol.
+    ///     replication_factor: Replication factor, sent as a topic option.
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///     segment_size: Per-topic segment size in bytes as `int | None`.
@@ -522,7 +528,6 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
         options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let _ = replication_factor;
         let (compression_algorithm, expiry, max_size) =
             resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
 
@@ -540,6 +545,7 @@ impl IggyClient {
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
             preallocate_segments,
+            replication_factor,
             raw: options.unwrap_or_default(),
         };
 
@@ -656,6 +662,10 @@ impl IggyClient {
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
+        let update_options = TopicUpdateOptions {
+            replication_factor,
+            ..TopicUpdateOptions::default()
+        };
 
         future_into_py(py, async move {
             inner
@@ -664,9 +674,9 @@ impl IggyClient {
                     &topic_id,
                     &name,
                     compression_algorithm,
-                    replication_factor,
                     expiry,
                     max_size,
+                    &update_options,
                 )
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;

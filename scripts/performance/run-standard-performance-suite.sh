@@ -69,8 +69,9 @@ get_env_vars() {
     # Specific env vars based on bench type
     case "$bench_type" in
     # fsync is a topic creation option (`enforce_fsync`) now, not server config,
-    # and iggy-bench exposes no flag for it, so this variant currently differs
-    # from plain no_cache only by name.
+    # so the bench command carries `--enforce-fsync` (added by
+    # `construct_bench_command` off the same remark) and only the cache setting
+    # is left to the server environment.
     *"no_cache_fsync"*)
         env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
         ;;

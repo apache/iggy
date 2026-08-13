@@ -345,6 +345,12 @@ Options:
 {CLAP_INDENT}
           [default: 1]
 
+      --set <KEY=VALUE>
+          Additional topic option as key=value, repeatable
+{CLAP_INDENT}
+          Only keys an update may change are accepted; the create-time knobs are
+          rejected with the key name. Discover them with the options catalog.
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -376,6 +382,7 @@ Arguments:
 Options:
   -m, --max-topic-size <MAX_TOPIC_SIZE>          New max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
   -r, --replication-factor <REPLICATION_FACTOR>  New replication factor for the topic [default: 1]
+      --set <KEY=VALUE>                          Additional topic option as key=value, repeatable
   -h, --help                                     Print help (see more with '--help')
 "#,
             ),

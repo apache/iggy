@@ -23,6 +23,7 @@ use crate::error::IggyError;
 use crate::utils::expiry::IggyExpiry;
 use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `UpdateTopic` command is used to update a topic in a stream.
 /// It has additional payload:
@@ -31,8 +32,10 @@ use serde::{Deserialize, Serialize};
 /// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
 /// - `max_topic_size` - maximum size of the topic in bytes, if `Unlimited` then topic size is unlimited.
 ///   Can't be lower than segment size in the config.
-/// - `replication_factor` - replication factor for the topic.
+/// - `replication_factor` - replication factor, carried as a topic option.
 /// - `name` - unique topic name, max length is 255 characters.
+/// - `options` - additional option keys as strings; only keys the update path
+///   accepts are allowed.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct UpdateTopic {
     /// Unique stream ID (numeric or name).
@@ -48,10 +51,15 @@ pub struct UpdateTopic {
     /// Max topic size, if `Unlimited` then topic size is unlimited.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
+    /// Replication factor for the topic. Sent as a topic option rather than a
+    /// field of the update command.
     pub replication_factor: Option<u8>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
+    /// Additional topic options as string key-values. Restricted to the keys
+    /// an update may change; anything else is rejected.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 impl Default for UpdateTopic {
@@ -64,6 +72,7 @@ impl Default for UpdateTopic {
             max_topic_size: MaxTopicSize::ServerDefault,
             replication_factor: None,
             name: "topic".to_string(),
+            options: BTreeMap::new(),
         }
     }
 }

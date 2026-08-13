@@ -642,7 +642,17 @@ internal static class TcpContracts
     internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry, byte? replicationFactor)
     {
-        Span<byte> bytes = stackalloc byte[4 + streamId.Length + topicId.Length + 19 + name.Length];
+        // Only the updatable subset may ride an update; the server rejects the
+        // create-time knobs by name.
+        var options = new Dictionary<HeaderKey, HeaderValue>();
+        if (replicationFactor.HasValue)
+        {
+            options[HeaderKey.FromString("replication_factor")] = HeaderValue.FromUInt8(replicationFactor.Value);
+        }
+
+        var optionsLength = HeadersByteLength(options);
+        Span<byte> bytes =
+            stackalloc byte[4 + streamId.Length + topicId.Length + 18 + name.Length + optionsLength];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
         var position = 4 + streamId.Length + topicId.Length;
         bytes[position] = (byte)compressionAlgorithm;
@@ -651,13 +661,12 @@ internal static class TcpContracts
             messageExpiry);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)],
             maxTopicSize);
-        bytes[position + 16] = replicationFactor ?? 0;
-        bytes[position + 17] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 18)..]);
+        bytes[position + 16] = (byte)name.Length;
+        Encoding.UTF8.GetBytes(name, bytes[(position + 17)..(position + 17 + name.Length)]);
+        WriteHeadersTo(bytes[(position + 17 + name.Length)..], options);
         return bytes.ToArray();
     }
 
-    // replicationFactor is kept for API compatibility but is gone from the wire protocol.
     internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
         CompressionAlgorithm compressionAlgorithm, byte? replicationFactor, ulong messageExpiry,
         ulong maxTopicSize)
@@ -677,6 +686,11 @@ internal static class TcpContracts
         if (maxTopicSize != 0)
         {
             options[HeaderKey.FromString("max_topic_size")] = HeaderValue.FromUInt64(maxTopicSize);
+        }
+
+        if (replicationFactor.HasValue)
+        {
+            options[HeaderKey.FromString("replication_factor")] = HeaderValue.FromUInt8(replicationFactor.Value);
         }
 
         var optionsLength = HeadersByteLength(options);

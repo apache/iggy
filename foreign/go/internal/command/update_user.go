@@ -23,6 +23,10 @@ type UpdateUser struct {
 	UserID   iggcon.Identifier  `json:"-"`
 	Username *string            `json:"username"`
 	Status   *iggcon.UserStatus `json:"userStatus"`
+	// Options carries the trailing options block. Users have no catalog keys
+	// yet, so the server rejects every key; the block is the extension point
+	// for the first one.
+	Options []iggcon.HeaderEntry `json:"-"`
 }
 
 func (u *UpdateUser) Code() Code {
@@ -50,7 +54,8 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 		length += 2
 	}
 
-	bytes := make([]byte, length+1)
+	optionsBytes := iggcon.GetHeadersBytes(u.Options)
+	bytes := make([]byte, length+1+len(optionsBytes))
 	position := 0
 
 	copy(bytes[position:position+len(userIdBytes)], userIdBytes)
@@ -79,9 +84,13 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 			statusByte = 2
 		}
 		bytes[position] = statusByte
+		position++
 	} else {
 		bytes[position] = 0
+		position++
 	}
+
+	copy(bytes[position:], optionsBytes)
 
 	return bytes, nil
 }

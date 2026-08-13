@@ -11942,8 +11942,6 @@ dependencies = [
  "human-repr",
  "iggy_binary_protocol",
  "iggy_common",
- "lending-iterator",
- "moka",
  "nix",
  "opentelemetry",
  "opentelemetry-appender-tracing",

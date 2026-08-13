@@ -21,7 +21,8 @@ use async_trait::async_trait;
 use core::fmt;
 use iggy_common::Client;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicUpdateOptions};
+use std::collections::BTreeMap;
 use tracing::{Level, event};
 
 pub struct UpdateTopicCmd {
@@ -29,9 +30,11 @@ pub struct UpdateTopicCmd {
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
     replication_factor: u8,
+    options: TopicUpdateOptions,
 }
 
 impl UpdateTopicCmd {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
@@ -40,6 +43,7 @@ impl UpdateTopicCmd {
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
+        set: BTreeMap<String, String>,
     ) -> Self {
         Self {
             update_topic: UpdateTopic {
@@ -50,10 +54,15 @@ impl UpdateTopicCmd {
                 message_expiry,
                 max_topic_size,
                 replication_factor: Some(replication_factor),
+                options: set.clone(),
             },
             message_expiry,
             max_topic_size,
             replication_factor,
+            options: TopicUpdateOptions {
+                replication_factor: Some(replication_factor),
+                raw: set,
+            },
         }
     }
 }
@@ -66,7 +75,7 @@ impl CliCommand for UpdateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, self.update_topic.compression_algorithm, self.replication_factor.into(), self.message_expiry, self.max_topic_size)
+            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, self.update_topic.compression_algorithm, self.message_expiry, self.max_topic_size, &self.options)
             .await
             .with_context(|| {
                 format!(

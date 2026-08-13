@@ -17,7 +17,7 @@
 
 use crate::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic,
-    TopicCreateOptions, TopicDetails,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use async_trait::async_trait;
 
@@ -58,9 +58,9 @@ pub trait TopicClient {
         topic_id: &Identifier,
         name: &str,
         compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Delete a topic by unique ID or name.
     ///

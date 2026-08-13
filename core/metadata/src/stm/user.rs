@@ -504,6 +504,12 @@ impl StateHandler for UpdateUserRequest {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
         };
 
+        // Decoded before any mutation: a malformed block must leave the user
+        // untouched rather than half-renamed.
+        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(UpdateUserResult::InvalidOptionValue);
+        };
+
         if let Some(new_username) = &self.username {
             // Same bound as CreateUser apply: a rename must not smuggle in a
             // username the edges reject. Rejected before any mutation.
@@ -528,6 +534,9 @@ impl StateHandler for UpdateUserRequest {
         {
             user.status = new_status;
         }
+        // Patch, never replace: keys the client did not send keep their
+        // current value, so a client that predates a key cannot erase it.
+        user.options.extend(updated_options);
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -1577,6 +1586,7 @@ mod tests {
             user_id: WireIdentifier::numeric(alice_id),
             username: Some(WireName::new(&short).unwrap()),
             status: None,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&rename, &mut users, IggyTimestamp::now());
         assert_eq!(reply.code, u32::from(UpdateUserResult::InvalidUsername));

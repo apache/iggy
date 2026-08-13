@@ -25,11 +25,11 @@ use crate::{
     CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode,
     ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
     ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
-    GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, IdentityInfo, IggyByteSize,
-    IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, Partition, Permissions,
-    PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream, StreamDetails,
-    StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints, UserInfo,
-    UserInfoDetails, UserStatus,
+    DEFAULT_REPLICATION_FACTOR, GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind,
+    IdentityInfo, IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue,
+    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
+    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicCreateOptions, TopicDetails,
+    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
 };
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
@@ -144,9 +144,13 @@ impl TryFrom<TopicHeader> for Topic {
             message_expiry,
             compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)?,
             max_topic_size,
-            // Inert since the wire dropped the byte; removed outright once
-            // the client trait surface is reworked.
-            replication_factor: 1,
+            // Mirrors the stored option so the typed field and the options map
+            // never disagree. Absent only for a topic written before the key
+            // existed, which reads as the default.
+            replication_factor: TopicCreateOptions::from_resource_options(&options)
+                .ok()
+                .and_then(|parsed| parsed.replication_factor)
+                .unwrap_or(DEFAULT_REPLICATION_FACTOR),
             options,
         })
     }

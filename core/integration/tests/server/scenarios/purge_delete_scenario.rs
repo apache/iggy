@@ -166,7 +166,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]);
@@ -222,7 +222,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     assert_layout_stable(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]);
@@ -243,7 +243,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]);
@@ -318,7 +318,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     let active_segment_offset = *EXPECTED_SEGMENT_OFFSETS.last().unwrap();
     await_segment_layout(
@@ -431,7 +431,7 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
             .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
             .await
             .unwrap();
-        maybe_restart(harness, restart_server).await;
+        maybe_restart(harness, &client, restart_server).await;
 
         let first_surviving = layout[i + 1];
         // Deletion is asynchronous (metadata commit -> reconciler), so
@@ -726,7 +726,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     assert_layout_stable(&partition_path, EXPECTED_SEGMENT_OFFSETS).await;
 
     // Phase 2: slow→seg0_end, barrier=seg0_end → seg0 released
@@ -753,7 +753,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
 
     // Phase 3: slow→mid-seg1, barrier below seg1_end → seg1 protected
@@ -780,7 +780,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     assert_layout_stable(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
 
     // Phase 4: slow→seg1_end, barrier=seg1_end → seg1 released
@@ -807,7 +807,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]).await;
 
     // Phase 5: slow→last sealed end → every sealed segment released
@@ -834,7 +834,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     await_segment_layout(&partition_path, &active_only).await;
     assert_no_orphaned_segment_files(&partition_path, 1).await;
 
@@ -984,7 +984,7 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     // instant even in the restart cells. Only the kill-lands-mid-purge case
     // earns a tolerance.
     let drained_before_restart = is_dir_empty(&consumers_dir) && is_dir_empty(&groups_dir);
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     // Purge is asynchronous (metadata commit -> reconciler -> pump). The
     // pump's purge resets the partition to a single segment at offset 0 and
@@ -1137,7 +1137,7 @@ pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
     send_messages(&client, &stream_ident, &topic_ident, 3).await;
     poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
 
-    maybe_restart(harness, true).await;
+    maybe_restart(harness, &client, true).await;
 
     // Ride out the boot reconcile pass: an un-hydrated applied generation
     // would re-purge asynchronously, so an immediate poll could still see
@@ -1188,7 +1188,7 @@ pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
 
     // Graceful restart: shutdown force-flushes the committed journal, whose
     // front still holds the five fenced pre-purge batches.
-    maybe_restart(harness, true).await;
+    maybe_restart(harness, &client, true).await;
 
     let polled = poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
     let offsets: Vec<u64> = polled.messages.iter().map(|m| m.header.offset).collect();
@@ -1294,11 +1294,46 @@ async fn assert_layout_stable(partition_path: &str, expected: &[u64]) {
     );
 }
 
-async fn maybe_restart(harness: &mut TestHarness, restart_server: bool) {
-    if restart_server {
-        harness.restart_server().await.unwrap();
+/// Bounce the server and hand back a client that is connected to the new
+/// process.
+///
+/// `TestHarness::restart_server` cycles the clients it owns (disconnect, then
+/// connect once the process is back); this scenario builds its own, so it has to
+/// be cycled explicitly. The disconnect is the part that matters: the client
+/// cannot notice the socket died on its own, so it still reports
+/// `Authenticated`, `connect` short-circuits as a no-op, and the first real call
+/// fails. `TcpClient::send_raw` deliberately does not retry that -- it drops the
+/// connection and returns `Disconnected` for the caller to handle, because a
+/// late reply would desync framing.
+///
+/// Reconnecting is retried rather than attempted once: `ServerHandle::start`
+/// only spawns the process, so the listener is not up yet, and a boot replaying
+/// this scenario's WAL takes longer than any fixed sleep worth hard-coding.
+async fn maybe_restart(harness: &mut TestHarness, client: &IggyClient, restart_server: bool) {
+    if !restart_server {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        return;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let _ = client.disconnect().await;
+    harness.restart_server().await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    loop {
+        // `connect` re-authenticates from the embedded credentials, so a
+        // successful ping means the shards are serving, not merely listening.
+        if client.connect().await.is_ok() && client.ping().await.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not serve again within {POLL_CONVERGENCE_TIMEOUT:?} of restart"
+        );
+        // Back to Disconnected, else the next `connect` no-ops on a half-open
+        // connection and the ping keeps failing until the deadline.
+        let _ = client.disconnect().await;
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
 }
 
 /// Build a root client with SDK-level auto-reconnect and auto-sign-in.

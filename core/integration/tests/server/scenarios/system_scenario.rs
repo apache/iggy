@@ -603,9 +603,12 @@ pub async fn run(harness: &TestHarness) {
             &Identifier::named(TOPIC_NAME).unwrap(),
             &updated_topic_name,
             CompressionAlgorithm::Gzip,
-            Some(updated_replication_factor),
             IggyExpiry::ExpireDuration(message_expiry_duration),
             updated_max_topic_size,
+            &TopicUpdateOptions {
+                replication_factor: Some(updated_replication_factor),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -629,6 +632,16 @@ pub async fn run(harness: &TestHarness) {
         CompressionAlgorithm::Gzip
     );
     assert_eq!(updated_topic.max_topic_size, updated_max_topic_size);
+    // An update's options patch the stored map, so the new replication factor
+    // is what both the typed field and the option report.
+    assert_eq!(updated_topic.replication_factor, updated_replication_factor);
+    let replication_key = HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR).unwrap();
+    let replication = updated_topic
+        .options
+        .get(&replication_key)
+        .expect("replication factor echoes back as an option");
+    assert!(replication.explicit, "an updated key is explicit");
+    assert_eq!(replication.value.as_bytes(), [updated_replication_factor]);
 
     // 39. Purge the existing topic and ensure it has no messages
     client
@@ -672,6 +685,7 @@ pub async fn run(harness: &TestHarness) {
         .update_stream(
             &Identifier::named(STREAM_NAME).unwrap(),
             &updated_stream_name,
+            &StreamUpdateOptions::default(),
         )
         .await
         .unwrap();

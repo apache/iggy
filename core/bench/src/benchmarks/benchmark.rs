@@ -130,10 +130,11 @@ pub trait Benchmarkable: Send {
                 .max_topic_size()
                 .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
             let message_expiry = self.args().message_expiry();
+            let enforce_fsync = self.args().enforce_fsync();
 
             info!(
-                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}",
-                topic_name, stream_name, max_topic_size, message_expiry
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, enforce fsync: {}",
+                topic_name, stream_name, max_topic_size, message_expiry, enforce_fsync
             );
 
             client
@@ -146,6 +147,7 @@ pub trait Benchmarkable: Send {
                             .then_some(message_expiry),
                         max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
                             .then_some(max_topic_size),
+                        enforce_fsync: enforce_fsync.then_some(true),
                         ..TopicCreateOptions::default()
                     },
                 )

@@ -20,17 +20,25 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::Identifier;
+use iggy_common::StreamUpdateOptions;
 use iggy_common::update_stream::UpdateStream;
+use std::collections::BTreeMap;
 use tracing::{Level, event};
 
 pub struct UpdateStreamCmd {
     update_stream: UpdateStream,
+    options: StreamUpdateOptions,
 }
 
 impl UpdateStreamCmd {
-    pub fn new(stream_id: Identifier, name: String) -> Self {
+    pub fn new(stream_id: Identifier, name: String, set: BTreeMap<String, String>) -> Self {
         UpdateStreamCmd {
-            update_stream: UpdateStream { stream_id, name },
+            update_stream: UpdateStream {
+                stream_id,
+                name,
+                options: set.clone(),
+            },
+            options: StreamUpdateOptions { raw: set },
         }
     }
 }
@@ -46,7 +54,11 @@ impl CliCommand for UpdateStreamCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_stream(&self.update_stream.stream_id, &self.update_stream.name)
+            .update_stream(
+                &self.update_stream.stream_id,
+                &self.update_stream.name,
+                &self.options,
+            )
             .await
             .with_context(|| {
                 format!(

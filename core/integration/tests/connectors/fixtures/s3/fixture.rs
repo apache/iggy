@@ -21,6 +21,7 @@ use integration::harness::{TestBinaryError, TestFixture};
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use std::collections::HashMap;
+use std::time::Duration;
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -36,6 +37,9 @@ const MINIO_CONSOLE_PORT: u16 = 9001;
 const MINIO_ACCESS_KEY: &str = "admin";
 const MINIO_SECRET_KEY: &str = "password";
 const MINIO_BUCKET: &str = "iggy-s3-test";
+/// Bounds the wait for MinIO's S3 API to come up behind its health endpoint.
+const BUCKET_CREATE_ATTEMPTS: u32 = 30;
+const BUCKET_CREATE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_S3_PATH";
 const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_S3_STREAMS_0_STREAM";
@@ -204,22 +208,44 @@ impl TestFixture for S3SinkFixture {
             message: format!("Failed to create credentials: {e}"),
         })?;
 
-        let config = s3::BucketConfiguration::default();
-        let response = Bucket::create_with_path_style(
-            MINIO_BUCKET,
-            region.clone(),
-            credentials.clone(),
-            config,
-        )
-        .await
-        .map_err(|e| TestBinaryError::FixtureSetup {
-            fixture_type: "S3SinkFixture".to_string(),
-            message: format!("Failed to create bucket: {e}"),
-        })?;
-        info!(
-            "S3 bucket '{}' ready (status: {})",
-            MINIO_BUCKET, response.response_code
-        );
+        // MinIO answers on its health endpoint before it can serve the S3 API,
+        // so bucket creation can come back 503 while it finishes starting. The
+        // call itself is `Ok` in that case -- the status lives in the response
+        // -- so taking it as success left the bucket absent, and the first
+        // `list_objects` then parsed an S3 error document as a listing and
+        // failed with the unhelpful `missing field 'Name'`. Retry until the
+        // status is a real one: 2xx created, 409 already owned by us.
+        let mut last_status = 0;
+        let mut created = false;
+        for _ in 0..BUCKET_CREATE_ATTEMPTS {
+            let response = Bucket::create_with_path_style(
+                MINIO_BUCKET,
+                region.clone(),
+                credentials.clone(),
+                s3::BucketConfiguration::default(),
+            )
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "S3SinkFixture".to_string(),
+                message: format!("Failed to create bucket: {e}"),
+            })?;
+            last_status = response.response_code;
+            if (200..300).contains(&last_status) || last_status == 409 {
+                created = true;
+                break;
+            }
+            tokio::time::sleep(BUCKET_CREATE_RETRY_DELAY).await;
+        }
+        if !created {
+            return Err(TestBinaryError::FixtureSetup {
+                fixture_type: "S3SinkFixture".to_string(),
+                message: format!(
+                    "Bucket '{MINIO_BUCKET}' not creatable after \
+                     {BUCKET_CREATE_ATTEMPTS} attempts (last status: {last_status})"
+                ),
+            });
+        }
+        info!("S3 bucket '{MINIO_BUCKET}' ready (status: {last_status})");
 
         let mut bucket = Bucket::new(MINIO_BUCKET, region, credentials).map_err(|e| {
             TestBinaryError::FixtureSetup {

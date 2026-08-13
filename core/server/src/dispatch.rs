@@ -74,12 +74,12 @@ use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
-use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
-use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, UpdateTopicRequest};
 use iggy_binary_protocol::requests::users::{
-    CreateUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
+    CreateUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest, UpdateUserRequest,
 };
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
@@ -94,7 +94,8 @@ use iggy_binary_protocol::{
 };
 use iggy_common::{
     IggyByteSize, IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression,
-    SystemSnapshotType, TopicCreateOptions, validate_topic_segment_size,
+    SystemSnapshotType, TopicCreateOptions, UPDATABLE_STREAM_OPTION_KEYS,
+    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -1135,6 +1136,25 @@ async fn handle_client_request<B, MJ, S, SB>(
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|delete_partitions| {
                 validate_partitions_change_count(delete_partitions.partitions_count)
+            }),
+        // Only the updatable subset: the create-time knobs are pushed to
+        // partitions when the topic is built and nothing re-pushes them, so
+        // accepting one here would store a value no partition ever sees.
+        Operation::UpdateTopic => UpdateTopicRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|update_topic| {
+                validate_option_keys(&update_topic.options, UPDATABLE_TOPIC_OPTION_KEYS)?;
+                TopicCreateOptions::parse(&update_topic.options).map(|_| ())
+            }),
+        Operation::UpdateStream => UpdateStreamRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|update_stream| {
+                validate_option_keys(&update_stream.options, UPDATABLE_STREAM_OPTION_KEYS)
+            }),
+        Operation::UpdateUser => UpdateUserRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|update_user| {
+                validate_option_keys(&update_user.options, UPDATABLE_USER_OPTION_KEYS)
             }),
         Operation::CreateStream => CreateStreamRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)

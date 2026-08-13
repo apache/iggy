@@ -261,6 +261,7 @@ impl SimClient {
         let wire = UpdateStreamRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             name: WireName::new(new_name).expect("stream name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateStream, &wire.to_bytes())
     }
@@ -305,8 +306,8 @@ impl SimClient {
             compression_algorithm: 0,
             message_expiry: 0,
             max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(new_name).expect("topic name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateTopic, &wire.to_bytes())
     }
@@ -444,6 +445,7 @@ impl SimClient {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
             username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
             status,
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateUser, &wire.to_bytes())
     }

@@ -60,11 +60,12 @@ pub use iggy_common::{
     PolledMessages, PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
     QuicClientReconnectionConfig, ResourceOptions, SendMessages, SendMessagesConfirmationResponse,
     SendMessagesResponse, Sizeable, SnapshotCompression, Stats, Stream, StreamDetails,
-    StreamPermissions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
-    TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails, TopicPermissions,
-    TransportEndpoints, TransportProtocol, UserId, UserInfo, UserInfoDetails, UserStatus,
-    Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
-    WebSocketClientReconnectionConfig, defaults, locking, topic_option_keys,
+    StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,
+    TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
+    TopicPermissions, TopicUpdateOptions, TransportEndpoints, TransportProtocol, UserId, UserInfo,
+    UserInfoDetails, UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
+    topic_option_keys,
 };
 pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,

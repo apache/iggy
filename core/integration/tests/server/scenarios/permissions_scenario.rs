@@ -400,6 +400,7 @@ async fn test_user_permissions(harness: &TestHarness, root_client: &IggyClient) 
             &Identifier::named("temp-user").unwrap(),
             Some("temp-user-updated"),
             None,
+            &UserUpdateOptions::default(),
         )
         .await
         .expect("manage_users: update_user should work");
@@ -450,7 +451,9 @@ async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient
         "read_streams: create_stream",
     );
     assert_unauthorized(
-        client.update_stream(&stream_id, "new-name").await,
+        client
+            .update_stream(&stream_id, "new-name", &StreamUpdateOptions::default())
+            .await,
         "read_streams: update_stream",
     );
     assert_unauthorized(
@@ -488,7 +491,11 @@ async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient
         .expect("manage_streams: create_stream should work");
 
     client
-        .update_stream(&Identifier::named("temp-stream").unwrap(), "temp-stream-v2")
+        .update_stream(
+            &Identifier::named("temp-stream").unwrap(),
+            "temp-stream-v2",
+            &StreamUpdateOptions::default(),
+        )
         .await
         .expect("manage_streams: update_stream should work");
 
@@ -572,9 +579,9 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
                 &topic_id,
                 "new-name",
                 CompressionAlgorithm::None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
+                &TopicUpdateOptions::default(),
             )
             .await,
         "read_topics: update_topic",
@@ -620,9 +627,9 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
             &Identifier::named("temp-topic").unwrap(),
             "temp-topic-v2",
             CompressionAlgorithm::None,
-            None,
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
+            &TopicUpdateOptions::default(),
         )
         .await
         .expect("manage_topics: update_topic should work");
@@ -1554,9 +1561,9 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
             &Identifier::named("temp-manage-stream-topic").unwrap(),
             "temp-manage-stream-topic-v2",
             CompressionAlgorithm::None,
-            None,
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
+            &TopicUpdateOptions::default(),
         )
         .await
         .expect("stream.manage_stream → manage_topics: update_topic");

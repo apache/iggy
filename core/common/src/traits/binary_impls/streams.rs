@@ -17,7 +17,9 @@
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, streams_from_wire};
-use crate::{BinaryClient, Identifier, IggyError, Stream, StreamClient, StreamDetails};
+use crate::{
+    BinaryClient, Identifier, IggyError, Stream, StreamClient, StreamDetails, StreamUpdateOptions,
+};
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_STREAM_CODE, DELETE_STREAM_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, PURGE_STREAM_CODE,
@@ -78,7 +80,12 @@ impl<B: BinaryClient> StreamClient for B {
         Ok(StreamDetails::try_from(wire_resp)?)
     }
 
-    async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError> {
+    async fn update_stream(
+        &self,
+        stream_id: &Identifier,
+        name: &str,
+        options: &StreamUpdateOptions,
+    ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         let wire_id = identifier_to_wire(stream_id)?;
         let wire_name = WireName::new(name).map_err(|_| IggyError::InvalidFormat)?;
@@ -87,6 +94,7 @@ impl<B: BinaryClient> StreamClient for B {
             UpdateStreamRequest {
                 stream_id: wire_id,
                 name: wire_name,
+                options: options.to_wire(),
             }
             .to_bytes(),
         )

@@ -137,6 +137,13 @@ pub mod topic_option_keys {
     /// [`Self::SEGMENT_SIZE`] -- preallocation reserves exactly that much, so
     /// the two only make sense decided together.
     pub const PREALLOCATE_SEGMENTS: &str = "preallocate_segments";
+    /// Copies of the topic's data the cluster should keep: `Uint8` or a
+    /// decimal string. Stored and echoed back, but nothing acts on it yet --
+    /// replica placement is a cluster-level concern the server does not derive
+    /// from topics. It lives here rather than as a command field precisely
+    /// because of that: an option costs nothing on the wire when unset,
+    /// whereas the fixed byte it replaced rode every `UpdateTopic`.
+    pub const REPLICATION_FACTOR: &str = "replication_factor";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -174,6 +181,9 @@ pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[system.partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
+/// One copy. Was the `replication_factor` byte on the create/update commands,
+/// which every topic reported as `1` because nothing ever stored it.
+pub const DEFAULT_REPLICATION_FACTOR: u8 = 1;
 
 /// Every runtime knob at its default, for a partition built with no resolved
 /// topic options (simulator, unit tests).
@@ -305,7 +315,118 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
     topic_option_keys::MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::PREALLOCATE_SEGMENTS,
+    topic_option_keys::REPLICATION_FACTOR,
 ];
+
+/// The subset of [`TOPIC_OPTION_KEYS`] an `UpdateTopic` options block may
+/// carry.
+///
+/// Deliberately narrow. Two separate reasons keep a key out:
+///
+/// * `compression_algorithm`, `message_expiry` and `max_topic_size` have
+///   dedicated fixed fields on the update layout. Accepting them in the block
+///   too would mean two sources for one setting and a precedence rule nobody
+///   can guess, so sending them here is an error rather than a silent
+///   last-writer-wins.
+/// * The partition runtime knobs (`segment_size`, `enforce_fsync`, both flush
+///   thresholds, `preallocate_segments`) are pushed to partitions when the
+///   topic is built. Nothing re-pushes them on update, so accepting one would
+///   store a value the partitions never see -- a knob that reads as applied
+///   and is not. They stay create-only until that propagation exists.
+///
+/// `replication_factor` is safe precisely because it is inert: it is stored
+/// and echoed, and no partition derives behaviour from it.
+pub const UPDATABLE_TOPIC_OPTION_KEYS: &[&str] = &[topic_option_keys::REPLICATION_FACTOR];
+
+/// Keys an `UpdateStream` options block may carry. Empty because streams have
+/// no catalog keys yet: the block exists so the first one costs a catalog
+/// entry instead of another wire change, and until then every key is rejected
+/// by name rather than stored and ignored.
+pub const UPDATABLE_STREAM_OPTION_KEYS: &[&str] = &[];
+
+/// Keys an `UpdateUser` options block may carry. Empty for the same reason as
+/// [`UPDATABLE_STREAM_OPTION_KEYS`].
+pub const UPDATABLE_USER_OPTION_KEYS: &[&str] = &[];
+
+/// Build an options map from string key-values, all marked explicit.
+///
+/// Shared by the update-options types: their keys are all client-sent, so none
+/// of the derived-provenance handling that create needs applies. Callers that
+/// also have typed fields insert those afterwards, so a typed value wins on
+/// collision and keeps its canonical kind.
+///
+/// # Panics
+///
+/// Panics when a key or value violates the header-field bounds (1..=255
+/// bytes); the wire validator rejects the same inputs immediately after.
+#[must_use]
+fn raw_options_map(raw: &BTreeMap<String, String>) -> ResourceOptions {
+    let mut options = ResourceOptions::new();
+    for (key, value) in raw {
+        options.insert(
+            HeaderKey::from_str(key).expect("raw option key fits a header key"),
+            OptionValue::explicit(
+                HeaderValue::try_from(value.as_str())
+                    .expect("raw option value fits a header value"),
+            ),
+        );
+    }
+    options
+}
+
+/// Encode string key-values into an options block, all marked explicit.
+///
+/// # Panics
+///
+/// See [`raw_options_map`].
+#[must_use]
+fn raw_options_to_wire(raw: &BTreeMap<String, String>) -> WireOptions {
+    crate::wire_conversions::resource_options_to_wire(&raw_options_map(raw), false)
+}
+
+/// The options an `UpdateStream` may carry.
+///
+/// Absent keys leave the stream's existing values alone -- an update patches
+/// the option map, it does not replace it. See [`TopicUpdateOptions`] for why.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamUpdateOptions {
+    /// Keys sent as `String` values. Checked against
+    /// [`UPDATABLE_STREAM_OPTION_KEYS`] server-side.
+    pub raw: BTreeMap<String, String>,
+}
+
+impl StreamUpdateOptions {
+    /// Encode the present keys into an options block.
+    ///
+    /// # Panics
+    ///
+    /// See [`raw_options_to_wire`].
+    #[must_use]
+    pub fn to_wire(&self) -> WireOptions {
+        raw_options_to_wire(&self.raw)
+    }
+}
+
+/// The options an `UpdateUser` may carry. Same patch semantics as
+/// [`StreamUpdateOptions`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserUpdateOptions {
+    /// Keys sent as `String` values. Checked against
+    /// [`UPDATABLE_USER_OPTION_KEYS`] server-side.
+    pub raw: BTreeMap<String, String>,
+}
+
+impl UserUpdateOptions {
+    /// Encode the present keys into an options block.
+    ///
+    /// # Panics
+    ///
+    /// See [`raw_options_to_wire`].
+    #[must_use]
+    pub fn to_wire(&self) -> WireOptions {
+        raw_options_to_wire(&self.raw)
+    }
+}
 
 /// This node's configured fallbacks for the runtime knobs, used to fill the
 /// derived-options block for keys a client did not send.
@@ -352,6 +473,45 @@ impl TopicRuntimeOptions {
     }
 }
 
+/// The options an `UpdateTopic` may carry, as a type that cannot express a
+/// key the update path rejects (see [`UPDATABLE_TOPIC_OPTION_KEYS`]).
+///
+/// Separate from [`TopicCreateOptions`] on purpose: reusing that struct would
+/// let a caller set `segment_size` on an update, encode it, and only learn at
+/// the server that it was refused. Absent keys leave the topic's existing
+/// value alone -- an update patches the option map, it does not replace it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TopicUpdateOptions {
+    /// Copies the cluster should keep. `0` is rejected.
+    pub replication_factor: Option<u8>,
+    /// Keys sent as `String` values, for setting a key this build does not
+    /// know yet. Still checked against the updatable set server-side.
+    pub raw: BTreeMap<String, String>,
+}
+
+impl TopicUpdateOptions {
+    /// Encode the present keys into an options block, in canonical kinds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a `raw` key or value violates the header-field bounds
+    /// (1..=255 bytes), matching [`TopicCreateOptions::to_wire`].
+    #[must_use]
+    pub fn to_wire(&self) -> WireOptions {
+        let mut options = raw_options_map(&self.raw);
+        if let Some(replication_factor) = self.replication_factor {
+            // Inserted after the raw entries so a typed field wins on
+            // collision, and in its canonical kind rather than as a string.
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from(replication_factor)),
+            );
+        }
+        crate::wire_conversions::resource_options_to_wire(&options, false)
+    }
+}
+
 /// Typed view of the known topic option keys, parsed from a wire block.
 ///
 /// `None` means the key was absent, which always means "resolve from server
@@ -384,6 +544,10 @@ pub struct TopicCreateOptions {
     /// Whether this topic's segments reserve their bytes on open; `None`
     /// resolves against [`DEFAULT_PREALLOCATE_SEGMENTS`].
     pub preallocate_segments: Option<bool>,
+    /// Copies the cluster should keep; `None` resolves against
+    /// [`DEFAULT_REPLICATION_FACTOR`]. Stored and echoed, not yet acted on.
+    /// `0` is rejected.
+    pub replication_factor: Option<u8>,
     /// Additional keys sent as `String` values, parsed server-side via the
     /// same rules as config-file values. Lets a client set a key this
     /// build's typed fields do not know yet (e.g. CLI `--set key=value`
@@ -451,6 +615,13 @@ impl TopicCreateOptions {
                 }
                 topic_option_keys::PREALLOCATE_SEGMENTS => {
                     parsed.preallocate_segments = Some(parse_bool(entry, key)?);
+                }
+                topic_option_keys::REPLICATION_FACTOR => {
+                    let factor = parse_u8(entry, key)?;
+                    if factor == 0 {
+                        return Err(IggyError::InvalidOptionValue(key.to_string()));
+                    }
+                    parsed.replication_factor = Some(factor);
                 }
                 _ => return Err(IggyError::UnsupportedOptionKey(key.to_string())),
             }
@@ -537,6 +708,13 @@ impl TopicCreateOptions {
                 OptionValue::explicit(HeaderValue::from(preallocate_segments)),
             );
         }
+        if let Some(replication_factor) = self.replication_factor {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from(replication_factor)),
+            );
+        }
         crate::wire_conversions::resource_options_to_wire(&options, false)
     }
 
@@ -617,6 +795,15 @@ impl TopicCreateOptions {
                 HeaderKey::from_str(topic_option_keys::PREALLOCATE_SEGMENTS)
                     .expect("catalog key is a valid header key"),
                 OptionValue::derived(HeaderValue::from(runtime_defaults.preallocate_segments)),
+            );
+        }
+        if self.replication_factor.is_none() {
+            // Not a `TopicRuntimeDefaults` member: no node-local config backs
+            // it, so every replica derives the same constant.
+            derived.insert(
+                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::derived(HeaderValue::from(DEFAULT_REPLICATION_FACTOR)),
             );
         }
         crate::wire_conversions::resource_options_to_wire(&derived, false)
@@ -702,6 +889,23 @@ fn parse_byte_size(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u64, Ig
 }
 
 /// `Bool` verbatim, or the strings `true` / `false`.
+fn parse_u8(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u8, IggyError> {
+    if entry.value_kind.0 == HeaderKind::Uint8.as_code() {
+        return entry
+            .value
+            .first()
+            .copied()
+            .ok_or_else(|| IggyError::InvalidOptionValue(key.to_string()));
+    }
+    if entry.value_kind.0 == HeaderKind::String.as_code() {
+        return std::str::from_utf8(entry.value)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| IggyError::InvalidOptionValue(key.to_string()));
+    }
+    Err(IggyError::InvalidOptionValue(key.to_string()))
+}
+
 fn parse_bool(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<bool, IggyError> {
     if entry.value_kind.0 == HeaderKind::Bool.as_code() {
         return match entry.value.first() {
@@ -756,6 +960,7 @@ mod tests {
             messages_required_to_save: Some(500),
             size_of_messages_required_to_save: Some(IggyByteSize::from(2_097_152u64)),
             preallocate_segments: Some(false),
+            replication_factor: Some(3),
             partitions_count: None,
             raw: BTreeMap::new(),
         };

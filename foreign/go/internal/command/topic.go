@@ -27,6 +27,7 @@ const (
 	topicOptionCompressionAlgorithm = "compression_algorithm"
 	topicOptionMessageExpiry        = "message_expiry"
 	topicOptionMaxTopicSize         = "max_topic_size"
+	topicOptionReplicationFactor    = "replication_factor"
 )
 
 type CreateTopic struct {
@@ -36,8 +37,8 @@ type CreateTopic struct {
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
 	Name                 string                      `json:"name"`
-	// ReplicationFactor is no longer part of the wire protocol; it is kept
-	// for API compatibility and ignored during serialization.
+	// ReplicationFactor rides the trailing options block rather than a fixed
+	// field of the command.
 	ReplicationFactor *uint8 `json:"replicationFactor"`
 }
 
@@ -78,7 +79,17 @@ func (t *CreateTopic) options() []iggcon.HeaderEntry {
 	if t.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
 	}
+	if t.ReplicationFactor != nil {
+		options = append(options, uint8Option(topicOptionReplicationFactor, *t.ReplicationFactor))
+	}
 	return options
+}
+
+func uint8Option(key string, value uint8) iggcon.HeaderEntry {
+	return iggcon.HeaderEntry{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint8, Value: []byte{value}},
+	}
 }
 
 func uint64Option(key string, value uint64) iggcon.HeaderEntry {
@@ -141,18 +152,27 @@ type UpdateTopic struct {
 	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
-	ReplicationFactor    *uint8                      `json:"replicationFactor"`
-	Name                 string                      `json:"name"`
+	// ReplicationFactor rides the trailing options block rather than a fixed
+	// field of the command.
+	ReplicationFactor *uint8 `json:"replicationFactor"`
+	Name              string `json:"name"`
 }
 
 func (u *UpdateTopic) Code() Code {
 	return UpdateTopicCode
 }
 
-func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
-	if u.ReplicationFactor == nil {
-		u.ReplicationFactor = new(uint8)
+// options builds the trailing options block. Only keys an update may change
+// are allowed; the server rejects the create-time knobs by name.
+func (u *UpdateTopic) options() []iggcon.HeaderEntry {
+	var options []iggcon.HeaderEntry
+	if u.ReplicationFactor != nil {
+		options = append(options, uint8Option(topicOptionReplicationFactor, *u.ReplicationFactor))
 	}
+	return options
+}
+
+func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	streamIdBytes, err := u.StreamId.MarshalBinary()
 	if err != nil {
 		return nil, err
@@ -162,7 +182,8 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 
-	buffer := make([]byte, 19+len(streamIdBytes)+len(topicIdBytes)+len(u.Name))
+	optionsBytes := iggcon.GetHeadersBytes(u.options())
+	buffer := make([]byte, 18+len(streamIdBytes)+len(topicIdBytes)+len(u.Name)+len(optionsBytes))
 
 	offset := 0
 
@@ -178,13 +199,11 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(buffer[offset:], u.MaxTopicSize)
 	offset += 8
 
-	buffer[offset] = *u.ReplicationFactor
-	offset++
-
 	buffer[offset] = uint8(len(u.Name))
 	offset++
 
-	copy(buffer[offset:], u.Name)
+	offset += copy(buffer[offset:], u.Name)
+	copy(buffer[offset:], optionsBytes)
 
 	return buffer, nil
 }

@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic,
-    TopicCreateOptions, TopicDetails,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -70,9 +70,9 @@ impl TopicClient for ClientWrapper {
         topic_id: &Identifier,
         name: &str,
         compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
@@ -82,9 +82,9 @@ impl TopicClient for ClientWrapper {
                         topic_id,
                         name,
                         compression_algorithm,
-                        replication_factor,
                         message_expiry,
                         max_topic_size,
+                        options,
                     )
                     .await
             }
@@ -95,9 +95,9 @@ impl TopicClient for ClientWrapper {
                         topic_id,
                         name,
                         compression_algorithm,
-                        replication_factor,
                         message_expiry,
                         max_topic_size,
+                        options,
                     )
                     .await
             }
@@ -108,9 +108,9 @@ impl TopicClient for ClientWrapper {
                         topic_id,
                         name,
                         compression_algorithm,
-                        replication_factor,
                         message_expiry,
                         max_topic_size,
+                        options,
                     )
                     .await
             }
@@ -121,9 +121,9 @@ impl TopicClient for ClientWrapper {
                         topic_id,
                         name,
                         compression_algorithm,
-                        replication_factor,
                         message_expiry,
                         max_topic_size,
+                        options,
                     )
                     .await
             }
@@ -134,9 +134,9 @@ impl TopicClient for ClientWrapper {
                         topic_id,
                         name,
                         compression_algorithm,
-                        replication_factor,
                         message_expiry,
                         max_topic_size,
+                        options,
                     )
                     .await
             }

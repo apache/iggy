@@ -19,8 +19,9 @@ use iggy::prelude::{
     ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
     Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize,
     MessageClient, PartitionClient, Partitioning, PersonalAccessTokenClient, PollingKind,
-    PollingStrategy, SegmentClient, StreamClient, SystemClient, SystemSnapshotType, TopicClient,
-    TopicCreateOptions, UserClient, UserStatus,
+    PollingStrategy, SegmentClient, StreamClient, StreamUpdateOptions, SystemClient,
+    SystemSnapshotType, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient,
+    UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -95,7 +96,11 @@ impl IggyService {
         Parameters(UpdateStream { stream_id, name }): Parameters<UpdateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        request(self.client.update_stream(&id(&stream_id)?, &name).await)
+        request(
+            self.client
+                .update_stream(&id(&stream_id)?, &name, &StreamUpdateOptions::default())
+                .await,
+        )
     }
 
     #[tool(description = "Delete stream")]
@@ -149,7 +154,7 @@ impl IggyService {
             name,
             partitions_count,
             compression_algorithm,
-            replication_factor: _,
+            replication_factor,
             message_expiry,
             max_size,
         }): Parameters<CreateTopic>,
@@ -176,6 +181,7 @@ impl IggyService {
                             .then_some(message_expiry),
                         max_topic_size: (max_size != MaxTopicSize::ServerDefault)
                             .then_some(max_size),
+                        replication_factor,
                         ..TopicCreateOptions::default()
                     },
                 )
@@ -211,9 +217,12 @@ impl IggyService {
                     &id(&topic_id)?,
                     &name,
                     compression_algorithm,
-                    replication_factor,
                     message_expiry,
                     max_size,
+                    &TopicUpdateOptions {
+                        replication_factor,
+                        ..TopicUpdateOptions::default()
+                    },
                 )
                 .await,
         )
@@ -698,7 +707,12 @@ impl IggyService {
         });
         request(
             self.client
-                .update_user(&id(&user_id)?, username.as_deref(), status)
+                .update_user(
+                    &id(&user_id)?,
+                    username.as_deref(),
+                    status,
+                    &UserUpdateOptions::default(),
+                )
                 .await,
         )
     }

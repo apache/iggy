@@ -57,7 +57,7 @@ export type CreateTopic = {
   sizeOfMessagesRequiredToSave?: bigint,
   /** Preallocate segment files when the topic is created */
   preallocateSegments?: boolean,
-  /** Ignored: replication factor is no longer part of the protocol */
+  /** Replication factor, carried as a topic option */
   replicationFactor?: number
 };
 
@@ -81,7 +81,8 @@ export const CREATE_TOPIC = {
     enforceFsync,
     messagesRequiredToSave,
     sizeOfMessagesRequiredToSave,
-    preallocateSegments
+    preallocateSegments,
+    replicationFactor
   }: CreateTopic
   ) => {
     // Topic ID is now auto-assigned by the server, not sent in the protocol
@@ -134,6 +135,11 @@ export const CREATE_TOPIC = {
       options.push({
         key: 'preallocate_segments',
         value: HeaderValue.Bool(preallocateSegments)
+      });
+    if (replicationFactor !== undefined)
+      options.push({
+        key: 'replication_factor',
+        value: HeaderValue.Uint8(replicationFactor)
       });
 
     const b = Buffer.allocUnsafe(4 + 1);

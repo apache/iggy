@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{DEFAULT_PARTITIONS_COUNT, Topic, TopicCreateOptions, TopicDetails};
+use iggy_common::{
+    DEFAULT_PARTITIONS_COUNT, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+};
 
 #[async_trait]
 impl TopicClient for HttpClient {
@@ -97,9 +99,9 @@ impl TopicClient for HttpClient {
         topic_id: &Identifier,
         name: &str,
         compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         self.put(
             &get_details_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -108,9 +110,10 @@ impl TopicClient for HttpClient {
                 topic_id: topic_id.clone(),
                 name: name.to_string(),
                 compression_algorithm,
-                replication_factor,
                 message_expiry,
                 max_topic_size,
+                replication_factor: options.replication_factor,
+                options: options.raw.clone(),
             },
         )
         .await?;

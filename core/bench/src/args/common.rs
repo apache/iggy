@@ -100,6 +100,12 @@ pub struct IggyBenchArgs {
     /// consumers start with fresh data and accurate latency measurements.
     #[arg(long, default_value_t = false)]
     pub reuse_streams: bool,
+
+    /// Fsync every write on the benchmark topic instead of leaving it to the
+    /// page cache. Set as a topic option at creation, so it has no effect with
+    /// `--reuse-streams` against an already-created topic.
+    #[arg(long, default_value_t = false)]
+    pub enforce_fsync: bool,
 }
 
 impl IggyBenchArgs {
@@ -325,6 +331,10 @@ impl IggyBenchArgs {
 
     pub const fn reuse_streams(&self) -> bool {
         self.reuse_streams
+    }
+
+    pub const fn enforce_fsync(&self) -> bool {
+        self.enforce_fsync
     }
 
     pub fn username(&self) -> &str {

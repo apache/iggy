@@ -148,9 +148,9 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
                     topic_id,
                     "echo-topic",
                     CompressionAlgorithm::None,
-                    None,
                     message_expiry,
                     max_topic_size,
+                    &TopicUpdateOptions::default(),
                 )
                 .await
                 .expect("update topic");
