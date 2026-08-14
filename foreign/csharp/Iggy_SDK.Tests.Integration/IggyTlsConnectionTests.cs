@@ -67,10 +67,11 @@ public class IggyTlsConnectionTests
             ReconnectionSettings = new ReconnectionSettings { Enabled = false }
         });
 
-        // The VSR register handshake runs inside ConnectAsync and dies against the TLS listener, so the
-        // client never reaches the connected state.
+        // Nothing travels at connect time (the roster read is auth-gated away), so the plaintext client
+        // only dies against the TLS listener on its first request: the server drops the connection
+        // without answering a single byte.
         await client.ConnectAsync();
-        await Should.ThrowAsync<NotConnectedException>(client.LoginUserAsync("iggy", "iggy"));
+        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUserAsync("iggy", "iggy"));
     }
 
     [Test]

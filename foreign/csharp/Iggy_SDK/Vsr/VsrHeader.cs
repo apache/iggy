@@ -31,17 +31,19 @@ internal static class VsrHeader
     internal const int SIZE_OFFSET = 48;
     internal const int COMMAND_OFFSET = 60;
 
+    // The client wire carries no routing group: the server derives it (plane from
+    // the operation, partition target from the payload) and stamps it into its own
+    // internal header. Every field past the operation therefore sits eight bytes
+    // earlier than it did while the client header still carried one.
     internal const int REQUEST_CLIENT_OFFSET = 128;
     internal const int REQUEST_TIMESTAMP_OFFSET = 160;
     internal const int REQUEST_ID_OFFSET = 168;
     internal const int REQUEST_OPERATION_OFFSET = 176;
-    internal const int REQUEST_NAMESPACE_OFFSET = 184;
-    internal const int REQUEST_SESSION_OFFSET = 192;
-    internal const int REQUEST_RESERVED_OFFSET = 204;
+    internal const int REQUEST_SESSION_OFFSET = 184;
+    internal const int REQUEST_RESERVED_OFFSET = 196;
 
     internal const int REPLY_OPERATION_OFFSET = 208;
-    internal const int REPLY_NAMESPACE_OFFSET = 216;
-    internal const int REPLY_STATUS_OFFSET = 224;
+    internal const int REPLY_STATUS_OFFSET = 216;
 
     internal const int EVICTION_CLIENT_OFFSET = 128;
     internal const int EVICTION_PROTOCOL_VERSION_OFFSET = 144;
@@ -69,7 +71,6 @@ internal static class VsrHeader
         header.Clear();
 
         var operation = VsrOperations.ForCode(code);
-        var ns = VsrNamespace.ForRequest(code, payload, operation);
 
         if (payload.Length > int.MaxValue - HEADER_SIZE)
         {
@@ -85,7 +86,6 @@ internal static class VsrHeader
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_TIMESTAMP_OFFSET..], 0);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_ID_OFFSET..], frame.RequestId);
         header[REQUEST_OPERATION_OFFSET] = (byte)operation;
-        BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_NAMESPACE_OFFSET..], ns);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_SESSION_OFFSET..], frame.SessionId);
 
         if (operation == VsrOperation.NonReplicated)

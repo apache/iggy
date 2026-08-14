@@ -50,10 +50,10 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int COMMAND_OFFSET = 60;
     private static final int REQUEST_ID_OFFSET = 168;
     private static final int REQUEST_OPERATION_OFFSET = 176;
-    private static final int REQUEST_CODE_OFFSET = 204;
+    private static final int REQUEST_CODE_OFFSET = 196;
     private static final int REPLY_REQUEST_ID_OFFSET = 200;
     private static final int REPLY_OPERATION_OFFSET = 208;
-    private static final int REPLY_STATUS_OFFSET = 224;
+    private static final int REPLY_STATUS_OFFSET = 216;
 
     private static final int COMMAND_REPLY = 8;
     private static final int OPERATION_REGISTER = 1;
@@ -61,7 +61,6 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int OPERATION_LOGOUT = 3;
     private static final int OPERATION_SEND_MESSAGES = 160;
     private static final int PING_CODE = 1;
-    private static final int GET_CLUSTER_METADATA_CODE = 12;
     private static final int LOGIN_CODE = 38;
     private static final int LOGOUT_CODE = 39;
     private static final int SEND_MESSAGES_CODE = 101;
@@ -245,9 +244,9 @@ class AsyncTcpConnectionConcurrencyTest {
                     assertNoRequest(input, socket);
                     writeResponse(output, register, registerBody());
 
-                    Request metadataDuringRegister = readRequest(input);
-                    assertThat(metadataDuringRegister.commandCode()).isEqualTo(GET_CLUSTER_METADATA_CODE);
-                    writeResponse(output, metadataDuringRegister, new byte[0]);
+                    Request pingDuringRegister = readRequest(input);
+                    assertThat(pingDuringRegister.commandCode()).isEqualTo(PING_CODE);
+                    writeResponse(output, pingDuringRegister, new byte[0]);
 
                     Request logout = readRequest(input);
                     assertThat(logout.operation()).isEqualTo(OPERATION_LOGOUT);
@@ -256,9 +255,9 @@ class AsyncTcpConnectionConcurrencyTest {
                     assertNoRequest(input, socket);
                     writeResponse(output, logout, new byte[0]);
 
-                    Request metadataDuringLogout = readRequest(input);
-                    assertThat(metadataDuringLogout.commandCode()).isEqualTo(GET_CLUSTER_METADATA_CODE);
-                    writeResponse(output, metadataDuringLogout, new byte[0]);
+                    Request pingDuringLogout = readRequest(input);
+                    assertThat(pingDuringLogout.commandCode()).isEqualTo(PING_CODE);
+                    writeResponse(output, pingDuringLogout, new byte[0]);
                 } catch (InterruptedException error) {
                     Thread.currentThread().interrupt();
                     registerRead.completeExceptionally(error);
@@ -276,19 +275,19 @@ class AsyncTcpConnectionConcurrencyTest {
                 connection.connect().get(5, TimeUnit.SECONDS);
                 CompletableFuture<ByteBuf> login = connection.send(LOGIN_CODE, loginPayload());
                 registerRead.get(5, TimeUnit.SECONDS);
-                CompletableFuture<ByteBuf> metadataDuringRegister =
-                        connection.send(GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+                // Ping needs no session, so the probe waits only for the lease
+                // and never for lazy authentication.
+                CompletableFuture<ByteBuf> pingDuringRegister = connection.send(PING_CODE, Unpooled.EMPTY_BUFFER);
                 registerConcurrentSendStarted.complete(null);
                 login.get(5, TimeUnit.SECONDS).release();
-                metadataDuringRegister.get(5, TimeUnit.SECONDS).release();
+                pingDuringRegister.get(5, TimeUnit.SECONDS).release();
 
                 CompletableFuture<ByteBuf> logout = connection.send(LOGOUT_CODE, Unpooled.EMPTY_BUFFER);
                 logoutRead.get(5, TimeUnit.SECONDS);
-                CompletableFuture<ByteBuf> metadataDuringLogout =
-                        connection.send(GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+                CompletableFuture<ByteBuf> pingDuringLogout = connection.send(PING_CODE, Unpooled.EMPTY_BUFFER);
                 logoutConcurrentSendStarted.complete(null);
                 logout.get(5, TimeUnit.SECONDS).release();
-                metadataDuringLogout.get(5, TimeUnit.SECONDS).release();
+                pingDuringLogout.get(5, TimeUnit.SECONDS).release();
             } finally {
                 connection.close().get(5, TimeUnit.SECONDS);
             }

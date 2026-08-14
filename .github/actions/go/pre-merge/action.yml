@@ -128,9 +128,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e.pid
         log-file: ${{ runner.temp }}/iggy-go-e2e.log
@@ -184,9 +182,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e-tls.pid
         log-file: ${{ runner.temp }}/iggy-go-e2e-tls.log
@@ -215,7 +211,7 @@ runs:
         pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
         log-file: ${{ steps.iggy-tls.outputs.log_file }}
 
-    # Both replicas of the roster in `core/server-ng/config.toml`, not just this
+    # Both replicas of the roster in `core/server/config.toml`, not just this
     # one: a two-replica cluster commits on 2 acks (`quorum_replication`), so a
     # lone node journals every op and commits none, and each client request
     # blocks until it times out.
@@ -224,9 +220,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-cluster-0.pid
         log-file: ${{ runner.temp }}/iggy-go-cluster-0.log
@@ -240,8 +234,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         replica-id: "1"
         tcp_address: 127.0.0.1:8091
         http_address: 127.0.0.1:3001

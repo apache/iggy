@@ -1950,7 +1950,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.7.1-edge.1"
+version = "0.8.0-edge.1"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "bench-report"
-version = "0.3.1-edge.1"
+version = "0.4.0-edge.1"
 dependencies = [
  "charming",
  "colored",
@@ -3198,7 +3198,6 @@ dependencies = [
  "static-toml",
  "strum 0.28.0",
  "tracing",
- "tungstenite 0.30.0",
 ]
 
 [[package]]
@@ -6624,7 +6623,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.0-edge.1"
+version = "0.11.0-edge.2"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6658,7 +6657,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.0-edge.1"
+version = "0.6.0-edge.2"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -6687,7 +6686,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.7.1-edge.1"
+version = "0.8.0-edge.1"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -6715,7 +6714,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.0-edge.1"
+version = "0.14.0-edge.2"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6749,7 +6748,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -6801,7 +6800,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -6835,7 +6834,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.0-edge.1"
+version = "0.11.0-edge.2"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6848,7 +6847,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.0-edge.1"
+version = "0.11.0-edge.2"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -6884,7 +6883,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_clickhouse_sink"
-version = "0.2.0-edge.1"
+version = "0.2.0-edge.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6902,7 +6901,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_delta_sink"
-version = "0.2.0-edge.1"
+version = "0.2.0-edge.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6919,7 +6918,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_doris_sink"
-version = "0.2.0-edge.1"
+version = "0.2.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -6939,7 +6938,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -6957,7 +6956,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_source"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -6975,7 +6974,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_http_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -6997,7 +6996,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "arrow-json 57.3.1",
  "async-trait",
@@ -7016,7 +7015,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -7037,7 +7036,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_source"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
@@ -7063,7 +7062,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_meilisearch_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -7081,7 +7080,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_mongodb_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "humantime",
@@ -7097,7 +7096,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7116,7 +7115,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_source"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -7138,7 +7137,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_quickwit_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7152,7 +7151,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_random_source"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7169,7 +7168,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_s3_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -7190,7 +7189,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.3.1-edge.1"
+version = "0.4.0-edge.1"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -7226,7 +7225,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_stdout_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7238,7 +7237,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_surrealdb_sink"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -7489,7 +7488,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "server",
  "sqlx",
  "sysinfo 0.39.6",
  "tempfile",
@@ -8490,6 +8488,7 @@ dependencies = [
  "left-right",
  "message_bus",
  "paste",
+ "rmp",
  "rmp-serde",
  "serde",
  "server_common",
@@ -9555,10 +9554,12 @@ dependencies = [
  "iggy_common",
  "journal",
  "message_bus",
+ "nix",
  "papaya",
  "ringbuffer",
  "server_common",
  "smallvec",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -11839,72 +11840,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.8.2-edge.1"
-dependencies = [
- "ahash 0.8.12",
- "anyhow",
- "async-channel",
- "async_zip",
- "axum",
- "axum-server",
- "bytes",
- "chrono",
- "clap",
- "compio",
- "configs",
- "ctrlc",
- "cyper",
- "cyper-axum",
- "dashmap",
- "dotenvy",
- "err_trail",
- "error_set",
- "figlet-rs",
- "flume",
- "fs2",
- "futures",
- "hash32 1.0.0",
- "human-repr",
- "iggy_binary_protocol",
- "iggy_common",
- "jsonwebtoken",
- "left-right",
- "mimalloc",
- "mime_guess",
- "nix",
- "papaya",
- "prometheus-client",
- "ringbuffer",
- "rmp-serde",
- "rust-embed",
- "rustls",
- "rustls-pemfile",
- "sd-notify",
- "secrecy",
- "send_wrapper",
- "serde",
- "serde_json",
- "server_common",
- "shard_allocator",
- "slab",
- "socket2 0.6.5",
- "strum 0.28.0",
- "sysinfo 0.39.6",
- "system_stats",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml 1.1.3+spec-1.1.0",
- "tower-http 0.7.0",
- "tracing",
- "ulid",
- "uuid",
- "vergen-git2",
-]
-
-[[package]]
-name = "server-ng"
-version = "0.9.0-edge.2"
+version = "0.9.0-edge.3"
 dependencies = [
  "ahash 0.8.12",
  "argon2",
@@ -11963,6 +11899,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pemfile",
+ "sd-notify",
  "secrecy",
  "send_wrapper",
  "serde",
@@ -12249,7 +12186,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_xoshiro",
  "secrecy",
- "server-ng",
+ "server",
  "server_common",
  "shard",
  "strum 0.28.0",

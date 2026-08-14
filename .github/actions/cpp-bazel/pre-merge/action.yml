@@ -84,11 +84,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        # The C++ bindings are vsr-built, so e2e runs against the vsr server.
-        # TODO(hubcio): change to iggy-server once legacy server is removed
-        # (core/server has VSR support)
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
 
     - name: Run e2e tests
       if: inputs.task == 'e2e'

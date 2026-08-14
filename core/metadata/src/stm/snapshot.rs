@@ -15,11 +15,51 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::IGGY_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
+
+/// The version of the snapshot format in use, reserved for breaking changes.
+///
+/// One version means exactly one serialized shape, and [`MetadataSnapshot::decode`]
+/// accepts nothing else. Bump it in the same change that alters the shape: append,
+/// remove, reorder, retype, or redefine the meaning of any field, at any depth
+/// under [`MetadataSnapshot`]. There is no accepted range and no per-version
+/// translation. A snapshot this build cannot read is refused, not best-effort
+/// decoded.
+///
+/// Nothing softer would hold. msgpack encodes a struct positionally, so a field one
+/// build appends reaches another as an unexplained extra array element; without the
+/// version the reader either fails on an unrelated msgpack error or, for a
+/// same-length change, silently reads one field's bytes as another's.
+///
+/// Bumping it invalidates every `snapshot.bin` already on disk, and a node whose
+/// snapshot is refused refuses boot. That is deliberate. The metadata plane is
+/// pre-production, so the cost is clearing a data directory; once it ships, a bump
+/// needs an explicit translation path added here alongside it.
+///
+/// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
+/// `namespace` word before it), which the client table's cached replies embed as raw
+/// wire bytes msgpack cannot introspect.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+
+/// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
+/// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
+/// renders it as `major.minor.patch`.
+///
+/// Provenance, never a gate. The format version says whether the bytes are
+/// readable; this says which build produced them, which matters most for a snapshot
+/// that arrived over state transfer from a machine whose build this node otherwise
+/// has no record of.
+///
+/// A build constant, identical on every replica, so two replicas holding identical
+/// state still serialize identically (see [`MetadataSnapshot`]).
+pub const SNAPSHOT_WRITER_RELEASE: u32 = IGGY_PROTOCOL_VERSION;
+
+const _: () = assert!(SNAPSHOT_WRITER_RELEASE > 0);
 
 #[derive(Debug)]
 pub enum SnapshotError {
@@ -42,6 +82,12 @@ pub enum SnapshotError {
     ChecksumMismatch { expected: u128, actual: u128 },
     /// Snapshot file is too short to contain a valid checksum.
     Truncated { size: u64 },
+    /// The snapshot was written in a format version this build does not read: a
+    /// different build wrote it, on this disk or on a state-transfer peer. Refuse it
+    /// rather than let msgpack read one field's bytes as another's. The version is
+    /// peeked ahead of the rest of the payload, so this fires even when nothing past
+    /// it is recognizable.
+    UnsupportedFormatVersion { found: u32, expected: u32 },
     /// A state-transfer descriptor's frontiers contradict its artifacts: a
     /// `commit_op` below the snapshot the same offer ships, or a client-table
     /// frontier above that commit point. Both are impossible from a
@@ -93,6 +139,13 @@ impl fmt::Display for SnapshotError {
                     "snapshot file truncated: {size} bytes (too short for checksum)"
                 )
             }
+            Self::UnsupportedFormatVersion { found, expected } => {
+                write!(
+                    f,
+                    "snapshot format version {found} is incompatible with this build, which \
+                     reads version {expected}"
+                )
+            }
             Self::IncoherentManifest {
                 snapshot_seq,
                 commit_op,
@@ -116,6 +169,7 @@ impl std::error::Error for SnapshotError {
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
             Self::ChecksumMismatch { .. }
             | Self::Truncated { .. }
+            | Self::UnsupportedFormatVersion { .. }
             | Self::IncoherentManifest { .. } => None,
         }
     }
@@ -140,8 +194,12 @@ impl From<std::io::Error> for SnapshotError {
 /// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
-    /// Snapshot format version for forward/backward compatibility.
-    /// TODO(krishvishal): Properly handle versioning for snapshot. This is a placeholder for now.
+    /// The version of the snapshot format in use, reserved for breaking changes.
+    /// See [`SNAPSHOT_FORMAT_VERSION`]; [`Self::decode`] refuses anything else.
+    ///
+    /// First field deliberately: msgpack encodes the struct positionally, so this is
+    /// the one element [`peek_format_version`] can pull out before it knows the rest
+    /// of the layout.
     pub version: u32,
     /// Timestamp when the snapshot was created (microseconds since epoch).
     pub created_at: u64,
@@ -154,10 +212,11 @@ pub struct MetadataSnapshot {
     pub streams: Option<StreamsSnapshot>,
     /// Client-table state (sessions + at-most-once dedup replies) at the checkpoint
     /// op. Not a state machine, but folded in so a restart that drained the WAL
-    /// prefix still recovers pre-checkpoint sessions. `#[serde(default)]` so a
-    /// snapshot predating this field decodes as `None`.
-    #[serde(default)]
+    /// prefix still recovers pre-checkpoint sessions.
     pub client_table: Option<consensus::ClientTableSnapshot>,
+    /// The release that wrote this snapshot, as a packed `iggy_binary_protocol`
+    /// semver. Provenance only, never a gate. See [`SNAPSHOT_WRITER_RELEASE`].
+    pub writer_release: u32,
 }
 
 impl Default for MetadataSnapshot {
@@ -171,7 +230,7 @@ impl MetadataSnapshot {
     #[must_use]
     pub const fn new(sequence_number: u64) -> Self {
         Self {
-            version: 1,
+            version: SNAPSHOT_FORMAT_VERSION,
             // Deterministic placeholder. The real creation time is stamped by
             // `Snapshot::create` from the consensus-injected clock (see
             // `VsrConsensus::clock_realtime_micros`) so a replayed simulator
@@ -182,6 +241,7 @@ impl MetadataSnapshot {
             users: None,
             streams: None,
             client_table: None,
+            writer_release: SNAPSHOT_WRITER_RELEASE,
         }
     }
 
@@ -193,13 +253,49 @@ impl MetadataSnapshot {
         rmp_serde::to_vec(self).map_err(SnapshotError::Serialize)
     }
 
-    /// Decode a snapshot from msgpack bytes.
+    /// Decode a snapshot from msgpack bytes, refusing a format version this build
+    /// does not read.
+    ///
+    /// The version is checked before the payload is deserialized, so a snapshot
+    /// whose layout past that field is unknown is refused by version rather than by
+    /// whichever later field happened to misparse.
     ///
     /// # Errors
-    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails.
+    /// [`SnapshotError::UnsupportedFormatVersion`] when the stamped version is not
+    /// [`SNAPSHOT_FORMAT_VERSION`], or [`SnapshotError::Deserialize`] if msgpack
+    /// deserialization fails.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        // Bytes carrying no readable version are not a snapshot at all, so they fall
+        // through to the deserializer, whose error names what actually went wrong.
+        if let Some(version) = peek_format_version(bytes)
+            && version != SNAPSHOT_FORMAT_VERSION
+        {
+            return Err(SnapshotError::UnsupportedFormatVersion {
+                found: version,
+                expected: SNAPSHOT_FORMAT_VERSION,
+            });
+        }
         rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)
     }
+}
+
+/// The format version stamped in encoded snapshot bytes, read without decoding the
+/// rest of them.
+///
+/// `None` for anything that is not a msgpack array whose first element is an
+/// unsigned integer, which covers every input that is not a snapshot.
+///
+/// Reading the version on its own is what keeps the check working across a layout
+/// change: deserializing the whole struct first would let some later field fail and
+/// report a msgpack error naming no version, which is the difference between "this
+/// file came from a newer build" and "this file is corrupt". `journal::superblock`
+/// reads its own version field the same way, ahead of the length and checksum it
+/// cannot yet trust.
+#[must_use]
+pub fn peek_format_version(encoded: &[u8]) -> Option<u32> {
+    let mut cursor = encoded;
+    rmp::decode::read_array_len(&mut cursor).ok()?;
+    rmp::decode::read_int(&mut cursor).ok()
 }
 
 /// Trait for metadata snapshot implementations.
@@ -435,9 +531,134 @@ mod tests {
         let decoded = MetadataSnapshot::decode(&encoded).unwrap();
 
         assert_eq!(decoded.sequence_number, 42);
+        assert_eq!(decoded.version, SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(decoded.writer_release, SNAPSHOT_WRITER_RELEASE);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
         assert!(decoded.client_table.is_none());
+    }
+
+    #[test]
+    fn encoded_shape_is_pinned_to_the_format_version() {
+        // The gate is only as good as the discipline that bumps it, and nothing else
+        // fails when a field is appended and the bump is forgotten. msgpack encodes
+        // positionally, so the element count is the shape's fingerprint: pinning it
+        // turns "shape changed, version did not" into a failing test rather than an
+        // operator's boot reading one field's bytes as another's. Changing either
+        // number is the reminder to change the other.
+        const FIELD_COUNT: u32 = 7;
+        const PINNED_VERSION: u32 = 2;
+
+        let encoded = MetadataSnapshot::new(0).encode().unwrap();
+        let mut cursor = encoded.as_slice();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut cursor).unwrap(),
+            FIELD_COUNT,
+            "MetadataSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+        assert_eq!(
+            SNAPSHOT_FORMAT_VERSION, PINNED_VERSION,
+            "SNAPSHOT_FORMAT_VERSION moved; confirm the shape moved with it"
+        );
+    }
+
+    #[test]
+    fn a_build_decodes_what_it_writes() {
+        // Exact-equality versioning makes this the one thing that could go wrong
+        // silently: a stamp the writer picks and the reader rejects would refuse every
+        // node its own snapshot on the next boot.
+        let encoded = MetadataSnapshot::new(5).encode().unwrap();
+        MetadataSnapshot::decode(&encoded).expect("a build must read its own snapshot");
+    }
+
+    #[test]
+    fn release_stamp_is_a_build_constant() {
+        // Two replicas holding identical state must serialize identically, which a
+        // per-node or per-write release stamp would break.
+        assert_eq!(
+            MetadataSnapshot::new(1).encode().unwrap(),
+            MetadataSnapshot::new(1).encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn encoded_snapshot_leads_with_the_version_element() {
+        // `peek_format_version` rests on this shape: a msgpack array (`rmp_serde`'s
+        // compact struct encoding) whose first element is `version`. Switching to
+        // `to_vec_named` would encode a map instead and silently blind the peek, so
+        // pin it here.
+        let encoded = MetadataSnapshot::new(3).encode().unwrap();
+        assert_eq!(
+            encoded[0] & 0xf0,
+            0x90,
+            "snapshot must encode as a msgpack fixarray"
+        );
+        assert_eq!(
+            peek_format_version(&encoded),
+            Some(SNAPSHOT_FORMAT_VERSION),
+            "the first array element must be the format version"
+        );
+    }
+
+    #[test]
+    fn peek_format_version_ignores_bytes_that_are_not_a_snapshot() {
+        assert_eq!(peek_format_version(&[]), None);
+        // A msgpack string, not an array.
+        assert_eq!(peek_format_version(&[0xa1, b'x']), None);
+        // An array whose first element is not an unsigned integer.
+        assert_eq!(peek_format_version(&[0x91, 0xc0]), None);
+    }
+
+    #[test]
+    fn decode_refuses_any_other_format_version() {
+        // Newer and older alike: there is no accepted window, so both directions are
+        // the same refusal. Version 0 is what a zeroed or absent stamp reads as.
+        for forged in [SNAPSHOT_FORMAT_VERSION + 1, 0] {
+            let mut snapshot = MetadataSnapshot::new(9);
+            snapshot.version = forged;
+            let encoded = snapshot.encode().unwrap();
+
+            match MetadataSnapshot::decode(&encoded) {
+                Err(SnapshotError::UnsupportedFormatVersion { found, expected }) => {
+                    assert_eq!(found, forged);
+                    assert_eq!(expected, SNAPSHOT_FORMAT_VERSION);
+                }
+                other => panic!("expected an unsupported-version refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_refuses_a_shape_change_by_version_not_by_msgpack() {
+        // The reason the version is peeked instead of read off the decoded struct: a
+        // future build's layout need not decode at all under this one, and the refusal
+        // must still name the version rather than whichever field happened to
+        // misparse. Emulated by appending an element, which is what a field append
+        // looks like on the wire.
+        let mut snapshot = MetadataSnapshot::new(4);
+        snapshot.version = SNAPSHOT_FORMAT_VERSION + 1;
+        let current = snapshot.encode().unwrap();
+        assert_eq!(current[0] & 0xf0, 0x90, "expected a msgpack fixarray");
+        let mut future = vec![0x90 | ((current[0] & 0x0f) + 1)];
+        future.extend_from_slice(&current[1..]);
+        future.push(0xc0);
+
+        match MetadataSnapshot::decode(&future) {
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. }) => {
+                assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+            }
+            other => panic!("expected an unsupported-version refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_reports_deserialization_when_no_version_is_readable() {
+        // Bytes carrying no version field are corruption, not a version skew, and the
+        // msgpack error names that far better than a fabricated version would.
+        match MetadataSnapshot::decode(&[0xa3, b'n', b'o', b'!']) {
+            Err(SnapshotError::Deserialize(_)) => {}
+            other => panic!("expected a deserialization error, got {other:?}"),
+        }
     }
 
     #[test]

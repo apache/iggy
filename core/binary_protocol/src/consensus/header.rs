@@ -32,6 +32,12 @@
 //! mixed pair is dropped, so no view change reaches a quorum. Nothing enforces this,
 //! because there is nothing left to enforce it with; this note is the declaration.
 //!
+//! The forwarding commands at discriminants 26 through 29 are same-release
+//! replica messages. A build whose command bit-pattern predates them drops the
+//! frames as unparsable and never sends a result, so backup-dialed session
+//! operations wait for their forward timeout in a mixed fleet. These commands are
+//! another reason the release cannot be rolled node by node.
+//!
 //! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
 //! `checksum` as their view-independent identity, and the three client-facing
 //! headers are sealed on neither side, so SDKs are untouched.
@@ -272,7 +278,6 @@ pub struct RequestHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
     /// Session fence epoch: the commit op of the latest committed `Register`
     /// for this `client`. Handed to the client by that register's reply and
     /// echoed on every subsequent request.
@@ -293,7 +298,7 @@ pub struct RequestHeader {
     /// The submitter's wire value is never trusted. Zero for `Logout`,
     /// partition-plane, and server-internal ops.
     pub user_id: u32,
-    pub reserved: [u8; 52],
+    pub reserved: [u8; 60],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -304,8 +309,87 @@ const _: () = {
     assert!(
         offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 52]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 60]>() == HEADER_SIZE);
 };
+
+/// A [`RequestHeader`] AFTER the receiving node resolved its target.
+///
+/// The server-internal shape a client request travels in between shards
+/// (and follower to primary), never on the client wire. `group` carries the
+/// resolved consensus group so the owner shard can route, park, and fence
+/// WITHOUT re-decoding the payload -- clients no longer send any namespace
+/// (it is derived: plane from `operation`, partition group from the body),
+/// so this is where the derivation result lives for the internal hop.
+///
+/// Layout: identical to [`RequestHeader`] with `group` claiming the LAST
+/// eight reserved bytes (the tail, bytes 248..256); the leading 52 reserved
+/// bytes keep their client-wire meaning, so promotion is a same-size copy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct RoutedRequestHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub client: u128,
+    pub request_checksum: u128,
+    pub timestamp: u64,
+    pub request: u64,
+    pub operation: Operation,
+    pub operation_padding: [u8; 7],
+    pub session: u64,
+    pub user_id: u32,
+    /// Same offset and meaning as the leading 52 bytes of
+    /// `RequestHeader::reserved` -- this region CARRIES DATA (the
+    /// non-replicated op code range), so `group` must not displace it.
+    pub reserved: [u8; 52],
+    /// The resolved consensus group id (see `binary_protocol::namespace`),
+    /// claiming the TAIL of the client header's reserved area.
+    pub group: u64,
+}
+const _: () = {
+    assert!(size_of::<RoutedRequestHeader>() == HEADER_SIZE);
+    // Every field shared with `RequestHeader` sits at the same offset --
+    // including the data-bearing prefix of `reserved` (the non-replicated
+    // code range) -- so promotion preserves everything a client sent.
+    assert!(offset_of!(RoutedRequestHeader, client) == offset_of!(RequestHeader, client));
+    assert!(offset_of!(RoutedRequestHeader, session) == offset_of!(RequestHeader, session));
+    assert!(offset_of!(RoutedRequestHeader, user_id) == offset_of!(RequestHeader, user_id));
+    assert!(offset_of!(RoutedRequestHeader, reserved) == offset_of!(RequestHeader, reserved));
+    assert!(offset_of!(RoutedRequestHeader, group) + size_of::<u64>() == HEADER_SIZE);
+};
+
+impl Default for RoutedRequestHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Command2::Reserved,
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: 0,
+            request_checksum: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Operation::Reserved,
+            operation_padding: [0; 7],
+            session: 0,
+            user_id: 0,
+            reserved: [0; 52],
+            group: 0,
+        }
+    }
+}
 
 impl Default for RequestHeader {
     fn default() -> Self {
@@ -325,11 +409,104 @@ impl Default for RequestHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
             session: 0,
             user_id: 0,
-            reserved: [0; 52],
+            reserved: [0; 60],
         }
+    }
+}
+
+/// Field rules shared by the client-wire [`RequestHeader`] and the
+/// server-internal [`RoutedRequestHeader`]. The routed shape is decoded
+/// straight off the peer wire (`MessageBag`), so it must reject everything
+/// the client boundary rejects; validating only the command byte there
+/// would let a peer frame carry `client = 0` into the client table's hard
+/// assert, or `operation = Reserved` into a cached-register replay.
+fn validate_request_fields(
+    client: u128,
+    operation: Operation,
+    session: u64,
+    request: u64,
+) -> Result<(), ConsensusError> {
+    if client == 0 {
+        return Err(ConsensusError::InvalidField(
+            "request: client must be != 0".to_string(),
+        ));
+    }
+    // Reserved is the zero value, never a real client op
+    // (`is_client_allowed` rejects it). Refusing it here rather than after
+    // the dedup preflight matters: a bound client sending
+    // `Reserved, request = 0` used to pass validation, reach
+    // `request_preflight`, hit its own watermark and get its register
+    // reply replayed before the operation gate ever ran.
+    if operation == Operation::Reserved {
+        return Err(ConsensusError::InvalidField(
+            "operation must not be Reserved".to_string(),
+        ));
+    }
+    // Register: session must be 0, request must be 0.
+    // NonReplicated: sessionless by design (the `ClientTable` ignores
+    // these ops and the server routes/auth-gates them by transport id),
+    // so a pre-register client may legitimately send session 0 --
+    // ping must work before authentication.
+    // Other non-register ops: session must be > 0, request must be > 0.
+    if operation == Operation::Register {
+        if session != 0 {
+            return Err(ConsensusError::InvalidField(
+                "register: session must be 0".to_string(),
+            ));
+        }
+        if request != 0 {
+            return Err(ConsensusError::InvalidField(
+                "register: request must be 0".to_string(),
+            ));
+        }
+    } else if operation != Operation::NonReplicated {
+        if session == 0 {
+            return Err(ConsensusError::InvalidField(
+                "non-register: session must be > 0".to_string(),
+            ));
+        }
+        if request == 0 {
+            return Err(ConsensusError::InvalidField(
+                "non-register: request must be > 0".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl ConsensusHeader for RoutedRequestHeader {
+    const COMMAND: Command2 = Command2::Request;
+    /// The client-wire [`RequestHeader`] this is promoted from is unsealed, and the
+    /// promotion copies `checksum` verbatim, so there is nothing here to verify.
+    const FRAME_SEALED: bool = false;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        self.operation
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::Request {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::Request,
+                found: self.command,
+            });
+        }
+        validate_request_fields(self.client, self.operation, self.session, self.request)
     }
 }
 
@@ -361,52 +538,7 @@ impl ConsensusHeader for RequestHeader {
                 found: self.command,
             });
         }
-        if self.client == 0 {
-            return Err(ConsensusError::InvalidField(
-                "request: client must be != 0".to_string(),
-            ));
-        }
-        // Reserved is the zero value, never a real client op
-        // (`is_client_allowed` rejects it). Refusing it here rather than after
-        // the dedup preflight matters: a bound client sending
-        // `Reserved, request = 0` used to pass validation, reach
-        // `request_preflight`, hit its own watermark and get its register
-        // reply replayed before the operation gate ever ran.
-        if self.operation == Operation::Reserved {
-            return Err(ConsensusError::InvalidField(
-                "operation must not be Reserved".to_string(),
-            ));
-        }
-        // Register: session must be 0, request must be 0.
-        // NonReplicated: sessionless by design (the `ClientTable` ignores
-        // these ops and the server routes/auth-gates them by transport id),
-        // so a pre-register client may legitimately send session 0 --
-        // ping must work before authentication.
-        // Other non-register ops: session must be > 0, request must be > 0.
-        if self.operation == Operation::Register {
-            if self.session != 0 {
-                return Err(ConsensusError::InvalidField(
-                    "register: session must be 0".to_string(),
-                ));
-            }
-            if self.request != 0 {
-                return Err(ConsensusError::InvalidField(
-                    "register: request must be 0".to_string(),
-                ));
-            }
-        } else if self.operation != Operation::NonReplicated {
-            if self.session == 0 {
-                return Err(ConsensusError::InvalidField(
-                    "non-register: session must be > 0".to_string(),
-                ));
-            }
-            if self.request == 0 {
-                return Err(ConsensusError::InvalidField(
-                    "non-register: request must be > 0".to_string(),
-                ));
-            }
-        }
-        Ok(())
+        validate_request_fields(self.client, self.operation, self.session, self.request)
     }
 }
 
@@ -437,7 +569,6 @@ pub struct ReplyHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
     /// Request-level status: 0 = ok; nonzero = the `IggyError` code for a
     /// failure decided before commit (e.g. a dispatch-time authorization
     /// denial, or the partition primary rejecting a consumer-offset op).
@@ -451,7 +582,7 @@ pub struct ReplyHeader {
     /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
     /// moves and `validate` does not inspect it.
     pub status: u32,
-    pub reserved: [u8; 28],
+    pub reserved: [u8; 36],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -459,10 +590,7 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(
-        offset_of!(ReplyHeader, status) == offset_of!(ReplyHeader, namespace) + size_of::<u64>()
-    );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -486,9 +614,8 @@ impl Default for ReplyHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
             status: 0,
-            reserved: [0; 28],
+            reserved: [0; 36],
         }
     }
 }
@@ -792,7 +919,12 @@ pub struct PrepareHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
+    /// Consensus group id: which of the node's multiplexed VSR groups this
+    /// frame belongs to. `METADATA_GROUP` (top bit) for the metadata plane,
+    /// otherwise the partition's packed stream-topic-partition key. The
+    /// demux and repair-replay routing key; see `binary_protocol::namespace`
+    /// for the value-space contract.
+    pub group: u64,
     /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
     /// that field for the stamping contract.
     pub user_id: u32,
@@ -805,8 +937,7 @@ const _: () = {
             == offset_of!(PrepareHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     assert!(
-        offset_of!(PrepareHeader, user_id)
-            == offset_of!(PrepareHeader, namespace) + size_of::<u64>()
+        offset_of!(PrepareHeader, user_id) == offset_of!(PrepareHeader, group) + size_of::<u64>()
     );
     assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
@@ -832,7 +963,7 @@ impl Default for PrepareHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
+            group: 0,
             user_id: 0,
             reserved: [0; 28],
         }
@@ -1008,7 +1139,7 @@ pub struct PrepareOkHeader {
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 48],
 }
 const _: () = {
@@ -1040,7 +1171,7 @@ impl Default for PrepareOkHeader {
             request: 0,
             operation: Operation::Reserved,
             operation_padding: [0; 7],
-            namespace: 0,
+            group: 0,
             reserved: [0; 48],
         }
     }
@@ -1099,7 +1230,7 @@ pub struct CommitHeader {
     pub timestamp_monotonic: u64,
     pub commit: u64,
     pub checkpoint_op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 80],
 }
 const _: () = {
@@ -1160,13 +1291,13 @@ pub struct StartViewChangeHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 120],
 }
 const _: () = {
     assert!(size_of::<StartViewChangeHeader>() == HEADER_SIZE);
     assert!(
-        offset_of!(StartViewChangeHeader, namespace)
+        offset_of!(StartViewChangeHeader, group)
             == offset_of!(StartViewChangeHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     assert!(offset_of!(StartViewChangeHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
@@ -1228,7 +1359,7 @@ pub struct DoViewChangeHeader {
     pub op: u64,
     /// Highest committed op.
     pub commit: u64,
-    pub namespace: u64,
+    pub group: u64,
     /// View when status was last normal (key for log selection).
     pub log_view: u32,
     pub reserved: [u8; 68],
@@ -1242,7 +1373,7 @@ pub struct DoViewChangeHeader {
     /// Silence costs availability; a false nack costs data.
     ///
     /// Carved from the tail of the former `reserved` region, with `present_bitset`
-    /// LAST so both land 16-aligned with no padding and `op`/`commit`/`namespace`/
+    /// LAST so both land 16-aligned with no padding and `op`/`commit`/`group`/
     /// `log_view` keep their offsets. A sender with nothing to nack sends zeros,
     /// decoding as "nacks nothing": safe, since that can only slow a view change.
     pub nack_bitset: u128,
@@ -1260,7 +1391,7 @@ const _: () = {
         offset_of!(DoViewChangeHeader, op)
             == offset_of!(DoViewChangeHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    // op/commit/namespace/log_view keep their pre-bitset offsets.
+    // op/commit/group/log_view keep their pre-bitset offsets.
     assert!(offset_of!(DoViewChangeHeader, reserved) == 156);
     // Both bitsets are last and 16-aligned, so the struct has no padding
     // (`NoUninit` would reject any).
@@ -1402,7 +1533,7 @@ pub struct StartViewHeader {
     pub op: u64,
     /// max(commit) from all DVCs.
     pub commit: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 88],
     /// Sender's incarnation, echoed from the `RequestStartView` this answers so a
     /// recovering replica can prove the reply post-dates its restart (see
@@ -1410,7 +1541,7 @@ pub struct StartViewHeader {
     /// (a normal view-change completion), which carries no freshness claim.
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
-    /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`namespace`.
+    /// lands 16-aligned with no padding WITHOUT moving `op`/`commit`/`group`.
     /// Zero is "no claim", which is what `handle_start_view` keys on and what the
     /// unsolicited completion path sends. NOT mixed-version tolerance: the frame seal
     /// drops a pre-seal peer before any field is read (see this module's header).
@@ -1418,7 +1549,7 @@ pub struct StartViewHeader {
 }
 const _: () = {
     assert!(size_of::<StartViewHeader>() == HEADER_SIZE);
-    // op/commit/namespace keep their pre-incarnation offsets.
+    // op/commit/group keep their pre-incarnation offsets.
     assert!(
         offset_of!(StartViewHeader, op)
             == offset_of!(StartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
@@ -1510,22 +1641,22 @@ pub struct RequestStartViewHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 104],
     /// The requester's per-boot incarnation, echoed back in the answering
     /// `StartView` so a reply from a previous incarnation is detectable.
     ///
     /// Carved from the tail of the former `reserved` region and placed LAST so it
-    /// lands 16-aligned with no padding WITHOUT moving `namespace`. Zero is "no claim
+    /// lands 16-aligned with no padding WITHOUT moving `group`. Zero is "no claim
     /// to echo"; see [`StartViewHeader::incarnation`] on why that is not
     /// mixed-version tolerance.
     pub incarnation: u128,
 }
 const _: () = {
     assert!(size_of::<RequestStartViewHeader>() == HEADER_SIZE);
-    // namespace keeps its pre-incarnation offset.
+    // group keeps its pre-incarnation offset.
     assert!(
-        offset_of!(RequestStartViewHeader, namespace)
+        offset_of!(RequestStartViewHeader, group)
             == offset_of!(RequestStartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     // `incarnation` is last and 16-aligned, so the struct has no padding.
@@ -1576,7 +1707,7 @@ impl ConsensusHeader for RequestStartViewHeader {
 /// Recovering/holed replica -> a Normal peer: request a repair stream.
 ///
 /// Sent to the primary first. Asks for the journaled prepares in
-/// `[from_op, to_op]` for `namespace`. Header-only. The peer answers with
+/// `[from_op, to_op]` for `group`. Header-only. The peer answers with
 /// `RepairPrepare` frames in op order, terminated by `RepairDone` or
 /// `RangeEvicted`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
@@ -1595,7 +1726,7 @@ pub struct RequestPreparesHeader {
     pub nonce: u128,
     pub from_op: u64,
     pub to_op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 88],
 }
 const _: () = {
@@ -1668,7 +1799,7 @@ pub struct RepairRangeReplyHeader {
     pub nonce: u128,
     /// `RepairDone`: last op served. `RangeEvicted`: oldest retained op.
     pub op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 96],
 }
 const _: () = {
@@ -1748,7 +1879,7 @@ pub struct RequestStateTransferHeader {
     pub reserved_frame: [u8; 66],
 
     pub nonce: u128,
-    pub namespace: u64,
+    pub group: u64,
     pub reserved: [u8; 104],
 }
 const _: () = {
@@ -1833,7 +1964,7 @@ pub struct StateTransferTargetHeader {
     /// Serving primary's applied frontier (`commit_min`) when the descriptor
     /// was built. The receiver's tail repair targets past this.
     pub commit_op: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub available: u8,
     /// Set on an `available == 0` refusal that means "not right now" rather than
     /// "this node is broken".
@@ -1879,7 +2010,7 @@ const _: () = {
     // The pre-existing published offsets. New fields grow into the reserved
     // tail only; a change that moves one of these is a wire break.
     assert!(offset_of!(StateTransferTargetHeader, commit_op) == 144);
-    assert!(offset_of!(StateTransferTargetHeader, namespace) == 152);
+    assert!(offset_of!(StateTransferTargetHeader, group) == 152);
     assert!(offset_of!(StateTransferTargetHeader, available) == 160);
     assert!(offset_of!(StateTransferTargetHeader, unavailable_transient) == 161);
     assert!(offset_of!(StateTransferTargetHeader, commit_max) == 168);
@@ -1971,7 +2102,7 @@ pub struct RequestStateChunkHeader {
 
     pub nonce: u128,
     pub offset: u64,
-    pub namespace: u64,
+    pub group: u64,
     pub len: u32,
     /// Index into the offered state manifest. Range-checked by the serving
     /// handler against the cached offer (the header cannot know the count).
@@ -2056,7 +2187,7 @@ pub struct StateChunkHeader {
 
     pub nonce: u128,
     pub offset: u64,
-    pub namespace: u64,
+    pub group: u64,
     /// Index into the offered state manifest. Range-checked by the receiving
     /// handler against its accepted manifest.
     pub artifact: u32,
@@ -2109,17 +2240,468 @@ impl ConsensusHeader for StateChunkHeader {
     }
 }
 
+// ForwardRegisterHeader - backup shard 0 -> primary shard 0
+
+/// A backup relays a login it has already authenticated.
+///
+/// Credential verification runs on the node the client dialed, against the
+/// replicated users table, so neither the client's frame nor its credentials
+/// travel: this header carries the VERIFIED identity and nothing else. The
+/// backup keeps the session bind, the reply build, and the connection.
+///
+/// The trust boundary is the replica interconnect's network placement: by
+/// default the replica port trusts any peer that reaches it (the PSK
+/// handshake and TLS ship disabled and are what upgrade the boundary), and
+/// the seal is an unkeyed integrity check, not a MAC. Trusting `user_id`
+/// here adds no capability the port did not already expose, since that same
+/// peer could inject a `Request` + `Register` directly. Clients cannot
+/// reach this command, because every client frame is typed through
+/// [`RequestHeader`], whose `validate` rejects any command but
+/// [`Command2::Request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardRegisterHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The login frame's consensus client id, proposed verbatim by the primary.
+    pub client: u128,
+    /// Correlation minted by the backup, echoed verbatim in the result. Unique
+    /// per in-flight forward on the originating node, across its restarts as
+    /// well: an answer that outlives the login it was minted for must not match
+    /// the one holding that nonce next.
+    pub nonce: u128,
+    /// The acting user the backup authenticated. The trust payload: the primary
+    /// proposes the register under this id without re-verifying credentials.
+    pub user_id: u32,
+    pub reserved: [u8; 92],
+}
+const _: () = {
+    assert!(size_of::<ForwardRegisterHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardRegisterHeader, client)
+            == offset_of!(ForwardRegisterHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardRegisterHeader, nonce) == 144);
+    assert!(offset_of!(ForwardRegisterHeader, user_id) == 160);
+    assert!(offset_of!(ForwardRegisterHeader, reserved) + size_of::<[u8; 92]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for ForwardRegisterHeader {
+    // The seal covers `user_id`, which is the whole reason this frame is
+    // believed: a flipped bit there would commit a register under another user.
+    const FRAME_SEALED: bool = true;
+
+    const COMMAND: Command2 = Command2::ForwardRegister;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardRegister {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardRegister,
+                found: self.command,
+            });
+        }
+        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)
+    }
+}
+
+// ForwardRegisterResultHeader - primary shard 0 -> backup shard 0
+
+/// The primary's verdict on a [`ForwardRegisterHeader`].
+///
+/// Header-only: the backup owns the client connection and builds the wire
+/// reply itself, so only the committed bind (or the refusal) crosses the
+/// interconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardRegisterResultHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// Echo of [`ForwardRegisterHeader::nonce`]; with `client`, the backup's
+    /// routing key.
+    pub nonce: u128,
+    /// Echo of [`ForwardRegisterHeader::client`]. Half of the routing key, not a
+    /// diagnostic: the backup drops an answer whose client disagrees with the
+    /// login it parked under `nonce`.
+    pub client: u128,
+    /// The committed register's op number, which fences the session. Zero
+    /// unless `outcome` is [`ForwardRegisterOutcome::Ok`].
+    pub epoch: u64,
+    /// The client-table entry's highest committed request number, for a caller
+    /// that must resume numbering. Zero unless `outcome` is
+    /// [`ForwardRegisterOutcome::Ok`].
+    pub watermark: u64,
+    pub reserved: [u8; 79],
+    pub outcome: ForwardRegisterOutcome,
+}
+const _: () = {
+    assert!(size_of::<ForwardRegisterResultHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardRegisterResultHeader, nonce)
+            == offset_of!(ForwardRegisterResultHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardRegisterResultHeader, client) == 144);
+    assert!(offset_of!(ForwardRegisterResultHeader, epoch) == 160);
+    assert!(offset_of!(ForwardRegisterResultHeader, watermark) == 168);
+    assert!(
+        offset_of!(ForwardRegisterResultHeader, outcome) + size_of::<ForwardRegisterOutcome>()
+            == HEADER_SIZE
+    );
+};
+
+/// Wire verdict on a forwarded register.
+///
+/// Mirrors the server-side submit error one-for-one so the backup can surface
+/// the primary's exact answer: every variant but
+/// [`Self::ClientIdOwnedByAnotherUser`] is transient and replayable.
+///
+/// **Wire-version pinned**, like [`EvictionReason`]: reordering or reusing a
+/// discriminant silently reinterprets a live cluster's frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum ForwardRegisterOutcome {
+    /// Committed; `epoch` and `watermark` carry the bind.
+    Ok = 0,
+    NotPrimary = 1,
+    /// Reserved: the register submit parks instead of bouncing when the
+    /// primary is not caught up, so nothing produces this today. Wire-pinned,
+    /// so it must keep its discriminant either way.
+    NotCaughtUp = 2,
+    PipelineFull = 3,
+    InProgress = 4,
+    Canceled = 5,
+    /// Terminal: the presented client id belongs to another user.
+    ClientIdOwnedByAnotherUser = 6,
+}
+
+impl ConsensusHeader for ForwardRegisterResultHeader {
+    const FRAME_SEALED: bool = true;
+
+    const COMMAND: Command2 = Command2::ForwardRegisterResult;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardRegisterResult {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardRegisterResult,
+                found: self.command,
+            });
+        }
+        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)?;
+        if self.outcome != ForwardRegisterOutcome::Ok && (self.epoch != 0 || self.watermark != 0) {
+            return Err(ConsensusError::InvalidField(
+                "forward register result bind must be zero on failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared field rules of the two register-forwarding headers.
+///
+/// Reserved bytes are strict-zero rather than ignored: this pair only ever
+/// travels between replicas of one release (see the wire-compatibility note at
+/// the top of this module), so there is no forward-compatibility to preserve
+/// and a nonzero byte can only mean a builder bug or a mangled frame.
+fn validate_forward_register_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    validate_forward_frame(size, client, nonce, reserved)
+}
+
+// ForwardLogoutHeader - backup shard 0 -> primary shard 0
+
+/// A backup asks the metadata primary to tear down a session it owns.
+///
+/// The client-facing Logout request stays on the backup. Only the replicated
+/// session identity and request number cross the replica interconnect, and the
+/// primary's epoch guard makes a delayed forward harmless after a rebind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardLogoutHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The consensus client id whose table entry should be removed.
+    pub client: u128,
+    /// Correlation minted by the backup and echoed in the result.
+    pub nonce: u128,
+    /// The exact register epoch being logged out.
+    pub session: u64,
+    /// The client's request number, or the server's synthetic disconnect id.
+    pub request: u64,
+    pub reserved: [u8; 80],
+}
+const _: () = {
+    assert!(size_of::<ForwardLogoutHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardLogoutHeader, client)
+            == offset_of!(ForwardLogoutHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardLogoutHeader, nonce) == 144);
+    assert!(offset_of!(ForwardLogoutHeader, session) == 160);
+    assert!(offset_of!(ForwardLogoutHeader, request) == 168);
+    assert!(offset_of!(ForwardLogoutHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for ForwardLogoutHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command2 = Command2::ForwardLogout;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+
+    fn command(&self) -> Command2 {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardLogout {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardLogout,
+                found: self.command,
+            });
+        }
+        validate_forward_logout_frame(
+            self.size,
+            self.client,
+            self.nonce,
+            self.session,
+            self.request,
+            &self.reserved,
+        )
+    }
+}
+
+// ForwardLogoutResultHeader - primary shard 0 -> backup shard 0
+
+/// The metadata primary's verdict on a [`ForwardLogoutHeader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardLogoutResultHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// Echo of [`ForwardLogoutHeader::nonce`].
+    pub nonce: u128,
+    /// Echo of [`ForwardLogoutHeader::client`].
+    pub client: u128,
+    /// Committed Logout op, or the current commit for an idempotent no-op.
+    /// Zero unless `outcome` is [`ForwardLogoutOutcome::Ok`].
+    pub commit: u64,
+    pub reserved: [u8; 87],
+    pub outcome: ForwardLogoutOutcome,
+}
+const _: () = {
+    assert!(size_of::<ForwardLogoutResultHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardLogoutResultHeader, nonce)
+            == offset_of!(ForwardLogoutResultHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardLogoutResultHeader, client) == 144);
+    assert!(offset_of!(ForwardLogoutResultHeader, commit) == 160);
+    assert!(
+        offset_of!(ForwardLogoutResultHeader, outcome) + size_of::<ForwardLogoutOutcome>()
+            == HEADER_SIZE
+    );
+};
+
+/// Wire verdict on a forwarded logout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum ForwardLogoutOutcome {
+    Ok = 0,
+    NotPrimary = 1,
+    PipelineFull = 2,
+    InProgress = 3,
+    Canceled = 4,
+}
+
+impl ConsensusHeader for ForwardLogoutResultHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command2 = Command2::ForwardLogoutResult;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+
+    fn command(&self) -> Command2 {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::ForwardLogoutResult {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::ForwardLogoutResult,
+                found: self.command,
+            });
+        }
+        validate_forward_frame(self.size, self.client, self.nonce, &self.reserved)?;
+        if self.outcome != ForwardLogoutOutcome::Ok && self.commit != 0 {
+            return Err(ConsensusError::InvalidField(
+                "forward logout result commit must be zero on failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_forward_logout_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    session: u64,
+    request: u64,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    validate_forward_frame(size, client, nonce, reserved)?;
+    if session == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward logout session must be non-zero".to_string(),
+        ));
+    }
+    if request == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward logout request must be non-zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn validate_forward_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    if size as usize != HEADER_SIZE {
+        return Err(ConsensusError::InvalidSize {
+            expected: HEADER_SIZE as u32,
+            found: size,
+        });
+    }
+    if client == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward client must be non-zero".to_string(),
+        ));
+    }
+    if nonce == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward nonce must be non-zero".to_string(),
+        ));
+    }
+    if reserved.iter().any(|&byte| byte != 0) {
+        return Err(ConsensusError::InvalidField(
+            "forward reserved bytes must be zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::{
         Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-        EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+        EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
+        ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+        ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
         PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
         RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-        RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-        StateTransferTargetHeader,
+        RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+        StateChunkHeader, StateTransferTargetHeader,
     };
     use aligned_vec::{AVec, ConstAlign};
 
@@ -2191,6 +2773,10 @@ mod tests {
             StateTransferTargetHeader,
             RequestStateChunkHeader,
             StateChunkHeader,
+            ForwardRegisterHeader,
+            ForwardRegisterResultHeader,
+            ForwardLogoutHeader,
+            ForwardLogoutResultHeader,
         );
     }
 
@@ -2383,19 +2969,86 @@ mod tests {
     }
 
     // `status` is carved from the reserved tail; the SDK reply funnel peeks it
-    // at this offset before any body decode, so a layout drift must trip here.
+    // at this offset before any body decode, and four foreign SDKs hardcode
+    // it, so a layout drift must trip here.
     #[test]
     fn reply_header_status_offset_and_size_pinned() {
         use std::mem::offset_of;
         assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
+        assert_eq!(offset_of!(ReplyHeader, status), 216);
         assert_eq!(
-            offset_of!(ReplyHeader, status),
-            offset_of!(ReplyHeader, namespace) + size_of::<u64>()
-        );
-        assert_eq!(
-            offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>(),
+            offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>(),
             HEADER_SIZE
         );
+    }
+
+    // `group` claims the TAIL of the client header's reserved area; the
+    // leading 52 reserved bytes carry data (the non-replicated op code lives
+    // in `reserved[0..4]`), so a reshuffle of the carve must trip here rather
+    // than silently move the code range.
+    #[test]
+    fn routed_request_group_claims_reserved_tail() {
+        use std::mem::offset_of;
+        assert_eq!(
+            offset_of!(RoutedRequestHeader, reserved),
+            offset_of!(RequestHeader, reserved)
+        );
+        assert_eq!(
+            offset_of!(RoutedRequestHeader, group),
+            offset_of!(RequestHeader, reserved) + 52
+        );
+        assert_eq!(offset_of!(RoutedRequestHeader, group), 248);
+        assert_eq!(
+            offset_of!(RoutedRequestHeader, group) + size_of::<u64>(),
+            HEADER_SIZE
+        );
+    }
+
+    // The routed shape is decoded straight off the peer wire, so it must
+    // enforce the same field rules as the client boundary; a command-only
+    // validate lets a forged `client = 0` frame reach the client table's
+    // hard assert.
+    #[test]
+    fn routed_request_zero_client_rejected() {
+        let header = RoutedRequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            session: 10,
+            request: 1,
+            ..RoutedRequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn routed_request_reserved_operation_rejected() {
+        let header = RoutedRequestHeader {
+            command: Command2::Request,
+            client: 0xCAFE,
+            session: 10,
+            request: 1,
+            ..RoutedRequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn routed_request_default_fails_validate() {
+        assert!(RoutedRequestHeader::default().validate().is_err());
+    }
+
+    #[test]
+    fn routed_request_valid_fields_accepted() {
+        let header = RoutedRequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            client: 0xCAFE,
+            session: 10,
+            request: 1,
+            group: 7,
+            ..RoutedRequestHeader::default()
+        };
+        assert!(header.validate().is_ok());
     }
 
     // A nonzero status rides the reserved region, which reply `validate` does
@@ -2490,5 +3143,319 @@ mod tests {
     #[test]
     fn eviction_header_is_256_bytes() {
         assert_eq!(size_of::<EvictionHeader>(), 256);
+    }
+
+    /// A sealed, well-formed `ForwardRegister` ready to be mutated per test.
+    fn forward_register() -> ForwardRegisterHeader {
+        let mut header = ForwardRegisterHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardRegister,
+            replica: 2,
+            reserved_frame: [0; 66],
+            client: 0xCAFE,
+            nonce: 0xF00D,
+            user_id: 41,
+            reserved: [0; 92],
+        };
+        header.seal();
+        header
+    }
+
+    /// A sealed, well-formed `ForwardRegisterResult` ready to be mutated.
+    fn forward_register_result(outcome: ForwardRegisterOutcome) -> ForwardRegisterResultHeader {
+        let mut header = ForwardRegisterResultHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardRegisterResult,
+            replica: 0,
+            reserved_frame: [0; 66],
+            nonce: 0xF00D,
+            client: 0xCAFE,
+            epoch: u64::from(outcome == ForwardRegisterOutcome::Ok) * 91,
+            watermark: u64::from(outcome == ForwardRegisterOutcome::Ok) * 12,
+            reserved: [0; 79],
+            outcome,
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn forward_register_round_trips_through_generic_bytes() {
+        for (command, bytes) in [
+            (
+                Command2::ForwardRegister,
+                bytemuck::bytes_of(&forward_register()).to_vec(),
+            ),
+            (
+                Command2::ForwardRegisterResult,
+                bytemuck::bytes_of(&forward_register_result(ForwardRegisterOutcome::Ok)).to_vec(),
+            ),
+        ] {
+            // 16-byte alignment: `Vec<u8>` requests align=1 and fails Miri.
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(&bytes);
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf)
+                .expect("a forward-register frame is a valid generic header");
+            assert_eq!(generic.command, command);
+            assert_eq!(generic.size as usize, HEADER_SIZE);
+        }
+
+        let buf = {
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(bytemuck::bytes_of(&forward_register()));
+            buf
+        };
+        let typed = bytemuck::checked::try_from_bytes::<ForwardRegisterHeader>(&buf)
+            .expect("round-trips into its own type");
+        assert_eq!(typed.verify_frame(), Ok(()));
+        assert_eq!(typed.validate(), Ok(()));
+        assert_eq!(typed.user_id, 41);
+        assert_eq!(typed.nonce, 0xF00D);
+
+        let buf = {
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
+                ForwardRegisterOutcome::ClientIdOwnedByAnotherUser,
+            )));
+            buf
+        };
+        let typed = bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf)
+            .expect("round-trips into its own type");
+        assert_eq!(typed.verify_frame(), Ok(()));
+        assert_eq!(typed.validate(), Ok(()));
+        assert_eq!(
+            typed.outcome,
+            ForwardRegisterOutcome::ClientIdOwnedByAnotherUser
+        );
+    }
+
+    // The seal is the whole trust story for `user_id`: the primary proposes a
+    // register under it without re-verifying credentials, so a flipped bit
+    // must not reach the proposal.
+    #[test]
+    fn forward_register_tampered_user_id_fails_the_seal() {
+        const USER_ID_OFFSET: usize = std::mem::offset_of!(ForwardRegisterHeader, user_id);
+
+        assert!(matches!(
+            tamper(forward_register(), USER_ID_OFFSET),
+            Err(ConsensusError::FrameChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn forward_register_validate_rejects_malformed_frames() {
+        let mut zero_client = forward_register();
+        zero_client.client = 0;
+        assert!(matches!(
+            zero_client.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut zero_nonce = forward_register();
+        zero_nonce.nonce = 0;
+        assert!(matches!(
+            zero_nonce.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut dirty_reserved = forward_register();
+        dirty_reserved.reserved[0] = 1;
+        assert!(matches!(
+            dirty_reserved.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut wrong_size = forward_register();
+        wrong_size.size = 512;
+        assert!(matches!(
+            wrong_size.validate(),
+            Err(ConsensusError::InvalidSize { .. })
+        ));
+
+        let mut result_zero_nonce = forward_register_result(ForwardRegisterOutcome::Ok);
+        result_zero_nonce.nonce = 0;
+        assert!(matches!(
+            result_zero_nonce.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut failed_with_bind = forward_register_result(ForwardRegisterOutcome::NotPrimary);
+        failed_with_bind.epoch = 91;
+        failed_with_bind.watermark = 12;
+        assert!(matches!(
+            failed_with_bind.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        failed_with_bind.epoch = 0;
+        failed_with_bind.watermark = 0;
+        assert_eq!(failed_with_bind.validate(), Ok(()));
+    }
+
+    // An unknown outcome is rejected by the bit-pattern check, one layer
+    // before `validate` ever runs.
+    #[test]
+    fn forward_register_result_rejects_unknown_outcome() {
+        const OUTCOME_OFFSET: usize = std::mem::offset_of!(ForwardRegisterResultHeader, outcome);
+
+        let mut buf = aligned_zeroed(HEADER_SIZE);
+        buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
+            ForwardRegisterOutcome::Ok,
+        )));
+        buf[OUTCOME_OFFSET] = 7;
+        assert!(bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf).is_err());
+    }
+
+    // Wire-discriminant pin: reordering reinterprets a live cluster's frames.
+    #[test]
+    fn forward_register_outcome_discriminants_pinned() {
+        assert_eq!(ForwardRegisterOutcome::Ok as u8, 0);
+        assert_eq!(ForwardRegisterOutcome::NotPrimary as u8, 1);
+        assert_eq!(ForwardRegisterOutcome::NotCaughtUp as u8, 2);
+        assert_eq!(ForwardRegisterOutcome::PipelineFull as u8, 3);
+        assert_eq!(ForwardRegisterOutcome::InProgress as u8, 4);
+        assert_eq!(ForwardRegisterOutcome::Canceled as u8, 5);
+        assert_eq!(ForwardRegisterOutcome::ClientIdOwnedByAnotherUser as u8, 6);
+    }
+
+    fn forward_logout() -> ForwardLogoutHeader {
+        let mut header = ForwardLogoutHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardLogout,
+            replica: 2,
+            reserved_frame: [0; 66],
+            client: 0xCAFE,
+            nonce: 0xF00D,
+            session: 91,
+            request: 12,
+            reserved: [0; 80],
+        };
+        header.seal();
+        header
+    }
+
+    fn forward_logout_result(outcome: ForwardLogoutOutcome) -> ForwardLogoutResultHeader {
+        let mut header = ForwardLogoutResultHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command2::ForwardLogoutResult,
+            replica: 0,
+            reserved_frame: [0; 66],
+            nonce: 0xF00D,
+            client: 0xCAFE,
+            commit: if outcome == ForwardLogoutOutcome::Ok {
+                92
+            } else {
+                0
+            },
+            reserved: [0; 87],
+            outcome,
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn forward_logout_headers_round_trip_and_validate() {
+        let forward = forward_logout();
+        assert_eq!(forward.verify_frame(), Ok(()));
+        assert_eq!(forward.validate(), Ok(()));
+
+        for outcome in [
+            ForwardLogoutOutcome::Ok,
+            ForwardLogoutOutcome::NotPrimary,
+            ForwardLogoutOutcome::PipelineFull,
+            ForwardLogoutOutcome::InProgress,
+            ForwardLogoutOutcome::Canceled,
+        ] {
+            let result = forward_logout_result(outcome);
+            assert_eq!(result.verify_frame(), Ok(()));
+            assert_eq!(result.validate(), Ok(()));
+            let mut bytes = aligned_zeroed(HEADER_SIZE);
+            bytes.copy_from_slice(bytemuck::bytes_of(&result));
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&bytes)
+                .expect("forward logout result is a valid generic header");
+            assert_eq!(generic.command, Command2::ForwardLogoutResult);
+        }
+    }
+
+    #[test]
+    fn forward_logout_validate_rejects_malformed_frames() {
+        let mut header = forward_logout();
+        header.client = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.nonce = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.session = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.request = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.reserved[0] = 1;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut result = forward_logout_result(ForwardLogoutOutcome::NotPrimary);
+        result.commit = 92;
+        assert!(matches!(
+            result.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+    }
+
+    #[test]
+    fn forward_logout_result_rejects_unknown_outcome() {
+        const OUTCOME_OFFSET: usize = std::mem::offset_of!(ForwardLogoutResultHeader, outcome);
+
+        let mut bytes = aligned_zeroed(HEADER_SIZE);
+        bytes.copy_from_slice(bytemuck::bytes_of(&forward_logout_result(
+            ForwardLogoutOutcome::Ok,
+        )));
+        bytes[OUTCOME_OFFSET] = 5;
+        assert!(bytemuck::checked::try_from_bytes::<ForwardLogoutResultHeader>(&bytes).is_err());
+    }
+
+    #[test]
+    fn forward_logout_outcome_discriminants_pinned() {
+        assert_eq!(ForwardLogoutOutcome::Ok as u8, 0);
+        assert_eq!(ForwardLogoutOutcome::NotPrimary as u8, 1);
+        assert_eq!(ForwardLogoutOutcome::PipelineFull as u8, 2);
+        assert_eq!(ForwardLogoutOutcome::InProgress as u8, 3);
+        assert_eq!(ForwardLogoutOutcome::Canceled as u8, 4);
     }
 }

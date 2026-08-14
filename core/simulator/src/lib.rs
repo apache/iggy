@@ -164,7 +164,7 @@ impl Simulator {
     }
 
     /// [`Simulator::new`] with `shards_per_replica` shards on every replica,
-    /// meshed exactly like server-ng bootstrap: metadata plane on shard 0,
+    /// meshed exactly like the server bootstrap: metadata plane on shard 0,
     /// partitions hash-assigned, one pump task per shard.
     ///
     /// # Panics
@@ -186,7 +186,7 @@ impl Simulator {
     }
 
     /// [`Simulator::with_shards`] with the deterministic dispatch shell on:
-    /// every shard wires server-ng's real dispatch handlers, so a client
+    /// every shard wires the server's real dispatch handlers, so a client
     /// request runs as a task the seeded executor interleaves with the
     /// pump. Off (the default) keeps the raw-`on_message` fast path.
     ///
@@ -276,7 +276,7 @@ impl Simulator {
             let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
             let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
             let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
-            // Single-writer metadata (mirrors server-ng bootstrap): shard 0
+            // Single-writer metadata (mirrors the server bootstrap): shard 0
             // builds the writable STM and mints a factory bundle; every peer
             // shard rebuilds a reader-mode mirror from it and sees committed
             // metadata through the shared read handle. Shards are built in index
@@ -317,7 +317,7 @@ impl Simulator {
                     );
                 }
 
-                // Same wiring as server-ng bootstrap: one pump task per
+                // Same wiring as the server bootstrap: one pump task per
                 // shard, stopped only by the (held) stop channel or a
                 // crash abort.
                 let (stop_tx, stop_rx) = shard::channel::<()>(1);
@@ -743,7 +743,7 @@ impl Simulator {
         let metadata_incarnation = self.replicas[idx].metadata_incarnation + 1;
         // Partition superblocks carry forward too: a group re-materialised after
         // the restart must recover its recorded view from the same store, exactly
-        // as a rebooted server-ng partition reads the record in its directory.
+        // as a rebooted server partition reads the record in its directory.
         let partition_superblocks =
             std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
 
@@ -814,7 +814,7 @@ impl Simulator {
         };
 
         // Re-materialise every group this replica had before the crash, as a
-        // rebooted server-ng re-opens every partition directory it owns. This
+        // rebooted the server re-opens every partition directory it owns. This
         // is what makes the carried-forward superblock load-bearing: the group
         // recovers the `(view, log_view)` it recorded instead of re-entering
         // view 0.
@@ -945,7 +945,7 @@ impl Simulator {
 /// the routing row on every shard of that replica.
 ///
 /// Shared by [`SimCluster::init_partition`] and the restart path: a rebooted
-/// server-ng re-opens every partition directory it owns, so the sim has to
+/// server re-opens every partition directory it owns, so the sim has to
 /// re-materialise too, otherwise the superblock a restart carries forward is
 /// never read back and the recovered-view branch is dead code.
 fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
@@ -1667,13 +1667,16 @@ mod tests {
         // shifts the trace. Re-lock on intentional changes; expect re-locks until
         // error discriminants and reply bodies stabilize the wire format.
         //
-        // Re-locked when the sim adopted METADATA_CONSENSUS_NAMESPACE (1<<63)
+        // Re-locked when the sim adopted METADATA_GROUP (1<<63)
         // for metadata requests and the metadata consensus group, replacing
         // the sim-only 0: reply headers and the per-group timeout-jitter seed
         // (replica_id ^ namespace) both changed. The old 0 only ever routed
         // correctly because `hash % 1 == 0` at one shard per replica.
+        // Re-locked again when replies stopped echoing a group id (the
+        // client wire lost its namespace field): the reply-hash tuple
+        // dropped that component.
         assert_eq!(
-            h1, 0x530D_499C_5DBE_A2BE,
+            h1, 0xCF1F_BC79_B44A_65F7,
             "workload reply hash drifted from locked baseline"
         );
     }
@@ -2319,15 +2322,7 @@ mod tests {
             }
             for reply in sim.step() {
                 let h = reply.header();
-                (
-                    h.client,
-                    h.request,
-                    h.op,
-                    h.commit,
-                    h.namespace,
-                    h.operation as u8,
-                )
-                    .hash(&mut hasher);
+                (h.client, h.request, h.op, h.commit, h.operation as u8).hash(&mut hasher);
                 let cmds = wl.on_reply(&reply);
                 apply_sim_commands(&mut sim, &cmds);
                 replies_seen += 1;
@@ -2618,7 +2613,7 @@ mod tests {
         sim.schedule_hash()
     }
 
-    /// Turning the dispatch shell on wires server-ng's real deferred
+    /// Turning the dispatch shell on wires the server's real deferred
     /// handlers on every shard. With no client traffic none of them is
     /// reached, so the consensus plane both replays deterministically and
     /// matches the shell-off schedule: the toggle is genuinely off the
@@ -2836,6 +2831,118 @@ mod tests {
         );
     }
 
+    /// The realloc half of the PR #3557 class, and the stronger one: a pump
+    /// `insert` that grows the partitions vec MOVES every element, so a stale
+    /// reference to any partition dangles, not just the one a `swap_remove`
+    /// displaced. `shell_detects_partition_borrow_held_across_await` covers the
+    /// remove; this covers the grow, on the same two-task deterministic
+    /// interleave (reconciler-shaped reader parked with a borrow live, pump-shaped
+    /// task mutating the container underneath it).
+    ///
+    /// The buffer address is asserted to have MOVED, so the test cannot pass on a
+    /// push into spare capacity, which relocates nothing.
+    ///
+    /// Debug-only, like the tripwire it drives: `BorrowGuard` compiles out in
+    /// release.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn shell_detects_partition_borrow_held_across_a_pump_realloc() {
+        use crate::executor::DetExecutor;
+        use consensus::PartitionsHandle;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: 3,
+            client_count: 1,
+            seed: 0x5CED_0022,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(3, std::iter::once(1u128), network_opts);
+        let ns_a = IggyNamespace::new(0, 0, 0);
+        let ns_b = IggyNamespace::new(0, 0, 1);
+        // The namespace the pump grows the vec with. Never materialised up front:
+        // inserting it IS the mutation under test.
+        let ns_grow = IggyNamespace::new(0, 0, 2);
+        sim.init_partition(ns_a);
+        sim.init_partition(ns_b);
+
+        // BAD read: the borrow is live across the suspension, so the pump's
+        // growing insert lands while a stale reference to every partition is
+        // outstanding. `catch_unwind` builds the executor inline so unwinding
+        // drops the parked read's guard and restores the borrow count.
+        let tripped = catch_unwind(AssertUnwindSafe(|| {
+            let mut executor = DetExecutor::new(11);
+            let read = Rc::clone(&sim.replicas[0].shards[0]);
+            executor.spawn(async move {
+                read.plane
+                    .partitions()
+                    .hold_borrow_across_await(std::future::pending())
+                    .await;
+            });
+            executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
+            let grow = Rc::clone(&sim.replicas[0].shards[0]);
+            executor.spawn(async move {
+                grow.init_partition(ns_grow, None, None);
+            });
+            executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
+        }))
+        .is_err();
+        assert!(
+            tripped,
+            "a pump realloc under a live partition borrow went undetected: the \
+             #3557 tripwire did not fire on the growing insert"
+        );
+        // The tripwire asserts before `push`, so the vec is untouched: the two
+        // originals survive and the grow namespace never materialised.
+        let partitions = sim.replicas[0].shards[0].plane.partitions();
+        assert_eq!(
+            partitions.len(),
+            2,
+            "tripwire must abort the insert before it relocates the vec"
+        );
+        assert!(!partitions.contains(&ns_grow));
+
+        // REAL read: `with_partition` drops the borrow before the suspension, so
+        // the identical schedule is sound and the grow applies.
+        let addr_before = partitions.buffer_addr();
+        let mut executor = DetExecutor::new(11);
+        let read = Rc::clone(&sim.replicas[0].shards[0]);
+        executor.spawn(async move {
+            let _ = read
+                .plane
+                .partitions()
+                .with_partition(&ns_a, |_partition| ());
+            std::future::pending::<()>().await;
+        });
+        executor.run_until_stalled(POLL_BUDGET);
+        let grow = Rc::clone(&sim.replicas[0].shards[0]);
+        executor.spawn(async move {
+            grow.init_partition(ns_grow, None, None);
+        });
+        executor.run_until_stalled(POLL_BUDGET);
+
+        let partitions = sim.replicas[0].shards[0].plane.partitions();
+        assert!(
+            partitions.contains(&ns_grow),
+            "correct with_partition read must leave the concurrent insert sound"
+        );
+        assert_ne!(
+            partitions.buffer_addr(),
+            addr_before,
+            "the insert landed in spare capacity, so nothing moved and this test \
+             proves nothing about a realloc; seed more partitions before the grow"
+        );
+        // Every pre-existing partition is still addressable after the move, which
+        // is what a stale reference would have missed.
+        assert!(partitions.contains(&ns_a) && partitions.contains(&ns_b));
+    }
+
     /// Committed metadata prepare timestamps for `seed`: register plus two
     /// stream creates, read back from replica 0's metadata journal.
     fn metadata_prepare_timestamps(seed: u64) -> Vec<u64> {
@@ -2951,7 +3058,7 @@ mod tests {
             let header: &PrepareOkHeader = bytemuck::checked::from_bytes(
                 &packet.message.as_slice()[..std::mem::size_of::<PrepareOkHeader>()],
             );
-            header.namespace == BLOCKED_NS.load(Ordering::Relaxed)
+            header.group == BLOCKED_NS.load(Ordering::Relaxed)
         }
 
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
@@ -3007,13 +3114,16 @@ mod tests {
         // ns_b shares the client, the replicas, and the shard, but has its
         // own consensus group: it must commit while ns_a stays wedged.
         let msg = client.send_messages(ns_b, &[Bytes::from_static(b"independent")]);
+        // Replies no longer carry a group id; correlate by the request id
+        // this send was stamped with.
+        let ns_b_request = msg.header().request;
         sim.submit_request(client_id, 0, msg.into_generic());
         let mut independent_replies = 0usize;
         for _ in 0..100 {
             for reply in sim.step() {
                 assert_eq!(
-                    reply.header().namespace,
-                    ns_b.inner(),
+                    reply.header().request,
+                    ns_b_request,
                     "only ns_b may commit while ns_a's acks are blocked"
                 );
                 independent_replies += 1;
@@ -3032,7 +3142,9 @@ mod tests {
         let mut drained_replies = 0usize;
         for _ in 0..800 {
             for reply in sim.step() {
-                if reply.header().namespace == ns_a.inner() {
+                // Only ns_a replies are outstanding once ns_b committed
+                // above, so every reply counts toward the drain.
+                if reply.header().request != ns_b_request {
                     drained_replies += 1;
                 }
             }
@@ -3115,8 +3227,10 @@ mod view_change_data_loss_tests {
     //! tests cover the sequencer-truncation path directly.
 
     use super::*;
+    use crate::executor::yield_once;
     use consensus::{Sequencer, Status};
     use journal::Journal;
+    use message_bus::MessageBus;
 
     /// Whether a replica's shard-0 metadata consensus is a settled primary in a
     /// view past the one that crashed.
@@ -3253,6 +3367,133 @@ mod view_change_data_loss_tests {
         assert!(
             metadata_holds(&sim, primary, committed),
             "op {committed} must be repaired back into the new primary's journal"
+        );
+    }
+
+    /// A client submit landing inside the new primary's view-start superblock
+    /// persist must not corrupt the pipeline.
+    ///
+    /// `start_pending_view` flips the replica into a Normal primary
+    /// synchronously and defers the rebuild of the inherited uncommitted
+    /// suffix; the persist then suspends the pump. A register admitted in that
+    /// window used to mint the next op into the still-empty pipeline, and the
+    /// deferred rebuild panicked pushing the inherited op beneath it
+    /// ("sequence must be sequential"); the same empty pipeline also blinded
+    /// the register dedup, admitting an inherited in-flight register twice.
+    /// The suspension is real on disk-backed stores (an fsync) and is restored
+    /// here with `set_yield_writes`.
+    #[test]
+    fn given_a_register_inside_the_view_start_persist_when_the_pipeline_rebuilds_should_commit_once()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let settled_client: u128 = 1;
+        let straggler_client: u128 = 2;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 2,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            [settled_client, straggler_client].into_iter(),
+            network_opts,
+        );
+
+        let client = SimClient::new(settled_client);
+        sim.register_client_with_primary(&client);
+        for _ in 0..100 {
+            sim.step();
+        }
+        let (baseline_head, baseline_commit) = metadata_progress(&sim, 1);
+        assert_eq!(
+            baseline_head, baseline_commit,
+            "the cluster must be quiescent before the straggler is staged"
+        );
+
+        // Stage the inherited suffix: the straggler's register reaches the
+        // next primary's journal, then the old primary dies before the commit
+        // makes it back.
+        let straggler = SimClient::new(straggler_client);
+        sim.submit_request(straggler_client, 0, straggler.register().into_generic());
+        let mut staged = None;
+        for _ in 0..200 {
+            sim.step();
+            let (head, commit_max) = metadata_progress(&sim, 1);
+            if head > baseline_head && commit_max < head {
+                staged = Some(head);
+                break;
+            }
+        }
+        let staged =
+            staged.expect("the register must reach the next primary's journal before it commits");
+
+        // Both survivors' next persists suspend once, opening the window a
+        // real fsync has.
+        sim.replicas[1].superblock.set_yield_writes();
+        sim.replicas[2].superblock.set_yield_writes();
+        sim.replica_crash(0);
+
+        // The straggler's retry loop, as the server runs it: `dispatch` spawns
+        // the in-process submit on its own task, which is what can interleave
+        // with the parked pump. The sim's wire path processes requests inside
+        // the pump itself, so the window is only reachable from a spawned
+        // task. A plain once-per-step retry is never ready inside the drain
+        // where the pump flips to primary and suspends on the persist, so
+        // each tick wake spends a small budget of yield-separated attempts:
+        // the yields land the retry between the pump's polls, one of which is
+        // the suspended view-start persist.
+        let registered = std::rc::Rc::new(std::cell::Cell::new(false));
+        let submit_shard = std::rc::Rc::clone(&sim.replicas[1].shards[0]);
+        let submit_flag = std::rc::Rc::clone(&registered);
+        sim.executor.spawn(async move {
+            loop {
+                for _ in 0..32 {
+                    match submit_shard
+                        .plane
+                        .metadata()
+                        .submit_register_in_process(straggler_client, 0)
+                        .await
+                    {
+                        Ok(_) => {
+                            submit_flag.set(true);
+                            return;
+                        }
+                        Err(error) if error.is_transient() => yield_once().await,
+                        Err(_) => return,
+                    }
+                }
+                submit_shard
+                    .bus
+                    .sleep(std::time::Duration::from_millis(10))
+                    .await;
+            }
+        });
+
+        for _ in 0..1500 {
+            sim.step();
+            if registered.get() {
+                break;
+            }
+        }
+        assert!(
+            registered.get(),
+            "the straggler's login must complete after the failover"
+        );
+
+        let primary = (1..replica_count)
+            .find(|&replica| is_new_metadata_primary(&sim, replica))
+            .expect("a metadata primary must be elected after the old one crashes");
+        let (_, commit_max) = metadata_progress(&sim, primary);
+        assert!(
+            commit_max >= staged,
+            "the inherited op ({staged}) must commit under the new primary \
+             (commit_max = {commit_max})"
         );
     }
 }

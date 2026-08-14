@@ -22,9 +22,6 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-[features]
-vsr = ["iggy/vsr"]
-
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }

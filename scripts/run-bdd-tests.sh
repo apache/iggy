@@ -19,12 +19,10 @@
 set -Eeuo pipefail
 
 COVERAGE=0
-VSR=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --coverage) COVERAGE=1 ;;
-    --vsr) VSR=1 ;;
     *) ARGS+=("$arg") ;;
   esac
 done
@@ -35,38 +33,20 @@ FEATURE="${ARGS[1]:-all}"
 log(){ printf "%b\n" "$*"; }
 
 usage(){
-  log "Usage: $0 [--coverage] [--vsr] <sdk> [feature]"
+  log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
-  # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-  log "  --vsr:   run against iggy-server-ng built with --features vsr (every SDK);"
-  log "           expects IGGY_SERVER_NG_PATH (default: target/debug/iggy-server-ng)"
-  log "           and a vsr-built iggy CLI at IGGY_CLI_PATH."
-  log "           Every foreign SDK speaks only VSR; the go suites imply the"
-  log "           flag and the java suite always applies the VSR overlay."
-  log "           Only rust still has a legacy (no --vsr) lane."
+  log ""
+  log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
+  log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
   log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
   log "  $0 rust basic_messaging         # run only basic_messaging for Rust"
   log "  $0 all leader_redirection       # run leader_redirection for all supporting SDKs"
-  log "  $0 --vsr rust                   # run all features for Rust against server-ng"
   log "  $0 --coverage go basic_messaging"
 }
-
-if [ "$VSR" = "1" ]; then
-  case "$SDK" in
-    rust|python|php|go|go-race|node|csharp|cpp|clean) ;;
-    java)
-      # Redundant: the Java suite applies the VSR overlay unconditionally.
-      VSR=0 ;;
-    *)
-      log "❌ unknown sdk for --vsr: ${SDK}"
-      usage
-      exit 2 ;;
-  esac
-fi
 
 case "$FEATURE" in
   basic_messaging|leader_redirection|raw_command|all) ;;
@@ -85,7 +65,6 @@ ALL_COMPOSE_FILES=(
   -f docker-compose.server.yml
   -f docker-compose.cluster.yml
   -f docker-compose.coverage.yml
-  -f docker-compose.vsr.yml
 )
 
 COMPOSE_FILES=(-f docker-compose.yml)
@@ -101,11 +80,6 @@ if [ "$COVERAGE" = "1" ]; then
   COMPOSE_FILES+=(-f docker-compose.coverage.yml)
   mkdir -p ../reports
 fi
-# vsr overrides must come last to win over the server/cluster/coverage files.
-if [ "$VSR" = "1" ]; then
-  COMPOSE_FILES+=(-f docker-compose.vsr.yml)
-  export BDD_RUST_FEATURES="bdd,vsr"
-fi
 
 cleanup(){
   log "🧹  cleaning up containers & volumes…"
@@ -115,10 +89,7 @@ trap cleanup EXIT INT TERM
 
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
-if [ "$VSR" = "1" ] || [ "$SDK" = "go" ] || [ "$SDK" = "go-race" ] || [ "$SDK" = "java" ]; then
-  # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
-  log "🗳️ Server: iggy-server-ng (--features vsr)"
-fi
+log "🗳️ Server: iggy-server"
 if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
@@ -140,21 +111,12 @@ run_suite(){
     esac
   fi
 
-  # The Go SDK speaks only the VSR wire protocol and the Java suite always
-  # runs against the VSR server overlay, so both run against the VSR server
-  # even when the caller did not ask for it. Each suite tears its own stack
-  # down, so an `all` run can mix the two servers.
-  local files=("${COMPOSE_FILES[@]}")
-  if { [ "$svc" = "go-bdd" ] || [ "$svc" = "java-bdd" ]; } && [ "$VSR" != "1" ]; then
-    files+=(-f docker-compose.vsr.yml)
-  fi
-
   log "${emoji} ${label}..."
   local code=0
-  docker compose "${files[@]}" \
+  docker compose "${COMPOSE_FILES[@]}" \
     up --build --exit-code-from "$svc" "$svc" \
     || code=$?
-  docker compose "${files[@]}" \
+  docker compose "${COMPOSE_FILES[@]}" \
     down -v --remove-orphans >/dev/null 2>&1 || true
   return "$code"
 }

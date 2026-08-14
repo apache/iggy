@@ -90,15 +90,12 @@ runs:
         npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/unit npm run test:unit
       shell: bash
 
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
     - name: Start Iggy server
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         wait-timeout-seconds: "90"
 
     - name: E2E tests
@@ -124,15 +121,12 @@ runs:
         path: ${{ steps.iggy.outputs.log_file }}
         if-no-files-found: ignore
 
-    # TODO(hubcio): change to iggy-server once legacy server is removed
-    # (core/server has VSR support)
     - name: Start Iggy server (TLS)
       id: iggy-tls
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server-ng
-        cargo-features: vsr
+        cargo-bin: iggy-server
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:

@@ -23,11 +23,11 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
-use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
 
 /// How often the shard pump drives `VsrConsensus::tick`.
@@ -36,76 +36,6 @@ use server_common::{Message, MessageBag};
 /// when the tick runs ("call this periodically, e.g. every 10ms"). Public
 /// so the simulator can advance its virtual clock in whole tick intervals.
 pub const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Decompose a [`MessageBag`] into the routing-relevant tuple
-/// `(operation, namespace, generic_message)`.
-///
-/// Single source of truth used by every dispatch entry point so the
-/// operation / namespace extraction never drifts between call sites.
-fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) {
-    match bag {
-        MessageBag::Request(r) => {
-            let h = *r.header();
-            (h.operation, h.namespace, r.into_generic())
-        }
-        MessageBag::Prepare(p) => {
-            let h = *p.header();
-            (h.operation, h.namespace, p.into_generic())
-        }
-        MessageBag::PrepareOk(p) => {
-            let h = *p.header();
-            (h.operation, h.namespace, p.into_generic())
-        }
-        MessageBag::StartViewChange(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::DoViewChange(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::StartView(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::Commit(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::RequestStartView(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::RequestPrepares(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::RepairPrepare(m) => {
-            let h = *m.header();
-            (h.0.operation, h.0.namespace, m.into_generic())
-        }
-        MessageBag::RepairRangeReply(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::RequestStateTransfer(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::StateTransferTarget(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::RequestStateChunk(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-        MessageBag::StateChunk(m) => {
-            let h = *m.header();
-            (h.operation(), h.namespace, m.into_generic())
-        }
-    }
-}
 
 /// Inter-shard dispatch logic.
 ///
@@ -122,20 +52,12 @@ where
     /// Network-receive entry point. Classifies the raw
     /// `Message<GenericHeader>` and routes it to the owning shard via
     /// `route_typed`.
-    //
-    // TODO(hubcio): perf - this `MessageBag::try_from` is run twice per
-    // consensus frame: once here to extract (operation, namespace) for
-    // routing, and a second time on the receiving shard inside `on_message`
-    // (lib.rs ~560) to dispatch to the correct on_* handler. The second
-    // parse re-runs `bytemuck::checked::try_from_bytes` + per-header
-    // `validate()` on bytes already validated upstream. Measured ~50 ns/
-    // frame; at 1M ops/sec/shard ~ 50 ms/sec/shard of pure re-validation.
-    //
-    // Fix: thread the classified bag through `ShardFrame::Consensus` (carry
-    // `MessageBag` instead of `Message<GenericHeader>`) so the inbox path
-    // matches directly with no second parse. Consensus variant grows from
-    // ~24 B to ~32 B, but `ShardFrame` total stays at 160 B (LifecycleFrame
-    // drives the union size).
+    ///
+    /// The only classify a frame gets: the bag rides
+    /// [`ShardFrame::Consensus`] to the owning shard, whose pump matches it
+    /// directly. Reading routing off it and then handing the bytes on generic
+    /// made every frame pay `bytemuck::checked::try_from_bytes` plus the
+    /// header's `validate()` twice.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
@@ -154,8 +76,8 @@ where
                 return;
             }
         };
-        let (operation, namespace, generic) = extract_routing(bag);
-        self.route_typed(operation, namespace, generic);
+        let (operation, namespace) = bag.routing();
+        self.route_typed(operation, namespace, bag);
     }
 
     /// Invoke the client-request handler directly, exactly as the client-fd
@@ -163,7 +85,7 @@ where
     /// The simulator's dispatch shell uses this to drive `SimClient` requests
     /// through the real `on_client_request` path (auth, session binding,
     /// consensus submit, reply) instead of the raw `dispatch` routing the
-    /// shell-off fast path takes. No production caller: a `-p iggy-server-ng`
+    /// shell-off fast path takes. No production caller: a `-p iggy-server`
     /// build excludes the `simulator` feature and this method.
     #[cfg(any(test, feature = "simulator"))]
     pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
@@ -176,7 +98,7 @@ where
     /// group is deterministic across the cluster.
     pub(crate) fn route_consensus_control(
         &self,
-        message: Message<GenericHeader>,
+        message: MessageBag,
         namespace_u64: u64,
         operation: Operation,
     ) {
@@ -195,15 +117,10 @@ where
     ///    frame (`StartViewChange`, `DoViewChange`, `StartView`, `Commit`)
     ///    or a client `Register` request. The owning consensus group is
     ///    identified by `namespace_u64`:
-    ///    - `METADATA_CONSENSUS_NAMESPACE` -> shard 0.
+    ///    - `METADATA_GROUP` -> shard 0.
     ///    - packable `IggyNamespace::inner()` -> the shard owning that
     ///      partition's consensus group.
-    fn route_typed(
-        &self,
-        operation: Operation,
-        namespace_u64: u64,
-        generic: Message<GenericHeader>,
-    ) {
+    fn route_typed(&self, operation: Operation, namespace_u64: u64, generic: MessageBag) {
         if operation.is_metadata() {
             self.try_send_to_target(0, generic, operation);
             return;
@@ -242,7 +159,7 @@ where
             "route_typed: operation {operation:?} fell through unclassified; \
              expected is_metadata / is_partition / is_vsr_reserved"
         );
-        if namespace_u64 == METADATA_CONSENSUS_NAMESPACE {
+        if namespace_u64 == METADATA_GROUP {
             self.try_send_to_target(0, generic, operation);
             return;
         }
@@ -254,17 +171,15 @@ where
     /// records the drop in `frame_drops_total`, under `variant=partition` for a
     /// partition-plane operation and `variant=consensus` otherwise -- the two
     /// have different recovery stories, so folding them into one label hides
-    /// which one is bleeding. VSR retransmit recovers consensus drops. A
+    /// which one is bleeding. VSR retransmit recovers consensus drops, except
+    /// the four register/logout forwarding frames, which no retransmit covers: a
+    /// dropped forward or its result surfaces as the origin's forward timeout
+    /// plus the SDK's session-operation replay. A
     /// `target` past the end of `senders` (a stored `u16` from `shard_for`, not
     /// a trusted index) is dropped with `reason=unroutable` rather than
     /// panicking. Metadata frames always pass `target = 0` here, since
     /// `is_metadata` operations are owned by shard 0.
-    fn try_send_to_target(
-        &self,
-        target: u16,
-        message: Message<GenericHeader>,
-        operation: Operation,
-    ) {
+    fn try_send_to_target(&self, target: u16, message: MessageBag, operation: Operation) {
         let variant = if operation.is_partition() {
             frame_drop_variant::PARTITION
         } else {
@@ -572,7 +487,7 @@ where
                 // Only shard 0 owns the metadata consensus group, and
                 // `forward_metadata_submit` always addresses shard 0, so a
                 // non-zero shard here is a routing bug. The handler (wired
-                // by server-ng) replies `None` on the carried sender if it
+                // by the server) replies `None` on the carried sender if it
                 // cannot submit, so the awaiting peer never blocks forever.
                 debug_assert_eq!(
                     self.id, 0,
@@ -583,7 +498,7 @@ where
             LifecycleFrame::ListClients { reply } => {
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
-                // (wired by server-ng) reads this shard's `SessionManager`
+                // (wired by the server) reads this shard's `SessionManager`
                 // and pushes the list over `reply`.
                 (self.on_list_clients)(reply);
             }
@@ -594,7 +509,7 @@ where
             } => {
                 // Addressed to the shard owning `namespace` (the sender
                 // resolved it via the shards table). The handler (wired by
-                // server-ng) runs the read against this shard's partitions
+                // the server) runs the read against this shard's partitions
                 // plane and pushes the result over `reply`; a dropped
                 // sender means the read is skipped and the gather side
                 // times out.

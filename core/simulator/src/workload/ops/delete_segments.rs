@@ -26,7 +26,7 @@
 //! in `Action` and the dispatch table so the surface compiles and the v2.4
 //! outcome expansion lands cleanly post-upgrade.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -61,7 +61,7 @@ pub const fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.delete_segments(
         &input.stream,
         &input.topic,

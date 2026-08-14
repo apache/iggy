@@ -2101,7 +2101,7 @@ where
             tracing::error!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = self.consensus().namespace(),
+                namespace_raw = self.consensus().group(),
                 frontier = self.offset_frontier(),
                 "state-transfer install could not record the installed offset frontier; \
                  the durable record stays at the pre-swap claim until the next view change"
@@ -2155,7 +2155,7 @@ where
         // Unlink the old segment chain oldest-first (a crash mid-loop leaves
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
-        let namespace_raw = self.consensus().namespace();
+        let namespace_raw = self.consensus().group();
         while let Some((_, mut storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
@@ -2331,6 +2331,7 @@ where
                     messages_w.size_counter(),
                     config.enforce_fsync,
                     true,
+                    config.preallocate_segments.then_some(config.segment_size),
                 )
                 .await
                 .map_err(|source| PartitionInstallError::SegmentOpen {
@@ -2433,7 +2434,7 @@ where
                 tracing::warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
-                    namespace_raw = self.consensus().namespace(),
+                    namespace_raw = self.consensus().group(),
                     path = %path,
                     %error,
                     "failed to unlink a superseded consumer-offset file during install"
@@ -2596,7 +2597,7 @@ where
                 tracing::warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
-                    namespace_raw = self.consensus().namespace(),
+                    namespace_raw = self.consensus().group(),
                     purge_generation = offsets_wire.purge_generation,
                     %error,
                     "state-transfer install could not record the offered purge \
@@ -2636,7 +2637,7 @@ where
         // promoted mid-transfer. (`last_prepare_checksum` needs nothing: it is
         // only read as a `parent:` stamp when building a prepare.)
         consensus.sequencer().set_sequence(commit_op);
-        consensus.pipeline().borrow_mut().clear();
+        consensus.clear_pipeline();
         consensus.advance_commit_max(commit_op);
         self.observed_view = self.consensus().view();
         self.repair = None;
@@ -2700,7 +2701,7 @@ where
                     tracing::error!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
-                        namespace_raw = self.consensus().namespace(),
+                        namespace_raw = self.consensus().group(),
                         partition_dir,
                         %error,
                         "converge sweep cannot list the partition directory"
@@ -2714,7 +2715,7 @@ where
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         warn_unlink(
-                            self.consensus().namespace(),
+                            self.consensus().group(),
                             &path.display().to_string(),
                             &error,
                         );
