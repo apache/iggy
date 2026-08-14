@@ -23,6 +23,8 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
@@ -34,13 +36,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
-import java.util.Map;
-import org.apache.iggy.message.HeaderKey;
-import org.apache.iggy.message.HeaderValue;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**

@@ -11959,7 +11959,6 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror 2.0.19",
- "tokio",
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry",

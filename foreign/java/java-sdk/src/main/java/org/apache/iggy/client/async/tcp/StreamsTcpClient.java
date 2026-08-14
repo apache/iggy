@@ -23,6 +23,8 @@ import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCounted;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
@@ -30,15 +32,13 @@ import org.apache.iggy.stream.StreamDetails;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
-import java.util.Map;
-import org.apache.iggy.message.HeaderKey;
-import org.apache.iggy.message.HeaderValue;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**

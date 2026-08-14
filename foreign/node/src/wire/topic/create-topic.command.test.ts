@@ -30,8 +30,7 @@ describe('CreateTopic', () => {
       partitionCount: 1,
       compressionAlgorithm: 1, // 1 = None, 2 = Gzip
       messageExpiry: 0n,
-      maxTopicSize: 0n,
-      replicationFactor: 1
+      maxTopicSize: 0n
     };
 
     // TLV field: [kind:u8][len:u32_le][bytes]
@@ -88,6 +87,17 @@ describe('CreateTopic', () => {
         + tlvSize('messages_required_to_save'.length) + tlvSize(4)
         + tlvSize('size_of_messages_required_to_save'.length) + tlvSize(8)
         + tlvSize('preallocate_segments'.length) + tlvSize(1)
+      );
+    });
+
+    it('serialize replicationFactor as an option', () => {
+      // 1 is an explicit value, not a sentinel: only an unset field lets the
+      // server resolve its own default.
+      const t = { ...t1, replicationFactor: 1 };
+      assert.deepEqual(
+        CREATE_TOPIC.serialize(t).length,
+        fixedSize + t1.name.length
+        + tlvSize('replication_factor'.length) + tlvSize(1)
       );
     });
 

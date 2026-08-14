@@ -252,12 +252,18 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
             case Int16 -> String.valueOf(asInt16());
             case Int32 -> String.valueOf(asInt32());
             case Int64 -> String.valueOf(asInt64());
+            case Float32 -> String.valueOf(asFloat32());
+            case Float64 -> String.valueOf(asFloat64());
+            default -> unsignedOrRawToString();
+        };
+    }
+
+    private String unsignedOrRawToString() {
+        return switch (kind) {
             case Uint8 -> String.valueOf(asUint8());
             case Uint16 -> String.valueOf(asUint16());
             case Uint32 -> String.valueOf(asUint32());
             case Uint64 -> asUint64().toString();
-            case Float32 -> String.valueOf(asFloat32());
-            case Float64 -> String.valueOf(asFloat64());
             default -> Base64.getEncoder().encodeToString(value);
         };
     }
