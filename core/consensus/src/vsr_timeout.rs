@@ -69,7 +69,18 @@ impl Timeout {
         self.attempts = 0;
     }
 
+    /// Restart a running timer's interval, clearing any accumulated backoff.
+    ///
+    /// # Panics
+    /// In debug builds, if the timer is not ticking. `reset` leaves `ticking` alone,
+    /// so on a stopped timer it yields an armed-but-dead state that never fires and
+    /// reads as healthy. Callers that cannot prove the timer is running want
+    /// [`Self::start`], identical to this on a running one.
     pub const fn reset(&mut self) {
+        debug_assert!(
+            self.ticking,
+            "reset on a stopped timeout leaves it armed-but-dead; use start"
+        );
         self.ticks_remaining = self.after;
         self.attempts = 0;
     }
