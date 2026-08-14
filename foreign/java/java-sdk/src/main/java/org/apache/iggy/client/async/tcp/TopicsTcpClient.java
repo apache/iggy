@@ -106,10 +106,11 @@ public class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name) {
+            String name,
+            Map<String, HeaderValue> options) {
 
-        var payload =
-                createTopicPayload(streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
+        var payload = createTopicPayload(
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, options);
 
         return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
             try {
@@ -126,23 +127,30 @@ public class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name) {
+            String name,
+            Map<String, HeaderValue> options) {
         // partitions_count is a fixed field of the command, never an option:
         // admission consumes it to compute partition assignments.
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeIntLE(partitionsCount.intValue());
         payload.writeBytes(BytesSerializer.toBytes(name));
-        payload.writeBytes(
-                BytesSerializer.toBytes(createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
+        payload.writeBytes(BytesSerializer.toBytes(
+                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize, options)));
         return payload;
     }
 
     private static Map<HeaderKey, HeaderValue> createTopicOptions(
-            CompressionAlgorithm compressionAlgorithm, BigInteger messageExpiry, BigInteger maxTopicSize) {
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Map<String, HeaderValue> extra) {
         // Server-default sentinels (compression none, expiry 0, size 0) are
         // omitted so the admitting server resolves them from its config.
         Map<HeaderKey, HeaderValue> options = new LinkedHashMap<>();
+        // Caller keys go in first so a parameter above overwrites one of them:
+        // the block must not carry a key twice, or the server refuses it whole.
+        extra.forEach((key, value) -> options.put(HeaderKey.fromString(key), value));
         if (compressionAlgorithm != CompressionAlgorithm.None) {
             var compressionName =
                     switch (compressionAlgorithm) {
@@ -167,7 +175,8 @@ public class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name) {
+            String name,
+            Map<String, HeaderValue> options) {
 
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
@@ -176,8 +185,8 @@ public class TopicsTcpClient implements TopicsClient {
         // Settings ride the options block. A default value means the caller did
         // not set the key, so it is omitted and the server leaves the topic's
         // current value alone.
-        payload.writeBytes(
-                BytesSerializer.toBytes(createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
+        payload.writeBytes(BytesSerializer.toBytes(
+                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize, options)));
 
         return connection()
                 .send(CommandCode.Topic.UPDATE.getValue(), payload)

@@ -20,7 +20,7 @@ import type { CommandResponse } from '../../client/client.type.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
-import { serializeOptions, type OptionEntry } from '../options.utils.js';
+import { dedupeOptions, serializeOptions, type OptionEntry } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 import {
   isValidCompressionAlgorithm, CompressionAlgorithm,
@@ -56,7 +56,14 @@ export type CreateTopic = {
   /** Accumulated message bytes that trigger a save */
   sizeOfMessagesRequiredToSave?: bigint,
   /** Preallocate segment files when the topic is created */
-  preallocateSegments?: boolean
+  preallocateSegments?: boolean,
+  /**
+   * Option keys with no field of their own, for a key the server catalog gained
+   * after this build shipped. A field above wins on collision, since the block
+   * must not carry a key twice. Call `describeOptions` for the keys a server
+   * accepts.
+   */
+  options?: OptionEntry[]
 };
 
 /**
@@ -79,7 +86,8 @@ export const CREATE_TOPIC = {
     enforceFsync,
     messagesRequiredToSave,
     sizeOfMessagesRequiredToSave,
-    preallocateSegments
+    preallocateSegments,
+    options: extraOptions = []
   }: CreateTopic
   ) => {
     // Topic ID is now auto-assigned by the server, not sent in the protocol
@@ -96,7 +104,8 @@ export const CREATE_TOPIC = {
     // Server-default sentinels (expiry 0, size 0, compression none) and
     // unset optionals are omitted so the server resolves them from its own
     // config and reports them back as derived options.
-    const options: OptionEntry[] = [];
+    // Caller keys first so a typed field below overwrites one of them.
+    const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
       options.push({
         key: 'compression_algorithm',
@@ -141,7 +150,7 @@ export const CREATE_TOPIC = {
       streamIdentifier,
       b,
       bName,
-      serializeOptions(options),
+      serializeOptions(dedupeOptions(options)),
     ]);
   },
 

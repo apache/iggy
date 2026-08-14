@@ -31,6 +31,8 @@ using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
@@ -156,7 +158,8 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0, CancellationToken token = default)
+        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
+        IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateTopicRequest
         {
@@ -164,7 +167,8 @@ public class HttpMessageStream : IIggyClient
             CompressionAlgorithm = compressionAlgorithm,
             MaxTopicSize = maxTopicSize,
             MessageExpiry = DurationHelpers.ToDuration(messageExpiry),
-            PartitionsCount = partitionsCount
+            PartitionsCount = partitionsCount,
+            Options = ToStringOptions(options)
         }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -184,10 +188,12 @@ public class HttpMessageStream : IIggyClient
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         ulong maxTopicSize = 0, TimeSpan? messageExpiry = null,
+        IReadOnlyDictionary<string, HeaderValue>? options = null,
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(
-            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, DurationHelpers.ToDuration(messageExpiry)),
+            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize,
+                DurationHelpers.ToDuration(messageExpiry), ToStringOptions(options)),
             _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);
@@ -470,13 +476,67 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<OptionSpec>> DescribeOptionsAsync(OptionsScope scope,
+    public async Task<IReadOnlyList<OptionSpec>> DescribeOptionsAsync(OptionsScope scope,
         CancellationToken token = default)
     {
-        // The REST catalog renders `kind` as a name and `default_value` as a JSON
-        // array, a second shape for the same contract. Until the two agree, the
-        // binary transports are the ones that carry it.
-        throw new FeatureUnavailableException();
+        var response = await _httpClient.GetAsync($"/options/{scope.ToString().ToLowerInvariant()}", token);
+        if (response.IsSuccessStatusCode)
+        {
+            var specs = await response.Content.ReadFromJsonAsync<List<HttpOptionSpec>>(_jsonSerializerOptions, token);
+            return specs?.Select(spec => spec.ToOptionSpec()).ToList() ?? [];
+        }
+
+        await HandleResponseAsync(response);
+
+        return [];
+    }
+
+    /// <summary>
+    ///     The REST shape of a catalog entry: the kind arrives as its name and the default as raw
+    ///     bytes, where the binary transport sends a kind code. Mapping it here keeps
+    ///     <see cref="OptionSpec" /> the one shape a caller sees on either transport.
+    /// </summary>
+    private sealed record HttpOptionSpec(string Key, string Kind, byte[] DefaultValue, string Description)
+    {
+        internal OptionSpec ToOptionSpec()
+        {
+            return new OptionSpec
+            {
+                Key = Key,
+                Kind = UserHeadersConverter.ParseHeaderKind(Kind),
+                DefaultValue = DefaultValue,
+                Description = Description
+            };
+        }
+    }
+
+    /// <summary>
+    ///     Renders option values as the strings the REST body carries them in.
+    ///
+    ///     The binary transports send a typed TLV block, but the JSON body takes a plain string map the
+    ///     server parses by the same rules a config file value goes through, so a typed value handed in
+    ///     here is rendered rather than passed through.
+    /// </summary>
+    private static Dictionary<string, string> ToStringOptions(IReadOnlyDictionary<string, HeaderValue>? options)
+    {
+        if (options is null)
+        {
+            return new Dictionary<string, string>();
+        }
+
+        return options.ToDictionary(entry => entry.Key, entry => ToStringValue(entry.Value));
+    }
+
+    private static string ToStringValue(HeaderValue value)
+    {
+        // A Bool header renders as "1" or "0", which the server's option parser refuses. It takes
+        // the words a config file would carry.
+        if (value.Kind is HeaderKind.Bool)
+        {
+            return value.ToBool() ? "true" : "false";
+        }
+
+        return value.ToString();
     }
 
     /// <inheritdoc />

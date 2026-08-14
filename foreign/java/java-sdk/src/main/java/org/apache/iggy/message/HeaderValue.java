@@ -236,7 +236,13 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
         return new HashCodeBuilder(17, 37).append(kind).append(value).toHashCode();
     }
 
-    private String toStringValue() {
+    /**
+     * Renders this value as the string a config file or a REST body carries it in.
+     *
+     * <p>The server parses those strings by the same rules, so a rendered value and the typed one
+     * it came from resolve to the same stored value.
+     */
+    public String toStringValue() {
         if (kind == HeaderKind.String) {
             return asString();
         }

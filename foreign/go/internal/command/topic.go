@@ -19,6 +19,7 @@ package command
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/apache/iggy/foreign/go/contracts"
 )
@@ -36,6 +37,10 @@ type CreateTopic struct {
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
 	Name                 string                      `json:"name"`
+	// Options carries keys with no field above, for a key the server catalog
+	// gained after this build shipped. Entries reuse HeaderEntry because options
+	// ride the user-headers codec. A field above wins on collision.
+	Options []iggcon.HeaderEntry `json:"-"`
 }
 
 func (t *CreateTopic) Code() Code {
@@ -83,7 +88,36 @@ func (t *CreateTopic) options() ([]iggcon.HeaderEntry, error) {
 	if t.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
 	}
-	return options, nil
+	return mergeOptions(options, t.Options)
+}
+
+// mergeOptions appends the caller's entries to the ones the typed fields
+// produced, dropping any that would duplicate a typed key.
+//
+// The block must not carry a key twice: wire validation refuses the whole
+// request for a duplicate. The typed field wins because it is the specific
+// argument, mirroring how the Rust SDK inserts typed values after raw ones.
+func mergeOptions(typed, extra []iggcon.HeaderEntry) ([]iggcon.HeaderEntry, error) {
+	if len(extra) == 0 {
+		return typed, nil
+	}
+	seen := make(map[string]struct{}, len(typed)+len(extra))
+	for _, entry := range typed {
+		seen[string(entry.Key.Value)] = struct{}{}
+	}
+	merged := typed
+	for _, entry := range extra {
+		if entry.Key.Kind != iggcon.String {
+			return nil, fmt.Errorf("option key kind %d is not a string", entry.Key.Kind)
+		}
+		key := string(entry.Key.Value)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, entry)
+	}
+	return merged, nil
 }
 
 func uint64Option(key string, value uint64) iggcon.HeaderEntry {
@@ -144,6 +178,9 @@ type UpdateTopic struct {
 	StreamId iggcon.Identifier `json:"streamId"`
 	TopicId  iggcon.Identifier `json:"topicId"`
 	Name     string            `json:"name"`
+	// Options carries keys with no field below. The server refuses any key an
+	// update may not change, by name.
+	Options []iggcon.HeaderEntry `json:"-"`
 	// Settings ride the options block. A zero value means "leave it alone",
 	// so a rename does not silently reset the rest.
 	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
@@ -174,7 +211,7 @@ func (u *UpdateTopic) options() ([]iggcon.HeaderEntry, error) {
 	if u.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, u.MaxTopicSize))
 	}
-	return options, nil
+	return mergeOptions(options, u.Options)
 }
 
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {

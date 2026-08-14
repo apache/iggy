@@ -251,13 +251,13 @@ public partial class IggyPublisher : IAsyncDisposable
         {
             await Client.CreateTopicAsync(Config.StreamId, Config.TopicId.GetString(),
                 Config.TopicPartitionsCount, Config.TopicCompressionAlgorithm,
-                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, ct);
+                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, token: ct);
         }
         else
         {
             await Client.CreateTopicAsync(Config.StreamId, Config.TopicName, Config.TopicPartitionsCount,
                 Config.TopicCompressionAlgorithm,
-                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, ct);
+                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, token: ct);
         }
 
         LogTopicCreated(Config.TopicId, Config.StreamId);

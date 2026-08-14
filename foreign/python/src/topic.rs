@@ -17,14 +17,37 @@
 
 use iggy::prelude::{
     IggyByteSize, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
-    Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
+    Partition as RustPartition, ResourceOptions, Topic as RustTopic,
+    TopicDetails as RustTopicDetails,
 };
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
+use crate::user_headers::{UserHeaders, rust_user_headers_to_py};
+
+/// The entries of one provenance, as the dictionary message user headers come
+/// back as.
+///
+/// Options ride the user-headers codec, so they are handed back through the
+/// same `HeaderKey`/`HeaderValue` types rather than a second shape meaning the
+/// same thing: `to_scalar_dict()` works on the result exactly as it does on
+/// `ReceiveMessage.user_headers`.
+fn options_by_provenance<'a>(
+    py: Python<'a>,
+    options: &ResourceOptions,
+    explicit: bool,
+) -> PyResult<Bound<'a, UserHeaders>> {
+    let selected = options
+        .iter()
+        .filter(|(_, option)| option.explicit == explicit)
+        .map(|(key, option)| (key.clone(), option.value.clone()))
+        .collect();
+    rust_user_headers_to_py(py, selected)
+}
 
 /// The expiry of the messages in a topic.
 #[gen_stub_pyclass_complex_enum]
@@ -218,6 +241,25 @@ impl Topic {
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.inner.max_topic_size.into()
     }
+
+    /// Options the creating client set explicitly.
+    ///
+    /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+    /// returns, since options ride that codec; call `to_scalar_dict()` for the
+    /// plain-scalar form.
+    #[getter]
+    pub fn options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, true)
+    }
+
+    /// Options admission resolved for the keys the client did not send.
+    ///
+    /// Same shape as [`Self::options`]. These would have resolved differently
+    /// under another server configuration.
+    #[getter]
+    pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, false)
+    }
 }
 
 #[gen_stub_pyclass]
@@ -289,6 +331,25 @@ impl TopicDetails {
     #[getter]
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.inner.max_topic_size.into()
+    }
+
+    /// Options the creating client set explicitly.
+    ///
+    /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+    /// returns, since options ride that codec; call `to_scalar_dict()` for the
+    /// plain-scalar form.
+    #[getter]
+    pub fn options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, true)
+    }
+
+    /// Options admission resolved for the keys the client did not send.
+    ///
+    /// Same shape as [`Self::options`]. These would have resolved differently
+    /// under another server configuration.
+    #[getter]
+    pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, false)
     }
 
     /// The collection of partitions in the topic.

@@ -40,6 +40,7 @@ __all__ = [
     "IggyConsumer",
     "IggyExpiry",
     "MaxTopicSize",
+    "OptionSpec",
     "Partition",
     "Permissions",
     "PollingStrategy",
@@ -1003,6 +1004,27 @@ class IggyClient:
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
         """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
+        """
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
@@ -1508,6 +1530,41 @@ class MaxTopicSize:
     ...
 
 @typing.final
+class OptionSpec:
+    r"""
+    One entry of a resource's option catalog, as served by `describe_options`.
+    """
+    @property
+    def key(self) -> builtins.str:
+        r"""
+        The option key a create command accepts.
+        """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        Name of this key's canonical kind: what the server encodes its default
+        under, and what a value set by `create_topic` is stored as whatever kind
+        it was sent in, since create admission re-encodes the block from its own
+        parse. `update_topic` stores what the client sent verbatim and is the
+        exception.
+        """
+    @property
+    def default_value(self) -> HeaderValue | None:
+        r"""
+        The key's default as a `HeaderValue`, or `None` when the key has no
+        default.
+
+        The same type message user headers use, so the usual accessors read it;
+        options ride that codec.
+        """
+    @property
+    def description(self) -> builtins.str:
+        r"""
+        What the option does, including the bounds its value is checked against.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Partition:
     @property
     def id(self) -> builtins.int:
@@ -1980,6 +2037,23 @@ class Topic:
         r"""
         The maximum size of the topic.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently under
+        another server configuration.
+        """
 
 @typing.final
 class TopicDetails:
@@ -2027,6 +2101,23 @@ class TopicDetails:
     def max_topic_size(self) -> MaxTopicSize:
         r"""
         The maximum size of the topic.
+        """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently under
+        another server configuration.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:

@@ -20,14 +20,17 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.util.Map;
 
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public abstract class TopicsClientBaseTest extends IntegrationTest {
 
@@ -81,6 +84,43 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
                 topicsClient.getTopic(STREAM_NAME, TopicId.of(topic.id())).get();
         assertThat(updatedTopic.name()).isEqualTo("new-name");
         assertThat(updatedTopic.messageExpiry()).isEqualTo(BigInteger.valueOf(5000));
+    }
+
+    @Test
+    void shouldCarryOptionKeysWithNoParameterOfTheirOwn() {
+        // when
+        var created = topicsClient.createTopic(
+                STREAM_NAME,
+                1L,
+                CompressionAlgorithm.None,
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                "options-topic",
+                Map.of("enforce_fsync", HeaderValue.fromString("true")));
+
+        // then
+        var topic = topicsClient.getTopic(STREAM_NAME, TopicId.of(created.id())).orElseThrow();
+        // Asserted through the string rendering rather than the kind: the binary
+        // transport reports the key's canonical Bool while REST renders values as
+        // strings, and both mean the same setting.
+        assertThat(topic.options()).containsKey("enforce_fsync");
+        assertThat(topic.options().get("enforce_fsync").toStringValue()).isEqualTo("true");
+        // Keys the client left alone are resolved by admission and reported apart.
+        assertThat(topic.derivedOptions()).containsKey("max_topic_size");
+        assertThat(topic.derivedOptions()).doesNotContainKey("enforce_fsync");
+    }
+
+    @Test
+    void shouldRejectAnOptionKeyOutsideTheCatalog() {
+        assertThatThrownBy(() -> topicsClient.createTopic(
+                        STREAM_NAME,
+                        1L,
+                        CompressionAlgorithm.None,
+                        BigInteger.ZERO,
+                        BigInteger.ZERO,
+                        "bad-options-topic",
+                        Map.of("not_a_real_option", HeaderValue.fromString("1"))))
+                .isInstanceOf(RuntimeException.class);
     }
 
     @Test

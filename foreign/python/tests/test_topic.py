@@ -1012,6 +1012,10 @@ class TestUpdateTopic:
             stream=stream_name, name=topic_name, partitions_count=1
         )
 
+        created = await iggy_client.get_topic(stream_name, topic_name)
+        assert created is not None
+        resolved_at_creation = created.max_topic_size
+
         await iggy_client.update_topic(
             stream_id=stream_name,
             topic_id=topic_name,
@@ -1023,7 +1027,13 @@ class TestUpdateTopic:
         assert topic is not None
         assert topic.name == topic_name
         if expected_kind == "server_default":
-            assert isinstance(topic.max_topic_size, MaxTopicSize.ServerDefault)
+            # Every setting rides the options block and 0 is its "resolve the
+            # default" sentinel, so a ServerDefault update carries no key at all
+            # and the topic keeps the value admission resolved when it was
+            # created. Resetting a setting back to the node default is
+            # deliberately not expressible.
+            assert isinstance(topic.max_topic_size, type(resolved_at_creation))
+            assert not isinstance(topic.max_topic_size, MaxTopicSize.ServerDefault)
         elif expected_kind == "unlimited":
             assert isinstance(topic.max_topic_size, MaxTopicSize.Unlimited)
         else:
@@ -1354,3 +1364,66 @@ class TestPurgeTopic:
         await client.connect()
         with pytest.raises(RuntimeError):
             await client.purge_topic(unique_name(), unique_name())
+
+
+class TestTopicOptions:
+    """Tests for the option catalog and the options a topic reports."""
+
+    @pytest.mark.asyncio
+    async def test_topic_options_round_trip(self, iggy_client: IggyClient, unique_name):
+        """Options a client sets come back readable, split by provenance."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+            options={"enforce_fsync": "true", "segment_size": "128 MiB"},
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        # Options come back through the same typed dict message user headers
+        # use, so the scalar helper reads them the same way.
+        explicit = topic.options.to_scalar_dict()
+        assert explicit["enforce_fsync"] is True
+        assert explicit["segment_size"] == 128 * 1024 * 1024
+        # Keys the client left alone are resolved by admission and reported
+        # separately, so an operator can tell chosen from defaulted.
+        derived = topic.derived_options.to_scalar_dict()
+        assert "max_topic_size" in derived
+        assert "enforce_fsync" not in derived
+
+        topics = await iggy_client.get_topics(stream_name)
+        listed = next(entry for entry in topics if entry.name == topic_name)
+        assert listed.options.to_scalar_dict()["enforce_fsync"] is True
+
+    @pytest.mark.asyncio
+    async def test_describe_options_lists_the_topic_catalog(
+        self, iggy_client: IggyClient
+    ):
+        """The catalog is what tells a client which keys create accepts."""
+        specs = await iggy_client.describe_options("topic")
+
+        by_key = {spec.key: spec for spec in specs}
+        assert "segment_size" in by_key
+        assert "enforce_fsync" in by_key
+        segment_size = by_key["segment_size"]
+        assert segment_size.kind == "uint64"
+        # The default is the same HeaderValue type message headers carry.
+        assert segment_size.default_value.value == 1024 * 1024 * 1024
+        assert segment_size.description
+
+        # Streams and users have no catalog keys yet.
+        assert await iggy_client.describe_options("stream") == []
+        assert await iggy_client.describe_options("user") == []
+
+    @pytest.mark.asyncio
+    async def test_describe_options_rejects_an_unknown_scope(
+        self, iggy_client: IggyClient
+    ):
+        """Test describe_options raises ValueError for an unknown scope."""
+        with pytest.raises(ValueError):
+            await iggy_client.describe_options("partition")

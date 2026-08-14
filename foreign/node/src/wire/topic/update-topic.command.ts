@@ -17,7 +17,7 @@
 //
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { serializeOptions, type OptionEntry } from '../options.utils.js';
+import { dedupeOptions, serializeOptions, type OptionEntry } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
@@ -46,6 +46,11 @@ export type UpdateTopic = {
   messageExpiry?: bigint,
   /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize?: bigint,
+  /**
+   * Option keys with no field of their own. The server refuses any key an update
+   * may not change, by name; a key left out keeps its current value.
+   */
+  options?: OptionEntry[]
 };
 
 /**
@@ -62,6 +67,7 @@ export const UPDATE_TOPIC = {
     compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
+    options: extraOptions = []
   }: UpdateTopic) => {
     const streamIdentifier = serializeIdentifier(streamId);
     const topicIdentifier = serializeIdentifier(topicId);
@@ -74,7 +80,8 @@ export const UPDATE_TOPIC = {
 
     // Settings ride the options block. A default value means the caller did not
     // set the key, so it is omitted and the server leaves the current value be.
-    const options: OptionEntry[] = [];
+    // Caller keys first so a typed field below overwrites one of them.
+    const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
       options.push({
         key: 'compression_algorithm',
@@ -99,7 +106,7 @@ export const UPDATE_TOPIC = {
       topicIdentifier,
       b,
       bName,
-      serializeOptions(options),
+      serializeOptions(dedupeOptions(options)),
     ]);
   },
 

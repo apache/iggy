@@ -32,6 +32,10 @@ import java.util.Map;
  * Both are keyed by option name, and the split is the provenance: a value in
  * {@code derivedOptions} would have resolved differently under another server config.
  * The fixed fields above repeat three of those keys and stay for compatibility.
+ *
+ * <p>Both transports populate them. The binary protocol carries each value in the kind the server
+ * stored it under; REST renders values in a readable string form, so over HTTP every value is
+ * String-kinded.
  */
 public record Topic(
         Long id,
@@ -44,4 +48,9 @@ public record Topic(
         BigInteger messagesCount,
         Long partitionsCount,
         Map<String, HeaderValue> options,
-        Map<String, HeaderValue> derivedOptions) {}
+        Map<String, HeaderValue> derivedOptions) {
+    public Topic {
+        options = options == null ? Map.of() : options;
+        derivedOptions = derivedOptions == null ? Map.of() : derivedOptions;
+    }
+}

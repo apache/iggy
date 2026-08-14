@@ -33,9 +33,10 @@ export type OptionsScope = typeof OptionsScope[keyof typeof OptionsScope];
  * One catalog entry: the key a create command accepts, the kind the server
  * encodes its default under, that default, and what the option does.
  *
- * `kind` is the kind to prefer, not a guarantee: an explicit entry is stored
- * with whatever kind the client sent, and a string value parsed through the
- * server's config rules stays a string.
+ * `kind` is this key's canonical kind: what the server encodes its default
+ * under, and what a value set at create is stored as whatever kind it was sent
+ * in, since create admission re-encodes the block from its own parse. An update
+ * stores the client's bytes verbatim and is the exception.
  */
 export type OptionSpec = {
   key: string,

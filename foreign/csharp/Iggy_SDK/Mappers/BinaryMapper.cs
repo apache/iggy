@@ -710,7 +710,7 @@ internal static class BinaryMapper
         return headers;
     }
 
-    private static HeaderKind MapHeaderKind(byte value)
+    internal static HeaderKind MapHeaderKind(byte value)
     {
         return value switch
         {
@@ -1262,7 +1262,7 @@ internal static class BinaryMapper
             specs.Add(new OptionSpec
             {
                 Key = key,
-                Kind = kind,
+                Kind = MapHeaderKind(kind),
                 DefaultValue = defaultValue,
                 Description = description
             });

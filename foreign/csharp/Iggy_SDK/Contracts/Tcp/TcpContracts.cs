@@ -640,12 +640,22 @@ internal static class TcpContracts
     }
 
     internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry)
+        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry,
+        IReadOnlyDictionary<string, HeaderValue>? extraOptions = null)
     {
         // Settings ride the options block. A default value means the caller did
         // not set the key, so it is omitted and the server leaves the topic's
         // current value alone.
         var options = new Dictionary<HeaderKey, HeaderValue>();
+        // Caller keys first, so a named argument overwrites one of them.
+        if (extraOptions is not null)
+        {
+            foreach (var (key, value) in extraOptions)
+            {
+                options[HeaderKey.FromString(key)] = value;
+            }
+        }
+
         if (compressionAlgorithm != CompressionAlgorithm.None)
         {
             options[HeaderKey.FromString("compression_algorithm")]
@@ -675,9 +685,19 @@ internal static class TcpContracts
 
     internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
         CompressionAlgorithm compressionAlgorithm, ulong messageExpiry,
-        ulong maxTopicSize)
+        ulong maxTopicSize, IReadOnlyDictionary<string, HeaderValue>? extraOptions = null)
     {
         var options = new Dictionary<HeaderKey, HeaderValue>();
+        // Caller keys go in first so a named argument overwrites one of them: the
+        // block must not carry a key twice, or the server refuses it whole.
+        if (extraOptions is not null)
+        {
+            foreach (var (key, value) in extraOptions)
+            {
+                options[HeaderKey.FromString(key)] = value;
+            }
+        }
+
         if (compressionAlgorithm != CompressionAlgorithm.None)
         {
             options[HeaderKey.FromString("compression_algorithm")]

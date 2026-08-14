@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Headers;
+
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
@@ -49,11 +51,12 @@ public class OptionSpec
     public required string Key { get; set; }
 
     /// <summary>
-    ///     Header kind code the server encodes this key's default under, and the
-    ///     kind a client should prefer. Not a guarantee about storage: an
-    ///     explicitly set entry keeps the kind the client sent.
+    ///     Canonical kind for this key: what the server encodes its default under, and
+    ///     what a value set at create is stored as whatever kind the client sent, since
+    ///     create admission re-encodes the block from its own parse. An update stores
+    ///     the client's bytes verbatim and is the exception.
     /// </summary>
-    public required byte Kind { get; set; }
+    public required HeaderKind Kind { get; set; }
 
     /// <summary>
     ///     The key's default in <see cref="Kind" />'s encoding; empty when the key

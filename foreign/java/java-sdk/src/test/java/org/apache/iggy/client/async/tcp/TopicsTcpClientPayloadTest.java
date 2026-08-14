@@ -41,7 +41,7 @@ class TopicsTcpClientPayloadTest {
     @Test
     void shouldWritePartitionsCountAsFixedFieldBeforeName() {
         ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of(1L), 3L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "orders");
+                StreamId.of(1L), 3L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "orders", Map.of());
 
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 1); // numeric identifier kind
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 4); // identifier length
@@ -54,7 +54,13 @@ class TopicsTcpClientPayloadTest {
     @Test
     void shouldOmitServerDefaultOptions() {
         ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of("my-stream"), 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "events");
+                StreamId.of("my-stream"),
+                1L,
+                CompressionAlgorithm.None,
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                "events",
+                Map.of());
 
         payload.skipBytes(2 + "my-stream".length());
         assertThat(payload.readUnsignedIntLE()).isEqualTo(1L);
@@ -70,7 +76,8 @@ class TopicsTcpClientPayloadTest {
                 CompressionAlgorithm.Gzip,
                 BigInteger.valueOf(60_000_000L),
                 BigInteger.valueOf(1024L),
-                "orders");
+                "orders",
+                Map.of());
 
         payload.skipBytes(6);
         assertThat(payload.readUnsignedIntLE()).isEqualTo(2L);

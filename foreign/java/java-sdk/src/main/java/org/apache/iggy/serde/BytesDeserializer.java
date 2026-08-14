@@ -52,6 +52,7 @@ import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.ConsumerGroupInfo;
+import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.Stats;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
@@ -82,6 +83,9 @@ public final class BytesDeserializer {
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
     private static final int MIN_CLUSTER_NODE_BYTES = 18;
+    // A one-character key (length byte plus a byte of name), a kind byte, and
+    // empty length-prefixed default and description.
+    private static final int MIN_OPTION_SPEC_BYTES = 2 + 1 + 4 + 4;
     // 50-byte fixed part + a one-character name (the server rejects an empty
     // one) + two u32 options-block length prefixes.
     private static final int MIN_TOPIC_BYTES = 59;
@@ -94,7 +98,7 @@ public final class BytesDeserializer {
         var topicsCount = response.readUnsignedIntLE();
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
-        var nameLength = response.readByte();
+        var nameLength = response.readUnsignedByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         var options = readOptionsBlock(response, "stream options");
 
@@ -146,7 +150,7 @@ public final class BytesDeserializer {
         var maxTopicSize = readU64AsBigInteger(response);
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
-        var nameLength = response.readByte();
+        var nameLength = response.readUnsignedByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         var options = readOptionsBlock(response, "topic explicit options");
         var derivedOptions = readOptionsBlock(response, "topic derived options");
@@ -189,7 +193,7 @@ public final class BytesDeserializer {
         var groupId = response.readUnsignedIntLE();
         var partitionsCount = response.readUnsignedIntLE();
         var membersCount = response.readUnsignedIntLE();
-        var nameLength = response.readByte();
+        var nameLength = response.readUnsignedByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         return new ConsumerGroup(groupId, name, partitionsCount, membersCount);
     }
@@ -413,6 +417,36 @@ public final class BytesDeserializer {
         return new ConsumerGroupInfo(streamId, topicId, groupId);
     }
 
+    /**
+     * Reads a {@code DescribeOptions} response.
+     *
+     * <p>Wire format: {@code [count:u32][key_len:u8][key][kind:u8][default_len:u32][default]
+     * [description_len:u32][description]}*. A scope with no catalog keys answers with a zero count
+     * rather than an error.
+     */
+    public static List<OptionSpec> readOptionSpecs(ByteBuf response) {
+        var count = response.readUnsignedIntLE();
+        int specsCount =
+                validatedCollectionSize(count, response.readableBytes(), MIN_OPTION_SPEC_BYTES, "Option count");
+        List<OptionSpec> specs = new ArrayList<>(specsCount);
+        for (int i = 0; i < specsCount; i++) {
+            var keyLength = response.readUnsignedByte();
+            if (keyLength > response.readableBytes()) {
+                throw new IggyMalformedResponseException("Truncated option key at entry " + i);
+            }
+            var key =
+                    response.readCharSequence(keyLength, StandardCharsets.UTF_8).toString();
+
+            var kindCode = response.readUnsignedByte();
+            var defaultValue = readU32PrefixedBytes(response, "option default value for '" + key + "'");
+            var description = readU32PrefixedString(response, "option description for '" + key + "'");
+
+            specs.add(new OptionSpec(key, new HeaderValue(HeaderKind.fromCode(kindCode), defaultValue), description));
+        }
+
+        return specs;
+    }
+
     public static ClusterMetadata readClusterMetadata(ByteBuf response) {
         var name = readU32PrefixedString(response, "cluster name");
         var nodesCount = response.readUnsignedIntLE();
@@ -522,7 +556,7 @@ public final class BytesDeserializer {
         var createdAt = readU64AsBigInteger(response);
         var statusCode = response.readByte();
         var status = UserStatus.fromCode(statusCode);
-        var usernameLength = response.readByte();
+        var usernameLength = response.readUnsignedByte();
         var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8)
                 .toString();
         // Validated and dropped: users have no catalog keys yet, so the server
@@ -532,14 +566,14 @@ public final class BytesDeserializer {
     }
 
     public static RawPersonalAccessToken readRawPersonalAccessToken(ByteBuf response) {
-        var tokenLength = response.readByte();
+        var tokenLength = response.readUnsignedByte();
         var token =
                 response.readCharSequence(tokenLength, StandardCharsets.UTF_8).toString();
         return new RawPersonalAccessToken(token);
     }
 
     public static PersonalAccessTokenInfo readPersonalAccessTokenInfo(ByteBuf response) {
-        var nameLength = response.readByte();
+        var nameLength = response.readUnsignedByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         var expiry = readU64AsBigInteger(response);
         Optional<BigInteger> expiryOptional = expiry.equals(BigInteger.ZERO) ? Optional.empty() : Optional.of(expiry);
@@ -596,6 +630,20 @@ public final class BytesDeserializer {
             }
         }
         return entries;
+    }
+
+    private static byte[] readU32PrefixedBytes(ByteBuf buffer, String field) {
+        if (buffer.readableBytes() < Integer.BYTES) {
+            throw new IggyMalformedResponseException("Missing length prefix for " + field);
+        }
+        var length = buffer.readUnsignedIntLE();
+        if (length > buffer.readableBytes()) {
+            throw new IggyMalformedResponseException("Length " + length + " for " + field
+                    + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
+        }
+        byte[] value = newByteArray(length);
+        buffer.readBytes(value);
+        return value;
     }
 
     private static String readU32PrefixedString(ByteBuf buffer, String field) {

@@ -38,6 +38,7 @@ use crate::consumer::{
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
+use crate::options::OptionSpec as PyOptionSpec;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
@@ -153,6 +154,39 @@ impl IggyClient {
                 .ping()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+    }
+
+    /// Describe the option catalog for a resource scope.
+    ///
+    /// This is the discovery surface for the `options` argument on
+    /// `create_topic`/`update_topic`: a key outside the catalog is refused at
+    /// create, and the binary transports carry only the error code back.
+    ///
+    /// Args:
+    ///     scope: One of `"topic"`, `"stream"`, `"user"`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+    ///     with no keys yet.
+    ///
+    /// Raises:
+    ///     ValueError: If the scope name is not one of the three above.
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[OptionSpec]]", imports=("collections.abc")))]
+    fn describe_options<'a>(&self, py: Python<'a>, scope: &str) -> PyResult<Bound<'a, PyAny>> {
+        let scope = crate::options::options_scope_from_str(scope)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let specs = inner
+                .describe_options(scope)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(specs
+                .into_iter()
+                .map(PyOptionSpec::from)
+                .collect::<Vec<_>>())
         })
     }
 

@@ -290,7 +290,7 @@ TEST_F(LowLevelE2E_Stream, UpdateStreamOnlyChangesName) {
     TrackStream(stream_id);
 
     ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream_id), topic_name, 2, "none", "never_expire", 0,
-                                         "server_default"));
+                                         "server_default", {}));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
@@ -572,8 +572,8 @@ TEST_F(LowLevelE2E_Stream, GetStreamsFieldsVerification) {
     TrackStream(stream_name);
     auto stream                  = client->get_stream(make_string_identifier(stream_name));
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -725,9 +725,9 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamPreservesStreamMetadata) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 2, "gzip", "duration",
-                                         1000, "1GiB"));
+                                         1000, "1GiB", {}));
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 3, "none",
-                                         "never_expire", 0, "server_default"));
+                                         "never_expire", 0, "server_default", {}));
 
     const auto stream_before_purge = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(stream_before_purge.topics.size(), 2u);
@@ -798,9 +798,9 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamRemovesMessagesAndPreservesTopics) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+                                         "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+                                         "server_default", 0, "server_default", {}));
 
     const auto created_stream = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(created_stream.topics.size(), 2u);
@@ -901,9 +901,9 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamAcrossMultipleTopicsAndPartitionsClearsEve
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 2, "none",
-                                         "server_default", 0, "server_default"));
+                                         "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 3, "none",
-                                         "server_default", 0, "server_default"));
+                                         "server_default", 0, "server_default", {}));
 
     const auto created_stream = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(created_stream.topics.size(), 2u);
@@ -972,7 +972,7 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamThenSendMessagesAgainSucceeds) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default"));
+                                         0, "server_default", {}));
 
     const auto created_stream = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(created_stream.topics.size(), 1u);
@@ -1008,7 +1008,7 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamTwiceKeepsStreamEmptyAndTopicsIntact) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default"));
+                                         0, "server_default", {}));
 
     const auto created_stream = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(created_stream.topics.size(), 1u);

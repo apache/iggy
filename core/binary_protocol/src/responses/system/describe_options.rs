@@ -28,12 +28,13 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// [default_len:u32][default bytes][description_len:u32][description]
 /// ```
 ///
-/// `kind` is the header kind code the server encodes this key's own default
-/// under, and the kind a client should prefer; a `String` value parsed by the
-/// same rules as a config file value is accepted too, and an explicitly set
-/// entry keeps the kind the client sent. `default` is that default in `kind`'s
-/// encoding, empty when the key has none, and is a build constant rather than a
-/// per-node value.
+/// `kind` is this key's canonical header kind code: what the server encodes its
+/// default under, and what a value set at create is stored as, since create
+/// admission re-encodes the block from its own parse (a `String` value parsed by
+/// the same rules as a config file value is accepted and canonicalized). An
+/// update stores the client's bytes verbatim and is the exception. `default` is
+/// that default in `kind`'s encoding, empty when the key has none, and is a
+/// build constant rather than a per-node value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionDescriptor {
     pub key: WireName,

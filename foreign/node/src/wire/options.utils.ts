@@ -61,6 +61,20 @@ export type OptionsDeserialized = {
 };
 
 /**
+ * Keeps the last entry for each key, preserving first-seen order.
+ *
+ * A block carrying a key twice is refused whole by wire validation, so callers
+ * that append their own entries ahead of the typed ones rely on this to let the
+ * typed value win.
+ */
+export const dedupeOptions = (options: OptionEntry[]): OptionEntry[] => {
+  const byKey = new Map<string, OptionEntry>();
+  for (const entry of options)
+    byKey.set(entry.key, entry);
+  return [...byKey.values()];
+};
+
+/**
  * Serializes resource options into a TLV block.
  * Reuses the user-headers TLV encoding: each field is
  * `[kind:u8][len:u32_le][bytes]`, alternating key, value.

@@ -256,6 +256,74 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 	}, nil
 }
 
+// optionSpecMinimumSize is the smallest catalog entry: a one-character name
+// (a length byte plus at least one byte), a kind byte, and empty
+// length-prefixed default and description.
+const optionSpecMinimumSize = 2 + 1 + 4 + 4
+
+// DeserializeOptionSpecs reads a DescribeOptions response.
+//
+// Wire format: [count:u32][ [key_len:u8][key][kind:u8][default_len:u32][default]
+// [description_len:u32][description] ]*
+func DeserializeOptionSpecs(payload []byte) ([]iggcon.OptionSpec, error) {
+	if len(payload) < 4 {
+		return nil, fmt.Errorf(
+			"not enough data to read option count: need 4 bytes, got %d", len(payload))
+	}
+	count := binary.LittleEndian.Uint32(payload[0:4])
+	position := 4
+
+	specs := make([]iggcon.OptionSpec, 0,
+		boundedCapacity(count, len(payload)-position, optionSpecMinimumSize))
+	for i := uint32(0); i < count; i++ {
+		if len(payload)-position < 1 {
+			return nil, fmt.Errorf("truncated option key length at offset %d", position)
+		}
+		keyLength := int(payload[position])
+		position++
+		if len(payload)-position < keyLength+1 {
+			return nil, fmt.Errorf("truncated option key at offset %d", position)
+		}
+		key := string(payload[position : position+keyLength])
+		position += keyLength
+
+		kind := payload[position]
+		position++
+
+		defaultValue, read, err := readLengthPrefixed(payload, position, "option default value")
+		if err != nil {
+			return nil, err
+		}
+		position += read
+
+		description, read, err := readLengthPrefixed(payload, position, "option description")
+		if err != nil {
+			return nil, err
+		}
+		position += read
+
+		specs = append(specs, iggcon.OptionSpec{
+			Key:          key,
+			DefaultValue: iggcon.HeaderValue{Kind: iggcon.HeaderKind(kind), Value: defaultValue},
+			Description:  string(description),
+		})
+	}
+
+	return specs, nil
+}
+
+func readLengthPrefixed(payload []byte, position int, field string) ([]byte, int, error) {
+	if len(payload)-position < 4 {
+		return nil, 0, fmt.Errorf("truncated length prefix for %s at offset %d", field, position)
+	}
+	length := int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	position += 4
+	if length < 0 || len(payload)-position < length {
+		return nil, 0, fmt.Errorf("truncated %s at offset %d", field, position)
+	}
+	return payload[position : position+length], 4 + length, nil
+}
+
 func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
 	if len(payload) < 4 {
 		return nil, fmt.Errorf(

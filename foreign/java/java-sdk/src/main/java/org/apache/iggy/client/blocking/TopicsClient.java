@@ -21,12 +21,14 @@ package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public interface TopicsClient {
@@ -54,13 +56,32 @@ public interface TopicsClient {
                 StreamId.of(streamId), partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
     }
 
+    default TopicDetails createTopic(
+            StreamId streamId,
+            Long partitionsCount,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            String name) {
+        return createTopic(
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+    }
+
+    /**
+     * Creates a topic, carrying option keys that have no parameter of their own.
+     *
+     * <p>{@code options} is keyed by option name and reuses {@link HeaderValue} because options ride
+     * the user-headers codec. It reaches keys the server catalog gained after this build shipped; a
+     * parameter above wins on collision, and a key outside the catalog is refused by name.
+     */
     TopicDetails createTopic(
             StreamId streamId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name);
+            String name,
+            Map<String, HeaderValue> options);
 
     default void updateTopic(
             Long streamId,
@@ -73,13 +94,30 @@ public interface TopicsClient {
                 StreamId.of(streamId), TopicId.of(topicId), compressionAlgorithm, messageExpiry, maxTopicSize, name);
     }
 
+    default void updateTopic(
+            StreamId streamId,
+            TopicId topicId,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            String name) {
+        updateTopic(streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+    }
+
+    /**
+     * Updates a topic, carrying option keys that have no parameter of their own.
+     *
+     * <p>The server refuses any key an update may not change, by name. A key left out keeps its
+     * current value.
+     */
     void updateTopic(
             StreamId streamId,
             TopicId topicId,
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name);
+            String name,
+            Map<String, HeaderValue> options);
 
     default void deleteTopic(Long streamId, Long topicId) {
         deleteTopic(StreamId.of(streamId), TopicId.of(topicId));

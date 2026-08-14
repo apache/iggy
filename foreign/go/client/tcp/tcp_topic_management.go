@@ -60,6 +60,7 @@ func (c *IggyTcpClient) CreateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
+	options ...iggcon.HeaderEntry,
 ) (*iggcon.TopicDetails, error) {
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return nil, ierror.ErrInvalidTopicName
@@ -74,6 +75,7 @@ func (c *IggyTcpClient) CreateTopic(
 		CompressionAlgorithm: compressionAlgorithm,
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
+		Options:              options,
 	})
 	if err != nil {
 		return nil, err
@@ -90,6 +92,7 @@ func (c *IggyTcpClient) UpdateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
+	options ...iggcon.HeaderEntry,
 ) error {
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return ierror.ErrInvalidTopicName
@@ -101,6 +104,7 @@ func (c *IggyTcpClient) UpdateTopic(
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
 		Name:                 name,
+		Options:              options,
 	})
 	return err
 }

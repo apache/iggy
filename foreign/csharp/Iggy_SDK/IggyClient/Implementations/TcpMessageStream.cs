@@ -31,6 +31,7 @@ using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
@@ -254,11 +255,12 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0, CancellationToken token = default)
+        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
+        IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
     {
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
-            messageExpiryValue, maxTopicSize);
+            messageExpiryValue, maxTopicSize, options);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
 
@@ -276,11 +278,12 @@ public sealed partial class TcpMessageStream : IIggyClient
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         ulong maxTopicSize = 0, TimeSpan? messageExpiry = null,
+        IReadOnlyDictionary<string, HeaderValue>? options = null,
         CancellationToken token = default)
     {
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.UpdateTopic(streamId, topicId, name, compressionAlgorithm, maxTopicSize,
-            messageExpiryValue);
+            messageExpiryValue, options);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_TOPIC_CODE);
 

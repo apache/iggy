@@ -24,30 +24,34 @@
 //!
 //! # SDK parity
 //!
-//! One feature, and the SDKs are at different points on it. What each can do
-//! today, so a gap is a known gap rather than a surprise:
+//! Every SDK can set any option key, read both blocks back, and ask the server
+//! which keys it accepts. What differs is only how each language spells the
+//! argument, since each reuses the type it already had for message user headers:
 //!
-//! | SDK    | Set typed keys | Set arbitrary keys | Read the blocks | `describe_options` |
-//! |--------|----------------|--------------------|-----------------|--------------------|
-//! | Rust   | all            | yes (`raw`)        | yes             | yes                |
-//! | Node   | all            | yes                | yes             | yes                |
-//! | Python | all            | yes (string dict)  | no              | no                 |
-//! | Go     | 3 legacy       | no                 | yes             | no                 |
-//! | C#     | 3 legacy       | no                 | yes (TCP)       | yes (TCP)          |
-//! | Java   | 3 legacy       | no                 | yes             | no                 |
-//! | C++    | 3 legacy       | no                 | no              | no                 |
+//! | SDK    | Arbitrary keys on create/update      | Reads the blocks | `describe_options` |
+//! |--------|--------------------------------------|------------------|--------------------|
+//! | Rust   | `TopicCreateOptions::raw`            | yes              | yes                |
+//! | Node   | `options?: OptionEntry[]`            | yes              | yes                |
+//! | Python | `options=` string dict                | yes              | yes                |
+//! | Go     | trailing `options ...HeaderEntry`    | yes              | yes                |
+//! | Java   | `Map<String, HeaderValue>` overload  | yes              | yes                |
+//! | C#     | optional `IReadOnlyDictionary`       | yes              | yes                |
+//! | C++    | trailing `Vec<HeaderEntry>`          | yes              | yes                |
 //!
-//! "3 legacy" is `compression_algorithm`, `message_expiry` and `max_topic_size`,
-//! the three that used to be fixed fields of `CreateTopic`. Every SDK can
-//! therefore express what it could before this feature; what a lagging one
-//! cannot yet do is reach the partition runtime knobs or a key added to the
-//! server catalog after it shipped.
+//! One transport caveat everywhere: REST renders option values as readable
+//! strings rather than the typed TLV, so a value read back over HTTP is
+//! String-kinded while the same value over a binary transport carries the kind
+//! the server stored. REST also reports both provenances in one map with a
+//! per-entry flag, which each SDK splits into the two maps its binary path
+//! produces.
 //!
-//! The write side is what to close next, and it is one change per SDK: accept a
-//! string map alongside the typed arguments and encode it into the block the
-//! same way. The block's byte layout is pinned by a golden vector that Rust,
-//! Node, Go and Java each assert independently, so a new encoder has a fixture
-//! to match rather than a description to interpret.
+//! Beyond the eight typed keys, Go, Java, C# and C++ ship typed constructors or
+//! builders for the five keys that have no named parameter of their own, so no
+//! caller has to spell an option key as a bare string.
+//!
+//! The block's byte layout is pinned by a golden vector that Rust, Node, Go and
+//! Java each assert independently, so a new encoder has a fixture to match
+//! rather than a description to interpret.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -422,11 +426,13 @@ impl FromStr for OptionsScope {
 pub struct OptionSpec {
     /// Option key accepted by the create command.
     pub key: String,
-    /// Kind the server encodes this key's own default under, and the kind a
-    /// client should prefer. Not a promise about what ends up stored: an
-    /// explicit entry is persisted and echoed back with the kind the client
-    /// sent it as, and a `String` value parsed through the server-config rules
-    /// stays a `String` in the map - which is what every CLI `--set` produces.
+    /// Canonical kind for this key: what the server encodes its default under,
+    /// and what a value set at CREATE is stored as whatever kind the client sent
+    /// it as. Create admission re-encodes the block from its own parse, so a
+    /// `--set segment_size=128MiB` string lands as a `Uint64`.
+    ///
+    /// An UPDATE is the exception: it stores the client's bytes verbatim, so a
+    /// key set that way keeps the kind it arrived in.
     pub kind: HeaderKind,
     /// The key's default in `kind`'s encoding; empty when the key has no
     /// default. A build constant rather than a per-node value: these defaults

@@ -19,6 +19,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { CREATE_TOPIC } from './create-topic.command.js';
+import { deserializeOptions } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
 
 describe('CreateTopic', () => {
 
@@ -88,6 +90,27 @@ describe('CreateTopic', () => {
         + tlvSize('size_of_messages_required_to_save'.length) + tlvSize(8)
         + tlvSize('preallocate_segments'.length) + tlvSize(1)
       );
+    });
+
+    it('serialize caller-supplied option keys, typed fields winning', () => {
+      const t = {
+        ...t1,
+        maxTopicSize: 4096n,
+        options: [
+          { key: 'enforce_fsync', value: HeaderValue.Bool(true) },
+          // The typed field covers this key, so the caller's entry is dropped:
+          // a duplicate key makes the server refuse the whole block.
+          { key: 'max_topic_size', value: HeaderValue.String('1 GiB') }
+        ]
+      };
+
+      const b = CREATE_TOPIC.serialize(t);
+      // The create payload runs its options block to the end, unprefixed.
+      const options = deserializeOptions(b, fixedSize + t.name.length);
+
+      assert.deepEqual(Object.keys(options).sort(), ['enforce_fsync', 'max_topic_size']);
+      assert.equal(options.enforce_fsync, true);
+      assert.equal(options.max_topic_size, 4096n);
     });
 
     it('throw on name < 1', () => {

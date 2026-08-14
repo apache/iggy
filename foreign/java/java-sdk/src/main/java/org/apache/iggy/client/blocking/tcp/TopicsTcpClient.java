@@ -22,12 +22,14 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 final class TopicsTcpClient implements TopicsClient {
@@ -55,9 +57,10 @@ final class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name) {
+            String name,
+            Map<String, HeaderValue> options) {
         return FutureUtil.resolve(delegate.createTopic(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name));
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, options));
     }
 
     @Override
@@ -67,9 +70,10 @@ final class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            String name) {
-        FutureUtil.resolve(
-                delegate.updateTopic(streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name));
+            String name,
+            Map<String, HeaderValue> options) {
+        FutureUtil.resolve(delegate.updateTopic(
+                streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name, options));
     }
 
     @Override

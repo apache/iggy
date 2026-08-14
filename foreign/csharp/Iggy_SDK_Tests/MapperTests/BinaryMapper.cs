@@ -17,12 +17,14 @@
 
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Shared;
 using Apache.Iggy.Tests.Utils;
@@ -260,6 +262,51 @@ public sealed class BinaryMapper
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
         Assert.Equal(CompressionAlgorithm.None, response.CompressionAlgorithm);
+    }
+
+    [Fact]
+    public void MapOptionSpecs_ReturnsTheCatalogWithKindsAndDefaults()
+    {
+        // Arrange: [count][key_len][key][kind][default_len][default][description_len][description]
+        const string key = "segment_size";
+        const string description = "Segment size in bytes";
+        var defaultValue = new byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(defaultValue, 1024UL * 1024 * 1024);
+
+        var payload = new List<byte>();
+        payload.AddRange(BitConverter.GetBytes(1u));
+        payload.Add((byte)key.Length);
+        payload.AddRange(Encoding.UTF8.GetBytes(key));
+        payload.Add(12); // Uint64 wire code
+        payload.AddRange(BitConverter.GetBytes((uint)defaultValue.Length));
+        payload.AddRange(defaultValue);
+        payload.AddRange(BitConverter.GetBytes((uint)description.Length));
+        payload.AddRange(Encoding.UTF8.GetBytes(description));
+
+        // Act
+        var specs = Mappers.BinaryMapper.MapOptionSpecs(payload.ToArray());
+
+        // Assert
+        var spec = Assert.Single(specs);
+        Assert.Equal(key, spec.Key);
+        Assert.Equal(HeaderKind.Uint64, spec.Kind);
+        Assert.Equal(defaultValue, spec.DefaultValue);
+        Assert.Equal(description, spec.Description);
+    }
+
+    [Fact]
+    public void MapOptionSpecs_RejectsAnEntryThatOverrunsThePayload()
+    {
+        // A declared length past the end must not read adjacent memory.
+        var payload = new List<byte>();
+        payload.AddRange(BitConverter.GetBytes(1u));
+        payload.Add(4);
+        payload.AddRange(Encoding.UTF8.GetBytes("size"));
+        payload.Add(12);
+        payload.AddRange(BitConverter.GetBytes(64u)); // claims 64 bytes that are not there
+
+        Assert.Throws<InvalidOperationException>(() =>
+            Mappers.BinaryMapper.MapOptionSpecs(payload.ToArray()));
     }
 
     [Fact]
