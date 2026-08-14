@@ -102,11 +102,7 @@ where
 {
     // In-flight dedup: a live prepare from this client absorbs the retry.
     // Pump delivers the reply at commit.
-    if consensus
-        .pipeline()
-        .borrow()
-        .has_message_from_client(client_id)
-    {
+    if consensus.pipeline_has_message_from_client(client_id) {
         tracing::debug!(
             client_id,
             request,
@@ -262,11 +258,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     // In-flight dedup.
-    if consensus
-        .pipeline()
-        .borrow()
-        .has_message_from_client(client_id)
-    {
+    if consensus.pipeline_has_message_from_client(client_id) {
         tracing::debug!(client_id, "register_preflight: in-flight prepare, drop");
         return false;
     }

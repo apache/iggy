@@ -44,6 +44,36 @@ pub fn collect_logs(
     (stdout, stderr)
 }
 
+/// The binary's stderr content when it contains a panic report.
+///
+/// A dead async task leaves the process alive and every assertion green, so
+/// without this check a test can pass over a server whose consensus pump
+/// panicked; the report also drowns at the tail of the full log dump. Stderr
+/// is quiet in normal operation, so returning it whole keeps the decisive
+/// lines together with any abort context around them.
+pub fn stderr_panic_report(stderr_path: &Option<PathBuf>) -> Option<String> {
+    let stderr = stderr_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())?;
+    let mut panics = stderr.lines().filter(|line| line.contains("panicked at"));
+    if panics.any(|line| !is_blocking_pool_dispatch(line)) {
+        Some(stderr.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Whether a panic came from dispatching work to compio's blocking pool.
+///
+/// The runtime catches these and hands them to the awaiting caller as an
+/// error, so they cannot leave a dead task behind, which is the only thing
+/// the check above exists for. Segment preallocation dispatches `fallocate`
+/// to that pool while the shard proactors run with it disabled, so every
+/// segment creation prints one and then falls back to buffered allocation.
+fn is_blocking_pool_dispatch(panic_line: &str) -> bool {
+    panic_line.contains("asyncify.rs")
+}
+
 /// Dump logs to stderr if we're panicking (for Drop impls).
 pub fn dump_logs_on_panic(
     binary_name: &str,

@@ -285,7 +285,7 @@ components:
     paths:
       - "foreign/csharp/**"
       - "examples/csharp/**"
-    tasks: ["lint", "test", "build", "e2e"]
+    tasks: ["lint", "test", "build", "e2e-net8.0", "e2e-net10.0"]
 
   sdk-cpp:
     depends_on:
