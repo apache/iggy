@@ -2641,7 +2641,7 @@ where
         // promoted mid-transfer. (`last_prepare_checksum` needs nothing: it is
         // only read as a `parent:` stamp when building a prepare.)
         consensus.sequencer().set_sequence(commit_op);
-        consensus.pipeline().borrow_mut().clear();
+        consensus.clear_pipeline();
         consensus.advance_commit_max(commit_op);
         self.observed_view = self.consensus().view();
         self.repair = None;

@@ -2389,20 +2389,25 @@ fn restore_metadata_consensus(
             commit_watermark,
             restored_op, "re-pipelining recovered uncommitted metadata suffix"
         );
-        let mut pipeline = consensus.pipeline().borrow_mut();
-        #[allow(clippy::cast_possible_truncation)]
-        for op in (commit_watermark + 1)..=restored_op {
-            let Some(header) = journal.header(op as usize) else {
-                warn!(
-                    op,
-                    "recovered journal suffix has a gap; stopping re-pipeline"
-                );
-                break;
-            };
-            let mut entry = PipelineEntry::new(*header);
-            entry.add_ack(topology.self_replica_id);
-            pipeline.push(entry);
-        }
+        consensus.with_pipeline_mut(|pipeline| {
+            #[allow(clippy::cast_possible_truncation)]
+            for op in (commit_watermark + 1)..=restored_op {
+                let Some(header) = journal.header(op as usize) else {
+                    warn!(
+                        op,
+                        "recovered journal suffix has a gap; stopping re-pipeline"
+                    );
+                    break;
+                };
+                let mut entry = PipelineEntry::new(*header);
+                entry.add_ack(topology.self_replica_id);
+                pipeline.push(entry);
+            }
+        });
+        // These went in through `Pipeline::push`, not `push_prepare_entry`, and `init`
+        // no longer arms the timer: without this the recovered suffix sits in the
+        // pipeline with nothing driving its retransmit.
+        consensus.sync_prepare_timeout();
     }
 
     consensus

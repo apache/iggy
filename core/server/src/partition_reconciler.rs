@@ -1182,8 +1182,8 @@ mod tests {
         PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command2, GenericHeader, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader,
-        WireIdentifier, WireOptions,
+        Command2, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireIdentifier,
+        WireOptions,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1193,8 +1193,8 @@ mod tests {
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use partitions::{IggyPartitions, PartitionsConfig};
-    use server_common::Message;
     use server_common::sharding::{IggyNamespace, ShardId};
+    use server_common::{Message, MessageBag};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, ShardIdentity};
     use std::mem::size_of;
@@ -1259,7 +1259,7 @@ mod tests {
     /// Build a partition-plane replicated `Prepare` for `namespace`, as a backup
     /// receives it from the primary. The frame a client never sees: it has no
     /// client to answer, so anything that discards it is silent data loss.
-    fn build_partition_prepare(namespace: IggyNamespace, op: u64) -> Message<GenericHeader> {
+    fn build_partition_prepare(namespace: IggyNamespace, op: u64) -> MessageBag {
         let header_size = size_of::<PrepareHeader>();
         let mut msg = Message::<PrepareHeader>::new(header_size);
         let header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(
@@ -1271,7 +1271,7 @@ mod tests {
         header.operation = Operation::SendMessages;
         header.group = namespace.inner();
         header.op = op;
-        msg.into_generic()
+        MessageBag::Prepare(msg)
     }
 
     async fn park_one_prepare(shard: &TestShard, namespace: IggyNamespace, op: u64) {
@@ -1283,7 +1283,7 @@ mod tests {
     /// Build a partition-plane client `Request` for `namespace`, as the pump
     /// receives it off the wire. Only the routing fields matter: parking reads
     /// `operation` + `namespace` and never touches the body.
-    fn build_partition_request(namespace: IggyNamespace) -> Message<GenericHeader> {
+    fn build_partition_request(namespace: IggyNamespace) -> MessageBag {
         build_partition_request_sized(namespace, 0)
     }
 
@@ -1297,10 +1297,7 @@ mod tests {
 
     /// [`build_partition_request`] with `body_len` trailing payload bytes, so a
     /// test can drive the park buffer's byte budget rather than its frame cap.
-    fn build_partition_request_sized(
-        namespace: IggyNamespace,
-        body_len: usize,
-    ) -> Message<GenericHeader> {
+    fn build_partition_request_sized(namespace: IggyNamespace, body_len: usize) -> MessageBag {
         let header_size = size_of::<RoutedRequestHeader>();
         let total_size = header_size + body_len;
         let mut msg = Message::<RoutedRequestHeader>::new(total_size);
@@ -1317,7 +1314,7 @@ mod tests {
         header.session = 1;
         header.request = TEST_REQUEST_ID;
         header.client = TEST_CLIENT_ID;
-        msg.into_generic()
+        MessageBag::Request(msg)
     }
 
     fn assignment(partition_id: u32, consensus_group_id: u64) -> CreatedPartitionAssignment {

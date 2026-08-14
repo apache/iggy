@@ -8488,6 +8488,7 @@ dependencies = [
  "left-right",
  "message_bus",
  "paste",
+ "rmp",
  "rmp-serde",
  "serde",
  "server_common",

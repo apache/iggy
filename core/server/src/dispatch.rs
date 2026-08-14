@@ -3714,7 +3714,7 @@ mod tests {
     use partitions::{IggyPartitions, PartitionsConfig};
     use server_common::iobuf::Frozen;
     use server_common::sharding::ShardId;
-    use server_common::{MESSAGE_ALIGN, Message};
+    use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use shard::metrics::ShardMetrics;
     use shard::shards_table::PapayaShardsTable;
     use shard::{
@@ -4298,7 +4298,7 @@ mod tests {
                 *new_header = header;
                 new_header.group = namespace.inner();
             });
-        shard.on_message(request.into_generic()).await;
+        shard.on_message(MessageBag::Request(request)).await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -4375,7 +4375,7 @@ mod tests {
                 new_header.group = namespace.inner();
             });
         // Namespace neither materialised nor tombstoned: the frame parks.
-        shard.on_message(request.into_generic()).await;
+        shard.on_message(MessageBag::Request(request)).await;
 
         shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
         shard.apply_reconcile_ops();
@@ -4753,7 +4753,7 @@ mod tests {
         outcome: ForwardRegisterOutcome,
         epoch: u64,
         watermark: u64,
-    ) -> Message<GenericHeader> {
+    ) -> MessageBag {
         let bound = match outcome {
             ForwardRegisterOutcome::Ok => Ok(BoundSession { epoch, watermark }),
             ForwardRegisterOutcome::ClientIdOwnedByAnotherUser => {
@@ -4761,30 +4761,28 @@ mod tests {
             }
             _ => Err(MetadataSubmitError::NotPrimary),
         };
-        build_forward_register_result_message(
+        MessageBag::ForwardRegisterResult(build_forward_register_result_message(
             forward.cluster,
             forward.view,
             0,
             forward.client,
             forward.nonce,
             &bound,
-        )
-        .into_generic()
+        ))
     }
 
     fn forward_logout_result_message(
         forward: &ForwardLogoutHeader,
         outcome: &Result<u64, MetadataSubmitError>,
-    ) -> Message<GenericHeader> {
-        build_forward_logout_result_message(
+    ) -> MessageBag {
+        MessageBag::ForwardLogoutResult(build_forward_logout_result_message(
             forward.cluster,
             forward.view,
             0,
             forward.client,
             forward.nonce,
             outcome,
-        )
-        .into_generic()
+        ))
     }
 
     /// The `GET_CLUSTER_METADATA` auth gate holds on every roster shape: it
