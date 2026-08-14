@@ -22,12 +22,11 @@
 //! **This library is the Apache Iggy SDK.**
 //! It exposes a low-level and a high-level API for the Apache Iggy message streaming infrastructure for the Rust programming language.
 //! SDKs for other programming languages can be found in [`core/foreign`] of the root repository on GitHub.
-//! Note, most of them wrap this SDK. Hence, newer features might be delayed in other languages.
 //!
 //! The core of the Iggy server is a persisted append-only log data structure.
 //! It is concerned with allowing read and writes in the most efficient way.
 //! Reading and writing to the server is the domain of this SDK.
-//! The server exposes *commands* that can be triggered to change it's state.
+//! The server exposes *commands* that can be triggered to change its state.
 //! These commands allow administrative tasks, such as handling users, permissions and setting up streams and topics
 //! or writing and reading messages from the log.
 //! A comprehensive overview of commands can be found in the [`schema spec`] on the website or checking the [`server command enum`] within the source code.
@@ -38,21 +37,17 @@
 //! connection-management machinery a production application needs. The
 //! [low-level API](#low-level-api) is the set of concrete transport clients that
 //! speak the wire protocol directly and that the high-level API is built on top of.
-//! Start with the high-level API unless you have a specific reason not to.
+//! It is recommended to start with the high-level API, and utilize the low level API
+//! in case the high-level API cannot satisfy your requirements.
 //!
 //! # High-level API
 //!
 //! The high-level API is most likely what you are looking for, especially if you are new to building
 //! message-streaming applications with Iggy.
-//! Clients provided by the high-level API already provide common message-streaming features, that
+//! Clients provided by the high-level API already provide common message-streaming features that
 //! you would otherwise need to build yourself.
 //!
-//! # Choosing a high-level client
-//!
-//! There are three client types, layered from low to high level. They are not
-//! alternatives to pick between so much as a control plane and two data-plane
-//! helpers built on top of it.
-//!
+//! There are three client types:
 //! - [`IggyClient`] is the entry point and the full API surface. It owns the
 //!   connection and implements every domain trait, including [`MessageClient`]
 //!   with the raw [`send_messages`] and [`poll_messages`] primitives. Each call
@@ -71,17 +66,10 @@
 //!
 //! Reach for [`IggyClient`] directly for administrative tasks such as
 //! creating streams, topics, users, and consumer groups, reading or storing
-//! offsets, or sending and polling a handful of messages in a script. Anything
-//! [`IggyClient`] cannot do, neither can the producer or consumer, since both
-//! are built on to of it.
-//!
+//! offsets, or sending and polling a handful of messages in a script.
 //! Reach for [`IggyProducer`] and [`IggyConsumer`] when producing and consuming messages.
-//! You could use the [`IggyClient`] for that, however the former two come with some
-//! additional features already implemented that are frequentlly required when building messages
-//! streaming applications.
 //!
 //! The [`IggyProducer`] adds, on top of [`send_messages`]:
-//!
 //! - **Background batching** that flushes by size, message count, or a linger
 //!   interval, instead of one network round-trip per send.
 //! - **Retries** with a configurable count and interval (three attempts one
@@ -92,7 +80,6 @@
 //!   `create_stream_if_not_exists` / `create_topic_if_not_exists` convenience.
 //!
 //! The [`IggyConsumer`] adds, on top of [`poll_messages`]:
-//!
 //! - A [`futures::Stream`] implementation, so a `while let Some(message) =
 //!   consumer.next().await` loop drives polling, paging, and the poll interval
 //!   for you.
@@ -100,15 +87,17 @@
 //!   position instead of taking an offset on every call.
 //! - **Auto-commit** and offset storage on an interval or after a number of
 //!   messages, so a restart resumes where it left off.
-//! - **Auto-join** of consumer groups, assignment refresh and reconnection
-//!   handling, and payload **decryption**.
+//! - **Auto-join** of consumer groupsa and assignment refresh should the server have
+//!   assigned the consumer another partition
+//! - Reconnection handling should the client disconnect
+//! - Payload **decryption**
 //!
 //! # Stream builder API
 //!
 //! The stream builder API is a convenient way to use the high-level API.
 //! [`IggyStream`], [`IggyStreamProducer`], and
-//! [`IggyStreamConsumer`] are construct everything at once.
-//! You can hand them an [`IggyClient`] (or just a connection string) together with a config,
+//! [`IggyStreamConsumer`] construct everything at once.
+//! You can pass an [`IggyClient`] (or just a connection string) together with a config,
 //! and they hand back a ready, connected [`IggyProducer`] / [`IggyConsumer`].
 //! Compared to the **high-level API**, it changes how you construct
 //! producers and consumers, not what they can do. Instead of chaining an
@@ -118,17 +107,6 @@
 //! the same [`IggyProducer`] and [`IggyConsumer`] the builders produce, backed
 //! by the same [`IggyClient`].
 //!
-//! ## When to use it
-//!
-//! Reach for the stream builder when you want a producer and consumer wired up
-//! with the least ceremony, especially a matched pair on one topic, or when you
-//! prefer to keep stream configuration in one declarative object instead of
-//! spread across imperative builder calls. When you need finer control over
-//! construction, drop down to [`IggyClient::producer`] and
-//! [`IggyClient::consumer`] and configure the builders directly. The stream
-//! builder offers nothing the high-level API cannot, since it is built entirely
-//! on top of it.
-//!
 //! # Low-level API
 //!
 //! The low-level API is the set of concrete transport clients: [`TcpClient`],
@@ -136,7 +114,6 @@
 //! [`Client`], the supertrait that pulls in every domain-specific trait, so a
 //! transport client on its own can already drive the full server API. The
 //! high-level [`IggyClient`] is one more layer over exactly these types.
-//! Anything the high-level API can do therefore ends up going through a low-level client.
 //!
 //! ## Differences to the high-level API
 //!
@@ -168,7 +145,7 @@
 //!   supervision, or a different heartbeat strategy, rather than let
 //!   [`IggyClient`] manage it.
 //! - You are building your own abstraction on top of the SDK, for example a
-//!   different producer or consumer, and want the unadorned primitives.
+//!   different producer or consumer, and want the primitives.
 //! - You forked the server and need to issue a command the typed API does not recognize and want the
 //!   raw [`send_raw_with_response`](BinaryTransport::send_raw_with_response) instruction.
 //!
