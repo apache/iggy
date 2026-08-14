@@ -38,6 +38,7 @@ async fn random_source_produces_messages(harness: &TestHarness) {
 }
 
 #[iggy_harness(
+    cluster_nodes = 1,
     server(connectors_runtime(config_path = "tests/connectors/random/source.toml")),
     seed = seeds::connector_stream
 )]
