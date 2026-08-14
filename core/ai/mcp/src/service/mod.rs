@@ -200,7 +200,7 @@ impl IggyService {
         }): Parameters<UpdateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        // Absent means "leave alone" now, so an unparseable value must not
+        // Absent means "leave alone" now, so an unparsable value must not
         // silently become a reset to the server default.
         let options = TopicUpdateOptions {
             compression_algorithm: compression_algorithm.and_then(|ca| ca.parse().ok()),

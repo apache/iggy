@@ -391,8 +391,6 @@ class TestCreateTopic:
                 max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes),
             )
 
-
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("partitions_count", [1001, 10000])
     async def test_create_topic_invalid_partitions_count(
@@ -895,8 +893,6 @@ class TestUpdateTopic:
                 name=topic_name,
                 message_expiry=invalid_message_expiry,
             )
-
-
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
