@@ -100,7 +100,7 @@ pub struct SessionManager {
     /// a consensus reply arrives and needs routing to the right connection.
     client_to_connection: HashMap<u128, u128>,
     /// This shard's copy of the configured cluster roster, served by the
-    /// pre-auth `GetClusterMetadata` read. Lives here because it is the
+    /// `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
     /// installed once at bootstrap, disabled until then.
     cluster_roster: Rc<ClusterRoster>,

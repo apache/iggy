@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.10"
-version = "0.9.0.dev1"
+version = "0.9.0.dev2"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -99,7 +99,7 @@ select = [
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
-    "pytest>=9.0.3,<10.0",
+    "pytest>=9.1.1,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",
     "pytest-xdist>=3.0,<4.0",
@@ -112,15 +112,15 @@ testing-docker = ["testcontainers>=4.15.0,<5.0"]
 # Development tools
 dev = [
     "maturin>=1.14.1,<2.0",
-    "pyrefly>=1.1.1",
+    "pyrefly>=1.2.0",
     "ruff>=0.1.0,<1.0",
 ]
 
 # All dependencies for full development setup
 all = [
     "maturin>=1.14.1,<2.0",
-    "pyrefly>=1.1.1",
-    "pytest>=9.0.3,<10.0",
+    "pyrefly>=1.2.0",
+    "pytest>=9.1.1,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",
     "pytest-xdist>=3.0,<4.0",

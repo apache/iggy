@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -116,10 +117,25 @@ public class ClusterRedirectionTests
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
         });
         await client.ConnectAsync();
-        var authResponse = await client.LoginWithPersonalAccessTokenAsync(pat.Token);
+        // The follower verifies the token against its own replicated copy, so it refuses until the mint has
+        // replicated. Fail-closed by design; poll through the window rather than asserting on its width.
+        var replicationDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        AuthResponse? authResponse;
+        while (true)
+        {
+            try
+            {
+                authResponse = await client.LoginWithPersonalAccessTokenAsync(pat.Token);
+                break;
+            }
+            catch (Exception) when (DateTimeOffset.UtcNow < replicationDeadline)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+            }
+        }
 
         authResponse.ShouldNotBeNull();
-        authResponse.UserId.ShouldBeGreaterThanOrEqualTo(0);
+        authResponse!.UserId.ShouldBeGreaterThanOrEqualTo(0);
 
         var address = client.GetCurrentAddress();
         address.ShouldNotBeNullOrEmpty();

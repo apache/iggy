@@ -31,6 +31,7 @@ use crate::partition_helpers::{
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
+use compio::runtime::ResumeUnwind;
 use configs::server::{ServerConfig, ServerSystemConfig};
 use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
@@ -105,6 +106,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -1434,7 +1436,9 @@ async fn shard_main(
             if let Some(tx) = &segment_cleaner_stop {
                 let _ = tx.try_send(());
             }
-            await_pump_drain(pump_handle.take(), config, shard_id).await;
+            // The bind failure is the primary fault; the drain verdict only
+            // matters for the log it emits.
+            let _ = await_pump_drain(pump_handle.take(), config, shard_id).await;
             return Err(error);
         }
 
@@ -1461,7 +1465,7 @@ async fn shard_main(
         let _ = tx.try_send(());
     }
 
-    await_pump_drain(pump_handle.take(), config, shard_id).await;
+    await_pump_drain(pump_handle.take(), config, shard_id).await?;
 
     info!(shard = shard_id, "server shard exited cleanly");
     Ok(())
@@ -1471,25 +1475,58 @@ async fn shard_main(
 /// post-loop work includes the final flush of every committed journal to
 /// segment storage, and returning first drops the compio runtime, which
 /// cancels that flush at its next await point.
+///
+/// `Err` means the pump was already dead (a panic, or an exit outside the
+/// stop protocol), so its final flush never ran and the shard must not
+/// report a clean exit. The verdict is the inner `JoinError`; the timeout
+/// wrapper alone cannot see it, and a shard that swallows it prints
+/// "exited cleanly" over a corpse.
 async fn await_pump_drain(
     pump_handle: Option<compio::runtime::JoinHandle<()>>,
     config: &ServerConfig,
     shard_id: u16,
-) {
+) -> Result<(), ServerError> {
     let Some(pump_handle) = pump_handle else {
-        return;
+        return Ok(());
     };
     let drain_budget = config.system.sharding.shutdown_drain_timeout.get_duration();
-    if compio::time::timeout(drain_budget, pump_handle)
-        .await
-        .is_err()
-    {
-        warn!(
+    let Ok(join_result) = compio::time::timeout(drain_budget, pump_handle).await else {
+        error!(
             shard = shard_id,
+            timeout = ?drain_budget,
             "message pump did not drain within the shutdown budget; \
              committed journal tail may not have flushed"
         );
-    }
+        return Err(ServerError::ShardPumpDrainTimedOut {
+            shard_id,
+            timeout: drain_budget,
+        });
+    };
+    // `JoinError` renders a panic as the bare "Task has panicked" and the
+    // type is not re-exported, so the payload -- the only part with
+    // diagnostic value -- is lifted by re-raising into an immediate catch.
+    // The panic hook already ran when the task died; `resume_unwind` does
+    // not run it again, so nothing is printed twice and the message finally
+    // reaches the tracing sink too.
+    let reason = match panic::catch_unwind(panic::AssertUnwindSafe(|| join_result.resume_unwind()))
+    {
+        Ok(Some(())) => return Ok(()),
+        Ok(None) => "task was cancelled".to_string(),
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .map_or_else(
+                || "task panicked".to_string(),
+                |message| format!("task panicked: {message}"),
+            ),
+    };
+    error!(
+        shard = shard_id,
+        "message pump died instead of draining ({reason}); \
+         committed journal tail may not have flushed"
+    );
+    Err(ServerError::ShardPumpDied { shard_id, reason })
 }
 
 /// Block until shard 0 broadcasts the metadata factory bundle, or the
@@ -1950,7 +1987,7 @@ async fn build_shard_for_thread(
     // Same wiring path as the simulator's shell mode: one per-shard
     // SessionManager shared by the client-request handler (binds sessions)
     // and the get_clients handler (reads them). It also carries this shard's
-    // cluster roster for the pre-auth GetClusterMetadata read.
+    // cluster roster for the GetClusterMetadata read.
     let ShellHandlers {
         on_replica_message,
         on_client_request,
@@ -4465,6 +4502,28 @@ mod tests {
             ),
             "expected ShardBootstrapBarrierAborted, got {err:?}"
         );
+    }
+
+    #[compio::test]
+    async fn pump_drain_timeout_is_not_reported_as_clean() {
+        let mut config = ServerConfig::default();
+        let timeout = Duration::from_millis(1);
+        Arc::get_mut(&mut config.system)
+            .expect("a fresh ServerConfig owns its system config")
+            .sharding
+            .shutdown_drain_timeout = iggy_common::IggyDuration::new(timeout);
+        let pump = compio::runtime::spawn(std::future::pending::<()>());
+
+        let error = await_pump_drain(Some(pump), &config, 7)
+            .await
+            .expect_err("a live pump past the drain budget is not a clean exit");
+        assert!(matches!(
+            error,
+            ServerError::ShardPumpDrainTimedOut {
+                shard_id: 7,
+                timeout: actual,
+            } if actual == timeout
+        ));
     }
 
     #[compio::test]

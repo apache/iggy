@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Net;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -222,8 +223,10 @@ public class LeaderRedirectionSteps
         var clientA = GetClient("A");
         var clientB = GetClient("B");
 
-        clientA.GetCurrentAddress().ShouldBe(clientB.GetCurrentAddress(),
-            "Both clients should be connected to the same server");
+        // A client that never redirected still holds the address it was given (possibly a
+        // hostname), while a redirected one holds the roster address the cluster published.
+        // Both may name the same node, so they are compared once resolved.
+        await AssertSameEndpointAsync(clientA.GetCurrentAddress(), clientB.GetCurrentAddress());
 
         await clientA.PingAsync();
         await clientB.PingAsync();
@@ -239,6 +242,24 @@ public class LeaderRedirectionSteps
     }
 
     // ---------- Helpers ----------
+
+    private static async Task AssertSameEndpointAsync(string left, string right)
+    {
+        static (string Host, int Port) Split(string address)
+        {
+            var separator = address.LastIndexOf(':');
+            return (address[..separator], int.Parse(address[(separator + 1)..]));
+        }
+
+        var (leftHost, leftPort) = Split(left);
+        var (rightHost, rightPort) = Split(right);
+        leftPort.ShouldBe(rightPort, $"Both clients should use the same port, got {left} and {right}");
+
+        var leftIps = await Dns.GetHostAddressesAsync(leftHost);
+        var rightIps = await Dns.GetHostAddressesAsync(rightHost);
+        leftIps.Intersect(rightIps).ShouldNotBeEmpty(
+            $"Both clients should be connected to the same server, got {left} and {right}");
+    }
 
     private string ResolveAddressForRole(string role) => role.ToLowerInvariant() switch
     {
