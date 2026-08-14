@@ -108,7 +108,8 @@ use iggy_common::{
     RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails,
     StreamUpdateOptions, TokenInfo, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
     UPDATABLE_STREAM_OPTION_KEYS, UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS,
-    UserInfo, UserInfoDetails, UserUpdateOptions, Validatable, validate_topic_segment_size,
+    UserInfo, UserInfoDetails, UserUpdateOptions, Validatable, validate_preallocated_topic_bytes,
+    validate_topic_segment_size,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -120,7 +121,7 @@ use shard::{PartitionRead, PartitionReadReply};
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
     resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
-    validate_topic_bounds,
+    validate_topic_bounds, validate_topic_size_floor,
 };
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
@@ -865,21 +866,28 @@ pub(in crate::http) async fn create_topic(
     // same typed pre-consensus checks as native fields; unknown keys deny
     // here with the key name.
     let parsed = TopicCreateOptions::parse(&wire_options).map_err(WriteError::Rejected)?;
-    let metadata = state.shard.plane.metadata();
     if let Some(segment_size) = parsed.segment_size {
         validate_topic_segment_size(
             segment_size.as_bytes_u64(),
-            metadata.max_topic_segment_size(),
+            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
         )
         .map_err(WriteError::Rejected)?;
+    }
+    let segment_size = parsed.segment_size.map_or_else(
+        || iggy_common::DEFAULT_SEGMENT_SIZE,
+        |segment_size| segment_size.as_bytes_u64(),
+    );
+    if parsed
+        .preallocate_segments
+        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
+    {
+        validate_preallocated_topic_bytes(segment_size, command.partitions_count)
+            .map_err(WriteError::Rejected)?;
     }
     validate_topic_bounds(
         command.partitions_count,
         parsed.max_topic_size.unwrap_or(MaxTopicSize::ServerDefault),
-        parsed.segment_size.map_or_else(
-            || metadata.default_segment_size(),
-            |segment_size| segment_size.as_bytes_u64(),
-        ),
+        segment_size,
     )
     .map_err(WriteError::Rejected)?;
     let request = CreateTopicRequest {
@@ -920,13 +928,32 @@ pub(in crate::http) async fn update_topic(
     }
     .to_wire()
     .map_err(WriteError::Rejected)?;
-    // Same pre-consensus gate the TCP ingress applies: a key this command may
-    // not change is denied here by name rather than riding a log entry.
+    // Same pre-consensus gates the TCP ingress applies: a key this command may
+    // not change is denied here by name rather than riding a log entry, and a
+    // cap below one of this topic's segments is denied for the same reason it is
+    // on create.
     validate_option_keys(&wire_options, UPDATABLE_TOPIC_OPTION_KEYS)
         .map_err(WriteError::Rejected)?;
+    let stream_wire = identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_wire = identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?;
+    if let Some(max_topic_size) = TopicCreateOptions::parse(&wire_options)
+        .map_err(WriteError::Rejected)?
+        .max_topic_size
+    {
+        let metadata = state.shard.plane.metadata();
+        let segment_size = metadata
+            .mux_stm
+            .streams()
+            .topic_segment_size(&stream_wire, &topic_wire)
+            .map_or_else(
+                || iggy_common::DEFAULT_SEGMENT_SIZE,
+                |segment_size| segment_size.as_bytes_u64(),
+            );
+        validate_topic_size_floor(max_topic_size, segment_size).map_err(WriteError::Rejected)?;
+    }
     let request = UpdateTopicRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
+        stream_id: stream_wire,
+        topic_id: topic_wire,
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
         options: wire_options,

@@ -470,6 +470,16 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public Task<IReadOnlyList<OptionSpec>> DescribeOptionsAsync(OptionsScope scope,
+        CancellationToken token = default)
+    {
+        // The REST catalog renders `kind` as a name and `default_value` as a JSON
+        // array, a second shape for the same contract. Until the two agree, the
+        // binary transports are the ones that carry it.
+        throw new FeatureUnavailableException();
+    }
+
+    /// <inheritdoc />
     public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/stats", token);

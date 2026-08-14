@@ -578,6 +578,24 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<IReadOnlyList<OptionSpec>> DescribeOptionsAsync(OptionsScope scope,
+        CancellationToken token = default)
+    {
+        var message = new[] { (byte)scope };
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DESCRIBE_OPTIONS_CODE);
+
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
+
+        if (responseBuffer.Memory.Length == 0)
+        {
+            return [];
+        }
+
+        return BinaryMapper.MapOptionSpecs(responseBuffer.Memory.Span);
+    }
+
+    /// <inheritdoc />
     public async Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();

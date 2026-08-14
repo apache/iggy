@@ -62,8 +62,8 @@ use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire_split};
 use iggy_common::{
-    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, ResourceOptions,
-    StreamStats, TopicCreateOptions, TopicStats,
+    CompressionAlgorithm, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats,
+    ResourceOptions, StreamStats, TopicCreateOptions, TopicRuntimeOptions, TopicStats,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::IggyNamespace;
@@ -883,6 +883,26 @@ impl Streams {
         })
     }
 
+    /// A topic's explicitly set segment size, or `None` when the stream or
+    /// topic is unknown or the topic left the key to the node default.
+    ///
+    /// Update admission reads it for the floor `max_topic_size` has to clear:
+    /// `segment_size` is create-only, so the stored value is the one every one
+    /// of the topic's partitions is already rotating at.
+    #[must_use]
+    pub fn topic_segment_size(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<IggyByteSize> {
+        self.inner.read(|inner| {
+            let stream_slab = inner.resolve_stream_id(stream_id)?;
+            let topic_slab = inner.resolve_topic_id(stream_slab, topic_id)?;
+            let topic = inner.items.get(stream_slab)?.topics.get(topic_slab)?;
+            TopicRuntimeOptions::from_resource_options(&topic.options).segment_size
+        })
+    }
+
     /// Build the `ConsumerGroupDetailsResponse` for a group (members + their
     /// round-robin partition assignment). `partitions_count` is the topic's
     /// total partition count. `None` if the stream/topic/group is unknown.
@@ -1661,6 +1681,42 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             }
         }
 
+        // Both blocks were validated and resolved at admission, so apply reads
+        // them leniently: a key this build does not know is skipped, not
+        // refused. Refusing would make the verdict depend on the build, and a
+        // replica that predates a key would then be missing a topic its peers
+        // committed. Decoded before the revision bump and the stats-registry
+        // insert below, so a block this build cannot read at all leaves no
+        // orphaned registry entry and wakes no reconciler.
+        let explicit = TopicCreateOptions::parse_committed(&self.request.options);
+        let derived = TopicCreateOptions::parse_committed(&self.derived_options);
+        let (Ok(explicit_map), Ok(derived_map)) = (
+            resource_options_from_wire(&self.request.options, true),
+            resource_options_from_wire(&self.derived_options, false),
+        ) else {
+            return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
+        };
+        let resolved = explicit.resolved_over(&derived);
+        let Ok(resolved_map) = resolved.to_option_map() else {
+            return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
+        };
+
+        // Explicit wins on collision. `partitions_count` cannot appear here at
+        // all: it is a fixed field of the command, not an option key.
+        let mut options = derived_map;
+        options.extend(explicit_map);
+        // A client may send the literal server-default sentinel (0) for a typed
+        // key. The typed fields normalize it to absent and resolve the node
+        // default, so the map has to report the resolved value too: otherwise
+        // the merge above drops the derived entry and one `GetTopic` response
+        // carries the resolved value in the fixed field and 0 in the options
+        // block. Provenance is left alone - the client did name the key.
+        for (key, resolved_value) in resolved_map {
+            if let Some(option) = options.get_mut(&key) {
+                option.value = resolved_value.value;
+            }
+        }
+
         // Past validation: this commit adds partitions, so bump the
         // monotonic revision and stamp every new partition with it.
         let new_revision = state.revision.wrapping_add(1);
@@ -1685,39 +1741,14 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
 
-        // Both blocks were validated and resolved at admission, so apply reads
-        // them leniently: a key this build does not know is skipped, not
-        // refused. Refusing would make the verdict depend on the build, and a
-        // replica that predates a key would then be missing a topic its peers
-        // committed.
-        let explicit = TopicCreateOptions::parse_committed(&self.request.options);
-        let derived = TopicCreateOptions::parse_committed(&self.derived_options);
-        let (Ok(explicit_map), Ok(derived_map)) = (
-            resource_options_from_wire(&self.request.options, true),
-            resource_options_from_wire(&self.derived_options, false),
-        ) else {
-            return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
-        };
-        // Explicit wins on collision. `partitions_count` cannot appear here at
-        // all: it is a fixed field of the command, not an option key.
-        let mut options = derived_map;
-        options.extend(explicit_map);
-
         let topic = Topic {
             id: topic_id,
             name: name_arc.clone(),
             created_at: timestamp,
-            message_expiry: explicit
-                .message_expiry
-                .or(derived.message_expiry)
-                .unwrap_or(IggyExpiry::ServerDefault),
-            compression_algorithm: explicit
-                .compression_algorithm
-                .or(derived.compression_algorithm)
-                .unwrap_or_default(),
-            max_topic_size: explicit
+            message_expiry: resolved.message_expiry.unwrap_or(IggyExpiry::ServerDefault),
+            compression_algorithm: resolved.compression_algorithm.unwrap_or_default(),
+            max_topic_size: resolved
                 .max_topic_size
-                .or(derived.max_topic_size)
                 .unwrap_or(MaxTopicSize::ServerDefault),
             options,
             stats: topic_stats,
@@ -2393,6 +2424,70 @@ mod tests {
         assert!(
             !topic.options.get(&size_key).unwrap().explicit,
             "derived key is marked derived"
+        );
+    }
+
+    /// A client may send the literal 0 that means "resolve the default". The
+    /// merge lets that explicit entry win over the derived one, so the map has
+    /// to be rewritten from the resolved value: otherwise the persisted map
+    /// reports 0 while the typed field reports the resolved default, and the
+    /// single `GetTopic` response contradicts itself.
+    #[test]
+    fn create_topic_replaces_a_client_sent_sentinel_with_the_resolved_default() {
+        use iggy_common::{HeaderKey, TopicCreateOptions, topic_option_keys};
+        use std::str::FromStr;
+
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let explicit = TopicCreateOptions {
+            max_topic_size: Some(MaxTopicSize::from(0u64)),
+            ..TopicCreateOptions::default()
+        };
+        let derived = TopicCreateOptions {
+            max_topic_size: Some(MaxTopicSize::from(10_000_000_000u64)),
+            ..TopicCreateOptions::default()
+        };
+        // `to_wire` normalizes the sentinel away, so the block is hand-built to
+        // carry the literal 0 the CLI's `--set max_topic_size=server_default`
+        // puts on the wire through the raw map.
+        let mut sentinel = bytes::BytesMut::new();
+        iggy_binary_protocol::primitives::user_headers::encode_user_headers(
+            &[(
+                2,
+                topic_option_keys::MAX_TOPIC_SIZE.as_bytes(),
+                12,
+                &0u64.to_le_bytes(),
+            )],
+            &mut sentinel,
+        );
+        let request = CreateTopicWithAssignmentsRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("t").unwrap(),
+                options: WireOptions::from_bytes(sentinel.freeze()).unwrap(),
+            },
+            derived_options: derived.to_wire().unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert!(explicit.max_topic_size.is_some(), "sentinel was sent");
+
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::from(1));
+        assert_eq!(reply.code, 0, "create must succeed");
+
+        let stream = inner.items.get(0).unwrap();
+        let (_, topic) = stream.topics.iter().next().unwrap();
+        assert_eq!(topic.max_topic_size, MaxTopicSize::from(10_000_000_000u64));
+        let size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
+        let stored = topic.options.get(&size_key).unwrap();
+        assert_eq!(
+            stored.value.as_bytes(),
+            &10_000_000_000u64.to_le_bytes(),
+            "the map must carry the resolved value, not the sentinel"
         );
     }
 

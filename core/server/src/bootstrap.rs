@@ -1127,30 +1127,6 @@ async fn shard_main(
     // view-change superblock write records the real (checkpoint_op, checksum)
     // instead of (0, 0). No-op on peer shards, which have no coordinator.
     metadata.seed_checkpoint_ref(checkpoint_seed.0, checkpoint_seed.1);
-    // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
-    // message expiry) at create admission; responses echo stored values verbatim.
-    metadata.set_default_max_topic_size(iggy_common::DEFAULT_MAX_TOPIC_SIZE);
-    metadata.set_default_message_expiry(iggy_common::DEFAULT_MESSAGE_EXPIRY);
-    metadata.set_default_segment_size(iggy_common::DEFAULT_SEGMENT_SIZE);
-    // Per-topic segment ceiling: the smaller of the global segment maximum
-    // and the state-transfer artifact budget minus one bus frame (a segment
-    // may close one whole batch past its cap; an artifact ceiling below that
-    // refuses a legal segment and livelocks the partition's rejoin).
-    metadata.set_max_topic_segment_size(
-        configs::validators::SEGMENT_MAX_SIZE_BYTES.min(
-            config
-                .partition
-                .transfer_artifact_bytes_max
-                .as_bytes_u64()
-                .saturating_sub(config.message_bus.max_message_size.as_bytes_u64()),
-        ),
-    );
-    metadata.set_partition_runtime_defaults(
-        iggy_common::DEFAULT_ENFORCE_FSYNC,
-        iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-        iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-        iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-    );
     // Keep the forced-checkpoint margin >= the configured prepare-queue
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).

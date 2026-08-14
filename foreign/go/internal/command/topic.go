@@ -48,7 +48,11 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 	nameBytes := []byte(t.Name)
-	optionsBytes := iggcon.GetHeadersBytes(t.options())
+	options, err := t.options()
+	if err != nil {
+		return nil, err
+	}
+	optionsBytes := iggcon.GetHeadersBytes(options)
 
 	bytes := make([]byte, 0, len(streamIdBytes)+4+1+len(nameBytes)+len(optionsBytes))
 	bytes = append(bytes, streamIdBytes...)
@@ -64,10 +68,14 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 // option: it fills the command's own fixed field. Keys carrying the
 // server-default sentinel (expiry 0, size 0, compression none) are omitted so
 // the server derives them and returns them as derived entries.
-func (t *CreateTopic) options() []iggcon.HeaderEntry {
+func (t *CreateTopic) options() ([]iggcon.HeaderEntry, error) {
 	var options []iggcon.HeaderEntry
-	if name := t.CompressionAlgorithm.String(); name != "none" {
-		options = append(options, stringOption(topicOptionCompressionAlgorithm, name))
+	compression, err := t.CompressionAlgorithm.OptionValue()
+	if err != nil {
+		return nil, err
+	}
+	if compression != "" {
+		options = append(options, stringOption(topicOptionCompressionAlgorithm, compression))
 	}
 	if t.MessageExpiry != 0 {
 		options = append(options, uint64Option(topicOptionMessageExpiry, uint64(t.MessageExpiry)))
@@ -75,7 +83,7 @@ func (t *CreateTopic) options() []iggcon.HeaderEntry {
 	if t.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
 	}
-	return options
+	return options, nil
 }
 
 func uint64Option(key string, value uint64) iggcon.HeaderEntry {
@@ -147,15 +155,18 @@ func (u *UpdateTopic) Code() Code {
 	return UpdateTopicCode
 }
 
-// options builds the trailing options block. Only keys an update may change
-// are allowed; the server rejects the create-time knobs by name.
-// options builds the trailing options block. A zero value means the caller did
-// not set the key, so it is omitted and the server leaves the topic's current
-// value alone.
-func (u *UpdateTopic) options() []iggcon.HeaderEntry {
+// options builds the trailing options block. Only keys an update may change are
+// allowed; the server rejects the create-time knobs by name. A zero value means
+// the caller did not set the key, so it is omitted and the server leaves the
+// topic's current value alone.
+func (u *UpdateTopic) options() ([]iggcon.HeaderEntry, error) {
 	var options []iggcon.HeaderEntry
-	if name := u.CompressionAlgorithm.String(); name != "none" {
-		options = append(options, stringOption(topicOptionCompressionAlgorithm, name))
+	compression, err := u.CompressionAlgorithm.OptionValue()
+	if err != nil {
+		return nil, err
+	}
+	if compression != "" {
+		options = append(options, stringOption(topicOptionCompressionAlgorithm, compression))
 	}
 	if u.MessageExpiry != 0 {
 		options = append(options, uint64Option(topicOptionMessageExpiry, uint64(u.MessageExpiry)))
@@ -163,7 +174,7 @@ func (u *UpdateTopic) options() []iggcon.HeaderEntry {
 	if u.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, u.MaxTopicSize))
 	}
-	return options
+	return options, nil
 }
 
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
@@ -176,7 +187,11 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 
-	optionsBytes := iggcon.GetHeadersBytes(u.options())
+	options, err := u.options()
+	if err != nil {
+		return nil, err
+	}
+	optionsBytes := iggcon.GetHeadersBytes(options)
 	buffer := make([]byte, 1+len(streamIdBytes)+len(topicIdBytes)+len(u.Name)+len(optionsBytes))
 
 	offset := 0

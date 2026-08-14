@@ -96,7 +96,8 @@ use iggy_binary_protocol::{
 use iggy_common::{
     IggyByteSize, IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression,
     SystemSnapshotType, TopicCreateOptions, UPDATABLE_STREAM_OPTION_KEYS,
-    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, validate_topic_segment_size,
+    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, validate_preallocated_topic_bytes,
+    validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -822,6 +823,16 @@ pub(crate) fn validate_topic_bounds(
     segment_size_bytes: u64,
 ) -> Result<(), IggyError> {
     validate_partitions_count(partitions_count)?;
+    validate_topic_size_floor(max_topic_size, segment_size_bytes)
+}
+
+/// A topic cap below one segment can never be enforced: the first segment
+/// already exceeds it. Split out of [`validate_topic_bounds`] because update
+/// admission checks the cap without a partitions count to check.
+pub(crate) fn validate_topic_size_floor(
+    max_topic_size: MaxTopicSize,
+    segment_size_bytes: u64,
+) -> Result<(), IggyError> {
     if !matches!(max_topic_size, MaxTopicSize::ServerDefault)
         && max_topic_size.as_bytes_u64() < segment_size_bytes
     {
@@ -1148,22 +1159,28 @@ async fn handle_client_request<B, MJ, S, SB>(
                 // `parse` doubles as the catalog gate: an unknown key or a
                 // malformed value denies typed here, pre-consensus.
                 let options = TopicCreateOptions::parse(&create_topic.options)?;
-                let metadata = shard.plane.metadata();
                 if let Some(segment_size) = options.segment_size {
                     validate_topic_segment_size(
                         segment_size.as_bytes_u64(),
-                        metadata.max_topic_segment_size(),
+                        iggy_common::MAX_TOPIC_SEGMENT_SIZE,
                     )?;
+                }
+                let segment_size = options.segment_size.map_or_else(
+                    || iggy_common::DEFAULT_SEGMENT_SIZE,
+                    |segment_size| segment_size.as_bytes_u64(),
+                );
+                if options
+                    .preallocate_segments
+                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
+                {
+                    validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
                 }
                 validate_topic_bounds(
                     create_topic.partitions_count,
                     options
                         .max_topic_size
                         .unwrap_or(MaxTopicSize::ServerDefault),
-                    options.segment_size.map_or_else(
-                        || metadata.default_segment_size(),
-                        |segment_size| segment_size.as_bytes_u64(),
-                    ),
+                    segment_size,
                 )
             }),
         Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
@@ -1183,7 +1200,24 @@ async fn handle_client_request<B, MJ, S, SB>(
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|update_topic| {
                 validate_option_keys(&update_topic.options, UPDATABLE_TOPIC_OPTION_KEYS)?;
-                TopicCreateOptions::parse(&update_topic.options).map(|_| ())
+                let options = TopicCreateOptions::parse(&update_topic.options)?;
+                let Some(max_topic_size) = options.max_topic_size else {
+                    return Ok(());
+                };
+                // An update can lower the cap below one segment just as a
+                // create can, and the stored map would then report a size the
+                // topic can never enforce. The floor is this topic's own
+                // segment size, since that key is create-only.
+                let metadata = shard.plane.metadata();
+                let segment_size = metadata
+                    .mux_stm
+                    .streams()
+                    .topic_segment_size(&update_topic.stream_id, &update_topic.topic_id)
+                    .map_or_else(
+                        || iggy_common::DEFAULT_SEGMENT_SIZE,
+                        |segment_size| segment_size.as_bytes_u64(),
+                    );
+                validate_topic_size_floor(max_topic_size, segment_size)
             }),
         Operation::UpdateStream => UpdateStreamRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)

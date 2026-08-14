@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use iggy::prelude;
 use rmcp::schemars::{self, JsonSchema};
@@ -87,6 +87,13 @@ pub struct CreateTopic {
 
     #[schemars(description = "maximum size (optional)")]
     pub max_size: Option<String>,
+
+    #[schemars(
+        description = "additional options as string key-values, e.g. {\"segment_size\": \"128 MiB\"}; \
+                       call describe_options for the keys the server accepts (optional)"
+    )]
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -108,6 +115,14 @@ pub struct UpdateTopic {
 
     #[schemars(description = "maximum size (optional)")]
     pub max_size: Option<String>,
+
+    #[schemars(
+        description = "options to change, as string key-values; only compression_algorithm, \
+                       message_expiry and max_topic_size may be updated, and a key left out \
+                       keeps its current value (optional)"
+    )]
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -292,7 +292,7 @@ Options:
 {CLAP_INDENT}
           Values are sent as strings and parsed server-side through each option's
           own FromStr (e.g. --set segment_size=128MiB). The server rejects keys it
-          does not support; GET /options/topic lists the ones it accepts.
+          does not support; run "iggy options topic" to list the ones it accepts.
 
   -h, --help
           Print help (see a summary with '-h')

@@ -434,6 +434,33 @@ mod tests {
             .expect("config deserializes")
     }
 
+    /// The per-topic `segment_size` ceiling lives in `iggy_common`, which cannot
+    /// import this crate. Admission reads it from there; boot validation reads
+    /// the constant here. This is the only place both are visible.
+    #[test]
+    fn given_segment_maximum_when_compared_to_the_option_ceiling_should_match() {
+        assert_eq!(
+            SEGMENT_MAX_SIZE_BYTES,
+            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+            "the option ceiling and the segment maximum must move together"
+        );
+    }
+
+    /// Admission may cap a topic's `segment_size` at
+    /// [`iggy_common::MAX_TOPIC_SEGMENT_SIZE`] flat only while boot refuses any
+    /// config whose artifact budget cannot carry a segment that large plus one
+    /// bus frame. Without that refusal the ceiling would have to be per node.
+    #[test]
+    fn given_artifact_budget_below_the_segment_ceiling_when_validating_should_reject() {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"1 GiB\"\n[message_bus]\nmax_message_size = \"1 MiB\"\n",
+        );
+        assert!(
+            config.validate().is_err(),
+            "an artifact budget under segment maximum + one frame must refuse boot"
+        );
+    }
+
     #[test]
     fn given_shipped_default_config_when_validating_should_pass() {
         let config: ServerConfig = Figment::new()

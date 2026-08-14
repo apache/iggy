@@ -537,7 +537,7 @@ where
 {
     match code {
         DESCRIBE_OPTIONS_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_describe_options_response(shard, body)?.to_bytes(),
+            build_describe_options_response(body)?.to_bytes(),
         )),
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
             build_cluster_metadata_response(roster, shard, client_ip).to_bytes(),
@@ -978,108 +978,120 @@ where
     })
 }
 
-/// Serve the option catalog for one resource scope. Static specs plus this
-/// node's resolved defaults; streams and users have no catalog keys yet, so
-/// their scopes return empty (every key is rejected at create until one
-/// lands).
-fn build_describe_options_response<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    body: &[u8],
-) -> Result<DescribeOptionsResponse, IggyError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
+/// Every key `CreateTopic` accepts, with the kind, default and bounds of each.
+///
+/// Split out of [`build_describe_options_response`] so the descriptions have room
+/// to state the bounds each value is checked against: this catalog is the only
+/// place an operator learns them.
+///
+/// Every default is a build constant: these knobs stopped being config-derived
+/// when the `[system.*]` keys became topic options, so the catalog reads them
+/// straight from `iggy_common`.
+fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
+    Ok(vec![
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::COMPRESSION_ALGORITHM)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"none"),
+            description: "Compression algorithm (none, gzip)".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MESSAGE_EXPIRY)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MESSAGE_EXPIRY.to_le_bytes(),
+            ),
+            description: "Message expiry in microseconds, or a humantime string \
+                              (e.g. 7 days)"
+                .to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MAX_TOPIC_SIZE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
+            ),
+            description: "Topic size cap in bytes, or a byte-size string (e.g. 1 GiB); \
+                              must be at least the segment size"
+                .to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::SEGMENT_SIZE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(&iggy_common::DEFAULT_SEGMENT_SIZE.to_le_bytes()),
+            description: format!(
+                "Segment size in bytes, or a byte-size string (e.g. 128 MiB); a 512-byte \
+                     multiple within {}..={}",
+                iggy_common::MIN_TOPIC_SEGMENT_SIZE,
+                iggy_common::MAX_TOPIC_SEGMENT_SIZE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::ENFORCE_FSYNC)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Bool.as_code(),
+            default_value: Bytes::copy_from_slice(&[u8::from(iggy_common::DEFAULT_ENFORCE_FSYNC)]),
+            description: "Whether writes to this topic's partitions fsync".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint32.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
+            ),
+            description: format!(
+                "Flush the journal once it holds this many messages; \
+                     1..={}. A threshold no segment can reach leaves committed \
+                     messages in the journal, which a crash does not preserve",
+                iggy_common::MAX_MESSAGES_REQUIRED_TO_SAVE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
+            ),
+            description: format!(
+                "Flush the journal once it holds this many bytes, or a byte-size \
+                     string; whichever threshold trips first flushes. At most {}",
+                iggy_common::MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::PREALLOCATE_SEGMENTS)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Bool.as_code(),
+            default_value: Bytes::copy_from_slice(&[u8::from(
+                iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            )]),
+            description: format!(
+                "Reserve each segment's bytes up front where the filesystem supports \
+                     it; pairs with segment_size. The reservation is real disk and runs \
+                     inline on the owning shard, at every rotation and once per owned \
+                     partition at boot, so segment_size * partitions_count is capped at \
+                     {} bytes",
+                iggy_common::MAX_PREALLOCATED_TOPIC_BYTES
+            ),
+        },
+    ])
+}
+
+/// Serve the option catalog for one resource scope.
+///
+/// Streams and users have no catalog keys yet, so their scopes return empty
+/// (every key is rejected at create until one lands).
+fn build_describe_options_response(body: &[u8]) -> Result<DescribeOptionsResponse, IggyError> {
     let request =
         DescribeOptionsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
     let entries = match request.scope {
-        OPTIONS_SCOPE_TOPIC => {
-            let metadata = shard.plane.metadata();
-            let (enforce_fsync, messages_required_to_save, size_of_messages, preallocate) =
-                metadata.partition_runtime_defaults();
-            vec![
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::COMPRESSION_ALGORITHM)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::String.as_code(),
-                    default_value: Bytes::from_static(b"none"),
-                    description: "Compression algorithm (none, gzip)".to_string(),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::MESSAGE_EXPIRY)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Uint64.as_code(),
-                    default_value: Bytes::copy_from_slice(
-                        &metadata.default_message_expiry().to_le_bytes(),
-                    ),
-                    description: "Message expiry in microseconds, or a humantime string \
-                                  (e.g. 7 days)"
-                        .to_string(),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::MAX_TOPIC_SIZE)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Uint64.as_code(),
-                    default_value: Bytes::copy_from_slice(
-                        &metadata.default_max_topic_size().to_le_bytes(),
-                    ),
-                    description: "Topic size cap in bytes, or a byte-size string (e.g. 1 GiB); \
-                                  must be at least the segment size"
-                        .to_string(),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::SEGMENT_SIZE)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Uint64.as_code(),
-                    default_value: Bytes::copy_from_slice(
-                        &metadata.default_segment_size().to_le_bytes(),
-                    ),
-                    description: format!(
-                        "Segment size in bytes, or a byte-size string (e.g. 128 MiB); a 512-byte \
-                         multiple within {}..={}",
-                        iggy_common::MIN_TOPIC_SEGMENT_SIZE,
-                        metadata.max_topic_segment_size()
-                    ),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::ENFORCE_FSYNC)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Bool.as_code(),
-                    default_value: Bytes::copy_from_slice(&[u8::from(enforce_fsync)]),
-                    description: "Whether writes to this topic's partitions fsync".to_string(),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Uint32.as_code(),
-                    default_value: Bytes::copy_from_slice(&messages_required_to_save.to_le_bytes()),
-                    description: "Flush the journal once it holds this many messages; must be \
-                                  non-zero"
-                        .to_string(),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Uint64.as_code(),
-                    default_value: Bytes::copy_from_slice(&size_of_messages.to_le_bytes()),
-                    description: "Flush the journal once it holds this many bytes, or a \
-                                  byte-size string; whichever threshold trips first flushes"
-                        .to_string(),
-                },
-                OptionDescriptor {
-                    key: WireName::new(topic_option_keys::PREALLOCATE_SEGMENTS)
-                        .map_err(|_| IggyError::InvalidFormat)?,
-                    kind: HeaderKind::Bool.as_code(),
-                    default_value: Bytes::copy_from_slice(&[u8::from(preallocate)]),
-                    description: "Reserve each segment's bytes up front where the filesystem \
-                                  supports it; pairs with segment_size"
-                        .to_string(),
-                },
-            ]
-        }
+        OPTIONS_SCOPE_TOPIC => topic_option_descriptors()?,
         OPTIONS_SCOPE_STREAM | OPTIONS_SCOPE_USER => Vec::new(),
         _ => return Err(IggyError::InvalidCommand),
     };

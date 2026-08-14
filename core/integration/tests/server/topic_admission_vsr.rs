@@ -193,6 +193,118 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
     test_client_transport = [Tcp],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
+async fn given_update_below_one_segment_when_updating_topic_should_reject_typed(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("update-bounds-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("update-bounds-stream").expect("stream identifier");
+    create_topic_with(
+        &client,
+        &stream_id,
+        "update-bounds-topic",
+        1,
+        MaxTopicSize::Unlimited,
+    )
+    .await
+    .expect("create topic");
+    let topic_id = Identifier::from_str_value("update-bounds-topic").expect("topic identifier");
+
+    // Create refuses a cap under one segment; an update has to refuse the same
+    // value, or the stored map reports a size the topic can never enforce.
+    let tiny = MaxTopicSize::Custom(IggyByteSize::from_str("10KiB").expect("byte size"));
+    let result = client
+        .update_topic(
+            &stream_id,
+            &topic_id,
+            "update-bounds-topic",
+            &TopicUpdateOptions {
+                max_topic_size: Some(tiny),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await;
+    let invalid_size = IggyError::InvalidTopicSize(tiny, IggyByteSize::default()).as_code();
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == invalid_size),
+        "update to a cap below one segment must deny with InvalidTopicSize, got {result:?}"
+    );
+
+    let topic = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("get topic")
+        .expect("topic exists");
+    assert_eq!(
+        topic.max_topic_size,
+        MaxTopicSize::Unlimited,
+        "a denied update must leave the stored cap alone"
+    );
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn given_sentinel_option_when_creating_topic_should_store_the_resolved_default(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("sentinel-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("sentinel-stream").expect("stream identifier");
+
+    // `server_default` reaches the wire as a literal 0 through the raw map, the
+    // same shape the CLI's `--set max_topic_size=server_default` produces. The
+    // stored map has to report the resolved default rather than that 0, or one
+    // GetTopic response contradicts itself.
+    client
+        .create_topic(
+            &stream_id,
+            "sentinel-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                raw: std::collections::BTreeMap::from([(
+                    "max_topic_size".to_string(),
+                    "server_default".to_string(),
+                )]),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic with a sentinel option");
+
+    let topic_id = Identifier::from_str_value("sentinel-topic").expect("topic identifier");
+    let topic = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("get topic")
+        .expect("topic exists");
+    let stored = topic
+        .options
+        .get(&HeaderKey::from_str("max_topic_size").expect("option key"))
+        .expect("max_topic_size is stored");
+    assert_eq!(
+        u64::from(topic.max_topic_size),
+        iggy_common::DEFAULT_MAX_TOPIC_SIZE,
+        "the typed field resolves to the node default"
+    );
+    assert_eq!(
+        stored.value.as_bytes(),
+        &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
+        "the options map must agree with the typed field"
+    );
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
 async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
     harness: &TestHarness,
 ) {

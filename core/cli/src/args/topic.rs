@@ -126,7 +126,7 @@ pub(crate) struct TopicCreateArgs {
     ///
     /// Values are sent as strings and parsed server-side through each option's
     /// own FromStr (e.g. --set segment_size=128MiB). The server rejects keys it
-    /// does not support; GET /options/topic lists the ones it accepts.
+    /// does not support; run "iggy options topic" to list the ones it accepts.
     #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value, verbatim_doc_comment)]
     pub(crate) set: Vec<(String, String)>,
 }

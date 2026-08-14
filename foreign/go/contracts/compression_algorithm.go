@@ -17,18 +17,44 @@
 
 package iggcon
 
+import "fmt"
+
 type CompressionAlgorithm uint8
 
 const (
-	CompressionAlgorithmNone CompressionAlgorithm = 1
-	CompressionAlgorithmGzip CompressionAlgorithm = 2
+	// CompressionAlgorithmDefault is the zero value of the field: the server
+	// resolves the algorithm from its own configuration.
+	CompressionAlgorithmDefault CompressionAlgorithm = 0
+	CompressionAlgorithmNone    CompressionAlgorithm = 1
+	CompressionAlgorithmGzip    CompressionAlgorithm = 2
 )
+
+// OptionValue renders the algorithm for the server's `compression_algorithm`
+// topic option, or "" when the option should be omitted so the server resolves
+// its own default.
+//
+// An unrecognized code is an error rather than a fall back to the default: the
+// topic would otherwise be created with the server's algorithm and no
+// diagnostic, where the old fixed-field wire format put the raw byte on the
+// wire and let the server reject it.
+func (c CompressionAlgorithm) OptionValue() (string, error) {
+	switch c {
+	case CompressionAlgorithmDefault, CompressionAlgorithmNone:
+		return "", nil
+	case CompressionAlgorithmGzip:
+		return "gzip", nil
+	default:
+		return "", fmt.Errorf("unknown compression algorithm code %d", uint8(c))
+	}
+}
 
 func (c CompressionAlgorithm) String() string {
 	switch c {
+	case CompressionAlgorithmDefault, CompressionAlgorithmNone:
+		return "none"
 	case CompressionAlgorithmGzip:
 		return "gzip"
 	default:
-		return "none"
+		return fmt.Sprintf("unknown(%d)", uint8(c))
 	}
 }

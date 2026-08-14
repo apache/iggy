@@ -1231,6 +1231,56 @@ internal static class BinaryMapper
         }, 13 + name.Length);
     }
 
+    internal static IReadOnlyList<OptionSpec> MapOptionSpecs(ReadOnlySpan<byte> payload)
+    {
+        var count = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
+        var position = 4;
+        var specs = new List<OptionSpec>();
+        for (var i = 0; i < count; i++)
+        {
+            var keyLength = payload[position];
+            position += 1;
+            EnsureFits(payload, position, keyLength, "option key");
+            var key = Encoding.UTF8.GetString(payload[position..(position + keyLength)]);
+            position += keyLength;
+
+            var kind = payload[position];
+            position += 1;
+
+            var defaultLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+            position += 4;
+            EnsureFits(payload, position, defaultLength, "option default value");
+            var defaultValue = payload[position..(position + defaultLength)].ToArray();
+            position += defaultLength;
+
+            var descriptionLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+            position += 4;
+            EnsureFits(payload, position, descriptionLength, "option description");
+            var description = Encoding.UTF8.GetString(payload[position..(position + descriptionLength)]);
+            position += descriptionLength;
+
+            specs.Add(new OptionSpec
+            {
+                Key = key,
+                Kind = kind,
+                DefaultValue = defaultValue,
+                Description = description
+            });
+        }
+
+        return specs;
+    }
+
+    private static void EnsureFits(ReadOnlySpan<byte> payload, int position, int length, string what)
+    {
+        if (position + length > payload.Length)
+        {
+            throw new InvalidOperationException(
+                $"Malformed DescribeOptions response: {what} of {length} bytes at offset {position} " +
+                $"overruns the {payload.Length}-byte payload");
+        }
+    }
+
     internal static ClusterMetadata MapClusterMetadata(ReadOnlySpan<byte> payload)
     {
         var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);

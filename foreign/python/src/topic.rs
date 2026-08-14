@@ -218,7 +218,6 @@ impl Topic {
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.inner.max_topic_size.into()
     }
-
 }
 
 #[gen_stub_pyclass]

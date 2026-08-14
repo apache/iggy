@@ -27,9 +27,12 @@ use bytes::{BufMut, BytesMut};
 /// [topics_count:u32_le][TopicHeader]*
 /// ```
 ///
-/// The count prefix exists because a topic element carries variable-length
-/// options blocks: without it, a decoder has no framing to detect a short
-/// read against.
+/// The count prefix is what lets a decoder pre-size its `Vec`: an element
+/// carries two variable-length option blocks, so the payload length alone says
+/// nothing useful about how many elements are in it. Detecting a short read
+/// does not need it - the element decoder errors on one, which is how
+/// `GetStreams` and `GetUsers` still run their loops to end-of-payload. This
+/// response is the odd one out of the three, and every SDK special-cases it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetTopicsResponse {
     pub topics: Vec<TopicHeader>,
@@ -53,9 +56,10 @@ impl WireEncode for GetTopicsResponse {
     }
 }
 
-/// Smallest a topic header can encode as: the fixed ids, timestamps, sizes and
-/// counts, plus a name length and two length-prefixed option blocks.
-const MIN_TOPIC_HEADER_SIZE: usize = 45;
+/// Smallest a topic header can encode as: the fixed ids, timestamps, sizes,
+/// counts and name length, plus the shortest name `WireName` accepts (one byte,
+/// since it rejects an empty one) and two empty length-prefixed option blocks.
+const MIN_TOPIC_HEADER_SIZE: usize = TopicHeader::FIXED_SIZE + 1 + 4 + 4;
 
 impl WireDecode for GetTopicsResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {

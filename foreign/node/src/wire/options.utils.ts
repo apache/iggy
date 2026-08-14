@@ -145,6 +145,15 @@ export const deserializePrefixedOptions = (
   p: Buffer, pos = 0
 ): OptionsDeserialized => {
   const length = p.readUInt32LE(pos);
-  const options = deserializeOptions(p, pos + 4, pos + 4 + length);
+  const end = pos + 4 + length;
+  // Without this, `subarray` clamps a truncated block silently: a known-kind
+  // value throws inside `deserializeHeaderValue`, the forward-compat catch
+  // swallows it and hands back raw bytes, and `bytesRead` over-reports so every
+  // later field decodes from the wrong offset.
+  if (end > p.length)
+    throw new Error(
+      `Options block overruns the payload: ${length} bytes declared at ${pos}, ` +
+      `${p.length - pos - 4} available`);
+  const options = deserializeOptions(p, pos + 4, end);
   return { bytesRead: 4 + length, options };
 };

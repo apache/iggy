@@ -51,6 +51,10 @@ pub struct CreateTopic {
     pub name: String,
     /// Additional topic options as string key-values, parsed by the server
     /// with the same rules as its config file. Unknown keys are rejected.
+    ///
+    /// A response renders each option as `{"value": "<string>", "explicit":
+    /// bool}`, in this same string form, so the values a `GET` reports can be
+    /// sent straight back here.
     #[serde(default)]
     pub options: BTreeMap<String, String>,
 }

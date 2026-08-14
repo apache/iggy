@@ -58,8 +58,10 @@ func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
 		return nil, err
 	}
 	// Count-driven: a topic element carries variable-length options blocks,
-	// so "consume until the buffer ends" no longer delimits it.
-	topics := make([]iggcon.Topic, 0, stream.TopicsCount)
+	// so "consume until the buffer ends" no longer delimits it. The declared
+	// count is an unvalidated wire u32, so the allocation hint is capped by
+	// what the remaining body could possibly hold.
+	topics := make([]iggcon.Topic, 0, boundedCapacity(stream.TopicsCount, len(payload)-pos, topicMinimumSize))
 	for i := uint32(0); i < stream.TopicsCount; i++ {
 		topic, readBytes, err := DeserializeToTopic(payload, pos)
 		if err != nil {
@@ -264,11 +266,7 @@ func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
 
 	// The declared count is server-controlled; the allocation hint is capped
 	// by what the body could possibly hold.
-	maxTopics := (len(payload) - position) / topicMinimumSize
-	if int(topicsCount) < maxTopics {
-		maxTopics = int(topicsCount)
-	}
-	topics := make([]iggcon.Topic, 0, maxTopics)
+	topics := make([]iggcon.Topic, 0, boundedCapacity(topicsCount, len(payload)-position, topicMinimumSize))
 	for i := uint32(0); i < topicsCount; i++ {
 		topic, readBytes, err := DeserializeToTopic(payload, position)
 		if err != nil {
@@ -306,9 +304,26 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 // max_topic_size + size_bytes + messages_count + name_len.
 const topicFixedSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 // 50 bytes
 
-// topicMinimumSize is the smallest possible topic element: fixed fields plus
-// the two u32 options-length prefixes (explicit and derived), both zero.
-const topicMinimumSize = topicFixedSize + 4 + 4
+// topicMinimumSize is the smallest possible topic element: fixed fields, a
+// one-character name (the server rejects an empty one), and the two u32
+// options-length prefixes (explicit and derived), both zero.
+const topicMinimumSize = topicFixedSize + 1 + 4 + 4
+
+// boundedCapacity caps a wire-declared element count by what the remaining
+// bytes could possibly hold.
+//
+// The count is an unvalidated u32: at max it asks for a multi-hundred-gigabyte
+// reservation, and a Go allocation failure cannot be recovered from.
+func boundedCapacity(declared uint32, remaining int, minItemSize int) int {
+	if remaining <= 0 || minItemSize <= 0 {
+		return 0
+	}
+	capacity := remaining / minItemSize
+	if uint64(declared) < uint64(capacity) {
+		return int(declared)
+	}
+	return capacity
+}
 
 func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error) {
 	remaining := len(payload) - position

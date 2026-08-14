@@ -582,6 +582,7 @@ mod tests {
         // actually grows need their own pins.
         const TOPIC_FIELD_COUNT: u32 = 11;
         const STREAM_FIELD_COUNT: u32 = 6;
+        const USER_FIELD_COUNT: u32 = 7;
 
         let topic = TopicSnapshot {
             id: 0,
@@ -624,6 +625,22 @@ mod tests {
             rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
             STREAM_FIELD_COUNT,
             "StreamSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let user = crate::stm::user::UserSnapshot {
+            id: 0,
+            username: String::new(),
+            password_hash: String::new(),
+            status: iggy_common::UserStatus::Active,
+            created_at: IggyTimestamp::default(),
+            permissions: None,
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&user).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            USER_FIELD_COUNT,
+            "UserSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
     }
 

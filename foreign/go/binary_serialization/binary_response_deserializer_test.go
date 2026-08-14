@@ -282,3 +282,35 @@ func TestDeserializeStreams_MaxLengthName(t *testing.T) {
 		t.Errorf("Name length = %d, want 255", len(streams[0].Name))
 	}
 }
+
+func TestBoundedCapacity_CapsDeclaredCount(t *testing.T) {
+	tests := []struct {
+		name        string
+		declared    uint32
+		remaining   int
+		minItemSize int
+		want        int
+	}{
+		{"declared below what fits", 2, 10 * topicMinimumSize, topicMinimumSize, 2},
+		{"declared above what fits", 1 << 31, 3 * topicMinimumSize, topicMinimumSize, 3},
+		{"nothing left to read", 1 << 31, 0, topicMinimumSize, 0},
+		{"zero item size", 1 << 31, 1024, 0, 0},
+	}
+	for _, test := range tests {
+		got := boundedCapacity(test.declared, test.remaining, test.minItemSize)
+		if got != test.want {
+			t.Errorf("%s: boundedCapacity(%d, %d, %d) = %d, want %d",
+				test.name, test.declared, test.remaining, test.minItemSize, got, test.want)
+		}
+	}
+}
+
+func TestDeserializeStream_LyingTopicsCountDoesNotPreallocate(t *testing.T) {
+	// A u32 topics count with no topics behind it: the decode must fail on the
+	// missing element rather than reserve a slice for the declared count.
+	payload := encodeStream(1, 100, 1<<31, 0, 0, "s")
+
+	if _, err := DeserializeStream(payload); err == nil {
+		t.Fatal("expected error for topics count with no elements, got nil")
+	}
+}

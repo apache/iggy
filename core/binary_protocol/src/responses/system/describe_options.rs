@@ -28,10 +28,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// [default_len:u32][default bytes][description_len:u32][description]
 /// ```
 ///
-/// `kind` is the canonical header kind code the server persists the value
-/// under; clients may also send a `String` value parsed via the same rules as
-/// the server config file. `default` is the server's current resolved default
-/// in the canonical kind's encoding, empty when the key has no server default.
+/// `kind` is the header kind code the server encodes this key's own default
+/// under, and the kind a client should prefer; a `String` value parsed by the
+/// same rules as a config file value is accepted too, and an explicitly set
+/// entry keeps the kind the client sent. `default` is that default in `kind`'s
+/// encoding, empty when the key has none, and is a build constant rather than a
+/// per-node value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionDescriptor {
     pub key: WireName,
@@ -64,7 +66,15 @@ impl WireDecode for OptionDescriptor {
         pos += 1;
         let default_len = read_u32_le(buf, pos)? as usize;
         pos += 4;
-        let default_end = pos + default_len;
+        // `checked_add`: on a 32-bit target a wire-supplied length wraps, the
+        // truncation guard below then passes, and the slice panics instead.
+        let default_end = pos
+            .checked_add(default_len)
+            .ok_or_else(|| WireError::UnexpectedEof {
+                offset: pos,
+                need: default_len,
+                have: buf.len().saturating_sub(pos),
+            })?;
         if buf.len() < default_end {
             return Err(WireError::UnexpectedEof {
                 offset: pos,
@@ -76,7 +86,13 @@ impl WireDecode for OptionDescriptor {
         pos = default_end;
         let description_len = read_u32_le(buf, pos)? as usize;
         pos += 4;
-        let description_end = pos + description_len;
+        let description_end =
+            pos.checked_add(description_len)
+                .ok_or_else(|| WireError::UnexpectedEof {
+                    offset: pos,
+                    need: description_len,
+                    have: buf.len().saturating_sub(pos),
+                })?;
         if buf.len() < description_end {
             return Err(WireError::UnexpectedEof {
                 offset: pos,
@@ -125,9 +141,10 @@ impl WireEncode for DescribeOptionsResponse {
     }
 }
 
-/// Smallest a descriptor can encode as: a name, a kind byte, a
-/// length-prefixed default and a length-prefixed description.
-const MIN_DESCRIPTOR_SIZE: usize = 4 + 1 + 1 + 4 + 4;
+/// Smallest a descriptor can encode as: a one-character `WireName` (a length
+/// byte plus at least one byte of name), a kind byte, and empty
+/// length-prefixed default and description.
+const MIN_DESCRIPTOR_SIZE: usize = 2 + 1 + 4 + 4;
 
 impl WireDecode for DescribeOptionsResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {

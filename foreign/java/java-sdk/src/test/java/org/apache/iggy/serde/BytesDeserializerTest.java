@@ -93,11 +93,38 @@ class BytesDeserializerTest {
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
         buffer.writeBytes("test".getBytes());
-        // Non-empty explicit options block: skipping it must leave the buffer
-        // positioned at the derived block.
         writeOptionsBlock(
                 buffer, Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
-        writeOptionsBlock(buffer, Map.of()); // derived options
+        writeOptionsBlock(buffer, Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+    }
+
+    private static void writeTopicDataWithUnknownOptionKind(ByteBuf buffer) {
+        buffer.writeIntLE(10);
+        writeU64(buffer, BigInteger.valueOf(1000));
+        buffer.writeIntLE(4);
+        writeU64(buffer, BigInteger.ZERO);
+        buffer.writeByte(CompressionAlgorithm.None.asCode());
+        writeU64(buffer, BigInteger.valueOf(10000));
+        writeU64(buffer, BigInteger.valueOf(500));
+        writeU64(buffer, BigInteger.valueOf(50));
+        buffer.writeByte(4);
+        buffer.writeBytes("test".getBytes());
+
+        ByteBuf options = Unpooled.buffer();
+        var known = BytesSerializer.toBytes(
+                Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
+        options.writeBytes(known);
+        // Hand-rolled entry: a string key with a value kind no `HeaderKind` names.
+        options.writeByte(HeaderKind.String.asCode());
+        options.writeIntLE("from_the_future".length());
+        options.writeBytes("from_the_future".getBytes());
+        options.writeByte(200);
+        options.writeIntLE(2);
+        options.writeBytes(new byte[] {1, 2});
+        buffer.writeIntLE(options.readableBytes());
+        buffer.writeBytes(options);
+
+        writeOptionsBlock(buffer, Map.of());
     }
 
     private static void writeOptionsBlock(ByteBuf buffer, Map<HeaderKey, HeaderValue> options) {
@@ -228,6 +255,23 @@ class BytesDeserializerTest {
             assertThat(topic.id()).isEqualTo(10L);
             assertThat(topic.name()).isEqualTo("test");
             assertThat(topic.partitionsCount()).isEqualTo(4L);
+            assertThat(topic.options()).containsOnlyKeys("max_topic_size");
+            assertThat(topic.options().get("max_topic_size").kind()).isEqualTo(HeaderKind.Uint64);
+            assertThat(topic.derivedOptions()).containsOnlyKeys("segment_size");
+            assertThat(new String(topic.derivedOptions().get("segment_size").value()))
+                    .isEqualTo("1 GiB");
+        }
+
+        @Test
+        void shouldKeepReadableOptionsWhenOneValueKindIsUnknown() {
+            // The wire contract forwards value kinds a client build has no name
+            // for, so one of them must not cost the whole response.
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicDataWithUnknownOptionKind(buffer);
+
+            var topic = readTopic(buffer);
+
+            assertThat(topic.options()).containsOnlyKeys("max_topic_size");
         }
 
         @Test

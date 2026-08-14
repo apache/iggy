@@ -19,8 +19,20 @@
 
 package org.apache.iggy.topic;
 
-import java.math.BigInteger;
+import org.apache.iggy.message.HeaderValue;
 
+import java.math.BigInteger;
+import java.util.Map;
+
+/**
+ * A topic as the server reports it.
+ *
+ * <p>{@code options} carries the keys the creating client set explicitly;
+ * {@code derivedOptions} carries the values admission resolved for the keys it did not.
+ * Both are keyed by option name, and the split is the provenance: a value in
+ * {@code derivedOptions} would have resolved differently under another server config.
+ * The fixed fields above repeat three of those keys and stay for compatibility.
+ */
 public record Topic(
         Long id,
         BigInteger createdAt,
@@ -30,4 +42,6 @@ public record Topic(
         CompressionAlgorithm compressionAlgorithm,
         BigInteger maxTopicSize,
         BigInteger messagesCount,
-        Long partitionsCount) {}
+        Long partitionsCount,
+        Map<String, HeaderValue> options,
+        Map<String, HeaderValue> derivedOptions) {}

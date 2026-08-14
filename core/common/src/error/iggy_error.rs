@@ -400,6 +400,10 @@ pub enum IggyError {
     InvalidBatchChecksum(u64, u64, u64) = 4039,
     #[error("Invalid header kind code: {0}")]
     InvalidHeaderKind(u8) = 4040,
+    /// The key is only populated where the error text itself travels, which
+    /// today means HTTP. A binary transport sends the code alone, so a client
+    /// rebuilding this variant from it renders an empty key; `DescribeOptions`
+    /// is what tells that client which keys exist.
     #[error("Unsupported option key: {0}")]
     UnsupportedOptionKey(String) = 4041,
     #[error("Invalid option value for key: {0}")]

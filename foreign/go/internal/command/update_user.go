@@ -38,24 +38,24 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length := len(userIdBytes)
-
-	if u.Username == nil {
-		u.Username = new(string)
+	username := ""
+	if u.Username != nil {
+		username = *u.Username
 	}
 
-	username := *u.Username
-
+	// Both presence flags are always written; only the payload behind a flag is
+	// conditional. The options block decodes to the end of the payload, so a
+	// byte of slack here is a stray zero-kind entry the server rejects.
+	length := len(userIdBytes) + 2
 	if len(username) != 0 {
-		length += 2 + len(username)
+		length += 1 + len(username)
 	}
-
 	if u.Status != nil {
-		length += 2
+		length++
 	}
 
 	optionsBytes := iggcon.GetHeadersBytes(u.Options)
-	bytes := make([]byte, length+1+len(optionsBytes))
+	bytes := make([]byte, length+len(optionsBytes))
 	position := 0
 
 	copy(bytes[position:position+len(userIdBytes)], userIdBytes)

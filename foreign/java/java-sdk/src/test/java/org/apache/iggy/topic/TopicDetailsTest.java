@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -39,7 +40,9 @@ class TopicDetailsTest {
                 CompressionAlgorithm.Gzip,
                 BigInteger.TWO,
                 BigInteger.ZERO,
-                1L);
+                1L,
+                Map.of(),
+                Map.of());
         var partitions = List.of(new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE));
 
         var topicDetails = new TopicDetails(topic, partitions);

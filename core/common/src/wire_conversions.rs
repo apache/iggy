@@ -786,19 +786,45 @@ pub fn user_headers_from_wire(
 pub(crate) fn user_headers_from_validated_slice(
     buf: &[u8],
 ) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
+    headers_from_validated_slice(buf, UnknownKinds::Reject)
+}
+
+/// What a decode does with an entry whose kind code has no domain meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownKinds {
+    /// Fail the whole decode. A message header the reader cannot interpret is
+    /// the caller's problem, not something to hide from it.
+    Reject,
+    /// Drop the entry and keep the rest.
+    Skip,
+}
+
+fn headers_from_validated_slice(
+    buf: &[u8],
+    unknown: UnknownKinds,
+) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
     if buf.is_empty() {
         return Ok(BTreeMap::new());
     }
     let mut headers = BTreeMap::new();
     for entry in WireUserHeaderIterator::new(buf) {
-        let key_kind = HeaderKind::from_code(entry.key_kind.0)?;
+        let (key_kind, value_kind) = match (
+            HeaderKind::from_code(entry.key_kind.0),
+            HeaderKind::from_code(entry.value_kind.0),
+        ) {
+            (Ok(key_kind), Ok(value_kind)) => (key_kind, value_kind),
+            (Err(error), _) | (Ok(_), Err(error)) => {
+                if unknown == UnknownKinds::Skip {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         if let Some(expected) = key_kind.expected_size()
             && entry.key.len() != expected
         {
             return Err(IggyError::InvalidHeaderKey);
         }
-
-        let value_kind = HeaderKind::from_code(entry.value_kind.0)?;
         if let Some(expected) = value_kind.expected_size()
             && entry.value.len() != expected
         {
@@ -843,17 +869,22 @@ pub fn option_specs_from_wire(
 /// block carries no per-entry provenance. Admission calls this once for the
 /// client block (`explicit == true`) and fills defaults separately.
 ///
+/// Entries whose kind code has no domain meaning are skipped, not rejected.
+/// The wire layer forwards unknown kinds verbatim so a mixed-version cluster
+/// can round-trip them, and this decode sits on the apply path, on the SDK's
+/// list-decode and on the server's own reads: refusing the entry would mean an
+/// old replica rejecting a commit a new one accepted, one unreadable entry
+/// failing a whole `get_topics()`, and a topic that cannot be read back.
+///
 /// # Errors
 ///
-/// Returns `IggyError::InvalidHeaderKey` / `InvalidHeaderValue` when a kind
-/// code has no domain meaning or a fixed-size kind carries a mismatched
-/// payload. The wire layer accepts unknown kinds for forwarding; interpreting
-/// them into the domain requires known semantics.
+/// Returns `IggyError::InvalidHeaderKey` / `InvalidHeaderValue` when a known
+/// fixed-size kind carries a mismatched payload.
 pub fn resource_options_from_wire(
     wire: &iggy_binary_protocol::WireOptions,
     explicit: bool,
 ) -> Result<ResourceOptions, IggyError> {
-    let headers = user_headers_from_validated_slice(wire.as_bytes())?;
+    let headers = headers_from_validated_slice(wire.as_bytes(), UnknownKinds::Skip)?;
     Ok(headers
         .into_iter()
         .map(|(key, value)| (key, OptionValue { value, explicit }))
@@ -936,6 +967,15 @@ pub fn resource_options_to_wire(
     }
     let mut buf = BytesMut::with_capacity(size);
     for (key, option) in entries {
+        // A non-string key would encode a block the receiving peer refuses,
+        // making the resource permanently unreadable. It holds because every
+        // producer went through `validate_options`, not because `HeaderKey`
+        // guarantees it, so the invariant is asserted where it is relied on.
+        debug_assert_eq!(
+            key.kind(),
+            HeaderKind::String,
+            "option key must be a string"
+        );
         buf.put_u8(key.kind().as_code());
         #[allow(clippy::cast_possible_truncation)]
         buf.put_u32_le(key.as_bytes().len() as u32);
@@ -946,8 +986,9 @@ pub fn resource_options_to_wire(
         buf.put_slice(option.value.as_bytes());
     }
     // Structural validity holds by construction: entries come from valid
-    // `HeaderKey`s walked in `BTreeMap` order, so keys are string-kinded,
-    // sorted and unique. The caps above cover what construction cannot.
+    // `HeaderKey`s walked in `BTreeMap` order, so keys are sorted and unique,
+    // and the loop above asserts they are string-kinded. The caps cover what
+    // construction cannot.
     Ok(WireOptions::from_validated(buf.freeze()))
 }
 
@@ -1019,5 +1060,36 @@ mod tests {
         assert!(iggy_binary_protocol::validate_user_headers(&buf).is_ok());
         assert!(user_headers_from_validated_slice(&buf).is_err());
         assert!(user_headers_from_wire(&WireUserHeaders::from_slice(&buf).unwrap()).is_err());
+    }
+
+    fn put_option_entry(buf: &mut Vec<u8>, key: &str, value_kind: u8, value: &[u8]) {
+        buf.push(HeaderKind::String.as_code());
+        buf.extend_from_slice(&u32::try_from(key.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.push(value_kind);
+        buf.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+
+    #[test]
+    fn given_option_with_unknown_value_kind_when_decoded_should_skip_only_that_entry() {
+        // A newer peer's option value kind. The wire layer forwards it, so the
+        // domain decode has to drop the entry rather than fail the block: this
+        // decode runs on the apply path, where an error means one replica
+        // rejecting a commit another accepted.
+        let mut buf = Vec::new();
+        put_option_entry(&mut buf, "from_the_future", 200, b"opaque");
+        put_option_entry(
+            &mut buf,
+            "segment_size",
+            HeaderKind::String.as_code(),
+            b"1MB",
+        );
+        let wire = WireOptions::from_slice(&buf).expect("unknown value kinds stay wire-valid");
+
+        let options = resource_options_from_wire(&wire, true).unwrap();
+
+        assert_eq!(options.len(), 1);
+        assert!(options.contains_key(&HeaderKey::from_str("segment_size").unwrap()));
     }
 }

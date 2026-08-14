@@ -37,7 +37,7 @@ use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codec::{
-    WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le, read_u128_le,
+    WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le, read_u128_le,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -435,7 +435,7 @@ impl WireDecode for JoinConsumerGroupRequest {
         // corrupt/bit-rotted count (near u32::MAX) allocate gigabytes and abort
         // every backup that applies it.
         let mut in_flight =
-            Vec::with_capacity(capped_capacity(count, buf.len().saturating_sub(pos), 4));
+            Vec::with_capacity(bounded_capacity(count, buf.len().saturating_sub(pos), 4));
         for _ in 0..count {
             in_flight.push(read_u32_le(buf, pos)?);
             pos += 4;

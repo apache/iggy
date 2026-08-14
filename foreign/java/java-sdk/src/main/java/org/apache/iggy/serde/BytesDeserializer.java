@@ -31,6 +31,7 @@ import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.HeaderKey;
@@ -67,6 +68,7 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -80,8 +82,9 @@ public final class BytesDeserializer {
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
     private static final int MIN_CLUSTER_NODE_BYTES = 18;
-    // 50-byte fixed part + empty name + two u32 options-block length prefixes.
-    private static final int MIN_TOPIC_BYTES = 58;
+    // 50-byte fixed part + a one-character name (the server rejects an empty
+    // one) + two u32 options-block length prefixes.
+    private static final int MIN_TOPIC_BYTES = 59;
 
     private BytesDeserializer() {}
 
@@ -93,9 +96,9 @@ public final class BytesDeserializer {
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
-        skipOptionsBlock(response, "stream options");
+        var options = readOptionsBlock(response, "stream options");
 
-        return new StreamBase(streamId, createdAt, name, size.toString(), messagesCount, topicsCount);
+        return new StreamBase(streamId, createdAt, name, size.toString(), messagesCount, topicsCount, options);
     }
 
     public static StreamDetails readStreamDetails(ByteBuf response) {
@@ -145,8 +148,8 @@ public final class BytesDeserializer {
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
-        skipOptionsBlock(response, "topic explicit options");
-        skipOptionsBlock(response, "topic derived options");
+        var options = readOptionsBlock(response, "topic explicit options");
+        var derivedOptions = readOptionsBlock(response, "topic derived options");
         return new Topic(
                 topicId,
                 createdAt,
@@ -156,7 +159,9 @@ public final class BytesDeserializer {
                 CompressionAlgorithm.fromCode(compressionAlgorithmCode),
                 maxTopicSize,
                 messagesCount,
-                partitionsCount);
+                partitionsCount,
+                options,
+                derivedOptions);
     }
 
     public static ConsumerGroupDetails readConsumerGroupDetails(ByteBuf response) {
@@ -520,7 +525,9 @@ public final class BytesDeserializer {
         var usernameLength = response.readByte();
         var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8)
                 .toString();
-        skipOptionsBlock(response, "user options");
+        // Validated and dropped: users have no catalog keys yet, so the server
+        // refuses every one and the block is always empty.
+        readOptionsBlock(response, "user options");
         return new UserInfo(userId, createdAt, status, username);
     }
 
@@ -539,7 +546,14 @@ public final class BytesDeserializer {
         return new PersonalAccessTokenInfo(name, expiryOptional);
     }
 
-    private static void skipOptionsBlock(ByteBuf buffer, String field) {
+    /**
+     * Reads a {@code u32}-length-prefixed options block into its entries.
+     *
+     * <p>Keys are always UTF-8 strings; values keep the kind the server sent, so a kind this
+     * build has no name for is dropped rather than failing the whole response - the wire
+     * contract forwards unknown value kinds so a mixed-version cluster can round-trip them.
+     */
+    private static Map<String, HeaderValue> readOptionsBlock(ByteBuf buffer, String field) {
         if (buffer.readableBytes() < Integer.BYTES) {
             throw new IggyMalformedResponseException("Missing length prefix for " + field);
         }
@@ -548,7 +562,40 @@ public final class BytesDeserializer {
             throw new IggyMalformedResponseException("Length " + optionsLength + " for " + field
                     + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
         }
-        buffer.skipBytes(toInt(optionsLength));
+        if (optionsLength == 0) {
+            return Map.of();
+        }
+        ByteBuf options = buffer.readSlice(toInt(optionsLength));
+        Map<String, HeaderValue> entries = new LinkedHashMap<>();
+        while (options.isReadable()) {
+            if (options.readableBytes() < 1 + Integer.BYTES) {
+                throw new IggyMalformedResponseException("Truncated key header in " + field);
+            }
+            options.readUnsignedByte();
+            var keyLength = options.readUnsignedIntLE();
+            if (keyLength > options.readableBytes()) {
+                throw new IggyMalformedResponseException("Truncated key in " + field);
+            }
+            var key = options.readCharSequence(toInt(keyLength), StandardCharsets.UTF_8)
+                    .toString();
+
+            if (options.readableBytes() < 1 + Integer.BYTES) {
+                throw new IggyMalformedResponseException("Truncated value header for '" + key + "' in " + field);
+            }
+            var valueKindCode = options.readUnsignedByte();
+            var valueLength = options.readUnsignedIntLE();
+            if (valueLength > options.readableBytes()) {
+                throw new IggyMalformedResponseException("Truncated value for '" + key + "' in " + field);
+            }
+            byte[] value = newByteArray(valueLength);
+            options.readBytes(value);
+            try {
+                entries.put(key, new HeaderValue(HeaderKind.fromCode(valueKindCode), value));
+            } catch (IggyInvalidArgumentException unknownKind) {
+                // A newer peer's value kind: keep every other entry readable.
+            }
+        }
+        return entries;
     }
 
     private static String readU32PrefixedString(ByteBuf buffer, String field) {

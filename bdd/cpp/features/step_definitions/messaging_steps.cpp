@@ -78,7 +78,7 @@ WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0
 
     context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
                                   static_cast<std::uint32_t>(partitions_count),
-                                  std::string(compression.compression_algorithm_value()), 0,
+                                  std::string(compression.compression_algorithm_value()),
                                   std::string(message_expiry.expiry_kind()), message_expiry.expiry_value(),
                                   std::string(max_topic_size.max_topic_size()));
 }

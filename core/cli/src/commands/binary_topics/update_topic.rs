@@ -34,7 +34,6 @@ pub struct UpdateTopicCmd {
 }
 
 impl UpdateTopicCmd {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,

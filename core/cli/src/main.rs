@@ -77,7 +77,7 @@ use iggy_cli::commands::{
         create_stream::CreateStreamCmd, delete_stream::DeleteStreamCmd, get_stream::GetStreamCmd,
         get_streams::GetStreamsCmd, purge_stream::PurgeStreamCmd, update_stream::UpdateStreamCmd,
     },
-    binary_system::{me::GetMeCmd, ping::PingCmd, stats::GetStatsCmd},
+    binary_system::{me::GetMeCmd, options::DescribeOptionsCmd, ping::PingCmd, stats::GetStatsCmd},
     binary_topics::{
         create_topic::CreateTopicCmd, delete_topic::DeleteTopicCmd, get_topic::GetTopicCmd,
         get_topics::GetTopicsCmd, purge_topic::PurgeTopicCmd, update_topic::UpdateTopicCmd,
@@ -182,6 +182,7 @@ fn get_command(
         },
         Command::Ping(args) => Box::new(PingCmd::new(args.count)),
         Command::Me => Box::new(GetMeCmd::new()),
+        Command::Options(args) => Box::new(DescribeOptionsCmd::new(args.scope)),
         Command::Stats(args) => Box::new(GetStatsCmd::new(cli_options.quiet, args.output.into())),
         Command::Snapshot(args) => Box::new(GetSnapshotCmd::new(
             args.compression,

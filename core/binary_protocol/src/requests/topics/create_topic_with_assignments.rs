@@ -17,10 +17,10 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
-use crate::primitives::options::WireOptions;
+use crate::primitives::options::{WireOptions, decode_options_prefixed};
 use crate::primitives::partition_assignment::CreatedPartitionAssignment;
 use crate::requests::topics::CreateTopicRequest;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 fn usize_to_u32(value: usize, context: &str) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| panic!("{context} exceeds u32"))
@@ -77,8 +77,19 @@ impl WireEncode for CreateTopicWithAssignmentsRequest {
 impl WireDecode for CreateTopicWithAssignmentsRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let request_size = read_u32_le(buf, 0)? as usize;
-        let request_start = 4;
-        let request_end = request_start + request_size;
+        let request_start: usize = 4;
+        // `checked_add`: on a 32-bit target a wire-supplied length wraps, the
+        // truncation guard below then passes, and the slice panics instead.
+        // This decode runs on journal replay, so that panic would take a
+        // replica down rather than fail one client request.
+        let request_end =
+            request_start
+                .checked_add(request_size)
+                .ok_or_else(|| WireError::UnexpectedEof {
+                    offset: request_start,
+                    need: request_size,
+                    have: buf.len().saturating_sub(request_start),
+                })?;
         if buf.len() < request_end {
             return Err(WireError::UnexpectedEof {
                 offset: request_start,
@@ -89,18 +100,8 @@ impl WireDecode for CreateTopicWithAssignmentsRequest {
 
         let request = CreateTopicRequest::decode_from(&buf[request_start..request_end])?;
 
-        let derived_size = read_u32_le(buf, request_end)? as usize;
-        let derived_start = request_end + 4;
-        let derived_end = derived_start + derived_size;
-        if buf.len() < derived_end {
-            return Err(WireError::UnexpectedEof {
-                offset: derived_start,
-                need: derived_size,
-                have: buf.len().saturating_sub(derived_start),
-            });
-        }
-        let derived_options =
-            WireOptions::from_bytes(Bytes::copy_from_slice(&buf[derived_start..derived_end]))?;
+        let (derived_options, derived_consumed) = decode_options_prefixed(buf, request_end)?;
+        let derived_end = request_end + derived_consumed;
 
         let partitions_count = read_u32_le(buf, derived_end)? as usize;
         let mut offset = derived_end + 4;

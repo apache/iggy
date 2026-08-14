@@ -21,6 +21,33 @@
 //! message user headers. The map MUST stay a `BTreeMap`: metadata snapshots
 //! require deterministic ordering across replicas, and a hash map would make
 //! snapshot bytes diverge per replica.
+//!
+//! # SDK parity
+//!
+//! One feature, and the SDKs are at different points on it. What each can do
+//! today, so a gap is a known gap rather than a surprise:
+//!
+//! | SDK    | Set typed keys | Set arbitrary keys | Read the blocks | `describe_options` |
+//! |--------|----------------|--------------------|-----------------|--------------------|
+//! | Rust   | all            | yes (`raw`)        | yes             | yes                |
+//! | Node   | all            | yes                | yes             | yes                |
+//! | Python | all            | yes (string dict)  | no              | no                 |
+//! | Go     | 3 legacy       | no                 | yes             | no                 |
+//! | C#     | 3 legacy       | no                 | yes (TCP)       | yes (TCP)          |
+//! | Java   | 3 legacy       | no                 | yes             | no                 |
+//! | C++    | 3 legacy       | no                 | no              | no                 |
+//!
+//! "3 legacy" is `compression_algorithm`, `message_expiry` and `max_topic_size`,
+//! the three that used to be fixed fields of `CreateTopic`. Every SDK can
+//! therefore express what it could before this feature; what a lagging one
+//! cannot yet do is reach the partition runtime knobs or a key added to the
+//! server catalog after it shipped.
+//!
+//! The write side is what to close next, and it is one change per SDK: accept a
+//! string map alongside the typed arguments and encode it into the block the
+//! same way. The block's byte layout is pinned by a golden vector that Rust,
+//! Node, Go and Java each assert independently, so a new encoder has a fixture
+//! to match rather than a description to interpret.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -96,11 +123,25 @@ pub type ResourceOptions = BTreeMap<HeaderKey, OptionValue>;
 /// carrying options goes through here instead, rendering the key as its plain
 /// text. Binary transports are unaffected: they never touch serde.
 pub mod resource_options_json {
-    use super::{HeaderKey, OptionValue, ResourceOptions};
+    use super::{HeaderKey, HeaderValue, OptionValue, ResourceOptions};
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::BTreeMap;
     use std::str::FromStr;
+
+    /// One entry's JSON form: the value in the same string form a config file
+    /// or a `POST` body would carry it in, plus its provenance.
+    ///
+    /// The stored value is a typed [`HeaderValue`], and serializing that gives
+    /// `{"kind":"uint64","value":"<base64>"}` - which no operator can read and
+    /// no client can feed back, since the create body takes options as a plain
+    /// string map. Rendering the string form makes the "re-send only the
+    /// explicit options" round trip actually expressible over HTTP.
+    #[derive(Serialize, Deserialize)]
+    struct OptionValueJson {
+        value: String,
+        explicit: bool,
+    }
 
     /// # Errors
     ///
@@ -109,26 +150,41 @@ pub mod resource_options_json {
         options: &ResourceOptions,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let readable: BTreeMap<String, &OptionValue> = options
+        let readable: BTreeMap<String, OptionValueJson> = options
             .iter()
-            .map(|(key, value)| (String::from_utf8_lossy(key.as_bytes()).into_owned(), value))
+            .map(|(key, option)| {
+                (
+                    String::from_utf8_lossy(key.as_bytes()).into_owned(),
+                    OptionValueJson {
+                        value: option.value.to_string_value(),
+                        explicit: option.explicit,
+                    },
+                )
+            })
             .collect();
         readable.serialize(serializer)
     }
 
     /// # Errors
     ///
-    /// Returns a deserializer error when a key is not a valid option name.
+    /// Returns a deserializer error when a key is not a valid option name or a
+    /// value does not fit a header value.
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<ResourceOptions, D::Error> {
-        let readable = BTreeMap::<String, OptionValue>::deserialize(deserializer)?;
+        let readable = BTreeMap::<String, OptionValueJson>::deserialize(deserializer)?;
         readable
             .into_iter()
-            .map(|(key, value)| {
-                HeaderKey::from_str(&key)
-                    .map(|key| (key, value))
-                    .map_err(D::Error::custom)
+            .map(|(key, option)| {
+                let key = HeaderKey::from_str(&key).map_err(D::Error::custom)?;
+                let value = HeaderValue::from_str(&option.value).map_err(D::Error::custom)?;
+                Ok((
+                    key,
+                    OptionValue {
+                        value,
+                        explicit: option.explicit,
+                    },
+                ))
             })
             .collect()
     }
@@ -215,11 +271,72 @@ impl Default for TopicRuntimeDefaults {
     }
 }
 
+/// Ceiling for `size_of_messages_required_to_save`.
+///
+/// A threshold above the largest a segment may be can never trip, so every
+/// committed message would sit in the journal until its segment rotates, and a
+/// crash does not preserve the journal. These two thresholds used to be
+/// operator-only config; anyone holding `create_topic` can set them now, so the
+/// ceilings are enforced at admission. Mirrors
+/// `configs::validators::SEGMENT_MAX_SIZE_BYTES`, which lives in the crate that
+/// depends on this one.
+pub const MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024 * 1024;
+
+/// Ceiling for `messages_required_to_save`, derived from the byte ceiling: a
+/// segment that large cannot hold more messages than this, because a message
+/// costs at least its header on disk.
+pub const MAX_MESSAGES_REQUIRED_TO_SAVE: u32 = 16 * 1024 * 1024;
+
 /// Smallest per-topic segment size. Segments far below the shipped default
 /// explode the per-partition segment count, which state transfer bounds via
 /// its manifest entry cap; a partition that crosses it becomes unservable
 /// for transfer, so the floor is enforced at admission.
 pub const MIN_TOPIC_SEGMENT_SIZE: u64 = 1024 * 1024;
+
+/// Largest per-topic `segment_size` a node admits.
+///
+/// The ceiling used to be computed per node as the smaller of the global
+/// segment maximum and `transfer_artifact_bytes_max - max_message_size` (a
+/// received segment artifact can be one whole batch past the cap, and an
+/// artifact ceiling below that livelocks a partition's rejoin). Config
+/// validation now refuses boot unless that subtraction is at least the segment
+/// maximum, so the minimum is always the maximum and the per-node expression was
+/// dead. Mirrors `configs::validators::SEGMENT_MAX_SIZE_BYTES`, which lives in
+/// the crate that depends on this one and pins the two together in a test.
+pub const MAX_TOPIC_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
+
+/// Ceiling on what one `preallocate_segments` topic may reserve when created:
+/// `segment_size * partitions_count`.
+///
+/// The reservation runs inline on the shard thread - once per partition as
+/// segments rotate, and again for every owned partition at boot - and
+/// `FALLOC_FL_KEEP_SIZE` makes it real disk rather than a sparse hole. Without a
+/// cap, one create at the 1 GiB default segment size and the maximum partition
+/// count reserves a terabyte before a single message arrives.
+pub const MAX_PREALLOCATED_TOPIC_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Validate what a preallocating topic would reserve at admission.
+///
+/// `segment_size_bytes` is the topic's resolved segment size. Callers skip this
+/// for a topic whose effective `preallocate_segments` is false: nothing is
+/// reserved up front there, so the product does not bound anything.
+///
+/// # Errors
+///
+/// Returns `IggyError::InvalidOptionValue("preallocate_segments")` when the
+/// reservation would exceed [`MAX_PREALLOCATED_TOPIC_BYTES`].
+pub fn validate_preallocated_topic_bytes(
+    segment_size_bytes: u64,
+    partitions_count: u32,
+) -> Result<(), IggyError> {
+    let reserved = segment_size_bytes.saturating_mul(u64::from(partitions_count));
+    if reserved > MAX_PREALLOCATED_TOPIC_BYTES {
+        return Err(IggyError::InvalidOptionValue(
+            topic_option_keys::PREALLOCATE_SEGMENTS.to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Validate an explicit per-topic `segment_size` against its bounds.
 ///
@@ -305,11 +422,15 @@ impl FromStr for OptionsScope {
 pub struct OptionSpec {
     /// Option key accepted by the create command.
     pub key: String,
-    /// Canonical kind the server persists the value under. A `String` value
-    /// parsed via the server-config rules is always accepted too.
+    /// Kind the server encodes this key's own default under, and the kind a
+    /// client should prefer. Not a promise about what ends up stored: an
+    /// explicit entry is persisted and echoed back with the kind the client
+    /// sent it as, and a `String` value parsed through the server-config rules
+    /// stays a `String` in the map - which is what every CLI `--set` produces.
     pub kind: HeaderKind,
-    /// This node's current resolved default in the canonical kind's
-    /// encoding; empty when the key has no server default.
+    /// The key's default in `kind`'s encoding; empty when the key has no
+    /// default. A build constant rather than a per-node value: these defaults
+    /// stopped being config-derived when the `[system.*]` keys became options.
     #[serde(default)]
     pub default_value: Vec<u8>,
     /// Human-readable description.
@@ -363,7 +484,13 @@ pub const UPDATABLE_STREAM_OPTION_KEYS: &[&str] = &[];
 pub const UPDATABLE_USER_OPTION_KEYS: &[&str] = &[];
 
 /// Longest key echoed back in an option error. A rejected key is attacker-sized
-/// by definition, and the error rides the wire back to the client.
+/// by definition, and over HTTP the error text rides the response body back to
+/// the client.
+///
+/// Binary transports carry only the error code, so a TCP, QUIC or WebSocket
+/// client rebuilds [`IggyError::UnsupportedOptionKey`] with an empty string and
+/// never sees which key was refused. `DescribeOptions` is the discovery path
+/// there - see the note on that variant.
 const ERROR_KEY_PREVIEW_LEN: usize = 64;
 
 fn key_preview(key: &str) -> String {
@@ -609,7 +736,7 @@ impl TopicCreateOptions {
         for entry in options {
             // Wire validation already enforced UTF-8 string keys.
             let key = String::from_utf8_lossy(entry.key);
-            parsed.absorb(&entry, &key, UnknownEntry::Reject)?;
+            parsed.absorb_strict(&entry, &key)?;
         }
         Ok(parsed)
     }
@@ -627,34 +754,21 @@ impl TopicCreateOptions {
         let mut parsed = Self::default();
         for entry in options {
             let key = String::from_utf8_lossy(entry.key);
-            // Infallible: `Skip` turns every parse error into a no-op.
-            let _ = parsed.absorb(&entry, &key, UnknownEntry::Skip);
+            // Discarding the error is the skip: see `absorb_strict`.
+            let _ = parsed.absorb_strict(&entry, &key);
         }
         parsed
     }
 
-    /// Fold one catalog entry into `self`, applying `unknown` to an entry this
-    /// build cannot interpret. Shared by [`Self::parse`] (wire block) and
-    /// [`Self::from_resource_options`] (persisted map) so both read the
-    /// identical key set, kinds, and value bounds, and differ only in what
-    /// they do with an entry outside it.
-    fn absorb(
-        &mut self,
-        entry: &WireUserHeaderEntry<'_>,
-        key: &str,
-        unknown: UnknownEntry,
-    ) -> Result<(), IggyError> {
-        // Every arm assigns only after its parse succeeds, so a skipped entry
-        // leaves `self` exactly as it found it.
-        match self.absorb_strict(entry, key) {
-            Ok(()) => Ok(()),
-            Err(error) => match unknown {
-                UnknownEntry::Reject => Err(error),
-                UnknownEntry::Skip => Ok(()),
-            },
-        }
-    }
-
+    /// Fold one catalog entry into `self`, refusing an entry this build cannot
+    /// interpret: a key outside [`TOPIC_OPTION_KEYS`], or a catalog key whose
+    /// value kind or payload does not parse. Shared by [`Self::parse`] (wire
+    /// block) and [`Self::from_resource_options`] (persisted map) so both read
+    /// the identical key set, kinds and value bounds.
+    ///
+    /// Every arm assigns only after its own parse succeeds, which is what makes
+    /// discarding the error a safe skip: a refused entry leaves `self` exactly
+    /// as it found it.
     fn absorb_strict(
         &mut self,
         entry: &WireUserHeaderEntry<'_>,
@@ -685,13 +799,16 @@ impl TopicCreateOptions {
                 }
                 topic_option_keys::MESSAGES_REQUIRED_TO_SAVE => {
                     let messages = parse_u32(entry, key)?;
-                    if messages == 0 {
+                    if messages == 0 || messages > MAX_MESSAGES_REQUIRED_TO_SAVE {
                         return Err(IggyError::InvalidOptionValue(key.to_string()));
                     }
                     parsed.messages_required_to_save = Some(messages);
                 }
                 topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE => {
                     let size = parse_byte_size(entry, key)?;
+                    if size > MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE {
+                        return Err(IggyError::InvalidOptionValue(key.to_string()));
+                    }
                     parsed.size_of_messages_required_to_save =
                         (size != 0).then_some(IggyByteSize::from(size));
                 }
@@ -704,8 +821,48 @@ impl TopicCreateOptions {
         Ok(())
     }
 
+    /// Field-wise overlay: every key this block sets wins, the rest fall back
+    /// to `defaults`.
+    ///
+    /// Apply resolves the client block over the derived one this way. `raw` is
+    /// dropped: by the time a block reaches apply, every key it named has
+    /// already been parsed into a typed field or refused by admission.
+    #[must_use]
+    pub fn resolved_over(&self, defaults: &Self) -> Self {
+        Self {
+            partitions_count: self.partitions_count.or(defaults.partitions_count),
+            compression_algorithm: self
+                .compression_algorithm
+                .or(defaults.compression_algorithm),
+            message_expiry: self.message_expiry.or(defaults.message_expiry),
+            max_topic_size: self.max_topic_size.or(defaults.max_topic_size),
+            segment_size: self.segment_size.or(defaults.segment_size),
+            enforce_fsync: self.enforce_fsync.or(defaults.enforce_fsync),
+            messages_required_to_save: self
+                .messages_required_to_save
+                .or(defaults.messages_required_to_save),
+            size_of_messages_required_to_save: self
+                .size_of_messages_required_to_save
+                .or(defaults.size_of_messages_required_to_save),
+            preallocate_segments: self.preallocate_segments.or(defaults.preallocate_segments),
+            raw: BTreeMap::new(),
+        }
+    }
+
     /// Encode the present keys into a client options block, in canonical
     /// kinds. The client-side counterpart of [`Self::parse`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::to_option_map`].
+    pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
+        crate::wire_conversions::resource_options_to_wire(
+            &self.to_option_map()?,
+            OptionsProvenance::All,
+        )
+    }
+
+    /// The present keys as a canonically-kinded option map.
     ///
     /// A typed field is inserted after the raw entries, so it wins on
     /// collision and keeps its canonical kind.
@@ -713,7 +870,7 @@ impl TopicCreateOptions {
     /// # Errors
     ///
     /// See [`raw_options_map`].
-    pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
+    pub fn to_option_map(&self) -> Result<ResourceOptions, IggyError> {
         let mut options = raw_options_map(&self.raw)?;
         if let Some(compression_algorithm) = self.compression_algorithm {
             options.insert(
@@ -774,7 +931,7 @@ impl TopicCreateOptions {
                 OptionValue::explicit(HeaderValue::from(preallocate_segments)),
             );
         }
-        crate::wire_conversions::resource_options_to_wire(&options, OptionsProvenance::All)
+        Ok(options)
     }
 
     /// Render the present keys as string key-values, for a transport that
@@ -932,25 +1089,11 @@ impl TopicCreateOptions {
                 value_kind: iggy_binary_protocol::WireHeaderKind(option.value.kind().as_code()),
                 value: option.value.as_bytes(),
             };
-            // Infallible: `Skip` turns every parse error into a no-op.
-            let _ = parsed.absorb(&entry, &key, UnknownEntry::Skip);
+            // Discarding the error is the skip: see `absorb_strict`.
+            let _ = parsed.absorb_strict(&entry, &key);
         }
         parsed
     }
-}
-
-/// What a parse does with an entry this build cannot interpret: a key outside
-/// [`TOPIC_OPTION_KEYS`], or a catalog key whose value kind or payload does
-/// not parse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnknownEntry {
-    /// Refuse the block. Used at admission, where the client is present to be
-    /// told which key it got wrong, and where the catalog gate belongs.
-    Reject,
-    /// Leave the knob unset and keep going. Used when reading state a newer
-    /// build wrote, where refusing would diverge this replica from the group
-    /// over a key it merely cannot read.
-    Skip,
 }
 
 fn parse_u32(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u32, IggyError> {
@@ -1093,11 +1236,13 @@ mod tests {
     }
 
     #[test]
-    fn resource_options_round_trip_through_json_with_string_keys() {
+    fn resource_options_render_as_readable_json_and_round_trip() {
         // `HeaderKey` serializes as a struct, and JSON object keys must be
         // strings, so the derived impl fails with "key must be a string" for
         // any non-empty map -- which 500'd every HTTP response carrying
-        // options. Keys must render as their plain text.
+        // options. Keys must render as their plain text, and values in the
+        // string form the create body takes them in: a base64 payload behind a
+        // kind tag is neither readable nor re-sendable.
         #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
         struct Holder {
             #[serde(default, with = "super::resource_options_json")]
@@ -1115,8 +1260,30 @@ mod tests {
             json.contains("\"segment_size\""),
             "the key must render as plain text, got: {json}"
         );
+        assert!(
+            json.contains("\"value\":\"1048576\""),
+            "the value must render as its string form, got: {json}"
+        );
+
         let decoded: Holder = serde_json::from_str(&json).expect("options must round-trip");
-        assert_eq!(decoded, holder);
+        let (key, option) = decoded.options.iter().next().unwrap();
+        assert_eq!(key.as_bytes(), topic_option_keys::SEGMENT_SIZE.as_bytes());
+        assert!(!option.explicit, "provenance survives the round trip");
+        // Re-read as a string-kinded value, which is exactly what the create
+        // body's string map produces, so the server parses it the same way.
+        assert_eq!(option.value.kind(), HeaderKind::String);
+        assert_eq!(option.value.as_bytes(), b"1048576");
+        assert!(
+            TopicCreateOptions::parse(
+                &crate::wire_conversions::resource_options_to_wire(
+                    &decoded.options,
+                    OptionsProvenance::All
+                )
+                .unwrap()
+            )
+            .is_ok(),
+            "the rendered value must parse back through the catalog"
+        );
     }
 
     #[test]
@@ -1291,5 +1458,68 @@ mod tests {
                 <= iggy_binary_protocol::MAX_OPTIONS_BYTES,
             "MAX_OPTIONS entries must fit in MAX_OPTIONS_BYTES"
         );
+    }
+
+    #[test]
+    fn flush_threshold_ceilings_are_derived_from_the_segment_maximum() {
+        // A threshold no segment can reach never trips, so committed messages
+        // sit in the journal - which a crash does not preserve - until the
+        // segment rotates. The message ceiling follows from the byte one: a
+        // message costs at least its header on disk.
+        assert_eq!(
+            MAX_MESSAGES_REQUIRED_TO_SAVE as u64,
+            MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
+                / crate::IGGY_MESSAGE_HEADER_SIZE
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            "message ceiling must stay derived from the byte ceiling"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_flush_thresholds_above_their_ceilings() {
+        let over_messages = TopicCreateOptions {
+            raw: BTreeMap::from([(
+                topic_option_keys::MESSAGES_REQUIRED_TO_SAVE.to_string(),
+                (u64::from(MAX_MESSAGES_REQUIRED_TO_SAVE) + 1).to_string(),
+            )]),
+            ..TopicCreateOptions::default()
+        };
+        assert!(
+            TopicCreateOptions::parse(&over_messages.to_wire().unwrap()).is_err(),
+            "a message threshold above the ceiling must be refused"
+        );
+
+        let over_bytes = TopicCreateOptions {
+            raw: BTreeMap::from([(
+                topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE.to_string(),
+                (MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE + 1).to_string(),
+            )]),
+            ..TopicCreateOptions::default()
+        };
+        assert!(
+            TopicCreateOptions::parse(&over_bytes.to_wire().unwrap()).is_err(),
+            "a byte threshold above the ceiling must be refused"
+        );
+
+        let at_ceiling = TopicCreateOptions {
+            messages_required_to_save: Some(MAX_MESSAGES_REQUIRED_TO_SAVE),
+            size_of_messages_required_to_save: Some(IggyByteSize::from(
+                MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            )),
+            ..TopicCreateOptions::default()
+        };
+        assert!(
+            TopicCreateOptions::parse(&at_ceiling.to_wire().unwrap()).is_ok(),
+            "the ceiling itself must remain settable"
+        );
+    }
+
+    #[test]
+    fn preallocation_cap_bounds_segment_size_times_partitions() {
+        assert!(validate_preallocated_topic_bytes(DEFAULT_SEGMENT_SIZE, 64).is_ok());
+        assert!(validate_preallocated_topic_bytes(DEFAULT_SEGMENT_SIZE, 65).is_err());
+        // The product saturates rather than wrapping into a passing value.
+        assert!(validate_preallocated_topic_bytes(u64::MAX, u32::MAX).is_err());
     }
 }

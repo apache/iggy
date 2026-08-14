@@ -424,6 +424,47 @@ mod tests {
         assert_eq!(decoded, options);
     }
 
+    /// The cross-SDK golden vector for an options block.
+    ///
+    /// Every SDK writes this block from its own encoder, so "it round-trips
+    /// through my own decoder" proves nothing about interoperability. The bytes
+    /// here are the contract: `foreign/{node,go,java}` pin the identical vector
+    /// in their own unit tests, and a change to the TLV layout has to break all
+    /// of them together instead of leaving one SDK talking to itself.
+    ///
+    /// `enforce_fsync=true` (a `Bool`) and `segment_size=1 GiB` (a `Uint64`)
+    /// cover both a one-byte and an eight-byte value, in the sorted key order
+    /// every encoder has to produce.
+    const GOLDEN_OPTIONS_BLOCK: &[u8] = &[
+        2, 13, 0, 0, 0, // key kind String, length 13
+        b'e', b'n', b'f', b'o', b'r', b'c', b'e', b'_', b'f', b's', b'y', b'n', b'c', 3, 1, 0, 0,
+        0, 1, // value kind Bool, length 1, true
+        2, 12, 0, 0, 0, // key kind String, length 12
+        b's', b'e', b'g', b'm', b'e', b'n', b't', b'_', b's', b'i', b'z', b'e', 12, 8, 0, 0,
+        0, // value kind Uint64, length 8
+        0, 0, 0, 64, 0, 0, 0, 0, // 1 GiB little-endian
+    ];
+
+    #[test]
+    fn golden_options_block_is_byte_stable() {
+        let encoded = encode(&[
+            (STRING, b"enforce_fsync", 3, &[1]),
+            (
+                STRING,
+                b"segment_size",
+                UINT64,
+                &1_073_741_824u64.to_le_bytes(),
+            ),
+        ]);
+
+        assert_eq!(
+            &encoded[..],
+            GOLDEN_OPTIONS_BLOCK,
+            "the options TLV layout changed; update every SDK's copy of this vector"
+        );
+        assert_eq!(validate_options(GOLDEN_OPTIONS_BLOCK).unwrap(), 2);
+    }
+
     #[test]
     fn prefixed_truncation_errors() {
         let buf = encode(&[(STRING, b"key", STRING, b"value")]);

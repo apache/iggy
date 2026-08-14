@@ -156,6 +156,7 @@ impl IggyService {
             compression_algorithm,
             message_expiry,
             max_size,
+            options,
         }): Parameters<CreateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
@@ -180,6 +181,10 @@ impl IggyService {
                             .then_some(message_expiry),
                         max_topic_size: (max_size != MaxTopicSize::ServerDefault)
                             .then_some(max_size),
+                        // Raw keys ride as strings and are parsed server-side by
+                        // the same rules a config value goes through, so a key
+                        // added after this build shipped is still reachable.
+                        raw: options,
                         ..TopicCreateOptions::default()
                     },
                 )
@@ -197,20 +202,21 @@ impl IggyService {
             compression_algorithm,
             message_expiry,
             max_size,
+            options,
         }): Parameters<UpdateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
         // Absent means "leave alone" now, so an unparsable value must not
         // silently become a reset to the server default.
-        let options = TopicUpdateOptions {
+        let update_options = TopicUpdateOptions {
             compression_algorithm: compression_algorithm.and_then(|ca| ca.parse().ok()),
             message_expiry: message_expiry.and_then(|me| me.parse().ok()),
             max_topic_size: max_size.and_then(|ms| ms.parse().ok()),
-            ..TopicUpdateOptions::default()
+            raw: options,
         };
         request(
             self.client
-                .update_topic(&id(&stream_id)?, &id(&topic_id)?, &name, &options)
+                .update_topic(&id(&stream_id)?, &id(&topic_id)?, &name, &update_options)
                 .await,
         )
     }

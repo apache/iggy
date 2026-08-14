@@ -952,13 +952,19 @@ transfer_served_cache_bytes_max = "2176 MiB"
 
 # Alloc ceiling for ONE received state-transfer artifact, per shard. The
 # receiver holds it resident through verify, walk and staging write, and up to
-# four transfers run at once. MUST cover system.segment.size plus
-# message_bus.max_message_size (a segment may close one whole batch past its
-# cap): under that, a legal segment is refused, the whole manifest with it, and
-# the partition livelocks re-requesting it from every peer. Boot validates the
-# floor. Raising this above the floor for headroom also DIVIDES the serving
-# concurrency derived from transfer_served_cache_bytes_max above, so raise that
-# in step. Must be > 0 and <= "64 GiB".
+# four transfers run at once. MUST cover the largest segment any topic may be
+# created with (a fixed 1 GiB, since segment_size is a per-topic option now)
+# plus message_bus.max_message_size, because a segment may close one whole batch
+# past its cap: under that, a legal segment is refused, the whole manifest with
+# it, and the partition livelocks re-requesting it from every peer. Boot
+# validates the floor.
+#
+# The shipped value sits EXACTLY at that floor: 1024 MiB + the shipped 64 MiB
+# max_message_size. Raising max_message_size alone therefore refuses boot --
+# raise this one by the same amount in the same edit. Raising it above the floor
+# for headroom also DIVIDES the serving concurrency derived from
+# transfer_served_cache_bytes_max above, so raise that in step. Must be > 0 and
+# <= "64 GiB".
 transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.

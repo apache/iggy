@@ -54,7 +54,7 @@ pub struct TopicHeader {
 }
 
 impl TopicHeader {
-    const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1; // 50
+    pub(crate) const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1; // 50
 }
 
 impl WireEncode for TopicHeader {
