@@ -44,11 +44,11 @@ async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            4,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(4),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
