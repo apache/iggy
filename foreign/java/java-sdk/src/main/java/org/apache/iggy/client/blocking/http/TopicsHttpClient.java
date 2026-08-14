@@ -116,6 +116,19 @@ class TopicsHttpClient implements TopicsClient {
         return rendered;
     }
 
+    private static Map<String, HeaderValue> optionsOf(Map<String, HttpOptionValue> options, boolean explicit) {
+        if (options == null) {
+            return Map.of();
+        }
+        Map<String, HeaderValue> selected = new LinkedHashMap<>();
+        options.forEach((key, option) -> {
+            if (option.explicit() == explicit) {
+                selected.put(key, HeaderValue.fromString(option.value()));
+            }
+        });
+        return Map.copyOf(selected);
+    }
+
     record CreateTopic(
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
@@ -203,18 +216,5 @@ class TopicsHttpClient implements TopicsClient {
                     optionsOf(options, true),
                     optionsOf(options, false));
         }
-    }
-
-    private static Map<String, HeaderValue> optionsOf(Map<String, HttpOptionValue> options, boolean explicit) {
-        if (options == null) {
-            return Map.of();
-        }
-        Map<String, HeaderValue> selected = new LinkedHashMap<>();
-        options.forEach((key, option) -> {
-            if (option.explicit() == explicit) {
-                selected.put(key, HeaderValue.fromString(option.value()));
-            }
-        });
-        return Map.copyOf(selected);
     }
 }

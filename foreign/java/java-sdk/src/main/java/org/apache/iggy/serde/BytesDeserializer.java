@@ -599,37 +599,45 @@ public final class BytesDeserializer {
         if (optionsLength == 0) {
             return Map.of();
         }
+
         ByteBuf options = buffer.readSlice(toInt(optionsLength));
         Map<String, HeaderValue> entries = new LinkedHashMap<>();
         while (options.isReadable()) {
-            if (options.readableBytes() < 1 + Integer.BYTES) {
-                throw new IggyMalformedResponseException("Truncated key header in " + field);
-            }
-            options.readUnsignedByte();
-            var keyLength = options.readUnsignedIntLE();
-            if (keyLength > options.readableBytes()) {
-                throw new IggyMalformedResponseException("Truncated key in " + field);
-            }
-            var key = options.readCharSequence(toInt(keyLength), StandardCharsets.UTF_8)
-                    .toString();
-
-            if (options.readableBytes() < 1 + Integer.BYTES) {
-                throw new IggyMalformedResponseException("Truncated value header for '" + key + "' in " + field);
-            }
-            var valueKindCode = options.readUnsignedByte();
-            var valueLength = options.readUnsignedIntLE();
-            if (valueLength > options.readableBytes()) {
-                throw new IggyMalformedResponseException("Truncated value for '" + key + "' in " + field);
-            }
-            byte[] value = newByteArray(valueLength);
-            options.readBytes(value);
-            try {
-                entries.put(key, new HeaderValue(HeaderKind.fromCode(valueKindCode), value));
-            } catch (IggyInvalidArgumentException unknownKind) {
-                // A newer peer's value kind: keep every other entry readable.
-            }
+            readOptionEntry(options, field, entries);
         }
         return entries;
+    }
+
+    private static void readOptionEntry(ByteBuf options, String field, Map<String, HeaderValue> entries) {
+        // The key kind is read and dropped: wire validation already enforces that
+        // every option key is a UTF-8 string.
+        readOptionFieldKind(options, field, "key");
+        var key = new String(readOptionFieldValue(options, field, "key"), StandardCharsets.UTF_8);
+
+        var valueKindCode = readOptionFieldKind(options, field, "value for '" + key + "'");
+        byte[] value = readOptionFieldValue(options, field, "value for '" + key + "'");
+        try {
+            entries.put(key, new HeaderValue(HeaderKind.fromCode(valueKindCode), value));
+        } catch (IggyInvalidArgumentException unknownKind) {
+            // A newer peer's value kind: keep every other entry readable.
+        }
+    }
+
+    private static short readOptionFieldKind(ByteBuf options, String field, String what) {
+        if (options.readableBytes() < 1 + Integer.BYTES) {
+            throw new IggyMalformedResponseException("Truncated " + what + " header in " + field);
+        }
+        return options.readUnsignedByte();
+    }
+
+    private static byte[] readOptionFieldValue(ByteBuf options, String field, String what) {
+        var length = options.readUnsignedIntLE();
+        if (length > options.readableBytes()) {
+            throw new IggyMalformedResponseException("Truncated " + what + " in " + field);
+        }
+        byte[] value = newByteArray(length);
+        options.readBytes(value);
+        return value;
     }
 
     private static byte[] readU32PrefixedBytes(ByteBuf buffer, String field) {

@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import IggyClient, IggyExpiry, MaxTopicSize, SendMessage
+from apache_iggy import HeaderValue, IggyClient, IggyExpiry, MaxTopicSize, SendMessage
 
 from .utils import (
     get_server_config,
@@ -1412,8 +1412,11 @@ class TestTopicOptions:
         assert "enforce_fsync" in by_key
         segment_size = by_key["segment_size"]
         assert segment_size.kind == "uint64"
-        # The default is the same HeaderValue type message headers carry.
-        assert segment_size.default_value.value == 1024 * 1024 * 1024
+        # The default is the same HeaderValue type message headers carry, so it
+        # arrives as the variant matching the key's kind.
+        default = segment_size.default_value
+        assert isinstance(default, HeaderValue.UnsignedInt64)
+        assert default.value == 1024 * 1024 * 1024
         assert segment_size.description
 
         # Streams and users have no catalog keys yet.

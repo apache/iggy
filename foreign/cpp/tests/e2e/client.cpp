@@ -409,8 +409,8 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
     bool removed                         = false;
     do {
         const auto clients = second_client->get_clients();
-        removed = std::none_of(clients.begin(), clients.end(),
-                               [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
         if (removed) {
             break;
         }
@@ -436,8 +436,8 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
     bool removed                         = false;
     do {
         const auto clients = second_client->get_clients();
-        removed = std::none_of(clients.begin(), clients.end(),
-                               [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
         if (removed) {
             break;
         }
@@ -465,8 +465,8 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsLoggedOutSessionAsUnauthenticated) 
     bool removed                         = false;
     do {
         const auto clients = second_client->get_clients();
-        removed = std::none_of(clients.begin(), clients.end(),
-                               [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
         if (removed) {
             break;
         }
