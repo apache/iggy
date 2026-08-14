@@ -30,6 +30,7 @@ use iggy_connector_sdk::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     str::FromStr,
     sync::{Arc, LazyLock, atomic::Ordering},
     time::Instant,
@@ -50,6 +51,8 @@ use crate::{
 use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
 use tokio::task::JoinHandle;
+
+const MAX_FAILED_TAIL_RETRIES: u32 = 3;
 
 pub(crate) struct SourceSenderEntry {
     pub(crate) sender: Sender<ProducedBatch>,
@@ -447,7 +450,7 @@ pub(crate) async fn source_forwarding_loop(
             .observe_stage_with_labels(&labels.stage_decode, decode_elapsed);
 
         let prepare_start = Instant::now();
-        let iggy_messages = process_messages(
+        let processed = process_messages(
             plugin_id,
             &encoder,
             &topic_metadata,
@@ -460,10 +463,23 @@ pub(crate) async fn source_forwarding_loop(
         context
             .metrics
             .observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
-        let sent_count = iggy_messages.len();
+        let prepared_count = processed.messages.len();
+        let processing_errors = decode_errors + processed.error_count;
 
         let iggy_send_start = Instant::now();
-        let send_result = producer.send(iggy_messages).await;
+        let send_result = if processing_errors == 0 {
+            send_with_failed_tail_retries(processed.messages, plugin_id, |messages| {
+                producer.send(messages)
+            })
+            .await
+        } else {
+            Err(IggyError::Error)
+        };
+        let sent_count = if send_result.is_ok() {
+            prepared_count
+        } else {
+            0
+        };
         let iggy_send_elapsed = iggy_send_start.elapsed();
         context
             .metrics
@@ -473,11 +489,17 @@ pub(crate) async fn source_forwarding_loop(
         let mut state_save_us: Option<u64> = None;
         let mut batch_result = SourceBatchResult::Nack;
         if let Err(error) = send_result {
-            let error_msg = format!(
-                "Failed to send {sent_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
-                producer.stream(),
-                producer.topic(),
-            );
+            let error_msg = if processing_errors > 0 {
+                format!(
+                    "Rejected source batch {batch_id} after {processing_errors} decode or processing errors for source connector with ID: {plugin_id}"
+                )
+            } else {
+                format!(
+                    "Failed to send {prepared_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
+                    producer.stream(),
+                    producer.topic(),
+                )
+            };
             error!("{error_msg}");
             context.metrics.inc_errors_with_labels(&labels.counter);
             context.sources.set_error(&plugin_key, &error_msg).await;
@@ -533,14 +555,25 @@ pub(crate) async fn source_forwarding_loop(
             }
         }
 
-        let result_code = batch_result_callback(plugin_id, batch_id, batch_result as u8);
+        // The plugin applies its async batch-result hook before this FFI call returns.
+        let result_code = tokio::task::spawn_blocking(move || {
+            batch_result_callback(plugin_id, batch_id, batch_result as u8)
+        })
+        .await
+        .unwrap_or(-1);
         if result_code != 0 {
-            let error_msg = format!(
-                "Failed to deliver {batch_result:?} for source connector with ID: {plugin_id}, batch ID: {batch_id}. Plugin returned: {result_code}"
-            );
-            error!("{error_msg}");
-            context.metrics.inc_errors_with_labels(&labels.counter);
-            context.sources.set_error(&plugin_key, &error_msg).await;
+            if context.sources.is_stopping_or_stopped(&plugin_key).await {
+                trace!(
+                    "Source connector with ID: {plugin_id} stopped before {batch_result:?} could be delivered for batch ID: {batch_id}"
+                );
+            } else {
+                let error_msg = format!(
+                    "Failed to deliver {batch_result:?} for source connector with ID: {plugin_id}, batch ID: {batch_id}. Plugin returned: {result_code}"
+                );
+                error!("{error_msg}");
+                context.metrics.inc_errors_with_labels(&labels.counter);
+                context.sources.set_error(&plugin_key, &error_msg).await;
+            }
         }
 
         let total_elapsed = total_start.elapsed();
@@ -667,6 +700,11 @@ pub fn handle(
     handles
 }
 
+struct ProcessedMessages {
+    messages: Vec<IggyMessage>,
+    error_count: u64,
+}
+
 fn process_messages(
     id: u32,
     encoder: &Arc<dyn StreamEncoder>,
@@ -675,7 +713,7 @@ fn process_messages(
     transforms: &Vec<Arc<dyn Transform>>,
     metrics: &Arc<crate::metrics::Metrics>,
     labels: &SourceLabels,
-) -> Vec<IggyMessage> {
+) -> ProcessedMessages {
     let mut iggy_messages = Vec::with_capacity(messages.len());
     // Accumulate per-message drops, flush once after the loop - one Family
     // lookup instead of one per message under filter/error storms.
@@ -738,7 +776,64 @@ fn process_messages(
     if filtered_count > 0 {
         metrics.inc_messages_filtered_with_labels(&labels.counter, filtered_count);
     }
-    iggy_messages
+    ProcessedMessages {
+        messages: iggy_messages,
+        error_count,
+    }
+}
+
+async fn send_with_failed_tail_retries<F, Fut, T>(
+    mut messages: Vec<IggyMessage>,
+    plugin_id: u32,
+    mut send: F,
+) -> Result<(), IggyError>
+where
+    F: FnMut(Vec<IggyMessage>) -> Fut,
+    Fut: Future<Output = Result<T, IggyError>>,
+{
+    let mut retry = 0;
+    loop {
+        match send(messages).await {
+            Ok(_) => return Ok(()),
+            Err(IggyError::ProducerSendFailed {
+                cause,
+                failed,
+                committed,
+                stream_name,
+                topic_name,
+            }) => {
+                warn!(
+                    "Source connector with ID: {plugin_id} send failed after {} chunks committed; {} messages remain",
+                    committed.len(),
+                    failed.len()
+                );
+                if retry >= MAX_FAILED_TAIL_RETRIES || failed.is_empty() {
+                    return Err(IggyError::ProducerSendFailed {
+                        cause,
+                        failed,
+                        committed,
+                        stream_name,
+                        topic_name,
+                    });
+                }
+
+                messages = match Arc::try_unwrap(failed) {
+                    Ok(messages) => messages,
+                    Err(failed) => {
+                        return Err(IggyError::ProducerSendFailed {
+                            cause,
+                            failed,
+                            committed,
+                            stream_name,
+                            topic_name,
+                        });
+                    }
+                };
+                retry += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(crate) extern "C" fn handle_produced_messages(
@@ -809,12 +904,31 @@ fn build_iggy_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::future::ready;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
 
     fn next_plugin_id() -> u32 {
         TEST_PLUGIN_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn test_message(marker: u8) -> IggyMessage {
+        IggyMessage::builder()
+            .payload(vec![marker].into())
+            .build()
+            .expect("test message should be valid")
+    }
+
+    fn failed_send(messages: Vec<IggyMessage>) -> IggyError {
+        IggyError::ProducerSendFailed {
+            cause: Box::new(IggyError::Error),
+            failed: Arc::new(messages),
+            committed: Arc::new(Vec::new()),
+            stream_name: "test-stream".to_string(),
+            topic_name: "test-topic".to_string(),
+        }
     }
 
     #[test]
@@ -896,5 +1010,85 @@ mod tests {
             handle_produced_messages(plugin_id, 1, serialized.as_ptr(), serialized.len()),
             -1
         );
+    }
+
+    #[test]
+    fn given_partially_committed_send_should_retry_only_failed_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = Vec::new();
+            let mut responses = VecDeque::from([
+                Err(failed_send(vec![test_message(2), test_message(3)])),
+                Ok(()),
+            ]);
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                31,
+                |messages| {
+                    attempts.push(
+                        messages
+                            .iter()
+                            .map(|message| message.payload[0])
+                            .collect::<Vec<_>>(),
+                    );
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+            )
+            .await;
+
+            assert!(result.is_ok());
+            assert_eq!(attempts, vec![vec![1, 2, 3], vec![2, 3]]);
+        });
+    }
+
+    #[test]
+    fn given_repeated_failed_tail_when_retries_are_exhausted_should_return_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = 0;
+            let mut responses = VecDeque::from(
+                (0..=MAX_FAILED_TAIL_RETRIES)
+                    .map(|_| Err::<(), _>(failed_send(vec![test_message(1)])))
+                    .collect::<Vec<_>>(),
+            );
+
+            let result = send_with_failed_tail_retries(vec![test_message(1)], 37, |_| {
+                attempts += 1;
+                ready(responses.pop_front().expect("send response should exist"))
+            })
+            .await;
+
+            assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
+            assert_eq!(attempts, MAX_FAILED_TAIL_RETRIES + 1);
+        });
+    }
+
+    #[test]
+    fn given_shared_failed_tail_when_retrying_should_return_original_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = Arc::new(vec![test_message(2)]);
+            let retained = Arc::clone(&failed);
+            let mut response = Some(Err::<(), _>(IggyError::ProducerSendFailed {
+                cause: Box::new(IggyError::Error),
+                failed,
+                committed: Arc::new(Vec::new()),
+                stream_name: "test-stream".to_string(),
+                topic_name: "test-topic".to_string(),
+            }));
+            let mut attempts = 0;
+
+            let result =
+                send_with_failed_tail_retries(vec![test_message(1), test_message(2)], 41, |_| {
+                    attempts += 1;
+                    ready(response.take().expect("send response should exist"))
+                })
+                .await;
+
+            assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
+            assert_eq!(attempts, 1);
+            assert_eq!(retained.len(), 1);
+        });
     }
 }

@@ -117,7 +117,8 @@ pub trait Source: Send + Sync {
     /// in [`Source::poll`] and apply them only after receiving [`source::SourceBatchResult::Ack`].
     /// A [`source::SourceBatchResult::Nack`] means the staged changes must be discarded so the
     /// batch can be polled again. The SDK allows only one batch to be in flight at a time and
-    /// stops polling if this method returns an error.
+    /// stops polling if this method returns an error. The default no-op is suitable only for
+    /// sources that have no staged cursor changes or destructive work.
     async fn on_batch_result(&self, _result: source::SourceBatchResult) -> Result<(), Error> {
         Ok(())
     }

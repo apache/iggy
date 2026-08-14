@@ -14,7 +14,7 @@ Source connectors use a one-in-flight-batch contract between the plugin and the 
 4. The runtime reports `SourceBatchResult::Ack` to the plugin. A send or state-save failure reports `SourceBatchResult::Nack` instead.
 5. `Source::on_batch_result()` commits or discards the plugin's staged work before the next poll starts.
 
-An empty batch follows the same handshake. This prevents a successful no-op send from persisting state left over from an earlier failed delivery. Producer errors, including request timeouts, report a NACK. A successful send from the legacy Iggy server is still an ACK even though that server returns an empty confirmation list.
+An empty batch follows the same handshake. A source should return `state: None` when an empty poll made no progress; this avoids an unnecessary state write and cannot persist state left over from a failed batch. Producer errors, including request timeouts, report a NACK. A successful send from the legacy Iggy server is still an ACK even though that server returns an empty confirmation list.
 
 The crash behavior is intentionally at-least-once:
 
@@ -25,11 +25,13 @@ The crash behavior is intentionally at-least-once:
 | After send success but before state persistence | Persisted state is unchanged, so the batch may be delivered again. |
 | After state persistence but before the plugin processes the ACK | The restored state records the delivered batch. Deferred source-side cleanup may still be pending. |
 | After the plugin processes the ACK | The state and plugin cursor both record the delivered batch. |
+| After an in-memory confirmation and source cleanup, but before Iggy fsyncs | A server crash can lose the batch after source cleanup unless server-side `enforce_fsync` is enabled. |
 
-Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch.
-The SDK stops polling if `Source::on_batch_result()` returns an error, preventing a failed rollback from advancing to another batch.
+An ACK means that Iggy confirmed the batch in memory; durability depends on the server's `enforce_fsync` setting. Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
 
-This contract is a breaking FFI change. Source plugins must be rebuilt with the matching SDK. `iggy_source_handle` now supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK.
+The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it. The SDK stops polling if the handler returns an error, preventing a failed rollback from advancing to another batch.
+
+This contract is a breaking FFI change. Source plugins must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK.
 
 Moreover, it contains both, the `decoders` and `encoders` modules, implementing either `StreamDecoder` or `StreamEncoder` traits, which are used when consuming or producing data from/to Iggy streams.
 
