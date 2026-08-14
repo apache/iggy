@@ -591,40 +591,72 @@ impl MessageBag {
     /// `group` is a plain field on every consensus header rather than a
     /// [`ConsensusHeader`] method, which is why this is a match and not a trait
     /// call. `RepairPrepare` reads through its wrapped prepare.
+    ///
+    /// One `header()` per arm, bound to a local: each call runs a checked bytemuck
+    /// cast over the 256-byte header, and this is the per-frame routing path.
     #[must_use]
     pub fn routing(&self) -> (Operation, u64) {
         match self {
-            Self::Request(message) => (message.header().operation, message.header().group),
-            Self::Prepare(message) => (message.header().operation, message.header().group),
-            Self::PrepareOk(message) => (message.header().operation, message.header().group),
-            Self::StartViewChange(message) => {
-                (message.header().operation(), message.header().group)
+            Self::Request(message) => {
+                let header = message.header();
+                (header.operation, header.group)
             }
-            Self::DoViewChange(message) => (message.header().operation(), message.header().group),
-            Self::StartView(message) => (message.header().operation(), message.header().group),
-            Self::Commit(message) => (message.header().operation(), message.header().group),
-            Self::RequestStartView(message) => {
-                (message.header().operation(), message.header().group)
+            Self::Prepare(message) => {
+                let header = message.header();
+                (header.operation, header.group)
             }
-            Self::RequestPrepares(message) => {
-                (message.header().operation(), message.header().group)
+            Self::PrepareOk(message) => {
+                let header = message.header();
+                (header.operation, header.group)
             }
             Self::RepairPrepare(message) => {
-                (message.header().0.operation, message.header().0.group)
+                let header = &message.header().0;
+                (header.operation, header.group)
+            }
+            Self::StartViewChange(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::DoViewChange(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StartView(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::Commit(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStartView(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestPrepares(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
             }
             Self::RepairRangeReply(message) => {
-                (message.header().operation(), message.header().group)
+                let header = message.header();
+                (header.operation(), header.group)
             }
             Self::RequestStateTransfer(message) => {
-                (message.header().operation(), message.header().group)
+                let header = message.header();
+                (header.operation(), header.group)
             }
             Self::StateTransferTarget(message) => {
-                (message.header().operation(), message.header().group)
+                let header = message.header();
+                (header.operation(), header.group)
             }
             Self::RequestStateChunk(message) => {
-                (message.header().operation(), message.header().group)
+                let header = message.header();
+                (header.operation(), header.group)
             }
-            Self::StateChunk(message) => (message.header().operation(), message.header().group),
+            Self::StateChunk(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
             // Register forwarding is a metadata-plane errand, and the metadata
             // consensus group lives on shard 0 on every node; the headers carry
             // no group field because there is nothing else they could address.

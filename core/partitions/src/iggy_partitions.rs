@@ -312,8 +312,13 @@ where
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn buffer_addr(&self) -> usize {
-        // Safety: read-only reborrow of the same pump-only vec every accessor
-        // here goes through; nothing is handed out past this statement.
+        // SAFETY: forms a shared reference into the `UnsafeCell` for this expression.
+        // Read-only-ness is not what makes that sound, since a shared reborrow
+        // aliasing a live `&mut` is UB whether or not it reads. What makes it sound
+        // is that no
+        // `&mut` from `get_mut_by_ns` / `namespace_map_mut` is live across the call:
+        // those are pump-only, and these callers run on the pump. Only the pointer
+        // value escapes.
         unsafe { (*self.partitions.get()).as_ptr() as usize }
     }
 

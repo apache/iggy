@@ -270,9 +270,9 @@ pub struct RequestEntry {
     /// [`VsrConsensus::push_queued_request`] stamps it, which is the only path
     /// that parks an entry in production.
     ///
-    /// Read against `clock_realtime_micros` at promotion for the queue wait:
-    /// what age-based shedding would filter on, and the queueing half of
-    /// end-to-end commit latency.
+    /// Read through [`Self::queue_wait_micros`] at promotion, never by subtracting
+    /// directly: the queue wait is what age-based shedding filters on and the
+    /// queueing half of end-to-end commit latency.
     ///
     /// Deliberately the plain clock read rather than
     /// [`VsrConsensus::next_monotonic_timestamp`]: this must not consume the
@@ -318,6 +318,18 @@ impl RequestEntry {
     pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
         self.reply_sender.take()
     }
+
+    /// How long this request has waited, against a realtime reading taken now
+    /// (`VsrConsensus::clock_realtime_micros`).
+    ///
+    /// Saturating, which is why this exists rather than a documented subtraction:
+    /// the realtime clock can step backwards between park and promotion, and on
+    /// `u64` a plain `now - received_at` wraps to ~1.8e19 micros, an age a shed would
+    /// act on. `0` for an unstamped entry.
+    #[must_use]
+    pub const fn queue_wait_micros(&self, now: u64) -> u64 {
+        now.saturating_sub(self.received_at)
+    }
 }
 
 impl<B, P> VsrConsensus<B, P>
@@ -337,23 +349,42 @@ where
 }
 
 /// Outcome of [`VsrConsensus::rollback_pipelined_prepare`].
+///
+/// Only [`Self::Unwound`] mutates. Every refusal leaves the sequencer, parent
+/// chain, and pipeline as it found them, so a caller can report one without
+/// repairing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrepareRollback {
     /// Sequencer, parent chain, and pipeline entry all restored. The op is free
     /// again and the next request reuses it.
     Unwound,
-    /// This replica never pre-advanced for the prepare, so there is nothing to
-    /// undo. A backup advances only AFTER its append succeeds.
+    /// Not primary now, so no pre-advance of this replica's own survives to undo.
+    /// Either a backup that never pre-advanced (it advances only AFTER its append
+    /// succeeds), or a demoted ex-primary whose claim the view-change reset already
+    /// discarded.
     NotPreAdvanced,
-    /// Refused: a sibling prepare was pipelined during the append await and is
-    /// already projected off the failed op, carrying `sequence` past it.
+    /// Refused: a view change ran while the append was parked, so the state this
+    /// prepare pre-advanced is no longer its own. `view` is the current view.
     ///
-    /// Both outcomes are bad here and unwinding is the worse one: the sibling is
-    /// live in the pipeline and already chained to a prepare the WAL will never
-    /// hold, so rewinding underneath it would additionally hand its op number out
-    /// to the next request. The hole is not closable locally; a view change is
-    /// what repairs it.
+    /// Still primary, and after a re-election the sequencer can sit at `header.op`
+    /// again with a DIFFERENT prepare under it: `start_pending_view` rewinds to the
+    /// merged head and the next request re-projects that number. Unwinding would pop
+    /// a live entry, rewind beneath an op peers have journaled, and mint the op a
+    /// third time. Hence the check ahead of the sequencer compare.
+    Superseded { view: u32 },
+    /// Refused: `sequence` no longer matches the failed op. Two directions, only
+    /// the first with a sibling behind it, neither closable locally:
+    ///
+    /// - `> header.op`: a sibling is live and already chained to a prepare the WAL
+    ///   will never hold, so unwinding would additionally hand out its op number.
+    /// - `< header.op`: a state transfer or view change rewound beneath this op;
+    ///   the pre-advance is simply gone.
     Overtaken { sequence: u64 },
+    /// Refused: the sequencer matches the failed op but the pipeline tail is a
+    /// different prepare. The two move together everywhere else, so an invariant has
+    /// already broken; release refuses rather than rewinding on numbers it just
+    /// proved it cannot trust.
+    TailMismatch,
 }
 
 /// Two-queue pipeline: in-flight prepares + buffered requests.
@@ -539,8 +570,9 @@ impl LocalPipeline {
     ///
     /// The one caller is the journal-append rollback
     /// ([`VsrConsensus::rollback_pipelined_prepare`]).
-    pub fn remove_prepare_tail(&mut self, op: u64) -> Option<PipelineEntry> {
-        if self.prepare_queue.back()?.header.op != op {
+    pub fn remove_prepare_tail(&mut self, op: u64, checksum: u128) -> Option<PipelineEntry> {
+        let tail = self.prepare_queue.back()?;
+        if tail.header.op != op || tail.header.checksum != checksum {
             return None;
         }
         self.prepare_queue.pop_back()
@@ -690,8 +722,8 @@ impl Pipeline for LocalPipeline {
         Self::pop_message(self)
     }
 
-    fn remove_tail(&mut self, op: u64) -> Option<Self::Entry> {
-        Self::remove_prepare_tail(self, op)
+    fn remove_tail(&mut self, op: u64, checksum: u128) -> Option<Self::Entry> {
+        Self::remove_prepare_tail(self, op, checksum)
     }
 
     fn clear(&mut self) {
@@ -1602,7 +1634,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if empty {
             timeouts.stop(TimeoutKind::Prepare);
         } else {
-            timeouts.reset(TimeoutKind::Prepare);
+            // `start`, not `reset`: `reset` leaves `ticking` untouched, so a timer
+            // stopped earlier would come back armed-but-dead and never fire. On an
+            // already-ticking timer the two are the same call. Same trap
+            // `advance_commit_max` documents.
+            timeouts.start(TimeoutKind::Prepare);
         }
     }
 
@@ -1679,24 +1715,44 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// [`Self::next_monotonic_timestamp`] only ever needs a lower bound, and
     /// lowering it back could re-stamp a value a peer already observed.
     ///
+    /// Runs after an `.await`, so the state it means to unwind may have been
+    /// reassigned meanwhile. Four guards prove the pre-advance is still this
+    /// prepare's (primaryship, its view, `Normal` status, and a tail matched on
+    /// `(op, checksum)`), and only [`PrepareRollback::Unwound`] mutates.
+    ///
     /// See [`PrepareRollback`] for the outcomes.
     pub fn rollback_pipelined_prepare(&self, header: &PrepareHeader) -> PrepareRollback {
         if !self.is_primary() {
             return PrepareRollback::NotPreAdvanced;
         }
+        // Ahead of the sequencer compare: a view change concluding under the append
+        // leaves it able to match `header.op` with a different prepare beneath it.
+        if header.view != self.view.get() || !self.is_normal() {
+            return PrepareRollback::Superseded {
+                view: self.view.get(),
+            };
+        }
         let sequence = self.sequencer.current_sequence();
         if sequence != header.op {
             return PrepareRollback::Overtaken { sequence };
         }
-        let removed = self.pipeline.borrow_mut().remove_tail(header.op);
-        debug_assert!(
-            removed.is_some(),
-            "sequencer at op {} but the pipeline tail is not that op",
-            header.op
-        );
+        // Matched on `(op, checksum)`: an op number alone is not unique across views,
+        // and a same-numbered entry belonging to someone else is the whole hazard.
+        // A refusal, not a `debug_assert`: the state is reachable from a race rather
+        // than a bug here, and asserting would panic debug builds on exactly what
+        // release declines to act on.
+        let Some(removed) = self
+            .pipeline
+            .borrow_mut()
+            .remove_tail(header.op, header.checksum)
+        else {
+            return PrepareRollback::TailMismatch;
+        };
         drop(removed);
         self.sequencer.set_sequence(header.op.saturating_sub(1));
         self.set_last_prepare_checksum(header.parent);
+        // The pop may have emptied the pipeline; the timeout is owned by its edges.
+        self.sync_prepare_timeout();
         PrepareRollback::Unwound
     }
 
@@ -2400,7 +2456,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // with the fired state intact turns the next pipeline push into
         // an instant spurious retransmit on the following tick (the push
         // sees `is_ticking` and does not restart the timer).
-        if !self.is_primary() || self.status.get() != Status::Normal {
+        // A replica that ceded at boot (`init_as_backup`) is a backup by role however
+        // the view math reads, so it must not retransmit either.
+        if !self.is_primary() || self.status.get() != Status::Normal || self.has_ceded_primaryship()
+        {
             self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
             return Vec::new();
         }
@@ -4653,6 +4712,28 @@ mod vsr_consensus_tests {
         })
     }
 
+    /// [`projected_prepare`] carrying the two fields the rollback guards match on,
+    /// so two prepares at the same op stay distinguishable.
+    #[allow(clippy::cast_possible_truncation)]
+    fn projected_prepare_in_view(
+        op: u64,
+        parent: u128,
+        checksum: u128,
+        view: u32,
+    ) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
+            *new = PrepareHeader {
+                command: Command2::Prepare,
+                size: size_of::<PrepareHeader>() as u32,
+                op,
+                parent,
+                checksum,
+                view,
+                ..Default::default()
+            };
+        })
+    }
+
     /// Pipeline a prepare the way `on_request` does, pre-advancing the sequencer
     /// and the parent chain ahead of the journal append.
     fn pipeline(consensus: &VsrConsensus<StageNoopBus>, message: &Message<PrepareHeader>) {
@@ -4831,6 +4912,102 @@ mod vsr_consensus_tests {
             consensus.pipeline_len(),
             2,
             "a refused rollback must not touch the pipeline"
+        );
+    }
+
+    #[test]
+    fn rollback_is_refused_while_a_view_change_is_running() {
+        // A view change can conclude under the append's `.await`, after which every
+        // number the rollback reads belongs to the new view, including a sequencer
+        // back on this op with a different prepare beneath it. Unwinding there pops a
+        // live entry and rewinds beneath an op peers have journaled.
+        const PARENT: u128 = 0xfeed;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+        consensus.set_last_prepare_checksum(PARENT);
+
+        let message = projected_prepare_in_view(8, PARENT, 0xaaaa, 0);
+        pipeline(&consensus, &message);
+        assert_eq!(consensus.sequencer().current_sequence(), 8);
+
+        let _ = consensus.enter_view_change(
+            PlaneKind::Metadata,
+            3,
+            ViewChangeReason::NormalHeartbeatTimeout,
+        );
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Superseded { view: 3 },
+            "a prepare from a view this replica has left owns none of this state"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            8,
+            "a refused rollback must not move the sequencer"
+        );
+        assert_eq!(
+            consensus.last_prepare_checksum(),
+            0xaaaa,
+            "a refused rollback must not rewind the parent chain"
+        );
+    }
+
+    #[test]
+    fn rollback_is_refused_when_the_tail_is_a_different_prepare() {
+        // Op numbers repeat across views: a rewind to the merged head lets the next
+        // request re-project this number with its own checksum. Matching on `op` alone
+        // pops that live entry, and the old `debug_assert` let release rewind anyway.
+        const PARENT: u128 = 0xfeed;
+        const LIVE: u128 = 0xbbbb;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        // The op-8 entry that is actually live, projected after the rewind.
+        let live = projected_prepare_in_view(8, PARENT, LIVE, 0);
+        pipeline(&consensus, &live);
+
+        // The op-8 prepare whose append failed: same number, different bytes.
+        let failed = projected_prepare_in_view(8, PARENT, 0xaaaa, 0);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(failed.header()),
+            PrepareRollback::TailMismatch
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 8);
+        assert_eq!(consensus.last_prepare_checksum(), LIVE);
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the live entry must survive a refused rollback"
+        );
+        assert!(
+            consensus.pipeline_holds_entry(8, LIVE),
+            "and it must still be the same entry"
+        );
+    }
+
+    #[test]
+    fn rollback_disarms_the_prepare_timeout_when_it_empties_the_pipeline() {
+        // `Unwound` pops through the pipeline directly, so it owes the same
+        // "ticking iff non-empty" maintenance every other drain does.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let message = projected_prepare(8, 0);
+        pipeline(&consensus, &message);
+        assert!(prepare_ticking(&consensus));
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Unwound
+        );
+        assert!(consensus.pipeline_is_empty());
+        assert!(
+            !prepare_ticking(&consensus),
+            "unwinding the sole in-flight prepare leaves nothing to retransmit"
         );
     }
 

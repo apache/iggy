@@ -1305,13 +1305,18 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Build a metadata reply carrying `payload` behind a success result section.
 ///
-/// Every metadata reply is result-framed, and the SDK strips that section off
-/// unconditionally (`split_metadata_result`) before decoding what follows. A
-/// payload written without the leading zero count therefore has its first four
-/// bytes eaten as a result count, and the decode fails or, worse, succeeds on the
-/// shifted remainder. That is not hypothetical: the raw-PAT reply shipped once
-/// without the prefix and broke SDK decoding. This is the only way to emit a
-/// success reply with a body, so the prefix cannot be forgotten again.
+/// The SDK strips a result section off exactly the replies whose operation is
+/// [`iggy_binary_protocol::Operation::is_result_framed`] (every metadata op plus the
+/// four consumer-offset ops), and a non-empty `Register`, which it handles on its
+/// own. For those, a payload missing the leading zero count has its first four bytes
+/// eaten as a result count, and the decode fails or, worse, succeeds on the shifted
+/// remainder: the raw-PAT reply shipped once without the prefix and broke the SDK.
+///
+/// The only way to BUILD a result-framed success body, though not the only path to a
+/// success reply with one: [`build_reply_from_bytes`] passes a committed body
+/// through, framed or not according to the operation. Framing a reply whose operation
+/// is not result-framed breaks decoding just as badly, so the choice belongs with the
+/// operation rather than here.
 fn build_result_framed_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,

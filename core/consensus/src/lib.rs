@@ -34,9 +34,12 @@ pub trait Pipeline {
 
     fn pop(&mut self) -> Option<Self::Entry>;
 
-    /// Drop the newest entry when it is `op`, returning it; `None` and no
-    /// mutation otherwise. Unwinds a push that turned out not to be durable.
-    fn remove_tail(&mut self, op: u64) -> Option<Self::Entry>;
+    /// Drop the newest entry when it is exactly `(op, checksum)`, returning it;
+    /// `None` and no mutation otherwise. Unwinds a push that proved not to be durable.
+    ///
+    /// The checksum is not redundant: op numbers repeat across views, so matching on
+    /// `op` alone can pop a live entry belonging to a later one.
+    fn remove_tail(&mut self, op: u64, checksum: u128) -> Option<Self::Entry>;
 
     fn clear(&mut self);
 
@@ -173,6 +176,9 @@ pub use state_transfer::{
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
+
+mod fatal;
+pub use fatal::{FatalReason, fatal};
 
 mod impls;
 pub use impls::*;

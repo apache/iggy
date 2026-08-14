@@ -2375,6 +2375,10 @@ fn restore_metadata_consensus(
                 pipeline.push(entry);
             }
         });
+        // These went in through `Pipeline::push`, not `push_prepare_entry`, and `init`
+        // no longer arms the timer: without this the recovered suffix sits in the
+        // pipeline with nothing driving its retransmit.
+        consensus.sync_prepare_timeout();
     }
 
     consensus

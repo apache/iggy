@@ -1722,14 +1722,37 @@ mod tests {
         // decode-then-encode staying byte-identical across every serde and rmp
         // release, and a divergence there would refuse boot on every checkpointed node
         // with its WAL prefix already drained.
+        //
+        // Canonical bytes cannot show that: they re-encode byte-identically (pinned by
+        // `populated_snapshot_reencode_and_checksum_are_stable`), so both candidate
+        // checksums agree and the assertion holds either way. This file is instead
+        // noncanonical but decodable, carrying the version in a `u32` marker that
+        // `read_int` accepts and a re-encode collapses back to a fixint, so hashing a
+        // re-encode gives a different checksum and the test can fail.
         const CHECKPOINT_OP: u64 = 42;
-        let encoded = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
+        let canonical = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
+        let on_disk = with_wide_version_marker(&canonical);
+
+        // Both halves of "noncanonical but decodable", so this cannot pass vacuously.
+        assert_ne!(
+            on_disk, canonical,
+            "the file must not be byte-identical to the canonical encoding"
+        );
+        let round_tripped = MetadataSnapshot::decode(&on_disk)
+            .expect("a wide version marker must still decode")
+            .encode()
+            .unwrap();
+        assert_ne!(
+            checkpoint_checksum(&on_disk),
+            checkpoint_checksum(&round_tripped),
+            "the two candidate checksums must differ, or this proves nothing"
+        );
 
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-        std::fs::write(metadata_dir.join("snapshot.bin"), &encoded).unwrap();
-        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&encoded));
+        std::fs::write(metadata_dir.join("snapshot.bin"), &on_disk).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&on_disk));
         {
             let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
             superblock.write(&state.to_bytes()).await.unwrap();
@@ -1747,9 +1770,30 @@ mod tests {
         assert_eq!(recovered.snapshot_checkpoint.0, CHECKPOINT_OP);
         assert_eq!(
             recovered.snapshot_checkpoint.1,
-            checkpoint_checksum(&encoded),
+            checkpoint_checksum(&on_disk),
             "the verified pairing must be the checksum of the bytes on disk"
         );
+    }
+
+    /// Re-encode a snapshot's leading `version` as an explicit msgpack `u32` marker
+    /// instead of the canonical fixint: same value, five bytes instead of one.
+    ///
+    /// `rmp` reads it back through the same `read_int` the peek uses, and a re-encode
+    /// canonicalizes it away, which is what makes it a probe for "did recovery hash
+    /// the file or its own re-encode".
+    fn with_wide_version_marker(canonical: &[u8]) -> Vec<u8> {
+        let mut cursor = canonical;
+        rmp::decode::read_array_len(&mut cursor).expect("a snapshot encodes as an array");
+        let array_header = canonical.len() - cursor.len();
+        let version: u32 =
+            rmp::decode::read_int(&mut cursor).expect("version is the first element");
+        let version_len = canonical.len() - cursor.len() - array_header;
+
+        let mut wide = Vec::with_capacity(canonical.len() + 4);
+        wide.extend_from_slice(&canonical[..array_header]);
+        rmp::encode::write_u32(&mut wide, version).expect("writing to a Vec cannot fail");
+        wide.extend_from_slice(&canonical[array_header + version_len..]);
+        wide
     }
 
     #[compio::test]

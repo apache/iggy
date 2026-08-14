@@ -57,9 +57,9 @@ pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 ///
 /// A build constant, identical on every replica, so two replicas holding identical
 /// state still serialize identically (see [`MetadataSnapshot`]).
-pub const SNAPSHOT_RELEASE_FORMAT: u32 = IGGY_PROTOCOL_VERSION;
+pub const SNAPSHOT_WRITER_RELEASE: u32 = IGGY_PROTOCOL_VERSION;
 
-const _: () = assert!(SNAPSHOT_RELEASE_FORMAT > 0);
+const _: () = assert!(SNAPSHOT_WRITER_RELEASE > 0);
 
 #[derive(Debug)]
 pub enum SnapshotError {
@@ -215,8 +215,8 @@ pub struct MetadataSnapshot {
     /// prefix still recovers pre-checkpoint sessions.
     pub client_table: Option<consensus::ClientTableSnapshot>,
     /// The release that wrote this snapshot, as a packed `iggy_binary_protocol`
-    /// semver. Provenance only, never a gate. See [`SNAPSHOT_RELEASE_FORMAT`].
-    pub release_format: u32,
+    /// semver. Provenance only, never a gate. See [`SNAPSHOT_WRITER_RELEASE`].
+    pub writer_release: u32,
 }
 
 impl Default for MetadataSnapshot {
@@ -241,7 +241,7 @@ impl MetadataSnapshot {
             users: None,
             streams: None,
             client_table: None,
-            release_format: SNAPSHOT_RELEASE_FORMAT,
+            writer_release: SNAPSHOT_WRITER_RELEASE,
         }
     }
 
@@ -532,10 +532,34 @@ mod tests {
 
         assert_eq!(decoded.sequence_number, 42);
         assert_eq!(decoded.version, SNAPSHOT_FORMAT_VERSION);
-        assert_eq!(decoded.release_format, SNAPSHOT_RELEASE_FORMAT);
+        assert_eq!(decoded.writer_release, SNAPSHOT_WRITER_RELEASE);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
         assert!(decoded.client_table.is_none());
+    }
+
+    #[test]
+    fn encoded_shape_is_pinned_to_the_format_version() {
+        // The gate is only as good as the discipline that bumps it, and nothing else
+        // fails when a field is appended and the bump is forgotten. msgpack encodes
+        // positionally, so the element count is the shape's fingerprint: pinning it
+        // turns "shape changed, version did not" into a failing test rather than an
+        // operator's boot reading one field's bytes as another's. Changing either
+        // number is the reminder to change the other.
+        const FIELD_COUNT: u32 = 7;
+        const PINNED_VERSION: u32 = 2;
+
+        let encoded = MetadataSnapshot::new(0).encode().unwrap();
+        let mut cursor = encoded.as_slice();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut cursor).unwrap(),
+            FIELD_COUNT,
+            "MetadataSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+        assert_eq!(
+            SNAPSHOT_FORMAT_VERSION, PINNED_VERSION,
+            "SNAPSHOT_FORMAT_VERSION moved; confirm the shape moved with it"
+        );
     }
 
     #[test]

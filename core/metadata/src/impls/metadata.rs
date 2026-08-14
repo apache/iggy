@@ -26,15 +26,15 @@ use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
-    Consensus, EvictionContext, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind,
-    PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent, Sequencer,
-    SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
-    build_eviction_message, build_reply_message, build_reply_message_with,
-    build_result_rejection_reply, emit_sim_event, fence_old_prepare_by_commit,
-    is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
-    pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
-    request_preflight, send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
+    Consensus, EvictionContext, FatalReason, Pipeline, PipelineEntry, Plane, PlaneIdentity,
+    PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent,
+    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
+    build_reply_message_with, build_result_rejection_reply, emit_sim_event, fatal,
+    fence_old_prepare_by_commit, is_caught_up_primary,
+    panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
+    register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -947,6 +947,34 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     }
 }
 
+/// Stop the process after a WAL append failed and left a claim
+/// [`VsrConsensus::rollback_pipelined_prepare`] could not prove was still its own.
+///
+/// The frontier is then an op ahead of the WAL with no local path back: the failed
+/// prepare was never broadcast, so no peer can repair from it. Stopping IS the repair,
+/// not an escalation: recovery re-derives the frontier from the WAL, which the failed
+/// write never reached. Every alternative keeps serving on numbers this replica just
+/// proved it cannot trust.
+fn fatal_on_unreconcilable_frontier<B>(
+    consensus: &VsrConsensus<B>,
+    op: u64,
+    error: &std::io::Error,
+    rollback: PrepareRollback,
+) -> !
+where
+    B: MessageBus,
+{
+    fatal(
+        FatalReason::UnreconcilableLogFrontier,
+        &format!(
+            "metadata replica {replica} failed to append op {op} ({error}) and could not hand \
+             the op back ({rollback:?}); the in-memory frontier is ahead of the WAL with no \
+             local path back, so this node stops and recovers its frontier from the log",
+            replica = consensus.replica(),
+        ),
+    );
+}
+
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M, SB> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M, SB>
 where
@@ -1212,10 +1240,9 @@ where
         //
         // On the primary the pre-advance in `push_prepare_entry` already claimed
         // this op, so a failed append has to hand it back or the next prepare
-        // chains off a phantom (see `rollback_pipelined_prepare`). The rollback is
-        // refused when a sibling prepare was pipelined during the await and has
-        // already been projected off this op; that log cannot be repaired from
-        // here, so it is reported and left to a view change.
+        // chains off a phantom (see `rollback_pipelined_prepare`). A refused rollback
+        // leaves the op claimed with nothing durable behind it and no protocol path
+        // back, so the process stops rather than serving on it.
         if let Err(e) = journal.handle().append(message.clone()).await {
             let rollback = consensus.rollback_pipelined_prepare(&header);
             error!(
@@ -1228,16 +1255,20 @@ where
                 rollback = ?rollback,
                 "journal append failed"
             );
-            if let PrepareRollback::Overtaken { sequence } = rollback {
-                error!(
-                    target: "iggy.metadata.diag",
-                    plane = "metadata",
-                    replica_id = consensus.replica(),
-                    op = header.op,
-                    sequence,
-                    "journal append failed after a sibling prepare was projected off this op; \
-                     the local log has a hole this replica cannot close, awaiting view change"
-                );
+            match rollback {
+                // `Unwound`: the op went back and the waiting client wakes with
+                // `Canceled`. `NotPreAdvanced`: a backup never claimed it, advancing
+                // only after its own append succeeds. Neither leaves a disagreement.
+                PrepareRollback::Unwound | PrepareRollback::NotPreAdvanced => {}
+                // Every refusal means the same thing: the claim could not be proved
+                // still this prepare's, so it cannot be safely reversed. Not split
+                // further, since deciding per variant which disagreements are
+                // survivable is the case analysis stopping exists to avoid.
+                PrepareRollback::Superseded { .. }
+                | PrepareRollback::Overtaken { .. }
+                | PrepareRollback::TailMismatch => {
+                    fatal_on_unreconcilable_frontier(consensus, header.op, &e, rollback);
+                }
             }
             return;
         }
@@ -1619,7 +1650,7 @@ where
         tracing::info!(
             snapshot_seq,
             format_version = snapshot.snapshot().version,
-            release_format = %ProtocolVersion(snapshot.snapshot().release_format),
+            writer_release = %ProtocolVersion(snapshot.snapshot().writer_release),
             "decoded a transferred metadata snapshot"
         );
 
@@ -3035,8 +3066,8 @@ where
     /// first failure and then at each backoff step rather than per tick.
     ///
     /// TODO(fail-stop): a replica wedged here is dead weight an operator has to notice
-    /// from logs. Fail-stopping the process is the TigerBeetle-style answer, but this
-    /// layer holds no process-lifecycle handle; wire it where the shard owns shutdown.
+    /// from logs. Fail-stopping the process is the answer, and
+    /// [`fatal`] is now that primitive; wire it where the shard owns shutdown.
     #[allow(clippy::future_not_send)]
     async fn write_superblock(&self, consensus: &VsrConsensus<B, P>, superblock: &SB) -> bool {
         // Carry the last durable pairing forward so a view-change write never

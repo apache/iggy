@@ -2421,7 +2421,11 @@ where
     {
         match message {
             MessageBag::Request(request) => {
-                let routing = (request.header().operation, request.header().group);
+                // One header read for the pair; `header()` casts on every call.
+                let routing = {
+                    let header = request.header();
+                    (header.operation, header.group)
+                };
                 match self.park_if_unmaterialised(request, routing.0, routing.1) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
@@ -2446,7 +2450,10 @@ where
                 }
             }
             MessageBag::Prepare(prepare) => {
-                let routing = (prepare.header().operation, prepare.header().group);
+                let routing = {
+                    let header = prepare.header();
+                    (header.operation, header.group)
+                };
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
