@@ -1125,4 +1125,30 @@ mod tests {
         );
         assert!(parsed.max_topic_size.is_some());
     }
+
+    #[test]
+    fn options_block_budget_matches_user_headers() {
+        // `MAX_OPTIONS_BYTES` duplicates `MAX_USER_HEADERS_SIZE` because
+        // `iggy_binary_protocol` cannot import this crate. This is the only
+        // place both are visible, so it is where they get tied together.
+        assert_eq!(
+            iggy_binary_protocol::MAX_OPTIONS_BYTES,
+            crate::MAX_USER_HEADERS_SIZE as usize,
+            "options inherit the user-headers byte budget; update both"
+        );
+    }
+
+    #[test]
+    fn max_options_is_reachable_within_the_byte_budget() {
+        // The cheapest entry is 12 bytes: kind + u32 length + one byte, for
+        // key and value each. If the budget ever drops below this product the
+        // entry cap becomes unreachable and `MAX_OPTIONS` stops being the
+        // limit that actually binds.
+        const MIN_ENTRY_BYTES: usize = 2 * (1 + 4 + 1);
+        assert!(
+            iggy_binary_protocol::MAX_OPTIONS as usize * MIN_ENTRY_BYTES
+                <= iggy_binary_protocol::MAX_OPTIONS_BYTES,
+            "MAX_OPTIONS entries must fit in MAX_OPTIONS_BYTES"
+        );
+    }
 }

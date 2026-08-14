@@ -36,13 +36,21 @@ use crate::primitives::user_headers::{
 };
 
 /// Maximum number of key-value entries in one options block.
-pub const MAX_OPTIONS: u32 = 64;
-
-/// Maximum byte length of an option key.
-pub const MAX_OPTION_KEY_LENGTH: usize = 64;
+pub const MAX_OPTIONS: u32 = 1024;
 
 /// Maximum total byte length of an encoded options block.
-pub const MAX_OPTIONS_BYTES: usize = 4096;
+///
+/// Mirrors `iggy_common::MAX_USER_HEADERS_SIZE`: options ride the user-headers
+/// codec, so they inherit its budget rather than inventing a second one. The
+/// constant is duplicated because `iggy_common` depends on this crate, not the
+/// other way round; `options_block_budget_matches_user_headers` pins the two
+/// together from the side that can see both.
+///
+/// Sized so [`MAX_OPTIONS`] is actually reachable: the cheapest entry is 12
+/// bytes (kind + length + one byte, for key and value each), so 1024 entries
+/// need at least 12 KiB. A smaller budget would silently cap the entry count
+/// below `MAX_OPTIONS` and make that limit a lie.
+pub const MAX_OPTIONS_BYTES: usize = 100 * 1000;
 
 /// Wire kind code for UTF-8 string fields, matching `HeaderKind::String`
 /// in `iggy_common`.
@@ -54,7 +62,7 @@ const STRING_KIND: WireHeaderKind = WireHeaderKind(2);
 ///
 /// - Total block size within [`MAX_OPTIONS_BYTES`]
 /// - At most [`MAX_OPTIONS`] entries
-/// - Every key is a UTF-8 string of at most [`MAX_OPTION_KEY_LENGTH`] bytes
+/// - Every key is a UTF-8 string (length already bounded by the codec)
 /// - No duplicate keys
 ///
 /// Value kind codes are deliberately NOT restricted to the currently defined
@@ -90,12 +98,6 @@ pub fn validate_options(buf: &[u8]) -> Result<u32, WireError> {
             return Err(WireError::Validation(Cow::Owned(format!(
                 "option key kind {} is not a string",
                 entry.key_kind.0
-            ))));
-        }
-        if entry.key.len() > MAX_OPTION_KEY_LENGTH {
-            return Err(WireError::Validation(Cow::Owned(format!(
-                "option key is {} bytes, exceeds maximum {MAX_OPTION_KEY_LENGTH}",
-                entry.key.len()
             ))));
         }
         if std::str::from_utf8(entry.key).is_err() {
@@ -321,16 +323,19 @@ mod tests {
     }
 
     #[test]
-    fn key_over_length_limit_is_rejected() {
-        let key = [b'k'; MAX_OPTION_KEY_LENGTH + 1];
-        let buf = encode(&[(STRING, &key, STRING, b"value")]);
+    fn key_length_is_bounded_by_the_user_headers_codec() {
+        // Options add no key-length rule of their own: every field is already
+        // bounded to 1..=255 by `validate_user_headers`, so the codec's limit
+        // is the option key's limit.
+        let over = [b'k'; 256];
+        let buf = encode(&[(STRING, &over, STRING, b"value")]);
         assert!(matches!(
             validate_options(&buf),
             Err(WireError::Validation(_))
         ));
 
-        let max_key = [b'k'; MAX_OPTION_KEY_LENGTH];
-        let buf = encode(&[(STRING, &max_key, STRING, b"value")]);
+        let at_limit = [b'k'; 255];
+        let buf = encode(&[(STRING, &at_limit, STRING, b"value")]);
         assert_eq!(validate_options(&buf).unwrap(), 1);
     }
 
@@ -353,8 +358,11 @@ mod tests {
 
     #[test]
     fn block_over_byte_limit_is_rejected() {
-        let value = [b'v'; 250];
-        let keys: Vec<String> = (0..16).map(|i| format!("key_{i}")).collect();
+        // 200 maximum-size entries are ~104 KB, over the byte budget while
+        // still well under `MAX_OPTIONS`, so this proves the byte cap trips
+        // independently of the entry count.
+        let value = [b'v'; 255];
+        let keys: Vec<String> = (0..200).map(|i| format!("{i:0>255}")).collect();
         let entries: Vec<(u8, &[u8], u8, &[u8])> = keys
             .iter()
             .map(|key| (STRING, key.as_bytes(), STRING, value.as_slice()))

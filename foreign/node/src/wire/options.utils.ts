@@ -26,13 +26,22 @@ import {
 } from './message/header.utils.js';
 
 /** Maximum number of key-value entries in one options block. */
-export const MAX_OPTIONS = 64;
+export const MAX_OPTIONS = 1024;
 
-/** Maximum byte length of an option key. */
-export const MAX_OPTION_KEY_LENGTH = 64;
+/**
+ * Maximum total byte length of an encoded options block.
+ *
+ * Mirrors the Rust `MAX_OPTIONS_BYTES`, which in turn mirrors the user-headers
+ * budget: options ride that codec and inherit its limit.
+ */
+export const MAX_OPTIONS_BYTES = 100 * 1000;
 
-/** Maximum total byte length of an encoded options block. */
-export const MAX_OPTIONS_BYTES = 4096;
+/**
+ * Key and value length bound, inherited from the header-field codec rather
+ * than being an options-specific rule (`serializeHeaders` enforces the same
+ * range on the way out).
+ */
+const MAX_HEADER_FIELD_LENGTH = 255;
 
 /** A resource option entry: UTF-8 string key with a typed value. */
 export type OptionEntry = {
@@ -66,13 +75,10 @@ export const serializeOptions = (options: OptionEntry[]): Buffer => {
     throw new Error(
       `Options block has ${options.length} entries, exceeds maximum ${MAX_OPTIONS}`);
 
-  const block = serializeHeaders(options.map(({ key, value }) => {
-    const keyLength = Buffer.byteLength(key);
-    if (keyLength < 1 || keyLength > MAX_OPTION_KEY_LENGTH)
-      throw new Error(
-        `Option key should be between 1 and ${MAX_OPTION_KEY_LENGTH} bytes`);
-    return { key: HeaderKeyFactory.String(key), value };
-  }));
+  // No key-length check here: `serializeHeaders` already bounds every field
+  // to 1..=255, so an options-specific cap would only duplicate it.
+  const block = serializeHeaders(options.map(({ key, value }) =>
+    ({ key: HeaderKeyFactory.String(key), value })));
 
   if (block.length > MAX_OPTIONS_BYTES)
     throw new Error(
@@ -99,10 +105,10 @@ export const deserializeOptions = (
     if (keyKind !== HeaderKind.String)
       throw new Error(`Option key kind ${keyKind} is not a string`);
     const keyLength = p.readUInt32LE(pos + 1);
-    if (keyLength < 1 || keyLength > MAX_OPTION_KEY_LENGTH)
+    if (keyLength < 1 || keyLength > MAX_HEADER_FIELD_LENGTH)
       throw new Error(
         `Invalid option key length: ${keyLength}, ` +
-        `must be between 1 and ${MAX_OPTION_KEY_LENGTH}`);
+        `must be between 1 and ${MAX_HEADER_FIELD_LENGTH}`);
     if (pos + 5 + keyLength > end)
       throw new Error('Option key overruns the block');
     const key = p.subarray(pos + 5, pos + 5 + keyLength).toString();
