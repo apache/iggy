@@ -43,7 +43,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import static java.util.Optional.empty;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -131,13 +130,7 @@ class TlsConnectionTest extends BaseIntegrationTest {
             assertThat(stream).isNotNull();
 
             client.topics()
-                    .createTopic(
-                            streamId,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            topicName);
+                    .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicName);
 
             List<Message> messages =
                     List.of(Message.of("tls-message-1"), Message.of("tls-message-2"), Message.of("tls-message-3"));

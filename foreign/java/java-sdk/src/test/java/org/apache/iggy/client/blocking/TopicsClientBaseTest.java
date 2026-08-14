@@ -26,7 +26,6 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 
-import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 

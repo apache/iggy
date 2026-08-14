@@ -41,12 +41,7 @@ class TopicsTcpClientPayloadTest {
     @Test
     void shouldWritePartitionsCountAsFixedFieldBeforeName() {
         ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of(1L),
-                3L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                "orders");
+                StreamId.of(1L), 3L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "orders");
 
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 1); // numeric identifier kind
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 4); // identifier length
@@ -59,12 +54,7 @@ class TopicsTcpClientPayloadTest {
     @Test
     void shouldOmitServerDefaultOptions() {
         ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of("my-stream"),
-                1L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                "events");
+                StreamId.of("my-stream"), 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "events");
 
         payload.skipBytes(2 + "my-stream".length());
         assertThat(payload.readUnsignedIntLE()).isEqualTo(1L);
@@ -87,8 +77,7 @@ class TopicsTcpClientPayloadTest {
         readString(payload);
 
         Map<String, TypedValue> options = readOptions(payload);
-        assertThat(options)
-                .containsOnlyKeys("compression_algorithm", "message_expiry", "max_topic_size");
+        assertThat(options).containsOnlyKeys("compression_algorithm", "message_expiry", "max_topic_size");
         assertThat(options.get("compression_algorithm").kind()).isEqualTo(HeaderKind.String);
         assertThat(new String(options.get("compression_algorithm").value(), StandardCharsets.UTF_8))
                 .isEqualTo("gzip");

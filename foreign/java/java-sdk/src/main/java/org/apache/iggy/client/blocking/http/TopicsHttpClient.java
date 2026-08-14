@@ -63,8 +63,7 @@ class TopicsHttpClient implements TopicsClient {
             String name) {
         var request = httpClient.preparePostRequest(
                 STREAMS + "/" + streamId + TOPICS,
-                new CreateTopic(
-                        partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name));
+                new CreateTopic(partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name));
         return httpClient.execute(request, new TypeReference<>() {});
     }
 

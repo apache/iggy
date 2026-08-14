@@ -43,7 +43,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 
 /**
  * Async TCP implementation of TopicsClient using Netty for non-blocking I/O.
@@ -109,8 +108,8 @@ public class TopicsTcpClient implements TopicsClient {
             BigInteger maxTopicSize,
             String name) {
 
-        var payload = createTopicPayload(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
+        var payload =
+                createTopicPayload(streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
 
         return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
             try {
@@ -134,15 +133,13 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeIntLE(partitionsCount.intValue());
         payload.writeBytes(BytesSerializer.toBytes(name));
-        payload.writeBytes(BytesSerializer.toBytes(
-                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
+        payload.writeBytes(
+                BytesSerializer.toBytes(createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
         return payload;
     }
 
     private static Map<HeaderKey, HeaderValue> createTopicOptions(
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize) {
+            CompressionAlgorithm compressionAlgorithm, BigInteger messageExpiry, BigInteger maxTopicSize) {
         // Server-default sentinels (compression none, expiry 0, size 0) are
         // omitted so the admitting server resolves them from its config.
         Map<HeaderKey, HeaderValue> options = new LinkedHashMap<>();
@@ -179,8 +176,8 @@ public class TopicsTcpClient implements TopicsClient {
         // Settings ride the options block. A default value means the caller did
         // not set the key, so it is omitted and the server leaves the topic's
         // current value alone.
-        payload.writeBytes(BytesSerializer.toBytes(
-                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
+        payload.writeBytes(
+                BytesSerializer.toBytes(createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
 
         return connection()
                 .send(CommandCode.Topic.UPDATE.getValue(), payload)

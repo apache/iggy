@@ -68,8 +68,8 @@ final class TopicsTcpClient implements TopicsClient {
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
             String name) {
-        FutureUtil.resolve(delegate.updateTopic(
-                streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name));
+        FutureUtil.resolve(
+                delegate.updateTopic(streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name));
     }
 
     @Override

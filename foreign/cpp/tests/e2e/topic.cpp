@@ -59,13 +59,13 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
         for (const auto &expiry_option : expiry_options) {
             for (const auto &max_topic_size : max_topic_sizes) {
                 const std::string topic_name = GetRandomName();
-                SCOPED_TRACE(
-                    "compression=" + compression_algorithm + ", expiry_kind=" + expiry_option.kind +
-                    ", expiry_value=" + std::to_string(expiry_option.value) + ", max_topic_size=" + max_topic_size);
+                SCOPED_TRACE("compression=" + compression_algorithm + ", expiry_kind=" + expiry_option.kind +
+                             ", expiry_value=" + std::to_string(expiry_option.value) +
+                             ", max_topic_size=" + max_topic_size);
 
                 ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1,
-                                                     compression_algorithm, expiry_option.kind,
-                                                     expiry_option.value, max_topic_size));
+                                                     compression_algorithm, expiry_option.kind, expiry_option.value,
+                                                     max_topic_size));
                 ++expected_topics_count;
                 expected_topic_names.insert(topic_name);
             }
@@ -100,7 +100,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
 
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), zero_partitions_topic_name, 0, "none",
                                          "server_default", 0, "server_default"));
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), max_partitions_topic_name, 1000, "none", "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), max_partitions_topic_name, 1000, "none",
+                                         "server_default", 0, "server_default"));
     ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), overflow_topic_name, 1001, "none",
                                       "server_default", 0, "server_default"),
                  std::exception);
@@ -134,8 +135,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
     };
     for (const auto &topic_name : illegal_topic_names) {
         SCOPED_TRACE(topic_name);
-        ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                          "server_default", 0, "server_default"),
+        ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                          0, "server_default"),
                      std::exception);
     }
 
@@ -153,10 +154,10 @@ TEST_F(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                      0, "server_default"),
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default", 0,
+                                      "server_default"),
                  std::exception);
 }
 
@@ -212,9 +213,9 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                      0, "1024"),
-                 std::exception);
+    ASSERT_THROW(
+        client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default", 0, "1024"),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicOnNonExistentStreamThrows) {
@@ -224,8 +225,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicOnNonExistentStreamThrows) {
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                      0, "server_default"),
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default", 0,
+                                      "server_default"),
                  std::exception);
 }
 
@@ -241,8 +242,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                      0, "server_default"),
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default", 0,
+                                      "server_default"),
                  std::exception);
 }
 
@@ -269,8 +270,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
     invalid_numeric_id.kind   = "numeric";
     invalid_numeric_id.length = 1;
     invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->create_topic(std::move(invalid_numeric_id), second_topic_name, 1, "none", "server_default",
-                                      0, "server_default"),
+    ASSERT_THROW(client->create_topic(std::move(invalid_numeric_id), second_topic_name, 1, "none", "server_default", 0,
+                                      "server_default"),
                  std::exception);
 }
 
@@ -306,8 +307,8 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicAfterCreate) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
 
@@ -351,8 +352,8 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicTwiceThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
     ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
@@ -368,8 +369,8 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -386,8 +387,8 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicBeforeLoginThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
@@ -414,8 +415,8 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicWithInvalidStreamIdentifierThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Identifier invalid_kind_id;
     invalid_kind_id.kind   = "invalid";
@@ -440,8 +441,8 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicWithInvalidTopicIdentifierThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Identifier invalid_kind_id;
     invalid_kind_id.kind   = "invalid";
@@ -489,8 +490,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicBeforeLoginThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
@@ -535,8 +536,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicWithWrongTopicThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     ASSERT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(wrong_topic_name)),
                  std::exception);
@@ -550,8 +551,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -567,8 +568,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicAfterTopicDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
     ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
 
     ASSERT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
@@ -583,8 +584,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicReturnsEmptyPartitionsForZeroPartitionTopic) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 0, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 0, "none", "server_default",
+                                         0, "server_default"));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -694,8 +695,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicsReturnsCreatedTopicInputFields) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 2, "gzip",
-                                         "duration", 1000, "1GiB"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 2, "gzip", "duration",
+                                         1000, "1GiB"));
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 0, "none",
                                          "never_expire", 0, "unlimited"));
 
@@ -849,7 +850,8 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicDoesNotChangePartitionsCount) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), original_topic, partitions_count, "none", "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), original_topic, partitions_count, "none",
+                                         "server_default", 0, "server_default"));
 
     ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(original_topic),
                                          updated_topic_name, "gzip", "duration", 1000, "1GiB"));
@@ -921,21 +923,20 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicWithAllOptionCombinationsUpdatesInputFields
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 2, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 2, "none", "server_default",
+                                         0, "server_default"));
 
     for (const auto &compression_algorithm : compression_algorithms) {
         for (const auto &expiry_option : expiry_options) {
             for (const auto &max_topic_size : max_topic_sizes) {
                 const std::string updated_topic_name = GetRandomName();
-                SCOPED_TRACE(
-                    "compression=" + compression_algorithm + ", expiry_kind=" + expiry_option.kind +
-                    ", expiry_value=" + std::to_string(expiry_option.value) + ", max_topic_size=" + max_topic_size);
+                SCOPED_TRACE("compression=" + compression_algorithm + ", expiry_kind=" + expiry_option.kind +
+                             ", expiry_value=" + std::to_string(expiry_option.value) +
+                             ", max_topic_size=" + max_topic_size);
 
-                ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name),
-                                                     make_string_identifier(topic_name), updated_topic_name,
-                                                     compression_algorithm, expiry_option.kind,
-                                                     expiry_option.value, max_topic_size));
+                ASSERT_NO_THROW(client->update_topic(
+                    make_string_identifier(stream_name), make_string_identifier(topic_name), updated_topic_name,
+                    compression_algorithm, expiry_option.kind, expiry_option.value, max_topic_size));
                 topic_name = updated_topic_name;
             }
         }
@@ -1005,8 +1006,8 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicWithInvalidNamesThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     const std::vector<std::string> invalid_topic_names = {
         "",
@@ -1066,8 +1067,8 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicBeforeLoginThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
@@ -1126,8 +1127,8 @@ TEST_F(LowLevelE2E_Topic, GetTopicsAfterStreamDeletionReturnsEmpty) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -1157,8 +1158,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -1189,8 +1190,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicWithInvalidStreamIdentifierThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Identifier invalid_kind_id;
     invalid_kind_id.kind   = "invalid";
@@ -1215,8 +1216,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicWithInvalidTopicIdentifierThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Identifier invalid_kind_id;
     invalid_kind_id.kind   = "invalid";
@@ -1370,8 +1371,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicAcrossMultiplePartitionsClearsAllPartitions)
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", "server_default",
+                                         0, "server_default"));
 
     const auto created_stream = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(created_stream.topics.size(), 1u);
@@ -1414,8 +1415,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicThenSendMessagesAgainSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     const auto created_stream = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(created_stream.topics.size(), 1u);
@@ -1542,8 +1543,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicBeforeLoginThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default"));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 

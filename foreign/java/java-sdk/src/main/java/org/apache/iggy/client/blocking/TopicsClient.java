@@ -51,12 +51,7 @@ public interface TopicsClient {
             BigInteger maxTopicSize,
             String name) {
         return createTopic(
-                StreamId.of(streamId),
-                partitionsCount,
-                compressionAlgorithm,
-                messageExpiry,
-                maxTopicSize,
-                name);
+                StreamId.of(streamId), partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
     }
 
     TopicDetails createTopic(
@@ -75,12 +70,7 @@ public interface TopicsClient {
             BigInteger maxTopicSize,
             String name) {
         updateTopic(
-                StreamId.of(streamId),
-                TopicId.of(topicId),
-                compressionAlgorithm,
-                messageExpiry,
-                maxTopicSize,
-                name);
+                StreamId.of(streamId), TopicId.of(topicId), compressionAlgorithm, messageExpiry, maxTopicSize, name);
     }
 
     void updateTopic(
