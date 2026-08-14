@@ -632,7 +632,10 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(updated_topic.max_topic_size, updated_max_topic_size);
     // The three settings the update carries as fixed fields are mirrored into
     // the stored map, so `options` cannot report a value the typed field has
-    // already moved past.
+    // already moved past. Compared through the rendered value rather than the
+    // raw bytes: this scenario runs on every transport, and HTTP renders option
+    // values as readable strings where the binary transports carry the kind the
+    // server stored.
     let expiry_key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).unwrap();
     let expiry = updated_topic
         .options
@@ -640,8 +643,8 @@ pub async fn run(harness: &TestHarness) {
         .expect("message expiry echoes back as an option");
     assert!(expiry.explicit, "an updated key is explicit");
     assert_eq!(
-        expiry.value.as_bytes(),
-        u64::from(updated_topic.message_expiry).to_le_bytes()
+        expiry.value.to_string_value(),
+        u64::from(updated_topic.message_expiry).to_string()
     );
     let max_size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
     let max_size = updated_topic
@@ -649,8 +652,8 @@ pub async fn run(harness: &TestHarness) {
         .get(&max_size_key)
         .expect("max topic size echoes back as an option");
     assert_eq!(
-        max_size.value.as_bytes(),
-        u64::from(updated_topic.max_topic_size).to_le_bytes()
+        max_size.value.to_string_value(),
+        u64::from(updated_topic.max_topic_size).to_string()
     );
 
     // 39. Purge the existing topic and ensure it has no messages
