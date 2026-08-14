@@ -17,6 +17,7 @@
 
 mod consumer_group;
 mod consumer_group_membership;
+mod consumer_offset;
 mod hello_world;
 mod http_refresh;
 mod producer;
