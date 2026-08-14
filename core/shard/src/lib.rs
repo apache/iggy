@@ -28,21 +28,23 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    ChunkProgress, CommitOutcome, Consensus, ConsensusClock, MetadataHandle, MuxPlane,
-    PartitionsHandle, Pipeline, Plane, PlaneKind, STATE_TRANSFER_MAX_DECODE_RETRIES,
-    STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, VsrAction, VsrConsensus,
-    build_deny_reply_from_request_header,
+    ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX, DvcHeaderKind,
+    DvcSuffix, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
+    STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, Status,
+    VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank, dvc_header_kind,
+    encode_prepare_headers, restamp_prepare_view, verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
-    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader,
+    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader,
+    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
+    RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
 };
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
@@ -172,7 +174,9 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// and awaits the outcome over `reply`. `Register` carries the submit error
 /// verbatim because one variant
 /// (`MetadataSubmitError::ClientIdOwnedByAnotherUser`) is terminal and must
-/// not be retried; the remaining variants are transient by contract.
+/// not be retried. The remaining variants are transient by contract, and
+/// Logout preserves them so its caller can distinguish an unknown outcome
+/// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
@@ -183,11 +187,37 @@ pub enum MetadataSubmit {
         /// client a retry storm of full password verifications.
         reply: Sender<Result<BoundSession, MetadataSubmitError>>,
     },
+    /// A backup node authenticated a login and asks this node -- which it
+    /// believes is the primary -- to run only the `Register` proposal. The
+    /// verdict travels back over the replica interconnect as a
+    /// `ForwardRegisterResult`, not over a channel: the awaiting login lives
+    /// in another process.
+    ///
+    /// Handled by proposing IN PROCESS, never by forwarding again. That is
+    /// what bounds a forward at one hop: a node that has since lost
+    /// primaryship answers `NotPrimary`, and the client's SDK replays.
+    ForwardedRegister {
+        vsr_client_id: u128,
+        user_id: u32,
+        /// Correlation the origin minted; echoed verbatim in the result.
+        nonce: u128,
+        /// Replica the result frame goes back to.
+        origin_replica: u8,
+    },
+    /// A backup owns a bound client connection and asks the metadata primary
+    /// to commit its Logout. The result returns over the replica interconnect.
+    ForwardedLogout {
+        vsr_client_id: u128,
+        session: u64,
+        request: u64,
+        nonce: u128,
+        origin_replica: u8,
+    },
     Logout {
         vsr_client_id: u128,
         session: u64,
         request: u64,
-        reply: Sender<Option<u64>>,
+        reply: Sender<Result<u64, MetadataSubmitError>>,
     },
     /// A peer (home) shard relays a client's replicated request to shard 0
     /// and awaits the committed reply over `reply` (`None` on a transient
@@ -216,7 +246,7 @@ pub enum MetadataSubmit {
 
 /// Handler shard 0 runs for an inbound [`MetadataSubmit`].
 ///
-/// server-ng wires it to `submit_register_in_process` /
+/// The server wires it to `submit_register_in_process` /
 /// `submit_logout_in_process` / `submit_request_in_process` and sends the
 /// result back over the frame's `reply` sender. A peer shard (no consensus)
 /// must never receive this frame.
@@ -249,7 +279,7 @@ pub struct ConnectedClientInfo {
 }
 
 /// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
-/// server-ng wires it to read the shard's `SessionManager` and push its
+/// The server wires it to read the shard's `SessionManager` and push its
 /// connected clients back over the carried reply sender.
 pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
 
@@ -332,7 +362,7 @@ pub enum PartitionReadReply {
 }
 
 /// Handler the owning shard runs for an inbound
-/// [`LifecycleFrame::PartitionRead`]. server-ng wires it to its partitions
+/// [`LifecycleFrame::PartitionRead`]. The server wires it to its partitions
 /// plane; the handler pushes the result back over the carried reply sender.
 pub type PartitionReadHandler =
     Rc<dyn Fn(IggyNamespace, PartitionRead, Sender<PartitionReadReply>)>;
@@ -349,13 +379,14 @@ pub type PartitionReadHandler =
 /// deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Race `future` against a bus timer: `Some` if it finishes within `budget`,
-/// `None` if the timer fires first. Uses [`MessageBus::sleep`] (virtual under
-/// the simulator, wall-clock in production) rather than `compio::time::timeout`,
-/// which panics outside a compio runtime and so cannot run under the
-/// deterministic executor.
+/// Race `future` against a bus timer.
+///
+/// `Some` if it finishes within `budget`, `None` if the timer fires first.
+/// Uses [`MessageBus::sleep`] (virtual under the simulator, wall-clock in
+/// production) rather than `compio::time::timeout`, which panics outside a
+/// compio runtime and so cannot run under the deterministic executor.
 #[allow(clippy::future_not_send)]
-async fn bus_timeout<B, F>(bus: &B, budget: std::time::Duration, future: F) -> Option<F::Output>
+pub async fn bus_timeout<B, F>(bus: &B, budget: std::time::Duration, future: F) -> Option<F::Output>
 where
     B: MessageBus,
     F: Future,
@@ -499,6 +530,23 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Starting point for [`IggyShard::next_forward_nonce`]: the low half
+/// of this boot's consensus incarnation.
+///
+/// Forward nonces are node-local and never persisted, so a counter that starts
+/// at zero every boot re-mints the exact sequence the previous boot used. A
+/// forward answer still in flight across a restart would then match a nonce a
+/// DIFFERENT login now holds and confirm a login that never committed. The
+/// incarnation is fresh per boot, which moves the whole sequence.
+///
+/// Zero on shards owning no metadata consensus (they never forward) and
+/// wherever nothing set an incarnation, which degenerates to the unseeded
+/// sequence: no worse than before, and the shards that take it are test ones.
+#[allow(clippy::cast_possible_truncation)]
+fn forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
+    consensus.map_or(0, VsrConsensus::incarnation) as u64
 }
 
 /// Lifecycle frame variants.
@@ -689,9 +737,14 @@ pub enum ShardFrame {
     /// receiver still validates `target_shard == self.id` and drops
     /// frames stamped for the wrong shard (`MISROUTED`) to preserve the
     /// single-pump invariant under any caller bug.
+    ///
+    /// Carries the bag the router already classified, not the raw frame: the
+    /// receiving pump dispatches straight off the variant instead of re-running
+    /// `bytemuck::checked::try_from_bytes` plus the header's `validate()` on
+    /// bytes this process validated one hop ago.
     Consensus {
         target_shard: u16,
-        message: Message<GenericHeader>,
+        message: MessageBag,
     },
     /// A connection setup or cross-shard forward frame. Drop recovery
     /// depends on the frame class: [`LifecycleFrame::ForwardReplicaSend`]
@@ -702,12 +755,19 @@ pub enum ShardFrame {
     Lifecycle(LifecycleFrame),
 }
 
+// Carrying the classified bag widens the Consensus variant (32 B against the
+// 24 B of the `Message<GenericHeader>` it was classified from), which is free
+// only while `LifecycleFrame` remains what sizes the union. Every shard inbox
+// holds thousands of these, so a regression would surface as queue memory
+// rather than as a failing test.
+const _: () = assert!(std::mem::size_of::<ShardFrame>() == std::mem::size_of::<LifecycleFrame>());
+
 impl ShardFrame {
     /// Create a consensus frame addressed to `target_shard`. The sender
     /// is the routing authority; `accept_frame_for_self` compares this
     /// stamp against the receiving shard id in O(1).
     #[must_use]
-    pub const fn consensus(target_shard: u16, message: Message<GenericHeader>) -> Self {
+    pub const fn consensus(target_shard: u16, message: MessageBag) -> Self {
         Self::Consensus {
             target_shard,
             message,
@@ -728,7 +788,7 @@ impl ShardFrame {
 /// the receiver pulls the window chunk by chunk instead (each walked
 /// `RepairDone` immediately requests the next chunk while progress holds).
 ///
-/// Runtime default; server-ng overrides the live ceiling per shard from
+/// Runtime default; the server overrides the live ceiling per shard from
 /// `[cluster] repair_chunk_max` at bootstrap.
 pub const REPAIR_CHUNK_MAX: u64 = 128;
 
@@ -865,7 +925,7 @@ const SEGMENT_SIZE_CEILING_BYTES: u64 = 1 << 30;
 /// The most one segment can overshoot its size cap: rotation checks the cap
 /// AFTER appending, so a segment closes at most one maximum-size batch past it.
 ///
-/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: server-ng never
+/// Derived from the BUS frame cap, not `MAX_PAYLOAD_SIZE`: the server never
 /// enforces the latter (its only enforcement sites are the legacy server and the
 /// SDK batch types), so the largest appendable batch is whatever the message bus
 /// will frame. This tracks the shipped `message_bus.max_message_size` default; an
@@ -878,7 +938,7 @@ const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// Mirrors `[partition] transfer_artifact_bytes_max`. Free const so the config
 /// crate's copy can be pinned to it by a `const _: () = assert!(..)` at the
-/// server-ng build edge, the way every other runtime default is.
+/// server build edge, the way every other runtime default is.
 pub const PARTITION_ARTIFACT_LEN_DEFAULT: u64 =
     SEGMENT_SIZE_CEILING_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
 
@@ -1179,6 +1239,28 @@ where
     /// See [`ServedSegmentCache`].
     served_segment_cache: RefCell<ServedSegmentCache>,
 
+    /// Logins this node forwarded to the primary and is still waiting on, keyed
+    /// by the `(nonce, client)` pair stamped into the `ForwardRegister` frame.
+    /// Shard 0 only, since that is where the forward is issued and where the
+    /// result routes back to. Entries are removed at exactly three points --
+    /// result delivery, forward timeout, and a failed send -- so an abandoned
+    /// login cannot leak one.
+    ///
+    /// The client id is part of the key rather than payload the ingest compares:
+    /// an answer echoing a client the nonce was never parked for is then exactly
+    /// as unroutable as one carrying an unknown nonce, and the miss leaves the
+    /// legitimate entry parked instead of evicting it.
+    register_forwards: RefCell<HashMap<(u128, u128), Sender<ForwardRegisterResultHeader>>>,
+
+    /// Logouts this node forwarded to the primary and is still waiting on.
+    logout_forwards: RefCell<HashMap<(u128, u128), Sender<ForwardLogoutResultHeader>>>,
+
+    /// Monotonic source of forwarding nonces. Node-local: the
+    /// nonce only has to distinguish this node's own in-flight forwards, across
+    /// its restarts as well as within one boot. Seeded by
+    /// [`forward_nonce_seed`].
+    forward_nonce: Cell<u64>,
+
     /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
     /// these (it owns the metadata consensus group); peers send them here
     /// via [`Self::forward_metadata_submit`]. Defaults to a no-op for the
@@ -1186,13 +1268,13 @@ where
     on_metadata_submit: MetadataSubmitHandler,
 
     /// Handler for inbound [`LifecycleFrame::ListClients`] broadcast
-    /// queries. Every shard receives these (not just shard 0); server-ng
+    /// queries. Every shard receives these (not just shard 0); the server
     /// wires it to its per-shard `SessionManager`. Defaults to a no-op for
     /// the simulator stub ctor.
     on_list_clients: ListClientsHandler,
 
     /// Handler for inbound [`LifecycleFrame::PartitionRead`] queries.
-    /// server-ng wires it to this shard's partitions plane. Defaults to a
+    /// The server wires it to this shard's partitions plane. Defaults to a
     /// no-op for the simulator stub ctor.
     on_partition_read: PartitionReadHandler,
 
@@ -1288,30 +1370,30 @@ where
     shard_park_shedding: Cell<bool>,
 
     /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
-    /// to [`REPAIR_CHUNK_MAX`]; server-ng overrides it from
+    /// to [`REPAIR_CHUNK_MAX`]; the server overrides it from
     /// `[cluster] repair_chunk_max` at bootstrap.
     repair_chunk_max: Cell<u64>,
 
     /// Live stalled-repair retry threshold in consensus ticks. Defaults to
-    /// [`partitions::REPAIR_RETRY_TICKS`]; server-ng overrides it from
+    /// [`partitions::REPAIR_RETRY_TICKS`]; the server overrides it from
     /// `[cluster] repair_retry_interval` at bootstrap.
     repair_retry_ticks: Cell<u32>,
 
     /// Live `[partition] transfer_served_cache_bytes_max`: the byte budget for
     /// segment payloads this shard keeps resident to serve chunk requests.
-    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; server-ng
+    /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; the server
     /// overrides it at bootstrap.
     served_segment_cache_bytes_max: Cell<u64>,
 
     /// Live `[partition] transfer_artifact_bytes_max`: the alloc ceiling for one
     /// RECEIVED artifact. Defaults to [`PARTITION_ARTIFACT_LEN_DEFAULT`];
-    /// server-ng overrides it at bootstrap.
+    /// the server overrides it at bootstrap.
     partition_artifact_len_max: Cell<u64>,
 
     /// Live `[message_bus] max_message_size`. Bounds a served state chunk: a
     /// frame above this is rejected by the RECEIVING transport, which tears
     /// down the whole replica connection. Defaults to a value that leaves
-    /// [`STATE_CHUNK_LEN`] usable; server-ng overrides it at bootstrap.
+    /// [`STATE_CHUNK_LEN`] usable; the server overrides it at bootstrap.
     bus_max_message_size: Cell<usize>,
 
     /// Consecutive metadata state-transfer rounds that made no progress.
@@ -1405,6 +1487,7 @@ where
             u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
+        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         Ok(Self {
@@ -1435,6 +1518,9 @@ where
             state_transfer_offers: RefCell::new(HashMap::new()),
             partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
+            register_forwards: RefCell::new(HashMap::new()),
+            logout_forwards: RefCell::new(HashMap::new()),
+            forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
@@ -1476,6 +1562,56 @@ where
     /// the simulator and tests keep the compile-time default.
     pub fn set_bus_max_message_size(&self, max_message_size: usize) {
         self.bus_max_message_size.set(max_message_size);
+    }
+
+    /// Mint a fresh, never-zero nonce for a register or logout forward.
+    ///
+    /// `replica` rides the high half, which separates the nonce spaces of
+    /// different NODES: a result frame that somehow arrives from the wrong node
+    /// cannot collide with a live entry. Successive boots of THIS node are
+    /// separated by the counter's incarnation seed instead.
+    ///
+    /// The counter skips zero on wrap: both forwarding headers reject a zero
+    /// nonce in `validate`, so a wrapped counter would have the origin build a
+    /// frame the primary drops.
+    pub fn next_forward_nonce(&self, replica: u8) -> u128 {
+        let counter = self.forward_nonce.get().wrapping_add(1).max(1);
+        self.forward_nonce.set(counter);
+        (u128::from(replica) << 64) | u128::from(counter)
+    }
+
+    /// Park a forwarded login under `(nonce, client)` until the primary answers.
+    pub fn park_register_forward(
+        &self,
+        nonce: u128,
+        client: u128,
+        reply: Sender<ForwardRegisterResultHeader>,
+    ) {
+        self.register_forwards
+            .borrow_mut()
+            .insert((nonce, client), reply);
+    }
+
+    /// Drop a parked login (timeout, or a forward that never left the node).
+    pub fn cancel_register_forward(&self, nonce: u128, client: u128) {
+        self.register_forwards.borrow_mut().remove(&(nonce, client));
+    }
+
+    /// Park a forwarded logout under `(nonce, client)` until the primary answers.
+    pub fn park_logout_forward(
+        &self,
+        nonce: u128,
+        client: u128,
+        reply: Sender<ForwardLogoutResultHeader>,
+    ) {
+        self.logout_forwards
+            .borrow_mut()
+            .insert((nonce, client), reply);
+    }
+
+    /// Drop a parked logout after timeout or a failed send.
+    pub fn cancel_logout_forward(&self, nonce: u128, client: u128) {
+        self.logout_forwards.borrow_mut().remove(&(nonce, client));
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -1653,6 +1789,7 @@ where
         // with the current type setup; revisit when crossfire grows an
         // unbounded variant or we replace it.
         let (_tx, inbox) = channel(1);
+        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         Self {
@@ -1689,6 +1826,9 @@ where
             state_transfer_offers: RefCell::new(HashMap::new()),
             partition_offer_builds: RefCell::new(HashMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
+            register_forwards: RefCell::new(HashMap::new()),
+            logout_forwards: RefCell::new(HashMap::new()),
+            forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
@@ -1773,6 +1913,34 @@ where
             return;
         };
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply));
+    }
+
+    /// `true` when an `InsertOwned` for `namespace` is built and queued but not
+    /// yet applied.
+    ///
+    /// The reconciler's own "already handled" test is `IggyPartitions::contains`,
+    /// which only turns true once the pump applies, so without this a pass run
+    /// during that lag rebuilds a namespace an earlier pass already built. The
+    /// queue IS the record of that in-flight work, so asking it cannot drift
+    /// from reality the way a parallel set would: every op leaves the queue
+    /// through `apply_reconcile_ops`, which either inserts or discards.
+    ///
+    /// Deliberately blind to `epoch`. Matching it would let a delete + recreate
+    /// landing inside the lag build a second incarnation over the queued one's
+    /// on-disk path, which is the case this exists to prevent; the recreate is
+    /// not lost, it costs one pass. The queued (dead-epoch) op applies, and the
+    /// next pass reads the epoch mismatch off the routing row and takes the
+    /// stale-incarnation teardown into a clean rebuild.
+    pub fn has_staged_insert_owned(&self, namespace: IggyNamespace) -> bool {
+        self.reconcile_queue.borrow().iter().any(|op| {
+            matches!(
+                op,
+                ReconcileOp::InsertOwned {
+                    namespace: staged_namespace,
+                    ..
+                } if *staged_namespace == namespace
+            )
+        })
     }
 
     /// Stage a segment-cleaner pass for `namespace` on this shard's pump. The
@@ -1882,18 +2050,30 @@ where
                     epoch,
                 } => {
                     // Idempotent apply, mirroring `ConfirmRemove` (idempotent
-                    // via `remove`'s `None` early-return). The reconciler
-                    // stages this from a task separate from the pump, so under
-                    // a commit burst two passes can each observe
-                    // `!contains(ns)` and build the same namespace before
-                    // either drains here. A second unconditional `insert`
-                    // would push a duplicate partition and overwrite the
-                    // `ns -> idx` entry, orphaning the first (its VSR group +
-                    // segment writers leak and `len` inflates). The discarded
-                    // build is a fresh empty incarnation over the same on-disk
-                    // path the kept one owns, so dropping it just closes a few
-                    // fds.
+                    // via `remove`'s `None` early-return). An unconditional
+                    // `insert` over a live namespace would push a duplicate
+                    // partition and overwrite the `ns -> idx` entry, orphaning
+                    // the first: its VSR group + segment writers leak and `len`
+                    // inflates.
+                    //
+                    // A backstop, not the mechanism. `reconcile_additions`
+                    // skips a namespace whose `InsertOwned` is already staged
+                    // ([`Self::has_staged_insert_owned`]), so a second op for a
+                    // live namespace should not be built at all. Dropping one
+                    // here is damage control rather than a free no-op: the
+                    // build already planted its initial segment over the live
+                    // incarnation's path and folded that into the namespace's
+                    // shared stats.
                     if partitions.contains(&namespace) {
+                        tracing::error!(
+                            shard = self_shard_id,
+                            ns_raw = namespace.inner(),
+                            epoch,
+                            "discarding duplicate InsertOwned for a live namespace: the \
+                             staged-op guard was bypassed and the build re-planted segment 0 \
+                             over the live incarnation's path"
+                        );
+                        self.metrics.record_duplicate_partition_build_discarded();
                         drop(partition);
                         continue;
                     }
@@ -2216,17 +2396,11 @@ where
     ///
     /// Routes requests, replication messages, and acks to either the metadata
     /// plane or the partitions plane based on `PlaneIdentity::is_applicable`.
-    //
-    // TODO(hubcio): perf - this `MessageBag::try_from` is the second parse of
-    // the same frame; the first ran in `IggyShard::dispatch` (router.rs ~85)
-    // to extract (operation, namespace) for routing. The work here re-runs
-    // `bytemuck::checked::try_from_bytes` + per-header `validate()` on bytes
-    // already validated upstream. See the matching TODO in router.rs for the
-    // fix: thread the classified `MessageBag` through `ShardFrame::Consensus`
-    // so this function takes the bag directly and the match below dispatches
-    // without re-parsing.
+    ///
+    /// Takes the bag `IggyShard::dispatch` classified, so the frame is parsed
+    /// once per hop rather than once for routing and again for dispatch.
     #[allow(clippy::future_not_send)]
-    pub async fn on_message(&self, message: Message<GenericHeader>)
+    pub async fn on_message(&self, message: MessageBag)
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -2245,9 +2419,13 @@ where
             >,
         T: ShardsTable,
     {
-        match MessageBag::try_from(message) {
-            Ok(MessageBag::Request(request)) => {
-                let routing = (request.header().operation, request.header().namespace);
+        match message {
+            MessageBag::Request(request) => {
+                // One header read for the pair; `header()` casts on every call.
+                let routing = {
+                    let header = request.header();
+                    (header.operation, header.group)
+                };
                 match self.park_if_unmaterialised(request, routing.0, routing.1) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
@@ -2271,8 +2449,11 @@ where
                     ParkOutcome::Parked => {}
                 }
             }
-            Ok(MessageBag::Prepare(prepare)) => {
-                let routing = (prepare.header().operation, prepare.header().namespace);
+            MessageBag::Prepare(prepare) => {
+                let routing = {
+                    let header = prepare.header();
+                    (header.operation, header.group)
+                };
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -2311,26 +2492,100 @@ where
                     ParkOutcome::Overflow(_) | ParkOutcome::Parked => {}
                 }
             }
-            Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
-            Ok(MessageBag::StartViewChange(msg)) => self.on_start_view_change(msg).await,
-            Ok(MessageBag::DoViewChange(msg)) => self.on_do_view_change(msg).await,
-            Ok(MessageBag::StartView(msg)) => self.on_start_view(msg).await,
-            Ok(MessageBag::Commit(ref msg)) => self.on_commit(msg).await,
-            Ok(MessageBag::RequestStartView(ref msg)) => self.on_request_start_view(msg).await,
-            Ok(MessageBag::RequestPrepares(ref msg)) => self.on_request_prepares(msg).await,
-            Ok(MessageBag::RepairPrepare(msg)) => self.on_repair_prepare(msg).await,
-            Ok(MessageBag::RepairRangeReply(ref msg)) => self.on_repair_range_reply(msg).await,
-            Ok(MessageBag::RequestStateTransfer(ref msg)) => {
+            MessageBag::PrepareOk(prepare_ok) => self.on_ack(prepare_ok).await,
+            MessageBag::StartViewChange(msg) => self.on_start_view_change(msg).await,
+            MessageBag::DoViewChange(msg) => self.on_do_view_change(msg).await,
+            MessageBag::StartView(msg) => self.on_start_view(msg).await,
+            MessageBag::Commit(ref msg) => self.on_commit(msg).await,
+            MessageBag::RequestStartView(ref msg) => self.on_request_start_view(msg).await,
+            MessageBag::RequestPrepares(ref msg) => self.on_request_prepares(msg).await,
+            MessageBag::RepairPrepare(msg) => self.on_repair_prepare(msg).await,
+            MessageBag::RepairRangeReply(ref msg) => self.on_repair_range_reply(msg).await,
+            MessageBag::RequestStateTransfer(ref msg) => {
                 self.on_request_state_transfer(msg).await;
             }
-            Ok(MessageBag::StateTransferTarget(ref msg)) => {
+            MessageBag::StateTransferTarget(ref msg) => {
                 self.on_state_transfer_target(msg).await;
             }
-            Ok(MessageBag::RequestStateChunk(ref msg)) => self.on_request_state_chunk(msg).await,
-            Ok(MessageBag::StateChunk(ref msg)) => self.on_state_chunk(msg).await,
-            Err(e) => {
-                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+            MessageBag::RequestStateChunk(ref msg) => self.on_request_state_chunk(msg).await,
+            MessageBag::StateChunk(ref msg) => self.on_state_chunk(msg).await,
+            // A forwarded proposal must leave the pump because its commit is
+            // driven by this same pump. The metadata-submit handler spawns it.
+            MessageBag::ForwardRegister(ref msg) => self.on_forward_register(*msg.header()),
+            MessageBag::ForwardRegisterResult(ref msg) => {
+                self.on_forward_register_result(*msg.header());
             }
+            MessageBag::ForwardLogout(ref msg) => self.on_forward_logout(*msg.header()),
+            MessageBag::ForwardLogoutResult(ref msg) => {
+                self.on_forward_logout_result(*msg.header());
+            }
+        }
+    }
+
+    fn on_forward_register(&self, header: ForwardRegisterHeader) {
+        if !self.peer_is_known(header.replica, "ForwardRegister") {
+            return;
+        }
+        debug_assert_eq!(
+            self.id, 0,
+            "ForwardRegister routes to the metadata consensus owner"
+        );
+        (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
+            vsr_client_id: header.client,
+            user_id: header.user_id,
+            nonce: header.nonce,
+            origin_replica: header.replica,
+        });
+    }
+
+    fn on_forward_register_result(&self, header: ForwardRegisterResultHeader) {
+        let waiter = self
+            .register_forwards
+            .borrow_mut()
+            .remove(&(header.nonce, header.client));
+        if let Some(waiter) = waiter {
+            let _ = waiter.try_send(header);
+        } else {
+            tracing::debug!(
+                shard = self.id,
+                nonce = header.nonce,
+                client = header.client,
+                "dropping forward-register result with no parked login"
+            );
+        }
+    }
+
+    fn on_forward_logout(&self, header: ForwardLogoutHeader) {
+        if !self.peer_is_known(header.replica, "ForwardLogout") {
+            return;
+        }
+        debug_assert_eq!(
+            self.id, 0,
+            "ForwardLogout routes to the metadata consensus owner"
+        );
+        (self.on_metadata_submit)(MetadataSubmit::ForwardedLogout {
+            vsr_client_id: header.client,
+            session: header.session,
+            request: header.request,
+            nonce: header.nonce,
+            origin_replica: header.replica,
+        });
+    }
+
+    fn on_forward_logout_result(&self, header: ForwardLogoutResultHeader) {
+        let waiter = self
+            .logout_forwards
+            .borrow_mut()
+            .remove(&(header.nonce, header.client));
+        if let Some(waiter) = waiter {
+            let _ = waiter.try_send(header);
+        } else {
+            tracing::debug!(
+                shard = self.id,
+                nonce = header.nonce,
+                client = header.client,
+                "dropping forward-logout result with no parked request"
+            );
         }
     }
 
@@ -2554,7 +2809,27 @@ where
         while let Some(frame) = remaining.next() {
             let passes = frame.passes;
             let parked_epoch = frame.epoch;
-            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, frame.message)) else {
+            // Parked frames are stored generic (the buffer holds every variant
+            // in one Vec), so re-entering the pump costs one classify. That is
+            // the rare path -- a post-`CreateTopic` convergence window, not the
+            // per-message steady state the bag handoff exists for.
+            let bag = match MessageBag::try_from(frame.message) {
+                Ok(bag) => bag,
+                Err(error) => {
+                    // The frame classified once already, on the way in, so this
+                    // is unreachable short of memory corruption. Dropping it
+                    // costs a client retry; panicking on the reconciler's path
+                    // would take the shard down.
+                    tracing::error!(
+                        shard = self.id,
+                        namespace_raw = namespace.inner(),
+                        %error,
+                        "parked partition frame no longer classifies; dropping it"
+                    );
+                    continue;
+                }
+            };
+            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, bag)) else {
                 continue;
             };
             let (refused, disconnected) = match error {
@@ -2567,7 +2842,7 @@ where
             let refused_frame = ParkedFrame {
                 epoch: parked_epoch,
                 passes,
-                message,
+                message: message.into_generic(),
             };
             if disconnected {
                 // Pump gone: re-parking holds the frame until process exit, and
@@ -2708,7 +2983,7 @@ where
     /// `frame_drops_total{variant=partition,reason=park_dropped}`.
     fn deny_parked_client_request(&self, frame: ParkedFrame) -> bool {
         if frame.message.header().command == Command2::Request
-            && let Ok(request) = frame.message.try_into_typed::<RequestHeader>()
+            && let Ok(request) = frame.message.try_into_typed::<RoutedRequestHeader>()
         {
             return self.stage_transient_deny(request.header());
         }
@@ -2913,7 +3188,7 @@ where
     /// budget. Sent directly over the bus; delivery failure is terminal for
     /// this reply (the client recovers via its own read-timeout).
     #[allow(clippy::future_not_send)]
-    async fn deny_partition_request_transient(&self, request_header: &RequestHeader) {
+    async fn deny_partition_request_transient(&self, request_header: &RoutedRequestHeader) {
         let reply = build_deny_reply_from_request_header(
             request_header,
             IggyError::TransientNotAccepted.as_code(),
@@ -2950,7 +3225,7 @@ where
     ///
     /// Returns whether the pump took it. A shard with no sender stages nothing,
     /// so assuming success logs an answer for a request destroyed unanswered.
-    fn stage_transient_deny(&self, request_header: &RequestHeader) -> bool {
+    fn stage_transient_deny(&self, request_header: &RoutedRequestHeader) -> bool {
         let reply = build_deny_reply_from_request_header(
             request_header,
             IggyError::TransientNotAccepted.as_code(),
@@ -2983,7 +3258,7 @@ where
     }
 
     #[allow(clippy::future_not_send)]
-    pub async fn on_request(&self, request: Message<RequestHeader>)
+    pub async fn on_request(&self, request: Message<RoutedRequestHeader>)
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -3134,7 +3409,7 @@ where
     /// production runtime path; bootstrap recovery uses `load_partition`),
     /// so it must never run in production. VSR replica id comes from
     /// `PartitionConsensusConfig`, not `self.id` (the local shard index). A
-    /// `-p iggy-server-ng` build excludes the `simulator` feature and this
+    /// `-p iggy-server` build excludes the `simulator` feature and this
     /// method; `cargo build --workspace` compiles it in but with no
     /// production caller.
     /// `superblock` is this group's durable `(view, log_view)` store. Passing
@@ -3201,7 +3476,7 @@ where
     }
 
     /// Resolve the single partition a VSR control frame addresses, keyed by
-    /// `header.namespace`. Warns and returns `None` when the namespace matches
+    /// `header.group`. Warns and returns `None` when the namespace matches
     /// neither metadata nor a live partition consensus. Returns `&mut` because
     /// `on_do_view_change` / `on_commit` need it for `commit_journal`; the read-
     /// only callers reborrow `&`. Pump-only (sole mutator), so the `&mut` formed
@@ -3230,7 +3505,7 @@ where
             return None;
         };
         debug_assert_eq!(
-            partition.consensus().namespace(),
+            partition.consensus().group(),
             namespace,
             "keyed partition lookup must match the frame namespace"
         );
@@ -3255,8 +3530,9 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
+            refresh_metadata_dvc_suffix(consensus, planes.0.journal.as_ref());
             let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
             let (local_actions, wire_actions) = split_local_actions(actions);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &local_actions).await;
@@ -3268,13 +3544,14 @@ where
 
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "StartViewChange",
         ) else {
             return;
         };
+        refresh_partition_dvc_suffix(partition);
         let consensus = partition.consensus();
         let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
         let (local_actions, wire_actions) = split_local_actions(actions);
@@ -3304,9 +3581,20 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
-            let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
+            refresh_metadata_dvc_suffix(consensus, planes.0.journal.as_ref());
+            let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
+                tracing::warn!(
+                    shard = self.id,
+                    from_replica = header.replica,
+                    view = header.view,
+                    "dropping do_view_change whose body failed its checksum"
+                );
+                return;
+            };
+            let actions =
+                consensus.handle_do_view_change(PlaneKind::Metadata, &header, suffix_body);
             let (local_actions, wire_actions) = split_local_actions(actions);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &local_actions).await;
             if planes.0.persist_superblock_if_needed(consensus).await {
@@ -3327,15 +3615,25 @@ where
         let config = planes.1.0.config();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "DoViewChange",
         ) else {
             return;
         };
+        refresh_partition_dvc_suffix(partition);
         let consensus = partition.consensus();
-        let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
+        let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
+            tracing::warn!(
+                shard = self.id,
+                from_replica = header.replica,
+                view = header.view,
+                "dropping do_view_change whose body failed its checksum"
+            );
+            return;
+        };
+        let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header, suffix_body);
         let (local_actions, wire_actions) = split_local_actions(actions);
         // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
@@ -3357,8 +3655,7 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn on_start_view(&self, msg: Message<StartViewHeader>)
     where
         B: MessageBus,
@@ -3374,15 +3671,31 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
-            let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
+            let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
+                tracing::warn!(
+                    shard = self.id,
+                    from_replica = header.replica,
+                    view = header.view,
+                    "dropping start_view whose body failed its checksum"
+                );
+                return;
+            };
+            let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, suffix_body);
             // Every rejection path (wrong primary, old view, stale incarnation,
             // below the commit floor, self-sent) returns no actions, and an
             // adopted StartView always emits at least `CommitJournal`. That
             // makes emptiness the adoption signal -- and the arms below must
             // not fire on a StartView this replica did not adopt.
             let adopted = !actions.is_empty();
+            if adopted {
+                // First chance to spot a local entry disagreeing with the view's log.
+                // Ahead of the local dispatch below: it truncates the journal that
+                // `RebuildPipeline` reads back, so a rebuild before it would seed the
+                // pipeline from the entries this is about to drop.
+                self.reconcile_metadata_view_divergence().await;
+            }
             let (local_actions, wire_actions) = split_local_actions(actions);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &local_actions).await;
             if planes.0.persist_superblock_if_needed(consensus).await {
@@ -3460,24 +3773,40 @@ where
         // entirely, but `IggyPartition::transfer` is `pub` and cleared inside the
         // partitions crate, so an externally maintained count would drift; that
         // refactor is a prerequisite, not a detail.)
-        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.namespace)
-        {
+        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.group) {
             self.partition_transfers_inflight()
         } else {
             0
         };
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "StartView",
         ) else {
             return;
         };
-        let consensus = partition.consensus();
-        let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
+        let Some(suffix_body) = control_suffix_body_verified(&msg, header.checksum_body) else {
+            tracing::warn!(
+                shard = self.id,
+                from_replica = header.replica,
+                view = header.view,
+                "dropping start_view whose body failed its checksum"
+            );
+            return;
+        };
+        let actions =
+            partition
+                .consensus()
+                .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
+        if adopted && let Some(pending) = partition.consensus().pending_view_log() {
+            // Ahead of the local dispatch, which rebuilds the pipeline out of the
+            // journal this rewrites. Same position as the metadata arm's twin.
+            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+        }
+        let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
         // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
         // executes there (`dispatch_vsr_actions` bails on `journal: None`)
@@ -3496,7 +3825,7 @@ where
         {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 "adopted a live view while awaiting transfer; requesting partition state transfer"
             );
@@ -3550,7 +3879,7 @@ where
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             match consensus.handle_commit(&header) {
                 CommitOutcome::Advanced => {
@@ -3598,7 +3927,7 @@ where
         let config = planes.1.0.config();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
-            header.namespace,
+            header.group,
             header.view,
             header.replica,
             "Commit",
@@ -3652,7 +3981,7 @@ where
         let header = *msg.header();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &header);
             let (local_actions, wire_actions) = split_local_actions(actions);
@@ -3665,7 +3994,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -3709,9 +4038,16 @@ where
         let repair_chunk_max = self.repair_chunk_max.get();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
-            if !consensus.is_normal() {
+            // Served in `ViewChange` too: the replicas holding a missing body are
+            // exactly those in `ViewChange`, so refusing would deadlock the repair
+            // the new primary waits on. Read-only; the requester decides.
+            if consensus.is_transferring() {
+                // A transfer rewrites local state wholesale; journal not stable yet.
+                return;
+            }
+            if !matches!(consensus.status(), Status::Normal | Status::ViewChange) {
                 return;
             }
             let Some(journal) = planes.0.journal.as_ref() else {
@@ -3720,11 +4056,21 @@ where
             let journal = journal.handle();
             let cluster = consensus.cluster();
             let self_id = consensus.replica();
-            let to_op = header.to_op.min(consensus.commit_max());
+            let to_op = repair_serve_ceiling(
+                header.to_op,
+                consensus.commit_max(),
+                consensus.sequencer().current_sequence(),
+            );
             // Skip the compacted prefix (below the snapshot floor) in one
             // RangeEvicted notice, then serve contiguously until the range
             // ends or the WAL runs out.
-            let mut from_op = header.from_op;
+            //
+            // Floored, not just walked up to: `validate` asks only for
+            // `1 <= from_op <= to_op`, and the walk steps op by op with no `.await`,
+            // so a peer sending `from_op = 1` against a large compacted frontier pins
+            // the pump against a 10 ms tick. Nothing at or below the watermark is
+            // servable anyway. The partition arm jumps to `retained_from` likewise.
+            let mut from_op = header.from_op.max(journal.snapshot_op() + 1);
             #[allow(clippy::cast_possible_truncation)]
             while from_op <= to_op && journal.header(from_op as usize).is_none() {
                 from_op += 1;
@@ -3741,7 +4087,7 @@ where
                     Command2::RangeEvicted,
                     header.nonce,
                     from_op,
-                    header.namespace,
+                    header.group,
                 )
                 .await;
                 self.send_repair_range_reply(
@@ -3751,7 +4097,7 @@ where
                     Command2::RepairDone,
                     header.nonce,
                     header.from_op.saturating_sub(1),
-                    header.namespace,
+                    header.group,
                 )
                 .await;
                 return;
@@ -3764,7 +4110,7 @@ where
                     Command2::RangeEvicted,
                     header.nonce,
                     from_op,
-                    header.namespace,
+                    header.group,
                 )
                 .await;
             }
@@ -3793,16 +4139,13 @@ where
                 Command2::RepairDone,
                 header.nonce,
                 served_through,
-                header.namespace,
+                header.group,
             )
             .await;
             return;
         }
-        let Some(partition) = planes
-            .1
-            .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
-        else {
+        let namespace = IggyNamespace::from_raw(header.group);
+        let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
         if !partition.consensus().is_normal() {
@@ -3817,7 +4160,6 @@ where
         // Defer instead: no RepairDone is sent, the rejoiner's stall retry
         // re-asks, and the local purge (one reconciler wake away) installs
         // the floor the fence below serves behind.
-        let namespace = IggyNamespace::from_raw(header.namespace);
         let committed_purge = self
             .plane
             .metadata()
@@ -3832,7 +4174,7 @@ where
             self.metrics.record_partition_repair_serve_deferred();
             tracing::debug!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 committed_purge,
                 applied_purge = partition.applied_purge_generation(),
                 "deferring repair serve until the committed purge applies locally"
@@ -3876,7 +4218,7 @@ where
                 Command2::RangeEvicted,
                 header.nonce,
                 retained_from,
-                header.namespace,
+                header.group,
             )
             .await;
             from_op = retained_from;
@@ -3899,12 +4241,12 @@ where
             Command2::RepairDone,
             header.nonce,
             served_through,
-            header.namespace,
+            header.group,
         )
         .await;
         tracing::info!(
             shard = self.id,
-            namespace_raw = header.namespace,
+            namespace_raw = header.group,
             target,
             from_op = header.from_op,
             to_op,
@@ -3916,7 +4258,7 @@ where
     /// Ingest one repaired prepare. Metadata journals it into the WAL (the
     /// commit walk at `RepairDone` applies it); partitions journal + stage it
     /// through the same apply path as live replication, minus fence and ack.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn on_repair_prepare(&self, msg: Message<RepairPrepareHeader>)
     where
         B: MessageBus,
@@ -3930,7 +4272,7 @@ where
         tracing::debug!(
             shard = self.id,
             op = msg.header().0.op,
-            namespace_raw = msg.header().0.namespace,
+            namespace_raw = msg.header().0.group,
             "repair prepare received"
         );
         // Convert to a live-prepare frame exactly once, here at the apply
@@ -3946,7 +4288,7 @@ where
         let header = *msg.header();
         let planes = self.plane.inner();
         // Legacy acceptance: pre-upgrade metadata WAL entries were journaled
-        // before prepares stamped `consensus.namespace()`, and repair ships
+        // before prepares stamped `consensus.group()`, and repair ships
         // stored bytes verbatim, so without it a mixed-version metadata repair
         // re-ships the same 0-stamped entries forever.
         //
@@ -3960,15 +4302,58 @@ where
         // being metadata mutations, so `is_metadata` alone is too narrow), which
         // is why both sites share it rather than re-deriving the set.
         let metadata_plane_op = header.operation.is_metadata_plane();
-        let legacy_metadata_claim = header.namespace == 0 && metadata_plane_op;
+        let legacy_metadata_claim = header.group == 0 && metadata_plane_op;
         if let Some(ref consensus) = planes.0.consensus
-            && (consensus.namespace() == header.namespace || legacy_metadata_claim)
+            && (consensus.group() == header.group || legacy_metadata_claim)
         {
             let session = *self.metadata_repair.borrow();
             let Some(session) = session else {
                 return;
             };
-            if header.op > session.to_op || header.op <= consensus.commit_min() {
+            if header.op > session.to_op {
+                return;
+            }
+            let is_primary = consensus.is_primary_for_view(consensus.view());
+            let commit_min = consensus.commit_min();
+            // In place: runs once per repaired prepare, and the clone is two Vecs.
+            let in_scope = consensus
+                .with_pending_view_log(|pending| {
+                    repair_op_in_scope(Some(pending), is_primary, commit_min, header.op)
+                })
+                .unwrap_or_else(|| repair_op_in_scope(None, is_primary, commit_min, header.op));
+            if !in_scope {
+                return;
+            }
+            // Applies to both planes, and is why a backup parks a log at all. The
+            // view already decided which prepare belongs at this op; a different
+            // one forks the log. An op the parked log omits is unconstrained.
+            let disagrees = consensus
+                .with_pending_view_log(|pending| {
+                    pending
+                        .headers
+                        .iter()
+                        .chain(pending.committed_elsewhere.iter())
+                        .find(|expected| expected.op == header.op)
+                        .is_some_and(|expected| expected.checksum != header.checksum)
+                })
+                .unwrap_or(false);
+            if disagrees {
+                tracing::warn!(
+                    shard = self.id,
+                    op = header.op,
+                    "discarding repaired prepare that disagrees with the merged log"
+                );
+                return;
+            }
+            // Recompute both integrity fields before durable storage: everything
+            // above treats `header.checksum` as an opaque token, so a corrupted
+            // frame passes whenever its flipped value satisfies the comparisons.
+            if let Err(reason) = verify_prepare_integrity(&header, msg.as_slice()) {
+                tracing::warn!(
+                    shard = self.id,
+                    op = header.op,
+                    "discarding repaired prepare: {reason}"
+                );
                 return;
             }
             let Some(journal) = planes.0.journal.as_ref() else {
@@ -4017,7 +4402,7 @@ where
                 shard = self.id,
                 op = header.op,
                 operation = ?header.operation,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 "dropping a metadata-plane repair prepare this shard cannot journal"
             );
             return;
@@ -4025,10 +4410,22 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
+        // The partition arm reaches the WAL via `apply_repaired_prepare` with no
+        // view fence and no ack, so this is its only integrity gate. Without it a
+        // repaired partition prepare is journaled on the serving peer's word alone.
+        if let Err(reason) = verify_prepare_integrity(&header, msg.as_slice()) {
+            tracing::warn!(
+                shard = self.id,
+                op = header.op,
+                namespace_raw = header.group,
+                "discarding repaired partition prepare: {reason}"
+            );
+            return;
+        }
         partition.apply_repaired_prepare(msg).await;
     }
 
@@ -4050,7 +4447,7 @@ where
         let header = *msg.header();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
+            && consensus.group() == header.group
         {
             let session = *self.metadata_repair.borrow();
             let Some(session) = session else {
@@ -4090,7 +4487,7 @@ where
                             session.nonce,
                             commit_min + 1,
                             session.to_op,
-                            header.namespace,
+                            header.group,
                         )
                         .await;
                     }
@@ -4143,14 +4540,13 @@ where
         // Counted BEFORE the `&mut partition` below exists, and only when an arm
         // is possible at all: see the StartView site for why the scan is gated
         // rather than replaced with a counter.
-        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.namespace)
-        {
+        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.group) {
             self.partition_transfers_inflight()
         } else {
             0
         };
         let config = planes.1.0.config().clone();
-        let namespace = IggyNamespace::from_raw(header.namespace);
+        let namespace = IggyNamespace::from_raw(header.group);
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
@@ -4188,7 +4584,7 @@ where
             self.metrics.record_partition_repair_serve_deferred();
             tracing::debug!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 committed_purge,
                 applied_purge = partition.applied_purge_generation(),
                 command = ?header.command,
@@ -4227,7 +4623,7 @@ where
                         // arming here would defeat its backoff.
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             floor,
                             to_op,
                             peer = header.replica,
@@ -4253,7 +4649,7 @@ where
                         // the scheduled re-arm) owns recovery from here.
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             floor,
                             to_op,
                             "partition repair floor refused; transfer in flight or scheduled"
@@ -4264,7 +4660,7 @@ where
                 if partition.repair.is_none() {
                     tracing::info!(
                         shard = self.id,
-                        namespace_raw = header.namespace,
+                        namespace_raw = header.group,
                         through_op = header.op,
                         "partition journal repair complete"
                     );
@@ -4283,7 +4679,7 @@ where
                             nonce,
                             commit_min + 1,
                             to_op,
-                            header.namespace,
+                            header.group,
                         )
                         .await;
                     }
@@ -4319,8 +4715,9 @@ where
                 h.nonce = nonce;
                 h.from_op = from_op;
                 h.to_op = to_op;
-                h.namespace = namespace;
+                h.group = namespace;
                 h.size = size_of::<RequestPreparesHeader>() as u32;
+                h.seal();
             });
         if self
             .bus
@@ -4393,13 +4790,432 @@ where
                 h.replica = self_id;
                 h.nonce = nonce;
                 h.op = op;
-                h.namespace = namespace;
+                h.group = namespace;
                 h.size = size_of::<RepairRangeReplyHeader>() as u32;
+                h.seal();
             });
         let _ = self
             .bus
             .send_to_replica(target, msg.into_generic().into_frozen())
             .await;
+    }
+
+    /// Partition-plane twin of [`Self::advance_pending_metadata_view`].
+    ///
+    /// No `RequestPrepares` stream to arm: the partition journal is not durable
+    /// yet, so coverage either holds or a peer must retransmit. Same invariant
+    /// either way: the view does not start until this replica can serve its log.
+    #[allow(clippy::future_not_send)]
+    async fn advance_pending_partition_view(&self, namespace: IggyNamespace)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let partitions = self.plane.partitions();
+        let started = {
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                return;
+            };
+            if !partition
+                .consensus()
+                .is_primary_for_view(partition.consensus().view())
+            {
+                return;
+            }
+            let Some(pending) = partition.consensus().pending_view_log() else {
+                return;
+            };
+            // Before the scan can mean anything: the repair ingest skips an op it
+            // already holds a header for, so the scan would report a gap nothing
+            // fills. Backups reach this on StartView adoption; a primary-elect has no
+            // adoption to hang it off.
+            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            let consensus = partition.consensus();
+            // Identity, not presence: see the metadata twin. The floor is the local
+            // commit point, the partition twin of the metadata snapshot floor:
+            // `evict_prefix` clears the header vec for the flushed (committed)
+            // prefix, so a survivor that flushes on every commit holds NO resident
+            // header for the op the merged window opens on. Demanding one parks the
+            // primary-elect in `ViewChange` forever, and the rotation lands
+            // primaryship on whichever replica still has its window resident -- a
+            // fresh rejoiner with nothing but repair-ingested entries, which then
+            // cannot serve the state transfer it itself needs. A committed op
+            // cannot diverge from the merged log, and its bytes stay serveable
+            // from the evicted ring or the flushed segments.
+            let missing = {
+                let journal = partition.log.journal();
+                first_op_not_covered(&pending, consensus.commit_min(), |op| {
+                    journal.inner.header_by_op(op)
+                })
+            };
+            if let Some(missing_op) = missing {
+                tracing::debug!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    missing_op,
+                    op_head = pending.op_head,
+                    "partition view change waiting on op {missing_op} before starting the view"
+                );
+                return;
+            }
+
+            let actions = consensus.start_pending_view(PlaneKind::Partitions);
+            let (local_actions, wire_actions) = split_local_actions(actions);
+            // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
+            // executes there (`dispatch_vsr_actions` bails on `journal: None`)
+            // and `CommitJournal` is a no-op in both.
+            dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
+            // `start_pending_view` flips this replica into `Normal` for the new
+            // view, so the `StartView` it emits advertises a view the superblock
+            // must already record. Same gate as the `on_do_view_change` and
+            // `on_start_view` partition arms.
+            if partition.persist_superblock_if_needed().await {
+                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
+                dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
+            }
+            local_actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::CommitJournal))
+        };
+        if started {
+            let config = partitions.config();
+            if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                partition.commit_journal(config).await;
+            }
+        }
+    }
+
+    /// Re-request the remaining repair window when the stream has gone quiet.
+    ///
+    /// Repair frames are fire-and-forget, so a lost one leaves the session armed
+    /// forever with the commit walk pinned below the frontier.
+    #[allow(clippy::future_not_send)]
+    async fn retry_stalled_metadata_repair<P>(&self, consensus: &VsrConsensus<B, P>)
+    where
+        B: MessageBus,
+        P: Pipeline<Entry = consensus::PipelineEntry>,
+    {
+        // Stall retry (mirrors `tick_partitions`): a lost frame must not wedge it.
+        let repair_retry_ticks = self.repair_retry_ticks.get();
+        let stalled = {
+            // `ViewChange` too: a parked view change repairs toward its merged log
+            // and cannot start until the window fills. Gating on `Normal` alone
+            // defers a dropped frame to the 500-tick escalation.
+            let repairing_view =
+                consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view());
+            let mut session = self.metadata_repair.borrow_mut();
+            session.as_mut().and_then(|session| {
+                if !consensus.is_normal() && !repairing_view {
+                    return None;
+                }
+                session.idle_ticks += 1;
+                if session.idle_ticks < repair_retry_ticks {
+                    return None;
+                }
+                session.idle_ticks = 0;
+                Some((session.peer, session.nonce, session.to_op))
+            })
+        };
+        if let Some((peer, nonce, to_op)) = stalled {
+            // Primary-elect only. Its window starts at the merged log's commit
+            // point, which can sit below local `commit_min` (the headers inherited
+            // from senders behind the canonical log_view live there), so
+            // `commit_min + 1` would skip them. A backup's parked `StartView`
+            // suffix is only a verification reference; resuming from its commit
+            // point would restart at the view's opening head, not at the gap.
+            let from_op = consensus
+                .is_primary_for_view(consensus.view())
+                .then(|| consensus.with_pending_view_log(|pending| pending.commit_max.max(1)))
+                .flatten()
+                .unwrap_or_else(|| consensus.commit_min() + 1);
+            if from_op <= to_op {
+                tracing::info!(
+                    shard = self.id,
+                    from_op,
+                    to_op,
+                    peer,
+                    "metadata repair stalled; re-requesting remaining window"
+                );
+                self.send_request_prepares(
+                    consensus.cluster(),
+                    consensus.replica(),
+                    peer,
+                    nonce,
+                    from_op,
+                    to_op,
+                    consensus.group(),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Compare this replica's log against the headers the view decided, and drop or
+    /// report where they disagree.
+    ///
+    /// Without this, divergence is silent and permanent: the replica acks with its
+    /// own checksum, the primary rejects the ack, and journal repair skips an op
+    /// it already has a header for.
+    ///
+    /// Both roles. A backup runs it against the `StartView` suffix it adopted, the
+    /// primary-elect against the merged log before the coverage scan in
+    /// [`Self::advance_pending_metadata_view`]. The merge does NOT reconcile the
+    /// primary's log for it: nothing installs the merged headers into the journal,
+    /// `RebuildPipeline` reads the pipeline back out of it, and `CommitJournal`
+    /// applies whatever sits at each op up to the merged commit point.
+    ///
+    /// The split at the announced commit point is what matters. Above it a
+    /// disagreement is ordinary, so the entry is dropped and the primary's
+    /// retransmission refills the range. At or below it, this replica applied
+    /// something the view says was different, which only state transfer fixes, so
+    /// it is reported and left alone.
+    ///
+    /// Truncation uses `Journal::truncate_from`, not `drain`: `drain` advances
+    /// `snapshot_op` past what it removed, marking ops that must stay refillable
+    /// as evictable.
+    #[allow(clippy::future_not_send)]
+    async fn reconcile_metadata_view_divergence(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: MetadataStm,
+    {
+        let metadata = self.plane.metadata();
+        let Some(ref consensus) = metadata.consensus else {
+            return;
+        };
+        let Some(pending) = consensus.pending_view_log() else {
+            return;
+        };
+        let Some(journal) = metadata.journal.as_ref() else {
+            return;
+        };
+
+        // Truncation is safe only above what this replica has *applied*, which is
+        // not the view's commit point: `pending.commit_max` is the new primary's
+        // number and a backup can sit above it. Splitting on the view's number
+        // would drop already-executed ops with no rollback, and silently.
+        let applied_floor = pending.commit_max.max(consensus.commit_min());
+
+        let mut repairable_from: Option<u64> = None;
+        for canonical in &pending.headers {
+            let Some(local) = usize::try_from(canonical.op)
+                .ok()
+                .and_then(|slot| journal.handle().header(slot))
+            else {
+                continue;
+            };
+            if header_is_view_entry(&local, canonical) {
+                continue;
+            }
+            if canonical.op <= applied_floor {
+                tracing::error!(
+                    shard = self.id,
+                    op = canonical.op,
+                    view = consensus.view(),
+                    commit_max = pending.commit_max,
+                    commit_min = consensus.commit_min(),
+                    local_checksum = local.checksum,
+                    canonical_checksum = canonical.checksum,
+                    "committed op {} disagrees with the view that just started; this replica \
+                     applied a different op as committed and cannot be reconciled by log repair",
+                    canonical.op
+                );
+                continue;
+            }
+            repairable_from = Some(repairable_from.map_or(canonical.op, |op| op.min(canonical.op)));
+        }
+
+        // A suffix ABOVE the announced head is named by nobody, so the loop cannot
+        // see it, and it is exactly the log that AGREES in-window (restart and
+        // re-adopt), where `repairable_from` never arms. Adoption drops the head
+        // under it, and the next prepare at `op_head + 1` then collides in `append`,
+        // which refuses the slot even when the ops match. Floored at the applied
+        // point too: an executed op is not rollback-able whatever the head says.
+        let above_head = pending.op_head.max(applied_floor) + 1;
+        if journal
+            .handle()
+            .last_op()
+            .is_some_and(|last_op| last_op >= above_head)
+        {
+            repairable_from = Some(repairable_from.map_or(above_head, |op| op.min(above_head)));
+        }
+
+        let Some(from_op) = repairable_from else {
+            return;
+        };
+        // SERIALIZATION: the drain guard excludes `truncate_from` against `drain`,
+        // NOT against an append; that is metadata's private `journal_gate`. It holds
+        // by call-site placement, not construction: the pump is single-threaded, and
+        // both callers run with a view change parked, so no submit is admitted and no
+        // repair prepare is in flight for these ops. Routing shard-side journal
+        // mutations through gate-taking metadata methods would make it structural.
+        match journal.handle().truncate_from(from_op).await {
+            Ok(removed) => {
+                // The snapshot's `(op, commit)` tag does not move when entries are
+                // removed under it, so the next `DoViewChange` would advertise the
+                // dropped headers and offer bodies this replica cannot serve.
+                consensus.invalidate_local_dvc_suffix();
+                tracing::warn!(
+                    shard = self.id,
+                    from_op,
+                    removed,
+                    op_head = pending.op_head,
+                    view = consensus.view(),
+                    "dropped {removed} uncommitted entries from op {from_op} that disagreed with \
+                     the view's log; the primary's retransmission refills the range"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    shard = self.id,
+                    from_op,
+                    %error,
+                    "could not drop the diverging uncommitted entries from op {from_op}; journal \
+                     repair skips ops it already holds a header for, so this replica will not \
+                     converge at those ops until it is restarted"
+                );
+            }
+        }
+    }
+
+    /// Drive a parked view change to completion.
+    ///
+    /// A DVC quorum decides the log before this replica necessarily holds it, so
+    /// the merged log parks in consensus and this replica stays in `ViewChange`,
+    /// announcing and preparing nothing: `StartView` promises it can serve every
+    /// op it names, and a backup adopting that head asks for the bodies at once.
+    ///
+    /// Check coverage, then start the view or pull missing bodies from a peer that
+    /// offered them in its DVC. Only those peers: a cleared present bit means the
+    /// body was never held or cannot be read back.
+    #[allow(clippy::future_not_send)]
+    async fn advance_pending_metadata_view(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: MetadataStm,
+    {
+        let metadata = self.plane.metadata();
+        let Some(ref consensus) = metadata.consensus else {
+            return;
+        };
+        // Primary-elect only. A backup's parked `StartView` suffix is only what
+        // its ingest verifies bodies against; driving repair from it would put a
+        // rejoining node on the tail-repair path when its gap sits below every
+        // peer's retention floor, racing the view probe that picks state transfer.
+        if !consensus.is_primary_for_view(consensus.view()) {
+            return;
+        }
+        // Before the coverage scan, and a primary-elect's only shot at it: the repair
+        // ingest skips an op it already holds a header for, so a diverging entry would
+        // never be replaced. No-op when nothing diverges.
+        self.reconcile_metadata_view_divergence().await;
+        let Some(pending) = consensus.pending_view_log() else {
+            return;
+        };
+        let Some(journal) = metadata.journal.as_ref() else {
+            return;
+        };
+
+        // Floor on what this replica can be asked to hold before starting the view.
+        // Entries at or below the snapshot watermark are compacted, so no repair puts
+        // one back: demanding one parks the view change forever on an op already
+        // applied and durable in the snapshot.
+        let repair_floor = journal.handle().snapshot_op();
+        let missing = first_op_not_covered(&pending, repair_floor, |op| {
+            usize::try_from(op)
+                .ok()
+                .and_then(|slot| journal.handle().header(slot))
+                .map(|header| *header)
+        });
+
+        let Some(missing_op) = missing else {
+            let actions = consensus.start_pending_view(PlaneKind::Metadata);
+            let (local_actions, wire_actions) = split_local_actions(actions);
+            tracing::info!(
+                shard = self.id,
+                view = consensus.view(),
+                op_head = pending.op_head,
+                commit_max = pending.commit_max,
+                "merged log is locally serveable; starting the view"
+            );
+            // Locals run BEFORE the persist await. `start_pending_view` has
+            // already flipped this replica into a Normal primary, so yielding
+            // with a still-empty pipeline lets a concurrent client submit mint
+            // the next op below the inherited suffix, and the later rebuild
+            // then pushes out of sequence. The locals must also survive a
+            // failed persist, which fences only the wire sends.
+            dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &local_actions).await;
+            if metadata.persist_superblock_if_needed(consensus).await {
+                dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &wire_actions).await;
+            }
+            if local_actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::CommitJournal))
+                && !consensus.is_transferring()
+            {
+                metadata.commit_journal().await;
+            }
+            return;
+        };
+
+        if self.metadata_repair.borrow().is_some() {
+            // Stream already running; the stall retry covers it drying up.
+            return;
+        }
+        let sources = consensus.pending_view_body_sources(missing_op);
+        let Some(peer) = sources.first().copied() else {
+            // The merge only returns a startable log when some replica offered each
+            // body, so an empty source list means that offer was withdrawn (peer
+            // restarted, or moved on). Let the view-change timeout escalate.
+            tracing::warn!(
+                shard = self.id,
+                missing_op,
+                "no replica offers op {missing_op} for the merged log; view change is stalled"
+            );
+            return;
+        };
+
+        let nonce = iggy_common::random_id::get_uuid();
+        *self.metadata_repair.borrow_mut() = Some(MetadataRepairSession {
+            nonce,
+            to_op: pending.op_head,
+            peer,
+            idle_ticks: 0,
+        });
+        tracing::info!(
+            shard = self.id,
+            missing_op,
+            peer,
+            to_op = pending.op_head,
+            "repairing toward the merged log before starting the view"
+        );
+        self.send_request_prepares(
+            consensus.cluster(),
+            consensus.replica(),
+            peer,
+            nonce,
+            missing_op,
+            pending.op_head,
+            consensus.group(),
+        )
+        .await;
     }
 
     /// Start metadata tail journal-repair from `peer` when the commit walk
@@ -4438,7 +5254,7 @@ where
                 nonce,
                 from_op,
                 to_op,
-                consensus.namespace(),
+                consensus.group(),
             )
             .await;
         }
@@ -4461,8 +5277,9 @@ where
                     h.cluster = consensus.cluster();
                     h.replica = consensus.replica();
                     h.nonce = nonce;
-                    h.namespace = consensus.namespace();
+                    h.group = consensus.group();
                     h.size = size_of::<RequestStateTransferHeader>() as u32;
+                    h.seal();
                 });
         let _ = self
             .bus
@@ -4504,7 +5321,7 @@ where
             h.cluster = cluster;
             h.replica = self_id;
             h.nonce = nonce;
-            h.namespace = namespace;
+            h.group = namespace;
             h.size = total_size as u32;
             // The serving replica's own progress travels with every descriptor,
             // available or not: it is what lets a receiver refuse an offer from
@@ -4516,6 +5333,7 @@ where
                 h.available = 1;
                 h.commit_op = commit_op;
             }
+            h.seal();
         });
         let _ = self
             .bus
@@ -4547,11 +5365,12 @@ where
                 h.cluster = cluster;
                 h.replica = self_id;
                 h.nonce = nonce;
-                h.namespace = namespace;
+                h.group = namespace;
                 h.artifact = artifact;
                 h.offset = offset;
                 h.len = len;
                 h.size = size_of::<RequestStateChunkHeader>() as u32;
+                h.seal();
             });
         let _ = self
             .bus
@@ -4579,7 +5398,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_request_state_transfer(msg).await;
         }
@@ -4599,7 +5418,7 @@ where
         let cached = self
             .state_transfer_offers
             .borrow_mut()
-            .get_mut(&(header.namespace, header.replica))
+            .get_mut(&(header.group, header.replica))
             .filter(|served| served.nonce == header.nonce)
             .and_then(|served| {
                 let ServedOffer::Metadata(offer) = &served.offer else {
@@ -4623,7 +5442,7 @@ where
                 self_id,
                 header.replica,
                 header.nonce,
-                header.namespace,
+                header.group,
                 TransferDescriptor::available(
                     &offer.manifest(),
                     offer.commit_op,
@@ -4651,7 +5470,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::available(
                         &offer.manifest(),
                         offer.commit_op,
@@ -4661,7 +5480,7 @@ where
                 )
                 .await;
                 self.state_transfer_offers.borrow_mut().insert(
-                    (header.namespace, header.replica),
+                    (header.group, header.replica),
                     ServedStateTransfer {
                         nonce: header.nonce,
                         offer: ServedOffer::Metadata(offer),
@@ -4686,7 +5505,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::unavailable(
                         false,
                         consensus.view(),
@@ -4731,7 +5550,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_state_transfer_target(msg).await;
         }
@@ -4909,7 +5728,7 @@ where
                 consensus.replica(),
                 peer,
                 nonce,
-                consensus.namespace(),
+                consensus.group(),
                 artifact,
                 offset,
                 len,
@@ -5022,7 +5841,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_request_state_chunk(msg).await;
         }
@@ -5044,7 +5863,7 @@ where
         let reply = {
             let mut offers = self.state_transfer_offers.borrow_mut();
             let served = offers
-                .get_mut(&(header.namespace, header.replica))
+                .get_mut(&(header.group, header.replica))
                 .filter(|served| served.nonce == header.nonce);
             served.map_or(
                 Some(ChunkReply::Unavailable { transient: true }),
@@ -5094,10 +5913,11 @@ where
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.nonce = header.nonce;
-                            h.namespace = header.namespace;
+                            h.group = header.group;
                             h.artifact = header.artifact;
                             h.offset = header.offset;
                             h.size = total_size as u32;
+                            h.seal();
                         },
                     )))
                 },
@@ -5122,7 +5942,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::unavailable(
                         transient,
                         consensus.view(),
@@ -5164,7 +5984,7 @@ where
             .0
             .consensus
             .as_ref()
-            .is_some_and(|consensus| consensus.namespace() == header.namespace);
+            .is_some_and(|consensus| consensus.group() == header.group);
         if !metadata_frame {
             return self.on_partition_state_chunk(msg).await;
         }
@@ -5504,6 +6324,16 @@ where
             };
 
             let consensus = partition.consensus();
+            // Only while a view change is live. A `Normal` tick has no consumer:
+            // `start_election` records no DoViewChange, and every path that does
+            // either refreshes at its own call site (the SVC and DVC handlers,
+            // still `Normal` at that point) or runs in `ViewChange`.
+            //
+            // Ungated, this rebuilt a 128-entry window every 10 ms per advancing
+            // partition: a linear `header_by_op` scan per entry plus 32 KiB.
+            if consensus.status() != Status::Normal {
+                refresh_partition_dvc_suffix(partition);
+            }
             let actions = consensus.tick(PlaneKind::Partitions);
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
@@ -5516,6 +6346,9 @@ where
                 dispatch_vsr_actions::<B, _, MJ>(consensus, None, &wire_actions).await;
                 dispatch_partition_journal_actions(consensus, partition, &wire_actions).await;
             }
+
+            // Finish a view change whose quorum decided ahead of the local log.
+            self.advance_pending_partition_view(namespace).await;
 
             // Stall retry: repair frames are fire-and-forget, so a lost
             // frame (or a peer that went silent mid-stream) would leave the
@@ -5787,7 +6620,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -5801,7 +6634,7 @@ where
         let cached = self
             .state_transfer_offers
             .borrow_mut()
-            .get_mut(&(header.namespace, header.replica))
+            .get_mut(&(header.group, header.replica))
             .filter(|served| served.nonce == header.nonce)
             .and_then(|served| {
                 let ServedOffer::Partition(offer) = &served.offer else {
@@ -5818,14 +6651,14 @@ where
             Some(offer) => {
                 tracing::debug!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     "re-answering a partition state transfer request from the offer \
                      already served"
                 );
                 Some(offer)
             }
-            None if !self.may_serve_another_partition_transfer(header.namespace) => {
+            None if !self.may_serve_another_partition_transfer(header.group) => {
                 // Admission control, because the served-payload budget is a
                 // BYTE budget and the pulls that overrun it do not degrade
                 // gracefully. Each concurrent pull holds a different segment
@@ -5838,7 +6671,7 @@ where
                 // Refusing the surplus is what makes the admitted ones finish.
                 tracing::info!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     "already serving as many partition transfers as the served-payload \
                      budget holds; refusing until one completes"
@@ -5849,7 +6682,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     TransferDescriptor::unavailable(true, view, commit_max),
                 )
                 .await;
@@ -5861,15 +6694,15 @@ where
                 // and holds nothing in the offers map meanwhile.
                 self.partition_offer_builds
                     .borrow_mut()
-                    .insert(header.namespace, 0);
+                    .insert(header.group, 0);
                 match partition.state_transfer_offer(&config).await {
                     Ok(offer) => {
                         self.partition_offer_builds
                             .borrow_mut()
-                            .remove(&header.namespace);
+                            .remove(&header.group);
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             requester = header.replica,
                             commit_op = offer.commit_op,
                             artifacts = offer.artifact_count(),
@@ -5877,7 +6710,7 @@ where
                             "serving partition state transfer"
                         );
                         self.state_transfer_offers.borrow_mut().insert(
-                            (header.namespace, header.replica),
+                            (header.group, header.replica),
                             ServedStateTransfer {
                                 nonce: header.nonce,
                                 offer: ServedOffer::Partition(Rc::clone(&offer)),
@@ -5905,12 +6738,12 @@ where
                         if !building {
                             self.partition_offer_builds
                                 .borrow_mut()
-                                .remove(&header.namespace);
+                                .remove(&header.group);
                         }
                         let transient = reason.transient();
                         tracing::info!(
                             shard = self.id,
-                            namespace_raw = header.namespace,
+                            namespace_raw = header.group,
                             requester = header.replica,
                             transient,
                             %reason,
@@ -5922,7 +6755,7 @@ where
                             self_id,
                             header.replica,
                             header.nonce,
-                            header.namespace,
+                            header.group,
                             TransferDescriptor::unavailable(transient, view, commit_max),
                         )
                         .await;
@@ -5946,7 +6779,7 @@ where
             self_id,
             header.replica,
             header.nonce,
-            header.namespace,
+            header.group,
             TransferDescriptor::available(&offer.manifest(), offer.commit_op, view, commit_max),
         )
         .await;
@@ -5985,11 +6818,7 @@ where
             return;
         }
         let planes = self.plane.inner();
-        let Some(partition) = planes
-            .1
-            .0
-            .get_by_ns(&IggyNamespace::from_raw(header.namespace))
-        else {
+        let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group)) else {
             return;
         };
         let cluster = partition.consensus().cluster();
@@ -6001,7 +6830,7 @@ where
             let attempt = 'attempt: {
                 let mut offers = self.state_transfer_offers.borrow_mut();
                 let served = offers
-                    .get_mut(&(header.namespace, header.replica))
+                    .get_mut(&(header.group, header.replica))
                     .filter(|served| served.nonce == header.nonce);
                 let Some(served) = served else {
                     break 'attempt ChunkAttempt::Reply(Some(ChunkReply::Unavailable {
@@ -6025,7 +6854,7 @@ where
                         match self
                             .served_segment_cache
                             .borrow_mut()
-                            .get(header.namespace, source.entry.checksum)
+                            .get(header.group, source.entry.checksum)
                         {
                             Some(payload) => {
                                 segment_payload = payload;
@@ -6062,7 +6891,7 @@ where
                     // the serving side's proof that the pull ran to completion.
                     tracing::info!(
                         shard = self.id,
-                        namespace_raw = header.namespace,
+                        namespace_raw = header.group,
                         requester = header.replica,
                         "partition state transfer fully served"
                     );
@@ -6077,10 +6906,14 @@ where
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.nonce = header.nonce;
-                        h.namespace = header.namespace;
+                        h.group = header.group;
                         h.artifact = header.artifact;
                         h.offset = header.offset;
                         h.size = total_size as u32;
+                        // `StateChunk` is `FRAME_SEALED`: the receiver's router
+                        // drops an unsealed frame before any handler sees it, so
+                        // a missing seal starves the pull silently.
+                        h.seal();
                     },
                 ))))
             };
@@ -6100,7 +6933,7 @@ where
                     let reason = match loaded {
                         Ok(bytes) => {
                             self.served_segment_cache.borrow_mut().insert(
-                                header.namespace,
+                                header.group,
                                 entry.checksum,
                                 Rc::new(bytes),
                                 self.served_segment_cache_bytes_max.get(),
@@ -6116,7 +6949,7 @@ where
                     let transient = reason.transient();
                     tracing::warn!(
                         shard = self.id,
-                        namespace_raw = header.namespace,
+                        namespace_raw = header.group,
                         artifact = header.artifact,
                         path = %log_path,
                         transient,
@@ -6125,7 +6958,7 @@ where
                     );
                     self.state_transfer_offers
                         .borrow_mut()
-                        .remove(&(header.namespace, header.replica));
+                        .remove(&(header.group, header.replica));
                     // The builder cache too: it is keyed by commit_op alone,
                     // and GC unlinks files WITHOUT a commit, so the restarted
                     // requester would otherwise be handed the same offer with
@@ -6145,7 +6978,7 @@ where
             Some(ChunkReply::Unavailable { transient }) => {
                 tracing::info!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     transient,
                     "partition chunk request for an unknown offer; telling requester to restart"
@@ -6155,7 +6988,7 @@ where
                     self_id,
                     header.replica,
                     header.nonce,
-                    header.namespace,
+                    header.group,
                     // Usually TRANSIENT -- retention GC'd a served segment, or
                     // the offer aged out between two chunks, and the restarted
                     // session converges -- but a load that failed on a local
@@ -6168,7 +7001,7 @@ where
             None => {
                 tracing::warn!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     requester = header.replica,
                     artifact = header.artifact,
                     offset = header.offset,
@@ -6414,7 +7247,7 @@ where
         {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 cap = Self::PARTITION_TRANSFERS_INFLIGHT_MAX,
                 "partition transfer slots exhausted; deferring this arm"
             );
@@ -6467,7 +7300,7 @@ where
         let to_op = consensus.commit_max();
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
-        let namespace = consensus.namespace();
+        let namespace = consensus.group();
         partition.repair = Some(partitions::RepairSession {
             nonce,
             to_op,
@@ -6507,7 +7340,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -6530,7 +7363,7 @@ where
             let transient = header.unavailable_transient == 1;
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 transient,
                 "partition transfer peer cannot serve; backing off before re-arming"
@@ -6576,7 +7409,7 @@ where
         if header.commit_op > header.commit_max {
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 serving_commit_op = header.commit_op,
                 serving_commit_max = header.commit_max,
@@ -6590,7 +7423,7 @@ where
         if header.view < local_view || header.commit_max < local_commit_max {
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 serving_view = header.view,
                 serving_commit_max = header.commit_max,
@@ -6611,7 +7444,7 @@ where
             Err(error) => {
                 tracing::warn!(
                     shard = self.id,
-                    namespace_raw = header.namespace,
+                    namespace_raw = header.group,
                     %error,
                     "partition transfer manifest rejected"
                 );
@@ -6640,7 +7473,7 @@ where
         if !kind_capped || total_len > Self::PARTITION_TRANSFER_TOTAL_LEN_MAX {
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 total_len,
                 "partition transfer manifest exceeds artifact caps; refusing descriptor"
             );
@@ -6660,7 +7493,7 @@ where
         if !reused.is_empty() {
             tracing::info!(
                 shard = self.id,
-                namespace_raw = header.namespace,
+                namespace_raw = header.group,
                 peer = header.replica,
                 adopted = reused.len(),
                 artifacts = entries.len(),
@@ -6707,7 +7540,7 @@ where
         if consensus.state_transfer_stage() == consensus::StateTransferStage::AwaitingTarget {
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Fetching);
         }
-        self.on_partition_transfer_progress(header.namespace).await;
+        self.on_partition_transfer_progress(header.group).await;
     }
 
     /// Receive one partition chunk; spill a completed segment artifact, and
@@ -6724,7 +7557,7 @@ where
         let Some(partition) = planes
             .1
             .0
-            .get_mut_by_ns(&IggyNamespace::from_raw(header.namespace))
+            .get_mut_by_ns(&IggyNamespace::from_raw(header.group))
         else {
             return;
         };
@@ -6758,7 +7591,7 @@ where
             session.idle_ticks = 0;
         }
         partition.note_transfer_progress();
-        self.on_partition_transfer_progress(header.namespace).await;
+        self.on_partition_transfer_progress(header.group).await;
     }
 
     /// Drive an in-flight partition transfer: spill newly completed segment
@@ -7121,7 +7954,7 @@ where
             // cannot tell the two apart; the serving node's own logs can.
             tracing::warn!(
                 shard = self.id,
-                namespace_raw = partition.consensus().namespace(),
+                namespace_raw = partition.consensus().group(),
                 peer,
                 refusals,
                 "partition state transfer has been refused {refusals} times in a row; the peer \
@@ -7169,7 +8002,7 @@ where
         };
         tracing::info!(
             shard = self.id,
-            namespace_raw = partition.consensus().namespace(),
+            namespace_raw = partition.consensus().group(),
             failures,
             next_peer,
             after_ticks,
@@ -7315,7 +8148,7 @@ where
         let metadata_served = metadata.consensus.as_ref().is_some_and(|consensus| {
             offers
                 .keys()
-                .any(|(namespace, _)| *namespace == consensus.namespace())
+                .any(|(namespace, _)| *namespace == consensus.group())
         });
         if !metadata_served {
             metadata.clear_state_transfer_offer_cache();
@@ -7360,6 +8193,10 @@ where
             return;
         };
 
+        // See the partition tick: no snapshot consumer on a `Normal` tick.
+        if consensus.status() != Status::Normal {
+            refresh_metadata_dvc_suffix(consensus, metadata.journal.as_ref());
+        }
         let actions = consensus.tick(PlaneKind::Metadata);
 
         let (local_actions, wire_actions) = split_local_actions(actions);
@@ -7382,6 +8219,9 @@ where
         // would otherwise wait for unrelated traffic. Quiet no-op when
         // nothing is stranded.
         metadata.resume_stranded_commits().await;
+
+        self.advance_pending_metadata_view().await;
+        self.expire_idle_state_transfer_offers();
 
         // Stall retry for an in-flight state transfer: descriptor or chunk
         // frames are fire-and-forget, so a lost one must not wedge the
@@ -7438,45 +8278,7 @@ where
             }
         }
 
-        // Stall retry, mirroring `tick_partitions`: a lost repair frame must
-        // not wedge the session forever.
-        let repair_retry_ticks = self.repair_retry_ticks.get();
-        let stalled = {
-            let mut session = self.metadata_repair.borrow_mut();
-            session.as_mut().and_then(|session| {
-                if !consensus.is_normal() {
-                    return None;
-                }
-                session.idle_ticks += 1;
-                if session.idle_ticks < repair_retry_ticks {
-                    return None;
-                }
-                session.idle_ticks = 0;
-                Some((session.peer, session.nonce, session.to_op))
-            })
-        };
-        if let Some((peer, nonce, to_op)) = stalled {
-            let from_op = consensus.commit_min() + 1;
-            if from_op <= to_op {
-                tracing::info!(
-                    shard = self.id,
-                    from_op,
-                    to_op,
-                    peer,
-                    "metadata repair stalled; re-requesting remaining window"
-                );
-                self.send_request_prepares(
-                    consensus.cluster(),
-                    consensus.replica(),
-                    peer,
-                    nonce,
-                    from_op,
-                    to_op,
-                    consensus.namespace(),
-                )
-                .await;
-            }
-        }
+        self.retry_stalled_metadata_repair(consensus).await;
     }
 }
 
@@ -7498,7 +8300,7 @@ where
         view = consensus.view(),
         op = consensus.sequencer().current_sequence(),
         commit = consensus.commit_max(),
-        namespace = consensus.namespace(),
+        namespace = consensus.group(),
         "answering stale-view heartbeat with StartView"
     );
     // Unsolicited, answering a stale-view heartbeat rather than a probe, so there is
@@ -7511,26 +8313,572 @@ where
         commit: consensus.commit_max(),
         incarnation: 0,
         target: None,
-        namespace: consensus.namespace(),
+        group: consensus.group(),
+        // Correcting a peer on a stale view, not concluding a view change: this
+        // publishes the settled frontier, which the peer reaches by repair.
+        suffix: Vec::new(),
     };
     dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
 }
 
-/// Re-stamp a stored prepare with the current view before retransmission.
-/// After a view change the primary re-sends its uncommitted suffix as its
-/// own prepares (VSR), but the journal keeps the original view stamp and
-/// `replicate_preflight` fences `header.view < view` as deposed-primary
-/// traffic -- a verbatim replay of the stored bytes would be ignored
-/// forever, wedging the commit walk on every peer. The stored buffer is
-/// shared with the journal, so the patch runs on an owned copy.
-fn restamp_prepare_view(stored: &[u8], view: u32) -> Option<Frozen<MESSAGE_ALIGN>> {
-    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
-    let mut owned = server_common::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(stored);
-    owned.as_mut_slice()[VIEW_OFFSET..VIEW_OFFSET + std::mem::size_of::<u32>()]
-        .copy_from_slice(&view.to_ne_bytes());
-    Message::<GenericHeader>::try_from(owned)
-        .ok()
-        .map(Message::into_frozen)
+/// Rebuild the new primary's pipeline over `from_op..=to_op` from local journal
+/// headers.
+///
+/// A gap means the caller started the view before its journal could serve the
+/// merged log: a bug in the transition, not a data condition. Nothing is
+/// truncated, because truncating to the last findable op discards ops committed
+/// on a quorum and already acknowledged. The pipeline is left short, the commit
+/// walk stalls at the gap, and repair fills it in.
+fn rebuild_pipeline_entries<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    self_id: u8,
+    from_op: u64,
+    to_op: u64,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+) where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    let mut gap_at = None;
+    let entries: Vec<_> = (from_op..=to_op)
+        .map_while(|op| {
+            let header = header_at(op).or_else(|| {
+                gap_at = Some(op);
+                None
+            })?;
+            // Lift the monotonic timestamp floor to the rebuilt log so
+            // post-view-change prepares cannot stamp below committed ones.
+            consensus.observe_prepare_timestamp(header.timestamp);
+            let mut entry = consensus::PipelineEntry::new(header);
+            entry.add_ack(self_id);
+            Some(entry)
+        })
+        .collect();
+
+    if let Some(missing_op) = gap_at {
+        tracing::error!(
+            replica = self_id,
+            missing_op,
+            range_start = from_op,
+            range_end = to_op,
+            rebuilt = entries.len(),
+            "RebuildPipeline: journal gap at op {missing_op} while starting a view; leaving the \
+             sequencer at {to_op} and stalling the commit walk. Truncating here would discard ops \
+             the view change proved recoverable."
+        );
+    }
+
+    consensus.with_pipeline_mut(|pipeline| {
+        for entry in entries {
+            pipeline.push(entry);
+        }
+    });
+}
+
+/// Snapshot this replica's uncommitted suffix into consensus, if the journal has
+/// moved since the last snapshot.
+///
+/// Called before every handler that could start or join a view change: consensus
+/// records its own `DoViewChange` there and has no journal to read. A stale
+/// snapshot is never reused; consensus tags it with its `(op, commit)` and falls
+/// back to an empty suffix, stalling the view change rather than nacking an op
+/// since acquired.
+fn refresh_metadata_dvc_suffix<B, P, MJ>(consensus: &VsrConsensus<B, P>, journal: Option<&MJ>)
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    MJ: JournalHandle,
+    <MJ as JournalHandle>::Target: Journal<
+            <MJ as JournalHandle>::Storage,
+            Entry = Message<PrepareHeader>,
+            Header = PrepareHeader,
+        >,
+{
+    if !consensus.local_dvc_suffix_stale() {
+        return;
+    }
+    let op = consensus.sequencer().current_sequence();
+    let commit = consensus.commit_max().min(op);
+    let pending = adopted_view_headers(consensus);
+    consensus.set_local_dvc_suffix(build_metadata_dvc_suffix(
+        journal,
+        commit,
+        op,
+        pending.as_ref().map(|pending| pending.headers.as_slice()),
+    ));
+}
+
+/// The adopted view's headers, when they describe a log this replica has NOT itself
+/// decided.
+///
+/// `None` for the primary-elect holding the log its own merge produced: that log is
+/// a proposal it is still repairing toward and may contain ops a later view
+/// truncated, so stitching it into its own `DoViewChange` would re-assert them.
+///
+/// A backup's parked log is the opposite: headers the view already decided and
+/// announced, which this replica acknowledged and is repairing to hold.
+fn adopted_view_headers<B, P>(consensus: &VsrConsensus<B, P>) -> Option<consensus::MergedLog>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    if consensus.is_primary_for_view(consensus.view()) {
+        return None;
+    }
+    consensus.pending_view_log()
+}
+
+/// Snapshot a partition's uncommitted suffix into its consensus.
+///
+/// Same contract as [`Self::refresh_metadata_dvc_suffix`]. The partition journal
+/// is in-memory only, so after a restart it reads empty and this replica votes
+/// all-nack: correct, since the ops really are lost and the merge needs a peer
+/// that still holds them.
+///
+/// Read through `repair_header`, not the resident headers: the committed prefix
+/// leaves those as soon as its bytes reach a segment, which on a caught-up
+/// replica includes the commit point itself.
+fn refresh_partition_dvc_suffix<B, SB>(partition: &partitions::IggyPartition<B, SB>)
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    let consensus = partition.consensus();
+    if !consensus.local_dvc_suffix_stale() {
+        return;
+    }
+    let op = consensus.sequencer().current_sequence();
+    let commit = consensus.commit_max().min(op);
+    let journal = partition.log.journal();
+    let pending = adopted_view_headers(consensus);
+    // The window materialized once: probing `repair_header` per op is two linear
+    // scans each, up to `DVC_HEADERS_MAX` of them, on every SVC/DVC arrival and
+    // non-Normal tick, on the pump. The internal clamp only narrows this range.
+    let head = op.max(
+        pending
+            .as_ref()
+            .and_then(|pending| pending.headers.first())
+            .map_or(0, |header| header.op),
+    );
+    let window = journal.inner.repair_headers_in(commit.max(1)..=head);
+    let suffix = build_dvc_suffix(
+        commit,
+        op,
+        |entry_op| window.get(&entry_op).copied(),
+        pending.as_ref().map(|pending| pending.headers.as_slice()),
+    );
+    consensus.set_local_dvc_suffix(suffix);
+}
+
+/// The suffix headers a `DoViewChange` or `StartView` carries, as raw bytes.
+///
+/// `size` is attacker-controlled, so it is clamped to what arrived; a short read
+/// decodes as a malformed suffix and the DVC is dropped.
+fn control_suffix_body<H>(msg: &Message<H>) -> &[u8]
+where
+    H: iggy_binary_protocol::ConsensusHeader,
+{
+    let slice = msg.as_slice();
+    let start = size_of::<H>();
+    let end = (msg.header().size() as usize).min(slice.len());
+    if end <= start {
+        return &[];
+    }
+    &slice[start..end]
+}
+
+/// Seal a control-message body. Zero for an empty body, which is the unsealed
+/// sentinel every other integrity field in this protocol uses.
+fn control_body_checksum(body: &[u8]) -> u128 {
+    if body.is_empty() {
+        return 0;
+    }
+    u128::from(iggy_common::calculate_checksum(body))
+}
+
+/// The body of a control frame, once it matches the checksum its header carries.
+///
+/// `None` means corruption in transit and the frame must be dropped whole: the
+/// header numbers describe a body that did not arrive intact, so neither half is
+/// trustworthy. This is what covers a body-carrying control message end to end.
+///
+/// Keyed on whether a body is present, NOT on whether `checksum_body` looks
+/// sealed: skipping the check when that field reads zero makes the layer
+/// bypassable by clearing the one field that decides whether anything is checked.
+/// A frame legitimately carries no body (a sender with nothing uncommitted, a
+/// probe-answer `StartView`), so emptiness is the only exemption. A non-empty body
+/// always came from a sender that seals it, and a zero checksum there is corruption.
+fn control_suffix_body_verified<H>(msg: &Message<H>, checksum_body: u128) -> Option<&[u8]>
+where
+    H: iggy_binary_protocol::ConsensusHeader,
+{
+    let body = control_suffix_body(msg);
+    if body.is_empty() {
+        // Nothing to verify. `checksum_body` is irrelevant either way.
+        return Some(body);
+    }
+    if control_body_checksum(body) == checksum_body {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+/// Whether a repaired prepare at `op` falls inside the range this replica is
+/// currently repairing.
+///
+/// A parked log means two things depending on who parked it, and only one is a
+/// repair window. The primary-elect parked the log its merge decided and repairs
+/// toward exactly that range, so the range IS its scope, including ops at or
+/// below `commit_min`: those are the headers inherited from senders behind the
+/// canonical `log_view`, which the ordinary rule would reject and header repair
+/// cannot walk back to. A backup's parked `StartView` suffix is only what its
+/// ingest verifies bodies against, and its repair runs for the whole view, so
+/// reading that range as a scope would discard every later op.
+fn repair_op_in_scope(
+    pending: Option<&MergedLog>,
+    is_primary_elect: bool,
+    commit_min: u64,
+    op: u64,
+) -> bool {
+    pending
+        .filter(|_| is_primary_elect)
+        .map_or(op > commit_min, |pending| {
+            (op >= pending.commit_max.max(1) && op <= pending.op_head)
+                || pending
+                    .committed_elsewhere
+                    .iter()
+                    .any(|expected| expected.op == op)
+        })
+}
+
+/// Ceiling on the op range a repair request may ask this replica to walk.
+///
+/// Not `commit_max` alone: a new primary repairing toward a merged log needs the
+/// uncommitted suffix the view change kept, which sits above every commit point.
+///
+/// Bounded by the local frontier all the same. `RequestPreparesHeader::validate`
+/// accepts any `from_op <= to_op`, so `u64::MAX` is legal, and the metadata serve
+/// path then walks op by op with no `.await` -- on a single-threaded shard pump
+/// that ends the shard rather than merely serving slowly. Nothing above the
+/// frontier is servable, so the clamp costs nothing.
+fn repair_serve_ceiling(requested_to_op: u64, commit_max: u64, head: u64) -> u64 {
+    requested_to_op.min(commit_max.max(head))
+}
+
+/// Read this replica's uncommitted suffix out of the metadata journal, for the
+/// window `commit..=op`.
+///
+/// The nack bit is load-bearing, and is set only where absence *proves* this
+/// replica never prepared the op:
+/// * Above the commit point, a missing header is proof: the WAL refuses to boot
+///   on interior corruption, so a hole in a journal that opened never arrived.
+/// * At or below it, a checkpoint may have compacted the header away. Those slots
+///   go out blank and un-nacked, read as "no information" rather than licence to
+///   truncate an op this replica considers committed.
+///
+/// Deriving the suffix on demand is also why it needs no durable record: the
+/// merged log is in memory and bodies are fetched whole, so the WAL is the only
+/// thing that ever backs a nack and recomputing after a restart gives the same
+/// answer. A torn tail is the one exception, and it changes the answer correctly:
+/// recovery truncates the incomplete append, which fsyncs before the ack, so no
+/// replication quorum could have counted it.
+fn build_metadata_dvc_suffix<J>(
+    journal: Option<&J>,
+    commit: u64,
+    op: u64,
+    view_headers: Option<&[PrepareHeader]>,
+) -> DvcSuffix
+where
+    J: JournalHandle,
+    <J as JournalHandle>::Target: Journal<
+            <J as JournalHandle>::Storage,
+            Entry = Message<PrepareHeader>,
+            Header = PrepareHeader,
+        >,
+{
+    let Some(journal) = journal else {
+        return DvcSuffix::empty();
+    };
+    let handle = journal.handle();
+    build_dvc_suffix(
+        commit,
+        op,
+        |entry_op| {
+            usize::try_from(entry_op)
+                .ok()
+                .and_then(|slot| handle.header(slot))
+                .map(|header| *header)
+        },
+        view_headers,
+    )
+}
+
+/// Plane-independent core of the suffix read. `header_at` answers "do I hold
+/// this op, and what is its header".
+fn build_dvc_suffix(
+    commit: u64,
+    op: u64,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+    view_headers: Option<&[PrepareHeader]>,
+) -> DvcSuffix {
+    // Stitch the adopted view's headers over the journal, high-to-low.
+    //
+    // Reading the journal alone is only correct for a replica whose journal IS its
+    // log. A backup that adopted a `StartView` is header-poor by design: the suffix
+    // went to `pending_view_log` and the bodies are still being repaired, so the
+    // journal holds nothing at those ops and would report them blank AND nacked,
+    // since a hole above the commit point is normally proof the op never arrived.
+    // Here it proves only unfinished repair, and enough such senders reach a nack
+    // quorum against ops the view just decided to keep.
+    //
+    // The head rises to the view's head too, so a later view change cannot let the
+    // op backtrack below what this replica already acknowledged.
+    let view_head = view_headers
+        .and_then(<[PrepareHeader]>::first)
+        .map_or(0, |header| header.op);
+    let op = op.max(view_head);
+    if op == 0 {
+        return DvcSuffix::empty();
+    }
+    // Window runs from the commit point up, floored at 1 because ops are 1-based.
+    // That floor is a scan bound only: the lines below can raise it above the
+    // commit point, so no reader may read it back as one. See `merge_commit_max`.
+    let mut low = commit.max(1);
+    if low > op {
+        return DvcSuffix::empty();
+    }
+    if op - low + 1 > DVC_HEADERS_MAX as u64 {
+        // Defensive: every plane's `prepare_queue_depth` is capped below
+        // `DVC_HEADERS_MAX` so `op - commit` cannot reach this. If it does, the
+        // clamped-away ops go out described by nobody and the merge stalls rather
+        // than deciding wrongly. Keep the highest entries, whose fate the view
+        // change decides, and log it rather than shipping a different window.
+        let clamped = op - DVC_HEADERS_MAX as u64 + 1;
+        tracing::warn!(
+            commit,
+            op,
+            window_from = clamped,
+            "uncommitted suffix wider than {DVC_HEADERS_MAX} entries; truncating the DVC window \
+             from below. Ops {}..={} are now undecidable and will stall the view change",
+            commit + 1,
+            clamped - 1
+        );
+        low = clamped;
+    }
+
+    let len = usize::try_from(op - low + 1).unwrap_or(DVC_HEADERS_MAX);
+    let mut headers = Vec::with_capacity(len);
+    let mut nack_bitset = 0u128;
+    let mut present_bitset = 0u128;
+    for (index, entry_op) in (low..=op).rev().enumerate() {
+        if let Some(header) = header_at(entry_op) {
+            headers.push(header);
+            // A header in the index means the entry is in the WAL at a known
+            // offset, the same condition `on_request_prepares` serves from.
+            present_bitset |= 1u128 << index;
+        } else if let Some(header) =
+            view_headers.and_then(|headers| view_header_at(headers, entry_op))
+        {
+            // Held from the adopted view rather than from the journal, so the
+            // header is reported and the op is NOT nacked: this replica knows
+            // the op exists and simply cannot serve its body yet. No present
+            // bit for the same reason.
+            headers.push(*header);
+        } else {
+            headers.push(dvc_blank(entry_op));
+            if entry_op > commit {
+                nack_bitset |= 1u128 << index;
+            } else {
+                // The commit point, the one slot that goes out blank AND
+                // un-nacked. The merge scans it and may not discard it, so a
+                // sender is asking the new primary to take the header from
+                // someone else; if every sender in the quorum does that, the
+                // op is undecidable and the view never starts.
+                //
+                // Every compaction path is supposed to leave this header behind
+                // (the metadata checkpoint drain stops one op short, a
+                // partition serves it from the evicted ring), so reaching here
+                // means a replica whose log genuinely starts above its own
+                // commit point: a state-transfer receiver that jumped its
+                // commit floor to a snapshot whose prepares it never held.
+                tracing::warn!(
+                    op = entry_op,
+                    commit,
+                    "no header at this replica's commit point; the DVC reports it blank and \
+                     cannot nack it, so the view change stalls unless a peer supplies it"
+                );
+            }
+        }
+    }
+    DvcSuffix::new(headers, nack_bitset, present_bitset)
+}
+
+/// Partition-plane twin of `Shard::reconcile_metadata_view_divergence`: same split
+/// at the announced commit point, dropping above it and reporting at or below.
+///
+/// Worse to skip here than on the metadata plane, which is why this exists.
+/// Partition `append` has no slot-collision check, so a re-prepared op pushes a
+/// duplicate header and rewrites `op_to_storage_offset`, and `committed_prefix` walks
+/// positionally, so the stale entry is what `evict_prefix` flushes to the segment:
+/// durable divergent bytes, no error anywhere.
+#[allow(clippy::future_not_send)]
+async fn reconcile_partition_view_divergence<B, SB>(
+    shard: u16,
+    partition: &mut IggyPartition<B, SB>,
+    pending: &MergedLog,
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    // Truncation is safe only above what this replica has *applied*, which is not
+    // the view's commit point: a backup can sit above it.
+    let applied_floor = pending.commit_max.max(partition.consensus().commit_min());
+
+    let mut repairable_from: Option<u64> = None;
+    for canonical in &pending.headers {
+        let Some(local) = partition.log.journal().inner.header_by_op(canonical.op) else {
+            continue;
+        };
+        if header_is_view_entry(&local, canonical) {
+            continue;
+        }
+        if canonical.op <= applied_floor {
+            tracing::error!(
+                shard,
+                namespace_raw = partition.consensus().group(),
+                op = canonical.op,
+                view = partition.consensus().view(),
+                commit_max = pending.commit_max,
+                commit_min = partition.consensus().commit_min(),
+                local_checksum = local.checksum,
+                canonical_checksum = canonical.checksum,
+                "committed partition op {} disagrees with the view that just started; this \
+                 replica applied a different op and log repair cannot reconcile it",
+                canonical.op
+            );
+            continue;
+        }
+        repairable_from = Some(repairable_from.map_or(canonical.op, |op| op.min(canonical.op)));
+    }
+
+    // The suffix above the announced head, which no canonical header names. As on
+    // the metadata twin, except here `append` pushes a duplicate rather than erroring.
+    let above_head = pending.op_head.max(applied_floor) + 1;
+    if partition
+        .log
+        .journal()
+        .inner
+        .last_op()
+        .is_some_and(|last_op| last_op >= above_head)
+    {
+        repairable_from = Some(repairable_from.map_or(above_head, |op| op.min(above_head)));
+    }
+
+    let Some(from_op) = repairable_from else {
+        return;
+    };
+    match partition.truncate_uncommitted_from(from_op).await {
+        Ok(removed) => {
+            tracing::warn!(
+                shard,
+                namespace_raw = partition.consensus().group(),
+                from_op,
+                removed,
+                op_head = pending.op_head,
+                view = partition.consensus().view(),
+                "dropped {removed} uncommitted partition entries from op {from_op} that \
+                 disagreed with the view's log; the primary's retransmission refills the range"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                shard,
+                namespace_raw = partition.consensus().group(),
+                from_op,
+                %error,
+                "could not drop the diverging uncommitted partition entries from op \
+                 {from_op}; repair skips ops it already holds, so this replica will not \
+                 converge there until restarted"
+            );
+        }
+    }
+}
+
+/// Whether a locally journaled header IS the entry the view's log names at that op.
+///
+/// Identity, not presence: otherwise a stale prepare at the right op reads as
+/// coverage everywhere: the repair ingest skips it as already held,
+/// `RebuildPipeline` seeds the pipeline from it and self-acks, `CommitJournal`
+/// applies it. `identity_checksum` excludes `view`, so a restamp still compares equal.
+///
+/// An unsealed checksum on either side is not evidence (pre-seal WAL, partition-plane
+/// prepare), so it counts as agreement, as in `dvc_suffix_decode`.
+const fn header_is_view_entry(local: &PrepareHeader, canonical: &PrepareHeader) -> bool {
+    local.checksum == CHECKSUM_UNSEALED
+        || canonical.checksum == CHECKSUM_UNSEALED
+        || local.checksum == canonical.checksum
+}
+
+/// The lowest op in the merged log this replica cannot serve, or `None` when the
+/// view can start.
+///
+/// Coverage is identity, not presence (see [`header_is_view_entry`]): starting a view
+/// over a differing entry commits this replica's own operation where the view says
+/// another belongs.
+///
+/// Covers every op the merged log names, including headers inherited from senders
+/// behind the canonical `log_view`, which sit below the canonical window where header
+/// repair cannot walk back to them. `repair_floor` drops the ops whose journal entry
+/// is legitimately gone AND whose identity is already settled: on the metadata plane
+/// ops compacted under a snapshot, on the partition plane ops at or below the local
+/// commit point, whose flushed entries `evict_prefix` moves out of the header vec.
+/// Neither can diverge from the merged log (a committed or compacted op is the
+/// quorum's op), and no repair puts the journal entry back, so demanding one parks
+/// the view change forever.
+fn first_op_not_covered(
+    pending: &MergedLog,
+    repair_floor: u64,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+) -> Option<u64> {
+    let held = |op: u64| {
+        let Some(local) = header_at(op) else {
+            return false;
+        };
+        pending
+            .headers
+            .iter()
+            .chain(pending.committed_elsewhere.iter())
+            .find(|header| header.op == op)
+            .is_none_or(|canonical| header_is_view_entry(&local, canonical))
+    };
+    (pending.commit_max.max(1).max(repair_floor + 1)..=pending.op_head)
+        .find(|op| !held(*op))
+        .or_else(|| {
+            pending
+                .committed_elsewhere
+                .iter()
+                .map(|header| header.op)
+                .filter(|op| *op > repair_floor)
+                .find(|op| !held(*op))
+        })
+}
+
+/// The adopted view's header at `op`, or `None` when the view says nothing about
+/// it.
+///
+/// Headers run high-to-low from the view's head, so the slot is arithmetic. The
+/// op is re-checked rather than assumed: a mismatch means the range is not the
+/// contiguous run this indexing needs, and inventing a header for the wrong op
+/// is worse than reporting none.
+fn view_header_at(view_headers: &[PrepareHeader], op: u64) -> Option<&PrepareHeader> {
+    let head = view_headers.first()?.op;
+    let index = usize::try_from(head.checked_sub(op)?).ok()?;
+    let header = view_headers.get(index)?;
+    if header.op != op || matches!(dvc_header_kind(header), DvcHeaderKind::Blank) {
+        return None;
+    }
+    Some(header)
 }
 
 /// Dispatch a list of `VsrAction`s by constructing the appropriate
@@ -7606,22 +8954,23 @@ async fn dispatch_vsr_actions<B, P, J>(
             !advertises_view || !consensus.needs_superblock_persist(),
             "durable-before-send violated: dispatching a view-scoped action for \
              namespace {} while the superblock is behind the in-memory view {}",
-            consensus.namespace(),
+            consensus.group(),
             consensus.view(),
         );
     }
 
     for action in actions {
         match action {
-            VsrAction::SendStartViewChange { view, namespace } => {
+            VsrAction::SendStartViewChange { view, group } => {
                 let msg = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
                     .transmute_header(|_, h: &mut StartViewChangeHeader| {
                         h.command = Command2::StartViewChange;
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.view = *view;
-                        h.namespace = *namespace;
+                        h.group = *group;
                         h.size = size_of::<StartViewChangeHeader>() as u32;
+                        h.seal();
                     });
                 broadcast(msg.into_generic().into_frozen()).await;
             }
@@ -7631,23 +8980,41 @@ async fn dispatch_vsr_actions<B, P, J>(
                 log_view,
                 op,
                 commit,
-                namespace,
+                group,
+                suffix,
             } => {
-                let msg = Message::<DoViewChangeHeader>::new(size_of::<DoViewChangeHeader>())
-                    .transmute_header(|_, h: &mut DoViewChangeHeader| {
-                        h.command = Command2::DoViewChange;
-                        h.cluster = cluster;
-                        h.replica = self_id;
-                        h.view = *view;
-                        h.log_view = *log_view;
-                        h.op = *op;
-                        h.commit = *commit;
-                        h.namespace = *namespace;
-                        h.size = size_of::<DoViewChangeHeader>() as u32;
-                    });
-                send(*target, msg.into_generic().into_frozen()).await;
+                let header_size = size_of::<DoViewChangeHeader>();
+                let total_size = header_size + suffix.encoded_len();
+                let mut msg = Message::<DoViewChangeHeader>::new(total_size);
+                // Body first: `transmute_header` zeroes only the header region, so
+                // anything past it survives. Same order as the manifest build.
+                suffix.encode_into(&mut msg.as_mut_slice()[header_size..total_size]);
+                let body_checksum = control_body_checksum(&msg.as_slice()[header_size..total_size]);
+                let nack_bitset = suffix.nack_bitset();
+                let present_bitset = suffix.present_bitset();
+                let msg = msg.transmute_header(|_, h: &mut DoViewChangeHeader| {
+                    h.command = Command2::DoViewChange;
+                    h.cluster = cluster;
+                    h.replica = self_id;
+                    h.view = *view;
+                    h.log_view = *log_view;
+                    h.op = *op;
+                    h.commit = *commit;
+                    h.group = *group;
+                    h.nack_bitset = nack_bitset;
+                    h.present_bitset = present_bitset;
+                    h.checksum_body = body_checksum;
+                    h.size = total_size as u32;
+                    // Last: covers the bitsets a new primary truncates on.
+                    h.seal();
+                });
+                // Broadcast, not unicast to `target`: a backup seeing a DVC for a
+                // newer view adopts it instead of waiting out its heartbeat
+                // timeout, which converges the view change in one round.
+                let _ = target;
+                broadcast(msg.into_generic().into_frozen()).await;
             }
-            VsrAction::SendRequestStartView { view, namespace } => {
+            VsrAction::SendRequestStartView { view, group } => {
                 // Stamp this replica's incarnation so the answering StartView can
                 // echo it, proving to us the reply post-dates our restart.
                 let incarnation = consensus.incarnation();
@@ -7659,8 +9026,9 @@ async fn dispatch_vsr_actions<B, P, J>(
                             h.replica = self_id;
                             h.view = *view;
                             h.incarnation = incarnation;
-                            h.namespace = *namespace;
+                            h.group = *group;
                             h.size = size_of::<RequestStartViewHeader>() as u32;
+                            h.seal();
                         });
                 broadcast(msg.into_generic().into_frozen()).await;
             }
@@ -7670,20 +9038,28 @@ async fn dispatch_vsr_actions<B, P, J>(
                 commit,
                 incarnation,
                 target,
-                namespace,
+                group,
+                suffix,
             } => {
-                let msg = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
-                    .transmute_header(|_, h: &mut StartViewHeader| {
-                        h.command = Command2::StartView;
-                        h.cluster = cluster;
-                        h.replica = self_id;
-                        h.view = *view;
-                        h.op = *op;
-                        h.commit = *commit;
-                        h.incarnation = *incarnation;
-                        h.namespace = *namespace;
-                        h.size = size_of::<StartViewHeader>() as u32;
-                    });
+                let header_size = size_of::<StartViewHeader>();
+                let total_size = header_size + suffix.len() * size_of::<PrepareHeader>();
+                let mut msg = Message::<StartViewHeader>::new(total_size);
+                // Body first: `transmute_header` zeroes only the header region.
+                encode_prepare_headers(suffix, &mut msg.as_mut_slice()[header_size..total_size]);
+                let body_checksum = control_body_checksum(&msg.as_slice()[header_size..total_size]);
+                let msg = msg.transmute_header(|_, h: &mut StartViewHeader| {
+                    h.checksum_body = body_checksum;
+                    h.command = Command2::StartView;
+                    h.cluster = cluster;
+                    h.replica = self_id;
+                    h.view = *view;
+                    h.op = *op;
+                    h.commit = *commit;
+                    h.incarnation = *incarnation;
+                    h.group = *group;
+                    h.size = total_size as u32;
+                    h.seal();
+                });
                 let frozen = msg.into_generic().into_frozen();
                 // A probe echo is addressed to its requester: the incarnation it
                 // carries is that replica's freshness proof, and a peer recovering
@@ -7699,7 +9075,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 from_op,
                 to_op,
                 target,
-                namespace,
+                group,
             } => {
                 let Some(journal) = journal else {
                     continue;
@@ -7722,8 +9098,9 @@ async fn dispatch_vsr_actions<B, P, J>(
                             h.prepare_checksum = prepare_header.checksum;
                             h.request = prepare_header.request;
                             h.operation = prepare_header.operation;
-                            h.namespace = *namespace;
+                            h.group = *group;
                             h.size = size_of::<PrepareOkHeader>() as u32;
+                            h.seal();
                         });
                     send(*target, msg.into_generic().into_frozen()).await;
                 }
@@ -7738,15 +9115,10 @@ async fn dispatch_vsr_actions<B, P, J>(
                         continue;
                     };
                     // Freeze the retransmit payload once; clone per target.
-                    let frozen = if prepare.header().view == current_view {
-                        prepare.into_generic().into_frozen()
-                    } else {
-                        let Some(restamped) =
-                            restamp_prepare_view(prepare.as_slice(), current_view)
-                        else {
-                            continue;
-                        };
-                        restamped
+                    let Some(frozen) =
+                        restamp_prepare_view(prepare.into_generic().into_frozen(), current_view)
+                    else {
+                        continue;
                     };
                     for replica in replicas {
                         send(*replica, frozen.clone()).await;
@@ -7757,49 +9129,12 @@ async fn dispatch_vsr_actions<B, P, J>(
                 let Some(journal) = journal else {
                     continue;
                 };
-                // Collect headers before borrowing the pipeline to avoid
-                // holding borrow_mut() across journal reads.
-                let mut gap_at = None;
-                let entries: Vec<_> = (*from_op..=*to_op)
-                    .map_while(|op| {
-                        let Some(header) = journal.handle().header(op as usize) else {
-                            gap_at = Some(op);
-                            return None;
-                        };
-                        // New-primary path: lift the monotonic timestamp
-                        // floor to the rebuilt log so post-view-change
-                        // prepares cannot stamp below committed ones.
-                        consensus.observe_prepare_timestamp(header.timestamp);
-                        let mut entry = consensus::PipelineEntry::new(*header);
-                        entry.add_ack(self_id);
-                        Some(entry)
-                    })
-                    .collect();
-                if let Some(missing_op) = gap_at {
-                    // A primary's own uncommitted suffix has no repair
-                    // source: peers ack'd nothing above the gap or the DVC
-                    // merge would have carried it, so the range is decided
-                    // lost. Truncate the sequencer to the last op we could
-                    // rebuild so the next client prepare chains correctly.
-                    let rebuilt_up_to = missing_op.saturating_sub(1);
-                    tracing::warn!(
-                        replica = self_id,
-                        missing_op,
-                        range_start = from_op,
-                        range_end = to_op,
-                        rebuilt = entries.len(),
-                        "RebuildPipeline: journal gap at op {missing_op}, \
-                         truncating sequencer from {to_op} to {rebuilt_up_to} \
-                         ({}/{} ops rebuilt)",
-                        entries.len(),
-                        to_op - from_op + 1,
-                    );
-                    consensus.sequencer().set_sequence(rebuilt_up_to);
-                }
-                let mut pipeline = consensus.pipeline().borrow_mut();
-                for entry in entries {
-                    pipeline.push(entry);
-                }
+                rebuild_pipeline_entries(consensus, self_id, *from_op, *to_op, |op| {
+                    usize::try_from(op)
+                        .ok()
+                        .and_then(|slot| journal.handle().header(slot))
+                        .map(|header| *header)
+                });
             }
             // Handled by the caller (shard view change handlers) since it
             // requires access to the plane's commit_journal method.
@@ -7807,7 +9142,7 @@ async fn dispatch_vsr_actions<B, P, J>(
             VsrAction::SendCommit {
                 view,
                 commit,
-                namespace,
+                group,
                 timestamp_monotonic,
             } => {
                 let msg = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
@@ -7817,9 +9152,10 @@ async fn dispatch_vsr_actions<B, P, J>(
                         h.replica = self_id;
                         h.view = *view;
                         h.commit = *commit;
-                        h.namespace = *namespace;
+                        h.group = *group;
                         h.timestamp_monotonic = *timestamp_monotonic;
                         h.size = size_of::<CommitHeader>() as u32;
+                        h.seal();
                     },
                 );
                 broadcast(msg.into_generic().into_frozen()).await;
@@ -7865,7 +9201,7 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 || !consensus.needs_superblock_persist(),
             "durable-before-send violated: dispatching a view-scoped action for \
              namespace {} while the superblock is behind the in-memory view {}",
-            consensus.namespace(),
+            consensus.group(),
             consensus.view(),
         );
     }
@@ -7877,7 +9213,7 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 from_op,
                 to_op,
                 target,
-                namespace,
+                group,
             } => {
                 for op in *from_op..=*to_op {
                     let Some(prepare_header) = journal.header_by_op(op) else {
@@ -7896,8 +9232,9 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                             h.prepare_checksum = prepare_header.checksum;
                             h.request = prepare_header.request;
                             h.operation = prepare_header.operation;
-                            h.namespace = *namespace;
+                            h.group = *group;
                             h.size = size_of::<PrepareOkHeader>() as u32;
+                            h.seal();
                         });
                     send(*target, msg.into_generic().into_frozen()).await;
                 }
@@ -7925,15 +9262,8 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                     // above and avoids both the per-target 4 KiB memcpy
                     // and the prior `.expect` that would panic the shard
                     // on a corrupted journal entry.
-                    let prepare = if header.view == current_view {
-                        prepare
-                    } else {
-                        let Some(restamped) =
-                            restamp_prepare_view(prepare.as_slice(), current_view)
-                        else {
-                            continue;
-                        };
-                        restamped
+                    let Some(prepare) = restamp_prepare_view(prepare, current_view) else {
+                        continue;
                     };
                     for replica in replicas {
                         send(*replica, prepare.clone()).await;
@@ -7941,42 +9271,9 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                 }
             }
             VsrAction::RebuildPipeline { from_op, to_op } => {
-                let mut gap_at = None;
-                let entries: Vec<_> = (*from_op..=*to_op)
-                    .map_while(|op| {
-                        let Some(header) = journal.header_by_op(op) else {
-                            gap_at = Some(op);
-                            return None;
-                        };
-                        // New-primary path: lift the monotonic timestamp
-                        // floor to the rebuilt log so post-view-change
-                        // prepares cannot stamp below committed ones.
-                        consensus.observe_prepare_timestamp(header.timestamp);
-                        let mut entry = consensus::PipelineEntry::new(header);
-                        entry.add_ack(self_id);
-                        Some(entry)
-                    })
-                    .collect();
-                if let Some(missing_op) = gap_at {
-                    let rebuilt_up_to = missing_op.saturating_sub(1);
-                    tracing::warn!(
-                        replica = self_id,
-                        missing_op,
-                        range_start = from_op,
-                        range_end = to_op,
-                        rebuilt = entries.len(),
-                        "RebuildPipeline: journal gap at op {missing_op}, \
-                         truncating sequencer from {to_op} to {rebuilt_up_to} \
-                         ({}/{} ops rebuilt)",
-                        entries.len(),
-                        to_op - from_op + 1,
-                    );
-                    consensus.sequencer().set_sequence(rebuilt_up_to);
-                }
-                let mut pipeline = consensus.pipeline().borrow_mut();
-                for entry in entries {
-                    pipeline.push(entry);
-                }
+                rebuild_pipeline_entries(consensus, self_id, *from_op, *to_op, |op| {
+                    journal.header_by_op(op)
+                });
             }
             _ => {}
         }
@@ -8008,7 +9305,8 @@ mod persist_gate_tests {
                 commit: 3,
                 incarnation: 0,
                 target: None,
-                namespace: 7,
+                group: 7,
+                suffix: Vec::new(),
             },
             VsrAction::CommitJournal,
             rebuild(),
@@ -8028,12 +9326,422 @@ mod persist_gate_tests {
 
     #[test]
     fn given_send_only_actions_when_split_should_leave_locals_empty() {
-        let actions = vec![VsrAction::SendStartViewChange {
-            view: 2,
-            namespace: 7,
-        }];
+        let actions = vec![VsrAction::SendStartViewChange { view: 2, group: 7 }];
         let (local, wire) = split_local_actions(actions);
         assert!(local.is_empty());
         assert_eq!(wire.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod repair_scope_tests {
+    //! Who parked the log decides what it means.
+
+    use super::{MergedLog, repair_op_in_scope, repair_serve_ceiling};
+    use iggy_binary_protocol::{Command2, PrepareHeader};
+
+    fn header(op: u64) -> PrepareHeader {
+        PrepareHeader {
+            command: Command2::Prepare,
+            op,
+            ..Default::default()
+        }
+    }
+
+    /// A view that started at op 100 with commit 98.
+    fn parked() -> MergedLog {
+        MergedLog {
+            op_head: 100,
+            commit_max: 98,
+            headers: (98..=100).rev().map(header).collect(),
+            committed_elsewhere: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn given_a_backup_with_a_parked_log_when_repairing_above_the_view_head_should_accept() {
+        // A backup keeps its parked `StartView` suffix for the whole view, so at
+        // op 200 the parked head is 100 ops stale. Reading it as a repair scope
+        // silently discards the served op: the retry loops, the commit walk
+        // freezes, checkpointing stops, and the backup stops acking.
+        assert!(
+            repair_op_in_scope(Some(&parked()), false, 149, 150),
+            "a backup repairs for the whole view, not just the view-start range"
+        );
+    }
+
+    #[test]
+    fn given_a_backup_with_a_parked_log_when_repairing_below_commit_min_should_reject() {
+        // A backup's parked log grants no licence to re-ingest committed ops.
+        assert!(!repair_op_in_scope(Some(&parked()), false, 149, 149));
+    }
+
+    #[test]
+    fn given_a_primary_elect_when_repairing_toward_its_merged_log_should_use_it_as_the_scope() {
+        let pending = parked();
+        // Inside the merged range, including inherited headers below `commit_min`.
+        assert!(repair_op_in_scope(Some(&pending), true, 99, 98));
+        assert!(repair_op_in_scope(Some(&pending), true, 99, 100));
+        // Outside it: the primary-elect is not repairing toward these.
+        assert!(!repair_op_in_scope(Some(&pending), true, 99, 101));
+        assert!(!repair_op_in_scope(Some(&pending), true, 99, 97));
+        // With nothing parked, the ordinary commit-point rule applies.
+        assert!(!repair_op_in_scope(None, false, 149, 149));
+        assert!(repair_op_in_scope(None, false, 149, 150));
+    }
+
+    #[test]
+    fn given_a_primary_elect_when_an_op_is_committed_elsewhere_should_accept_it() {
+        let mut pending = parked();
+        pending.committed_elsewhere.push(header(42));
+        assert!(repair_op_in_scope(Some(&pending), true, 99, 42));
+    }
+
+    #[test]
+    fn given_a_repair_request_when_serving_should_clamp_to_the_frontier_but_not_below_it() {
+        // `validate` accepts any `to_op >= from_op` and the serve path walks op by
+        // op with no `.await`, so an unclamped ceiling hangs the whole shard.
+        assert_eq!(repair_serve_ceiling(u64::MAX, 40, 90), 90);
+        assert_eq!(repair_serve_ceiling(50, 40, 90), 50);
+        // The suffix a new primary repairs toward sits above every commit point,
+        // so clamping to `commit_max` alone deadlocks the view change.
+        assert_eq!(repair_serve_ceiling(90, 40, 90), 90);
+        // `commit_max` above the local head still counts: heartbeats outrun prepares.
+        assert_eq!(repair_serve_ceiling(u64::MAX, 120, 90), 120);
+    }
+}
+
+#[cfg(test)]
+mod view_coverage_tests {
+    //! Holding an op is not holding the view's op.
+
+    use super::{MergedLog, first_op_not_covered};
+    use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+
+    fn sealed(op: u64, request: u64) -> PrepareHeader {
+        let mut header = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::CreateStream,
+            op,
+            request,
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+        header
+    }
+
+    #[test]
+    fn given_a_diverging_entry_when_scanning_should_report_it_like_a_hole() {
+        // Op 99 is present and is not the view's op 99. Reading presence as coverage
+        // starts the view over an operation the view says is something else, which
+        // `CommitJournal` then applies at or below the commit point unchecked.
+        let pending = MergedLog {
+            op_head: 100,
+            commit_max: 98,
+            headers: (98..=100).rev().map(|op| sealed(op, 1)).collect(),
+            committed_elsewhere: Vec::new(),
+        };
+        let held = [sealed(100, 1), sealed(99, 7), sealed(98, 1)];
+        let missing = first_op_not_covered(&pending, 0, |op| {
+            held.iter().find(|header| header.op == op).copied()
+        });
+        assert_eq!(missing, Some(99));
+    }
+
+    #[test]
+    fn given_an_evicted_committed_window_when_floored_should_start_the_view() {
+        // The wedge behind the partition_state_transfer regressions: a survivor
+        // that flushes on every commit holds NO resident journal header (the
+        // flush evicts them), so a merged window opening on its own committed op
+        // reads as a hole nothing can fill -- no repair re-journals a committed
+        // op. The floor (local commit point) must count it as covered, or the
+        // primary-elect parks in `ViewChange` forever and the rotation hands
+        // primaryship to an empty rejoiner that then cannot be served the state
+        // transfer it needs.
+        let pending = MergedLog {
+            op_head: 256,
+            commit_max: 256,
+            headers: vec![sealed(256, 1)],
+            committed_elsewhere: Vec::new(),
+        };
+        let nothing_resident = |_: u64| None;
+        assert_eq!(
+            first_op_not_covered(&pending, 0, nothing_resident),
+            Some(256),
+            "unfloored, the evicted committed op reads as an unfillable hole"
+        );
+        assert_eq!(
+            first_op_not_covered(&pending, 256, nothing_resident),
+            None,
+            "floored at the local commit point, the view starts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dvc_suffix_window_tests {
+    //! The suffix window's floor is a scan bound, not a commit point.
+    //!
+    //! Reading the lowest suffix op back as a proven commit point assumes suffix
+    //! generation stops at the sender's commit. These pin the two paths that break
+    //! that premise, so it cannot be quietly reintroduced.
+
+    use super::{DVC_HEADERS_MAX, build_dvc_suffix};
+    use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+
+    /// A real prepare at `op`. The operation must not be `Reserved`: that is
+    /// exactly `dvc_blank`, and `dvc_header_kind` classifies by equality with it.
+    fn held(op: u64) -> PrepareHeader {
+        PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::CreateStream,
+            op,
+            ..Default::default()
+        }
+    }
+
+    /// The lowest op the built window describes.
+    fn floor(suffix: &consensus::DvcSuffix) -> Option<u64> {
+        suffix.headers().last().map(|header| header.op)
+    }
+
+    /// A view's headers for `low..=high`, high-to-low as the suffix carries them.
+    fn view_headers(low: u64, high: u64) -> Vec<PrepareHeader> {
+        (low..=high).rev().map(held).collect()
+    }
+
+    #[test]
+    fn given_an_adopted_view_when_the_journal_is_empty_should_report_its_headers_unnacked() {
+        // A backup that adopted a `StartView` put the suffix in `pending_view_log`
+        // and is still repairing bodies, so its journal holds nothing at those ops.
+        // Reading the journal alone reports them blank AND nacked, which reaches a
+        // nack quorum against ops the view had just decided to keep.
+        let view = view_headers(3, 5);
+        let suffix = build_dvc_suffix(2, 0, |_| None, Some(&view));
+
+        assert_eq!(
+            suffix.len(),
+            4,
+            "the window rises to the view's head even with an empty journal"
+        );
+        assert_eq!(
+            floor(&suffix),
+            Some(2),
+            "the floor is still the commit point"
+        );
+        assert_eq!(
+            suffix.nack_bitset(),
+            0,
+            "a header held from the adopted view is not a nack"
+        );
+        assert_eq!(
+            suffix.present_bitset(),
+            0,
+            "and its body is not servable, so no present bit either"
+        );
+    }
+
+    #[test]
+    fn given_no_adopted_view_when_the_journal_is_empty_should_nack() {
+        // The contrast: without an adopted view the same holes really are proof.
+        let suffix = build_dvc_suffix(2, 5, |_| None, None);
+        assert_eq!(
+            suffix.nack_bitset(),
+            0b0111,
+            "ops 5, 4 and 3 nack; op 2 is the commit point"
+        );
+    }
+
+    #[test]
+    fn given_an_adopted_view_when_the_journal_covers_part_should_prefer_the_journal() {
+        // Journal first, so an op whose body this replica can serve keeps its
+        // present bit; the view fills only what the journal is missing.
+        let view = view_headers(3, 5);
+        let suffix = build_dvc_suffix(2, 5, |op| (op == 5).then(|| held(op)), Some(&view));
+
+        assert_eq!(suffix.len(), 4);
+        assert_eq!(suffix.present_bitset(), 0b0001, "only op 5 is servable");
+        assert_eq!(suffix.nack_bitset(), 0, "the view covers ops 4 and 3");
+
+        // The head is the max of the two, never the view's alone.
+        let short_view = view_headers(3, 4);
+        let deeper = build_dvc_suffix(2, 6, |op| Some(held(op)), Some(&short_view));
+        assert_eq!(deeper.headers().first().map(|header| header.op), Some(6));
+        assert_eq!(deeper.present_bitset(), 0b1_1111, "ops 6 down to 2");
+    }
+
+    #[test]
+    fn given_a_blank_view_entry_should_not_report_it_as_held() {
+        // A blank is the view saying "no header here", not one this replica holds.
+        let mut view = view_headers(3, 5);
+        view[1] = consensus::dvc_blank(4);
+        let suffix = build_dvc_suffix(2, 0, |_| None, Some(&view));
+
+        assert_eq!(suffix.nack_bitset(), 0b010, "only the blank op nacks");
+    }
+
+    #[test]
+    fn given_no_header_at_the_commit_point_should_report_it_blank_and_undecidable() {
+        // The window's floor is the commit point, and a blank there is the one
+        // entry that goes out with neither a header nor a nack. The merge scans
+        // that op and may not discard it, so a quorum of these deadlocks the view
+        // change. Pinned here because both compaction paths are meant to keep the
+        // header alive precisely so this shape never leaves a healthy replica.
+        let suffix = build_dvc_suffix(5, 5, |_| None, None);
+
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(floor(&suffix), Some(5));
+        assert_eq!(
+            suffix.nack_bitset(),
+            0,
+            "the commit point is never nacked, whatever the journal says"
+        );
+        assert_eq!(suffix.present_bitset(), 0);
+    }
+
+    #[test]
+    fn given_a_window_at_the_depth_ceiling_when_building_should_floor_at_the_commit() {
+        // At the deepest legal prepare-queue depth the window still starts exactly
+        // at the commit point, so nothing is clamped and no op goes undescribed.
+        // Config ceilings and `LocalPipeline::with_capacities` enforce the depth.
+        let depth = DVC_HEADERS_MAX as u64 - 1;
+        let commit = 500;
+        let op = commit + depth;
+        let suffix = build_dvc_suffix(commit, op, |op| Some(held(op)), None);
+
+        assert_eq!(suffix.len(), DVC_HEADERS_MAX, "the widest window that fits");
+        assert_eq!(
+            floor(&suffix),
+            Some(commit),
+            "at the ceiling the floor is still the commit point"
+        );
+    }
+
+    #[test]
+    fn given_a_window_past_the_depth_ceiling_when_building_should_clamp_above_the_commit() {
+        // One op deeper and the window clamps: the floor sits 501 ops above the
+        // sender's commit, with no marker on the frame saying so.
+        let commit = 500;
+        let op = commit + DVC_HEADERS_MAX as u64;
+        let suffix = build_dvc_suffix(commit, op, |op| Some(held(op)), None);
+
+        assert_eq!(suffix.len(), DVC_HEADERS_MAX);
+        assert_eq!(
+            floor(&suffix),
+            Some(op - DVC_HEADERS_MAX as u64 + 1),
+            "the clamped floor sits above the commit point"
+        );
+        assert!(floor(&suffix) > Some(commit));
+
+        // Second path, at any depth: ops are 1-based, so commit 0 floors at op 1.
+        let from_zero = build_dvc_suffix(0, 3, |op| Some(held(op)), None);
+        assert_eq!(floor(&from_zero), Some(1));
+    }
+
+    #[test]
+    fn given_a_compacted_log_when_building_should_still_describe_the_commit_point() {
+        // The commit point goes out blank AND un-nacked, so the merge can neither
+        // adopt nor discard it: a quorum that all compacted to the same op deadlocks
+        // and no further message fixes it. Both planes must keep that header
+        // reachable (metadata's drain stops one op short, a partition serves it from
+        // the evicted ring); nothing in `build_dvc_suffix` enforces it.
+        let commit = 500;
+        let compacted = |op: u64| (op >= commit).then(|| held(op));
+        let suffix = build_dvc_suffix(commit, commit + 3, compacted, None);
+
+        let commit_index = suffix.index_of(commit + 3, commit).expect("in window");
+        assert!(
+            suffix.valid_header_at(commit_index).is_some(),
+            "a blank at the commit point is undecidable for the merge"
+        );
+        assert!(
+            suffix.offers_body(commit_index),
+            "the commit point must be servable, or the merge stalls waiting for a peer"
+        );
+        assert!(
+            !suffix.nacks(commit_index),
+            "the commit point can never be nacked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod control_frame_tests {
+    //! A control frame's body must be verified on a rule corruption cannot switch
+    //! off. Keying on `checksum_body` looking sealed is bypassable by zeroing it.
+
+    use super::{control_body_checksum, control_suffix_body_verified};
+    use iggy_binary_protocol::{Command2, DoViewChangeHeader, PrepareHeader};
+    use server_common::Message;
+    use std::mem::size_of;
+
+    /// A `DoViewChange` frame carrying `entries` blank suffix headers.
+    fn frame(entries: usize, checksum_body: u128) -> Message<DoViewChangeHeader> {
+        let header_size = size_of::<DoViewChangeHeader>();
+        let total = header_size + entries * size_of::<PrepareHeader>();
+        let mut msg = Message::<DoViewChangeHeader>::new(total);
+        for (index, byte) in msg.as_mut_slice()[header_size..total]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = u8::try_from(index % 251).expect("modulus fits u8");
+        }
+        msg.transmute_header(|_, header: &mut DoViewChangeHeader| {
+            header.command = Command2::DoViewChange;
+            header.checksum_body = checksum_body;
+            header.size = u32::try_from(total).expect("frame fits u32");
+        })
+    }
+
+    #[test]
+    fn given_a_sealed_body_when_verifying_should_accept() {
+        let header_size = size_of::<DoViewChangeHeader>();
+        let unsealed = frame(2, 0);
+        let sealed_value = control_body_checksum(
+            &unsealed.as_slice()[header_size..unsealed.header().size as usize],
+        );
+        let msg = frame(2, sealed_value);
+
+        assert!(
+            control_suffix_body_verified(&msg, msg.header().checksum_body).is_some(),
+            "a correctly sealed body must be accepted"
+        );
+    }
+
+    #[test]
+    fn given_a_body_with_a_zeroed_checksum_when_verifying_should_reject() {
+        // A non-empty body always came from a sender that seals it, so a zero here is
+        // corruption. Treating it as "unsealed, skip" disables the layer by clearing
+        // the one field that decides whether anything is checked.
+        let msg = frame(2, 0);
+        assert!(
+            control_suffix_body_verified(&msg, msg.header().checksum_body).is_none(),
+            "a non-empty body with a zeroed checksum must be rejected, not waved through"
+        );
+    }
+
+    #[test]
+    fn given_a_corrupted_body_when_verifying_should_reject() {
+        let header_size = size_of::<DoViewChangeHeader>();
+        let unsealed = frame(2, 0);
+        let sealed_value = control_body_checksum(
+            &unsealed.as_slice()[header_size..unsealed.header().size as usize],
+        );
+        let mut msg = frame(2, sealed_value);
+        msg.as_mut_slice()[header_size] ^= 0xFF;
+
+        assert!(
+            control_suffix_body_verified(&msg, msg.header().checksum_body).is_none(),
+            "a body that does not match its checksum must be rejected"
+        );
+    }
+
+    #[test]
+    fn given_a_header_only_frame_when_verifying_should_accept() {
+        // A sender with nothing uncommitted contributes numbers only, no body.
+        let msg = frame(0, 0);
+        let body = control_suffix_body_verified(&msg, msg.header().checksum_body)
+            .expect("a header-only frame has nothing to verify");
+        assert!(body.is_empty());
     }
 }

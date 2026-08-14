@@ -16,7 +16,7 @@
 // under the License.
 
 //! Commit confirmations for `SendMessages`: which partition a batch landed in
-//! and at which offset. server-ng answers a committed send with a confirmation
+//! and at which offset. The server answers a committed send with a confirmation
 //! payload; the legacy server answers with an empty body, which the SDK reports
 //! as no confirmations rather than as a decode failure.
 
@@ -28,14 +28,11 @@ const TOPIC_NAME: &str = "confirmation-topic";
 const MESSAGES_COUNT: u32 = 10;
 const PARTITIONS_COUNT: u32 = 3;
 
-// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
-#[cfg(feature = "vsr")]
+// Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 /// Chunking for the direct producer: `CHUNKS * CHUNK_LENGTH` messages exceed
 /// one request, so the send is split and every chunk confirms separately.
-#[cfg(feature = "vsr")]
 const CHUNK_LENGTH: u32 = 4;
-#[cfg(feature = "vsr")]
 const CHUNKS: u32 = 3;
 
 fn batch(count: u32) -> Vec<IggyMessage> {
@@ -71,7 +68,6 @@ async fn create_stream_and_topic(client: &IggyClient, partitions_count: u32) -> 
     (stream.id, topic.id)
 }
 
-#[cfg(feature = "vsr")]
 fn sole_confirmation(response: &SendMessagesResponse) -> &SendMessagesConfirmationResponse {
     assert_eq!(
         response.confirmations.len(),
@@ -83,7 +79,6 @@ fn sole_confirmation(response: &SendMessagesResponse) -> &SendMessagesConfirmati
 
 /// Each transport carries the reply body on its own path, so the full
 /// confirmation shape is pinned on all three.
-#[cfg(feature = "vsr")]
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
 async fn given_explicit_partition_when_sending_two_batches_should_confirm_advancing_base_offset(
     harness: &TestHarness,
@@ -128,7 +123,6 @@ async fn given_explicit_partition_when_sending_two_batches_should_confirm_advanc
     client.logout_user().await.unwrap();
 }
 
-#[cfg(feature = "vsr")]
 #[iggy_harness]
 async fn given_balanced_partitioning_when_sending_should_confirm_a_partition_of_the_topic(
     harness: &TestHarness,
@@ -167,7 +161,6 @@ async fn given_balanced_partitioning_when_sending_should_confirm_a_partition_of_
     client.logout_user().await.unwrap();
 }
 
-#[cfg(feature = "vsr")]
 #[iggy_harness]
 async fn given_messages_key_partitioning_when_sending_should_confirm_a_partition_of_the_topic(
     harness: &TestHarness,
@@ -200,7 +193,6 @@ async fn given_messages_key_partitioning_when_sending_should_confirm_a_partition
     client.logout_user().await.unwrap();
 }
 
-#[cfg(feature = "vsr")]
 #[iggy_harness]
 async fn given_direct_producer_when_send_splits_into_chunks_should_confirm_every_chunk(
     harness: &TestHarness,
@@ -241,28 +233,4 @@ async fn given_direct_producer_when_send_splits_into_chunks_should_confirm_every
     }
 
     client.logout_user().await.unwrap();
-}
-
-#[cfg(not(feature = "vsr"))]
-#[iggy_harness]
-async fn given_legacy_server_when_sending_should_report_no_confirmations(harness: &TestHarness) {
-    let client = harness.root_client().await.unwrap();
-
-    create_stream_and_topic(&client, PARTITIONS_COUNT).await;
-    let mut messages = batch(MESSAGES_COUNT);
-    let response = client
-        .send_messages(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            &Partitioning::balanced(),
-            &mut messages,
-        )
-        .await
-        .expect("send_messages");
-
-    assert!(
-        response.confirmations.is_empty(),
-        "the legacy server reports no offsets; a synthetic entry would be \
-         indistinguishable from a genuine commit at offset 0"
-    );
 }

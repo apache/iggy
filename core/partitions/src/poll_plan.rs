@@ -39,13 +39,13 @@ use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
 };
 use server_common::iobuf::{Frozen, Owned};
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, decode_batch_slice};
+use server_common::send_messages2::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
 use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
 /// read-state handle. Index density is one entry per flush: at the default
@@ -120,6 +120,9 @@ pub struct DiskReadPlan {
     pub(crate) segments: Vec<DiskSegment>,
     pub(crate) start_position: u64,
     pub(crate) namespace_raw: u64,
+    /// Whether to verify each batch's `batch_checksum` against the bytes read.
+    /// Detection only; a mismatch fails the poll closed and repairs nothing.
+    pub(crate) validate_checksum: bool,
 }
 
 pub struct DiskSegment {
@@ -283,12 +286,18 @@ impl PollPlan {
                     crate::journal::select_resident(&resident_tail.entries, query)
                         .unwrap_or_else(|| (PollFragments::new(), None))
                 }
-                // Disk read stopped on an IO fault. Fail-closed: return an empty
-                // poll WITHOUT the journal-forward fallback. Falling forward
-                // here would splice the next resident op over the unreadable run
-                // and silently skip live data; the fault instead surfaces as a
-                // visibly stuck consumer that recovers on a later poll once the
-                // segment reads again.
+                // Disk read stopped on a fault. Fail-closed: return an empty poll
+                // WITHOUT the journal-forward fallback. Falling forward here would
+                // splice the next resident op over the unreadable run and silently
+                // skip live data.
+                //
+                // TODO(partitions): the poll reply has no error channel, so this
+                // reaches the consumer as an ordinary empty poll. Fair for a transient
+                // IO fault, wrong for a batch that failed its own checksum: data
+                // damaged at rest never reads again, so the consumer waits forever.
+                // Surfacing it needs a status on the poll reply, an SDK-visible change
+                // on every client. Until then the ERROR in `walk_disk_chunk` is the
+                // only signal, and it is server-side only.
                 DiskReadOutcome::Faulted => (PollFragments::new(), None),
                 // Straddle: continue past the last disk match into the resident
                 // tail (gate + race argument live on `straddle_continuation`).
@@ -533,14 +542,27 @@ impl DiskReadPlan {
                     faulted = true;
                     break 'walk;
                 };
-                let consumed = walk_disk_chunk(
+                let ChunkWalk { consumed, corrupt } = walk_disk_chunk(
                     &chunk,
                     query,
                     count,
                     &mut matched,
                     &mut fragments,
                     &mut last_matching_offset,
+                    if self.validate_checksum {
+                        BatchIntegrity::Verify
+                    } else {
+                        BatchIntegrity::LayoutOnly
+                    },
+                    self.namespace_raw,
                 );
+                if corrupt {
+                    // A batch that does not match its own checksum. Fail closed like
+                    // an IO fault: serving it hands a consumer data provably not what
+                    // was written, and skipping ahead punches a silent gap.
+                    faulted = true;
+                    break 'walk;
+                }
                 if consumed == 0 {
                     if (len as u64) >= persisted - position {
                         // The whole remainder fit yet no complete batch
@@ -883,6 +905,7 @@ pub fn upsert_offset_max<K>(
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
 /// re-reads from there), or the chunk end when everything decoded.
+#[allow(clippy::too_many_arguments)]
 fn walk_disk_chunk(
     chunk: &Frozen<4096>,
     query: MessageLookup,
@@ -890,15 +913,37 @@ fn walk_disk_chunk(
     matched: &mut u32,
     fragments: &mut PollFragments<4096>,
     last_matching_offset: &mut Option<u64>,
-) -> usize {
+    integrity: BatchIntegrity,
+    namespace_raw: u64,
+) -> ChunkWalk {
     let bytes: &[u8] = chunk;
     let mut cursor = 0usize;
 
     while *matched < count && cursor + COMMAND_HEADER_SIZE <= bytes.len() {
-        let Ok(batch) = decode_batch_slice(&bytes[cursor..]) else {
-            // Incomplete tail batch (or corrupt data): hand the position
-            // back so the caller can re-read or bail.
-            break;
+        let batch = match decode_batch_slice_with(&bytes[cursor..], integrity) {
+            Ok(batch) => batch,
+            Err(IggyError::InvalidBatchChecksum(found, expected, base_offset)) => {
+                // Distinguished from the incomplete-tail case below: this batch is
+                // entirely present and fails its own checksum, so it is damaged at rest.
+                error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw,
+                    base_offset,
+                    expected,
+                    found,
+                    position = cursor,
+                    "disk poll: batch checksum mismatch; segment is corrupt at rest"
+                );
+                return ChunkWalk {
+                    consumed: cursor.min(bytes.len()),
+                    corrupt: true,
+                };
+            }
+            Err(_) => {
+                // Incomplete tail batch: hand the position back to re-read or bail.
+                break;
+            }
         };
         let total_size = batch.header.total_size();
 
@@ -919,7 +964,17 @@ fn walk_disk_chunk(
         cursor += total_size;
     }
 
-    cursor.min(bytes.len())
+    ChunkWalk {
+        consumed: cursor.min(bytes.len()),
+        corrupt: false,
+    }
+}
+
+/// How far [`walk_disk_chunk`] got, and whether it stopped on corruption rather
+/// than on a batch that simply did not fit in the chunk.
+struct ChunkWalk {
+    consumed: usize,
+    corrupt: bool,
 }
 
 #[cfg(test)]

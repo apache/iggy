@@ -15,24 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
+use crate::leader_aware::{
+    LeaderRedirectionState, check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
+};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
-#[cfg(feature = "vsr")]
 use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-#[cfg(not(feature = "vsr"))]
-use bytes::BufMut;
 use bytes::{Bytes, BytesMut};
-#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
-#[cfg(not(feature = "vsr"))]
-use iggy_common::IggyErrorDiscriminants;
-#[cfg(feature = "vsr")]
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
@@ -44,7 +39,6 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(feature = "vsr")]
 use std::sync::Mutex as StdMutex;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -52,16 +46,11 @@ use tokio::time::sleep;
 use tokio_rustls::{TlsConnector, TlsStream};
 use tracing::{error, info, trace, warn};
 
-#[cfg(not(feature = "vsr"))]
-const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
-#[cfg(not(feature = "vsr"))]
-const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 /// Upper bound for awaiting a reply on the lockstep VSR connection. Far
 /// beyond any healthy round-trip; only trips when the server loses the
 /// reply entirely (e.g. stalled replication quorum), which would otherwise
 /// hold the stream lock forever and wedge the client.
-#[cfg(feature = "vsr")]
 const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Backoff before replaying a request the server answered with an explicit
@@ -69,7 +58,6 @@ const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// view-change cancel). The reply arrives promptly, so a short pause keeps the
 /// replay from spinning while the primary catches up. Bounded by
 /// `RESPONSE_READ_TIMEOUT`.
-#[cfg(feature = "vsr")]
 const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How long a request replays `TransientNotCommitted` on the SAME connection
@@ -78,7 +66,6 @@ const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// forever, so replaying alone never recovers; periodically consult the
 /// roster and fail over to the leader. Bounded by `RESPONSE_READ_TIMEOUT`
 /// overall.
-#[cfg(feature = "vsr")]
 const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// TCP client for interacting with the Iggy API.
@@ -93,15 +80,12 @@ pub struct TcpClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
-    #[cfg(feature = "vsr")]
     // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
     // is `encode_request_header`, which is pure CPU and never awaits. The
     // tokio variant would pay a waker alloc + internal semaphore on
     // contention with zero correctness benefit.
     consensus_session: Arc<StdMutex<ConsensusSession>>,
-    #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
-    #[cfg(feature = "vsr")]
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
@@ -167,25 +151,26 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
+        if is_unauthenticated_metadata_probe(code, &error) {
+            return Err(error);
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
 
-        #[cfg(feature = "vsr")]
         if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
             // Without auto-login a reconnect cannot re-establish the session,
             // so non-login requests fail fast. Login/register itself is the
             // exception: the server stays deliberately silent on transient
-            // register failures (server-ng `surface_login_failure`) and
+            // register failures (the server `surface_login_failure`) and
             // relies on the client timing out and replaying the request.
             return Err(error);
         }
 
         self.disconnect().await?;
 
-        #[cfg(feature = "vsr")]
         let skip_auto_login = is_login_register_code(code);
-        #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
         }
@@ -200,7 +185,6 @@ impl BinaryTransport for TcpClient {
         }
 
         let reconnect = self.connect().await;
-        #[cfg(feature = "vsr")]
         if skip_auto_login && reconnect.is_err() {
             *self.skip_auto_login_once.lock().await = false;
         }
@@ -212,16 +196,13 @@ impl BinaryTransport for TcpClient {
         self.config.heartbeat_interval
     }
 
-    #[cfg(feature = "vsr")]
     fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
         Arc::clone(&self.consumer_group_state)
     }
 }
 
-#[cfg(feature = "vsr")]
 impl iggy_common::VsrSessionSealed for TcpClient {}
 
-#[cfg(feature = "vsr")]
 #[async_trait::async_trait]
 impl iggy_common::VsrSessionControl for TcpClient {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
@@ -311,54 +292,10 @@ impl TcpClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
-            #[cfg(feature = "vsr")]
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
-            #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
-            #[cfg(feature = "vsr")]
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
-    }
-
-    #[cfg(not(feature = "vsr"))]
-    async fn handle_response(
-        status: u32,
-        length: u32,
-        stream: &mut ConnectionStreamKind,
-    ) -> Result<Bytes, IggyError> {
-        if status != 0 {
-            // TEMP: See https://github.com/apache/iggy/pull/604 for context.
-            if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
-                || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
-                || status == IggyErrorDiscriminants::UserAlreadyExists as u32
-                || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
-                || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
-            {
-                tracing::debug!(
-                    "Received a server resource already exists response: {} ({})",
-                    status,
-                    IggyError::from_code_as_string(status)
-                )
-            } else {
-                error!(
-                    "Received an invalid response with status: {} ({}).",
-                    status,
-                    IggyError::from_code_as_string(status),
-                );
-            }
-
-            return Err(IggyError::from_code(status));
-        }
-
-        trace!("Status: OK. Response length: {}", length);
-        if length <= 1 {
-            return Ok(Bytes::new());
-        }
-
-        let mut response_buffer = BytesMut::with_capacity(length as usize);
-        response_buffer.put_bytes(0, length as usize);
-        stream.read(&mut response_buffer).await?;
-        Ok(response_buffer.freeze())
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
@@ -542,7 +479,6 @@ impl TcpClient {
             self.set_state(ClientState::Connected).await;
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
-            #[cfg(feature = "vsr")]
             let skip_auto_login = {
                 let mut guard = self.skip_auto_login_once.lock().await;
                 std::mem::take(&mut *guard)
@@ -552,35 +488,17 @@ impl TcpClient {
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
                     info!("Automatic sign-in is disabled.");
-                    // Leadership still matters without auto-login: the caller
-                    // signs in manually, and a login against a non-leader
-                    // replays for its whole read timeout. `GetClusterMetadata`
-                    // is sessionless and pre-auth on server-ng, so the check
-                    // works on the unauthenticated connection. vsr-only: the
-                    // legacy server auth-gates cluster metadata, so this check
-                    // would bounce `Unauthenticated` into the reconnect path
-                    // and recurse back into `connect`.
-                    #[cfg(feature = "vsr")]
-                    {
-                        self.handle_leader_redirection().await?
-                    }
-                    #[cfg(not(feature = "vsr"))]
+                    // Only `IggyClient` redirects after a manual sign-in, so
+                    // a raw transport can stay on a backup: its first
+                    // replicated write gets `TransientNotAccepted`, the
+                    // redirect drops the session, and the retry fails
+                    // `Unauthenticated` until the caller signs in again.
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
-                    #[cfg(feature = "vsr")]
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
-                    } else if self.handle_leader_redirection().await? {
-                        // Check leadership BEFORE signing in: register/login are
-                        // consensus ops a backup answers with
-                        // `TransientNotCommitted`, so signing in against a
-                        // non-leader replays for the whole read timeout instead
-                        // of failing over. `GetClusterMetadata` is sessionless
-                        // and pre-auth, so it works on the unauthenticated
-                        // connection.
-                        true
                     } else {
                         info!("{NAME} client: {client_address} is signing in...");
                         self.set_state(ClientState::Authenticating).await;
@@ -600,28 +518,11 @@ impl TcpClient {
                             }
                         }
 
-                        self.handle_leader_redirection().await?
-                    }
-                    #[cfg(not(feature = "vsr"))]
-                    {
-                        info!("{NAME} client: {client_address} is signing in...");
-                        self.set_state(ClientState::Authenticating).await;
-                        match credentials {
-                            Credentials::UsernamePassword(username, password) => {
-                                self.login_user(username, password.expose_secret()).await?;
-                                info!(
-                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
-                                );
-                            }
-                            Credentials::PersonalAccessToken(token) => {
-                                self.login_with_personal_access_token(token.expose_secret())
-                                    .await?;
-                                info!(
-                                    "{NAME} client: {client_address} has signed in with a personal access token.",
-                                );
-                            }
-                        }
-
+                        // The sole leader settlement, and it runs
+                        // authenticated. Any node completes a login now -- a
+                        // backup forwards the register to the primary -- so
+                        // this decides where later ops land, not whether
+                        // sign-in works.
                         self.handle_leader_redirection().await?
                     }
                 }
@@ -681,7 +582,6 @@ impl TcpClient {
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
         self.stream.lock().await.take();
-        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -700,7 +600,6 @@ impl TcpClient {
         if let Some(mut stream) = stream {
             stream.shutdown().await?;
         }
-        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
@@ -725,126 +624,62 @@ impl TcpClient {
             _ => {}
         }
 
-        #[cfg(feature = "vsr")]
-        {
-            // One overall deadline bounds the request across transient replays
-            // AND leader failovers, matching the previous single-connection
-            // budget. Login/register replays stay on this connection for the
-            // whole budget: the connect flow owns leader redirection for the
-            // sign-in handshake, and reconnecting from underneath it would
-            // recurse.
-            let overall_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-            let mut preencoded = None;
-            loop {
-                let transient_deadline = if is_login_register_code(code) {
-                    overall_deadline
-                } else {
-                    overall_deadline
-                        .min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
-                };
-                let (header, result) = self
-                    .send_raw_vsr_attempt(
-                        code,
-                        payload.clone(),
-                        preencoded,
-                        transient_deadline,
-                        overall_deadline,
-                    )
-                    .await;
-                match result {
-                    Err(IggyError::TransientNotAccepted)
-                        if tokio::time::Instant::now() < overall_deadline
-                            && !is_login_register_code(code) =>
-                    {
-                        // The server explicitly did NOT admit the request, so
-                        // re-issuing it -- same id on this session, or a fresh
-                        // id under a new session after a failover -- cannot
-                        // double-apply. Keep the encoded id for same-session
-                        // replays; a redirect re-registers, so the id is
-                        // re-encoded under the new session.
-                        // (`TransientNotCommitted` never reaches this branch:
-                        // its outcome is unknown, so the attempt loop replays
-                        // it same-session for the whole budget and then the
-                        // error propagates to the caller.)
-                        preencoded = header;
-                        if let Ok(true) = self.handle_leader_redirection().await {
-                            self.connect().await?;
-                            preencoded = None;
-                        }
+        // One overall deadline bounds the request across transient replays
+        // AND leader failovers, matching the previous single-connection
+        // budget. Login/register replays stay on this connection for the
+        // whole budget: the connect flow owns leader redirection for the
+        // sign-in handshake, and reconnecting from underneath it would
+        // recurse.
+        let overall_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+        let mut preencoded = None;
+        loop {
+            let transient_deadline = if is_login_register_code(code) {
+                overall_deadline
+            } else {
+                overall_deadline
+                    .min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
+            };
+            let (header, result) = self
+                .send_raw_vsr_attempt(
+                    code,
+                    payload.clone(),
+                    preencoded,
+                    transient_deadline,
+                    overall_deadline,
+                )
+                .await;
+            match result {
+                Err(IggyError::TransientNotAccepted)
+                    if tokio::time::Instant::now() < overall_deadline
+                        && !is_login_register_code(code) =>
+                {
+                    // The server explicitly did NOT admit the request, so
+                    // re-issuing it -- same id on this session, or a fresh
+                    // id under a new session after a failover -- cannot
+                    // double-apply. Keep the encoded id for same-session
+                    // replays; a redirect re-registers, so the id is
+                    // re-encoded under the new session.
+                    // (`TransientNotCommitted` never reaches this branch:
+                    // its outcome is unknown, so the attempt loop replays
+                    // it same-session for the whole budget and then the
+                    // error propagates to the caller.)
+                    preencoded = header;
+                    if let Ok(true) = self.handle_leader_redirection().await {
+                        self.connect().await?;
+                        preencoded = None;
                     }
-                    Err(IggyError::Disconnected) => {
-                        // Reply stream state is unknown (timed out or torn
-                        // mid-frame); a late reply would desync framing for the
-                        // next request, so drop the connection and let callers
-                        // reconnect.
-                        self.stream.lock().await.take();
-                        self.set_state(ClientState::Disconnected).await;
-                        return Err(IggyError::Disconnected);
-                    }
-                    other => return other,
                 }
-            }
-        }
-
-        #[cfg(not(feature = "vsr"))]
-        {
-            let stream = self.stream.clone();
-            // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
-            let result = tokio::spawn(async move {
-                let mut stream = stream.lock().await;
-                if let Some(stream) = stream.as_mut() {
-                    let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-                    trace!("Sending a TCP request of size {payload_length} with code: {code}");
-                    stream.write(&(payload_length as u32).to_le_bytes()).await?;
-                    stream.write(&code.to_le_bytes()).await?;
-                    stream.write(&payload).await?;
-                    stream.flush().await?;
-                    trace!("Sent a TCP request with code: {code}, waiting for a response...");
-                    let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-                    let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
-                        error!(
-                            "Failed to read response for TCP request with code: {code}: {error}",
-                            code = code,
-                            error = error
-                        );
-                        IggyError::Disconnected
-                    })?;
-
-                    if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
-                        error!("Received an invalid or empty response.");
-                        return Err(IggyError::EmptyResponse);
-                    }
-
-                    let status = u32::from_le_bytes(
-                        response_buffer[..4]
-                            .try_into()
-                            .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                    );
-                    let length = u32::from_le_bytes(
-                        response_buffer[4..]
-                            .try_into()
-                            .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                    );
-                    return TcpClient::handle_response(status, length, stream).await;
+                Err(IggyError::Disconnected) => {
+                    // Reply stream state is unknown (timed out or torn
+                    // mid-frame); a late reply would desync framing for the
+                    // next request, so drop the connection and let callers
+                    // reconnect.
+                    self.stream.lock().await.take();
+                    self.set_state(ClientState::Disconnected).await;
+                    return Err(IggyError::Disconnected);
                 }
-
-                error!("Cannot send data. Client is not connected.");
-                Err(IggyError::NotConnected)
-            })
-            .await
-            .map_err(|e| {
-                error!("Task execution failed during TCP request: {}", e);
-                IggyError::TcpError
-            })?;
-
-            if matches!(result, Err(IggyError::Disconnected)) {
-                // Reply stream state is unknown (timed out or torn mid-frame);
-                // a late reply would desync framing for the next request, so
-                // drop the connection and let callers reconnect.
-                self.stream.lock().await.take();
-                self.set_state(ClientState::Disconnected).await;
+                other => return other,
             }
-            result
         }
     }
 
@@ -855,7 +690,6 @@ impl TcpClient {
     /// full request budget -- so a short transient window cannot tear down a
     /// connection that is merely slow to reply. Returns the header used so the
     /// caller can replay the same id on a later attempt.
-    #[cfg(feature = "vsr")]
     async fn send_raw_vsr_attempt(
         &self,
         code: u32,
@@ -1026,7 +860,6 @@ impl TcpClient {
     }
 }
 
-#[cfg(feature = "vsr")]
 const fn is_login_register_code(code: u32) -> bool {
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }
@@ -1037,26 +870,6 @@ const fn is_login_register_code(code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(feature = "vsr"))]
-    use tokio::io::AsyncWriteExt;
-    #[cfg(not(feature = "vsr"))]
-    use tokio::net::TcpListener;
-
-    #[cfg(not(feature = "vsr"))]
-    async fn make_dummy_stream(data: &[u8]) -> ConnectionStreamKind {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let data = data.to_vec();
-        tokio::spawn(async move {
-            let (mut server_side, _) = listener.accept().await.unwrap();
-            server_side.write_all(&data).await.unwrap();
-        });
-
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let client_addr = client.local_addr().unwrap();
-        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, client))
-    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -1324,45 +1137,5 @@ mod tests {
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
         );
-    }
-
-    #[cfg(not(feature = "vsr"))]
-    #[tokio::test]
-    async fn should_return_error_when_status_is_non_zero() {
-        let mut stream = make_dummy_stream(&[1u8; 10]).await;
-        let tcp_client = TcpClient::handle_response(1, 0, &mut stream).await;
-        assert!(tcp_client.is_err());
-    }
-
-    #[cfg(not(feature = "vsr"))]
-    #[tokio::test]
-    async fn should_return_ok_when_status_is_zero() {
-        let mut stream = make_dummy_stream(&[1u8; 10]).await;
-        let tcp_client = TcpClient::handle_response(0, 0, &mut stream).await;
-        assert!(tcp_client.is_ok());
-    }
-
-    #[cfg(not(feature = "vsr"))]
-    #[tokio::test]
-    async fn should_return_ok_when_length_is_less_than_data() {
-        let mut stream = make_dummy_stream(&[1u8; 10]).await;
-        let tcp_client = TcpClient::handle_response(0, 5, &mut stream).await;
-        assert!(tcp_client.is_ok());
-    }
-
-    #[cfg(not(feature = "vsr"))]
-    #[tokio::test]
-    async fn should_return_ok_when_length_is_equal_to_one() {
-        let mut stream = make_dummy_stream(&[1u8; 10]).await;
-        let tcp_client = TcpClient::handle_response(0, 1, &mut stream).await;
-        assert_eq!(tcp_client.unwrap(), Bytes::new());
-    }
-
-    #[cfg(not(feature = "vsr"))]
-    #[tokio::test]
-    async fn should_return_err_when_length_exceeds_data() {
-        let mut stream = make_dummy_stream(&[1u8; 10]).await;
-        let tcp_client = TcpClient::handle_response(0, 50, &mut stream).await;
-        assert!(tcp_client.is_err());
     }
 }

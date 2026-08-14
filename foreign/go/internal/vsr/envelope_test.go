@@ -55,8 +55,6 @@ func TestEncodeRequest_EncodesARegisterFrame(t *testing.T) {
 	assert.Equal(t, byte(OperationRegister), header[requestOffsetOperation])
 	assert.Zero(t, binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 	assert.Zero(t, binary.LittleEndian.Uint64(header[requestOffsetSession:]))
-	assert.Equal(t, MetadataConsensusNamespace,
-		binary.LittleEndian.Uint64(header[requestOffsetNamespace:]))
 	assert.Zero(t, binary.LittleEndian.Uint32(header[requestOffsetReserved:]))
 }
 
@@ -77,8 +75,6 @@ func TestEncodeRequest_EncodesALogoutFrame(t *testing.T) {
 
 	header := frameHeader(t, frame)
 	assert.Equal(t, byte(OperationLogout), header[requestOffsetOperation])
-	assert.Equal(t, MetadataConsensusNamespace,
-		binary.LittleEndian.Uint64(header[requestOffsetNamespace:]))
 	assert.Equal(t, uint64(1), binary.LittleEndian.Uint64(header[requestOffsetRequest:]),
 		"logout advances the metadata watermark")
 	assert.Equal(t, uint64(2), session.CurrentRequestID())
@@ -128,10 +124,8 @@ func TestEncodeRequest_DoesNotAdvanceTheWatermarkOffTheMetadataPlane(t *testing.
 	}
 	assert.Equal(t, uint64(1), session.CurrentRequestID())
 
-	payload := sendMessagesPayload(
-		numericIdentifier(1), numericIdentifier(1), partitionIDPartitioning(0))
 	for range 3 {
-		_, err := EncodeRequest(session, uint32(command.SendMessagesCode), payload)
+		_, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 		require.NoError(t, err)
 	}
 	assert.Equal(t, uint64(1), session.CurrentRequestID())
@@ -146,7 +140,6 @@ func TestEncodeRequest_AdvancesTheWatermarkPerMetadataCommand(t *testing.T) {
 		header := frameHeader(t, frame)
 		assert.Equal(t, expected, binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 		assert.Equal(t, byte(OperationCreateStream), header[requestOffsetOperation])
-		assert.Zero(t, binary.LittleEndian.Uint64(header[requestOffsetNamespace:]))
 	}
 	assert.Equal(t, uint64(4), session.CurrentRequestID())
 }
@@ -161,51 +154,19 @@ func TestEncodeRequest_RejectsAReplicatedCommandOnAnUnboundSession(t *testing.T)
 
 func TestEncodeRequest_RejectsAPartitionCommandOnAnUnboundSession(t *testing.T) {
 	session := NewSessionWithClientID(ClientID{Lo: 1})
-	payload := sendMessagesPayload(
-		numericIdentifier(1), numericIdentifier(1), partitionIDPartitioning(0))
 
-	_, err := EncodeRequest(session, uint32(command.SendMessagesCode), payload)
+	_, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 	assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
 }
 
-func TestEncodeRequest_ReportsTheMissingSessionAheadOfAnUnroutablePayload(t *testing.T) {
-	session := NewSessionWithClientID(ClientID{Lo: 1})
-	unroutable := sendMessagesPayload(
-		numericIdentifier(MaxStreams), numericIdentifier(1), partitionIDPartitioning(0))
-
-	_, err := EncodeRequest(session, uint32(command.SendMessagesCode), unroutable)
-	assert.ErrorIs(t, err, ierror.ErrUnauthenticated,
-		"an unauthenticated caller could not have sent the request either way")
-}
-
-func TestEncodeRequest_BurnsNoIDWhenTheNamespaceFails(t *testing.T) {
+func TestEncodeRequest_EncodesASendMessagesFrame(t *testing.T) {
 	session := boundSession(t)
-	malformed := sendMessagesPayload(
-		numericIdentifier(1), numericIdentifier(1), []byte{1, 4, 0, 0, 0, 0})
 
-	_, err := EncodeRequest(session, uint32(command.SendMessagesCode), malformed)
-	assert.ErrorIs(t, err, ierror.ErrFeatureUnavailable)
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
-
-	// The next metadata command still takes id 1, so the sequence has no gap.
-	frame, err := EncodeRequest(session, uint32(command.CreateStreamCode), []byte{1})
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1),
-		binary.LittleEndian.Uint64(frameHeader(t, frame)[requestOffsetRequest:]))
-}
-
-func TestEncodeRequest_RoutesSendMessagesToItsPartition(t *testing.T) {
-	session := boundSession(t)
-	payload := sendMessagesPayload(
-		numericIdentifier(3), numericIdentifier(2), partitionIDPartitioning(7))
-
-	frame, err := EncodeRequest(session, uint32(command.SendMessagesCode), payload)
+	frame, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 	require.NoError(t, err)
 
 	header := frameHeader(t, frame)
 	assert.Equal(t, byte(OperationSendMessages), header[requestOffsetOperation])
-	assert.Equal(t, uint64(3<<32|2<<20|7),
-		binary.LittleEndian.Uint64(header[requestOffsetNamespace:]))
 	assert.Zero(t, binary.LittleEndian.Uint32(header[requestOffsetReserved:]),
 		"only non-replicated frames carry the code")
 }

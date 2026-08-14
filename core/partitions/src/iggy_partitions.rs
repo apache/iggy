@@ -23,7 +23,7 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
@@ -200,6 +200,12 @@ where
 
     /// Insert a new partition and return its local index.
     ///
+    /// Insertion is the moment a build becomes the addressable incarnation,
+    /// so this is also where its offset counter is published into the shared
+    /// `PartitionStats` ([`IggyPartition::publish_current_offset`]). No
+    /// earlier point is safe: a build that is never adopted must leave the
+    /// live incarnation's counters alone.
+    ///
     /// # Safety discipline (compiler cannot enforce)
     ///
     /// Must only be called from the shard's pump task (i.e. inside
@@ -220,6 +226,7 @@ where
             0,
             "IggyPartitions::insert while a with_partition borrow is live"
         );
+        partition.publish_current_offset();
         // Safety: pump-only invariant, caller responsibility.
         let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
@@ -294,6 +301,27 @@ where
         suspend.await;
     }
 
+    /// TEST / SIMULATOR ONLY. Address of the partitions vec's heap buffer.
+    ///
+    /// Lets a test prove that an [`Self::insert`] actually REALLOCATED rather
+    /// than landing in spare capacity. The distinction is the whole point of the
+    /// realloc half of PR #3557: `swap_remove` invalidates one slot's reference,
+    /// while a growing `push` moves every element and invalidates all of them. A
+    /// test that only checked "insert happened" would pass on a push into spare
+    /// capacity, which moves nothing and proves nothing.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn buffer_addr(&self) -> usize {
+        // SAFETY: forms a shared reference into the `UnsafeCell` for this expression.
+        // Read-only-ness is not what makes that sound, since a shared reborrow
+        // aliasing a live `&mut` is UB whether or not it reads. What makes it sound
+        // is that no
+        // `&mut` from `get_mut_by_ns` / `namespace_map_mut` is live across the call:
+        // those are pump-only, and these callers run on the pump. Only the pointer
+        // value escapes.
+        unsafe { (*self.partitions.get()).as_ptr() as usize }
+    }
+
     /// Get mutable partition by namespace directly. Tombstone-gated like
     /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
@@ -352,7 +380,7 @@ where
             // by the moved partition's namespace key in O(1); the previous
             // linear value-scan turned bulk DeleteStream into O(K²) on the
             // pump task, stalling client traffic for ~10k-partition topics.
-            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().namespace());
+            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().group());
             let entry = self.namespace_map_mut().get_mut(&moved_ns).expect(
                 "IggyPartitions invariant: swapped-in partition missing namespace_to_local entry",
             );
@@ -412,8 +440,10 @@ where
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
         // inside), so no sibling task can realloc the partitions vec under it.
+        // Read the knob first: the `&mut` borrow below covers `self.config` too.
+        let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
-        Some(partition.build_poll_plan(consumer, args))
+        Some(partition.build_poll_plan(consumer, args, validate_checksum))
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully
@@ -496,8 +526,11 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        let namespace = IggyNamespace::from_raw(message.header().group);
         if self.is_tombstoned(&namespace) {
             warn!(
                 target: "iggy.partitions.diag",
@@ -550,20 +583,20 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare: namespace tombstoned"
             );
             return;
         }
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 operation = ?message.header().operation,
                 "partition not initialized for namespace"
@@ -575,21 +608,21 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare-ok: namespace tombstoned"
             );
             return;
         }
         let config = self.config.clone();
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 "partition not initialized for namespace"
             );
@@ -641,6 +674,28 @@ mod tests {
             TEST_CLUSTER,
             0,
             1,
+            namespace.inner(),
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        )
+    }
+
+    /// `build_partition` for a replicated group. The replica count is what
+    /// decides whether the journal retains evicted entries for repair, so a
+    /// single-replica partition cannot exercise anything that reads the ring.
+    fn build_replicated_partition() -> IggyPartition<IggyMessageBus> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            3,
             namespace.inner(),
             IggyMessageBus::new(0),
             LocalPipeline::new(),
@@ -794,6 +849,67 @@ mod tests {
             Some(3),
             "contiguous continuation returns the resident tail starting at 3",
         );
+    }
+
+    /// A flush evicts the committed prefix up to and INCLUDING `commit_max`, so
+    /// a caught-up replica keeps no resident header at its own commit point. The
+    /// `DoViewChange` suffix is floored there and cannot nack it, so reading the
+    /// resident headers alone sends the commit point out blank, which a quorum of
+    /// senders turns into a view change that never starts.
+    ///
+    /// The entry is still servable (`repair_entry` answers from the evicted
+    /// ring), so the suffix reads through `repair_header`, over the same range.
+    #[compio::test]
+    async fn evicted_commit_point_still_answers_for_the_view_change_suffix() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partition = build_replicated_partition();
+
+        for offset in 0..=2u64 {
+            partition
+                .log
+                .journal()
+                .inner
+                .append(build_send_messages_entry(namespace, offset + 1, offset))
+                .await
+                .expect("append journal entry");
+        }
+
+        let commit_max = 3;
+        let prefix = partition.log.journal().inner.committed_prefix(commit_max);
+        assert_eq!(prefix.len(), 3, "the whole log is committed and flushable");
+        partition
+            .log
+            .journal()
+            .inner
+            .evict_prefix(prefix.len())
+            .await;
+
+        assert!(
+            partition
+                .log
+                .journal()
+                .inner
+                .header_by_op(commit_max)
+                .is_none(),
+            "the flush evicted the commit point from the resident headers",
+        );
+        assert!(
+            partition
+                .log
+                .journal()
+                .inner
+                .repair_entry(commit_max)
+                .is_some(),
+            "yet the entry is still servable from the evicted ring",
+        );
+
+        let header = partition
+            .log
+            .journal()
+            .inner
+            .repair_header(commit_max)
+            .expect("the commit point must stay describable for the DVC suffix");
+        assert_eq!(header.op, commit_max);
     }
 
     /// The resident journal holds replicated-but-uncommitted prepares ahead of

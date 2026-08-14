@@ -32,6 +32,21 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.util.List;
 
+/**
+ * Base for integration tests. The SDK speaks the VSR wire protocol, so the
+ * server under test must support it.
+ *
+ * <p>With {@code USE_EXTERNAL_SERVER} set, tests target an externally
+ * started VSR server on localhost, running standalone (single-node) mode.
+ * Start it from the repo root:
+ * <pre>{@code
+ * IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server
+ * }</pre>
+ *
+ * <p>Otherwise a server container is started via testcontainers. This works
+ * once the published image ships a VSR-capable server; until then the
+ * external-server mode is the only one that can pass.
+ */
 @Testcontainers
 public abstract class BaseIntegrationTest {
 
@@ -58,6 +73,10 @@ public abstract class BaseIntegrationTest {
     static void setupContainer() {
         ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
         if (!USE_EXTERNAL_SERVER) {
+            // The published image still ships the legacy server, which does
+            // not speak the VSR wire protocol, so tests against this
+            // container fail until a VSR-capable server is released. Use
+            // USE_EXTERNAL_SERVER until then.
             log.info("Starting Iggy Server Container...");
             iggyServer = new GenericContainer<>(DockerImageName.parse("apache/iggy:edge"))
                     .withExposedPorts(HTTP_PORT, TCP_PORT)

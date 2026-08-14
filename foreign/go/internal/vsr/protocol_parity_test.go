@@ -46,10 +46,8 @@ var rustSources = map[string]string{
 	"header":    "core/binary_protocol/src/consensus/header.rs",
 	"command":   "core/binary_protocol/src/consensus/command.rs",
 	"operation": "core/binary_protocol/src/consensus/operation.rs",
-	"namespace": "core/binary_protocol/src/namespace.rs",
 	"cargo":     "core/binary_protocol/Cargo.toml",
 	"eviction":  "core/common/src/error/eviction.rs",
-	"sdk":       "core/sdk/src/vsr.rs",
 }
 
 // goOperations names every discriminant the codec declares. It exists so the
@@ -131,7 +129,6 @@ var goHeaderOffsets = map[string]map[string]int{
 		"timestamp": requestOffsetTimestamp,
 		"request":   requestOffsetRequest,
 		"operation": requestOffsetOperation,
-		"namespace": requestOffsetNamespace,
 		"session":   requestOffsetSession,
 		"reserved":  requestOffsetReserved,
 	},
@@ -139,7 +136,6 @@ var goHeaderOffsets = map[string]map[string]int{
 		"size":      replyOffsetSize,
 		"command":   replyOffsetCommand,
 		"operation": replyOffsetOperation,
-		"namespace": replyOffsetNamespace,
 		"status":    replyOffsetStatus,
 	},
 	"EvictionHeader": {
@@ -333,47 +329,6 @@ func TestProtocolParity_ReplicatedOperationMap(t *testing.T) {
 	assert.Equal(t, want, replicatedOperation)
 }
 
-func TestProtocolParity_NamespaceLayout(t *testing.T) {
-	sources := loadRustSources(t)
-	limits := namedNumbers(sources["namespace"],
-		regexp.MustCompile(`(?m)^pub const (MAX_[A-Z]+): usize = ([0-9_]+);$`))
-
-	require.Equal(t, uint64(MaxStreams), limits["MAX_STREAMS"])
-	require.Equal(t, uint64(MaxTopics), limits["MAX_TOPICS"])
-	require.Equal(t, uint64(MaxPartitions), limits["MAX_PARTITIONS"])
-
-	// Rust derives the shifts from the limits rather than declaring literals,
-	// so the parity assertion derives them the same way.
-	assert.Equal(t, bitsRequired(limits["MAX_STREAMS"]-1), streamBits)
-	assert.Equal(t, bitsRequired(limits["MAX_TOPICS"]-1), topicBits)
-	assert.Equal(t, bitsRequired(limits["MAX_PARTITIONS"]-1), partitionBits)
-
-	literalShift := namedNumbers(sources["namespace"],
-		regexp.MustCompile(`(?m)^pub const (PARTITION_SHIFT): u32 = ([0-9]+);$`))
-	require.Contains(t, literalShift, "PARTITION_SHIFT")
-	assert.Equal(t, uint64(partitionShift), literalShift["PARTITION_SHIFT"])
-	assert.Equal(t, partitionShift+partitionBits, topicShift)
-	assert.Equal(t, topicShift+topicBits, streamShift)
-
-	packed, err := PackNamespace(1, 1, 1)
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1)<<streamShift|uint64(1)<<topicShift|1, packed)
-
-	sentinel := namedNumbers(sources["namespace"],
-		regexp.MustCompile(`(?m)^pub const (METADATA_CONSENSUS_NAMESPACE): u64 = 1u64 << ([0-9]+);$`))
-	require.Contains(t, sentinel, "METADATA_CONSENSUS_NAMESPACE")
-	assert.Equal(t, uint64(1)<<sentinel["METADATA_CONSENSUS_NAMESPACE"], MetadataConsensusNamespace)
-}
-
-func bitsRequired(value uint64) int {
-	bits := 0
-	for value > 0 {
-		bits++
-		value >>= 1
-	}
-	return bits
-}
-
 func TestProtocolParity_EvictionReasons(t *testing.T) {
 	sources := loadRustSources(t)
 	rustValues := rustEnumValues(sources["header"], "EvictionReason")
@@ -561,48 +516,19 @@ func TestProtocolParity_EvictionReasonMapping(t *testing.T) {
 	// dedicated eviction tests in reply_test.go.
 }
 
-func TestProtocolParity_NamespaceRouting(t *testing.T) {
+// The client wire carries no routing namespace: the server derives the
+// consensus group (plane from the operation, partition target from the
+// payload) and stamps it into its own internal header, so this SDK has no
+// packing rules to mirror. Growing the field back would move every field
+// behind it, which is what makes this worth asserting on its own rather than
+// leaving to the offset recomputation.
+func TestProtocolParity_ClientHeadersCarryNoNamespace(t *testing.T) {
 	sources := loadRustSources(t)
-	codeValues := rustCommandCodes(sources["codes"])
-	require.NotEmpty(t, codeValues)
 
-	body := captureBlock(sources["sdk"], `fn namespace_for_request\(`)
-	require.NotEmpty(t, body, "the Rust namespace_for_request routing was not found")
-
-	armed := make(map[uint32]string)
-	for _, arm := range regexp.MustCompile(`(?m)^\s*([A-Z0-9_]+_CODE) => \{`).
-		FindAllStringSubmatch(body, -1) {
-		value, ok := codeValues[arm[1]]
-		require.True(t, ok, "unknown command constant %s", arm[1])
-		armed[uint32(value)] = arm[1]
-	}
-	require.NotEmpty(t, armed, "no payload-peek arms were parsed")
-
-	for name, value := range codeValues {
-		code := uint32(value)
-		operation := OperationForCode(code)
-		if operation == OperationRegister || operation == OperationLogout ||
-			operation == OperationNonReplicated || IsMetadata(operation) {
-			continue
-		}
-		// A code that reaches the payload peek fails on an empty payload; a
-		// code Rust does not route is refused outright. The two errors keep
-		// the routing decisions distinguishable without crafting payloads.
-		_, err := NamespaceForRequest(code, nil, operation)
-		if _, peeked := armed[code]; peeked {
-			assert.ErrorIs(t, err, ierror.ErrInvalidCommand,
-				"%s must derive its namespace from the payload", name)
-		} else {
-			assert.ErrorIs(t, err, ierror.ErrFeatureUnavailable,
-				"%s must be refused rather than routed blindly", name)
-		}
-	}
-
-	for code, name := range armed {
-		operation := OperationForCode(code)
-		shortCircuited := operation == OperationRegister || operation == OperationLogout ||
-			operation == OperationNonReplicated || IsMetadata(operation)
-		assert.False(t, shortCircuited, "%s never reaches the namespace peek in Go", name)
+	for _, structName := range []string{"RequestHeader", "ReplyHeader"} {
+		offsets := rustStructOffsets(t, sources["header"], structName)
+		assert.NotContains(t, offsets, "namespace",
+			"%s must not carry a routing namespace", structName)
 	}
 }
 

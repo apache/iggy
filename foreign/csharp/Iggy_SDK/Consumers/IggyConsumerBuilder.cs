@@ -31,7 +31,7 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public class IggyConsumerBuilder
 {
-    private IMessageEncryptor? _encryptor;
+    private protected IMessageEncryptor? _encryptor;
 
     internal Func<ConsumerErrorEventArgs, Task>? OnPollingError { get; set; }
     internal IggyConsumerConfig Config { get; set; } = new();
@@ -39,7 +39,7 @@ public class IggyConsumerBuilder
 
     /// <summary>
     ///     Creates a new consumer builder that will create its own Iggy client.
-    ///     You must configure connection settings using <see cref="WithConnection" />.
+    ///     You must configure connection settings using <c>WithConnection</c>.
     /// </summary>
     /// <param name="streamId">The stream identifier to consume from</param>
     /// <param name="topicId">The topic identifier to consume from</param>
@@ -245,6 +245,7 @@ public class IggyConsumerBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });
