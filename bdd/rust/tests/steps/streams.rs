@@ -34,14 +34,7 @@ pub async fn given_no_streams(world: &mut GlobalContext) {
 
 #[when(regex = r#"^I create a stream with name "(.+)"$"#)]
 pub async fn when_create_stream(world: &mut GlobalContext, stream_name: String) {
-    let client = world.client.as_ref().expect("Client should be available");
-    let stream = client
-        .create_stream(&stream_name)
-        .await
-        .expect("Should be able to create stream");
-
-    world.last_stream_id = Some(stream.id);
-    world.last_stream_name = Some(stream.name.clone());
+    create_stream(world, &stream_name).await;
 }
 
 #[then("the stream should be created successfully")]
@@ -54,38 +47,22 @@ pub async fn then_stream_created_successfully(world: &mut GlobalContext) {
 
 #[then(regex = r#"^the stream should have name "(.+)"$"#)]
 pub async fn then_stream_has_name(world: &mut GlobalContext, expected_name: String) {
-    let stream_name = world
-        .last_stream_name
-        .as_ref()
-        .expect("Stream should exist");
-    assert_eq!(
-        stream_name, &expected_name,
-        "Stream should have expected name"
-    );
+    assert_last_stream_name(world, &expected_name);
 }
 
 #[given(regex = r#"^a stream with name "(.+)" exists$"#)]
 pub async fn given_stream_exists(world: &mut GlobalContext, stream_name: String) {
-    when_create_stream(world, stream_name).await;
+    create_stream(world, &stream_name).await;
 }
 
 #[when("I get the stream by its numeric ID")]
 pub async fn when_get_stream_by_numeric_id(world: &mut GlobalContext) {
-    let client = world.client.as_ref().expect("Client should be available");
-    let stream_id = world
-        .last_stream_id
-        .expect("Stream should have been created");
-    let stream = client
-        .get_stream(&Identifier::numeric(stream_id).expect("Stream ID should be valid"))
-        .await
-        .expect("Should be able to get stream");
-
-    world.last_stream_name = stream.map(|stream| stream.name);
+    get_stream_by_numeric_id(world).await;
 }
 
 #[then(regex = r#"^the returned stream should have name "(.+)"$"#)]
 pub async fn then_returned_stream_has_name(world: &mut GlobalContext, expected_name: String) {
-    then_stream_has_name(world, expected_name).await;
+    assert_last_stream_name(world, &expected_name);
 }
 
 #[when("I list all streams")]
@@ -127,8 +104,8 @@ pub async fn when_update_stream_name(world: &mut GlobalContext, stream_name: Str
 
 #[then(regex = r#"^getting the stream by its numeric ID should return name "(.+)"$"#)]
 pub async fn then_get_stream_returns_name(world: &mut GlobalContext, expected_name: String) {
-    when_get_stream_by_numeric_id(world).await;
-    then_returned_stream_has_name(world, expected_name).await;
+    get_stream_by_numeric_id(world).await;
+    assert_last_stream_name(world, &expected_name);
 }
 
 #[when("I delete the stream by its numeric ID")]
@@ -145,9 +122,44 @@ pub async fn when_delete_stream_by_numeric_id(world: &mut GlobalContext) {
 
 #[then("getting the stream by its numeric ID should return no stream")]
 pub async fn then_get_stream_returns_no_stream(world: &mut GlobalContext) {
-    when_get_stream_by_numeric_id(world).await;
+    get_stream_by_numeric_id(world).await;
     assert!(
         world.last_stream_name.is_none(),
         "Deleted stream should not be returned"
+    );
+}
+
+async fn create_stream(world: &mut GlobalContext, stream_name: &str) {
+    let client = world.client.as_ref().expect("Client should be available");
+    let stream = client
+        .create_stream(stream_name)
+        .await
+        .expect("Should be able to create stream");
+
+    world.last_stream_id = Some(stream.id);
+    world.last_stream_name = Some(stream.name);
+}
+
+async fn get_stream_by_numeric_id(world: &mut GlobalContext) {
+    let client = world.client.as_ref().expect("Client should be available");
+    let stream_id = world
+        .last_stream_id
+        .expect("Stream should have been created");
+    let stream = client
+        .get_stream(&Identifier::numeric(stream_id).expect("Stream ID should be valid"))
+        .await
+        .expect("Should be able to get stream");
+
+    world.last_stream_name = stream.map(|stream| stream.name);
+}
+
+fn assert_last_stream_name(world: &GlobalContext, expected_name: &str) {
+    let stream_name = world
+        .last_stream_name
+        .as_ref()
+        .expect("Stream should exist");
+    assert_eq!(
+        stream_name, expected_name,
+        "Stream should have expected name"
     );
 }

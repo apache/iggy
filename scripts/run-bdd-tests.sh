@@ -94,20 +94,25 @@ if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
 
+unsupported(){
+  local feature="$1" svc="$2"
+  if [ "$SDK" = "all" ]; then
+    log "⚠️ skipping ${svc%-bdd} (does not support ${feature})"
+    return 0
+  else
+    log "❌ ${SDK} does not support feature '${feature}'"
+    return 1
+  fi
+}
+
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
       rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
-        if [ "$SDK" = "all" ]; then
-          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
-          return 0
-        else
-          log "❌ ${SDK} does not support feature '${FEATURE}'"
-          return 1
-        fi
-        ;;
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
     esac
   fi
 
@@ -115,14 +120,8 @@ run_suite(){
     case "$svc" in
       rust-bdd|java-bdd) ;;
       *)
-        if [ "$SDK" = "all" ]; then
-          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
-          return 0
-        else
-          log "❌ ${SDK} does not support feature '${FEATURE}'"
-          return 1
-        fi
-        ;;
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
     esac
   fi
 
