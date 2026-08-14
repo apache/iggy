@@ -81,8 +81,8 @@ public class ConsumerGroupTests
         var cg = await client.CreateConsumerGroupAsync(Identifier.String(streamName),
             Identifier.String(TopicName), GroupName);
 
-        var response = await client.GetConsumerGroupByIdAsync(
-            Identifier.String(streamName), Identifier.String(TopicName),
+        var response = await client.GetConsumerGroupByIdAsync(Identifier.String(streamName),
+            Identifier.String(TopicName),
             Identifier.Numeric(cg!.Id));
 
         response.ShouldNotBeNull();
@@ -194,15 +194,14 @@ public class ConsumerGroupTests
         var clients = new List<IIggyClient>();
         for (var i = 0; i < 2; i++)
         {
-            var memberClient = await Fixture.CreateClient(Protocol.Tcp);
+            var memberClient = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
             clients.Add(memberClient);
-            await memberClient.LoginUserAsync("iggy", "iggy");
             await memberClient.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(TopicName), Identifier.Numeric(cg!.Id));
         }
 
-        var response = await client.GetConsumerGroupByIdAsync(
-            Identifier.String(streamName), Identifier.String(TopicName),
+        var response = await client.GetConsumerGroupByIdAsync(Identifier.String(streamName),
+            Identifier.String(TopicName),
             Identifier.Numeric(cg!.Id));
 
         response.ShouldNotBeNull();

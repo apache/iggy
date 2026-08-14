@@ -56,7 +56,6 @@ use iggy_binary_protocol::requests::users::ChangePasswordRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier};
 use iggy_common::{IggyError, variadic};
 use server_common::Message;
-use std::mem::size_of;
 
 /// Gate a committed prepare, then apply it. A denial commits as an
 /// `Unauthorized` no-op (the gate never mutates state); an allow proceeds to
@@ -137,7 +136,7 @@ pub(crate) fn authorize(
     if user_id == ROOT_USER_ID {
         return None;
     }
-    let body = &prepare.as_slice()[size_of::<PrepareHeader>()..header.size as usize];
+    let body = prepare.body();
 
     match header.operation {
         // Streams. `create_stream` is unscoped; the rest resolve the stream id.

@@ -27,13 +27,13 @@
 //! - **SDK-client plane**: ephemeral client connections. Available
 //!   transports: TCP, TCP-TLS, WebSocket, WSS, QUIC. Each request
 //!   carries a `(client: u128, request: u64)` pair in `RequestHeader`;
-//!   downstream consumers in `core/server-ng` are free to use it for
+//!   downstream consumers in `core/server` are free to use it for
 //!   tracing, idempotency, or correlation.
 //!
 //! # Auth
 //!
 //! Neither plane is authenticated at the bus layer. Both connect first
-//! and let the caller (`core/server-ng`) gate command access via
+//! and let the caller (`core/server`) gate command access via
 //! application-level LOGIN commands:
 //!
 //! - SDK-client plane: `LOGIN_USER` / `LOGIN_WITH_PERSONAL_ACCESS_TOKEN`,
@@ -101,7 +101,7 @@ pub use lifecycle::{
 pub use transports::tls::TlsServerCredentials;
 
 pub use compio::runtime::JoinHandle;
-use configs::server_ng::ServerNgConfig;
+use configs::server::ServerConfig;
 use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::array;
@@ -144,7 +144,7 @@ pub const OWNER_NONE: u16 = u16::MAX;
 
 /// Shared atomic owner table mapping `replica_id` to `owning_shard_id`.
 ///
-/// One Arc-cloned instance is allocated per server-ng process at
+/// One Arc-cloned instance is allocated per the server process at
 /// bootstrap and shared across every shard's [`IggyMessageBus`]. The owning shard
 /// stamps its id into a slot when an inbound replica connection passes
 /// the registry-insert race; the same shard CAS-clears the slot when
@@ -723,7 +723,7 @@ pub struct IggyMessageBus {
 
 impl IggyMessageBus {
     /// Construct a bus with default tunables (derived from
-    /// [`ServerNgConfig::default`]).
+    /// [`ServerConfig::default`]).
     #[must_use]
     pub fn new(shard_id: u16) -> Self {
         Self::with_tunables(shard_id, MessageBusConfig::default())
@@ -743,10 +743,10 @@ impl IggyMessageBus {
         Self::with_tunables(shard_id, cfg)
     }
 
-    /// Construct a bus from the validated server-ng schema.
+    /// Construct a bus from the validated the server schema.
     ///
     /// Production constructor: takes a fully-validated
-    /// [`ServerNgConfig`] and derives the runtime [`MessageBusConfig`]
+    /// [`ServerConfig`] and derives the runtime [`MessageBusConfig`]
     /// internally. Field conversions ([`iggy_common::IggyDuration`] -> [`Duration`],
     /// [`iggy_common::IggyByteSize`] -> `usize`, schema WS knobs ->
     /// tungstenite [`WebSocketConfig`]) happen once here so hot paths
@@ -759,19 +759,19 @@ impl IggyMessageBus {
     /// surfaces operator misconfiguration loudly rather than letting
     /// every `writev` fail silently with `EMSGSIZE` once traffic starts.
     #[must_use]
-    pub fn with_config(shard_id: u16, cfg: &ServerNgConfig) -> Self {
+    pub fn with_config(shard_id: u16, cfg: &ServerConfig) -> Self {
         Self::with_tunables(shard_id, MessageBusConfig::from(cfg))
     }
 
-    /// Production constructor for multi-shard server-ng: same as
+    /// Production constructor for multi-shard the server: same as
     /// [`Self::with_config`] but takes a pre-allocated
     /// [`ReplicaOwnerTable`] Arc. Bootstrap allocates one table per
-    /// server-ng process and clones the Arc into every shard so all
+    /// server process and clones the Arc into every shard so all
     /// buses see the same atomic slots.
     #[must_use]
     pub fn with_config_and_owner_table(
         shard_id: u16,
-        cfg: &ServerNgConfig,
+        cfg: &ServerConfig,
         owner_table: Arc<ReplicaOwnerTable>,
     ) -> Self {
         Self::with_tunables_and_owner_table(shard_id, MessageBusConfig::from(cfg), owner_table)
@@ -781,7 +781,7 @@ impl IggyMessageBus {
     ///
     /// Used by the public constructors above and by tests that need to
     /// patch a single field on the derived [`MessageBusConfig`] without
-    /// round-tripping through [`ServerNgConfig`].
+    /// round-tripping through [`ServerConfig`].
     ///
     /// # Panics
     ///

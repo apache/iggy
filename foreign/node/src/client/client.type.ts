@@ -56,8 +56,6 @@ export type SendCommandOptions = {
  * Provides direct access to command sending and event handling.
  */
 export type RawClient = {
-  /** Server wire protocol used by this connection */
-  readonly protocol: Protocol,
   /** Sends a command to the server and returns the response */
   sendCommand: (
     code: number,
@@ -114,9 +112,6 @@ export type ReconnectOption = {
  */
 export type TransportOption = TcpOption | TlsOption;
 
-/** Server wire protocol. */
-export type Protocol = 'classic' | 'vsr';
-
 /**
  * Token-based authentication credentials.
  */
@@ -155,8 +150,6 @@ export type PoolSizeOption = {
  * Complete client configuration for connecting to the Iggy server.
  */
 export type ClientConfig = {
-  /** Server wire protocol (default: classic) */
-  protocol?: Protocol,
   /** Transport protocol to use (TCP or TLS) */
   transport: TransportType,
   /** Transport-specific connection options */

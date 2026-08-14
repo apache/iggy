@@ -45,8 +45,14 @@ pub mod artifact_kind {
     pub const METADATA_SNAPSHOT: u8 = 0;
     /// Metadata plane: [`crate::ClientTable::encode`] bytes.
     pub const CLIENT_TABLE: u8 = 1;
-    // Partition plane (reserved, not served yet):
-    // SEGMENT_LOG = 2, CONSUMER_OFFSETS = 3.
+    /// Partition plane: one retained segment's `.log` bytes verbatim
+    /// (prepare-stripped `SendMessages2` records); `frontier` = the
+    /// segment's base offset.
+    pub const SEGMENT_LOG: u8 = 2;
+    /// Partition plane: the encoded consumer + consumer-group offset table
+    /// (plus the applied purge generation); `frontier` = the offer's
+    /// `commit_op`.
+    pub const CONSUMER_OFFSETS: u8 = 3;
 }
 
 /// One artifact a serving peer offers: what it is, where its receiver-side
@@ -86,6 +92,32 @@ pub fn state_artifact_checksum(bytes: &[u8]) -> u64 {
     let mut hasher = XxHash3_64::new();
     hasher.write(bytes);
     hasher.finish()
+}
+
+/// Streaming form of [`state_artifact_checksum`].
+///
+/// For payloads too large to hold resident (a serving primary hashing
+/// multi-GiB segment files in chunks between reactor yields). Feeding the
+/// same bytes in any chunking produces the same stamp as the one-shot form.
+#[derive(Default)]
+pub struct StateArtifactHasher {
+    inner: XxHash3_64,
+}
+
+impl StateArtifactHasher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.inner.write(bytes);
+    }
+
+    #[must_use]
+    pub fn finish(&self) -> u64 {
+        self.inner.finish()
+    }
 }
 
 /// Failure decoding an encoded manifest.

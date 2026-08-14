@@ -19,7 +19,9 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ConnectTimeoutException;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
@@ -33,20 +35,26 @@ import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
+import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -105,19 +113,24 @@ public class AsyncIggyTcpClient {
 
     private static final int INVALID_COMMAND_ERROR_CODE = 3;
     private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
+    private static final RetryPolicy DEFAULT_RECONNECT_POLICY = RetryPolicy.fixedDelay(12, Duration.ofSeconds(5));
 
+    private final ConnectionInfo seedConnectionInfo;
+    private final AtomicBoolean reconnecting = new AtomicBoolean();
     private final Optional<String> username;
     private final Optional<String> password;
     private final Optional<Duration> connectionTimeout;
     private final Optional<Duration> acquireTimeout;
     private final Optional<Duration> requestTimeout;
-    private final Optional<Integer> connectionPoolSize;
+    private final Duration heartbeatInterval;
+    private final int maxVsrFrameSize;
     private final Optional<RetryPolicy> retryPolicy;
     private final boolean enableTls;
     private final Optional<File> tlsCertificate;
     private final TcpConnectionPoolConfig poolConfig;
+    private final ClientRoutingState routingState = new ClientRoutingState();
     private final AtomicReference<AsyncTcpConnection> connection = new AtomicReference<>();
-    private final AtomicReference<CompletableFuture<Void>> redirectChain =
+    private final AtomicReference<CompletableFuture<Void>> loginChain =
             new AtomicReference<>(CompletableFuture.completedFuture(null));
     private volatile ConnectionInfo connectionInfo;
     private volatile boolean closed;
@@ -140,7 +153,19 @@ public class AsyncIggyTcpClient {
      * @param port the server port
      */
     public AsyncIggyTcpClient(String host, int port) {
-        this(host, port, null, null, null, null, null, null, null, false, Optional.empty());
+        this(
+                host,
+                port,
+                null,
+                null,
+                null,
+                null,
+                null,
+                Duration.ofSeconds(5),
+                VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
+                null,
+                false,
+                Optional.empty());
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -152,23 +177,25 @@ public class AsyncIggyTcpClient {
             Duration connectionTimeout,
             Duration acquireTimeout,
             Duration requestTimeout,
-            Integer connectionPoolSize,
+            Duration heartbeatInterval,
+            int maxVsrFrameSize,
             RetryPolicy retryPolicy,
             boolean enableTls,
             Optional<File> tlsCertificate) {
         this.connectionInfo = new ConnectionInfo(host, port);
+        this.seedConnectionInfo = this.connectionInfo;
         this.username = Optional.ofNullable(username);
         this.password = Optional.ofNullable(password);
         this.connectionTimeout = Optional.ofNullable(connectionTimeout);
         this.acquireTimeout = Optional.ofNullable(acquireTimeout);
         this.requestTimeout = Optional.ofNullable(requestTimeout);
-        this.connectionPoolSize = Optional.ofNullable(connectionPoolSize);
+        this.heartbeatInterval = heartbeatInterval;
+        this.maxVsrFrameSize = maxVsrFrameSize;
         this.retryPolicy = Optional.ofNullable(retryPolicy);
         this.enableTls = enableTls;
         this.tlsCertificate = tlsCertificate;
 
         var poolConfigBuilder = TcpConnectionPoolConfig.builder();
-        this.connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
         this.acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
         this.poolConfig = poolConfigBuilder.build();
     }
@@ -199,18 +226,18 @@ public class AsyncIggyTcpClient {
         if (previousConnection != null) {
             previousConnection.close();
         }
+        routingState.clearAssignments();
         Supplier<AsyncTcpConnection> currentConnection = connection::get;
         return newConnection.connect().thenRun(() -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
-            messagesClient = new MessagesTcpClient(currentConnection);
+            messagesClient = new MessagesTcpClient(currentConnection, routingState);
             consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
             consumerOffsetsClient = new ConsumerOffsetsTcpClient(currentConnection);
             streamsClient = new StreamsTcpClient(currentConnection);
             topicsClient = new TopicsTcpClient(currentConnection);
-            usersClient = new UsersTcpClient(currentConnection, this::checkLeaderAndRedirect);
+            usersClient = new UsersTcpClient(currentConnection, this::loginOnLeader);
             systemClient = new SystemTcpClient(currentConnection);
-            personalAccessTokensClient =
-                    new PersonalAccessTokensTcpClient(currentConnection, this::checkLeaderAndRedirect);
+            personalAccessTokensClient = new PersonalAccessTokensTcpClient(currentConnection, this::loginOnLeader);
             partitionsClient = new PartitionsTcpClient(currentConnection);
         });
     }
@@ -408,9 +435,9 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Returns the server address this client currently targets. Leader
-     * redirection can change it after login, so it may differ from the
-     * address the client was built with.
+     * Returns the server address this client currently targets. Pre-login
+     * leader discovery can change it, so it may differ from the address the
+     * client was built with.
      *
      * @return the current {@link ConnectionInfo}
      */
@@ -420,48 +447,261 @@ public class AsyncIggyTcpClient {
 
     private AsyncTcpConnection openConnection(ConnectionInfo target) {
         return new AsyncTcpConnection(
-                target.host(), target.port(), enableTls, tlsCertificate, poolConfig, connectionTimeout);
+                target.host(),
+                target.port(),
+                enableTls,
+                tlsCertificate,
+                poolConfig,
+                connectionTimeout,
+                requestTimeout,
+                heartbeatInterval,
+                maxVsrFrameSize,
+                this::retryTransientOnLeader,
+                routingState::clearAssignments,
+                this::onConnectionFailure);
     }
 
     /**
-     * Post-login leader check, serialized across concurrent logins: fetches
-     * the cluster roster and, while a healthy leader lives elsewhere,
-     * reconnects to it and replays the login. A queued login waits for the
-     * in-flight redirection and then re-checks the roster, so it either
-     * confirms the new node or retries a redirection that failed. Every
-     * failure except the replayed login's own is non-fatal; the client then
-     * stays on the current node. Each check runs with a fresh redirection
-     * budget, so hitting the cap parks only that login, not the client.
+     * A not-accepted request was never admitted, so it is safe to recheck the
+     * leader, restore authentication on a new connection, and retry it within
+     * the original request deadline.
      */
-    private CompletableFuture<IdentityInfo> checkLeaderAndRedirect(Supplier<CompletableFuture<IdentityInfo>> reLogin) {
+    private CompletableFuture<ByteBuf> retryTransientOnLeader(
+            AsyncTcpConnection source,
+            int commandCode,
+            ByteBuf payload,
+            long requestDeadlineNanos,
+            IggyServerException rejection) {
+        AtomicReference<ByteBuf> requestPayload = new AtomicReference<>(payload);
+        Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication = source.authenticationSnapshot();
+        AtomicReference<ByteBuf> authenticationPayload = new AtomicReference<>(authentication
+                .map(AsyncTcpConnection.AuthenticationSnapshot::payload)
+                .orElse(null));
+
+        CompletableFuture<Void> ready = prepareTransientFailover(
+                source, authentication, authenticationPayload, requestDeadlineNanos, rejection);
+        CompletableFuture<ByteBuf> retried = ready.thenCompose(ignored -> {
+            if (requestDeadlineNanos - System.nanoTime() <= 0) {
+                return CompletableFuture.failedFuture(rejection);
+            }
+            AsyncTcpConnection currentConnection = connection.get();
+            if (currentConnection == null) {
+                return CompletableFuture.failedFuture(new IggyNotConnectedException());
+            }
+            return currentConnection.send(commandCode, takePayload(requestPayload), requestDeadlineNanos);
+        });
+        return retried.whenComplete((response, error) -> {
+            releasePayload(requestPayload);
+            releasePayload(authenticationPayload);
+        });
+    }
+
+    private CompletableFuture<Void> prepareTransientFailover(
+            AsyncTcpConnection source,
+            Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication,
+            AtomicReference<ByteBuf> authenticationPayload,
+            long requestDeadlineNanos,
+            IggyServerException rejection) {
         CompletableFuture<Void> gate = new CompletableFuture<>();
-        CompletableFuture<Void> previous = redirectChain.getAndSet(gate);
+        CompletableFuture<Void> previous = loginChain.getAndSet(gate);
         LeaderRedirectionState redirectionState = new LeaderRedirectionState();
-        return previous.thenCompose(ignored -> redirectToLeader(reLogin, null, redirectionState))
-                .whenComplete((identity, error) -> gate.complete(null));
+        CompletableFuture<Void> transaction = previous.thenCompose(ignored -> {
+            if (closed) {
+                return CompletableFuture.failedFuture(new IggyNotConnectedException());
+            }
+            if (requestDeadlineNanos - System.nanoTime() <= 0) {
+                return CompletableFuture.failedFuture(rejection);
+            }
+            if (connection.get() != source) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return redirectToLeader(redirectionState).thenCompose(redirected -> {
+                AsyncTcpConnection currentConnection = connection.get();
+                if (currentConnection == null || currentConnection == source || authentication.isEmpty()) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                if (requestDeadlineNanos - System.nanoTime() <= 0) {
+                    return CompletableFuture.failedFuture(rejection);
+                }
+                return currentConnection
+                        .send(
+                                authentication.orElseThrow().commandCode(),
+                                takePayload(authenticationPayload),
+                                requestDeadlineNanos)
+                        .thenAccept(ByteBuf::release);
+            });
+        });
+        transaction.whenComplete((ignored, error) -> gate.complete(null));
+        return transaction;
+    }
+
+    private static ByteBuf takePayload(AtomicReference<ByteBuf> payload) {
+        ByteBuf owned = payload.getAndSet(null);
+        if (owned == null) {
+            throw new IllegalStateException("Request payload ownership was already transferred");
+        }
+        return owned;
+    }
+
+    private static void releasePayload(AtomicReference<ByteBuf> payload) {
+        ByteBuf owned = payload.getAndSet(null);
+        if (owned != null) {
+            owned.release();
+        }
     }
 
     /**
-     * One redirection hop: when the roster names a healthy leader elsewhere,
-     * reconnect to it, replay the login and re-check from the new node, since
-     * mid-election metadata can point at a node that is itself not the
-     * leader. Bounded by the per-check redirection budget.
+     * Entry point of the background redial after a pool acquire failure or an
+     * expired reply. Requests that were in flight stay failed (their outcome
+     * is unknown); the redial only restores the client for subsequent calls.
+     * Alternates the current endpoint with the seed, paced by the configured
+     * retry policy, and replays the builder credentials on the restored
+     * connection. Personal-access-token logins cannot be replayed here; those
+     * clients must log in again themselves.
      */
-    private CompletableFuture<IdentityInfo> redirectToLeader(
-            Supplier<CompletableFuture<IdentityInfo>> reLogin,
-            IdentityInfo redirectedIdentity,
-            LeaderRedirectionState redirectionState) {
+    private void onConnectionFailure(Throwable cause) {
+        if (closed || !isConnectionLoss(cause)) {
+            return;
+        }
+        if (!reconnecting.compareAndSet(false, true)) {
+            return;
+        }
+        log.warn("Connection to {} lost ({}), starting redial", connectionInfo.serverAddress(), cause.getMessage());
+        RetryPolicy policy = retryPolicy.orElse(DEFAULT_RECONNECT_POLICY);
+        redialAttempt(1, policy).whenComplete((ignored, error) -> reconnecting.set(false));
+    }
+
+    private static boolean isConnectionLoss(Throwable cause) {
+        return cause instanceof ConnectTimeoutException
+                || cause instanceof IOException
+                || cause instanceof IggyTimeoutException;
+    }
+
+    private CompletableFuture<Void> redialAttempt(int attempt, RetryPolicy policy) {
+        if (closed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (attempt > policy.getMaxRetries()) {
+            log.error("Redial gave up after {} attempts, next request will fail fast", policy.getMaxRetries());
+            return CompletableFuture.completedFuture(null);
+        }
+        ConnectionInfo target = ReconnectPlan.target(connectionInfo, seedConnectionInfo, attempt);
+        Duration delay = ReconnectPlan.delay(policy, attempt);
+        Executor delayedExecutor = CompletableFuture.delayedExecutor(delay.toMillis(), TimeUnit.MILLISECONDS);
+        return CompletableFuture.supplyAsync(() -> null, delayedExecutor).thenCompose(ignored -> {
+            if (closed) {
+                return CompletableFuture.completedFuture(null);
+            }
+            log.info("Redial attempt {}/{} to {}", attempt, policy.getMaxRetries(), target.serverAddress());
+            return retarget(target)
+                    .thenCompose(retargeted -> replayLogin())
+                    .handle((ok, error) -> {
+                        if (error == null) {
+                            log.info("Reconnected to {}", target.serverAddress());
+                            return CompletableFuture.<Void>completedFuture(null);
+                        }
+                        log.warn(
+                                "Redial attempt {} to {} failed: {}",
+                                attempt,
+                                target.serverAddress(),
+                                error.getMessage());
+                        return redialAttempt(attempt + 1, policy);
+                    })
+                    .thenCompose(Function.identity());
+        });
+    }
+
+    /**
+     * Replays the builder credentials on the freshly published connection.
+     * The login runs through the users client, so leader discovery retargets
+     * again before Register when the redialed node is not the leader.
+     */
+    private CompletableFuture<Void> replayLogin() {
+        if (username.isEmpty() || password.isEmpty() || usersClient == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return usersClient.login(username.get(), password.get()).thenApply(identity -> null);
+    }
+
+    /**
+     * Serializes Register and authenticated leader settlement across concurrent
+     * logins. A queued login waits for the entire in-flight transaction. Each
+     * redirect drops the bound session, so the login is replayed before the next
+     * roster read. Each transaction has a fresh redirection budget.
+     */
+    CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt) {
+        CompletableFuture<Void> gate = new CompletableFuture<>();
+        CompletableFuture<Void> previous = loginChain.getAndSet(gate);
+        LeaderRedirectionState redirectionState = new LeaderRedirectionState();
+        CompletableFuture<IdentityInfo> transaction =
+                previous.thenCompose(ignored -> loginAndSettleOnLeader(loginAttempt, redirectionState));
+        CompletableFuture<IdentityInfo> callerFuture = new CompletableFuture<>();
+        transaction.whenComplete((identity, error) -> {
+            gate.complete(null);
+            if (error != null) {
+                callerFuture.completeExceptionally(error);
+            } else {
+                callerFuture.complete(identity);
+            }
+        });
+        return callerFuture;
+    }
+
+    private CompletableFuture<IdentityInfo> loginAndSettleOnLeader(
+            Supplier<CompletableFuture<IdentityInfo>> loginAttempt, LeaderRedirectionState redirectionState) {
+        return loginAttempt.get().thenCompose(identity -> {
+            ConnectionInfo currentTarget = connectionInfo;
+            return findLeaderElsewhere(currentTarget).thenCompose(leaderTarget -> {
+                if (leaderTarget.isEmpty()) {
+                    return CompletableFuture.completedFuture(identity);
+                }
+                if (!redirectionState.canRedirect()) {
+                    log.warn(
+                            "Maximum leader redirections ({}) reached, connection will continue on server node {}",
+                            LeaderAwareness.MAX_LEADER_REDIRECTS,
+                            currentTarget.serverAddress());
+                    return CompletableFuture.completedFuture(identity);
+                }
+                return retarget(leaderTarget.get())
+                        .handle((ignored, error) -> {
+                            if (error != null) {
+                                log.warn(
+                                        "Failed to reconnect to leader at {}: {}, connection will continue"
+                                                + " on server node {}",
+                                        leaderTarget.get().serverAddress(),
+                                        error.getMessage(),
+                                        currentTarget.serverAddress());
+                                return CompletableFuture.completedFuture(identity);
+                            }
+                            redirectionState.recordRedirect();
+                            return loginAndSettleOnLeader(loginAttempt, redirectionState);
+                        })
+                        .thenCompose(Function.identity());
+            });
+        });
+    }
+
+    /**
+     * One discovery hop for transient failover. When the roster names a healthy leader elsewhere,
+     * reconnect to it and re-check from the new node, since mid-election
+     * metadata can point at a node that is itself not the leader. Register is
+     * sent only after this bounded process settles. Reading the roster needs a
+     * bound session, so a connection that has none fails the fetch locally and
+     * stays where it is. Login settlement uses {@link #loginAndSettleOnLeader}
+     * so every redirected connection binds before its next roster read.
+     */
+    private CompletableFuture<Void> redirectToLeader(LeaderRedirectionState redirectionState) {
         ConnectionInfo currentTarget = connectionInfo;
         return findLeaderElsewhere(currentTarget).thenCompose(leaderTarget -> {
             if (leaderTarget.isEmpty()) {
-                return CompletableFuture.completedFuture(redirectedIdentity);
+                return CompletableFuture.completedFuture(null);
             }
             if (!redirectionState.canRedirect()) {
                 log.warn(
                         "Maximum leader redirections ({}) reached, connection will continue on server node {}",
                         LeaderAwareness.MAX_LEADER_REDIRECTS,
                         currentTarget.serverAddress());
-                return CompletableFuture.completedFuture(redirectedIdentity);
+                return CompletableFuture.completedFuture(null);
             }
             return retarget(leaderTarget.get())
                     .handle((ignored, error) -> {
@@ -472,11 +712,10 @@ public class AsyncIggyTcpClient {
                                     leaderTarget.get().serverAddress(),
                                     error.getMessage(),
                                     currentTarget.serverAddress());
-                            return CompletableFuture.completedFuture(redirectedIdentity);
+                            return CompletableFuture.<Void>completedFuture(null);
                         }
                         redirectionState.recordRedirect();
-                        return reLogin.get()
-                                .thenCompose(identity -> redirectToLeader(reLogin, identity, redirectionState));
+                        return redirectToLeader(redirectionState);
                     })
                     .thenCompose(Function.identity());
         });
@@ -488,7 +727,7 @@ public class AsyncIggyTcpClient {
      * (metadata fetch, malformed roster) so the redirection path never fails
      * the login that triggered it.
      */
-    private CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(ConnectionInfo currentTarget) {
+    CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(ConnectionInfo currentTarget) {
         SystemClient currentSystemClient = systemClient;
         if (currentSystemClient == null) {
             return CompletableFuture.completedFuture(Optional.empty());
@@ -496,7 +735,7 @@ public class AsyncIggyTcpClient {
         return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget);
     }
 
-    private CompletableFuture<Void> retarget(ConnectionInfo newTarget) {
+    CompletableFuture<Void> retarget(ConnectionInfo newTarget) {
         AsyncTcpConnection oldConnection = connection.get();
         AsyncTcpConnection newConnection;
         try {
@@ -527,6 +766,7 @@ public class AsyncIggyTcpClient {
                     new IggyNotConnectedException("Client closed during leader redirection"));
         }
         connectionInfo = newTarget;
+        routingState.clearAssignments();
         oldConnection.close().whenComplete((ignored, closeError) -> {
             if (closeError != null) {
                 log.warn("Failed to close previous connection: {}", closeError.getMessage());

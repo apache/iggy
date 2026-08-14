@@ -186,9 +186,12 @@ pub struct ShardMetrics {
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
+    partitions_duplicate_builds_discarded_total: Counter,
+    partition_transfer_refusals_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
+    partition_repair_serves_deferred_purge_total: Counter,
 }
 
 impl ShardMetrics {
@@ -218,9 +221,12 @@ impl ShardMetrics {
             partitions_materialised_total: Counter::default(),
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
+            partitions_duplicate_builds_discarded_total: Counter::default(),
+            partition_transfer_refusals_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
+            partition_repair_serves_deferred_purge_total: Counter::default(),
         }
     }
 
@@ -255,12 +261,42 @@ impl ShardMetrics {
         self.partitions_removed_total.inc();
     }
 
+    /// Bumped when the pump discards a duplicate `InsertOwned` for a namespace
+    /// that is already live. The reconciler's staged-op guard should make this
+    /// unreachable, so a non-zero value is a caught correctness anomaly, not
+    /// routine churn: the discarded build re-planted segment 0 over the live
+    /// incarnation's path and folded its initial segment into the shared stats
+    /// before the pump caught it.
+    pub fn record_duplicate_partition_build_discarded(&self) {
+        self.partitions_duplicate_builds_discarded_total.inc();
+    }
+
     /// Bumped each time `build_partition_fresh` or
     /// `delete_partitions_from_disk` returns `Err`. The reconciler retries
     /// next tick, but a sustained climb surfaces a stuck partition (disk
     /// full, permission denied, ENOENT on a path it cannot recreate, etc.).
     pub fn record_partition_reconcile_failure(&self) {
         self.partitions_reconcile_failures_total.inc();
+    }
+
+    /// Bumped every time a serving peer refuses a partition state transfer.
+    ///
+    /// Transient refusals re-arm on a flat interval and charge no failure
+    /// count -- deliberately, since the alternative routes through a 1024x
+    /// backoff cap that pins a partition for ~17 minutes after the peer has
+    /// already caught up -- which also means a partition stuck rejoining for
+    /// hours produces no signal of its own. This counter plus the escalating
+    /// log level at the refusal site is that signal.
+    pub fn record_partition_transfer_refusal(&self) {
+        self.partition_transfer_refusals_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings; the production scrape goes
+    /// through the prometheus registry.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_transfer_refusals_value(&self) -> u64 {
+        self.partition_transfer_refusals_total.get()
     }
 
     /// Bumped when a parked partition frame is answered instead of served
@@ -342,6 +378,23 @@ impl ShardMetrics {
     #[must_use]
     pub fn partition_requests_denied_transient_value(&self) -> u64 {
         self.partition_requests_denied_transient_total.get()
+    }
+
+    /// Bumped every time this replica declines to serve or complete a partition
+    /// repair because a committed purge has not applied locally yet. One or two
+    /// per rejoin is the normal convergence window; a sustained climb means the
+    /// purge never landed, and the requester is spinning its stall retry with
+    /// nothing but a `debug!` to show for it.
+    pub fn record_partition_repair_serve_deferred(&self) {
+        self.partition_repair_serves_deferred_purge_total.inc();
+    }
+
+    /// Snapshot of `partition_repair_serves_deferred_purge_total`.
+    /// Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_repair_serves_deferred_purge_value(&self) -> u64 {
+        self.partition_repair_serves_deferred_purge_total.get()
     }
 
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator

@@ -33,11 +33,17 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use utils::cpu_name::append_cpu_name_lowercase;
 
+/// Which SDK framing this binary speaks, printed in the always-on banner so a
+/// server that answers a Register handshake with silence is diagnosed in a
+/// second rather than mistaken for a hang.
+const SDK_FRAMING: &str = "vsr (Register handshake)";
+
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {
     let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert("Iggy Bench");
     println!("{}", figure.unwrap());
+    println!("SDK framing: {SDK_FRAMING}");
 
     let mut args = IggyBenchArgs::parse();
     args.validate();

@@ -21,7 +21,11 @@ import pytest
 
 from apache_iggy import IggyClient, IggyExpiry, MaxTopicSize, SendMessage
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
+from .utils import (
+    get_server_config,
+    wait_for_ping,
+    wait_for_server,
+)
 
 
 class TestCreateTopic:
@@ -1436,6 +1440,7 @@ class TestPurgeTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.messages_count == 0
+        assert topic.size == 0
 
     @pytest.mark.asyncio
     async def test_purge_nonexistent_topic_fails(

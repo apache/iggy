@@ -152,15 +152,18 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.max_topic_size, MaxTopicSize::Unlimited);
     assert_eq!(topic.replication_factor, 1);
 
-    // 11. Get topic details by ID; the owning shards materialize the fresh
-    // partitions (first segment included) asynchronously after the commit.
-    let topic = get_topic_when(&client, STREAM_NAME, TOPIC_NAME, |topic| {
-        topic
-            .partitions
-            .iter()
-            .all(|partition| partition.segments_count == 1)
-    })
-    .await;
+    // 11. Get topic details by ID. The owning shards materialize fresh
+    // partitions asynchronously after the commit, but the reply reports the
+    // deterministic initial state (one empty segment) for a committed
+    // partition immediately, so no convergence loop is needed here.
+    let topic = client
+        .get_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("Failed to get topic");
     assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
@@ -286,11 +289,8 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
-    // The exact byte size is framing-specific: legacy counts a 64-byte header
-    // per message; server-ng counts its on-disk batch framing.
-    #[cfg(not(feature = "vsr"))]
-    assert_eq!(topic.size, 100502);
-    #[cfg(feature = "vsr")]
+    // The exact byte size tracks the on-disk batch framing, so only its
+    // presence is asserted here.
     assert!(topic.size > 0);
     assert_eq!(topic.messages_count, MESSAGES_COUNT as u64);
     let topic_partition = topic.partitions.get((PARTITION_ID) as usize).unwrap();
