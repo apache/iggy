@@ -120,7 +120,6 @@ fn get_command(
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(
                 args.stream_id.clone(),
                 args.name.clone(),
-                args.set.iter().cloned().collect(),
             )),
             StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
             StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
@@ -134,7 +133,6 @@ fn get_command(
                 args.name.clone(),
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
-                args.replication_factor,
                 args.set.iter().cloned().collect(),
             )),
             TopicAction::Delete(args) => Box::new(DeleteTopicCmd::new(
@@ -148,8 +146,6 @@ fn get_command(
                 args.name.clone(),
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
-                args.replication_factor,
-                args.set.iter().cloned().collect(),
             )),
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),

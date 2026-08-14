@@ -60,12 +60,11 @@ class TopicsHttpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         var request = httpClient.preparePostRequest(
                 STREAMS + "/" + streamId + TOPICS,
                 new CreateTopic(
-                        partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+                        partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name));
         return httpClient.execute(request, new TypeReference<>() {});
     }
 
@@ -76,11 +75,10 @@ class TopicsHttpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         var request = httpClient.preparePutRequest(
                 STREAMS + "/" + streamId + TOPICS + "/" + topicId,
-                new UpdateTopic(compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+                new UpdateTopic(compressionAlgorithm, messageExpiry, maxTopicSize, name));
         httpClient.execute(request);
     }
 
@@ -95,13 +93,11 @@ class TopicsHttpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {}
 
     record UpdateTopic(
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {}
 }

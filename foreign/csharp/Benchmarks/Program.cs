@@ -71,7 +71,6 @@ try
             compressionAlgorithm: CompressionAlgorithm.None,
             messageExpiry: TimeSpan.Zero,
             maxTopicSize: 2_000_000_000,
-            replicationFactor: 3,
             partitionsCount: 1);
     }
 }

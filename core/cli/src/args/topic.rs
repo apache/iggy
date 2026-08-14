@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::args::common::ListMode;
+use crate::args::common::{ListMode, parse_key_value};
 use clap::{Args, Subcommand};
 use iggy::prelude::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 
@@ -117,9 +117,6 @@ pub(crate) struct TopicCreateArgs {
     /// Can't be lower than segment size in the config.
     #[arg(short, long, default_value = "server_default", verbatim_doc_comment)]
     pub(crate) max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic
-    #[arg(short, long, default_value = "1")]
-    pub(crate) replication_factor: u8,
     /// Message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
     ///
     /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
@@ -127,24 +124,14 @@ pub(crate) struct TopicCreateArgs {
     pub(crate) message_expiry: Vec<IggyExpiry>,
     /// Additional topic option as key=value, repeatable
     ///
-    /// Values are sent as strings and parsed by the server with the same rules
-    /// as its config file (e.g. --set segment_size=128MiB). The server rejects
-    /// keys it does not support; discover them with the options catalog.
+    /// Values are sent as strings and parsed server-side through each option's
+    /// own FromStr (e.g. --set segment_size=128MiB). The server rejects keys it
+    /// does not support; GET /options/topic lists the ones it accepts.
     #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value, verbatim_doc_comment)]
     pub(crate) set: Vec<(String, String)>,
 }
 
 /// Parse one `--set key=value` occurrence.
-fn parse_key_value(raw: &str) -> Result<(String, String), String> {
-    let (key, value) = raw
-        .split_once('=')
-        .ok_or_else(|| format!("expected KEY=VALUE, got: {raw}"))?;
-    if key.is_empty() || value.is_empty() {
-        return Err(format!("expected non-empty KEY=VALUE, got: {raw}"));
-    }
-    Ok((key.to_string(), value.to_string()))
-}
-
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TopicDeleteArgs {
     /// Stream ID to delete topic
@@ -182,20 +169,11 @@ pub(crate) struct TopicUpdateArgs {
     /// Can't be lower than segment size in the config.
     #[arg(short, long, default_value = "server_default", verbatim_doc_comment)]
     pub(crate) max_topic_size: MaxTopicSize,
-    #[arg(short, long, default_value = "1")]
-    /// New replication factor for the topic
-    pub(crate) replication_factor: u8,
     /// New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
     ///
     /// "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
     #[arg(default_value = "server_default", value_parser = clap::value_parser!(IggyExpiry), verbatim_doc_comment)]
     pub(crate) message_expiry: Vec<IggyExpiry>,
-    /// Additional topic option as key=value, repeatable
-    ///
-    /// Only keys an update may change are accepted; the create-time knobs are
-    /// rejected with the key name. Discover them with the options catalog.
-    #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value, verbatim_doc_comment)]
-    pub(crate) set: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -102,23 +102,6 @@ pub(crate) struct StreamUpdateArgs {
     pub(crate) stream_id: Identifier,
     /// New name for the stream
     pub(crate) name: String,
-    /// Additional stream option as key=value, repeatable
-    ///
-    /// Only keys an update may change are accepted. Streams have no option
-    /// keys yet, so every key is currently rejected by name.
-    #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value, verbatim_doc_comment)]
-    pub(crate) set: Vec<(String, String)>,
-}
-
-/// Parse one `--set key=value` occurrence.
-fn parse_key_value(raw: &str) -> Result<(String, String), String> {
-    let (key, value) = raw
-        .split_once('=')
-        .ok_or_else(|| format!("expected KEY=VALUE, got '{raw}'"))?;
-    if key.is_empty() {
-        return Err(format!("empty option key in '{raw}'"));
-    }
-    Ok((key.to_string(), value.to_string()))
 }
 
 #[derive(Debug, Clone, Args)]

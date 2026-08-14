@@ -137,7 +137,6 @@ class TlsConnectionTest extends BaseIntegrationTest {
                             CompressionAlgorithm.None,
                             BigInteger.ZERO,
                             BigInteger.ZERO,
-                            empty(),
                             topicName);
 
             List<Message> messages =

@@ -253,12 +253,12 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0, CancellationToken token = default)
     {
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
-            replicationFactor, messageExpiryValue, maxTopicSize);
+            messageExpiryValue, maxTopicSize);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
 
@@ -275,12 +275,12 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null, byte? replicationFactor = null,
+        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null,
         CancellationToken token = default)
     {
         var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
         var message = TcpContracts.UpdateTopic(streamId, topicId, name, compressionAlgorithm, maxTopicSize,
-            messageExpiryValue, replicationFactor);
+            messageExpiryValue);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_TOPIC_CODE);
 

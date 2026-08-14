@@ -29,6 +29,5 @@ public record Topic(
         BigInteger messageExpiry,
         CompressionAlgorithm compressionAlgorithm,
         BigInteger maxTopicSize,
-        Short replicationFactor,
         BigInteger messagesCount,
         Long partitionsCount) {}

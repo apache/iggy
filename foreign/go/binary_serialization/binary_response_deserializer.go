@@ -329,7 +329,6 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+41 : position+49])
 	// Replication factor left the wire protocol together with the old fixed
 	// layout; every topic reports the single-copy default.
-	topic.ReplicationFactor = 1
 
 	nameLength := int(payload[position+49])
 	if remaining < topicFixedSize+nameLength {

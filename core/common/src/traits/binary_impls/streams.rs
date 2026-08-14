@@ -94,7 +94,7 @@ impl<B: BinaryClient> StreamClient for B {
             UpdateStreamRequest {
                 stream_id: wire_id,
                 name: wire_name,
-                options: options.to_wire(),
+                options: options.to_wire()?,
             }
             .to_bytes(),
         )

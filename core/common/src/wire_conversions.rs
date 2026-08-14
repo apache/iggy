@@ -25,12 +25,14 @@ use crate::{
     CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode,
     ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
     ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
-    DEFAULT_REPLICATION_FACTOR, GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind,
-    IdentityInfo, IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue,
-    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
-    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicCreateOptions, TopicDetails,
-    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
+    GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, IdentityInfo, IggyByteSize,
+    IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, OptionsProvenance, Partition,
+    Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream,
+    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
+    UserInfo, UserInfoDetails, UserStatus,
 };
+use bytes::{BufMut, BytesMut};
+use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
@@ -144,13 +146,6 @@ impl TryFrom<TopicHeader> for Topic {
             message_expiry,
             compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)?,
             max_topic_size,
-            // Mirrors the stored option so the typed field and the options map
-            // never disagree. Absent only for a topic written before the key
-            // existed, which reads as the default.
-            replication_factor: TopicCreateOptions::from_resource_options(&options)
-                .ok()
-                .and_then(|parsed| parsed.replication_factor)
-                .unwrap_or(DEFAULT_REPLICATION_FACTOR),
             options,
         })
     }
@@ -186,7 +181,6 @@ impl TryFrom<GetTopicResponse> for TopicDetails {
             message_expiry: topic.message_expiry,
             compression_algorithm: topic.compression_algorithm,
             max_topic_size: topic.max_topic_size,
-            replication_factor: topic.replication_factor,
             partitions_count: topic.partitions_count,
             partitions,
             options: topic.options,
@@ -884,46 +878,62 @@ pub fn resource_options_from_wire_split(
 
 /// Split domain resource options into `(explicit, derived)` wire blocks,
 /// the response-side layout that preserves per-key provenance.
-#[must_use]
+///
+/// # Errors
+///
+/// Same contract as [`resource_options_to_wire`].
 pub fn resource_options_to_wire_split(
     options: &ResourceOptions,
-) -> (
-    iggy_binary_protocol::WireOptions,
-    iggy_binary_protocol::WireOptions,
-) {
-    let derived: ResourceOptions = options
-        .iter()
-        .filter(|(_, option)| !option.explicit)
-        .map(|(key, option)| (key.clone(), option.clone()))
-        .collect();
-    (
-        resource_options_to_wire(options, true),
-        resource_options_to_wire(&derived, false),
-    )
+) -> Result<(WireOptions, WireOptions), IggyError> {
+    Ok((
+        resource_options_to_wire(options, OptionsProvenance::Explicit)?,
+        resource_options_to_wire(options, OptionsProvenance::Derived)?,
+    ))
 }
 
-/// Encode domain resource options into a [`WireOptions`] block.
+/// Fixed per-entry cost of the TLV encoding: a kind byte and a `u32` length
+/// for the key and for the value.
+const OPTION_ENTRY_OVERHEAD: usize = 2 * (1 + 4);
+
+/// Encode domain resource options into a [`WireOptions`] block, keeping only
+/// the entries matching `provenance`. Encoding just the explicit ones is what
+/// lets a client round-trip a create without pinning server defaults.
 ///
-/// With `explicit_only`, derived entries are skipped, which is what lets a
-/// client round-trip a create exactly without pinning server defaults.
+/// # Errors
+///
+/// Returns `IggyError::OptionsBlockTooLarge` when the selected entries exceed
+/// `MAX_OPTIONS` or `MAX_OPTIONS_BYTES`. [`WireOptions::from_validated`] skips
+/// revalidation, so the two caps have to hold here: a block written past them
+/// is one the receiving peer's `decode_options_prefixed` refuses, which would
+/// make the resource permanently unreadable rather than merely oversized.
 pub fn resource_options_to_wire(
     options: &ResourceOptions,
-    explicit_only: bool,
-) -> iggy_binary_protocol::WireOptions {
-    use bytes::{BufMut, BytesMut};
-    use iggy_binary_protocol::WireOptions;
-
+    provenance: OptionsProvenance,
+) -> Result<WireOptions, IggyError> {
     let entries: Vec<(&HeaderKey, &OptionValue)> = options
         .iter()
-        .filter(|(_, option)| option.explicit || !explicit_only)
+        .filter(|(_, option)| option.matches(provenance))
         .collect();
     if entries.is_empty() {
-        return WireOptions::empty();
+        return Ok(WireOptions::empty());
+    }
+    if entries.len() > MAX_OPTIONS as usize {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{} entries, maximum {MAX_OPTIONS}",
+            entries.len()
+        )));
     }
     let size: usize = entries
         .iter()
-        .map(|(key, option)| 1 + 4 + key.as_bytes().len() + 1 + 4 + option.value.as_bytes().len())
+        .map(|(key, option)| {
+            OPTION_ENTRY_OVERHEAD + key.as_bytes().len() + option.value.as_bytes().len()
+        })
         .sum();
+    if size > MAX_OPTIONS_BYTES {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{size} bytes, maximum {MAX_OPTIONS_BYTES}"
+        )));
+    }
     let mut buf = BytesMut::with_capacity(size);
     for (key, option) in entries {
         buf.put_u8(key.kind().as_code());
@@ -935,9 +945,10 @@ pub fn resource_options_to_wire(
         buf.put_u32_le(option.value.as_bytes().len() as u32);
         buf.put_slice(option.value.as_bytes());
     }
-    // Encoded from valid HeaderKey entries in BTreeMap order: structurally
-    // valid TLV, string keys, sorted, no duplicates.
-    WireOptions::from_validated(buf.freeze())
+    // Structural validity holds by construction: entries come from valid
+    // `HeaderKey`s walked in `BTreeMap` order, so keys are string-kinded,
+    // sorted and unique. The caps above cover what construction cannot.
+    Ok(WireOptions::from_validated(buf.freeze()))
 }
 
 #[cfg(test)]

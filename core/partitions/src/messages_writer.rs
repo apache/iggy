@@ -21,7 +21,6 @@ use compio::{
 };
 use iggy_common::{IggyByteSize, IggyError};
 use server_common::iobuf::Frozen;
-#[cfg(target_os = "linux")]
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},

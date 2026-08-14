@@ -162,7 +162,6 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         "test-topic")
                 .get(5, TimeUnit.SECONDS);
 
@@ -203,7 +202,6 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         "test-topic")
                 .get(5, TimeUnit.SECONDS);
 

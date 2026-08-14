@@ -98,7 +98,6 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        empty(),
                         TOPIC_NAME.getName());
     }
 

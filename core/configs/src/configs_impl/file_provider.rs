@@ -28,6 +28,49 @@ use tracing::{error, info, warn};
 
 const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
 
+/// Config keys that became per-topic options, paired with the option key that
+/// replaced each one.
+///
+/// Nothing else catches them. Their struct fields are gone and no config table
+/// sets `deny_unknown_fields`, so figment drops an unrecognized key without a
+/// word: a server still carrying `enforce_fsync = true` would boot reporting
+/// success and run without fsync. Every entry here used to change behavior, so
+/// the boot is refused rather than warned about.
+const RELOCATED_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("system.topic.max_size", "max_topic_size"),
+    ("system.topic.message_expiry", "message_expiry"),
+    ("system.partition.enforce_fsync", "enforce_fsync"),
+    (
+        "system.partition.messages_required_to_save",
+        "messages_required_to_save",
+    ),
+    (
+        "system.partition.size_of_messages_required_to_save",
+        "size_of_messages_required_to_save",
+    ),
+    ("system.segment.size", "segment_size"),
+    ("system.segment.preallocate", "preallocate_segments"),
+];
+
+/// Refuse a config file that still sets a key which moved to a topic option.
+fn reject_relocated_keys(file_path: &str) -> Result<(), ConfigurationError> {
+    let file = Figment::from(Toml::file(file_path));
+    let mut found = false;
+    for (key, option) in RELOCATED_CONFIG_KEYS {
+        if file.find_value(key).is_ok() {
+            found = true;
+            error!(
+                "Config key '{key}' no longer exists; it is now the per-topic '{option}' option, \
+                 set on CreateTopic. Remove the key to boot."
+            );
+        }
+    }
+    if found {
+        return Err(ConfigurationError::InvalidConfigurationValue);
+    }
+    Ok(())
+}
+
 /// File-based configuration provider that combines file, default, and environment configurations.
 pub struct FileConfigProvider<P> {
     file_path: String,
@@ -75,6 +118,7 @@ impl<P: Provider + Clone> ConfigProvider for FileConfigProvider<P> {
         // If the config file exists, merge it into the configuration
         if file_exists(&self.file_path) {
             info!("Found configuration file at path: '{}'.", self.file_path);
+            reject_relocated_keys(&self.file_path)?;
             config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
             warn!(

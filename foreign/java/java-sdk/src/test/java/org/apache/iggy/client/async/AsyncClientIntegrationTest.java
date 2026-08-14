@@ -96,7 +96,6 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
                             CompressionAlgorithm.None,
                             BigInteger.ZERO,
                             BigInteger.ZERO,
-                            Optional.empty(),
                             "test-topic")
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
@@ -151,7 +150,6 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
                             CompressionAlgorithm.None,
                             BigInteger.ZERO,
                             BigInteger.ZERO,
-                            Optional.empty(),
                             "test-topic")
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
@@ -214,7 +212,6 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
                             CompressionAlgorithm.None,
                             BigInteger.ZERO,
                             BigInteger.ZERO,
-                            Optional.empty(),
                             "test-topic")
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 

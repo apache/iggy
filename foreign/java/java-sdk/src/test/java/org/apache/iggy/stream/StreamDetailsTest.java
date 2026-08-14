@@ -40,7 +40,6 @@ class StreamDetailsTest {
                 BigInteger.TEN,
                 CompressionAlgorithm.None,
                 BigInteger.ONE,
-                (short) 2,
                 BigInteger.ZERO,
                 2L));
 

@@ -29,7 +29,6 @@ pub struct UpdateTopicCmd {
     update_topic: UpdateTopic,
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
-    replication_factor: u8,
     options: TopicUpdateOptions,
 }
 
@@ -42,8 +41,6 @@ impl UpdateTopicCmd {
         name: String,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
-        replication_factor: u8,
-        set: BTreeMap<String, String>,
     ) -> Self {
         Self {
             update_topic: UpdateTopic {
@@ -53,16 +50,11 @@ impl UpdateTopicCmd {
                 compression_algorithm,
                 message_expiry,
                 max_topic_size,
-                replication_factor: Some(replication_factor),
-                options: set.clone(),
+                options: BTreeMap::new(),
             },
             message_expiry,
             max_topic_size,
-            replication_factor,
-            options: TopicUpdateOptions {
-                replication_factor: Some(replication_factor),
-                raw: set,
-            },
+            options: TopicUpdateOptions::default(),
         }
     }
 }
@@ -88,13 +80,12 @@ impl CliCommand for UpdateTopicCmd {
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Topic with ID: {} updated name: {}, updated message expiry: {}, updated compression algorithm: {}, updated max topic size: {}, updated replication factor: {} in stream with ID: {}",
+            "Topic with ID: {} updated name: {}, updated message expiry: {}, updated compression algorithm: {}, updated max topic size: {} in stream with ID: {}",
             self.update_topic.topic_id,
             self.update_topic.name,
             self.message_expiry,
             self.update_topic.compression_algorithm,
             self.max_topic_size,
-            self.replication_factor,
             self.update_topic.stream_id,
         );
 
@@ -109,14 +100,13 @@ impl fmt::Display for UpdateTopicCmd {
         let compression_algorithm = &self.update_topic.compression_algorithm;
         let message_expiry = &self.message_expiry;
         let max_topic_size = &self.max_topic_size;
-        let replication_factor = self.replication_factor;
         let stream_id = &self.update_topic.stream_id;
 
         write!(
             f,
             "update topic with ID: {topic_id}, name: {topic_name}, message expiry: \
-            {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: {max_topic_size}, replication \
-            factor: {replication_factor}, in stream with ID: {stream_id}",
+            {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: \
+            {max_topic_size}, in stream with ID: {stream_id}",
         )
     }
 }

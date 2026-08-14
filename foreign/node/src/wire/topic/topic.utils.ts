@@ -38,8 +38,6 @@ export type BaseTopic = {
   messageExpiry: bigint,
   /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize: bigint,
-  /** Replication factor (no longer on the wire, always 1) */
-  replicationFactor: number
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -164,7 +162,6 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       partitionsCount,
       compressionAlgorithm,
       maxTopicSize,
-      replicationFactor: 1,
       messageExpiry,
       messagesCount,
       sizeBytes,

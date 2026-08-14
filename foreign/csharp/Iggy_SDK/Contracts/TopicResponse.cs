@@ -76,10 +76,6 @@ public sealed class TopicResponse
     /// </summary>
     public required uint PartitionsCount { get; init; }
 
-    /// <summary>
-    ///     Replication factor of the topic.
-    /// </summary>
-    public required byte? ReplicationFactor { get; init; }
 
     /// <summary>
     ///     List of partitions in the topic.

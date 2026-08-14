@@ -126,7 +126,7 @@ impl<B: BinaryClient> UserClient for B {
                 user_id: wire_id,
                 username: wire_username,
                 status: status.map(|s| s.as_code()),
-                options: options.to_wire(),
+                options: options.to_wire()?,
             }
             .to_bytes(),
         )

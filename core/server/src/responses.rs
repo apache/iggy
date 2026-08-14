@@ -84,7 +84,8 @@ use iggy_binary_protocol::{
 };
 use iggy_common::wire_conversions::{resource_options_to_wire, resource_options_to_wire_split};
 use iggy_common::{
-    EncryptorKind, HeaderKind, Identifier, IggyError, IggyTimestamp, topic_option_keys,
+    EncryptorKind, HeaderKind, Identifier, IggyError, IggyTimestamp, OptionsProvenance,
+    topic_option_keys,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -1092,7 +1093,7 @@ fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyE
         created_at: user.created_at.as_micros(),
         status: user.status.as_code(),
         username: WireName::new(user.username.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
-        options: resource_options_to_wire(&user.options, true),
+        options: resource_options_to_wire(&user.options, OptionsProvenance::Explicit)?,
     })
 }
 
@@ -1318,7 +1319,7 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
         size_bytes: stream.stats.size_bytes_inconsistent(),
         messages_count: stream.stats.messages_count_inconsistent(),
         name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
-        options: resource_options_to_wire(&stream.options, true),
+        options: resource_options_to_wire(&stream.options, OptionsProvenance::Explicit)?,
     })
 }
 
@@ -1328,7 +1329,7 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
 /// came from an update and must read back as `ServerDefault`, not as the node
 /// default frozen at read time.
 fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
-    let (options, derived_options) = resource_options_to_wire_split(&topic.options);
+    let (options, derived_options) = resource_options_to_wire_split(&topic.options)?;
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),

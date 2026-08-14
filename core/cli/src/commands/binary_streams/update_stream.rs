@@ -31,14 +31,14 @@ pub struct UpdateStreamCmd {
 }
 
 impl UpdateStreamCmd {
-    pub fn new(stream_id: Identifier, name: String, set: BTreeMap<String, String>) -> Self {
+    pub fn new(stream_id: Identifier, name: String) -> Self {
         UpdateStreamCmd {
             update_stream: UpdateStream {
                 stream_id,
                 name,
-                options: set.clone(),
+                options: BTreeMap::new(),
             },
-            options: StreamUpdateOptions { raw: set },
+            options: StreamUpdateOptions::default(),
         }
     }
 }

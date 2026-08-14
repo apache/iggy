@@ -55,10 +55,9 @@ final class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         return FutureUtil.resolve(delegate.createTopic(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name));
     }
 
     @Override
@@ -68,10 +67,9 @@ final class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         FutureUtil.resolve(delegate.updateTopic(
-                streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+                streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name));
     }
 
     @Override

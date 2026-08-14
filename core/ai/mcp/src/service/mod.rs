@@ -154,7 +154,6 @@ impl IggyService {
             name,
             partitions_count,
             compression_algorithm,
-            replication_factor,
             message_expiry,
             max_size,
         }): Parameters<CreateTopic>,
@@ -181,7 +180,6 @@ impl IggyService {
                             .then_some(message_expiry),
                         max_topic_size: (max_size != MaxTopicSize::ServerDefault)
                             .then_some(max_size),
-                        replication_factor,
                         ..TopicCreateOptions::default()
                     },
                 )
@@ -197,7 +195,6 @@ impl IggyService {
             topic_id,
             name,
             compression_algorithm,
-            replication_factor,
             message_expiry,
             max_size,
         }): Parameters<UpdateTopic>,
@@ -219,10 +216,7 @@ impl IggyService {
                     compression_algorithm,
                     message_expiry,
                     max_size,
-                    &TopicUpdateOptions {
-                        replication_factor,
-                        ..TopicUpdateOptions::default()
-                    },
+                    &TopicUpdateOptions::default(),
                 )
                 .await,
         )

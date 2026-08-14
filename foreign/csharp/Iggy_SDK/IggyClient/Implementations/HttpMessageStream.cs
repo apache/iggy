@@ -155,7 +155,7 @@ public class HttpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateTopicRequest
@@ -164,8 +164,7 @@ public class HttpMessageStream : IIggyClient
             CompressionAlgorithm = compressionAlgorithm,
             MaxTopicSize = maxTopicSize,
             MessageExpiry = DurationHelpers.ToDuration(messageExpiry),
-            PartitionsCount = partitionsCount,
-            ReplicationFactor = replicationFactor
+            PartitionsCount = partitionsCount
         }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -184,12 +183,11 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null, byte? replicationFactor = null,
+        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null,
         CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize,
-                DurationHelpers.ToDuration(messageExpiry),
-                replicationFactor),
+        var json = JsonSerializer.Serialize(
+            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, DurationHelpers.ToDuration(messageExpiry)),
             _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);

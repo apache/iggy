@@ -281,8 +281,6 @@ func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
 	assert.Equal(t, uint8(2), topic.CompressionAlgorithm,
 		"compression is the u8 at +24")
 	assert.Equal(t, uint64(1<<30), topic.MaxTopicSize)
-	assert.Equal(t, uint8(1), topic.ReplicationFactor,
-		"replication factor left the wire protocol; the model reports 1")
 	assert.Equal(t, uint64(4096), topic.Size)
 	assert.Equal(t, uint64(12), topic.MessagesCount)
 	assert.Equal(t, name, topic.Name)

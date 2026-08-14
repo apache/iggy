@@ -49,7 +49,6 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         return createTopic(
                 StreamId.of(streamId),
@@ -57,7 +56,6 @@ public interface TopicsClient {
                 compressionAlgorithm,
                 messageExpiry,
                 maxTopicSize,
-                replicationFactor,
                 name);
     }
 
@@ -67,7 +65,6 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name);
 
     default void updateTopic(
@@ -76,7 +73,6 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         updateTopic(
                 StreamId.of(streamId),
@@ -84,7 +80,6 @@ public interface TopicsClient {
                 compressionAlgorithm,
                 messageExpiry,
                 maxTopicSize,
-                replicationFactor,
                 name);
     }
 
@@ -94,7 +89,6 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name);
 
     default void deleteTopic(Long streamId, Long topicId) {

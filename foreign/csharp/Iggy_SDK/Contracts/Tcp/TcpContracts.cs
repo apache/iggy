@@ -640,16 +640,11 @@ internal static class TcpContracts
     }
 
     internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry, byte? replicationFactor)
+        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry)
     {
-        // Only the updatable subset may ride an update; the server rejects the
-        // create-time knobs by name.
+        // No key may ride an update yet; the block exists so the first one
+        // costs a catalog entry rather than another wire change.
         var options = new Dictionary<HeaderKey, HeaderValue>();
-        if (replicationFactor.HasValue)
-        {
-            options[HeaderKey.FromString("replication_factor")] = HeaderValue.FromUInt8(replicationFactor.Value);
-        }
-
         var optionsLength = HeadersByteLength(options);
         Span<byte> bytes =
             stackalloc byte[4 + streamId.Length + topicId.Length + 18 + name.Length + optionsLength];
@@ -668,7 +663,7 @@ internal static class TcpContracts
     }
 
     internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
-        CompressionAlgorithm compressionAlgorithm, byte? replicationFactor, ulong messageExpiry,
+        CompressionAlgorithm compressionAlgorithm, ulong messageExpiry,
         ulong maxTopicSize)
     {
         var options = new Dictionary<HeaderKey, HeaderValue>();
@@ -686,11 +681,6 @@ internal static class TcpContracts
         if (maxTopicSize != 0)
         {
             options[HeaderKey.FromString("max_topic_size")] = HeaderValue.FromUInt64(maxTopicSize);
-        }
-
-        if (replicationFactor.HasValue)
-        {
-            options[HeaderKey.FromString("replication_factor")] = HeaderValue.FromUInt8(replicationFactor.Value);
         }
 
         var optionsLength = HeadersByteLength(options);

@@ -90,17 +90,6 @@ describe('CreateTopic', () => {
       );
     });
 
-    it('serialize replicationFactor as an option', () => {
-      // 1 is an explicit value, not a sentinel: only an unset field lets the
-      // server resolve its own default.
-      const t = { ...t1, replicationFactor: 1 };
-      assert.deepEqual(
-        CREATE_TOPIC.serialize(t).length,
-        fixedSize + t1.name.length
-        + tlvSize('replication_factor'.length) + tlvSize(1)
-      );
-    });
-
     it('throw on name < 1', () => {
       const t = { ...t1, name: '' };
       assert.throws(

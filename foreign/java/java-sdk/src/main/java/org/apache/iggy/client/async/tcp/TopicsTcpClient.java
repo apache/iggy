@@ -53,7 +53,6 @@ public class TopicsTcpClient implements TopicsClient {
     private static final String COMPRESSION_ALGORITHM_OPTION = "compression_algorithm";
     private static final String MESSAGE_EXPIRY_OPTION = "message_expiry";
     private static final String MAX_TOPIC_SIZE_OPTION = "max_topic_size";
-    private static final String REPLICATION_FACTOR_OPTION = "replication_factor";
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
 
@@ -108,11 +107,10 @@ public class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
 
         var payload = createTopicPayload(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name);
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
 
         return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
             try {
@@ -129,7 +127,6 @@ public class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
         // partitions_count is a fixed field of the command, never an option:
         // admission consumes it to compute partition assignments.
@@ -138,15 +135,14 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeIntLE(partitionsCount.intValue());
         payload.writeBytes(BytesSerializer.toBytes(name));
         payload.writeBytes(BytesSerializer.toBytes(
-                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor)));
+                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
         return payload;
     }
 
     private static Map<HeaderKey, HeaderValue> createTopicOptions(
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor) {
+            BigInteger maxTopicSize) {
         // Server-default sentinels (compression none, expiry 0, size 0) are
         // omitted so the admitting server resolves them from its config.
         Map<HeaderKey, HeaderValue> options = new LinkedHashMap<>();
@@ -164,8 +160,6 @@ public class TopicsTcpClient implements TopicsClient {
         if (maxTopicSize.signum() != 0) {
             options.put(HeaderKey.fromString(MAX_TOPIC_SIZE_OPTION), HeaderValue.fromUint64(maxTopicSize));
         }
-        replicationFactor.ifPresent(
-                factor -> options.put(HeaderKey.fromString(REPLICATION_FACTOR_OPTION), HeaderValue.fromUint8(factor)));
         return options;
     }
 
@@ -176,7 +170,6 @@ public class TopicsTcpClient implements TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name) {
 
         var payload = Unpooled.buffer();
@@ -189,8 +182,6 @@ public class TopicsTcpClient implements TopicsClient {
         // Only the updatable subset may ride an update; the server rejects the
         // create-time knobs by name.
         Map<HeaderKey, HeaderValue> options = new LinkedHashMap<>();
-        replicationFactor.ifPresent(
-                factor -> options.put(HeaderKey.fromString(REPLICATION_FACTOR_OPTION), HeaderValue.fromUint8(factor)));
         payload.writeBytes(BytesSerializer.toBytes(options));
 
         return connection()

@@ -595,7 +595,6 @@ pub async fn run(harness: &TestHarness) {
     let updated_message_expiry = 1000;
     let message_expiry_duration = updated_message_expiry.into();
     let updated_max_topic_size = MaxTopicSize::Custom(IggyByteSize::from_str("2 GB").unwrap());
-    let updated_replication_factor = 5;
 
     client
         .update_topic(
@@ -605,10 +604,7 @@ pub async fn run(harness: &TestHarness) {
             CompressionAlgorithm::Gzip,
             IggyExpiry::ExpireDuration(message_expiry_duration),
             updated_max_topic_size,
-            &TopicUpdateOptions {
-                replication_factor: Some(updated_replication_factor),
-                ..TopicUpdateOptions::default()
-            },
+            &TopicUpdateOptions::default(),
         )
         .await
         .unwrap();
@@ -632,16 +628,28 @@ pub async fn run(harness: &TestHarness) {
         CompressionAlgorithm::Gzip
     );
     assert_eq!(updated_topic.max_topic_size, updated_max_topic_size);
-    // An update's options patch the stored map, so the new replication factor
-    // is what both the typed field and the option report.
-    assert_eq!(updated_topic.replication_factor, updated_replication_factor);
-    let replication_key = HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR).unwrap();
-    let replication = updated_topic
+    // The three settings the update carries as fixed fields are mirrored into
+    // the stored map, so `options` cannot report a value the typed field has
+    // already moved past.
+    let expiry_key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).unwrap();
+    let expiry = updated_topic
         .options
-        .get(&replication_key)
-        .expect("replication factor echoes back as an option");
-    assert!(replication.explicit, "an updated key is explicit");
-    assert_eq!(replication.value.as_bytes(), [updated_replication_factor]);
+        .get(&expiry_key)
+        .expect("message expiry echoes back as an option");
+    assert!(expiry.explicit, "an updated key is explicit");
+    assert_eq!(
+        expiry.value.as_bytes(),
+        u64::from(updated_topic.message_expiry).to_le_bytes()
+    );
+    let max_size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
+    let max_size = updated_topic
+        .options
+        .get(&max_size_key)
+        .expect("max topic size echoes back as an option");
+    assert_eq!(
+        max_size.value.as_bytes(),
+        u64::from(updated_topic.max_topic_size).to_le_bytes()
+    );
 
     // 39. Purge the existing topic and ensure it has no messages
     client

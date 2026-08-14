@@ -38,7 +38,7 @@ func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 	})
 
 	topic, err := client.CreateTopic(context.Background(),
-		numericIdentifier(t, 1), "orders", 3, 0, iggcon.Duration(0), 0, nil)
+		numericIdentifier(t, 1), "orders", 3, 0, iggcon.Duration(0), 0)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), topic.PartitionsCount)
 	assert.Equal(t, "orders", topic.Name)
@@ -51,13 +51,11 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	})
 
 	streamId := numericIdentifier(t, 1)
-	zeroReplication := uint8(0)
 	tests := []struct {
-		name        string
-		topicName   string
-		partitions  uint32
-		replication *uint8
-		want        error
+		name       string
+		topicName  string
+		partitions uint32
+		want       error
 	}{
 		{name: "empty name", topicName: "", partitions: 1,
 			want: ierror.ErrInvalidTopicName},
@@ -65,13 +63,11 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 			partitions: 1, want: ierror.ErrInvalidTopicName},
 		{name: "too many partitions", topicName: "orders",
 			partitions: MaxPartitionCount + 1, want: ierror.ErrTooManyPartitions},
-		{name: "zero replication factor", topicName: "orders", partitions: 1,
-			replication: &zeroReplication, want: ierror.ErrInvalidReplicationFactor},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := client.CreateTopic(context.Background(), streamId,
-				test.topicName, test.partitions, 0, iggcon.Duration(0), 0, test.replication)
+				test.topicName, test.partitions, 0, iggcon.Duration(0), 0)
 			assert.ErrorIs(t, err, test.want)
 		})
 	}
@@ -86,14 +82,10 @@ func TestUpdateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 
 	streamId := numericIdentifier(t, 1)
 	topicId := numericIdentifier(t, 2)
-	zeroReplication := uint8(0)
 
 	err := client.UpdateTopic(context.Background(), streamId, topicId,
-		"", 0, iggcon.Duration(0), 0, nil)
+		"", 0, iggcon.Duration(0), 0)
 	assert.ErrorIs(t, err, ierror.ErrInvalidTopicName)
-	err = client.UpdateTopic(context.Background(), streamId, topicId,
-		"orders", 0, iggcon.Duration(0), 0, &zeroReplication)
-	assert.ErrorIs(t, err, ierror.ErrInvalidReplicationFactor)
 	assert.Empty(t, server.recorded())
 }
 
@@ -105,7 +97,7 @@ func TestUpdateTopic_AcceptsACommittedUpdate(t *testing.T) {
 
 	assert.NoError(t, client.UpdateTopic(context.Background(),
 		numericIdentifier(t, 1), numericIdentifier(t, 2),
-		"renamed", 0, iggcon.Duration(0), 0, nil))
+		"renamed", 0, iggcon.Duration(0), 0))
 }
 
 func TestGetTopics_DecodesTheRoster(t *testing.T) {

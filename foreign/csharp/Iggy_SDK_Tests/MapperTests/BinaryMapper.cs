@@ -152,7 +152,7 @@ public sealed class BinaryMapper
         var streamPayload
             = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
         var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1,
-                createdAtTopic, replicationFactor, maxTopicSize) =
+                createdAtTopic, maxTopicSize) =
             TopicFactory.CreateTopicResponseFields();
         var topicPayload1 = BinaryFactory.CreateTopicPayload(topicId1,
             partitionsCount1,
@@ -197,12 +197,12 @@ public sealed class BinaryMapper
     {
         // Arrange
         var (id1, partitionsCount1, name1, messageExpiry1, sizeBytesTopic1, messagesCountTopic1, createdAt,
-                replicationFactor1, maxTopicSize1) =
+                maxTopicSize1) =
             TopicFactory.CreateTopicResponseFields();
         var payload1 = BinaryFactory.CreateTopicPayload(id1, partitionsCount1, messageExpiry1, name1,
             sizeBytesTopic1, messagesCountTopic1, createdAt, maxTopicSize1, 1);
         var (id2, partitionsCount2, name2, messageExpiry2, sizeBytesTopic2, messagesCountTopic2, createdAt2,
-                replicationFactor2, maxTopicSize2) =
+                maxTopicSize2) =
             TopicFactory.CreateTopicResponseFields();
         var payload2 = BinaryFactory.CreateTopicPayload(id2, partitionsCount2, messageExpiry2, name2,
             sizeBytesTopic2, messagesCountTopic2, createdAt2, maxTopicSize2, 2);
@@ -241,8 +241,8 @@ public sealed class BinaryMapper
     public void MapTopic_ReturnsValidTopicResponse()
     {
         // Arrange
-        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2, replicationFactor
-            , maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
         var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
             sizeBytes, messagesCount, createdAt2, maxTopicSize, 1);
 

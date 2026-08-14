@@ -23,5 +23,4 @@ internal record UpdateTopicRequest(
     string Name,
     CompressionAlgorithm CompressionAlgorithm,
     ulong MaxTopicSize,
-    ulong MessageExpiry,
-    byte? ReplicationFactor);
+    ulong MessageExpiry);

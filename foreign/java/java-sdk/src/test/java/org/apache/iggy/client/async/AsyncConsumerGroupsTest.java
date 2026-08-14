@@ -88,7 +88,6 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         TEST_TOPIC)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
@@ -274,7 +273,6 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                             CompressionAlgorithm.None,
                             BigInteger.ZERO,
                             BigInteger.ZERO,
-                            Optional.empty(),
                             topicName)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 

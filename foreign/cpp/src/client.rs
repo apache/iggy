@@ -390,7 +390,6 @@ impl Client {
         topic_name: String,
         partitions_count: u32,
         compression_algorithm: String,
-        replication_factor: u8,
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
@@ -405,7 +404,6 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -438,7 +436,6 @@ impl Client {
                 .then_some(rust_message_expiry),
             max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
                 .then_some(rust_max_topic_size),
-            replication_factor: rust_replication_factor,
             ..TopicCreateOptions::default()
         };
 
@@ -508,7 +505,6 @@ impl Client {
         topic_id: ffi::Identifier,
         topic_name: String,
         compression_algorithm: String,
-        replication_factor: u8,
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
@@ -525,7 +521,6 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -540,7 +535,6 @@ impl Client {
         };
         // Replication factor rides the options block now, not a fixed field.
         let update_options = TopicUpdateOptions {
-            replication_factor: rust_replication_factor,
             ..TopicUpdateOptions::default()
         };
         let rust_max_topic_size = match max_topic_size.as_str() {

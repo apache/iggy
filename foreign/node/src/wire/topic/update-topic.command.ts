@@ -45,8 +45,6 @@ export type UpdateTopic = {
   messageExpiry?: bigint,
   /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize?: bigint,
-  /** Replication factor (1-255), carried as a topic option */
-  replicationFactor?: number,
 };
 
 /**
@@ -63,7 +61,6 @@ export const UPDATE_TOPIC = {
     compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
-    replicationFactor,
   }: UpdateTopic) => {
     const streamIdentifier = serializeIdentifier(streamId);
     const topicIdentifier = serializeIdentifier(topicId);
@@ -74,14 +71,9 @@ export const UPDATE_TOPIC = {
     if(!isValidCompressionAlgorithm(compressionAlgorithm))
       throw new Error(`createTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
 
-    // Only the updatable subset may ride an update; the server rejects the
-    // create-time knobs by name.
+    // No key may ride an update yet; the block exists so the first one costs
+    // a catalog entry rather than another wire change.
     const options: OptionEntry[] = [];
-    if (replicationFactor !== undefined)
-      options.push({
-        key: 'replication_factor',
-        value: HeaderValue.Uint8(replicationFactor)
-      });
 
     const b = Buffer.allocUnsafe(8 + 8 + 1 + 1);
     b.writeUInt8(compressionAlgorithm, 0);

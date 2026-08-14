@@ -391,65 +391,7 @@ class TestCreateTopic:
                 max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes),
             )
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "replication_factor",
-        [
-            0,  # value for server default replication factor
-            1,
-            42,
-            255,
-        ],
-    )
-    async def test_create_topic_with_valid_replication_factor(
-        self, iggy_client: IggyClient, unique_name, replication_factor: int
-    ):
-        """Test create_topic accepts a supported replication factor."""
-        stream_name = unique_name()
-        topic_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-            replication_factor=replication_factor,
-        )
-
-        topic = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic is not None
-        assert topic.name == topic_name
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("replication_factor", "expected_exception"),
-        [
-            (-1, OverflowError),
-            (256, OverflowError),
-            ("1", TypeError),
-            (1.0, TypeError),
-        ],
-    )
-    async def test_create_topic_invalid_replication_factor(
-        self,
-        iggy_client: IggyClient,
-        unique_name,
-        replication_factor,
-        expected_exception,
-    ):
-        """Test create_topic rejects invalid replication factor values."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-
-        with pytest.raises(expected_exception):
-            await iggy_client.create_topic(
-                stream=stream_name,
-                name=topic_name,
-                partitions_count=1,
-                replication_factor=replication_factor,
-            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("partitions_count", [1001, 10000])
@@ -954,65 +896,7 @@ class TestUpdateTopic:
                 message_expiry=invalid_message_expiry,
             )
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("replication_factor", [0, 1, 255])
-    async def test_update_topic_with_valid_replication_factor(
-        self, iggy_client: IggyClient, unique_name, replication_factor: int
-    ):
-        """Test update_topic accepts a supported replication factor."""
-        stream_name = unique_name()
-        topic_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        await iggy_client.update_topic(
-            stream_id=stream_name,
-            topic_id=topic_name,
-            name=topic_name,
-            replication_factor=replication_factor,
-        )
-
-        topic = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic is not None
-        # The server normalizes a replication factor of 0 to 1.
-        assert topic.replication_factor == (replication_factor or 1)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("replication_factor", "expected_exception"),
-        [
-            (-1, OverflowError),
-            (256, OverflowError),
-            ("1", TypeError),
-            (1.0, TypeError),
-        ],
-    )
-    async def test_update_topic_invalid_replication_factor(
-        self,
-        iggy_client: IggyClient,
-        unique_name,
-        replication_factor,
-        expected_exception,
-    ):
-        """Test update_topic rejects invalid replication factor values."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        with pytest.raises(expected_exception):
-            await iggy_client.update_topic(
-                stream_id=stream_name,
-                topic_id=topic_name,
-                name=topic_name,
-                replication_factor=replication_factor,
-            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1393,7 +1277,6 @@ class TestPurgeTopic:
         assert after.created_at == before.created_at
         assert after.partitions_count == before.partitions_count
         assert after.compression_algorithm == before.compression_algorithm
-        assert after.replication_factor == before.replication_factor
         assert isinstance(before.message_expiry, IggyExpiry.NeverExpire)
         assert isinstance(after.message_expiry, IggyExpiry.NeverExpire)
         assert isinstance(before.max_topic_size, MaxTopicSize.Unlimited)

@@ -333,7 +333,6 @@ impl From<RustTopic> for ffi::Topic {
             message_expiry: u64::from(topic.message_expiry),
             compression_algorithm: topic.compression_algorithm.to_string(),
             max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
         }
@@ -350,7 +349,6 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
             message_expiry: u64::from(topic.message_expiry),
             compression_algorithm: topic.compression_algorithm.to_string(),
             max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic

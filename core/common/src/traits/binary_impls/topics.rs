@@ -97,7 +97,7 @@ impl<B: BinaryClient> TopicClient for B {
                     stream_id: wire_stream_id,
                     partitions_count: options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT),
                     name: wire_name,
-                    options: options.to_wire(),
+                    options: options.to_wire()?,
                 }
                 .to_bytes(),
             )
@@ -129,7 +129,7 @@ impl<B: BinaryClient> TopicClient for B {
                 message_expiry: u64::from(message_expiry),
                 max_topic_size: u64::from(max_topic_size),
                 name: wire_name,
-                options: options.to_wire(),
+                options: options.to_wire()?,
             }
             .to_bytes(),
         )

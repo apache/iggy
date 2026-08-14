@@ -36,7 +36,7 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(
         client->create_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 43));
@@ -79,7 +79,7 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
                                          "server_default", 0, "server_default"));
 
     ASSERT_THROW(
@@ -99,7 +99,7 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
                                          "server_default", 0, "server_default"));
 
     iggy::ffi::Identifier invalid_stream_kind_id;
@@ -159,7 +159,7 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues)
 
     for (const auto &test_case : test_cases) {
         SCOPED_TRACE(test_case.topic_name);
-        ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), test_case.topic_name, 1, "none", 0,
+        ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), test_case.topic_name, 1, "none",
                                              "server_default", 0, "server_default"));
 
         if (test_case.should_succeed) {
@@ -201,7 +201,7 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
                                          "server_default", 0, "server_default"));
 
     const auto stream_details = client->get_stream(make_string_identifier(stream_name));
@@ -228,7 +228,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 44, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 44, "none",
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(
         client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 43));
@@ -269,7 +269,7 @@ TEST_F(LowLevelE2E_Partition, DeleteMorePartitionsThanExistingThrows) {
     for (const auto &test_case : test_cases) {
         SCOPED_TRACE(test_case.topic_name);
         ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), test_case.topic_name,
-                                             test_case.initial_partitions, "none", 0, "server_default", 0,
+                                             test_case.initial_partitions, "none", "server_default", 0,
                                              "server_default"));
 
         if (test_case.should_succeed) {
@@ -311,7 +311,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeCreatingAdditionalPartitions
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none",
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(
         client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1));
@@ -333,7 +333,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsFromTopicWithZeroPartitionsThrows)
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 0, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 0, "none",
                                          "server_default", 0, "server_default"));
 
     ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
@@ -377,7 +377,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none",
                                          "server_default", 0, "server_default"));
 
     ASSERT_THROW(
@@ -397,7 +397,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none",
                                          "server_default", 0, "server_default"));
 
     iggy::ffi::Identifier invalid_stream_kind_id;
@@ -438,7 +438,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsTwiceForSameTopicSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 45, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 45, "none",
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(
         client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 20));
@@ -462,7 +462,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none",
                                          "server_default", 0, "server_default"));
 
     const auto stream_details = client->get_stream(make_string_identifier(stream_name));

@@ -46,7 +46,7 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     void shouldCreateAndDeleteTopic() {
         // when
         var topicDetails = topicsClient.createTopic(
-                STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, empty(), "test-topic");
+                STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
         var topicId = TopicId.of("test-topic");
         var topicOptional = topicsClient.getTopic(STREAM_NAME, topicId);
 
@@ -66,7 +66,7 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     void shouldUpdateTopic() {
         // given
         var topic = topicsClient.createTopic(
-                STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, empty(), "test-topic");
+                STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
 
         // when
         topicsClient.updateTopic(
@@ -75,7 +75,6 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
                 CompressionAlgorithm.None,
                 BigInteger.valueOf(5000),
                 BigInteger.ZERO,
-                empty(),
                 "new-name");
 
         // then

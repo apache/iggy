@@ -125,11 +125,19 @@ impl WireEncode for DescribeOptionsResponse {
     }
 }
 
+/// Smallest a descriptor can encode as: a name, a kind byte, a
+/// length-prefixed default and a length-prefixed description.
+const MIN_DESCRIPTOR_SIZE: usize = 4 + 1 + 1 + 4 + 4;
+
 impl WireDecode for DescribeOptionsResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let count = read_u32_le(buf, 0)? as usize;
         let mut pos = 4;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(crate::codec::bounded_capacity(
+            count,
+            buf.len().saturating_sub(pos),
+            MIN_DESCRIPTOR_SIZE,
+        ));
         for _ in 0..count {
             let (entry, consumed) = OptionDescriptor::decode(&buf[pos..])?;
             pos += consumed;

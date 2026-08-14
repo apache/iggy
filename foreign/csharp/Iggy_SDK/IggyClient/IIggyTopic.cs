@@ -57,7 +57,6 @@ public interface IIggyTopic
     /// <param name="name">The unique name of the topic (max 255 characters).</param>
     /// <param name="partitionsCount">The number of partitions for the topic (max 1000).</param>
     /// <param name="compressionAlgorithm">The compression algorithm to use for messages (default: None).</param>
-    /// <param name="replicationFactor">The replication factor for the topic (optional).</param>
     /// <param name="messageExpiry">The message expiry period (0 for server default, MaxValue for never expire).</param>
     /// <param name="maxTopicSize">The maximum size of the topic in bytes (0 = unlimited).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
@@ -66,15 +65,15 @@ public interface IIggyTopic
     ///     creation failed.
     /// </returns>
     Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         TimeSpan? messageExpiry = null, ulong maxTopicSize = 0, CancellationToken token = default);
 
     /// <summary>
     ///     Updates the configuration of an existing topic.
     /// </summary>
     /// <remarks>
-    ///     This method allows updating topic properties such as name, compression algorithm, size limits, message expiry, and
-    ///     replication factor.
+    ///     This method allows updating topic properties such as name, compression algorithm, size limits and message
+    ///     expiry.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic to update (numeric ID or name).</param>
@@ -82,12 +81,11 @@ public interface IIggyTopic
     /// <param name="compressionAlgorithm">The new compression algorithm to use (default: None).</param>
     /// <param name="maxTopicSize">The new maximum size of the topic in bytes (0 = unlimited).</param>
     /// <param name="messageExpiry">The new message expiry period (0 for server default, MaxValue for never expire).</param>
-    /// <param name="replicationFactor">The new replication factor (optional).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
     Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, ulong maxTopicSize = 0,
-        TimeSpan? messageExpiry = null, byte? replicationFactor = null, CancellationToken token = default);
+        TimeSpan? messageExpiry = null, CancellationToken token = default);
 
     /// <summary>
     ///     Deletes an existing topic and all its associated messages and partitions.

@@ -32,7 +32,6 @@ public record TopicDetails(
         BigInteger messageExpiry,
         CompressionAlgorithm compressionAlgorithm,
         BigInteger maxTopicSize,
-        Short replicationFactor,
         BigInteger messagesCount,
         Long partitionsCount,
         List<Partition> partitions) {
@@ -45,7 +44,6 @@ public record TopicDetails(
                 topic.messageExpiry(),
                 topic.compressionAlgorithm(),
                 topic.maxTopicSize(),
-                topic.replicationFactor(),
                 topic.messagesCount(),
                 topic.partitionsCount(),
                 partitions);

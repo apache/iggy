@@ -87,7 +87,6 @@ public final class ResourceProvisioner {
                                     CompressionAlgorithm.None,
                                     BigInteger.valueOf(pinnedProducerCliArgs.messageExpiry()),
                                     BigInteger.valueOf(pinnedProducerCliArgs.maxTopicSize()),
-                                    Optional.empty(),
                                     topicNames.get(0));
                 }
             }

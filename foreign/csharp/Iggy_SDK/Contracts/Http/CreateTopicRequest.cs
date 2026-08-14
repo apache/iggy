@@ -26,7 +26,6 @@ internal sealed class CreateTopicRequest
     public CompressionAlgorithm CompressionAlgorithm { get; set; } = CompressionAlgorithm.None;
     public ulong MessageExpiry { get; set; }
     public uint PartitionsCount { get; set; } = 1;
-    public byte? ReplicationFactor { get; set; } = 1;
     public ulong MaxTopicSize { get; set; }
 
     public CreateTopicRequest()
@@ -38,14 +37,12 @@ internal sealed class CreateTopicRequest
         CompressionAlgorithm compressionAlgorithm,
         ulong messageExpiry,
         uint partitionsCount,
-        byte? replicationFactor,
         ulong maxTopicSize)
     {
         Name = name;
         CompressionAlgorithm = compressionAlgorithm;
         MessageExpiry = messageExpiry;
         PartitionsCount = partitionsCount;
-        ReplicationFactor = replicationFactor;
         MaxTopicSize = maxTopicSize;
     }
 }

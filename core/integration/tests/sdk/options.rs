@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy::prelude::*;
-use iggy_common::{OptionsScope, topic_option_keys};
+use iggy_common::{OptionsScope, TOPIC_OPTION_KEYS, topic_option_keys};
 use integration::iggy_harness;
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -25,17 +25,18 @@ use std::str::FromStr;
 async fn given_topic_scope_when_describing_options_should_list_the_catalog(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
     let specs = client.describe_options(OptionsScope::Topic).await.unwrap();
-    let keys: Vec<&str> = specs.iter().map(|spec| spec.key.as_str()).collect();
+    let mut served: Vec<&str> = specs.iter().map(|spec| spec.key.as_str()).collect();
+    served.sort_unstable();
+    let mut accepted: Vec<&str> = TOPIC_OPTION_KEYS.to_vec();
+    accepted.sort_unstable();
+    // Exact equality, not per-key contains: the catalog is the only way a
+    // client discovers a key, and create rejects anything outside it, so a key
+    // accepted but unlisted is undiscoverable and one listed but unaccepted is
+    // a lie.
+    assert_eq!(served, accepted, "catalog must match the accepted key set");
     // `partitions_count` is deliberately absent: it is a fixed field of the
     // CreateTopic command, not a topic setting.
-    assert!(!keys.contains(&"partitions_count"));
-    assert!(keys.contains(&topic_option_keys::COMPRESSION_ALGORITHM));
-    assert!(keys.contains(&topic_option_keys::MESSAGE_EXPIRY));
-    assert!(keys.contains(&topic_option_keys::MAX_TOPIC_SIZE));
-    assert!(keys.contains(&topic_option_keys::SEGMENT_SIZE));
-    assert!(keys.contains(&topic_option_keys::ENFORCE_FSYNC));
-    assert!(keys.contains(&topic_option_keys::MESSAGES_REQUIRED_TO_SAVE));
-    assert!(keys.contains(&topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE));
+    assert!(!served.contains(&"partitions_count"));
 }
 
 #[iggy_harness]
@@ -298,7 +299,6 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
                     topic_option_keys::SEGMENT_SIZE.to_string(),
                     "2MiB".to_string(),
                 )]),
-                ..TopicUpdateOptions::default()
             },
         )
         .await;
@@ -312,10 +312,7 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
             CompressionAlgorithm::None,
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
-            &TopicUpdateOptions {
-                replication_factor: Some(4),
-                ..TopicUpdateOptions::default()
-            },
+            &TopicUpdateOptions::default(),
         )
         .await
         .unwrap();
@@ -325,11 +322,8 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
         .await
         .unwrap()
         .expect("topic exists");
-    assert_eq!(details.replication_factor, 4);
-
     // The keys the update did not mention keep the values create resolved.
     for (key, expected_explicit) in [
-        (topic_option_keys::REPLICATION_FACTOR, true),
         (topic_option_keys::SEGMENT_SIZE, true),
         (topic_option_keys::ENFORCE_FSYNC, true),
         (topic_option_keys::PREALLOCATE_SEGMENTS, false),

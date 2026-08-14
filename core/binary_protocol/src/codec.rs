@@ -263,6 +263,21 @@ pub fn capped_capacity(count: usize, remaining: usize, min_item_size: usize) -> 
     count.min(remaining / min_item_size)
 }
 
+/// Capacity to preallocate for `count` elements that still have to be decoded
+/// out of `remaining` bytes, each at least `min_element_size` bytes on the
+/// wire.
+///
+/// A count read off the wire is chosen by the peer, and `Vec::with_capacity`
+/// reserves for it before a single element has been bounds-checked. A hostile
+/// or corrupt frame claiming `u32::MAX` elements therefore aborts the process
+/// on allocation failure instead of returning a decode error. The bytes left
+/// to decode are the honest ceiling on how many elements can exist.
+#[must_use]
+#[inline]
+pub fn bounded_capacity(count: usize, remaining: usize, min_element_size: usize) -> usize {
+    count.min(remaining / min_element_size.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

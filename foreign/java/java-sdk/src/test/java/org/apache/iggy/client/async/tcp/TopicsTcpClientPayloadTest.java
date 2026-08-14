@@ -29,7 +29,6 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -47,7 +46,6 @@ class TopicsTcpClientPayloadTest {
                 CompressionAlgorithm.None,
                 BigInteger.ZERO,
                 BigInteger.ZERO,
-                Optional.empty(),
                 "orders");
 
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 1); // numeric identifier kind
@@ -66,7 +64,6 @@ class TopicsTcpClientPayloadTest {
                 CompressionAlgorithm.None,
                 BigInteger.ZERO,
                 BigInteger.ZERO,
-                Optional.empty(),
                 "events");
 
         payload.skipBytes(2 + "my-stream".length());
@@ -83,7 +80,6 @@ class TopicsTcpClientPayloadTest {
                 CompressionAlgorithm.Gzip,
                 BigInteger.valueOf(60_000_000L),
                 BigInteger.valueOf(1024L),
-                Optional.of((short) 3),
                 "orders");
 
         payload.skipBytes(6);
@@ -92,7 +88,7 @@ class TopicsTcpClientPayloadTest {
 
         Map<String, TypedValue> options = readOptions(payload);
         assertThat(options)
-                .containsOnlyKeys("compression_algorithm", "message_expiry", "max_topic_size", "replication_factor");
+                .containsOnlyKeys("compression_algorithm", "message_expiry", "max_topic_size");
         assertThat(options.get("compression_algorithm").kind()).isEqualTo(HeaderKind.String);
         assertThat(new String(options.get("compression_algorithm").value(), StandardCharsets.UTF_8))
                 .isEqualTo("gzip");

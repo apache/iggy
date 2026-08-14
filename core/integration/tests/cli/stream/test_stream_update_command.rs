@@ -138,7 +138,7 @@ Examples:
  iggy stream update 1 production
  iggy stream update test development
 
-{USAGE_PREFIX} stream update [OPTIONS] <STREAM_ID> <NAME>
+{USAGE_PREFIX} stream update <STREAM_ID> <NAME>
 
 Arguments:
   <STREAM_ID>
@@ -150,12 +150,6 @@ Arguments:
           New name for the stream
 
 Options:
-      --set <KEY=VALUE>
-          Additional stream option as key=value, repeatable
-{CLAP_INDENT}
-          Only keys an update may change are accepted. Streams have no option
-          keys yet, so every key is currently rejected by name.
-
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -175,15 +169,14 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Update stream name for given stream ID
 
-{USAGE_PREFIX} stream update [OPTIONS] <STREAM_ID> <NAME>
+{USAGE_PREFIX} stream update <STREAM_ID> <NAME>
 
 Arguments:
   <STREAM_ID>  Stream ID to update
   <NAME>       New name for the stream
 
 Options:
-      --set <KEY=VALUE>  Additional stream option as key=value, repeatable
-  -h, --help             Print help (see more with '--help')
+  -h, --help  Print help (see more with '--help')
 "#,
             ),
         ))

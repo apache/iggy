@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 /// - `size`: the total size of the topic in bytes.
 /// - `message_expiry`: the expiry of the messages in the topic.
 /// - `max_topic_size`: the maximum size of the topic.
-/// - `replication_factor`: replication factor for the topic.
 /// - `messages_count`: the total number of messages in the topic.
 /// - `partitions_count`: the total number of partitions in the topic.
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,8 +51,6 @@ pub struct Topic {
     /// The optional maximum size of the topic.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: u8,
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.
@@ -72,7 +69,6 @@ pub struct Topic {
 /// - `size`: the total size of the topic.
 /// - `message_expiry`: the expiry of the messages in the topic.
 /// - `max_topic_size`: the maximum size of the topic.
-/// - `replication_factor`: replication factor for the topic.
 /// - `messages_count`: the total number of messages in the topic.
 /// - `partitions_count`: the total number of partitions in the topic.
 /// - `partitions`: the collection of partitions in the topic.
@@ -93,8 +89,6 @@ pub struct TopicDetails {
     /// The optional maximum size of the topic.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: u8,
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.

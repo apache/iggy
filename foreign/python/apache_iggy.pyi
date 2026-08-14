@@ -1009,7 +1009,6 @@ class IggyClient:
         name: builtins.str,
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
         segment_size: builtins.int | None = None,
@@ -1027,7 +1026,6 @@ class IggyClient:
             name: Topic name as `str`.
             partitions_count: Number of partitions as `int`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Accepted and ignored; no longer part of the protocol.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
             segment_size: Per-topic segment size in bytes as `int | None`.
@@ -1079,7 +1077,6 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
@@ -1094,7 +1091,6 @@ class IggyClient:
             topic_id: Topic identifier as `str | int`.
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Replication factor as `int | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
 
@@ -1983,11 +1979,6 @@ class Topic:
         r"""
         The maximum size of the topic.
         """
-    @property
-    def replication_factor(self) -> builtins.int:
-        r"""
-        Replication factor for the topic.
-        """
 
 @typing.final
 class TopicDetails:
@@ -2035,11 +2026,6 @@ class TopicDetails:
     def max_topic_size(self) -> MaxTopicSize:
         r"""
         The maximum size of the topic.
-        """
-    @property
-    def replication_factor(self) -> builtins.int:
-        r"""
-        Replication factor for the topic.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:

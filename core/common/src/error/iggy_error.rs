@@ -404,6 +404,8 @@ pub enum IggyError {
     UnsupportedOptionKey(String) = 4041,
     #[error("Invalid option value for key: {0}")]
     InvalidOptionValue(String) = 4042,
+    #[error("Options block exceeds its limits: {0}")]
+    OptionsBlockTooLarge(String) = 4043,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]

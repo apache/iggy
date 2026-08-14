@@ -45,7 +45,6 @@ struct TestTopicUpdateCmd {
     topic_new_compression_algorithm: CompressionAlgorithm,
     topic_new_message_expiry: Option<Vec<String>>,
     topic_new_max_size: MaxTopicSize,
-    topic_new_replication_factor: u8,
     using_stream_id: TestStreamId,
     using_topic_id: TestTopicId,
 }
@@ -64,7 +63,6 @@ impl TestTopicUpdateCmd {
         topic_new_compression_algorithm: CompressionAlgorithm,
         topic_new_message_expiry: Option<Vec<String>>,
         topic_new_max_size: MaxTopicSize,
-        topic_new_replication_factor: u8,
         using_stream_id: TestStreamId,
         using_topic_id: TestTopicId,
     ) -> Self {
@@ -80,7 +78,6 @@ impl TestTopicUpdateCmd {
             topic_new_compression_algorithm,
             topic_new_message_expiry,
             topic_new_max_size,
-            topic_new_replication_factor,
             using_stream_id,
             using_topic_id,
         }
@@ -100,13 +97,6 @@ impl TestTopicUpdateCmd {
         command.push(self.topic_new_name.clone());
         command.push(self.topic_new_compression_algorithm.to_string());
         command.push(format!("--max-topic-size={}", self.topic_new_max_size));
-
-        if self.topic_new_replication_factor != 1 {
-            command.push(format!(
-                "--replication-factor={}",
-                self.topic_new_replication_factor
-            ));
-        }
 
         if let Some(message_expiry) = &self.topic_new_message_expiry {
             command.extend(message_expiry.clone());
@@ -179,17 +169,16 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
         })
         .to_string();
 
-        let replication_factor = self.topic_new_replication_factor;
         let new_topic_name = &self.topic_new_name;
         let new_max_topic_size = self.topic_new_max_size.to_string();
 
         let expected_message = format!(
             "Executing update topic with ID: {topic_id}, name: {new_topic_name}, \
-                                message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: {new_max_topic_size}, \
-                                replication factor: {replication_factor}, in stream with ID: {stream_id}\n\
+                                message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: \
+                                {new_max_topic_size}, in stream with ID: {stream_id}\n\
                                 Topic with ID: {topic_id} updated name: {new_topic_name}, updated message expiry: {message_expiry}, \
-                                updated compression algorithm: {compression_algorithm}, updated max topic size: {new_max_topic_size}, \
-                                updated replication factor: {replication_factor} in stream with ID: {stream_id}\n"
+                                updated compression algorithm: {compression_algorithm}, \
+                                updated max topic size: {new_max_topic_size} in stream with ID: {stream_id}\n"
         );
 
         command_state.success().stdout(diff(expected_message));
@@ -254,7 +243,6 @@ pub async fn should_be_successful() {
             CompressionAlgorithm::Gzip,
             None,
             MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").unwrap()),
-            1,
             TestStreamId::Named,
             TestTopicId::Named,
         ))
@@ -272,7 +260,6 @@ pub async fn should_be_successful() {
             CompressionAlgorithm::Gzip,
             None,
             MaxTopicSize::Unlimited,
-            1,
             TestStreamId::Named,
             TestTopicId::Named,
         ))
@@ -340,17 +327,6 @@ Options:
 {CLAP_INDENT}
           [default: server_default]
 
-  -r, --replication-factor <REPLICATION_FACTOR>
-          New replication factor for the topic
-{CLAP_INDENT}
-          [default: 1]
-
-      --set <KEY=VALUE>
-          Additional topic option as key=value, repeatable
-{CLAP_INDENT}
-          Only keys an update may change are accepted; the create-time knobs are
-          rejected with the key name. Discover them with the options catalog.
-
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -380,10 +356,8 @@ Arguments:
   [MESSAGE_EXPIRY]...      New message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -m, --max-topic-size <MAX_TOPIC_SIZE>          New max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-  -r, --replication-factor <REPLICATION_FACTOR>  New replication factor for the topic [default: 1]
-      --set <KEY=VALUE>                          Additional topic option as key=value, repeatable
-  -h, --help                                     Print help (see more with '--help')
+  -m, --max-topic-size <MAX_TOPIC_SIZE>  New max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
+  -h, --help                             Print help (see more with '--help')
 "#,
             ),
         ))

@@ -82,9 +82,6 @@ pub struct CreateTopic {
     #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
     pub compression_algorithm: Option<String>,
 
-    #[schemars(description = "replication factor (optional, must be greater than 0)")]
-    pub replication_factor: Option<u8>,
-
     #[schemars(description = "message expiry (optional)")]
     pub message_expiry: Option<String>,
 
@@ -105,9 +102,6 @@ pub struct UpdateTopic {
 
     #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
     pub compression_algorithm: Option<String>,
-
-    #[schemars(description = "replication factor (optional, must be greater than 0)")]
-    pub replication_factor: Option<u8>,
 
     #[schemars(description = "message expiry (optional)")]
     pub message_expiry: Option<String>,

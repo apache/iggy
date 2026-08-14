@@ -31,7 +31,6 @@ import (
 //operations
 
 func successfullyCreateTopic(streamId uint32, client iggcon.Client) (uint32, string) {
-	replicationFactor := uint8(1)
 	name := createRandomString(128)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topic, err := client.CreateTopic(
@@ -41,8 +40,7 @@ func successfullyCreateTopic(streamId uint32, client iggcon.Client) (uint32, str
 		2,
 		1,
 		0,
-		math.MaxUint64,
-		&replicationFactor)
+		math.MaxUint64)
 
 	itShouldSuccessfullyCreateTopic(streamId, topic.Id, name, client)
 	itShouldNotReturnError(err)

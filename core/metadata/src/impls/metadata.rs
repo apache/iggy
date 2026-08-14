@@ -823,14 +823,23 @@ where
             journal_gate: LocalGate::new(),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
-            default_max_topic_size: Cell::new(u64::MAX),
-            default_message_expiry: Cell::new(u64::MAX),
-            default_segment_size: Cell::new(1024 * 1024 * 1024),
-            max_topic_segment_size: Cell::new(1024 * 1024 * 1024),
-            default_enforce_fsync: Cell::new(false),
-            default_messages_required_to_save: Cell::new(1000),
-            default_size_of_messages_required_to_save: Cell::new(1024 * 1024),
-            default_preallocate_segments: Cell::new(true),
+            // Seeded from the shared constants, not from literals: a node that
+            // never reaches `set_partition_runtime_defaults` (simulator, unit
+            // tests) still derives the documented defaults. Drifting from them
+            // here re-arms preallocation, which reserves a whole segment per
+            // partition on a `fallocate` that now runs inline on the shard.
+            default_max_topic_size: Cell::new(iggy_common::DEFAULT_MAX_TOPIC_SIZE),
+            default_message_expiry: Cell::new(iggy_common::DEFAULT_MESSAGE_EXPIRY),
+            default_segment_size: Cell::new(iggy_common::DEFAULT_SEGMENT_SIZE),
+            max_topic_segment_size: Cell::new(iggy_common::DEFAULT_SEGMENT_SIZE),
+            default_enforce_fsync: Cell::new(iggy_common::DEFAULT_ENFORCE_FSYNC),
+            default_messages_required_to_save: Cell::new(
+                iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            default_size_of_messages_required_to_save: Cell::new(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            default_preallocate_segments: Cell::new(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
         }
@@ -3449,7 +3458,7 @@ where
                             .preallocate_segments
                             .unwrap_or_else(|| self.default_preallocate_segments.get()),
                     },
-                );
+                )?;
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)

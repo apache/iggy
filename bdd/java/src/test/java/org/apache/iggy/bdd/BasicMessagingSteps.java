@@ -108,7 +108,6 @@ public class BasicMessagingSteps {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         topicName);
 
         context.lastTopicId = topic.id();

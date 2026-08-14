@@ -126,7 +126,6 @@ impl IggyClient {
     /// Creates a topic.
     ///
     /// Every option left null resolves against the server default at admission.
-    /// `replication_factor` rides the options block rather than a fixed field.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -134,7 +133,6 @@ impl IggyClient {
         name: String,
         partitions_count: u32,
         compression_algorithm: Option<String>,
-        replication_factor: Option<u8>,
         message_expiry_micros: Option<u64>,
         max_topic_size: Option<u64>,
         segment_size: Option<u64>,
@@ -168,7 +166,6 @@ impl IggyClient {
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
             preallocate_segments,
-            replication_factor,
             ..TopicCreateOptions::default()
         };
 

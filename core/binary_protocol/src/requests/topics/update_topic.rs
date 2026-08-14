@@ -29,9 +29,7 @@ use bytes::{BufMut, BytesMut};
 ///  [message_expiry:u64_le][max_topic_size:u64_le][name_len:u8][name:N][options TLV to end]`
 ///
 /// The options block mirrors `CreateTopic`'s and carries the same catalog, so
-/// a knob added there is updatable here without another layout change. It
-/// replaced the `replication_factor:u8` that used to sit before the name:
-/// nothing ever read that byte, and as an option it costs nothing when unset.
+/// a knob added there is updatable here without another layout change.
 ///
 /// Keys absent from the block are LEFT ALONE rather than reset to their
 /// defaults. A client built before a key existed cannot send it, so treating
@@ -107,7 +105,7 @@ mod tests {
 
     fn sample_options() -> WireOptions {
         let mut buf = BytesMut::new();
-        encode_user_headers(&[(2, b"replication_factor", 9, &[3u8])], &mut buf);
+        encode_user_headers(&[(2, b"future_option", 9, &[3u8])], &mut buf);
         WireOptions::from_bytes(buf.freeze()).unwrap()
     }
 

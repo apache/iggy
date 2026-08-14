@@ -104,7 +104,11 @@ impl WireDecode for CreateTopicWithAssignmentsRequest {
 
         let partitions_count = read_u32_le(buf, derived_end)? as usize;
         let mut offset = derived_end + 4;
-        let mut partitions = Vec::with_capacity(partitions_count);
+        let mut partitions = Vec::with_capacity(crate::codec::bounded_capacity(
+            partitions_count,
+            buf.len().saturating_sub(offset),
+            CreatedPartitionAssignment::ENCODED_SIZE,
+        ));
         for _ in 0..partitions_count {
             let (partition, consumed) = CreatedPartitionAssignment::decode(&buf[offset..])?;
             offset += consumed;

@@ -473,7 +473,6 @@ impl IggyClient {
     ///     name: Topic name as `str`.
     ///     partitions_count: Number of partitions as `int`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
-    ///     replication_factor: Replication factor, sent as a topic option.
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///     segment_size: Per-topic segment size in bytes as `int | None`.
@@ -494,7 +493,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -506,9 +505,6 @@ impl IggyClient {
         partitions_count: u32,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
             String,
-        >,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
-            u8,
         >,
         #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
             &IggyExpiry,
@@ -545,7 +541,6 @@ impl IggyClient {
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
             preallocate_segments,
-            replication_factor,
             raw: options.unwrap_or_default(),
         };
 
@@ -622,7 +617,6 @@ impl IggyClient {
     ///     topic_id: Topic identifier as `str | int`.
     ///     name: New topic name as `str`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
-    ///     replication_factor: Replication factor as `int | None`.
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///
@@ -633,7 +627,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
+        signature = (stream_id, topic_id, name, compression_algorithm = None, message_expiry = None, max_topic_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -645,9 +639,6 @@ impl IggyClient {
         name: String,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
             String,
-        >,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
-            u8,
         >,
         #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
             &IggyExpiry,
@@ -662,10 +653,7 @@ impl IggyClient {
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
-        let update_options = TopicUpdateOptions {
-            replication_factor,
-            ..TopicUpdateOptions::default()
-        };
+        let update_options = TopicUpdateOptions::default();
 
         future_into_py(py, async move {
             inner

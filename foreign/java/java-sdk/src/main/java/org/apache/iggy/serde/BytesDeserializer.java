@@ -147,8 +147,6 @@ public final class BytesDeserializer {
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         skipOptionsBlock(response, "topic explicit options");
         skipOptionsBlock(response, "topic derived options");
-        // The replication factor left the wire format; the model field stays
-        // for API compatibility and reports the only value a topic can have.
         return new Topic(
                 topicId,
                 createdAt,
@@ -157,7 +155,6 @@ public final class BytesDeserializer {
                 messageExpiry,
                 CompressionAlgorithm.fromCode(compressionAlgorithmCode),
                 maxTopicSize,
-                (short) 1,
                 messagesCount,
                 partitionsCount);
     }

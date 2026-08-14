@@ -219,11 +219,6 @@ impl Topic {
         self.inner.max_topic_size.into()
     }
 
-    /// Replication factor for the topic.
-    #[getter]
-    pub fn replication_factor(&self) -> u8 {
-        self.inner.replication_factor
-    }
 }
 
 #[gen_stub_pyclass]
@@ -295,12 +290,6 @@ impl TopicDetails {
     #[getter]
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.inner.max_topic_size.into()
-    }
-
-    /// Replication factor for the topic.
-    #[getter]
-    pub fn replication_factor(&self) -> u8 {
-        self.inner.replication_factor
     }
 
     /// The collection of partitions in the topic.

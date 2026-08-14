@@ -149,7 +149,15 @@ pub fn encode_options_prefixed(options: &WireOptions, buf: &mut BytesMut) {
 pub fn decode_options_prefixed(buf: &[u8], pos: usize) -> Result<(WireOptions, usize), WireError> {
     let length = crate::codec::read_u32_le(buf, pos)? as usize;
     let start = pos + 4;
-    let end = start + length;
+    // `checked_add`: on a 32-bit target a wire-supplied length wraps, the
+    // truncation guard below then passes, and the slice panics instead.
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset: start,
+            need: length,
+            have: buf.len().saturating_sub(start),
+        })?;
     if buf.len() < end {
         return Err(WireError::UnexpectedEof {
             offset: start,

@@ -43,7 +43,31 @@ pub struct OptionValue {
     pub explicit: bool,
 }
 
+/// Which provenance classes an encoded options block carries.
+///
+/// Responses split a resource's options into two blocks so `GetTopic` can say
+/// which values the client chose and which admission filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionsProvenance {
+    /// Every entry, whatever its provenance.
+    All,
+    /// Only the keys the client sent.
+    Explicit,
+    /// Only the keys admission resolved from server defaults.
+    Derived,
+}
+
 impl OptionValue {
+    /// Whether this entry belongs in a block encoded for `provenance`.
+    #[must_use]
+    pub const fn matches(&self, provenance: OptionsProvenance) -> bool {
+        match provenance {
+            OptionsProvenance::All => true,
+            OptionsProvenance::Explicit => self.explicit,
+            OptionsProvenance::Derived => !self.explicit,
+        }
+    }
+
     #[must_use]
     pub fn explicit(value: HeaderValue) -> Self {
         Self {
@@ -137,13 +161,6 @@ pub mod topic_option_keys {
     /// [`Self::SEGMENT_SIZE`] -- preallocation reserves exactly that much, so
     /// the two only make sense decided together.
     pub const PREALLOCATE_SEGMENTS: &str = "preallocate_segments";
-    /// Copies of the topic's data the cluster should keep: `Uint8` or a
-    /// decimal string. Stored and echoed back, but nothing acts on it yet --
-    /// replica placement is a cluster-level concern the server does not derive
-    /// from topics. It lives here rather than as a command field precisely
-    /// because of that: an option costs nothing on the wire when unset,
-    /// whereas the fixed byte it replaced rode every `UpdateTopic`.
-    pub const REPLICATION_FACTOR: &str = "replication_factor";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -181,9 +198,6 @@ pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[system.partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
-/// One copy. Was the `replication_factor` byte on the create/update commands,
-/// which every topic reported as `1` because nothing ever stored it.
-pub const DEFAULT_REPLICATION_FACTOR: u8 = 1;
 
 /// Every runtime knob at its default, for a partition built with no resolved
 /// topic options (simulator, unit tests).
@@ -315,13 +329,12 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
     topic_option_keys::MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::PREALLOCATE_SEGMENTS,
-    topic_option_keys::REPLICATION_FACTOR,
 ];
 
 /// The subset of [`TOPIC_OPTION_KEYS`] an `UpdateTopic` options block may
 /// carry.
 ///
-/// Deliberately narrow. Two separate reasons keep a key out:
+/// Empty. Two separate reasons keep every key out:
 ///
 /// * `compression_algorithm`, `message_expiry` and `max_topic_size` have
 ///   dedicated fixed fields on the update layout. Accepting them in the block
@@ -333,10 +346,7 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
 ///   topic is built. Nothing re-pushes them on update, so accepting one would
 ///   store a value the partitions never see -- a knob that reads as applied
 ///   and is not. They stay create-only until that propagation exists.
-///
-/// `replication_factor` is safe precisely because it is inert: it is stored
-/// and echoed, and no partition derives behaviour from it.
-pub const UPDATABLE_TOPIC_OPTION_KEYS: &[&str] = &[topic_option_keys::REPLICATION_FACTOR];
+pub const UPDATABLE_TOPIC_OPTION_KEYS: &[&str] = &[];
 
 /// Keys an `UpdateStream` options block may carry. Empty because streams have
 /// no catalog keys yet: the block exists so the first one costs a catalog
@@ -348,6 +358,14 @@ pub const UPDATABLE_STREAM_OPTION_KEYS: &[&str] = &[];
 /// [`UPDATABLE_STREAM_OPTION_KEYS`].
 pub const UPDATABLE_USER_OPTION_KEYS: &[&str] = &[];
 
+/// Longest key echoed back in an option error. A rejected key is attacker-sized
+/// by definition, and the error rides the wire back to the client.
+const ERROR_KEY_PREVIEW_LEN: usize = 64;
+
+fn key_preview(key: &str) -> String {
+    key.chars().take(ERROR_KEY_PREVIEW_LEN).collect()
+}
+
 /// Build an options map from string key-values, all marked explicit.
 ///
 /// Shared by the update-options types: their keys are all client-sent, so none
@@ -355,33 +373,33 @@ pub const UPDATABLE_USER_OPTION_KEYS: &[&str] = &[];
 /// also have typed fields insert those afterwards, so a typed value wins on
 /// collision and keeps its canonical kind.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when a key or value violates the header-field bounds (1..=255
-/// bytes); the wire validator rejects the same inputs immediately after.
-#[must_use]
-fn raw_options_map(raw: &BTreeMap<String, String>) -> ResourceOptions {
+/// `UnsupportedOptionKey` when a key is empty or over 255 bytes,
+/// `InvalidOptionValue` when a value is. Both bounds come from the
+/// header-field codec these entries ride.
+fn raw_options_map(raw: &BTreeMap<String, String>) -> Result<ResourceOptions, IggyError> {
     let mut options = ResourceOptions::new();
     for (key, value) in raw {
-        options.insert(
-            HeaderKey::from_str(key).expect("raw option key fits a header key"),
-            OptionValue::explicit(
-                HeaderValue::try_from(value.as_str())
-                    .expect("raw option value fits a header value"),
-            ),
-        );
+        let header_key = HeaderKey::from_str(key)
+            .map_err(|_| IggyError::UnsupportedOptionKey(key_preview(key)))?;
+        let header_value = HeaderValue::try_from(value.as_str())
+            .map_err(|_| IggyError::InvalidOptionValue(key_preview(key)))?;
+        options.insert(header_key, OptionValue::explicit(header_value));
     }
-    options
+    Ok(options)
 }
 
 /// Encode string key-values into an options block, all marked explicit.
 ///
-/// # Panics
+/// # Errors
 ///
 /// See [`raw_options_map`].
-#[must_use]
-fn raw_options_to_wire(raw: &BTreeMap<String, String>) -> WireOptions {
-    crate::wire_conversions::resource_options_to_wire(&raw_options_map(raw), false)
+fn raw_options_to_wire(raw: &BTreeMap<String, String>) -> Result<WireOptions, IggyError> {
+    crate::wire_conversions::resource_options_to_wire(
+        &raw_options_map(raw)?,
+        OptionsProvenance::All,
+    )
 }
 
 /// The options an `UpdateStream` may carry.
@@ -398,11 +416,10 @@ pub struct StreamUpdateOptions {
 impl StreamUpdateOptions {
     /// Encode the present keys into an options block.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// See [`raw_options_to_wire`].
-    #[must_use]
-    pub fn to_wire(&self) -> WireOptions {
+    pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
         raw_options_to_wire(&self.raw)
     }
 }
@@ -419,11 +436,10 @@ pub struct UserUpdateOptions {
 impl UserUpdateOptions {
     /// Encode the present keys into an options block.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// See [`raw_options_to_wire`].
-    #[must_use]
-    pub fn to_wire(&self) -> WireOptions {
+    pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
         raw_options_to_wire(&self.raw)
     }
 }
@@ -454,15 +470,14 @@ pub struct TopicRuntimeOptions {
 
 impl TopicRuntimeOptions {
     /// Derive the runtime knobs from a topic's persisted options map.
-    /// A map written by a build that knew an unknown key yields `None` for
-    /// every knob rather than failing the partition build: the partition then
-    /// runs on shard-wide config, which is the same degradation an older
-    /// build already accepts for a key it cannot interpret.
+    ///
+    /// Degrades per key, not per map. An entry this build cannot interpret
+    /// leaves its own knob unset and every other knob intact, so one key a
+    /// newer node wrote cannot silently drop a topic's `enforce_fsync` or
+    /// reset its segment size along with it.
     #[must_use]
     pub fn from_resource_options(options: &ResourceOptions) -> Self {
-        let Ok(parsed) = TopicCreateOptions::from_resource_options(options) else {
-            return Self::default();
-        };
+        let parsed = TopicCreateOptions::from_resource_options(options);
         Self {
             segment_size: parsed.segment_size,
             enforce_fsync: parsed.enforce_fsync,
@@ -482,33 +497,19 @@ impl TopicRuntimeOptions {
 /// value alone -- an update patches the option map, it does not replace it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicUpdateOptions {
-    /// Copies the cluster should keep. `0` is rejected.
-    pub replication_factor: Option<u8>,
     /// Keys sent as `String` values, for setting a key this build does not
     /// know yet. Still checked against the updatable set server-side.
     pub raw: BTreeMap<String, String>,
 }
 
 impl TopicUpdateOptions {
-    /// Encode the present keys into an options block, in canonical kinds.
+    /// Encode the present keys into an options block.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when a `raw` key or value violates the header-field bounds
-    /// (1..=255 bytes), matching [`TopicCreateOptions::to_wire`].
-    #[must_use]
-    pub fn to_wire(&self) -> WireOptions {
-        let mut options = raw_options_map(&self.raw);
-        if let Some(replication_factor) = self.replication_factor {
-            // Inserted after the raw entries so a typed field wins on
-            // collision, and in its canonical kind rather than as a string.
-            options.insert(
-                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
-                    .expect("catalog key is a valid header key"),
-                OptionValue::explicit(HeaderValue::from(replication_factor)),
-            );
-        }
-        crate::wire_conversions::resource_options_to_wire(&options, false)
+    /// See [`raw_options_to_wire`].
+    pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
+        raw_options_to_wire(&self.raw)
     }
 }
 
@@ -544,15 +545,11 @@ pub struct TopicCreateOptions {
     /// Whether this topic's segments reserve their bytes on open; `None`
     /// resolves against [`DEFAULT_PREALLOCATE_SEGMENTS`].
     pub preallocate_segments: Option<bool>,
-    /// Copies the cluster should keep; `None` resolves against
-    /// [`DEFAULT_REPLICATION_FACTOR`]. Stored and echoed, not yet acted on.
-    /// `0` is rejected.
-    pub replication_factor: Option<u8>,
-    /// Additional keys sent as `String` values, parsed server-side via the
-    /// same rules as config-file values. Lets a client set a key this
-    /// build's typed fields do not know yet (e.g. CLI `--set key=value`
-    /// against a newer server). A typed field wins over a raw entry for the
-    /// same key. Client-side only: [`Self::parse`] never populates it.
+    /// String-valued keys with no typed field above, parsed server-side
+    /// through each key's `FromStr`. Lets a client reach a key added to the
+    /// server catalog after this build shipped. Outbound only: a typed field
+    /// wins on collision in [`Self::to_wire`], and [`Self::parse`] never
+    /// populates it.
     pub raw: BTreeMap<String, String>,
 }
 
@@ -569,15 +566,57 @@ impl TopicCreateOptions {
         for entry in options {
             // Wire validation already enforced UTF-8 string keys.
             let key = String::from_utf8_lossy(entry.key);
-            parsed.absorb(&entry, &key)?;
+            parsed.absorb(&entry, &key, UnknownEntry::Reject)?;
         }
         Ok(parsed)
     }
 
-    /// Fold one catalog entry into `self`. Shared by [`Self::parse`] (wire
-    /// block) and [`Self::from_resource_options`] (persisted map) so both
-    /// enforce the identical key set, kinds, and value bounds.
-    fn absorb(&mut self, entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<(), IggyError> {
+    /// Parse a block that is already COMMITTED, skipping what this build
+    /// cannot interpret.
+    ///
+    /// Admission gated the block against the catalog on the primary, once.
+    /// Re-running that gate at apply would make the verdict depend on the
+    /// build running it, so a replica that predates a key would reject an
+    /// operation its peers accepted and diverge from the group permanently.
+    /// The catalog belongs at the edge; apply only reads what it knows.
+    #[must_use]
+    pub fn parse_committed(options: &WireOptions) -> Self {
+        let mut parsed = Self::default();
+        for entry in options {
+            let key = String::from_utf8_lossy(entry.key);
+            // Infallible: `Skip` turns every parse error into a no-op.
+            let _ = parsed.absorb(&entry, &key, UnknownEntry::Skip);
+        }
+        parsed
+    }
+
+    /// Fold one catalog entry into `self`, applying `unknown` to an entry this
+    /// build cannot interpret. Shared by [`Self::parse`] (wire block) and
+    /// [`Self::from_resource_options`] (persisted map) so both read the
+    /// identical key set, kinds, and value bounds, and differ only in what
+    /// they do with an entry outside it.
+    fn absorb(
+        &mut self,
+        entry: &WireUserHeaderEntry<'_>,
+        key: &str,
+        unknown: UnknownEntry,
+    ) -> Result<(), IggyError> {
+        // Every arm assigns only after its parse succeeds, so a skipped entry
+        // leaves `self` exactly as it found it.
+        match self.absorb_strict(entry, key) {
+            Ok(()) => Ok(()),
+            Err(error) => match unknown {
+                UnknownEntry::Reject => Err(error),
+                UnknownEntry::Skip => Ok(()),
+            },
+        }
+    }
+
+    fn absorb_strict(
+        &mut self,
+        entry: &WireUserHeaderEntry<'_>,
+        key: &str,
+    ) -> Result<(), IggyError> {
         let parsed = self;
         {
             match key {
@@ -616,13 +655,6 @@ impl TopicCreateOptions {
                 topic_option_keys::PREALLOCATE_SEGMENTS => {
                     parsed.preallocate_segments = Some(parse_bool(entry, key)?);
                 }
-                topic_option_keys::REPLICATION_FACTOR => {
-                    let factor = parse_u8(entry, key)?;
-                    if factor == 0 {
-                        return Err(IggyError::InvalidOptionValue(key.to_string()));
-                    }
-                    parsed.replication_factor = Some(factor);
-                }
                 _ => return Err(IggyError::UnsupportedOptionKey(key.to_string())),
             }
         }
@@ -632,23 +664,14 @@ impl TopicCreateOptions {
     /// Encode the present keys into a client options block, in canonical
     /// kinds. The client-side counterpart of [`Self::parse`].
     ///
-    /// # Panics
+    /// A typed field is inserted after the raw entries, so it wins on
+    /// collision and keeps its canonical kind.
     ///
-    /// Panics when a `raw` key or value violates the header-field bounds
-    /// (1..=255 bytes); CLI-grade inputs are expected to be validated by the
-    /// wire layer right after encoding anyway.
-    #[must_use]
-    pub fn to_wire(&self) -> WireOptions {
-        let mut options = ResourceOptions::new();
-        for (key, value) in &self.raw {
-            options.insert(
-                HeaderKey::from_str(key).expect("raw option key fits a header key"),
-                OptionValue::explicit(
-                    HeaderValue::try_from(value.as_str())
-                        .expect("raw option value fits a header value"),
-                ),
-            );
-        }
+    /// # Errors
+    ///
+    /// See [`raw_options_map`].
+    pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
+        let mut options = raw_options_map(&self.raw)?;
         if let Some(compression_algorithm) = self.compression_algorithm {
             options.insert(
                 HeaderKey::from_str(topic_option_keys::COMPRESSION_ALGORITHM)
@@ -708,27 +731,70 @@ impl TopicCreateOptions {
                 OptionValue::explicit(HeaderValue::from(preallocate_segments)),
             );
         }
-        if let Some(replication_factor) = self.replication_factor {
+        crate::wire_conversions::resource_options_to_wire(&options, OptionsProvenance::All)
+    }
+
+    /// Render the present keys as string key-values, for a transport that
+    /// carries options as a JSON object instead of a TLV block.
+    ///
+    /// `compression_algorithm`, `message_expiry` and `max_topic_size` are left
+    /// out: the JSON body has dedicated fields for those three, and sending
+    /// both would be the two-sources-for-one-setting the update path refuses.
+    /// The rest ride as strings and are parsed server-side by the same
+    /// `FromStr` rules a config file value goes through, so a typed field
+    /// survives the round trip rather than being silently dropped.
+    #[must_use]
+    pub fn to_string_options(&self) -> BTreeMap<String, String> {
+        // Typed fields are inserted over the raw entries, matching the
+        // collision rule `to_wire` applies.
+        let mut options = self.raw.clone();
+        if let Some(segment_size) = self.segment_size {
             options.insert(
-                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
-                    .expect("catalog key is a valid header key"),
-                OptionValue::explicit(HeaderValue::from(replication_factor)),
+                topic_option_keys::SEGMENT_SIZE.to_owned(),
+                segment_size.as_bytes_u64().to_string(),
             );
         }
-        crate::wire_conversions::resource_options_to_wire(&options, false)
+        if let Some(enforce_fsync) = self.enforce_fsync {
+            options.insert(
+                topic_option_keys::ENFORCE_FSYNC.to_owned(),
+                enforce_fsync.to_string(),
+            );
+        }
+        if let Some(messages_required_to_save) = self.messages_required_to_save {
+            options.insert(
+                topic_option_keys::MESSAGES_REQUIRED_TO_SAVE.to_owned(),
+                messages_required_to_save.to_string(),
+            );
+        }
+        if let Some(size_of_messages) = self.size_of_messages_required_to_save {
+            options.insert(
+                topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE.to_owned(),
+                size_of_messages.as_bytes_u64().to_string(),
+            );
+        }
+        if let Some(preallocate_segments) = self.preallocate_segments {
+            options.insert(
+                topic_option_keys::PREALLOCATE_SEGMENTS.to_owned(),
+                preallocate_segments.to_string(),
+            );
+        }
+        options
     }
 
     /// Encode the resolved values for every key the client did NOT send into
     /// a derived-options wire block, in canonical kinds. `partitions_count`
     /// is never included: it is consumed at admission.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::wire_conversions::resource_options_to_wire`].
     pub fn derived_block(
         &self,
         compression_algorithm: CompressionAlgorithm,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
         runtime_defaults: TopicRuntimeDefaults,
-    ) -> iggy_binary_protocol::WireOptions {
+    ) -> Result<WireOptions, IggyError> {
         let mut derived = ResourceOptions::new();
         if self.compression_algorithm.is_none() {
             derived.insert(
@@ -797,16 +863,7 @@ impl TopicCreateOptions {
                 OptionValue::derived(HeaderValue::from(runtime_defaults.preallocate_segments)),
             );
         }
-        if self.replication_factor.is_none() {
-            // Not a `TopicRuntimeDefaults` member: no node-local config backs
-            // it, so every replica derives the same constant.
-            derived.insert(
-                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
-                    .expect("catalog key is a valid header key"),
-                OptionValue::derived(HeaderValue::from(DEFAULT_REPLICATION_FACTOR)),
-            );
-        }
-        crate::wire_conversions::resource_options_to_wire(&derived, false)
+        crate::wire_conversions::resource_options_to_wire(&derived, OptionsProvenance::All)
     }
 
     /// Parse a topic's PERSISTED options map (explicit plus admission-derived
@@ -816,12 +873,13 @@ impl TopicCreateOptions {
     /// nothing on the STM `Topic` duplicates it per key, so a new key costs
     /// one catalog entry rather than one field on every stored type.
     ///
-    /// # Errors
-    ///
-    /// Same contract as [`Self::parse`]. A persisted map is only ever written
-    /// by admission, so an error here means state written by a build that
-    /// knew a key this one does not.
-    pub fn from_resource_options(options: &ResourceOptions) -> Result<Self, IggyError> {
+    /// Infallible by design. A persisted map can hold keys a newer build
+    /// wrote, and refusing the whole map for one of them is what would make
+    /// this replica read a topic differently from the node that stored it.
+    /// Unreadable entries are skipped; their knobs stay unset and resolve
+    /// against shard-wide config exactly as an absent key does.
+    #[must_use]
+    pub fn from_resource_options(options: &ResourceOptions) -> Self {
         let mut parsed = Self::default();
         for (key, option) in options {
             let key = String::from_utf8_lossy(key.as_bytes());
@@ -831,10 +889,60 @@ impl TopicCreateOptions {
                 value_kind: iggy_binary_protocol::WireHeaderKind(option.value.kind().as_code()),
                 value: option.value.as_bytes(),
             };
-            parsed.absorb(&entry, &key)?;
+            // Infallible: `Skip` turns every parse error into a no-op.
+            let _ = parsed.absorb(&entry, &key, UnknownEntry::Skip);
         }
-        Ok(parsed)
+        parsed
     }
+}
+
+/// The option entries mirroring the three settings `UpdateTopic` carries as
+/// fixed fields of the command rather than as option keys.
+///
+/// An update writes both, so the stored map has to be rewritten alongside the
+/// typed fields; leaving it alone makes `GetTopic` report the new expiry in
+/// its field and the create-time one under `options`, with no way to tell
+/// which is in force.
+#[must_use]
+pub fn topic_field_options(
+    compression_algorithm: CompressionAlgorithm,
+    message_expiry: IggyExpiry,
+    max_topic_size: MaxTopicSize,
+) -> ResourceOptions {
+    ResourceOptions::from([
+        (
+            HeaderKey::from_str(topic_option_keys::COMPRESSION_ALGORITHM)
+                .expect("catalog key is a valid header key"),
+            OptionValue::explicit(
+                HeaderValue::try_from(compression_algorithm.to_string().as_str())
+                    .expect("compression name fits a header value"),
+            ),
+        ),
+        (
+            HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY)
+                .expect("catalog key is a valid header key"),
+            OptionValue::explicit(HeaderValue::from(u64::from(message_expiry))),
+        ),
+        (
+            HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE)
+                .expect("catalog key is a valid header key"),
+            OptionValue::explicit(HeaderValue::from(u64::from(max_topic_size))),
+        ),
+    ])
+}
+
+/// What a parse does with an entry this build cannot interpret: a key outside
+/// [`TOPIC_OPTION_KEYS`], or a catalog key whose value kind or payload does
+/// not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownEntry {
+    /// Refuse the block. Used at admission, where the client is present to be
+    /// told which key it got wrong, and where the catalog gate belongs.
+    Reject,
+    /// Leave the knob unset and keep going. Used when reading state a newer
+    /// build wrote, where refusing would diverge this replica from the group
+    /// over a key it merely cannot read.
+    Skip,
 }
 
 fn parse_u32(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u32, IggyError> {
@@ -886,24 +994,6 @@ fn parse_byte_size(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u64, Ig
     parse_u64_or(entry, key, |text| {
         IggyByteSize::from_str(text).map(|size| size.as_bytes_u64())
     })
-}
-
-/// `Bool` verbatim, or the strings `true` / `false`.
-fn parse_u8(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u8, IggyError> {
-    if entry.value_kind.0 == HeaderKind::Uint8.as_code() {
-        return entry
-            .value
-            .first()
-            .copied()
-            .ok_or_else(|| IggyError::InvalidOptionValue(key.to_string()));
-    }
-    if entry.value_kind.0 == HeaderKind::String.as_code() {
-        return std::str::from_utf8(entry.value)
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .ok_or_else(|| IggyError::InvalidOptionValue(key.to_string()));
-    }
-    Err(IggyError::InvalidOptionValue(key.to_string()))
 }
 
 fn parse_bool(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<bool, IggyError> {
@@ -960,11 +1050,10 @@ mod tests {
             messages_required_to_save: Some(500),
             size_of_messages_required_to_save: Some(IggyByteSize::from(2_097_152u64)),
             preallocate_segments: Some(false),
-            replication_factor: Some(3),
             partitions_count: None,
             raw: BTreeMap::new(),
         };
-        let parsed = TopicCreateOptions::parse(&options.to_wire()).unwrap();
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(parsed, options);
     }
 
@@ -977,14 +1066,14 @@ mod tests {
             partitions_count: Some(7),
             ..TopicCreateOptions::default()
         };
-        assert!(options.to_wire().is_empty());
+        assert!(options.to_wire().unwrap().is_empty());
         // ...and the key is rejected if a client hand-rolls it into the block.
         let raw = TopicCreateOptions {
             raw: BTreeMap::from([("partitions_count".to_string(), "7".to_string())]),
             ..TopicCreateOptions::default()
         };
         assert_eq!(
-            TopicCreateOptions::parse(&raw.to_wire()),
+            TopicCreateOptions::parse(&raw.to_wire().unwrap()),
             Err(IggyError::UnsupportedOptionKey(
                 "partitions_count".to_string()
             ))
@@ -1031,7 +1120,7 @@ mod tests {
             segment_size: Some(IggyByteSize::from(0u64)),
             ..TopicCreateOptions::default()
         };
-        let parsed = TopicCreateOptions::parse(&options.to_wire()).unwrap();
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(parsed.message_expiry, None);
         assert_eq!(parsed.max_topic_size, None);
         assert_eq!(parsed.segment_size, None);
@@ -1048,7 +1137,8 @@ mod tests {
         // What admission persists: the client block merged with derived
         // defaults, keyed by HeaderKey. The channel reads exactly this.
         let persisted =
-            crate::wire_conversions::resource_options_from_wire(&options.to_wire(), true).unwrap();
+            crate::wire_conversions::resource_options_from_wire(&options.to_wire().unwrap(), true)
+                .unwrap();
         let runtime = TopicRuntimeOptions::from_resource_options(&persisted);
         assert_eq!(runtime.segment_size, Some(IggyByteSize::from(2_097_152u64)));
         assert_eq!(runtime.enforce_fsync, Some(true));
@@ -1063,7 +1153,7 @@ mod tests {
             raw: BTreeMap::from([("enforce_fsync".to_string(), "false".to_string())]),
             ..TopicCreateOptions::default()
         };
-        let parsed = TopicCreateOptions::parse(&options.to_wire()).unwrap();
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(parsed.enforce_fsync, Some(true));
     }
 
@@ -1077,7 +1167,7 @@ mod tests {
             ..TopicCreateOptions::default()
         };
         assert_eq!(
-            TopicCreateOptions::parse(&options.to_wire()),
+            TopicCreateOptions::parse(&options.to_wire().unwrap()),
             Err(IggyError::UnsupportedOptionKey(
                 "prepare_queue_depth".to_string()
             ))
@@ -1095,7 +1185,7 @@ mod tests {
             ]),
             ..TopicCreateOptions::default()
         };
-        let parsed = TopicCreateOptions::parse(&options.to_wire()).unwrap();
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(
             parsed.segment_size,
             Some(IggyByteSize::from(134_217_728u64))
@@ -1117,7 +1207,7 @@ mod tests {
             ]),
             ..TopicCreateOptions::default()
         };
-        let parsed = TopicCreateOptions::parse(&options.to_wire()).unwrap();
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(parsed.message_expiry, Some(IggyExpiry::from(5_000_000u64)));
         assert_eq!(
             parsed.compression_algorithm,

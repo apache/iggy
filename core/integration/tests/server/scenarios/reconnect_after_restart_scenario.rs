@@ -46,12 +46,7 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .producer(STREAM_NAME, TOPIC_NAME)
         .expect("Failed to create producer builder")
         .create_stream_if_not_exists()
-        .create_topic_if_not_exists(
-            1,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
+        .create_topic_if_not_exists(1, IggyExpiry::NeverExpire, MaxTopicSize::ServerDefault)
         .send_retries(Some(10), Some(IggyDuration::from_str("2s").unwrap()))
         .build();
 

@@ -27,7 +27,6 @@ const (
 	topicOptionCompressionAlgorithm = "compression_algorithm"
 	topicOptionMessageExpiry        = "message_expiry"
 	topicOptionMaxTopicSize         = "max_topic_size"
-	topicOptionReplicationFactor    = "replication_factor"
 )
 
 type CreateTopic struct {
@@ -37,9 +36,6 @@ type CreateTopic struct {
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
 	Name                 string                      `json:"name"`
-	// ReplicationFactor rides the trailing options block rather than a fixed
-	// field of the command.
-	ReplicationFactor *uint8 `json:"replicationFactor"`
 }
 
 func (t *CreateTopic) Code() Code {
@@ -79,17 +75,7 @@ func (t *CreateTopic) options() []iggcon.HeaderEntry {
 	if t.MaxTopicSize != 0 {
 		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
 	}
-	if t.ReplicationFactor != nil {
-		options = append(options, uint8Option(topicOptionReplicationFactor, *t.ReplicationFactor))
-	}
 	return options
-}
-
-func uint8Option(key string, value uint8) iggcon.HeaderEntry {
-	return iggcon.HeaderEntry{
-		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
-		Value: iggcon.HeaderValue{Kind: iggcon.Uint8, Value: []byte{value}},
-	}
 }
 
 func uint64Option(key string, value uint64) iggcon.HeaderEntry {
@@ -152,9 +138,6 @@ type UpdateTopic struct {
 	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
-	// ReplicationFactor rides the trailing options block rather than a fixed
-	// field of the command.
-	ReplicationFactor *uint8 `json:"replicationFactor"`
 	Name              string `json:"name"`
 }
 
@@ -166,9 +149,6 @@ func (u *UpdateTopic) Code() Code {
 // are allowed; the server rejects the create-time knobs by name.
 func (u *UpdateTopic) options() []iggcon.HeaderEntry {
 	var options []iggcon.HeaderEntry
-	if u.ReplicationFactor != nil {
-		options = append(options, uint8Option(topicOptionReplicationFactor, *u.ReplicationFactor))
-	}
 	return options
 }
 

@@ -71,7 +71,6 @@ type Client interface {
 		compressionAlgorithm CompressionAlgorithm,
 		messageExpiry Duration,
 		maxTopicSize uint64,
-		replicationFactor *uint8,
 	) (*TopicDetails, error)
 
 	// UpdateTopic update a topic by unique ID or name.
@@ -84,7 +83,6 @@ type Client interface {
 		compressionAlgorithm CompressionAlgorithm,
 		messageExpiry Duration,
 		maxTopicSize uint64,
-		replicationFactor *uint8,
 	) error
 
 	// DeleteTopic delete a topic by unique ID or name.

@@ -44,7 +44,7 @@ import java.util.concurrent.CompletableFuture;
  * // Create a topic with 3 partitions and no message expiry
  * topics.createTopic(
  *         StreamId.of(1L), 3L, CompressionAlgorithm.none(),
- *         BigInteger.ZERO, BigInteger.ZERO, Optional.empty(), "events")
+ *         BigInteger.ZERO, BigInteger.ZERO, "events")
  *     .thenAccept(details -> System.out.println("Topic created: " + details.name()));
  *
  * // List all topics in a stream
@@ -92,7 +92,6 @@ public interface TopicsClient {
      *                             means messages never expire
      * @param maxTopicSize         maximum topic size in bytes; {@link BigInteger#ZERO}
      *                             means unlimited
-     * @param replicationFactor    optional replication factor for the topic; if empty,
      *                             the server default is used
      * @param name                 the topic name (must be unique within the stream)
      * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
@@ -105,7 +104,6 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name);
 
     /**
@@ -119,7 +117,6 @@ public interface TopicsClient {
      * @param compressionAlgorithm the new compression algorithm
      * @param messageExpiry        the new message expiry in microseconds
      * @param maxTopicSize         the new maximum topic size in bytes
-     * @param replicationFactor    optional new replication factor
      * @param name                 the new topic name
      * @return a {@link CompletableFuture} that completes when the update is done
      * @throws org.apache.iggy.exception.IggyException if the topic does not exist
@@ -130,7 +127,6 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
             String name);
 
     /**

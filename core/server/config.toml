@@ -502,8 +502,8 @@ path = "topics"
 #                      ("unlimited" when unset)
 #   message_expiry   - delete sealed segments older than this ("none" when unset)
 # Both policies can be active at once; the active segment is never touched.
-# Run `iggy topic describe-options` (or GET /options/topic) for the full
-# catalog with this server's defaults.
+# Call GET /options/topic (or the SDK's describe_options) for the full catalog
+# with this server's defaults.
 
 # Partition configuration
 [system.partition]

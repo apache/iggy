@@ -63,7 +63,7 @@ use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire_split};
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, ResourceOptions,
-    StreamStats, TopicCreateOptions, TopicStats,
+    StreamStats, TopicCreateOptions, TopicStats, topic_field_options,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::IggyNamespace;
@@ -1685,15 +1685,13 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
 
-        // Both blocks were validated and resolved at admission; a parse
-        // failure here means an unknown value kind reached a committed op,
-        // which commits as a deterministic rejection rather than a panic.
-        let (Ok(explicit), Ok(derived)) = (
-            TopicCreateOptions::parse(&self.request.options),
-            TopicCreateOptions::parse(&self.derived_options),
-        ) else {
-            return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
-        };
+        // Both blocks were validated and resolved at admission, so apply reads
+        // them leniently: a key this build does not know is skipped, not
+        // refused. Refusing would make the verdict depend on the build, and a
+        // replica that predates a key would then be missing a topic its peers
+        // committed.
+        let explicit = TopicCreateOptions::parse_committed(&self.request.options);
+        let derived = TopicCreateOptions::parse_committed(&self.derived_options);
         let (Ok(explicit_map), Ok(derived_map)) = (
             resource_options_from_wire(&self.request.options, true),
             resource_options_from_wire(&self.derived_options, false),
@@ -1771,7 +1769,9 @@ fn encode_create_topic_reply(name: &WireName, topic_id: usize, topic: &Topic) ->
     let Ok(partitions_count_u32) = u32::try_from(topic.partitions.len()) else {
         return Bytes::new();
     };
-    let (options, derived_options) = resource_options_to_wire_split(&topic.options);
+    let Ok((options, derived_options)) = resource_options_to_wire_split(&topic.options) else {
+        return Bytes::new();
+    };
     let header = TopicHeader {
         id: topic_id_u32,
         created_at: topic.created_at.into(),
@@ -1853,6 +1853,14 @@ impl StateHandler for UpdateTopicRequest {
             CompressionAlgorithm::from_code(self.compression_algorithm).unwrap_or_default();
         topic.message_expiry = IggyExpiry::from(self.message_expiry);
         topic.max_topic_size = MaxTopicSize::from(self.max_topic_size);
+        // The three settings the command carries as fixed fields are mirrored
+        // into the map, so a reader of `options` never sees a value the typed
+        // field has already moved past.
+        topic.options.extend(topic_field_options(
+            topic.compression_algorithm,
+            topic.message_expiry,
+            topic.max_topic_size,
+        ));
         // Patch, never replace: keys the client did not send keep their
         // current value, so a client that predates a key cannot erase it.
         topic.options.extend(updated_options);
@@ -2354,9 +2362,9 @@ mod tests {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
                 name: WireName::new("t").unwrap(),
-                options: explicit.to_wire(),
+                options: explicit.to_wire().unwrap(),
             },
-            derived_options: derived.to_wire(),
+            derived_options: derived.to_wire().unwrap(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,

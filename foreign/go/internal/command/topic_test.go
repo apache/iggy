@@ -56,7 +56,6 @@ func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
 
 func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier(uint32(1))
-	replicationFactor := uint8(3)
 	request := CreateTopic{
 		StreamId:             streamId,
 		Name:                 "topic",
@@ -64,7 +63,6 @@ func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 		CompressionAlgorithm: iggcon.CompressionAlgorithmGzip,
 		MessageExpiry:        100 * iggcon.Microsecond,
 		MaxTopicSize:         1 << 30,
-		ReplicationFactor:    &replicationFactor,
 	}
 
 	serialized, err := request.MarshalBinary()
@@ -92,8 +90,8 @@ func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 		byKey[string(entry.Key.Value)] = entry.Value
 	}
 
-	if len(byKey) != 4 {
-		t.Fatalf("expected 4 options, got %d: %v", len(byKey), byKey)
+	if len(byKey) != 3 {
+		t.Fatalf("expected 3 options, got %d: %v", len(byKey), byKey)
 	}
 	if _, found := byKey["partitions_count"]; found {
 		t.Error("partitions_count rides the fixed field, not the options block")
@@ -109,10 +107,6 @@ func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 	maxSize := byKey[topicOptionMaxTopicSize]
 	if maxSize.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(maxSize.Value) != 1<<30 {
 		t.Errorf("max_topic_size = %+v, want Uint64 %d", maxSize, 1<<30)
-	}
-	replication := byKey[topicOptionReplicationFactor]
-	if replication.Kind != iggcon.Uint8 || len(replication.Value) != 1 || replication.Value[0] != replicationFactor {
-		t.Errorf("replication_factor = %+v, want Uint8 %d", replication, replicationFactor)
 	}
 }
 

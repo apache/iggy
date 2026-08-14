@@ -44,7 +44,15 @@ use crate::stm::user::UsersSnapshot;
 /// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
 /// `namespace` word before it), which the client table's cached replies embed as raw
 /// wire bytes msgpack cannot introspect.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+///
+/// Version 3: `TopicSnapshot` dropped `replication_factor` from the middle of the
+/// struct and gained `options`. Both changes land in the same element count, so a
+/// version 2 file decoded under this shape does not fail cleanly: msgpack reads the
+/// old `replication_factor` byte as `message_expiry` and walks every later field one
+/// position out of place. The bump is what turns that into
+/// `UnsupportedFormatVersion` instead of an opaque deserializer error, or worse a
+/// silent misread.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -550,7 +558,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 2;
+        const PINNED_VERSION: u32 = 3;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -562,6 +570,60 @@ mod tests {
         assert_eq!(
             SNAPSHOT_FORMAT_VERSION, PINNED_VERSION,
             "SNAPSHOT_FORMAT_VERSION moved; confirm the shape moved with it"
+        );
+    }
+
+    #[test]
+    fn nested_snapshot_shapes_are_pinned_too() {
+        // The top-level count above is blind to everything under it, which is how
+        // `TopicSnapshot` once swapped a removed field for an added one and kept
+        // the same element count: a version 2 file then decoded field-by-field
+        // one position out of place instead of failing. The types the STM
+        // actually grows need their own pins.
+        const TOPIC_FIELD_COUNT: u32 = 11;
+        const STREAM_FIELD_COUNT: u32 = 6;
+
+        let topic = TopicSnapshot {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            message_expiry: IggyExpiry::default(),
+            compression_algorithm: CompressionAlgorithm::default(),
+            max_topic_size: MaxTopicSize::default(),
+            stats: StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+            partitions: Vec::new(),
+            consumer_groups: Vec::new(),
+            next_consumer_group_id: 0,
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&topic).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            TOPIC_FIELD_COUNT,
+            "TopicSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let stream = StreamSnapshot {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            stats: StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+            topics: Vec::new(),
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&stream).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            STREAM_FIELD_COUNT,
+            "StreamSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
     }
 

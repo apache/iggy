@@ -26,7 +26,6 @@ type CreateTopicRequest struct {
 	CompressionAlgorithm uint8         `json:"compressionAlgorithm"`
 	MessageExpiry        time.Duration `json:"messageExpiry"`
 	MaxTopicSize         uint64        `json:"maxTopicSize"`
-	ReplicationFactor    uint8         `json:"replicationFactor"`
 	Name                 string        `json:"name"`
 }
 
@@ -36,7 +35,6 @@ type UpdateTopicRequest struct {
 	CompressionAlgorithm uint8         `json:"compressionAlgorithm"`
 	MessageExpiry        time.Duration `json:"messageExpiry"`
 	MaxTopicSize         uint64        `json:"maxTopicSize"`
-	ReplicationFactor    uint8         `json:"replicationFactor"`
 	Name                 string        `json:"name"`
 }
 
@@ -48,7 +46,6 @@ type Topic struct {
 	MessageExpiry        Duration               `json:"messageExpiry"`
 	CompressionAlgorithm uint8                  `json:"compressionAlgorithm"`
 	MaxTopicSize         uint64                 `json:"maxTopicSize"`
-	ReplicationFactor    uint8                  `json:"replicationFactor"`
 	MessagesCount        uint64                 `json:"messagesCount"`
 	PartitionsCount      uint32                 `json:"partitionsCount"`
 	Options              map[string]HeaderValue `json:"options,omitempty"`

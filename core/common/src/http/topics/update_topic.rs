@@ -32,7 +32,6 @@ use std::collections::BTreeMap;
 /// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
 /// - `max_topic_size` - maximum size of the topic in bytes, if `Unlimited` then topic size is unlimited.
 ///   Can't be lower than segment size in the config.
-/// - `replication_factor` - replication factor, carried as a topic option.
 /// - `name` - unique topic name, max length is 255 characters.
 /// - `options` - additional option keys as strings; only keys the update path
 ///   accepts are allowed.
@@ -51,9 +50,6 @@ pub struct UpdateTopic {
     /// Max topic size, if `Unlimited` then topic size is unlimited.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic. Sent as a topic option rather than a
-    /// field of the update command.
-    pub replication_factor: Option<u8>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
     /// Additional topic options as string key-values. Restricted to the keys
@@ -70,7 +66,6 @@ impl Default for UpdateTopic {
             compression_algorithm: Default::default(),
             message_expiry: IggyExpiry::NeverExpire,
             max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: "topic".to_string(),
             options: BTreeMap::new(),
         }
@@ -81,12 +76,6 @@ impl Validatable<IggyError> for UpdateTopic {
     fn validate(&self) -> Result<(), IggyError> {
         if self.name.is_empty() || self.name.len() > MAX_NAME_LENGTH {
             return Err(IggyError::InvalidTopicName);
-        }
-
-        if let Some(replication_factor) = self.replication_factor
-            && replication_factor == 0
-        {
-            return Err(IggyError::InvalidReplicationFactor);
         }
 
         Ok(())

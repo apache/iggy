@@ -768,7 +768,8 @@ pub(in crate::http) async fn update_stream(
     let wire_options = StreamUpdateOptions {
         raw: command.options,
     }
-    .to_wire();
+    .to_wire()
+    .map_err(WriteError::Rejected)?;
     // Same pre-consensus gate the TCP ingress applies: a key this command may
     // not change is denied here by name rather than riding a log entry.
     validate_option_keys(&wire_options, UPDATABLE_STREAM_OPTION_KEYS)
@@ -846,7 +847,7 @@ pub(in crate::http) async fn create_topic(
     Json(command): Json<CreateTopic>,
 ) -> Result<Json<TopicDetails>, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    // Rejects empty/oversized name, partitions_count > MAX, replication_factor == Some(0).
+    // Rejects empty/oversized name and partitions_count > MAX.
     command.validate().map_err(WriteError::Rejected)?;
     let options = TopicCreateOptions {
         partitions_count: Some(command.partitions_count),
@@ -859,7 +860,7 @@ pub(in crate::http) async fn create_topic(
         raw: command.options,
         ..TopicCreateOptions::default()
     };
-    let wire_options = options.to_wire();
+    let wire_options = options.to_wire().map_err(WriteError::Rejected)?;
     // Re-parse the encoded block so `--set`-style raw string entries get the
     // same typed pre-consensus checks as native fields; unknown keys deny
     // here with the key name.
@@ -908,13 +909,12 @@ pub(in crate::http) async fn update_topic(
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
-    // Also rejects replication_factor == Some(0), which `WireName` cannot see.
     command.validate().map_err(WriteError::Rejected)?;
     let wire_options = TopicUpdateOptions {
-        replication_factor: command.replication_factor,
         raw: command.options,
     }
-    .to_wire();
+    .to_wire()
+    .map_err(WriteError::Rejected)?;
     // Same pre-consensus gate the TCP ingress applies: a key this command may
     // not change is denied here by name rather than riding a log entry.
     validate_option_keys(&wire_options, UPDATABLE_TOPIC_OPTION_KEYS)
@@ -1482,7 +1482,8 @@ pub(in crate::http) async fn update_user(
     let user_update_options = UserUpdateOptions {
         raw: command.options,
     }
-    .to_wire();
+    .to_wire()
+    .map_err(WriteError::Rejected)?;
     validate_option_keys(&user_update_options, UPDATABLE_USER_OPTION_KEYS)
         .map_err(WriteError::Rejected)?;
     let request = UpdateUserRequest {

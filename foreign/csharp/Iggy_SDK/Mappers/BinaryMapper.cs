@@ -934,7 +934,6 @@ internal static class BinaryMapper
             MessageExpiry = topic.MessageExpiry,
             MessagesCount = topic.MessagesCount,
             Size = topic.Size,
-            ReplicationFactor = topic.ReplicationFactor,
             MaxTopicSize = topic.MaxTopicSize,
             Partitions = partitions,
             Options = topic.Options,
@@ -971,8 +970,6 @@ internal static class BinaryMapper
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
                 MessageExpiry = DurationHelpers.FromDuration(messageExpiry),
-                // Replication factor is gone from the wire protocol.
-                ReplicationFactor = 1,
                 MaxTopicSize = maxTopicSize,
                 Options = options,
                 DerivedOptions = derivedOptions

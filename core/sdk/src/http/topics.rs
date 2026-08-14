@@ -77,12 +77,15 @@ impl TopicClient for HttpClient {
                     name: name.to_string(),
                     partitions_count: options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT),
                     compression_algorithm: options.compression_algorithm.unwrap_or_default(),
-                    replication_factor: None,
                     message_expiry: options.message_expiry.unwrap_or(IggyExpiry::ServerDefault),
                     max_topic_size: options
                         .max_topic_size
                         .unwrap_or(MaxTopicSize::ServerDefault),
-                    options: options.raw.clone(),
+                    // Carries the runtime knobs too, not just `raw`: this body
+                    // has no dedicated field for them, and dropping them here
+                    // gave one transport a topic without the fsync the caller
+                    // asked for while the other honored it.
+                    options: options.to_string_options(),
                 },
             )
             .await?;
@@ -112,7 +115,6 @@ impl TopicClient for HttpClient {
                 compression_algorithm,
                 message_expiry,
                 max_topic_size,
-                replication_factor: options.replication_factor,
                 options: options.raw.clone(),
             },
         )

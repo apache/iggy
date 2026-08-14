@@ -37,9 +37,6 @@ async fn main() -> Result<(), IggyError> {
         // The more clients are reading concurrently, the more partitions you should create.
         // i.e. if you have 10 clients, you should create 10 partitions
         .topic_partitions_count(10)
-        // Optionally, you can set the replication factor for topic redundancy.
-        // There is a tradeoff between replication factor and performance, so you want to benchmark your setup.
-        .topic_replication_factor(2)
         // The max number of messages to send in a batch. The greater the batch size, the higher the throughput for bulk data.
         // Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
         // Note, this only applies to batch send messages. Single messages are sent immediately.

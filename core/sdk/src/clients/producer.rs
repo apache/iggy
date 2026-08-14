@@ -94,10 +94,6 @@ pub struct ProducerCore {
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
-    // Accepted by the builder but ignored since CreateTopic stopped carrying
-    // replication_factor; kept so the public builder API stays stable.
-    #[allow(dead_code)]
-    topic_replication_factor: Option<u8>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     default_partitioning: Arc<Partitioning>,
@@ -497,7 +493,6 @@ impl IggyProducer {
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
         topic_partitions_count: u32,
-        topic_replication_factor: Option<u8>,
         topic_message_expiry: IggyExpiry,
         topic_max_size: MaxTopicSize,
         send_retries_count: Option<u32>,
@@ -518,7 +513,6 @@ impl IggyProducer {
             create_stream_if_not_exists,
             create_topic_if_not_exists,
             topic_partitions_count,
-            topic_replication_factor,
             topic_message_expiry,
             topic_max_size,
             default_partitioning: Arc::new(Partitioning::balanced()),

@@ -61,7 +61,6 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.sizeBytes, 4096n);
     assert.equal(topic.messagesCount, 12n);
     assert.equal(topic.name, 't');
-    assert.equal(topic.replicationFactor, 1);
     assert.deepEqual(topic.options, { message_expiry: 86_400_000_000n });
     assert.deepEqual(topic.derivedOptions, {
       compression_algorithm: 'gzip',
