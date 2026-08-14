@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared HTTP transport plumbing for the server-ng REST suites (`http_vsr`,
+//! Shared HTTP transport plumbing for the server REST suites (`http_vsr`,
 //! `http_rbac`): one authenticated `reqwest` session with the login-retry gate
 //! and the generic verb helpers. Each suite keeps its own request shapes and
 //! assertions as extension methods on [`HttpClient`], so the wire-contract and
@@ -38,7 +38,7 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One authenticated HTTP session against the test server's shard-0 listener: a
 /// `reqwest` client, the listener base URL, and the bearer to send. The bearer
-/// is either a login JWT or a raw personal access token (server-ng resolves
+/// is either a login JWT or a raw personal access token (the server resolves
 /// either on the `Authorization: Bearer` header).
 pub struct HttpClient {
     pub client: reqwest::Client,

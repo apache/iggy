@@ -267,7 +267,7 @@ impl Users {
             "root username length {length} outside {MIN_USERNAME_LENGTH}..={MAX_USERNAME_LENGTH}; fix IGGY_ROOT_USERNAME"
         );
 
-        // Boot-only invariant: server-ng calls this before listeners and
+        // Boot-only invariant: the server calls this before listeners and
         // consensus traffic start, on shard 0 initialization. The read/apply
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
@@ -571,7 +571,7 @@ impl StateHandler for ChangePasswordRequest {
         };
 
         // An empty `new_password` is the primary's signal that the caller's
-        // current password did not match (see server-ng
+        // current password did not match (see the server
         // `verify_and_rewrite_change_password`): the accept path always
         // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
         // here (rather than denying pre-consensus) commits the op as a no-op,
@@ -617,11 +617,21 @@ impl StateHandler for UpdatePermissionsRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. generated raw token from the
-// primary-side mint) instead of empty Bytes. The raw token is currently
-// generated only at the request-rewrite step on the primary and dropped;
-// surfacing it back to the client needs a side-channel out of
-// `maybe_rewrite_pat_request`.
+/// The success reply here is deliberately empty: the raw token the caller needs
+/// is the one thing this apply must never see.
+///
+/// The primary mints the raw token and its hash at ingress (server-ng
+/// `pat::rewrite_pat_request_for_user`) and replicates only the hash. Minting
+/// inside this apply would call `ring::rand` on every replica and diverge the
+/// token index, and replicating the raw token would persist a live credential in
+/// every WAL and snapshot. So the raw token leaves the primary by a side channel
+/// (`maybe_rewrite_pat_request` returns it alongside the rewritten request) and
+/// the home shard splices it into this op's reply as a typed
+/// `RawPersonalAccessTokenResponse` (server-ng `responses::build_raw_pat_reply`).
+///
+/// One consequence rides on that: the secret exists only on the wire of the
+/// original reply, so a replayed request cannot be served from the client-table
+/// cache. `impls::metadata::unreplayable_secret_refusal` refuses it instead.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
     fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {

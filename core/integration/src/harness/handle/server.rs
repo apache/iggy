@@ -92,15 +92,7 @@ impl std::fmt::Debug for ServerHandle {
 
 impl ServerHandle {
     fn default_server_binary() -> &'static str {
-        #[cfg(feature = "vsr")]
-        {
-            "iggy-server-ng"
-        }
-
-        #[cfg(not(feature = "vsr"))]
-        {
-            "iggy-server"
-        }
+        "iggy-server"
     }
 
     fn launched_binary(&self) -> String {
@@ -837,13 +829,9 @@ impl TestBinary for ServerHandle {
             // trusts (rcgen self-signed certs share the same subject DN), which
             // rustls rejects as `BadSignature`. Generate only when absent so all
             // nodes and clients share one keypair; this also keeps the
-            // certificate stable across a restart. The legacy single-node
-            // harness keeps its regenerate-per-start behavior.
-            #[cfg(feature = "vsr")]
+            // certificate stable across a restart.
             let should_generate = !(cert_dir.join("test_cert.pem").exists()
                 && cert_dir.join("test_key.pem").exists());
-            #[cfg(not(feature = "vsr"))]
-            let should_generate = true;
             if should_generate {
                 generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
                     TestBinaryError::InvalidState {
@@ -894,13 +882,6 @@ impl TestBinary for ServerHandle {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
         command.envs(&self.envs);
-
-        // Legacy clustering elects node 0 externally and requires explicit followers.
-        // VSR/server-ng elects its own primary and should see symmetric node startup.
-        #[cfg(not(feature = "vsr"))]
-        if self.server_id > 0 {
-            command.arg("--follower");
-        }
 
         // `--replica-id` is the single identity input expected by the
         // server when cluster mode is enabled; all other cluster config is
@@ -1046,6 +1027,23 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
+            if std::thread::panicking() {
+                // Ahead of the full dump, which buries these lines under the
+                // complete stdout of every node.
+                eprintln!("Iggy server panicked:\n{report}");
+            } else {
+                // A dead task leaves the process alive and the test green;
+                // failing here is the only thing that surfaces it. The panic
+                // unwinds out of this `Drop` before the dump below runs, so
+                // print this node's logs first.
+                let (stdout, stderr) =
+                    super::common::collect_logs(&self.stdout_path, &self.stderr_path);
+                eprintln!("Iggy server stdout:\n{stdout}");
+                eprintln!("Iggy server stderr:\n{stderr}");
+                panic!("Iggy server panicked:\n{report}");
+            }
+        }
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
 }

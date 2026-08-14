@@ -218,9 +218,8 @@ namespace Iggy {
         public function sendBinaryRequest(int $code, string $payload): string {}
 
         /**
-         * Sends messages to a topic and returns the commit confirmations.
-         *
-         * The list is empty against the legacy server, which reports no offsets.
+         * Sends messages to a topic and returns the commit confirmations, one per
+         * partition the batch landed in.
          *
          * @param mixed $stream
          * @param mixed $topic
@@ -513,9 +512,6 @@ namespace Iggy {
          * crash-restart can stamp a later batch with an offset a client has already
          * recorded.
          *
-         * The legacy server returns an empty confirmation list, so it reports no offset
-         * at all.
-         *
          * @var int
          */
         public readonly int $base_offset;
@@ -536,9 +532,9 @@ namespace Iggy {
         /**
          * One confirmation per partition the batch landed in.
          *
-         * The list is empty when the server reports no offsets. The legacy server never
-         * reports any, and a server that does can still commit a batch it has no offsets
-         * to describe, so check for an empty array instead of indexing.
+         * The list is empty when the server reports no offsets. A server can commit a
+         * batch it has no offsets to describe, so check for an empty array instead of
+         * indexing.
          *
          * The confirmations are rebuilt on each getter call; cache the result in PHP if
          * they will be read repeatedly.

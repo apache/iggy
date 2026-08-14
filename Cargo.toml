@@ -61,7 +61,6 @@ members = [
     "core/partitions",
     "core/sdk",
     "core/server",
-    "core/server-ng",
     "core/server_common",
     "core/shard",
     "core/shard_allocator",
@@ -200,11 +199,11 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.11.0-edge.1" }
-iggy-cli = { path = "core/cli", version = "0.14.0-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.1" }
-iggy_common = { path = "core/common", version = "0.11.0-edge.1" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
+iggy = { path = "core/sdk", version = "0.11.0-edge.2" }
+iggy-cli = { path = "core/cli", version = "0.14.0-edge.2" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.2" }
+iggy_common = { path = "core/common", version = "0.11.0-edge.2" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.1" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }
 ipnet = "2.12.0"
@@ -279,6 +278,7 @@ reqwest-tracing = "0.7.1"
 ring = "0.17.14"
 ringbuffer = "0.16.0"
 rmcp = "2.2.0"
+rmp = "0.8.15"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
 rust-embed = "8.12.0"
@@ -295,7 +295,6 @@ serde_with = { version = "3.21.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.5.0"
 server = { path = "core/server" }
-server-ng = { path = "core/server-ng" }
 server_common = { path = "core/server_common" }
 shard = { path = "core/shard" }
 shard_allocator = { path = "core/shard_allocator" }

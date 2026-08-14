@@ -40,8 +40,7 @@ import java.util.List;
  * started VSR server on localhost, running standalone (single-node) mode.
  * Start it from the repo root:
  * <pre>{@code
- * # TODO: change to iggy-server once legacy server is removed (core/server has VSR support)
- * IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server-ng --features vsr
+ * IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server
  * }</pre>
  *
  * <p>Otherwise a server container is started via testcontainers. This works

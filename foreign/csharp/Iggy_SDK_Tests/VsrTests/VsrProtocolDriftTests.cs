@@ -36,7 +36,6 @@ public sealed class VsrProtocolDriftTests
     private const string HeaderPath = "core/binary_protocol/src/consensus/header.rs";
     private const string CommandPath = "core/binary_protocol/src/consensus/command.rs";
     private const string OperationPath = "core/binary_protocol/src/consensus/operation.rs";
-    private const string NamespacePath = "core/binary_protocol/src/namespace.rs";
     private const string CodesPath = "core/binary_protocol/src/codes.rs";
     private const string DispatchPath = "core/binary_protocol/src/dispatch.rs";
     private const string ErrorPath = "core/common/src/error/iggy_error.rs";
@@ -80,9 +79,13 @@ public sealed class VsrProtocolDriftTests
         Assert.Equal(VsrHeader.REQUEST_TIMESTAMP_OFFSET, offsets["timestamp"]);
         Assert.Equal(VsrHeader.REQUEST_ID_OFFSET, offsets["request"]);
         Assert.Equal(VsrHeader.REQUEST_OPERATION_OFFSET, offsets["operation"]);
-        Assert.Equal(VsrHeader.REQUEST_NAMESPACE_OFFSET, offsets["namespace"]);
         Assert.Equal(VsrHeader.REQUEST_SESSION_OFFSET, offsets["session"]);
         Assert.Equal(VsrHeader.REQUEST_RESERVED_OFFSET, offsets["reserved"]);
+
+        // A routing group reintroduced on the client header would shift every field
+        // after it and silently reinstate a derivation this SDK no longer performs.
+        Assert.DoesNotContain("namespace", offsets.Keys);
+        Assert.DoesNotContain("group", offsets.Keys);
     }
 
     [Fact]
@@ -93,8 +96,10 @@ public sealed class VsrProtocolDriftTests
         Assert.Equal(VsrHeader.SIZE_OFFSET, offsets["size"]);
         Assert.Equal(VsrHeader.COMMAND_OFFSET, offsets["command"]);
         Assert.Equal(VsrHeader.REPLY_OPERATION_OFFSET, offsets["operation"]);
-        Assert.Equal(VsrHeader.REPLY_NAMESPACE_OFFSET, offsets["namespace"]);
         Assert.Equal(VsrHeader.REPLY_STATUS_OFFSET, offsets["status"]);
+
+        Assert.DoesNotContain("namespace", offsets.Keys);
+        Assert.DoesNotContain("group", offsets.Keys);
     }
 
     [Fact]
@@ -144,30 +149,6 @@ public sealed class VsrProtocolDriftTests
         IReadOnlyDictionary<string, int> rust = RustEnum.Discriminants(ReadRustSource(OperationPath), "Operation");
 
         AssertExactMatch<VsrOperation>(rust);
-    }
-
-    [Fact]
-    public void NamespacePacking_MatchesTheRustConstants()
-    {
-        var source = ReadRustSource(NamespacePath);
-
-        Assert.Equal(VsrNamespace.MAX_STREAMS, RustConst(source, "MAX_STREAMS"));
-        Assert.Equal(VsrNamespace.MAX_TOPICS, RustConst(source, "MAX_TOPICS"));
-        Assert.Equal(VsrNamespace.MAX_PARTITIONS, RustConst(source, "MAX_PARTITIONS"));
-        Assert.Equal(VsrNamespace.PARTITION_SHIFT, RustConst(source, "PARTITION_SHIFT"));
-
-        // The remaining shifts are derived from the maxima on the Rust side, so re-derive them the same way
-        // instead of matching an expression the parser would have to evaluate.
-        Assert.Equal(VsrNamespace.PARTITION_BITS, BitsRequired(VsrNamespace.MAX_PARTITIONS - 1));
-        Assert.Equal(VsrNamespace.TOPIC_BITS, BitsRequired(VsrNamespace.MAX_TOPICS - 1));
-        Assert.Equal(VsrNamespace.STREAM_BITS, BitsRequired(VsrNamespace.MAX_STREAMS - 1));
-        Assert.Equal(VsrNamespace.TOPIC_SHIFT, VsrNamespace.PARTITION_SHIFT + VsrNamespace.PARTITION_BITS);
-        Assert.Equal(VsrNamespace.STREAM_SHIFT, VsrNamespace.TOPIC_SHIFT + VsrNamespace.TOPIC_BITS);
-
-        var sentinel = Regex.Match(source, @"pub const METADATA_CONSENSUS_NAMESPACE: u64 = 1u64 << (\d+);");
-        Assert.True(sentinel.Success, "METADATA_CONSENSUS_NAMESPACE is no longer a shifted literal.");
-        Assert.Equal(VsrNamespace.METADATA_CONSENSUS_NAMESPACE,
-            1UL << int.Parse(sentinel.Groups[1].Value, CultureInfo.InvariantCulture));
     }
 
     [Fact]
@@ -645,26 +626,6 @@ public sealed class VsrProtocolDriftTests
     private static int Group(Match match, int index)
     {
         return int.Parse(match.Groups[index].Value, CultureInfo.InvariantCulture);
-    }
-
-    private static int BitsRequired(int max)
-    {
-        var bits = 0;
-        while (max > 0)
-        {
-            bits++;
-            max >>= 1;
-        }
-
-        return bits;
-    }
-
-    private static int RustConst(string source, string name)
-    {
-        var match = Regex.Match(source, $@"pub const {name}: \w+ = ([\d_]+);");
-        Assert.True(match.Success, $"{name} is no longer a literal constant.");
-
-        return int.Parse(match.Groups[1].Value.Replace("_", string.Empty), CultureInfo.InvariantCulture);
     }
 
     /// <summary>Every .NET member matches Rust, and Rust carries no member the .NET enum is missing.</summary>

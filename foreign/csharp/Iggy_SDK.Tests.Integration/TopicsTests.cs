@@ -234,7 +234,7 @@ public class TopicsTests
         await Should.NotThrowAsync(client.PurgeTopicAsync(Identifier.String(streamName),
             Identifier.String("Purge Topic")));
 
-        // server-ng commits the purge by advancing a generation its reconciler acts on a tick later.
+        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
         var afterPurge = await Eventually.ReadAsync(
             () => client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("Purge Topic")),
             topic => topic?.MessagesCount == 0, TimeSpan.FromSeconds(10));

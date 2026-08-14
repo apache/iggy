@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -159,14 +159,11 @@ readonly EXAMPLES_SERVER_TIMEOUT=300
 readonly EXAMPLES_STOP_TIMEOUT=5
 
 # Resolve and validate the server binary path.
-# Usage: resolve_server_binary [target] [binary_name] [cargo_features]
-# Sets global SERVER_BIN. binary_name defaults to iggy-server; vsr lanes
-# pass their server binary and the vsr feature (so the wire protocol
-# matches vsr-built clients).
+# Usage: resolve_server_binary [target] [binary_name]
+# Sets global SERVER_BIN. binary_name defaults to iggy-server.
 function resolve_server_binary() {
     local target="${1:-}"
     local binary="${2:-iggy-server}"
-    local features="${3:-}"
 
     if [ -n "${target}" ]; then
         SERVER_BIN="target/${target}/debug/${binary}"
@@ -178,9 +175,6 @@ function resolve_server_binary() {
         local build_command="cargo build --bin ${binary}"
         if [ -n "${target}" ]; then
             build_command="cargo build --target ${target} --bin ${binary}"
-        fi
-        if [ -n "${features}" ]; then
-            build_command="${build_command} --features ${features}"
         fi
         echo "Error: Server binary not found at ${SERVER_BIN}"
         echo "Please build the server binary before running this script:"

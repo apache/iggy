@@ -20,13 +20,70 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
-    RequestHeader, frame_body,
+    CHECKSUM_UNSEALED, Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RoutedRequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
-use server_common::{Message, iobuf::Owned};
-use std::mem::size_of;
-use std::ops::AsyncFnOnce;
+use server_common::{
+    MESSAGE_ALIGN, Message,
+    iobuf::{Frozen, Owned},
+};
+use std::{error::Error, fmt, mem::size_of, ops::AsyncFnOnce};
+
+/// Failure to route or forward a prepare through the replication chain.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ChainReplicationError {
+    MalformedPrepare,
+    UnexpectedCommand { command: Command2 },
+    CommittedPrepare { op: u64, commit_min: u64 },
+    SelfRoute { replica: u8 },
+    Transport(SendError),
+}
+
+impl ChainReplicationError {
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl fmt::Display for ChainReplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedPrepare => formatter.write_str("malformed prepare frame"),
+            Self::UnexpectedCommand { command } => {
+                write!(formatter, "expected prepare command, found {command:?}")
+            }
+            Self::CommittedPrepare { op, commit_min } => write!(
+                formatter,
+                "prepare op {op} is not above committed op {commit_min}"
+            ),
+            Self::SelfRoute { replica } => {
+                write!(
+                    formatter,
+                    "replication chain routes replica {replica} to itself"
+                )
+            }
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ChainReplicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SendError> for ChainReplicationError {
+    fn from(error: SendError) -> Self {
+        Self::Transport(error)
+    }
+}
 
 /// Shared pipeline-first request flow (metadata + partitions).
 ///
@@ -79,43 +136,137 @@ where
 ///
 /// # Errors
 ///
-/// Returns `SendError` if the bus fails to deliver to the next replica.
+/// Returns an error if the prepare cannot be routed or the bus cannot deliver
+/// it to the next replica.
 /// Callers decide error policy (VSR retransmits from WAL via prepare timeout).
-///
-/// # Panics
-/// - If `header.command` is not `Command2::Prepare`.
-/// - If `header.op <= consensus.commit_min()`.
-/// - If the computed next replica equals self.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: &Message<PrepareHeader>,
-) -> Result<(), SendError>
+) -> Result<(), ChainReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let header = *message.header();
+    let Some(next) = replication_target(consensus, message.header())? else {
+        return Ok(());
+    };
+    let frozen = message.deep_copy().into_generic().into_frozen();
+    consensus
+        .message_bus()
+        .send_to_replica(next, frozen)
+        .await
+        .map_err(Into::into)
+}
 
-    assert_eq!(header.command, Command2::Prepare);
-    assert!(header.op > consensus.commit_min());
+/// Forward an already validated frozen prepare to the next replica without
+/// copying its payload.
+///
+/// # Errors
+///
+/// Returns an error if the frame is malformed, cannot be routed, or the bus
+/// cannot deliver it to the next replica.
+#[allow(clippy::future_not_send)]
+pub async fn replicate_frozen_to_next_in_chain<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    message: Frozen<MESSAGE_ALIGN>,
+) -> Result<(), ChainReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header = frozen_prepare_header(&message)?;
+    let Some(next) = replication_target(consensus, &header)? else {
+        return Ok(());
+    };
+    consensus
+        .message_bus()
+        .send_to_replica(next, message)
+        .await
+        .map_err(Into::into)
+}
+
+fn frozen_prepare_header(
+    message: &Frozen<MESSAGE_ALIGN>,
+) -> Result<PrepareHeader, ChainReplicationError> {
+    let header_bytes = message
+        .as_slice()
+        .get(..size_of::<PrepareHeader>())
+        .ok_or(ChainReplicationError::MalformedPrepare)?;
+    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+        .copied()
+        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
+    header
+        .validate()
+        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
+    let frame_size =
+        usize::try_from(header.size).map_err(|_| ChainReplicationError::MalformedPrepare)?;
+    if !(size_of::<PrepareHeader>()..=message.len()).contains(&frame_size) {
+        return Err(ChainReplicationError::MalformedPrepare);
+    }
+    Ok(header)
+}
+
+fn replication_target<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    header: &PrepareHeader,
+) -> Result<Option<u8>, ChainReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    if header.command != Command2::Prepare {
+        return Err(ChainReplicationError::UnexpectedCommand {
+            command: header.command,
+        });
+    }
+    let commit_min = consensus.commit_min();
+    if header.op <= commit_min {
+        return Err(ChainReplicationError::CommittedPrepare {
+            op: header.op,
+            commit_min,
+        });
+    }
 
     let next = (consensus.replica() + 1) % consensus.replica_count();
     let primary = consensus.primary_index(header.view);
 
     if next == primary {
-        return Ok(());
+        return Ok(None);
     }
 
-    assert_ne!(next, consensus.replica());
+    if next == consensus.replica() {
+        return Err(ChainReplicationError::SelfRoute {
+            replica: consensus.replica(),
+        });
+    }
+    Ok(Some(next))
+}
 
-    // Chain replication to the next replica is N=1, so the freeze-once
-    // trick does not apply: the caller has already appended `message` to
-    // its local journal (durability-before-ack) and kept a reference for
-    // this forward, so we deep_copy a fresh Frozen here. Future refactor
-    // could freeze once and share the backing with the journal path.
-    let frozen = message.deep_copy().into_generic().into_frozen();
-    consensus.message_bus().send_to_replica(next, frozen).await
+/// Re-stamp a stored prepare with the current view before retransmission.
+/// The prepare identity excludes `view`, so the payload and operation identity
+/// remain unchanged.
+#[must_use]
+pub fn restamp_prepare_view(
+    stored: Frozen<MESSAGE_ALIGN>,
+    view: u32,
+) -> Option<Frozen<MESSAGE_ALIGN>> {
+    const VIEW_OFFSET: usize = std::mem::offset_of!(PrepareHeader, view);
+
+    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+        stored.as_slice().get(..size_of::<PrepareHeader>())?,
+    )
+    .ok()?;
+    if header.view == view {
+        return Some(stored);
+    }
+
+    let mut owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(stored.as_slice());
+    owned.as_mut_slice()[VIEW_OFFSET..VIEW_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&view.to_ne_bytes());
+    Message::<GenericHeader>::try_from(owned)
+        .ok()
+        .map(Message::into_frozen)
 }
 
 /// Recompute a prepare's integrity fields and report the first that disagrees.
@@ -264,15 +415,15 @@ where
         return false;
     }
 
-    let pipeline = consensus.pipeline().borrow();
     let mut new_commit = consensus.commit_max();
-    while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
-        if !entry.ok_quorum_received {
-            break;
+    consensus.with_pipeline(|pipeline| {
+        while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
+            if !entry.ok_quorum_received {
+                break;
+            }
+            new_commit += 1;
         }
-        new_commit += 1;
-    }
-    drop(pipeline);
+    });
 
     if new_commit > consensus.commit_max() {
         consensus.advance_commit_max(new_commit);
@@ -296,17 +447,27 @@ where
 {
     let commit = consensus.commit_max();
     let mut drained = Vec::new();
-    let mut pipeline = consensus.pipeline().borrow_mut();
 
-    while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
-        if head_op > commit {
-            break;
+    consensus.with_pipeline_mut(|pipeline| {
+        while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
+            if head_op > commit {
+                break;
+            }
+
+            let entry = pipeline
+                .pop()
+                .expect("drain_committable_prefix: head exists");
+            drained.push(entry);
         }
+    });
 
-        let entry = pipeline
-            .pop()
-            .expect("drain_committable_prefix: head exists");
-        drained.push(entry);
+    // Popping through the pipeline directly bypasses
+    // `VsrConsensus::pop_committed_prepare`, so re-establish the prepare
+    // timeout's ticking-iff-non-empty invariant here: an emptied pipeline
+    // disarms it, and a remaining head becomes the entry the timer measures,
+    // timed from now rather than inheriting the drained entry's elapsed ticks.
+    if !drained.is_empty() {
+        consensus.sync_prepare_timeout();
     }
 
     drained
@@ -327,10 +488,8 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
-    let pipeline = consensus.pipeline().borrow();
-    pipeline
-        .head()
-        .map(|entry| entry.header)
+    consensus
+        .pipeline_head_header()
         .filter(|header| header.op <= commit)
 }
 
@@ -399,7 +558,6 @@ where
         timestamp: prepare_header.timestamp,
         request: prepare_header.request,
         operation: prepare_header.operation,
-        namespace: prepare_header.namespace,
         ..Default::default()
     };
     // `BytesMut` makes no alignment guarantee, so never cast into it.
@@ -434,7 +592,7 @@ where
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn build_result_rejection_reply(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     commit: u64,
     code: u32,
 ) -> Message<ReplyHeader> {
@@ -462,7 +620,6 @@ pub fn build_result_rejection_reply(
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
@@ -486,7 +643,7 @@ pub fn build_result_rejection_reply(
 #[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 pub fn build_reply_from_request<B, P>(
     consensus: &VsrConsensus<B, P>,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     body: bytes::Bytes,
 ) -> Message<ReplyHeader>
 where
@@ -516,7 +673,6 @@ where
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
@@ -542,7 +698,7 @@ where
 /// If the constructed message buffer is not valid.
 pub fn build_deny_reply_from_request<B, P>(
     consensus: &VsrConsensus<B, P>,
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     status: u32,
 ) -> Message<ReplyHeader>
 where
@@ -561,7 +717,7 @@ where
 }
 
 /// [`build_deny_reply_from_request`] for layers that hold no consensus group
-/// for the request's namespace (a shard fencing a frame aimed at a torn-down
+/// for the request's group (a shard fencing a frame aimed at a torn-down
 /// or never-materialised partition).
 ///
 /// Replica-stamped fields (`cluster`, `view`, `replica`) echo the request
@@ -574,7 +730,7 @@ where
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn build_deny_reply_from_request_header(
-    request_header: &RequestHeader,
+    request_header: &RoutedRequestHeader,
     status: u32,
 ) -> Message<ReplyHeader> {
     let header_size = std::mem::size_of::<ReplyHeader>();
@@ -593,7 +749,6 @@ pub fn build_deny_reply_from_request_header(
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
-        namespace: request_header.namespace,
         ..Default::default()
     };
     buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
@@ -670,7 +825,7 @@ pub async fn send_prepare_ok<B, P>(
         prepare_checksum: header.checksum,
         request: header.request,
         operation: header.operation,
-        namespace: header.namespace,
+        group: header.group,
         size: std::mem::size_of::<PrepareOkHeader>() as u32,
         ..Default::default()
     };
@@ -815,7 +970,7 @@ mod tests {
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
-                    new.namespace = 0;
+                    new.group = 0;
                 });
         let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
 
@@ -855,7 +1010,7 @@ mod tests {
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
-                    new.namespace = 0;
+                    new.group = 0;
                 });
         let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
 
@@ -886,7 +1041,7 @@ mod tests {
             reserved_frame: [0; 66],
             op: dvc_op,
             commit,
-            namespace: 0,
+            group: 0,
             log_view: 0,
             reserved: [0; 68],
             nack_bitset: 0,
@@ -921,6 +1076,83 @@ mod tests {
             restamped.identity_checksum(),
             "view must not participate in a prepare's identity"
         );
+    }
+
+    #[test]
+    fn given_matching_view_when_restamping_should_reuse_frozen_prepare() {
+        let message = prepare_message(9, 7, 11).transmute_header(|old, new: &mut PrepareHeader| {
+            *new = old;
+            new.view = 4;
+        });
+        let frozen = message.into_frozen();
+        let original_ptr = frozen.as_slice().as_ptr();
+
+        let restamped = restamp_prepare_view(frozen, 4).expect("valid prepare");
+        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &restamped[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+
+        assert_eq!(restamped.as_slice().as_ptr(), original_ptr);
+        assert_eq!(header.view, 4);
+    }
+
+    #[test]
+    fn given_new_view_when_restamping_should_only_change_view() {
+        let message = prepare_message(9, 7, 11).transmute_header(|old, new: &mut PrepareHeader| {
+            *new = old;
+            new.view = 4;
+            new.client = 17;
+            new.request = 23;
+        });
+        let expected_identity = message.header().identity_checksum();
+        let expected_op = message.header().op;
+        let expected_client = message.header().client;
+        let expected_request = message.header().request;
+
+        let restamped = restamp_prepare_view(message.into_frozen(), 12).expect("valid prepare");
+        let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &restamped[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+
+        assert_eq!(header.view, 12);
+        assert_eq!(header.identity_checksum(), expected_identity);
+        assert_eq!(header.op, expected_op);
+        assert_eq!(header.client, expected_client);
+        assert_eq!(header.request, expected_request);
+    }
+
+    #[test]
+    fn given_truncated_buffer_when_restamping_should_reject() {
+        let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
+
+        assert!(restamp_prepare_view(malformed, 1).is_none());
+    }
+
+    #[test]
+    fn given_truncated_buffer_when_reading_frozen_prepare_should_reject() {
+        let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
+
+        assert!(matches!(
+            frozen_prepare_header(&malformed),
+            Err(ChainReplicationError::MalformedPrepare)
+        ));
+    }
+
+    #[test]
+    fn given_committed_prepare_when_selecting_replication_target_should_reject() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = prepare_message(0, 0, 0);
+
+        assert!(matches!(
+            replication_target(&consensus, prepare.header()),
+            Err(ChainReplicationError::CommittedPrepare {
+                op: 0,
+                commit_min: 0
+            })
+        ));
     }
 
     #[test]
@@ -1064,7 +1296,7 @@ mod tests {
             reserved_frame: [0; 66],
             op,
             commit,
-            namespace: 0,
+            group: 0,
             log_view,
             reserved: [0; 68],
             nack_bitset: 0,
@@ -1120,7 +1352,7 @@ mod tests {
             command: Command2::StartViewChange,
             replica,
             reserved_frame: [0; 66],
-            namespace: 0,
+            group: 0,
             reserved: [0; 120],
         }
     }
@@ -1415,7 +1647,7 @@ mod tests {
             reserved_frame: [0; 66],
             op,
             commit,
-            namespace: 0,
+            group: 0,
             reserved: [0; 88],
             incarnation: 0,
         };
@@ -1747,11 +1979,7 @@ mod tests {
 
         assert_eq!(drained_ops, vec![5, 6]);
         assert_eq!(
-            consensus
-                .pipeline()
-                .borrow()
-                .head()
-                .map(|entry| entry.header.op),
+            consensus.pipeline_head_header().map(|header| header.op),
             Some(7)
         );
     }
@@ -1766,12 +1994,11 @@ mod tests {
         consensus.init();
         consensus.advance_commit_max(4);
 
-        let request = RequestHeader {
+        let request = RoutedRequestHeader {
             command: Command2::Request,
             operation: Operation::DeleteConsumerOffset2,
             client: 42,
             request: 7,
-            namespace: 9,
             ..Default::default()
         };
         let status = 3021;
@@ -1784,7 +2011,6 @@ mod tests {
         assert_eq!(header.commit, 4);
         assert_eq!(header.client, 42);
         assert_eq!(header.request, 7);
-        assert_eq!(header.namespace, 9);
         assert_eq!(header.operation, Operation::DeleteConsumerOffset2);
         assert_eq!(
             header.size as usize,

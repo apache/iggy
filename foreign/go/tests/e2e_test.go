@@ -24,6 +24,7 @@ import (
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -259,15 +260,17 @@ func TestE2E_AutoLoginSignsInOnConnect(t *testing.T) {
 	assert.NotNil(t, streams)
 }
 
-func TestE2E_PingWorksBeforeSigningIn(t *testing.T) {
+func TestE2E_OnlyPingWorksBeforeSigningIn(t *testing.T) {
 	connected := newClient(t)
 
 	require.NoError(t, connected.Ping(context.Background()))
 
+	// Ping is the only command the server answers on an unbound connection.
+	// The cluster roster is auth-gated so that an unauthenticated reader cannot
+	// enumerate the private network topology.
 	metadata, err := connected.GetClusterMetadata(context.Background())
-	require.NoError(t, err, "cluster metadata is readable before the sign-in")
-	require.NotNil(t, metadata)
-	assert.NotEmpty(t, metadata.Nodes)
+	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Nil(t, metadata, "no roster leaks to an unauthenticated reader")
 }
 
 func TestE2E_LogoutEndsTheSession(t *testing.T) {

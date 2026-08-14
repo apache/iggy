@@ -29,7 +29,7 @@ crate-type = ["staticlib"]
 [dependencies]
 bytes = "1.12.1"
 cxx = "1.0.198"
-iggy = { path = "../../core/sdk", features = ["vsr"] }
+iggy = { path = "../../core/sdk" }
 iggy_binary_protocol = { path = "../../core/binary_protocol" }
 iggy_common = { path = "../../core/common" }
 # Explicitly enable the runtime + I/O drivers required by `Runtime::enable_all()` in lib.rs.

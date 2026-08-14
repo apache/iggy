@@ -23,13 +23,11 @@
 //
 // Prerequisites:
 //   Start the Iggy server with TLS enabled:
-//     TODO(hubcio): change to iggy-server once legacy server is removed
-//     (core/server has VSR support)
 //     IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo r --bin iggy-server-ng --features vsr
+//     cargo r --bin iggy-server
 //
 // Run this example (from examples/node/):
 //   DEBUG=iggy:* npx tsx src/tcp-tls/producer.ts

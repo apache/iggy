@@ -18,7 +18,7 @@
 //! `StoreConsumerOffset` op. Pre-`AckLevel` manual encoding. Live
 //! namespace via shadow, fabricated consumer kind/id. Samples Success.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -58,7 +58,7 @@ pub fn sample(
             // Draw against the configured ceiling, then clamp to committed
             // reality so the offset is reachable. Clamping post-draw keeps
             // the PRNG draw order (and determinism hash baseline) intact
-            // while staying valid once server-ng validates offsets.
+            // while staying valid once the server validates offsets.
             let raw: u64 = prng.random_range(0..options.max_offset.max(1));
             let high = shadow.sends_committed(ns).max(1);
             let offset = raw % high;
@@ -73,7 +73,7 @@ pub fn sample(
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.store_consumer_offset(
         input.ns,
         input.consumer_kind,

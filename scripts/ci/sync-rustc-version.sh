@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -79,7 +82,7 @@ fi
 # Strip trailing ".0" -> e.g., 1.89.0 -> 1.89 (no change if it doesn't end in .0)
 RUST_VERSION_SHORT=$(echo "$RUST_VERSION" | sed -E 's/^([0-9]+)\.([0-9]+)\.0$/\1.\2/')
 RUST_IMAGE_VARIANT="slim-trixie"
-RUST_IMAGE_PATTERN="FROM[[:space:]].*\\brust:"
+RUST_IMAGE_PATTERN="FROM[[:space:]]+(.*[^[:alnum:]_])?rust:"
 RUST_IMAGE_TAG_PATTERN="(rust:[^-[:space:]]+)"
 
 echo "Rust version from rust-toolchain.toml: ${GREEN}$RUST_VERSION${NC} (using ${GREEN}$RUST_VERSION_SHORT${NC} for Dockerfiles)"
@@ -108,9 +111,9 @@ for dockerfile in $DOCKERFILES; do
         SOURCE="arg"
         CURRENT_VERSION=$(grep "^ARG RUST_VERSION=" "$dockerfile" | head -1 | sed 's/^ARG RUST_VERSION=//')
         EXPECTED_VERSION="$RUST_VERSION_SHORT"
-    elif grep -qE "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" 2>/dev/null; then
+    elif grep -qE "${RUST_IMAGE_PATTERN}[0-9]" "$dockerfile" 2>/dev/null; then
         SOURCE="from"
-        CURRENT_VERSION=$(grep -E "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" | head -1 | sed -nE 's/.*\brust:([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p')
+        CURRENT_VERSION=$(grep -E "${RUST_IMAGE_PATTERN}[0-9]" "$dockerfile" | head -1 | sed -nE 's/.*rust:([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p')
         # Preserve the file's precision: full patch (1.96.0) or short (1.96).
         if [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             EXPECTED_VERSION="$RUST_VERSION"
@@ -159,7 +162,7 @@ for dockerfile in $DOCKERFILES; do
                 sed -i.bak "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$EXPECTED_VERSION/" "$dockerfile"
                 rm -f "$dockerfile.bak"
             elif [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
-                sed -i.bak -E "/FROM[[:space:]].*\\brust:[0-9]/ s#(\\brust:)[0-9]+\\.[0-9]+(\\.[0-9]+)?#\\1$EXPECTED_VERSION#g" "$dockerfile"
+                sed -i.bak -E "/${RUST_IMAGE_PATTERN}[0-9]/ s#(rust:)[0-9]+\\.[0-9]+(\\.[0-9]+)?#\\1$EXPECTED_VERSION#g" "$dockerfile"
                 rm -f "$dockerfile.bak"
             fi
             if [ "$RUST_IMAGE_MISMATCH" = "true" ]; then

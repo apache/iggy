@@ -23,7 +23,7 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
@@ -301,6 +301,27 @@ where
         suspend.await;
     }
 
+    /// TEST / SIMULATOR ONLY. Address of the partitions vec's heap buffer.
+    ///
+    /// Lets a test prove that an [`Self::insert`] actually REALLOCATED rather
+    /// than landing in spare capacity. The distinction is the whole point of the
+    /// realloc half of PR #3557: `swap_remove` invalidates one slot's reference,
+    /// while a growing `push` moves every element and invalidates all of them. A
+    /// test that only checked "insert happened" would pass on a push into spare
+    /// capacity, which moves nothing and proves nothing.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn buffer_addr(&self) -> usize {
+        // SAFETY: forms a shared reference into the `UnsafeCell` for this expression.
+        // Read-only-ness is not what makes that sound, since a shared reborrow
+        // aliasing a live `&mut` is UB whether or not it reads. What makes it sound
+        // is that no
+        // `&mut` from `get_mut_by_ns` / `namespace_map_mut` is live across the call:
+        // those are pump-only, and these callers run on the pump. Only the pointer
+        // value escapes.
+        unsafe { (*self.partitions.get()).as_ptr() as usize }
+    }
+
     /// Get mutable partition by namespace directly. Tombstone-gated like
     /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
@@ -359,7 +380,7 @@ where
             // by the moved partition's namespace key in O(1); the previous
             // linear value-scan turned bulk DeleteStream into O(K²) on the
             // pump task, stalling client traffic for ~10k-partition topics.
-            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().namespace());
+            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().group());
             let entry = self.namespace_map_mut().get_mut(&moved_ns).expect(
                 "IggyPartitions invariant: swapped-in partition missing namespace_to_local entry",
             );
@@ -505,8 +526,11 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        let namespace = IggyNamespace::from_raw(message.header().group);
         if self.is_tombstoned(&namespace) {
             warn!(
                 target: "iggy.partitions.diag",
@@ -559,20 +583,20 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare: namespace tombstoned"
             );
             return;
         }
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 operation = ?message.header().operation,
                 "partition not initialized for namespace"
@@ -584,21 +608,21 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare-ok: namespace tombstoned"
             );
             return;
         }
         let config = self.config.clone();
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 "partition not initialized for namespace"
             );

@@ -21,7 +21,7 @@ description: .NET pre-merge testing github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, test, build, e2e)"
+    description: "Task to run (lint, test, build, e2e-<tfm>)"
     required: true
 
 runs:
@@ -30,10 +30,12 @@ runs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v5
       with:
-        dotnet-version: "10.0.x"
+        dotnet-version: |
+          8.0.x
+          10.0.x
 
     - name: Setup Rust with cache
-      if: inputs.task == 'test' || inputs.task == 'e2e'
+      if: inputs.task == 'test' || startsWith(inputs.task, 'e2e')
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Restore dependencies
@@ -77,30 +79,31 @@ runs:
 
     - name: Build Iggy server Docker image
       id: docker_build
-      if: inputs.task == 'e2e'
+      if: startsWith(inputs.task, 'e2e')
       shell: bash
       run: |
-        # TODO(hubcio): change to iggy-server once legacy server is removed
-        # (core/server has VSR support)
-        cargo build --locked --features vsr --bin iggy-server-ng --bin iggy
+        cargo build --locked --bin iggy-server --bin iggy
         docker build \
-          -f core/server-ng/Dockerfile \
+          -f core/server/Dockerfile \
           --target runtime-prebuilt \
           -t iggy-server:test \
-          --build-arg PREBUILT_IGGY_SERVER_NG=target/debug/iggy-server-ng \
+          --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
           --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
           .
         echo "docker_image=iggy-server:test" >> "$GITHUB_OUTPUT"
 
     - name: Run integration tests
-      if: inputs.task == 'e2e'
+      if: startsWith(inputs.task, 'e2e')
       working-directory: foreign/csharp
       env:
         IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
         IGGY_TEST_LOGS_DIR: ./reports/container-logs
         IGGY_TEST_CLUSTER_NODES: "3"
+        IGGY_TASK: ${{ inputs.task }}
       run: |
+        # Task name carries the target framework: e2e-net8.0 -> net8.0
         dotnet test --project Iggy_SDK.Tests.Integration \
+          --framework "${IGGY_TASK#e2e-}" \
           --no-build \
           --verbosity normal \
           --coverage \
@@ -111,7 +114,7 @@ runs:
       shell: bash
 
     - name: Collect container logs
-      if: inputs.task == 'e2e' && always()
+      if: startsWith(inputs.task, 'e2e') && always()
       shell: bash
       run: |
         mkdir -p foreign/csharp/reports/container-logs
@@ -119,7 +122,7 @@ runs:
 
     - name: Upload Test Results
       uses: actions/upload-artifact@v7
-      if: inputs.task == 'e2e' && always()
+      if: startsWith(inputs.task, 'e2e') && always()
       with:
         name: dotnet-test-results-${{ inputs.task }}
         path: foreign/csharp/reports
