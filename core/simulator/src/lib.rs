@@ -2831,6 +2831,118 @@ mod tests {
         );
     }
 
+    /// The realloc half of the PR #3557 class, and the stronger one: a pump
+    /// `insert` that grows the partitions vec MOVES every element, so a stale
+    /// reference to any partition dangles, not just the one a `swap_remove`
+    /// displaced. `shell_detects_partition_borrow_held_across_await` covers the
+    /// remove; this covers the grow, on the same two-task deterministic
+    /// interleave (reconciler-shaped reader parked with a borrow live, pump-shaped
+    /// task mutating the container underneath it).
+    ///
+    /// The buffer address is asserted to have MOVED, so the test cannot pass on a
+    /// push into spare capacity, which relocates nothing.
+    ///
+    /// Debug-only, like the tripwire it drives: `BorrowGuard` compiles out in
+    /// release.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn shell_detects_partition_borrow_held_across_a_pump_realloc() {
+        use crate::executor::DetExecutor;
+        use consensus::PartitionsHandle;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: 3,
+            client_count: 1,
+            seed: 0x5CED_0022,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(3, std::iter::once(1u128), network_opts);
+        let ns_a = IggyNamespace::new(0, 0, 0);
+        let ns_b = IggyNamespace::new(0, 0, 1);
+        // The namespace the pump grows the vec with. Never materialised up front:
+        // inserting it IS the mutation under test.
+        let ns_grow = IggyNamespace::new(0, 0, 2);
+        sim.init_partition(ns_a);
+        sim.init_partition(ns_b);
+
+        // BAD read: the borrow is live across the suspension, so the pump's
+        // growing insert lands while a stale reference to every partition is
+        // outstanding. `catch_unwind` builds the executor inline so unwinding
+        // drops the parked read's guard and restores the borrow count.
+        let tripped = catch_unwind(AssertUnwindSafe(|| {
+            let mut executor = DetExecutor::new(11);
+            let read = Rc::clone(&sim.replicas[0].shards[0]);
+            executor.spawn(async move {
+                read.plane
+                    .partitions()
+                    .hold_borrow_across_await(std::future::pending())
+                    .await;
+            });
+            executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
+            let grow = Rc::clone(&sim.replicas[0].shards[0]);
+            executor.spawn(async move {
+                grow.init_partition(ns_grow, None, None);
+            });
+            executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
+        }))
+        .is_err();
+        assert!(
+            tripped,
+            "a pump realloc under a live partition borrow went undetected: the \
+             #3557 tripwire did not fire on the growing insert"
+        );
+        // The tripwire asserts before `push`, so the vec is untouched: the two
+        // originals survive and the grow namespace never materialised.
+        let partitions = sim.replicas[0].shards[0].plane.partitions();
+        assert_eq!(
+            partitions.len(),
+            2,
+            "tripwire must abort the insert before it relocates the vec"
+        );
+        assert!(!partitions.contains(&ns_grow));
+
+        // REAL read: `with_partition` drops the borrow before the suspension, so
+        // the identical schedule is sound and the grow applies.
+        let addr_before = partitions.buffer_addr();
+        let mut executor = DetExecutor::new(11);
+        let read = Rc::clone(&sim.replicas[0].shards[0]);
+        executor.spawn(async move {
+            let _ = read
+                .plane
+                .partitions()
+                .with_partition(&ns_a, |_partition| ());
+            std::future::pending::<()>().await;
+        });
+        executor.run_until_stalled(POLL_BUDGET);
+        let grow = Rc::clone(&sim.replicas[0].shards[0]);
+        executor.spawn(async move {
+            grow.init_partition(ns_grow, None, None);
+        });
+        executor.run_until_stalled(POLL_BUDGET);
+
+        let partitions = sim.replicas[0].shards[0].plane.partitions();
+        assert!(
+            partitions.contains(&ns_grow),
+            "correct with_partition read must leave the concurrent insert sound"
+        );
+        assert_ne!(
+            partitions.buffer_addr(),
+            addr_before,
+            "the insert landed in spare capacity, so nothing moved and this test \
+             proves nothing about a realloc; seed more partitions before the grow"
+        );
+        // Every pre-existing partition is still addressable after the move, which
+        // is what a stale reference would have missed.
+        assert!(partitions.contains(&ns_a) && partitions.contains(&ns_b));
+    }
+
     /// Committed metadata prepare timestamps for `seed`: register plus two
     /// stream creates, read back from replica 0's metadata journal.
     fn metadata_prepare_timestamps(seed: u64) -> Vec<u64> {

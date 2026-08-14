@@ -737,9 +737,14 @@ pub enum ShardFrame {
     /// receiver still validates `target_shard == self.id` and drops
     /// frames stamped for the wrong shard (`MISROUTED`) to preserve the
     /// single-pump invariant under any caller bug.
+    ///
+    /// Carries the bag the router already classified, not the raw frame: the
+    /// receiving pump dispatches straight off the variant instead of re-running
+    /// `bytemuck::checked::try_from_bytes` plus the header's `validate()` on
+    /// bytes this process validated one hop ago.
     Consensus {
         target_shard: u16,
-        message: Message<GenericHeader>,
+        message: MessageBag,
     },
     /// A connection setup or cross-shard forward frame. Drop recovery
     /// depends on the frame class: [`LifecycleFrame::ForwardReplicaSend`]
@@ -750,12 +755,19 @@ pub enum ShardFrame {
     Lifecycle(LifecycleFrame),
 }
 
+// Carrying the classified bag widens the Consensus variant (32 B against the
+// 24 B of the `Message<GenericHeader>` it was classified from), which is free
+// only while `LifecycleFrame` remains what sizes the union. Every shard inbox
+// holds thousands of these, so a regression would surface as queue memory
+// rather than as a failing test.
+const _: () = assert!(std::mem::size_of::<ShardFrame>() == std::mem::size_of::<LifecycleFrame>());
+
 impl ShardFrame {
     /// Create a consensus frame addressed to `target_shard`. The sender
     /// is the routing authority; `accept_frame_for_self` compares this
     /// stamp against the receiving shard id in O(1).
     #[must_use]
-    pub const fn consensus(target_shard: u16, message: Message<GenericHeader>) -> Self {
+    pub const fn consensus(target_shard: u16, message: MessageBag) -> Self {
         Self::Consensus {
             target_shard,
             message,
@@ -2384,17 +2396,11 @@ where
     ///
     /// Routes requests, replication messages, and acks to either the metadata
     /// plane or the partitions plane based on `PlaneIdentity::is_applicable`.
-    //
-    // TODO(hubcio): perf - this `MessageBag::try_from` is the second parse of
-    // the same frame; the first ran in `IggyShard::dispatch` (router.rs ~85)
-    // to extract (operation, namespace) for routing. The work here re-runs
-    // `bytemuck::checked::try_from_bytes` + per-header `validate()` on bytes
-    // already validated upstream. See the matching TODO in router.rs for the
-    // fix: thread the classified `MessageBag` through `ShardFrame::Consensus`
-    // so this function takes the bag directly and the match below dispatches
-    // without re-parsing.
+    ///
+    /// Takes the bag `IggyShard::dispatch` classified, so the frame is parsed
+    /// once per hop rather than once for routing and again for dispatch.
     #[allow(clippy::future_not_send)]
-    pub async fn on_message(&self, message: Message<GenericHeader>)
+    pub async fn on_message(&self, message: MessageBag)
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -2413,9 +2419,13 @@ where
             >,
         T: ShardsTable,
     {
-        match MessageBag::try_from(message) {
-            Ok(MessageBag::Request(request)) => {
-                let routing = (request.header().operation, request.header().group);
+        match message {
+            MessageBag::Request(request) => {
+                // One header read for the pair; `header()` casts on every call.
+                let routing = {
+                    let header = request.header();
+                    (header.operation, header.group)
+                };
                 match self.park_if_unmaterialised(request, routing.0, routing.1) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
@@ -2439,8 +2449,11 @@ where
                     ParkOutcome::Parked => {}
                 }
             }
-            Ok(MessageBag::Prepare(prepare)) => {
-                let routing = (prepare.header().operation, prepare.header().group);
+            MessageBag::Prepare(prepare) => {
+                let routing = {
+                    let header = prepare.header();
+                    (header.operation, header.group)
+                };
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -2479,35 +2492,32 @@ where
                     ParkOutcome::Overflow(_) | ParkOutcome::Parked => {}
                 }
             }
-            Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
-            Ok(MessageBag::StartViewChange(msg)) => self.on_start_view_change(msg).await,
-            Ok(MessageBag::DoViewChange(msg)) => self.on_do_view_change(msg).await,
-            Ok(MessageBag::StartView(msg)) => self.on_start_view(msg).await,
-            Ok(MessageBag::Commit(ref msg)) => self.on_commit(msg).await,
-            Ok(MessageBag::RequestStartView(ref msg)) => self.on_request_start_view(msg).await,
-            Ok(MessageBag::RequestPrepares(ref msg)) => self.on_request_prepares(msg).await,
-            Ok(MessageBag::RepairPrepare(msg)) => self.on_repair_prepare(msg).await,
-            Ok(MessageBag::RepairRangeReply(ref msg)) => self.on_repair_range_reply(msg).await,
-            Ok(MessageBag::RequestStateTransfer(ref msg)) => {
+            MessageBag::PrepareOk(prepare_ok) => self.on_ack(prepare_ok).await,
+            MessageBag::StartViewChange(msg) => self.on_start_view_change(msg).await,
+            MessageBag::DoViewChange(msg) => self.on_do_view_change(msg).await,
+            MessageBag::StartView(msg) => self.on_start_view(msg).await,
+            MessageBag::Commit(ref msg) => self.on_commit(msg).await,
+            MessageBag::RequestStartView(ref msg) => self.on_request_start_view(msg).await,
+            MessageBag::RequestPrepares(ref msg) => self.on_request_prepares(msg).await,
+            MessageBag::RepairPrepare(msg) => self.on_repair_prepare(msg).await,
+            MessageBag::RepairRangeReply(ref msg) => self.on_repair_range_reply(msg).await,
+            MessageBag::RequestStateTransfer(ref msg) => {
                 self.on_request_state_transfer(msg).await;
             }
-            Ok(MessageBag::StateTransferTarget(ref msg)) => {
+            MessageBag::StateTransferTarget(ref msg) => {
                 self.on_state_transfer_target(msg).await;
             }
-            Ok(MessageBag::RequestStateChunk(ref msg)) => self.on_request_state_chunk(msg).await,
-            Ok(MessageBag::StateChunk(ref msg)) => self.on_state_chunk(msg).await,
+            MessageBag::RequestStateChunk(ref msg) => self.on_request_state_chunk(msg).await,
+            MessageBag::StateChunk(ref msg) => self.on_state_chunk(msg).await,
             // A forwarded proposal must leave the pump because its commit is
             // driven by this same pump. The metadata-submit handler spawns it.
-            Ok(MessageBag::ForwardRegister(ref msg)) => self.on_forward_register(*msg.header()),
-            Ok(MessageBag::ForwardRegisterResult(ref msg)) => {
+            MessageBag::ForwardRegister(ref msg) => self.on_forward_register(*msg.header()),
+            MessageBag::ForwardRegisterResult(ref msg) => {
                 self.on_forward_register_result(*msg.header());
             }
-            Ok(MessageBag::ForwardLogout(ref msg)) => self.on_forward_logout(*msg.header()),
-            Ok(MessageBag::ForwardLogoutResult(ref msg)) => {
+            MessageBag::ForwardLogout(ref msg) => self.on_forward_logout(*msg.header()),
+            MessageBag::ForwardLogoutResult(ref msg) => {
                 self.on_forward_logout_result(*msg.header());
-            }
-            Err(e) => {
-                tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
             }
         }
     }
@@ -2799,7 +2809,27 @@ where
         while let Some(frame) = remaining.next() {
             let passes = frame.passes;
             let parked_epoch = frame.epoch;
-            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, frame.message)) else {
+            // Parked frames are stored generic (the buffer holds every variant
+            // in one Vec), so re-entering the pump costs one classify. That is
+            // the rare path -- a post-`CreateTopic` convergence window, not the
+            // per-message steady state the bag handoff exists for.
+            let bag = match MessageBag::try_from(frame.message) {
+                Ok(bag) => bag,
+                Err(error) => {
+                    // The frame classified once already, on the way in, so this
+                    // is unreachable short of memory corruption. Dropping it
+                    // costs a client retry; panicking on the reconciler's path
+                    // would take the shard down.
+                    tracing::error!(
+                        shard = self.id,
+                        namespace_raw = namespace.inner(),
+                        %error,
+                        "parked partition frame no longer classifies; dropping it"
+                    );
+                    continue;
+                }
+            };
+            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, bag)) else {
                 continue;
             };
             let (refused, disconnected) = match error {
@@ -2812,7 +2842,7 @@ where
             let refused_frame = ParkedFrame {
                 epoch: parked_epoch,
                 passes,
-                message,
+                message: message.into_generic(),
             };
             if disconnected {
                 // Pump gone: re-parking holds the frame until process exit, and
@@ -8338,10 +8368,11 @@ fn rebuild_pipeline_entries<B, P>(
         );
     }
 
-    let mut pipeline = consensus.pipeline().borrow_mut();
-    for entry in entries {
-        pipeline.push(entry);
-    }
+    consensus.with_pipeline_mut(|pipeline| {
+        for entry in entries {
+            pipeline.push(entry);
+        }
+    });
 }
 
 /// Snapshot this replica's uncommitted suffix into consensus, if the journal has
