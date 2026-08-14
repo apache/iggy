@@ -234,9 +234,6 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                         &ctx.stream_id,
                         &ctx.topic_id,
                         "x",
-                        CompressionAlgorithm::None,
-                        IggyExpiry::NeverExpire,
-                        MaxTopicSize::ServerDefault,
                         &TopicUpdateOptions::default(),
                     )
                     .await

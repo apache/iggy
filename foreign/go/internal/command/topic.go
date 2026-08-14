@@ -133,12 +133,14 @@ func (d *DeleteTopic) MarshalBinary() ([]byte, error) {
 }
 
 type UpdateTopic struct {
-	StreamId             iggcon.Identifier           `json:"streamId"`
-	TopicId              iggcon.Identifier           `json:"topicId"`
+	StreamId iggcon.Identifier `json:"streamId"`
+	TopicId  iggcon.Identifier `json:"topicId"`
+	Name     string            `json:"name"`
+	// Settings ride the options block. A zero value means "leave it alone",
+	// so a rename does not silently reset the rest.
 	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
 	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
-	Name              string `json:"name"`
 }
 
 func (u *UpdateTopic) Code() Code {
@@ -147,8 +149,20 @@ func (u *UpdateTopic) Code() Code {
 
 // options builds the trailing options block. Only keys an update may change
 // are allowed; the server rejects the create-time knobs by name.
+// options builds the trailing options block. A zero value means the caller did
+// not set the key, so it is omitted and the server leaves the topic's current
+// value alone.
 func (u *UpdateTopic) options() []iggcon.HeaderEntry {
 	var options []iggcon.HeaderEntry
+	if name := u.CompressionAlgorithm.String(); name != "none" {
+		options = append(options, stringOption(topicOptionCompressionAlgorithm, name))
+	}
+	if u.MessageExpiry != 0 {
+		options = append(options, uint64Option(topicOptionMessageExpiry, uint64(u.MessageExpiry)))
+	}
+	if u.MaxTopicSize != 0 {
+		options = append(options, uint64Option(topicOptionMaxTopicSize, u.MaxTopicSize))
+	}
 	return options
 }
 
@@ -163,21 +177,12 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	}
 
 	optionsBytes := iggcon.GetHeadersBytes(u.options())
-	buffer := make([]byte, 18+len(streamIdBytes)+len(topicIdBytes)+len(u.Name)+len(optionsBytes))
+	buffer := make([]byte, 1+len(streamIdBytes)+len(topicIdBytes)+len(u.Name)+len(optionsBytes))
 
 	offset := 0
 
 	offset += copy(buffer[offset:], streamIdBytes)
 	offset += copy(buffer[offset:], topicIdBytes)
-
-	buffer[offset] = byte(u.CompressionAlgorithm)
-	offset++
-
-	binary.LittleEndian.PutUint64(buffer[offset:], uint64(u.MessageExpiry))
-	offset += 8
-
-	binary.LittleEndian.PutUint64(buffer[offset:], u.MaxTopicSize)
-	offset += 8
 
 	buffer[offset] = uint8(len(u.Name))
 	offset++

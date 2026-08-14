@@ -63,7 +63,7 @@ use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire_split};
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, ResourceOptions,
-    StreamStats, TopicCreateOptions, TopicStats, topic_field_options,
+    StreamStats, TopicCreateOptions, TopicStats,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::IggyNamespace;
@@ -1846,23 +1846,27 @@ impl StateHandler for UpdateTopicRequest {
         let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
             return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
         };
+        // Read leniently, like every other committed op: a key this build does
+        // not know is skipped rather than failing an operation its peers
+        // accepted.
+        let updated = TopicCreateOptions::parse_committed(&self.options);
 
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
-        topic.compression_algorithm =
-            CompressionAlgorithm::from_code(self.compression_algorithm).unwrap_or_default();
-        topic.message_expiry = IggyExpiry::from(self.message_expiry);
-        topic.max_topic_size = MaxTopicSize::from(self.max_topic_size);
-        // The three settings the command carries as fixed fields are mirrored
-        // into the map, so a reader of `options` never sees a value the typed
-        // field has already moved past.
-        topic.options.extend(topic_field_options(
-            topic.compression_algorithm,
-            topic.message_expiry,
-            topic.max_topic_size,
-        ));
-        // Patch, never replace: keys the client did not send keep their
-        // current value, so a client that predates a key cannot erase it.
+        // Settings arrive only through the options block now, so the typed
+        // fields are a projection of it and cannot drift. Absent means absent:
+        // a client that sends just a rename leaves every setting alone, and one
+        // built before a key existed cannot erase it.
+        if let Some(compression_algorithm) = updated.compression_algorithm {
+            topic.compression_algorithm = compression_algorithm;
+        }
+        if let Some(message_expiry) = updated.message_expiry {
+            topic.message_expiry = message_expiry;
+        }
+        if let Some(max_topic_size) = updated.max_topic_size {
+            topic.max_topic_size = max_topic_size;
+        }
+        // Patch, never replace, for the stored map too.
         topic.options.extend(updated_options);
         stream.topic_index.insert(new_name_arc, topic_id);
         ApplyReply::ok(Bytes::new())

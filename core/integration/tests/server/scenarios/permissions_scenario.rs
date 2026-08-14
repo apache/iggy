@@ -578,9 +578,6 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
                 &stream_id,
                 &topic_id,
                 "new-name",
-                CompressionAlgorithm::None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
                 &TopicUpdateOptions::default(),
             )
             .await,
@@ -626,9 +623,6 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
             &stream_id,
             &Identifier::named("temp-topic").unwrap(),
             "temp-topic-v2",
-            CompressionAlgorithm::None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
             &TopicUpdateOptions::default(),
         )
         .await
@@ -1560,9 +1554,6 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
             &stream_id,
             &Identifier::named("temp-manage-stream-topic").unwrap(),
             "temp-manage-stream-topic-v2",
-            CompressionAlgorithm::None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
             &TopicUpdateOptions::default(),
         )
         .await

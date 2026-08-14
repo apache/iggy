@@ -910,7 +910,12 @@ pub(in crate::http) async fn update_topic(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
     command.validate().map_err(WriteError::Rejected)?;
+    // The named JSON fields fold into the same option keys the binary protocol
+    // uses, so REST keeps its ergonomics without giving a setting two homes.
     let wire_options = TopicUpdateOptions {
+        compression_algorithm: command.compression_algorithm,
+        message_expiry: command.message_expiry,
+        max_topic_size: command.max_topic_size,
         raw: command.options,
     }
     .to_wire()
@@ -922,9 +927,6 @@ pub(in crate::http) async fn update_topic(
     let request = UpdateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
-        compression_algorithm: command.compression_algorithm.as_code(),
-        message_expiry: command.message_expiry.into(),
-        max_topic_size: command.max_topic_size.into(),
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
         options: wire_options,

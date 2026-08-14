@@ -27,6 +27,7 @@ use tracing::{Level, event};
 
 pub struct UpdateTopicCmd {
     update_topic: UpdateTopic,
+    compression_algorithm: CompressionAlgorithm,
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
     options: TopicUpdateOptions,
@@ -47,14 +48,20 @@ impl UpdateTopicCmd {
                 stream_id,
                 topic_id,
                 name,
-                compression_algorithm,
-                message_expiry,
-                max_topic_size,
+                compression_algorithm: Some(compression_algorithm),
+                message_expiry: Some(message_expiry),
+                max_topic_size: Some(max_topic_size),
                 options: BTreeMap::new(),
             },
+            compression_algorithm,
             message_expiry,
             max_topic_size,
-            options: TopicUpdateOptions::default(),
+            options: TopicUpdateOptions {
+                compression_algorithm: Some(compression_algorithm),
+                message_expiry: Some(message_expiry),
+                max_topic_size: Some(max_topic_size),
+                ..TopicUpdateOptions::default()
+            },
         }
     }
 }
@@ -67,7 +74,7 @@ impl CliCommand for UpdateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, self.update_topic.compression_algorithm, self.message_expiry, self.max_topic_size, &self.options)
+            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, &self.options)
             .await
             .with_context(|| {
                 format!(
@@ -84,7 +91,7 @@ impl CliCommand for UpdateTopicCmd {
             self.update_topic.topic_id,
             self.update_topic.name,
             self.message_expiry,
-            self.update_topic.compression_algorithm,
+            self.compression_algorithm,
             self.max_topic_size,
             self.update_topic.stream_id,
         );
@@ -97,7 +104,7 @@ impl fmt::Display for UpdateTopicCmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let topic_id = &self.update_topic.topic_id;
         let topic_name = &self.update_topic.name;
-        let compression_algorithm = &self.update_topic.compression_algorithm;
+        let compression_algorithm = &self.compression_algorithm;
         let message_expiry = &self.message_expiry;
         let max_topic_size = &self.max_topic_size;
         let stream_id = &self.update_topic.stream_id;

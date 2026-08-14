@@ -533,10 +533,6 @@ impl Client {
                 ));
             }
         };
-        // Replication factor rides the options block now, not a fixed field.
-        let update_options = TopicUpdateOptions {
-            ..TopicUpdateOptions::default()
-        };
         let rust_max_topic_size = match max_topic_size.as_str() {
             "" | "server_default" | "0" => RustMaxTopicSize::ServerDefault,
             _ => RustMaxTopicSize::from_str(&max_topic_size).map_err(|error| {
@@ -546,17 +542,22 @@ impl Client {
             })?,
         };
 
+        // Settings ride the options block; a server-default sentinel means the
+        // caller did not set the key, so the topic keeps its current value.
+        let update_options = TopicUpdateOptions {
+            compression_algorithm: (rust_compression_algorithm
+                != RustCompressionAlgorithm::default())
+            .then_some(rust_compression_algorithm),
+            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
+                .then_some(rust_message_expiry),
+            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
+                .then_some(rust_max_topic_size),
+            ..TopicUpdateOptions::default()
+        };
+
         RUNTIME.block_on(async {
             self.inner
-                .update_topic(
-                    &rust_stream_id,
-                    &rust_topic_id,
-                    &topic_name,
-                    rust_compression_algorithm,
-                    rust_message_expiry,
-                    rust_max_topic_size,
-                    &update_options,
-                )
+                .update_topic(&rust_stream_id, &rust_topic_id, &topic_name, &update_options)
                 .await
                 .map_err(|error| {
                     format!(

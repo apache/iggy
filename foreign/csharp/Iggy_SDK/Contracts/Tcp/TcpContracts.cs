@@ -642,23 +642,34 @@ internal static class TcpContracts
     internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry)
     {
-        // No key may ride an update yet; the block exists so the first one
-        // costs a catalog entry rather than another wire change.
+        // Settings ride the options block. A default value means the caller did
+        // not set the key, so it is omitted and the server leaves the topic's
+        // current value alone.
         var options = new Dictionary<HeaderKey, HeaderValue>();
+        if (compressionAlgorithm != CompressionAlgorithm.None)
+        {
+            options[HeaderKey.FromString("compression_algorithm")]
+                = HeaderValue.FromString(compressionAlgorithm.ToString().ToLowerInvariant());
+        }
+
+        if (messageExpiry != 0)
+        {
+            options[HeaderKey.FromString("message_expiry")] = HeaderValue.FromUInt64(messageExpiry);
+        }
+
+        if (maxTopicSize != 0)
+        {
+            options[HeaderKey.FromString("max_topic_size")] = HeaderValue.FromUInt64(maxTopicSize);
+        }
+
         var optionsLength = HeadersByteLength(options);
         Span<byte> bytes =
-            stackalloc byte[4 + streamId.Length + topicId.Length + 18 + name.Length + optionsLength];
+            stackalloc byte[4 + streamId.Length + topicId.Length + 1 + name.Length + optionsLength];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
         var position = 4 + streamId.Length + topicId.Length;
-        bytes[position] = (byte)compressionAlgorithm;
-        position += 1;
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)],
-            messageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)],
-            maxTopicSize);
-        bytes[position + 16] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 17)..(position + 17 + name.Length)]);
-        WriteHeadersTo(bytes[(position + 17 + name.Length)..], options);
+        bytes[position] = (byte)name.Length;
+        Encoding.UTF8.GetBytes(name, bytes[(position + 1)..(position + 1 + name.Length)]);
+        WriteHeadersTo(bytes[(position + 1 + name.Length)..], options);
         return bytes.ToArray();
     }
 

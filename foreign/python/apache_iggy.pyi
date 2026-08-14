@@ -1083,8 +1083,9 @@ class IggyClient:
         r"""
         Update an existing topic.
 
-        This is a full replacement: any optional parameter left unset is reset to
-        its server default rather than preserved.
+        A patch, not a replacement: every setting rides the options block, so a
+        field left unset keeps the topic's current value rather than resetting
+        it to a server default.
 
         Args:
             stream_id: Stream identifier as `str | int`.

@@ -116,7 +116,11 @@ impl WireDecode for GetTopicResponse {
         // Count-driven so the element stays delimited even when embedded in a
         // larger payload; the header's variable-length options blocks removed
         // the old "everything after the header is partitions" property.
-        let mut partitions = Vec::with_capacity(topic.partitions_count as usize);
+        let mut partitions = Vec::with_capacity(crate::codec::bounded_capacity(
+            topic.partitions_count as usize,
+            buf.len().saturating_sub(pos),
+            PartitionResponse::FIXED_SIZE,
+        ));
         for _ in 0..topic.partitions_count {
             let (partition, consumed) = PartitionResponse::decode(&buf[pos..])?;
             pos += consumed;

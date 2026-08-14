@@ -18,9 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, topics_from_wire};
 use crate::{
-    BinaryClient, CompressionAlgorithm, DEFAULT_PARTITIONS_COUNT, Identifier, IggyError,
-    IggyExpiry, MaxTopicSize, Topic, TopicClient, TopicCreateOptions, TopicDetails,
-    TopicUpdateOptions,
+    BinaryClient, DEFAULT_PARTITIONS_COUNT, Identifier, IggyError, Topic, TopicClient,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
@@ -111,9 +110,6 @@ impl<B: BinaryClient> TopicClient for B {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
@@ -125,9 +121,6 @@ impl<B: BinaryClient> TopicClient for B {
             UpdateTopicRequest {
                 stream_id: wire_stream_id,
                 topic_id: wire_topic_id,
-                compression_algorithm: compression_algorithm.as_code(),
-                message_expiry: u64::from(message_expiry),
-                max_topic_size: u64::from(max_topic_size),
                 name: wire_name,
                 options: options.to_wire()?,
             }

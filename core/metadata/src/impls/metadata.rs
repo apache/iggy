@@ -3404,15 +3404,25 @@ where
 
         match header.operation {
             Operation::CreateTopic => {
-                let request = WireCreateTopicRequest::decode_from(body)
+                let mut request = WireCreateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
                 // Resolve every absent catalog key against server config here,
                 // at primary admission, so the replicated payload carries
                 // concrete values and every replica commits the same state
-                // regardless of local config. The client's explicit block is
-                // forwarded verbatim; resolved defaults ride a separate
+                // regardless of local config. Resolved defaults ride a separate
                 // derived block, preserving per-key provenance for `GetTopic`.
                 let explicit = TopicCreateOptions::parse(&request.options)?;
+                // Re-encode the explicit block from the parse rather than
+                // forwarding the client's bytes. Parsing normalizes a zero
+                // sentinel to "absent", so the resolved value goes in the
+                // derived block -- but apply merges with explicit winning, so a
+                // forwarded literal `0` would land back on top as the stored
+                // effective value. `GetTopic` would report 0, and a restart
+                // would re-parse that 0 to absent and fall back to whatever the
+                // node default is by then, not the value resolved at creation.
+                // Re-encoding also canonicalizes kinds (a `"128MiB"` string
+                // becomes `Uint64`), so the stored map reads back uniformly.
+                request.options = explicit.to_wire()?;
                 let resolved_segment_size = explicit
                     .segment_size
                     .unwrap_or_else(|| IggyByteSize::from(self.default_segment_size.get()));
@@ -4544,7 +4554,7 @@ mod tests {
             .expect("create topic with assignments prepare must decode");
         assert!(
             persisted.request.options.is_empty(),
-            "the client's explicit block is forwarded verbatim"
+            "a client that sent no options gets an empty explicit block"
         );
         let derived = iggy_common::TopicCreateOptions::parse(&persisted.derived_options)
             .expect("derived block parses against the catalog");

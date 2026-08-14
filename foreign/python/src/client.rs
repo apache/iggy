@@ -609,8 +609,9 @@ impl IggyClient {
 
     /// Update an existing topic.
     ///
-    /// This is a full replacement: any optional parameter left unset is reset to
-    /// its server default rather than preserved.
+    /// A patch, not a replacement: every setting rides the options block, so a
+    /// field left unset keeps the topic's current value rather than resetting
+    /// it to a server default.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -647,25 +648,28 @@ impl IggyClient {
             &MaxTopicSize,
         >,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let (compression_algorithm, expiry, max_size) =
-            resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
+        // Absent stays absent: a key the caller did not pass is left alone
+        // server-side rather than reset to a default.
+        let compression_algorithm = compression_algorithm
+            .map(|algo| {
+                CompressionAlgorithm::from_str(&algo)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            })
+            .transpose()?;
+        let update_options = TopicUpdateOptions {
+            compression_algorithm,
+            message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
+            max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
+            ..TopicUpdateOptions::default()
+        };
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
-        let update_options = TopicUpdateOptions::default();
 
         future_into_py(py, async move {
             inner
-                .update_topic(
-                    &stream_id,
-                    &topic_id,
-                    &name,
-                    compression_algorithm,
-                    expiry,
-                    max_size,
-                    &update_options,
-                )
+                .update_topic(&stream_id, &topic_id, &name, &update_options)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())

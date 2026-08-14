@@ -17,7 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
+use crate::prelude::{Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::create_topic::CreateTopic;
@@ -101,9 +101,6 @@ impl TopicClient for HttpClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         self.put(
@@ -112,9 +109,9 @@ impl TopicClient for HttpClient {
                 stream_id: stream_id.clone(),
                 topic_id: topic_id.clone(),
                 name: name.to_string(),
-                compression_algorithm,
-                message_expiry,
-                max_topic_size,
+                compression_algorithm: options.compression_algorithm,
+                message_expiry: options.message_expiry,
+                max_topic_size: options.max_topic_size,
                 options: options.raw.clone(),
             },
         )

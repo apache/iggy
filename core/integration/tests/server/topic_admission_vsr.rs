@@ -147,10 +147,11 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
                     stream_id,
                     topic_id,
                     "echo-topic",
-                    CompressionAlgorithm::None,
-                    message_expiry,
-                    max_topic_size,
-                    &TopicUpdateOptions::default(),
+                    &TopicUpdateOptions {
+                        message_expiry: Some(message_expiry),
+                        max_topic_size: Some(max_topic_size),
+                        ..TopicUpdateOptions::default()
+                    },
                 )
                 .await
                 .expect("update topic");
@@ -163,15 +164,16 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
         }
     };
 
-    // The server echoes both stored sentinels as wire 0 (legacy parity). The
-    // SDK decodes a topic-response size 0 as `ServerDefault` but an expiry 0
-    // as `NeverExpire` (`wire_conversions`), so that is the legacy-identical
-    // client-visible read-back; the node default must NOT leak into either.
+    // Settings ride the options block and 0 is its "resolve the default"
+    // sentinel, so a `ServerDefault` on update carries no key at all: the topic
+    // keeps what it already had. Resetting a setting back to the node default
+    // is deliberately not expressible -- an update states the values it wants,
+    // and everything it omits survives.
+    let created_size = MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").expect("byte size"));
     assert_eq!(
         update_topic(MaxTopicSize::ServerDefault, IggyExpiry::ServerDefault).await,
-        (MaxTopicSize::ServerDefault, IggyExpiry::NeverExpire),
-        "an update to ServerDefault must echo the stored sentinel, \
-         not the node default frozen at update time"
+        (created_size, IggyExpiry::NeverExpire),
+        "a sentinel carries no key, so the value set at creation survives"
     );
     let custom_size = MaxTopicSize::Custom(IggyByteSize::from_str("3GiB").expect("byte size"));
     let custom_expiry = IggyExpiry::ExpireDuration(IggyDuration::from_str("5s").expect("duration"));

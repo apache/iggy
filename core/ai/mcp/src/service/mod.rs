@@ -200,24 +200,17 @@ impl IggyService {
         }): Parameters<UpdateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        let compression_algorithm = compression_algorithm
-            .and_then(|ca| ca.parse().ok())
-            .unwrap_or_default();
-        let message_expiry = message_expiry
-            .and_then(|me| me.parse().ok())
-            .unwrap_or_default();
-        let max_size = max_size.and_then(|ms| ms.parse().ok()).unwrap_or_default();
+        // Absent means "leave alone" now, so an unparseable value must not
+        // silently become a reset to the server default.
+        let options = TopicUpdateOptions {
+            compression_algorithm: compression_algorithm.and_then(|ca| ca.parse().ok()),
+            message_expiry: message_expiry.and_then(|me| me.parse().ok()),
+            max_topic_size: max_size.and_then(|ms| ms.parse().ok()),
+            ..TopicUpdateOptions::default()
+        };
         request(
             self.client
-                .update_topic(
-                    &id(&stream_id)?,
-                    &id(&topic_id)?,
-                    &name,
-                    compression_algorithm,
-                    message_expiry,
-                    max_size,
-                    &TopicUpdateOptions::default(),
-                )
+                .update_topic(&id(&stream_id)?, &id(&topic_id)?, &name, &options)
                 .await,
         )
     }

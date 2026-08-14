@@ -175,14 +175,12 @@ public class TopicsTcpClient implements TopicsClient {
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
-        payload.writeByte(compressionAlgorithm.asCode());
-        payload.writeBytes(toBytesAsU64(messageExpiry));
-        payload.writeBytes(toBytesAsU64(maxTopicSize));
         payload.writeBytes(BytesSerializer.toBytes(name));
-        // Only the updatable subset may ride an update; the server rejects the
-        // create-time knobs by name.
-        Map<HeaderKey, HeaderValue> options = new LinkedHashMap<>();
-        payload.writeBytes(BytesSerializer.toBytes(options));
+        // Settings ride the options block. A default value means the caller did
+        // not set the key, so it is omitted and the server leaves the topic's
+        // current value alone.
+        payload.writeBytes(BytesSerializer.toBytes(
+                createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize)));
 
         return connection()
                 .send(CommandCode.Topic.UPDATE.getValue(), payload)

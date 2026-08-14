@@ -601,10 +601,12 @@ pub async fn run(harness: &TestHarness) {
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &updated_topic_name,
-            CompressionAlgorithm::Gzip,
-            IggyExpiry::ExpireDuration(message_expiry_duration),
-            updated_max_topic_size,
-            &TopicUpdateOptions::default(),
+            &TopicUpdateOptions {
+                compression_algorithm: Some(CompressionAlgorithm::Gzip),
+                message_expiry: Some(IggyExpiry::ExpireDuration(message_expiry_duration)),
+                max_topic_size: Some(updated_max_topic_size),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .unwrap();

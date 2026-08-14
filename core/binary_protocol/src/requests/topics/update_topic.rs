@@ -17,19 +17,21 @@
 
 use crate::WireError;
 use crate::WireIdentifier;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u64_le};
+use crate::codec::{WireDecode, WireEncode};
 use crate::primitives::identifier::WireName;
 use crate::primitives::options::WireOptions;
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 
 /// `UpdateTopic` request.
 ///
 /// Wire format:
-/// `[stream_id:WireIdentifier][topic_id:WireIdentifier][compression_algorithm:u8]
-///  [message_expiry:u64_le][max_topic_size:u64_le][name_len:u8][name:N][options TLV to end]`
+/// `[stream_id:WireIdentifier][topic_id:WireIdentifier][name_len:u8][name:N]
+///  [options TLV to end]`
 ///
-/// The options block mirrors `CreateTopic`'s and carries the same catalog, so
-/// a knob added there is updatable here without another layout change.
+/// Identity and the new name are the only fixed fields; every SETTING rides the
+/// options block, which mirrors `CreateTopic`'s and carries the same catalog.
+/// A knob added there is updatable here without another layout change, and no
+/// setting has two homes to disagree between.
 ///
 /// Keys absent from the block are LEFT ALONE rather than reset to their
 /// defaults. A client built before a key existed cannot send it, so treating
@@ -40,20 +42,14 @@ use bytes::{BufMut, BytesMut};
 pub struct UpdateTopicRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
-    pub compression_algorithm: u8,
-    pub message_expiry: u64,
-    pub max_topic_size: u64,
     pub name: WireName,
     pub options: WireOptions,
 }
-
-const FIXED_FIELDS_SIZE: usize = 1 + 8 + 8; // 17 bytes
 
 impl WireEncode for UpdateTopicRequest {
     fn encoded_size(&self) -> usize {
         self.stream_id.encoded_size()
             + self.topic_id.encoded_size()
-            + FIXED_FIELDS_SIZE
             + self.name.encoded_size()
             + self.options.encoded_size()
     }
@@ -61,9 +57,6 @@ impl WireEncode for UpdateTopicRequest {
     fn encode(&self, buf: &mut BytesMut) {
         self.stream_id.encode(buf);
         self.topic_id.encode(buf);
-        buf.put_u8(self.compression_algorithm);
-        buf.put_u64_le(self.message_expiry);
-        buf.put_u64_le(self.max_topic_size);
         self.name.encode(buf);
         self.options.encode(buf);
     }
@@ -74,12 +67,6 @@ impl WireDecode for UpdateTopicRequest {
         let (stream_id, mut pos) = WireIdentifier::decode(buf)?;
         let (topic_id, consumed) = WireIdentifier::decode(&buf[pos..])?;
         pos += consumed;
-        let compression_algorithm = read_u8(buf, pos)?;
-        pos += 1;
-        let message_expiry = read_u64_le(buf, pos)?;
-        pos += 8;
-        let max_topic_size = read_u64_le(buf, pos)?;
-        pos += 8;
         let (name, name_consumed) = WireName::decode(&buf[pos..])?;
         pos += name_consumed;
         let options = WireOptions::from_slice(&buf[pos..])?;
@@ -87,9 +74,6 @@ impl WireDecode for UpdateTopicRequest {
             Self {
                 stream_id,
                 topic_id,
-                compression_algorithm,
-                message_expiry,
-                max_topic_size,
                 name,
                 options,
             },
@@ -113,9 +97,6 @@ mod tests {
         UpdateTopicRequest {
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(2),
-            compression_algorithm: 1,
-            message_expiry: 7200,
-            max_topic_size: 500_000,
             name: WireName::new("updated-topic").unwrap(),
             options: sample_options(),
         }
@@ -135,9 +116,6 @@ mod tests {
         let req = UpdateTopicRequest {
             stream_id: WireIdentifier::named("stream-a").unwrap(),
             topic_id: WireIdentifier::named("topic-b").unwrap(),
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: u64::MAX,
             name: WireName::new("new-name").unwrap(),
             options: WireOptions::empty(),
         };

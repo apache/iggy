@@ -303,9 +303,6 @@ impl SimClient {
         let wire = UpdateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
             name: WireName::new(new_name).expect("topic name must be valid"),
             options: WireOptions::empty(),
         };

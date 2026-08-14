@@ -149,12 +149,20 @@ impl WireEncode for GetStreamResponse {
     }
 }
 
+/// Smallest a topic header can encode as: the fixed ids, timestamps, sizes and
+/// counts, plus a name length and two length-prefixed option blocks.
+const MIN_TOPIC_HEADER_SIZE: usize = 45;
+
 impl WireDecode for GetStreamResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (stream, mut pos) = StreamResponse::decode(buf)?;
         // Count-driven: a topic element carries variable-length options
         // blocks, so "consume until the buffer ends" no longer delimits it.
-        let mut topics = Vec::with_capacity(stream.topics_count as usize);
+        let mut topics = Vec::with_capacity(crate::codec::bounded_capacity(
+            stream.topics_count as usize,
+            buf.len().saturating_sub(pos),
+            MIN_TOPIC_HEADER_SIZE,
+        ));
         for _ in 0..stream.topics_count {
             let (topic, consumed) = TopicHeader::decode(&buf[pos..])?;
             pos += consumed;

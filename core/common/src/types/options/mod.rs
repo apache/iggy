@@ -334,19 +334,23 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
 /// The subset of [`TOPIC_OPTION_KEYS`] an `UpdateTopic` options block may
 /// carry.
 ///
-/// Empty. Two separate reasons keep every key out:
+/// These three used to be fixed fields of the update command, which meant one
+/// setting had two homes and an update always rewrote all three whether the
+/// caller meant to or not. As options they are patched: a key the client did
+/// not send keeps its current value.
 ///
-/// * `compression_algorithm`, `message_expiry` and `max_topic_size` have
-///   dedicated fixed fields on the update layout. Accepting them in the block
-///   too would mean two sources for one setting and a precedence rule nobody
-///   can guess, so sending them here is an error rather than a silent
-///   last-writer-wins.
-/// * The partition runtime knobs (`segment_size`, `enforce_fsync`, both flush
-///   thresholds, `preallocate_segments`) are pushed to partitions when the
-///   topic is built. Nothing re-pushes them on update, so accepting one would
-///   store a value the partitions never see -- a knob that reads as applied
-///   and is not. They stay create-only until that propagation exists.
-pub const UPDATABLE_TOPIC_OPTION_KEYS: &[&str] = &[];
+/// The partition runtime knobs (`segment_size`, `enforce_fsync`, both flush
+/// thresholds, `preallocate_segments`) stay out, and not only because nothing
+/// re-pushes them to a live partition. They describe how a partition's storage
+/// was laid down: changing `segment_size` mid-segment leaves one segment sized
+/// by the old cap and the next by the new one, and `preallocate_segments` can
+/// only act on a file not yet opened. A topic gets them at creation and keeps
+/// them, so its segments stay uniform.
+pub const UPDATABLE_TOPIC_OPTION_KEYS: &[&str] = &[
+    topic_option_keys::COMPRESSION_ALGORITHM,
+    topic_option_keys::MESSAGE_EXPIRY,
+    topic_option_keys::MAX_TOPIC_SIZE,
+];
 
 /// Keys an `UpdateStream` options block may carry. Empty because streams have
 /// no catalog keys yet: the block exists so the first one costs a catalog
@@ -408,8 +412,10 @@ fn raw_options_to_wire(raw: &BTreeMap<String, String>) -> Result<WireOptions, Ig
 /// the option map, it does not replace it. See [`TopicUpdateOptions`] for why.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamUpdateOptions {
-    /// Keys sent as `String` values. Checked against
-    /// [`UPDATABLE_STREAM_OPTION_KEYS`] server-side.
+    /// Keys sent as `String` values, checked against
+    /// [`UPDATABLE_STREAM_OPTION_KEYS`] server-side. That list is empty, so
+    /// every key is currently refused by name; the field exists so the first
+    /// updatable stream key costs a catalog entry, not a wire change.
     pub raw: BTreeMap<String, String>,
 }
 
@@ -428,8 +434,10 @@ impl StreamUpdateOptions {
 /// [`StreamUpdateOptions`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UserUpdateOptions {
-    /// Keys sent as `String` values. Checked against
-    /// [`UPDATABLE_USER_OPTION_KEYS`] server-side.
+    /// Keys sent as `String` values, checked against
+    /// [`UPDATABLE_USER_OPTION_KEYS`] server-side. That list is empty, so every
+    /// key is currently refused by name; the field exists so the first
+    /// updatable user key costs a catalog entry, not a wire change.
     pub raw: BTreeMap<String, String>,
 }
 
@@ -497,19 +505,54 @@ impl TopicRuntimeOptions {
 /// value alone -- an update patches the option map, it does not replace it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicUpdateOptions {
-    /// Keys sent as `String` values, for setting a key this build does not
-    /// know yet. Still checked against the updatable set server-side.
+    /// `None` leaves the topic's current algorithm alone.
+    pub compression_algorithm: Option<CompressionAlgorithm>,
+    /// `None` leaves the topic's current expiry alone.
+    pub message_expiry: Option<IggyExpiry>,
+    /// `None` leaves the topic's current cap alone.
+    pub max_topic_size: Option<MaxTopicSize>,
+    /// Keys sent as `String` values, checked against
+    /// [`UPDATABLE_TOPIC_OPTION_KEYS`] server-side. Lets a client reach an
+    /// updatable key added to the catalog after this build shipped.
     pub raw: BTreeMap<String, String>,
 }
 
 impl TopicUpdateOptions {
-    /// Encode the present keys into an options block.
+    /// Encode the present keys into an options block, in canonical kinds.
+    ///
+    /// A typed field is inserted after the raw entries, so it wins on collision
+    /// and keeps its canonical kind.
     ///
     /// # Errors
     ///
-    /// See [`raw_options_to_wire`].
+    /// See [`raw_options_map`].
     pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
-        raw_options_to_wire(&self.raw)
+        let mut options = raw_options_map(&self.raw)?;
+        if let Some(compression_algorithm) = self.compression_algorithm {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::COMPRESSION_ALGORITHM)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(
+                    HeaderValue::try_from(compression_algorithm.to_string().as_str())
+                        .expect("compression name fits a header value"),
+                ),
+            );
+        }
+        if let Some(message_expiry) = self.message_expiry {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from(u64::from(message_expiry))),
+            );
+        }
+        if let Some(max_topic_size) = self.max_topic_size {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from(u64::from(max_topic_size))),
+            );
+        }
+        crate::wire_conversions::resource_options_to_wire(&options, OptionsProvenance::All)
     }
 }
 
@@ -896,41 +939,6 @@ impl TopicCreateOptions {
     }
 }
 
-/// The option entries mirroring the three settings `UpdateTopic` carries as
-/// fixed fields of the command rather than as option keys.
-///
-/// An update writes both, so the stored map has to be rewritten alongside the
-/// typed fields; leaving it alone makes `GetTopic` report the new expiry in
-/// its field and the create-time one under `options`, with no way to tell
-/// which is in force.
-#[must_use]
-pub fn topic_field_options(
-    compression_algorithm: CompressionAlgorithm,
-    message_expiry: IggyExpiry,
-    max_topic_size: MaxTopicSize,
-) -> ResourceOptions {
-    ResourceOptions::from([
-        (
-            HeaderKey::from_str(topic_option_keys::COMPRESSION_ALGORITHM)
-                .expect("catalog key is a valid header key"),
-            OptionValue::explicit(
-                HeaderValue::try_from(compression_algorithm.to_string().as_str())
-                    .expect("compression name fits a header value"),
-            ),
-        ),
-        (
-            HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY)
-                .expect("catalog key is a valid header key"),
-            OptionValue::explicit(HeaderValue::from(u64::from(message_expiry))),
-        ),
-        (
-            HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE)
-                .expect("catalog key is a valid header key"),
-            OptionValue::explicit(HeaderValue::from(u64::from(max_topic_size))),
-        ),
-    ])
-}
-
 /// What a parse does with an entry this build cannot interpret: a key outside
 /// [`TOPIC_OPTION_KEYS`], or a catalog key whose value kind or payload does
 /// not parse.
@@ -998,10 +1006,15 @@ fn parse_byte_size(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<u64, Ig
 
 fn parse_bool(entry: &WireUserHeaderEntry<'_>, key: &str) -> Result<bool, IggyError> {
     if entry.value_kind.0 == HeaderKind::Bool.as_code() {
-        return match entry.value.first() {
-            Some(0) => Ok(false),
-            Some(_) => Ok(true),
-            None => Err(IggyError::InvalidOptionValue(key.to_string())),
+        // Exactly one byte of 0 or 1. Anything looser admits a value that
+        // `HeaderValue::as_bool` later refuses to read, so the stored map would
+        // hold an entry its own public accessor rejects; a multi-byte payload
+        // would pass this gate and only fail at apply, turning a client
+        // mistake into a committed state-machine rejection.
+        return match entry.value {
+            [0] => Ok(false),
+            [1] => Ok(true),
+            _ => Err(IggyError::InvalidOptionValue(key.to_string())),
         };
     }
     if entry.value_kind.0 == HeaderKind::String.as_code() {
@@ -1018,12 +1031,11 @@ fn parse_compression(
     key: &str,
 ) -> Result<CompressionAlgorithm, IggyError> {
     if entry.value_kind.0 == HeaderKind::Uint8.as_code() {
-        let code = entry
-            .value
-            .first()
-            .copied()
-            .ok_or_else(|| IggyError::InvalidOptionValue(key.to_string()))?;
-        return CompressionAlgorithm::from_code(code)
+        // Exactly one byte, for the same reason as `parse_bool`.
+        let [code] = entry.value else {
+            return Err(IggyError::InvalidOptionValue(key.to_string()));
+        };
+        return CompressionAlgorithm::from_code(*code)
             .map_err(|_| IggyError::InvalidOptionValue(key.to_string()));
     }
     if entry.value_kind.0 == HeaderKind::String.as_code() {
@@ -1124,6 +1136,45 @@ mod tests {
         assert_eq!(parsed.message_expiry, None);
         assert_eq!(parsed.max_topic_size, None);
         assert_eq!(parsed.segment_size, None);
+    }
+
+    #[test]
+    fn sentinel_zeros_do_not_survive_re_encoding() {
+        // A client may send 0 to mean "resolve the default". Parsing normalizes
+        // it to absent, so admission puts the resolved value in the derived
+        // block -- but apply merges with explicit winning. If the literal 0
+        // were still in the explicit block it would land back on top as the
+        // stored effective value, and a restart would re-parse it to absent and
+        // fall back to the node default rather than the value resolved at
+        // creation. Re-encoding from the parse is what drops it.
+        let sent = TopicCreateOptions {
+            message_expiry: Some(IggyExpiry::from(0u64)),
+            max_topic_size: Some(MaxTopicSize::from(0u64)),
+            segment_size: Some(IggyByteSize::from(0u64)),
+            size_of_messages_required_to_save: Some(IggyByteSize::from(0u64)),
+            enforce_fsync: Some(true),
+            ..TopicCreateOptions::default()
+        };
+        let parsed = TopicCreateOptions::parse(&sent.to_wire().unwrap()).unwrap();
+        let re_encoded = parsed.to_wire().unwrap();
+        let stored =
+            crate::wire_conversions::resource_options_from_wire(&re_encoded, true).unwrap();
+
+        for key in [
+            topic_option_keys::MESSAGE_EXPIRY,
+            topic_option_keys::MAX_TOPIC_SIZE,
+            topic_option_keys::SEGMENT_SIZE,
+            topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+        ] {
+            assert!(
+                !stored.contains_key(&HeaderKey::from_str(key).unwrap()),
+                "{key} sentinel must not be persisted as an explicit value"
+            );
+        }
+        // A non-sentinel key alongside them still rides through untouched.
+        assert!(
+            stored.contains_key(&HeaderKey::from_str(topic_option_keys::ENFORCE_FSYNC).unwrap())
+        );
     }
 
     #[test]

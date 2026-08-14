@@ -25,6 +25,7 @@ import { COMMAND_CODE } from '../command.code.js';
 import {
   type CompressionAlgorithm as CompressionAlgorithmT,
   CompressionAlgorithm,
+  compressionAlgorithmName,
   isValidCompressionAlgorithm
 } from './topic.utils.js';
 
@@ -69,17 +70,29 @@ export const UPDATE_TOPIC = {
     if (bName.length < 1 || bName.length > 255)
       throw new Error('Topic name should be between 1 and 255 bytes');
     if(!isValidCompressionAlgorithm(compressionAlgorithm))
-      throw new Error(`createTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
+      throw new Error(`updateTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
 
-    // No key may ride an update yet; the block exists so the first one costs
-    // a catalog entry rather than another wire change.
+    // Settings ride the options block. A default value means the caller did not
+    // set the key, so it is omitted and the server leaves the current value be.
     const options: OptionEntry[] = [];
+    if (compressionAlgorithm !== CompressionAlgorithm.None)
+      options.push({
+        key: 'compression_algorithm',
+        value: HeaderValue.String(compressionAlgorithmName(compressionAlgorithm))
+      });
+    if (messageExpiry !== 0n)
+      options.push({
+        key: 'message_expiry',
+        value: HeaderValue.Uint64(messageExpiry)
+      });
+    if (maxTopicSize !== 0n)
+      options.push({
+        key: 'max_topic_size',
+        value: HeaderValue.Uint64(maxTopicSize)
+      });
 
-    const b = Buffer.allocUnsafe(8 + 8 + 1 + 1);
-    b.writeUInt8(compressionAlgorithm, 0);
-    b.writeBigUInt64LE(messageExpiry, 1); // 0 is unlimited ???
-    b.writeBigUInt64LE(maxTopicSize, 9); // optional, 0 is null
-    b.writeUInt8(bName.length, 17);
+    const b = Buffer.allocUnsafe(1);
+    b.writeUInt8(bName.length, 0);
 
     return Buffer.concat([
       streamIdentifier,

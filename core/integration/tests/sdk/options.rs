@@ -291,14 +291,12 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
             &stream,
             &topic,
             "update-topic",
-            CompressionAlgorithm::None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
             &TopicUpdateOptions {
                 raw: BTreeMap::from([(
                     topic_option_keys::SEGMENT_SIZE.to_string(),
                     "2MiB".to_string(),
                 )]),
+                ..TopicUpdateOptions::default()
             },
         )
         .await;
@@ -309,9 +307,6 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
             &stream,
             &topic,
             "update-topic",
-            CompressionAlgorithm::None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
             &TopicUpdateOptions::default(),
         )
         .await
@@ -398,4 +393,129 @@ async fn given_unknown_key_when_updating_stream_or_user_should_reject(harness: &
         )
         .await
         .unwrap();
+}
+
+#[iggy_harness]
+async fn given_sentinel_zeros_when_creating_topic_should_report_resolved_defaults(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.unwrap();
+    client.create_stream("sentinel-stream").await.unwrap();
+    let stream = Identifier::named("sentinel-stream").unwrap();
+
+    // 0 means "resolve the server default", not "expire immediately" / "no
+    // space". Admission normalizes it away, so the stored map must report the
+    // resolved value as derived -- never a literal 0 marked explicit, which is
+    // what a client would then read back as the effective configuration.
+    client
+        .create_topic(
+            &stream,
+            "sentinel-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::from(0u64)),
+                max_topic_size: Some(MaxTopicSize::from(0u64)),
+                segment_size: Some(IggyByteSize::from(0u64)),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let details = client
+        .get_topic(&stream, &Identifier::named("sentinel-topic").unwrap())
+        .await
+        .unwrap()
+        .expect("topic exists");
+
+    for key in [
+        topic_option_keys::MESSAGE_EXPIRY,
+        topic_option_keys::MAX_TOPIC_SIZE,
+        topic_option_keys::SEGMENT_SIZE,
+    ] {
+        let option = details
+            .options
+            .get(&HeaderKey::from_str(key).unwrap())
+            .unwrap_or_else(|| panic!("{key} resolves to a default rather than vanishing"));
+        assert!(
+            !option.explicit,
+            "{key} sentinel must resolve to a derived default, not persist as explicit"
+        );
+        assert_ne!(
+            option.value.as_bytes(),
+            0u64.to_le_bytes(),
+            "{key} must report the resolved value, not the sentinel"
+        );
+    }
+}
+
+#[iggy_harness]
+async fn given_rename_only_when_updating_topic_should_leave_settings_alone(harness: &TestHarness) {
+    let client = harness.root_client().await.unwrap();
+    client.create_stream("patch-stream").await.unwrap();
+    let stream = Identifier::named("patch-stream").unwrap();
+
+    client
+        .create_topic(
+            &stream,
+            "patch-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                compression_algorithm: Some(CompressionAlgorithm::Gzip),
+                message_expiry: Some(IggyExpiry::from(5_000_000u64)),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic = Identifier::named("patch-topic").unwrap();
+
+    // Settings live only in the options block, so an update that carries none
+    // of them is a pure rename. While they were fixed fields of the command
+    // this was impossible: every update rewrote all three whether or not the
+    // caller meant to.
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            "patch-renamed",
+            &TopicUpdateOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let details = client
+        .get_topic(&stream, &Identifier::named("patch-renamed").unwrap())
+        .await
+        .unwrap()
+        .expect("topic exists");
+    assert_eq!(details.name, "patch-renamed");
+    assert_eq!(details.compression_algorithm, CompressionAlgorithm::Gzip);
+    assert_eq!(details.message_expiry, IggyExpiry::from(5_000_000u64));
+
+    // Sending one key changes that key and leaves the other alone.
+    client
+        .update_topic(
+            &stream,
+            &Identifier::named("patch-renamed").unwrap(),
+            "patch-renamed",
+            &TopicUpdateOptions {
+                message_expiry: Some(IggyExpiry::from(9_000_000u64)),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let details = client
+        .get_topic(&stream, &Identifier::named("patch-renamed").unwrap())
+        .await
+        .unwrap()
+        .expect("topic exists");
+    assert_eq!(details.message_expiry, IggyExpiry::from(9_000_000u64));
+    assert_eq!(
+        details.compression_algorithm,
+        CompressionAlgorithm::Gzip,
+        "a key the update did not carry keeps its value"
+    );
 }

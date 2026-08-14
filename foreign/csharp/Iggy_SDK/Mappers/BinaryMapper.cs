@@ -748,27 +748,32 @@ internal static class BinaryMapper
     private static Dictionary<HeaderKey, HeaderValue> MapOptions(ReadOnlySpan<byte> payload, int position,
         out int readBytes)
     {
-        var optionsLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        readBytes = 4 + optionsLength;
+        // Every length here is server-controlled. Read the block length as long
+        // so a value above int.MaxValue cannot wrap negative, and bound each
+        // entry against the block before slicing: an entry that overruns `end`
+        // would otherwise be accepted and silently consume the response bytes
+        // that follow the block.
+        var optionsLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        var available = (long)payload.Length - (position + 4);
+        if (optionsLength > available)
+        {
+            throw new MalformedResponseException(
+                $"Malformed options block at byte {position}: declared length {optionsLength} exceeds the " +
+                $"{available} bytes remaining in the payload.");
+        }
+
+        readBytes = 4 + (int)optionsLength;
 
         var options = new Dictionary<HeaderKey, HeaderValue>();
         var cursor = position + 4;
-        var end = position + 4 + optionsLength;
+        var end = cursor + (int)optionsLength;
         while (cursor < end)
         {
-            var keyKind = MapHeaderKind(payload[cursor]);
-            cursor += 1;
-            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[cursor..(cursor + 4)]);
-            cursor += 4;
-            var key = payload[cursor..(cursor + keyLength)].ToArray();
-            cursor += keyLength;
+            var keyKind = MapHeaderKind(ReadOptionByte(payload, ref cursor, end, position));
+            var key = ReadOptionField(payload, ref cursor, end, position, "key");
 
-            var valueKind = MapHeaderKind(payload[cursor]);
-            cursor += 1;
-            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[cursor..(cursor + 4)]);
-            cursor += 4;
-            var value = payload[cursor..(cursor + valueLength)].ToArray();
-            cursor += valueLength;
+            var valueKind = MapHeaderKind(ReadOptionByte(payload, ref cursor, end, position));
+            var value = ReadOptionField(payload, ref cursor, end, position, "value");
 
             options[new HeaderKey
             {
@@ -781,7 +786,55 @@ internal static class BinaryMapper
             };
         }
 
+        if (cursor != end)
+        {
+            throw new MalformedResponseException(
+                $"Malformed options block at byte {position}: entries ended at {cursor}, block ends at {end}.");
+        }
+
         return options;
+    }
+
+    private static byte ReadOptionByte(ReadOnlySpan<byte> payload, ref int cursor, int end, int blockStart)
+    {
+        if (cursor + 1 > end)
+        {
+            throw new MalformedResponseException(
+                $"Malformed options block at byte {blockStart}: entry kind runs past the end of the block.");
+        }
+
+        var value = payload[cursor];
+        cursor += 1;
+        return value;
+    }
+
+    private static byte[] ReadOptionField(ReadOnlySpan<byte> payload, ref int cursor, int end, int blockStart,
+        string field)
+    {
+        if (cursor + 4 > end)
+        {
+            throw new MalformedResponseException(
+                $"Malformed options block at byte {blockStart}: {field} length runs past the end of the block.");
+        }
+
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(payload[cursor..(cursor + 4)]);
+        cursor += 4;
+        if (length is < 1 or > 255)
+        {
+            throw new MalformedResponseException(
+                $"Malformed options block at byte {blockStart}: {field} length {length} is outside 1..=255.");
+        }
+
+        if (cursor + (int)length > end)
+        {
+            throw new MalformedResponseException(
+                $"Malformed options block at byte {blockStart}: {field} of {length} bytes runs past the end of " +
+                "the block.");
+        }
+
+        var bytes = payload[cursor..(cursor + (int)length)].ToArray();
+        cursor += (int)length;
+        return bytes;
     }
 
     internal static IReadOnlyList<StreamResponse> MapStreams(ReadOnlySpan<byte> payload)

@@ -168,15 +168,23 @@ fn preallocate_file(file: &File, file_path: &str, len: u64) {
         return;
     };
 
-    // Runs INLINE on the shard thread, deliberately. Shard executors disable
-    // the blocking fallback pool (`thread_pool_limit(0)` in
-    // `server_common::executor`), so `spawn_blocking` does not park a task --
-    // compio panics the shard outright with "the thread pool is needed but no
-    // worker thread is running". `FALLOC_FL_KEEP_SIZE` is a metadata-only
-    // extent reservation, microseconds on a local filesystem, which is the
-    // deployment this reservation exists for. A network filesystem can make it
-    // block; there it is better to turn the topic's `preallocate_segments`
-    // option off than to reintroduce a pool the runtime does not have.
+    // Runs INLINE on the shard thread, deliberately. `server_common::executor`
+    // sets `thread_pool_limit(0)` on the shard proactor, so `spawn_blocking`
+    // has no worker to park a task on and compio panics the shard outright with
+    // "the thread pool is needed but no worker thread is running". (That limit
+    // is skipped on macOS/aarch64, where the pool does exist -- see the FIXME
+    // there -- so the panic is Linux-and-most-targets, not universal. This arm
+    // is Linux-only regardless.)
+    //
+    // The cost is acceptable only because of what this call is: a metadata-only
+    // extent reservation, microseconds on the local filesystems this option
+    // exists for, and an immediate `EOPNOTSUPP` where the filesystem cannot do
+    // it. Where it can genuinely block -- NFSv4.2 `ALLOCATE`, FUSE, a badly
+    // fragmented extent tree forcing a journal commit -- it stalls the whole
+    // core, not one partition, because nothing here yields. Preallocation is
+    // opt-in per topic at creation for that reason; on such a deployment,
+    // create topics without `preallocate_segments` rather than reintroducing a
+    // pool the shard runtime does not have.
     if let Err(error) = fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len) {
         warn!(
             target: "iggy.partitions.storage",

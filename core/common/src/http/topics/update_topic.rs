@@ -29,10 +29,11 @@ use std::collections::BTreeMap;
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-/// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
-/// - `max_topic_size` - maximum size of the topic in bytes, if `Unlimited` then topic size is unlimited.
-///   Can't be lower than segment size in the config.
 /// - `name` - unique topic name, max length is 255 characters.
+/// - `compression_algorithm`, `message_expiry`, `max_topic_size` - omit a field
+///   to leave the topic's current value alone. Named here for REST ergonomics;
+///   the server folds them into the same option keys the binary protocol uses,
+///   so there is still one source per setting.
 /// - `options` - additional option keys as strings; only keys the update path
 ///   accepts are allowed.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -43,13 +44,15 @@ pub struct UpdateTopic {
     /// Unique topic ID (numeric or name).
     #[serde(skip)]
     pub topic_id: Identifier,
-    /// Compression algorithm for the topic.
-    pub compression_algorithm: CompressionAlgorithm,
-    /// Message expiry, if `NeverExpire` then messages will never expire.
-    pub message_expiry: IggyExpiry,
-    /// Max topic size, if `Unlimited` then topic size is unlimited.
-    /// Can't be lower than segment size in the config.
-    pub max_topic_size: MaxTopicSize,
+    /// Compression algorithm; omit to leave the current one alone.
+    #[serde(default)]
+    pub compression_algorithm: Option<CompressionAlgorithm>,
+    /// Message expiry; omit to leave the current one alone.
+    #[serde(default)]
+    pub message_expiry: Option<IggyExpiry>,
+    /// Max topic size; omit to leave the current one alone.
+    #[serde(default)]
+    pub max_topic_size: Option<MaxTopicSize>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
     /// Additional topic options as string key-values. Restricted to the keys
@@ -63,9 +66,9 @@ impl Default for UpdateTopic {
         UpdateTopic {
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            compression_algorithm: Default::default(),
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
+            compression_algorithm: None,
+            message_expiry: None,
+            max_topic_size: None,
             name: "topic".to_string(),
             options: BTreeMap::new(),
         }
