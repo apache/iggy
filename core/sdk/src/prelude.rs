@@ -33,7 +33,7 @@ pub use crate::client_wrappers::connection_info::ConnectionInfo;
 pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
+    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, IggyConsumerState, ReceivedMessage,
 };
 pub use crate::clients::consumer_builder::IggyConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
