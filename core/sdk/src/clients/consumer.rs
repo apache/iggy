@@ -270,6 +270,316 @@ impl IggyConsumerState {
 // 4. All `&self` methods only access Sync-safe fields
 unsafe impl Sync for IggyConsumer {}
 
+/// Reads messages from the partitions of one topic and yields them one at a time.
+///
+/// A topic is split into partitions, and a partition is an ordered log that producers append to.
+/// Every message sits at an *offset*, its position in that log. Reading is therefore always the
+/// same three decisions: which partition to read, where in it to start, and how to keep track of
+/// how far you got so the next run can continue there.
+///
+/// `IggyConsumer` handles all three. It fetches batches of messages from the server, keeps them in
+/// an in-memory buffer, decrypts them when the client is configured with an encryptor, and records
+/// how far it has read. It implements [`Stream`], so consuming is a loop over [`StreamExt::next`].
+///
+/// You can use a consumer as a worker draining a topic, a reader that replays a
+/// partition from a chosen point, and a pool of consumers sharing a workload through a consumer
+/// group.
+///
+/// # Creating a consumer
+///
+/// Easiest way is to use the [`IggyClient`] with a configured connection. Then:
+/// - [`IggyClient::consumer()`] builds a standalone consumer, bound to the one partition passed
+///   in.
+/// - [`IggyClient::consumer_group()`] builds a member of a consumer group. The server gives every
+///   partition to exactly one member, so several consumers using the same group name split the
+///   topic between them and share one set of offsets.
+///
+/// Note, building never talks to the server. [`init()`](Self::init) must be awaited once before the
+/// first message is read.
+///
+/// # Examples
+///
+/// A standalone consumer reading partition 1 with the defaults:
+///
+/// ```rust,no_run
+/// use futures_util::StreamExt;
+/// use iggy::prelude::*;
+///
+/// # async fn example() -> Result<(), IggyError> {
+/// let client = IggyClient::from_connection_string("iggy://iggy:iggy@localhost:8090")?;
+/// client.connect().await?;
+///
+/// let mut consumer = client
+///     .consumer("my-consumer", "my-stream", "my-topic", 1)?
+///     .batch_length(100)
+///     .poll_interval(IggyDuration::new_from_secs(1))
+///     .build();
+/// consumer.init().await?;
+///
+/// while let Some(received) = consumer.next().await {
+///     match received {
+///         Ok(received) => println!("Offset: {}", received.message.header.offset),
+///         Err(error) => eprintln!("Failed to read a message: {error}"),
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A group member that commits every message right after it is handed over, and shuts down
+/// cleanly:
+///
+/// ```rust,no_run
+/// use futures_util::StreamExt;
+/// use iggy::prelude::*;
+///
+/// # async fn handle(message: &IggyMessage) {}
+/// # async fn example() -> Result<(), IggyError> {
+/// let client = IggyClient::from_connection_string("iggy://iggy:iggy@localhost:8090")?;
+/// client.connect().await?;
+///
+/// let mut consumer = client
+///     .consumer_group("order-workers", "my-stream", "my-topic")?
+///     .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
+///     .polling_strategy(PollingStrategy::next())
+///     .build();
+/// consumer.init().await?;
+///
+/// let mut consumed = 0;
+/// while let Some(received) = consumer.next().await {
+///     handle(&received?.message).await;
+///     consumed += 1;
+///     if consumed == 100 {
+///         break;
+///     }
+/// }
+///
+/// consumer.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Committing by hand, so that a message the handler could not process comes back:
+///
+/// ```rust,no_run
+/// use futures_util::StreamExt;
+/// use iggy::prelude::*;
+///
+/// # async fn handle(message: &IggyMessage) -> Result<(), IggyError> { Ok(()) }
+/// # async fn example() -> Result<(), IggyError> {
+/// let client = IggyClient::from_connection_string("iggy://iggy:iggy@localhost:8090")?;
+/// client.connect().await?;
+///
+/// let mut consumer = client
+///     .consumer("my-consumer", "my-stream", "my-topic", 1)?
+///     .auto_commit(AutoCommit::Disabled)
+///     .polling_strategy(PollingStrategy::next())
+///     // Without this, messages already handed over once are never handed over again.
+///     .allow_replay()
+///     .build();
+/// consumer.init().await?;
+///
+/// while let Some(received) = consumer.next().await {
+///     let received = received?;
+///     if handle(&received.message).await.is_ok() {
+///         consumer
+///             .store_offset(received.message.header.offset, Some(received.partition_id))
+///             .await?;
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Which partitions are read
+///
+/// A **standalone consumer** reads exactly one partition, the one passed to
+/// [`IggyClient::consumer()`]. Covering a whole topic with several partitions
+/// means running one consumer per partition and dividing the work yourself.
+///
+/// A **consumer group member** does not choose. The server hands every partition of the topic to
+/// exactly one member, so consumers sharing a group name split the topic between them without
+/// coordinating. [`partition_id()`](Self::partition_id) reports where the last message came from.
+///
+/// What to know when working with consumer groups:
+/// - A member joins during [`init()`](Self::init), creating the group first if
+///   [`create_consumer_group_if_not_exists()`] is set (the default). It rejoins on its own after a
+///   reconnect and whenever the server reports that its membership is gone.
+/// - Until the join has succeeded the consumer does not poll. It waits for
+///   [`polling_retry_interval()`] and tries again.
+/// - Partitions are redistributed whenever members join or leave, so a member reads different
+///   partitions over time and messages from several partitions interleave in its stream.
+/// - More members than partitions leaves the surplus members idle. The partition count of the
+///   topic is the ceiling on how far one group can be scaled out.
+/// - The group shares one set of stored offsets, kept under the group name. Thus,
+///   a partition taken over by another member continues where the previous one
+///   committed.
+///
+/// # How messages are read
+///
+/// Reading is done by polling. One request fetches up to [`batch_length()`] messages. The consumer
+/// passes the first one to the caller and buffers the rest. The next request is sent once that buffer
+/// is empty.
+///
+/// [`poll_interval()`] sets a timeout between two requests should the buffer be empty.
+/// Without it the next request goes out as soon as the previous one is
+/// answered, which is the fastest option but keeps a busy loop running against an idle topic.
+///
+/// [`polling_strategy()`] decides **where** in the partition reading begins:
+///
+/// | Strategy | Starts at |
+/// | --- | --- |
+/// | [`PollingStrategy::next()`] (default) | the message after the offset that is stored on the server |
+/// | [`PollingStrategy::first()`] | the oldest message in the partition |
+/// | [`PollingStrategy::last()`] | the end of the partition (returns up to [`batch_length()`] of the most recent messages) |
+/// | [`PollingStrategy::offset()`] | a custom offset |
+/// | [`PollingStrategy::timestamp()`] | the first message at or after a given point in time |
+///
+/// Only [`PollingStrategy::next()`] consults the offset stored on the server.
+/// Use this if you want to resume where a previous run stopped. The other four are starting points for the first request only.
+/// From the second request onwards, the consumer asks for whatever follows it.
+///
+/// Note, when polling, [`StreamExt::next`] never returns `None`, not when the topic is empty
+/// and not while the client is disconnected. A `while let Some(..)` loop only ends when the
+/// loop body breaks out of it. A request that comes back empty is not an error and not the end of
+/// the stream, it just means nothing new has arrived yet.
+///
+/// A failed request is yielded as `Some(Err(..))` and leaves the consumer usable, while the next call
+/// retries. Connection and authentication failures pause polling until the client has reconnected
+/// and signed in again, which the consumer handles automatically. Hence, deciding when to give up on
+/// repeated errors is up to you.
+///
+/// For a boilerplate implementation of such a loop Iggy provides [`IggyConsumerMessageExt::consume_messages`].
+///
+/// # Tracking what has been read
+///
+/// An offset is the index tracking what has been already read from a partition by the consumer.
+/// Managing the offset has implications on where consumers resume reading messages.
+///
+/// There are two positions (offsets) tracked in two different places:
+/// - The **reading position** is held by the consumer, one per partition, and is the offset of the
+///   last message handed over
+///   ([`get_last_consumed_offset()`](Self::get_last_consumed_offset)). It dies with the process.
+/// - The **stored offset** lives on the server under the consumer name, or the group name for a
+///   group. This offset survives restarts. Writing it is called *storing* or *committing* an offset.
+///
+/// Committing matters because [`PollingStrategy::next()`] resumes from the stored offset. A
+/// consumer that never commits keeps starting over from the same place.
+/// Note, *committing* is a request of its own, not a side effect of reading and therefore controllable.
+///
+/// [`auto_commit()`] decides when the consumer commits by itself:
+///
+/// | Setting | Commits |
+/// | --- | --- |
+/// | [`AutoCommit::Disabled`] | never on its own, decide manually with [`store_offset()`](Self::store_offset) or on [`shutdown()`](Self::shutdown) |
+/// | [`AutoCommit::Interval`] | on every tick, for every partition read so far |
+/// | [`AutoCommitWhen::PollingMessages`] | with the poll request itself, before your code sees the batch |
+/// | [`AutoCommitWhen::ConsumingEachMessage`] | after every message was handed over to the calling code |
+/// | [`AutoCommitWhen::ConsumingEveryNthMessage`] | when the offset of a message handed over divides by `n` |
+/// | [`AutoCommitWhen::ConsumingAllMessages`] | when the buffer of the current batch runs empty |
+/// | [`AutoCommitAfter`] variants | as their [`AutoCommitWhen`] counterparts, but once the handler returned, and only under [`IggyConsumerMessageExt::consume_messages`] |
+///
+/// [`AutoCommit::IntervalOrWhen`] and [`AutoCommit::IntervalOrAfter`] combine an interval with a
+/// message trigger. The default is [`AutoCommit::IntervalOrWhen`] with one second and
+/// [`AutoCommitWhen::PollingMessages`].
+/// Important implications of these defaults:
+/// - [`AutoCommitWhen::PollingMessages`] marks a batch as consumed while it is being delivered,
+///   before your code has seen any of it. If a crash must not skip messages, commit after handling
+///   with [`AutoCommitWhen::ConsumingEachMessage`] instead.
+/// - [`AutoCommitWhen::ConsumingEveryNthMessage`] tests the offset of a message, not a counter of
+///   messages this process handled, so it commits at every `n`-th offset of the partition.
+///
+/// ## Guarantees
+///
+/// - **Each message is handed over once per consumer.** Messages whose offset is not greater than
+///   the reading position of their partition are dropped before they reach the stream. Re-reading
+///   a partition, or letting a message come back because your handler failed, needs
+///   [`allow_replay()`], which turns that filter off.
+/// - **Delivery is at-least-once.** A crash between handling a message and committing its offset
+///   replays that message on the next run, so handlers have to tolerate seeing one twice. No
+///   setting makes this exactly-once.
+///
+/// # Options and defaults
+///
+/// Everything is configured on the [`IggyConsumerBuilder`] before [`build()`] and is fixed
+/// afterwards.
+///
+/// | Option | Default | Controls |
+/// | --- | --- | --- |
+/// | [`stream()`], [`topic()`], [`partition()`] | the values passed to the entry point | what is read |
+/// | [`batch_length()`] | 1000 | messages fetched per request |
+/// | [`poll_interval()`] | none | smallest gap between two requests |
+/// | [`polling_strategy()`] | [`PollingStrategy::next()`] | where reading starts |
+/// | [`auto_commit()`] | [`AutoCommit::IntervalOrWhen`], one second, [`AutoCommitWhen::PollingMessages`] | when offsets are committed |
+/// | [`allow_replay()`] | off | whether a message can be handed over again |
+/// | [`auto_join_consumer_group()`] | on | joining the group during [`init()`](Self::init) |
+/// | [`create_consumer_group_if_not_exists()`] | on | creating the group when it is missing |
+/// | [`polling_retry_interval()`] | one second | wait between attempts while polling is blocked |
+/// | [`init_retries()`] | none, one second apart | retries when the stream or topic is missing at [`init()`](Self::init) |
+/// | [`offset_drain_timeout()`] | five seconds | how long [`shutdown()`](Self::shutdown) waits for pending commits |
+/// | [`encryptor()`] | inherited from the client | decrypting payloads and user headers |
+///
+/// The switches have inverse setters as well, such as [`without_poll_interval()`],
+/// [`without_encryptor()`], [`do_not_auto_join_consumer_group()`] and
+/// [`do_not_create_consumer_group_if_not_exists()`].
+///
+/// # Encryption
+///
+/// When the [`IggyClient`] was created with an encryptor, payloads and user headers are decrypted
+/// before a message is yielded, which only works if the producer encrypted them with a matching
+/// key. This is guaranteed if you spawned both, the [`IggyProducer`] and the [`IggyConsumer`] from the same [`IggyClient`].
+/// A message that cannot be decrypted is yielded as an error and the rest of its batch is
+/// discarded.
+///
+/// # Concurrency
+///
+/// A consumer hands you a stream to poll messages, but also spawns background tasks
+/// for watching connection lifecycle changes and committing offsets. Refer to [`init()`](Self::init)
+/// docs for more details.
+///
+/// `IggyConsumer` is `Send` and `Sync` but not `Clone`. Driving the stream
+/// ([`StreamExt::next`]) and [`shutdown()`](Self::shutdown) take exclusively (`&mut self`)
+/// Hence, one task owns and drives a given consumer end to end.
+///
+/// The following methods take `&self` and are safe to call from any other task holding a
+/// `&IggyConsumer`: [`store_offset()`](Self::store_offset),
+/// [`delete_offset()`](Self::delete_offset),
+/// [`get_last_consumed_offset()`](Self::get_last_consumed_offset),
+/// [`get_last_stored_offset()`](Self::get_last_stored_offset),
+/// [`partition_id()`](Self::partition_id), [`name()`](Self::name), [`stream()`](Self::stream) and
+/// [`topic()`](Self::topic).
+///
+/// # Shutting down
+///
+/// Call [`shutdown()`](Self::shutdown) once done consuming. It stops concurrent background tasks gracefully.
+/// Note, that just dropping a `IggyConsumer` loses everything that is currently in-flight.
+/// Read the docs of [`shutdown()`](Self::shutdown) for details.
+///
+/// [`IggyClient`]: crate::clients::client::IggyClient
+/// [`IggyClient::consumer()`]: crate::clients::client::IggyClient::consumer
+/// [`IggyClient::consumer_group()`]: crate::clients::client::IggyClient::consumer_group
+/// [`IggyProducer`]: crate::clients::producer::IggyProducer
+/// [`IggyConsumerBuilder`]: crate::clients::consumer_builder::IggyConsumerBuilder
+/// [`IggyConsumerMessageExt::consume_messages`]: crate::consumer_ext::IggyConsumerMessageExt::consume_messages
+/// [`allow_replay()`]: crate::clients::consumer_builder::IggyConsumerBuilder::allow_replay
+/// [`auto_commit()`]: crate::clients::consumer_builder::IggyConsumerBuilder::auto_commit
+/// [`auto_join_consumer_group()`]: crate::clients::consumer_builder::IggyConsumerBuilder::auto_join_consumer_group
+/// [`batch_length()`]: crate::clients::consumer_builder::IggyConsumerBuilder::batch_length
+/// [`build()`]: crate::clients::consumer_builder::IggyConsumerBuilder::build
+/// [`create_consumer_group_if_not_exists()`]: crate::clients::consumer_builder::IggyConsumerBuilder::create_consumer_group_if_not_exists
+/// [`do_not_auto_join_consumer_group()`]: crate::clients::consumer_builder::IggyConsumerBuilder::do_not_auto_join_consumer_group
+/// [`do_not_create_consumer_group_if_not_exists()`]: crate::clients::consumer_builder::IggyConsumerBuilder::do_not_create_consumer_group_if_not_exists
+/// [`encryptor()`]: crate::clients::consumer_builder::IggyConsumerBuilder::encryptor
+/// [`init_retries()`]: crate::clients::consumer_builder::IggyConsumerBuilder::init_retries
+/// [`offset_drain_timeout()`]: crate::clients::consumer_builder::IggyConsumerBuilder::offset_drain_timeout
+/// [`partition()`]: crate::clients::consumer_builder::IggyConsumerBuilder::partition
+/// [`poll_interval()`]: crate::clients::consumer_builder::IggyConsumerBuilder::poll_interval
+/// [`polling_retry_interval()`]: crate::clients::consumer_builder::IggyConsumerBuilder::polling_retry_interval
+/// [`polling_strategy()`]: crate::clients::consumer_builder::IggyConsumerBuilder::polling_strategy
+/// [`stream()`]: crate::clients::consumer_builder::IggyConsumerBuilder::stream
+/// [`topic()`]: crate::clients::consumer_builder::IggyConsumerBuilder::topic
+/// [`without_encryptor()`]: crate::clients::consumer_builder::IggyConsumerBuilder::without_encryptor
+/// [`without_poll_interval()`]: crate::clients::consumer_builder::IggyConsumerBuilder::without_poll_interval
 pub struct IggyConsumer {
     initialized: bool,
     shutdown: Arc<AtomicBool>,
@@ -407,21 +717,27 @@ impl IggyConsumer {
     }
 
     /// Returns the name of the consumer.
+    ///
+    /// For a consumer group this is also the name of the group.
     pub fn name(&self) -> &str {
         &self.consumer_name
     }
 
-    /// Returns the topic ID of the consumer.
+    /// Returns the identifier of the topic this consumer reads from.
     pub fn topic(&self) -> &Identifier {
         &self.topic_id
     }
 
-    /// Returns the stream ID of the consumer.
+    /// Returns the identifier of the stream this consumer reads from.
     pub fn stream(&self) -> &Identifier {
         &self.stream_id
     }
 
-    /// Returns the current partition ID of the consumer.
+    /// Returns the partition the last message came from.
+    ///
+    /// This is `0` until the first message has been read, because a partition is only known once
+    /// the server has answered. For a consumer group the value changes over time, as the server
+    /// can hand different partitions to this member.
     pub fn partition_id(&self) -> u32 {
         self.state.partition_id()
     }
@@ -431,7 +747,23 @@ impl IggyConsumer {
         self.state.clone()
     }
 
-    /// Stores the consumer offset on the server either for the current partition or the provided partition ID.
+    /// Stores an offset on the server, marking every message up to and including it as consumed.
+    ///
+    /// This is the manual counterpart to [`AutoCommit`] and is meant for
+    /// [`AutoCommit::Disabled`].
+    ///
+    /// Pass `None` as `partition_id` to use the partition of the most recent batch polled.
+    ///
+    /// An offset that is not ahead of the last one this consumer stored for that partition is
+    /// skipped and `Ok(())` is returned without a request.
+    /// If you want to move an offset backwards configure the consumer
+    /// with [`allow_replay`](crate::clients::consumer_builder::IggyConsumerBuilder::allow_replay).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the server raised while storing the offset, for example
+    /// [`IggyError::Disconnected`] or a permission error. The offset is then not stored and the
+    /// call can be retried.
     pub async fn store_offset(
         &self,
         offset: u64,
@@ -440,8 +772,11 @@ impl IggyConsumer {
         self.state.store_offset(offset, partition_id).await
     }
 
-    /// Retrieves the last consumed offset for the specified partition ID.
-    /// To get the current partition ID use `partition_id()`
+    /// Returns the offset of the last message this consumer handed over for the given partition,
+    /// or `None` if it has not read from that partition yet.
+    ///
+    /// This is the local reading position, which can be ahead of what has been stored on the
+    /// server.
     pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_consumed_offset(partition_id)
     }
@@ -451,15 +786,79 @@ impl IggyConsumer {
         self.state.delete_offset(partition_id).await
     }
 
-    /// Retrieves the last stored offset (on the server) for the specified partition ID.
-    /// To get the current partition ID use `partition_id()`
+    /// Returns the offset this consumer last stored on the server for the given partition, or
+    /// `None` if it has not stored one yet.
+    ///
+    /// The value is this consumer's own record of what it committed, kept in memory rather than
+    /// read back from the server, so it says nothing about offsets stored by other members of the
+    /// same consumer group.
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_stored_offset(partition_id)
     }
 
-    /// Initializes the consumer by subscribing to diagnostic events, initializing the consumer group if needed, storing the offsets in the background etc.
+    /// Initializes the consumer and makes it ready to poll messages.
     ///
-    /// Note: This method must be called before polling messages.
+    /// This must be called before the consumer can start polling messages. Calling it again on an
+    /// initialized consumer does nothing and returns immediately.
+    ///
+    /// Initialization ensures that:
+    /// - the consumers `stream_id` and `topic_id` exist on the server.
+    ///   It retries for a number of `init_retries` (defaults to `None`, which is treated as no
+    ///   retry) with `init_retry_interval` (defaults to one
+    ///   second) time in between retries. Both can be set together through
+    ///   [`IggyConsumerBuilder::init_retries`](crate::clients::consumer_builder::IggyConsumerBuilder::init_retries).
+    /// - the consumer subscribes to connection lifecycle events ([`DiagnosticEvent`]) in order to
+    ///   update its state, should it receive a shutdown, connected, disconnected, log in or log out event.
+    /// - if the consumer belongs to a group and `auto_join_consumer_group` is enabled, the group is
+    ///   initialized if it does not exist yet, and the consumer joins that group.
+    /// - the tasks that store the offset on the server are spawned.
+    ///
+    /// # Lifecycle events
+    ///
+    /// Calling init spawns a background tasks that listens for lifecycle changes ([`DiagnosticEvent`]s) of the
+    /// client connection.
+    /// - [`DiagnosticEvent::Connected`]: a fresh connection has not joined anything yet.
+    ///   Polling resumes immediately only for a consumer that is not a group member.
+    /// - [`DiagnosticEvent::SignedIn`]: re-enables polling. A group member signing in after a
+    ///   reconnect rejoins its group first and only polls once that succeeded. A failed rejoin is
+    ///   logged and leaves polling disabled until the next event.
+    /// - [`DiagnosticEvent::Disconnected`] and [`DiagnosticEvent::SignedOut`] disables polling.
+    /// - [`DiagnosticEvent::Shutdown`] disables polling and terminates the background task listening
+    ///   for lifecycle changes. It does not flush in-flight commits; that only happens when
+    ///   [`shutdown()`](Self::shutdown) itself is called.
+    ///
+    /// # Storing offsets
+    ///
+    /// An offset is the position of a message within a partition, and storing one tells the server
+    /// how many this consumer (or its consumer group) has consumed already.
+    /// When this offset is stored at the server is configured in `auto_commit`, which defaults to
+    /// [`AutoCommit::IntervalOrWhen`] equal to 1s and [`AutoCommitWhen::PollingMessages`].
+    /// - A interval background task is only spawned for the variants that carry an interval
+    ///   ([`AutoCommit::Interval`], [`AutoCommit::IntervalOrWhen`], [`AutoCommit::IntervalOrAfter`]).
+    /// - The offset store task is spawned in any case. It can be configured with [`AutoCommitWhen::ConsumingEachMessage`],
+    ///   [`AutoCommitWhen::ConsumingEveryNthMessage`], [`AutoCommitWhen::ConsumingAllMessages`] and
+    ///   their [`AutoCommitAfter`] counterparts. Under [`AutoCommit::Disabled`] nothing is
+    ///   ever sent and the task stays idle.
+    ///
+    /// A variant such as [`AutoCommit::IntervalOrWhen`] runs both together. The message count
+    /// trigger stores as messages are consumed, the interval stores what the trigger has not
+    /// covered yet. There is no double-work, since an offset that is not ahead of the one last stored
+    /// for that partition is skipped instead of sent.
+    /// Unless `allow_replay` is enabled an offset that is not past the last stored offset on the server
+    /// will not be committed. Consequently, setting `allow_replay` allows the caller to read messages multiple times.
+    ///
+    /// The [`AutoCommitAfter`] variants only take effect when consuming through
+    /// [`IggyConsumerMessageExt::consume_messages`](crate::consumer_ext::IggyConsumerMessageExt::consume_messages).
+    ///
+    /// # Errors
+    ///
+    /// - [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`] when the
+    ///   stream or the topic still does not exist once the retries are exhausted.
+    /// - [`IggyError::ConsumerGroupNameNotFound`] when the consumer group does not exist
+    ///   and its auto creation is disabled.
+    /// - Any error returned by the server while looking up the stream or the topic, or
+    ///   while creating or joining the consumer group. Such an error ends initialization
+    ///   immediately instead of consuming a retry.
     pub async fn init(&mut self) -> Result<(), IggyError> {
         if self.initialized {
             return Ok(());
@@ -485,7 +884,11 @@ impl IggyConsumer {
             let mut stream_exists = client.get_stream(&stream_id).await?.is_some();
             let mut topic_exists = client.get_topic(&stream_id, &topic_id).await?.is_some();
 
+            // Absent streams or topics are not necessarily permanent failures.
+            // It may happen that get_stream/ get_topic races the initial setup of the stream/ topic.
+            // Retry for init_retires times, while waiting interval between retries.
             loop {
+                // immediate happy path
                 if stream_exists && topic_exists {
                     info!(
                         "Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",
@@ -521,6 +924,7 @@ impl IggyConsumer {
                 timer.tick().await;
             }
 
+            // Unhappy-path after hitting retry limit while stream is still missing.
             if !stream_exists {
                 error!("Stream: {stream_id} was not found.");
                 return Err(IggyError::StreamNameNotFound(
@@ -528,6 +932,7 @@ impl IggyConsumer {
                 ));
             };
 
+            // Unhappy-path after hitting retry limit. Stream exists but topic is missing.
             if !topic_exists {
                 error!("Topic: {topic_id} was not found in stream: {stream_id}.");
                 return Err(IggyError::TopicNameNotFound(
@@ -537,9 +942,15 @@ impl IggyConsumer {
             }
         }
 
+        // Spawn background task to track status changes in the connection lifecycle
+        // (connected, shutdown, disconnect, sign in, sign out)
         self.subscribe_events().await;
+        // No-op if either is_consumer_group or auto_join_consumer_group is false
         self.init_consumer_group().await?;
 
+        // Storing the offset on the server is configured with `AutoCommit`.
+        // If a the configuration defines an time interval at which the offset should be stored
+        // the corresponding process is spawned.
         match self.auto_commit {
             AutoCommit::Interval(interval)
             | AutoCommit::IntervalOrWhen(interval, _)
@@ -553,6 +964,9 @@ impl IggyConsumer {
         let (store_offset_sender, store_offset_receiver) = flume::unbounded();
         self.store_offset_sender = store_offset_sender;
 
+        // The IggyClients `poll_next` implementation sends store offset requests down to this receiver.
+        // This is the second path over which offsets are stored on the server on a message base, compared to
+        // the duration based config above. While the interval based path can be configured, this task always runs.
         self.store_offset_task = Some(tokio::spawn(async move {
             while let Ok((partition_id, offset)) = store_offset_receiver.recv_async().await {
                 trace!(
@@ -579,13 +993,15 @@ impl IggyConsumer {
         let notify = self.background_commit_notify.clone();
         tokio::spawn(async move {
             loop {
+                // Wait the task until either the interval has passed or
+                // the task is explicitly notified, which happens when shutdown() is called.
                 tokio::select! {
                     _ = sleep(interval.get_duration()) => {}
                     _ = notify.notified() => {}
                 }
-                // Checked before storing: `shutdown` already ran its own final
-                // flush as a group member, so a store past that point would
-                // hit a group we've since left.
+
+                // On consumer shutdown the final commit is owned by the shutdown() method,
+                // so skip here.
                 if shutdown.load(ORDERING) {
                     trace!("Shutdown signal received, stopping background offset storage");
                     break;
@@ -1035,13 +1451,28 @@ impl IggyConsumer {
     }
 }
 
+/// A single message handed over by an [`IggyConsumer`].
 pub struct ReceivedMessage {
+    /// The message itself, with its payload already decrypted when the client uses an encryptor.
+    ///
+    /// Its own offset is `message.header.offset`, which is the value to pass to
+    /// [`IggyConsumer::store_offset`] when committing by hand.
     pub message: IggyMessage,
+    /// The offset of the newest message in the partition at the time it was polled.
+    ///
+    /// Comparing it with `message.header.offset` shows how far this consumer lags behind the end
+    /// of the partition. It is a snapshot taken per request, so it does not change while the
+    /// buffered messages of that request are handed over.
     pub current_offset: u64,
+    /// The partition this message was read from.
+    ///
+    /// For a consumer group this varies between messages, since the server hands different
+    /// partitions to the same member.
     pub partition_id: u32,
 }
 
 impl ReceivedMessage {
+    /// Creates a received message from a message and the partition it was read from.
     pub fn new(message: IggyMessage, current_offset: u64, partition_id: u32) -> Self {
         Self {
             message,
@@ -1051,6 +1482,12 @@ impl ReceivedMessage {
     }
 }
 
+/// Yields messages one at a time.
+/// A new batch is fetched from the server whenever the buffer is empty.
+///
+/// The stream never yields `None`. So a `while let Some(..)` loop over it runs
+/// until the loop body breaks out. Errors are yielded as items and do not end the stream, polling
+/// again retries. See the [type documentation](IggyConsumer#polling) for the details of polling.
 impl Stream for IggyConsumer {
     type Item = Result<ReceivedMessage, IggyError>;
 
@@ -1058,6 +1495,9 @@ impl Stream for IggyConsumer {
         let partition_id = self.state.partition_id();
         if let Some(message) = self.buffered_messages.pop_front() {
             {
+                // Since a consumer can be standalone or a member of a consumer group, in which case
+                // it can be reassigned to another partition, either update the offset of a partition
+                // the consumer already worked with or add a new record, if it got reassigned.
                 if let Some(last_consumed_offset_entry) =
                     self.state.last_consumed_offsets.get(&partition_id)
                 {
@@ -1076,6 +1516,11 @@ impl Stream for IggyConsumer {
                 }
             }
 
+            // Popping above may have left the buffer empty.
+            // The next turn will therefore poll messages from the server.
+            // With `PollingStrategy` the user defines the starting point where to poll from.
+            // After that, each poll must read the next sequential offset. Hence, strategy is
+            // set to `next` and the next offset to read from is the last consumed message + 1.
             if self.buffered_messages.is_empty() {
                 if self.polling_strategy.kind != PollingKind::Next {
                     self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
@@ -1086,6 +1531,8 @@ impl Stream for IggyConsumer {
                 }
             }
 
+            // Not the position of this message but the newest offset the partition had when the
+            // batch was polled. So every message of a batch reports the same value.
             let current_offset;
             if let Some(current_offset_entry) = self.current_offsets.get(&partition_id) {
                 current_offset = current_offset_entry.load(ORDERING);
@@ -1158,6 +1605,7 @@ impl Stream for IggyConsumer {
                             );
                         }
 
+                        // Return the first message and move the rest into the buffer.
                         let message = polled_messages.messages.remove(0);
                         self.buffered_messages.extend(polled_messages.messages);
 
@@ -1209,24 +1657,46 @@ impl Stream for IggyConsumer {
 }
 
 impl IggyConsumer {
+    /// Shuts the consumer down.
+    ///
+    /// Specifically, run shutdown and await before dropping the consumer to
+    /// - finish storing the offsets that are currently in-flight.
+    ///   There are two background tasks that can have commits in flight. The interval-based one
+    ///   (only spawned for [`AutoCommit`] variants that carry an interval) and the one driven by
+    ///   [`AutoCommitWhen`]/[`AutoCommitAfter`] (always spawned). The consumer waits for
+    ///   `offset_drain_timeout` on each in turn before forcing it to abort.
+    ///   Any offset that is not stored until then will be lost.
+    /// - commit every offset from partitions where the consumed offset is ahead of the stored one.
+    ///   Note, this happens even under [`AutoCommit::Disabled`].
+    /// - leave the consumer group, if this consumer is a group member. This lets the server give its partitions to
+    ///   the remaining members immediately instead of waiting for the connection to time out.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(())` even when the final commits or the group leave failed, since those
+    /// failures are logged and do not leave anything for the caller to undo. The
+    /// [`Result`] is part of the signature for forward compatibility.
     pub async fn shutdown(&mut self) -> Result<(), IggyError> {
+        // Immediately return, if the consumer is already shut down.
+        // Otherwise, swap so background tasks see that the consumer got shut down.
         if self.shutdown.swap(true, ORDERING) {
             return Ok(());
         }
 
         info!("Shutting down consumer: {}...", self.consumer_name);
 
-        // Drain the background commit tasks while still a group member,
-        // before leaving below — otherwise a store they send afterward hits
-        // a group we've already left.
+        // Wake the task responsible for storing the offsets (spawned in store_offset_in_background())
         self.background_commit_notify.notify_one();
+
+        // A background_commit_task exists, if auto_commit is configured with an interval option.
+        // If it exists, the task may be waiting or currently perform the interval based store offset operation.
+        // In case it is currently working, wait until drain timeout has passed and then force
+        // the task to abort.
         if let Some(mut task) = self.background_commit_task.take()
             && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
                 .await
                 .is_err()
         {
-            // Still running past the bound: abort it rather than leaving it
-            // detached, so it can't send a stale store after we leave below.
             task.abort();
             warn!(
                 "Timed out waiting for the background offset-commit task to stop for consumer: {}, aborted",
@@ -1234,11 +1704,19 @@ impl IggyConsumer {
             );
         }
 
+        // Drop the sending end of the store offset task to end the `recv_async()` loop in `send_store_offset().
+        // Offsets in queue will still be committed. This prevents loading additional offsets into a channel
+        // that is not read anymore.
+        // Replace with a new (hanging) channel, since `store_offset_sender` is not optional.
         let (closed_sender, _) = flume::bounded(0);
         drop(std::mem::replace(
             &mut self.store_offset_sender,
             closed_sender,
         ));
+
+        // This task always exists, so no need to notify.
+        // If it still exists after closing the channel above, wait until drain timeout has passed
+        // and the force the task to abort.
         if let Some(mut task) = self.store_offset_task.take()
             && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
                 .await
@@ -1274,9 +1752,9 @@ impl IggyConsumer {
             );
 
             let client = self.client.read().await;
-            // Cleared either way: this consumer is torn down regardless of
-            // whether the broker confirmed the leave.
+            // Update consumer state to not being part of a consumer group.
             self.joined_consumer_group.store(false, ORDERING);
+            // Let the server know that the consumer left its group.
             if let Err(error) = client
                 .leave_consumer_group(&self.stream_id, &self.topic_id, &group_id)
                 .await
@@ -1296,6 +1774,10 @@ impl IggyConsumer {
     }
 }
 
+/// Stops the background tasks, nothing more.
+///
+/// Dropping cannot await, so it neither commits pending offsets nor leaves the consumer group.
+/// Await [`IggyConsumer::shutdown`] for that.
 impl Drop for IggyConsumer {
     fn drop(&mut self) {
         self.shutdown.store(true, ORDERING);
