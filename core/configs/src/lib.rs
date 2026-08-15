@@ -20,7 +20,7 @@ extern crate self as configs;
 mod common;
 mod configs_impl;
 mod server_config;
-pub use common::{COMPONENT, cache_indexes, defaults, displays, http, system, validators};
+pub use common::{COMPONENT, defaults, displays, http, system, validators};
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,

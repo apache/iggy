@@ -48,9 +48,13 @@ use iggy_binary_protocol::requests::partitions::{
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
 };
+// Only the slab-seeding helpers build a bare `CreateTopicRequest`; without
+// their cfg the import is dead and `-p <crate>` clippy (which skips the
+// simulator feature) rejects it.
+#[cfg(any(test, feature = "simulator"))]
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest,
-    UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
@@ -864,22 +868,51 @@ impl Streams {
     }
 
     /// Retention policy for a topic: `(message_expiry, max_topic_size,
-    /// partition_count)`, or `None` if the stream or topic is unknown. The
-    /// per-shard segment cleaner reads this off-pump to decide local segment
-    /// deletion; `partition_count` lets it derive a per-partition size budget.
+    /// partition_count, segment_size)`, or `None` if the stream or topic is
+    /// unknown. The per-shard segment cleaner reads this off-pump to decide
+    /// local segment deletion; `partition_count` lets it derive a
+    /// per-partition size budget and `segment_size` (`None` when the topic
+    /// left the key to the node default) the floor that budget cannot go
+    /// under.
     #[must_use]
     pub fn topic_retention_config(
         &self,
         stream_id: usize,
         topic_id: usize,
-    ) -> Option<(IggyExpiry, MaxTopicSize, usize)> {
+    ) -> Option<(IggyExpiry, MaxTopicSize, usize, Option<IggyByteSize>)> {
         self.inner.read(|inner| {
             let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
             Some((
                 topic.message_expiry,
                 topic.max_topic_size,
                 topic.partitions.len(),
+                TopicRuntimeOptions::from_resource_options(&topic.options).segment_size,
             ))
+        })
+    }
+
+    /// A topic's current partition count, or `None` if the stream or topic is
+    /// unknown. Update admission reads it to size the floor a `max_topic_size`
+    /// has to clear across the whole topic; the update request itself carries
+    /// no partitions count.
+    #[must_use]
+    pub fn topic_partitions_count(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<usize> {
+        self.inner.read(|inner| {
+            let stream_slab = inner.resolve_stream_id(stream_id)?;
+            let topic_slab = inner.resolve_topic_id(stream_slab, topic_id)?;
+            Some(
+                inner
+                    .items
+                    .get(stream_slab)?
+                    .topics
+                    .get(topic_slab)?
+                    .partitions
+                    .len(),
+            )
         })
     }
 
