@@ -27,6 +27,7 @@ use tokio::time::{sleep, timeout};
 const API_KEY: &str = "test-api-key";
 const SOURCE_KEY: &str = "random";
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const STATE_STABILITY_WINDOW: Duration = Duration::from_secs(1);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[iggy_harness(
@@ -57,13 +58,12 @@ async fn send_failure_preserves_state_and_source_recovers(harness: &mut TestHarn
     let errors_before_failure = source_errors(&http, &api_url).await;
 
     harness.server_mut().stop().expect("server should stop");
-    let errors_after_failure =
-        wait_for_source_error_after(&http, &api_url, errors_before_failure).await;
+    wait_for_source_error_after(&http, &api_url, errors_before_failure).await;
     let state_after_failure = tokio::fs::read(&state_path)
         .await
         .expect("source state should remain readable");
 
-    wait_for_source_error_after(&http, &api_url, errors_after_failure).await;
+    sleep(STATE_STABILITY_WINDOW).await;
     assert_eq!(
         tokio::fs::read(&state_path)
             .await
@@ -118,7 +118,7 @@ async fn source_errors(http: &Client, api_url: &str) -> u64 {
         .errors
 }
 
-async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_errors: u64) -> u64 {
+async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_errors: u64) {
     timeout(WAIT_TIMEOUT, async {
         loop {
             if let Ok(response) = http
@@ -134,7 +134,7 @@ async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_erro
                 && source.status == ConnectorStatus::Error
                 && source.errors > previous_errors
             {
-                return source.errors;
+                break;
             }
             sleep(RETRY_INTERVAL).await;
         }
