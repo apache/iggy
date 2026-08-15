@@ -140,7 +140,7 @@
 //! so a parked op N is re-queued *behind* an op N+1 that was already sitting in
 //! the inbox. The partition plane then sees N+1 first, rejects it against its
 //! backup gap check, and N+1 is gone -- with no normal-status repair driver to
-//! refetch it (see the TODO below). Ordering has to be restored at the plane, by
+//! refetch it (see the TODO above). Ordering has to be restored at the plane, by
 //! buffering out-of-order prepares rather than dropping them, or by re-dispatching
 //! through a priority path that preserves op order.
 //!
