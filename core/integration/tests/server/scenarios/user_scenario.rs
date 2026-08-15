@@ -19,6 +19,7 @@ use crate::server::scenarios::create_client;
 use iggy::prelude::Identifier;
 use iggy::prelude::PersonalAccessTokenExpiry;
 use iggy::prelude::UserStatus;
+use iggy::prelude::UserUpdateOptions;
 use iggy::prelude::defaults::DEFAULT_ROOT_USERNAME;
 use iggy::prelude::{GlobalPermissions, Permissions};
 use iggy::prelude::{PersonalAccessTokenClient, SEC_IN_MICRO, SystemClient, UserClient};
@@ -209,6 +210,7 @@ pub async fn run(harness: &TestHarness) {
             &Identifier::named(test_user).unwrap(),
             Some(updated_test_user),
             Some(UserStatus::Inactive),
+            &UserUpdateOptions::default(),
         )
         .await
         .unwrap();

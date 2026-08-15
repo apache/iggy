@@ -15,19 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::MessageDeduplicator;
 use crate::PooledBuffer;
 use crate::indexes_mut::IggyIndexesMut;
 use iggy_common::{
     IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError, IggyIndexView, IggyMessage,
     IggyMessageBoundaries, IggyMessageView, IggyMessageViewIterator, IggyMessageViewMutIterator,
-    IggyMessagesBatch, IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable,
-    Validatable, random_id,
+    IggyMessagesBatch, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
-use lending_iterator::prelude::*;
 use std::ops::Index;
-use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::error;
 
 /// A container for mutable messages that are being prepared for persistence.
 ///
@@ -120,87 +116,6 @@ impl IggyMessagesBatchMut {
     /// Returns the raw message bytes as a slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.messages
-    }
-
-    /// Prepares all messages in the batch for persistence by setting their offsets,
-    /// timestamps, and other necessary fields.
-    ///
-    /// # Arguments
-    ///
-    /// * `start_offset` - The starting offset of the segment
-    /// * `base_offset` - The base offset for this batch of messages
-    /// * `current_position` - The current position in the segment
-    ///
-    /// # Returns
-    ///
-    /// An immutable `IggyMessagesBatch` ready for persistence
-    pub async fn prepare_for_persistence(
-        &mut self,
-        start_offset: u64,
-        base_offset: u64,
-        current_position: u32,
-        deduplicator: Option<&Arc<MessageDeduplicator>>,
-    ) {
-        let messages_count = self.count();
-        if messages_count == 0 {
-            return;
-        }
-
-        let mut curr_abs_offset = base_offset;
-        let mut curr_position = current_position;
-        let mut curr_rel_offset: u32 = 0;
-
-        // Prepare invalid messages indexes if deduplicator is provided, this
-        // way we avoid creating a new vector if we don't need it.
-        // The less allocation the better.
-        let mut invalid_messages_indexes =
-            deduplicator.map(|_| Vec::with_capacity(messages_count as usize));
-
-        self.indexes.set_base_position(current_position);
-        let mut iter: IggyMessageViewMutIterator<'_> =
-            IggyMessageViewMutIterator::new(&mut self.messages);
-        let timestamp = IggyTimestamp::now().as_micros();
-
-        while let Some(mut message) = iter.next() {
-            message.header_mut().set_offset(curr_abs_offset);
-            message.header_mut().set_timestamp(timestamp);
-            if message.header().id() == 0 {
-                message.header_mut().set_id(random_id::get_uuid());
-            }
-
-            if let Some(deduplicator) = deduplicator
-                && !deduplicator.try_insert(message.header().id()).await
-            {
-                warn!(
-                    "Detected duplicate message ID {}, removing...",
-                    message.header().id()
-                );
-                invalid_messages_indexes
-                    .as_mut()
-                    .unwrap()
-                    .push(curr_rel_offset);
-            }
-
-            message.update_checksum();
-
-            let message_size = message.size() as u32;
-            curr_position += message_size;
-
-            let relative_offset = (curr_abs_offset - start_offset) as u32;
-            self.indexes.set_offset_at(curr_rel_offset, relative_offset);
-            self.indexes.set_position_at(curr_rel_offset, curr_position);
-            self.indexes.set_timestamp_at(curr_rel_offset, timestamp);
-
-            curr_abs_offset += 1;
-            curr_rel_offset += 1;
-        }
-
-        if let Some(invalid_messages_indexes) = invalid_messages_indexes {
-            if invalid_messages_indexes.is_empty() {
-                return;
-            }
-            self.remove_messages(&invalid_messages_indexes, current_position);
-        }
     }
 
     /// Returns the first offset in the batch

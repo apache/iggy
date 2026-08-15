@@ -146,6 +146,20 @@ public readonly struct HeaderValue
     }
 
     /// <summary>
+    ///     Creates a header value from a byte.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
+    public static HeaderValue FromUInt8(byte value)
+    {
+        return new HeaderValue
+        {
+            Kind = HeaderKind.Uint8,
+            Value = [value]
+        };
+    }
+
+    /// <summary>
     ///     Creates a header value from a uint.
     /// </summary>
     /// <param name="value">Header value</param>

@@ -170,11 +170,11 @@ async fn create_topic_assert_empty(client: &IggyClient, stream_name: &str, topic
         .create_topic(
             &Identifier::from_str(stream_name).unwrap(),
             topic_name,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

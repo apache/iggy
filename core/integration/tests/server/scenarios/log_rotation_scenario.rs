@@ -17,9 +17,7 @@
 
 use crate::server::scenarios::{PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME};
 use iggy::prelude::*;
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
-};
+use iggy_common::{Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize};
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -196,11 +194,12 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
             .create_topic(
                 &stream_identifier,
                 &topic_name,
-                PARTITIONS_COUNT,
-                CompressionAlgorithm::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::Unlimited,
+                &TopicCreateOptions {
+                    partitions_count: Some(PARTITIONS_COUNT),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    max_topic_size: Some(MaxTopicSize::Unlimited),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .map_err(|e| format!("Failed to create topic {topic_name}: {e}"))?;

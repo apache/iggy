@@ -26,8 +26,9 @@ use super::COMPONENT;
 use super::cluster::STATE_CHUNK_HEADER_LEN;
 use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
 use crate::ConfigurationError;
+use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
-use iggy_common::{IggyExpiry, MaxTopicSize, Validatable};
+use iggy_common::{IggyExpiry, Validatable};
 use server_common::sharding::IggyNamespace;
 use tracing::warn;
 
@@ -102,31 +103,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
                 format!("{COMPONENT} (error: {e}) - failed to validate message saver config")
             })?;
 
-        let topic_size = match self.system.topic.max_size {
-            MaxTopicSize::Custom(size) => Ok(size.as_bytes_u64()),
-            MaxTopicSize::Unlimited => Ok(u64::MAX),
-            MaxTopicSize::ServerDefault => {
-                eprintln!("system.topic.max_size cannot be ServerDefault in the server config");
-                Err(ConfigurationError::InvalidConfigurationValue)
-            }
-        }?;
-
-        if let IggyExpiry::ServerDefault = self.system.topic.message_expiry {
-            eprintln!("system.topic.message_expiry cannot be ServerDefault in the server config");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        // A zero duration encodes to wire value 0, the same value the wire uses
-        // for ServerDefault, so it would silently collide with that sentinel.
-        if let IggyExpiry::ExpireDuration(duration) = self.system.topic.message_expiry
-            && duration.as_micros() == 0
-        {
-            eprintln!(
-                "system.topic.message_expiry is a zero duration, which collides with the server-default sentinel on the wire; use \"none\" to never expire or a positive duration"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
         {
@@ -171,15 +147,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
             }
         }
 
-        if topic_size < self.system.segment.size.as_bytes_u64() {
-            eprintln!(
-                "system.topic.max_size ({} B) must be >= system.segment.size ({} B)",
-                topic_size,
-                self.system.segment.size.as_bytes_u64()
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
         // A received segment artifact can be one whole batch larger than the
         // segment cap (rotation checks the cap AFTER appending), and the real
         // batch bound is the BUS frame cap -- the server never enforces
@@ -188,21 +155,18 @@ impl Validatable<ConfigurationError> for ServerConfig {
         // partition livelocks re-requesting the same segment from every peer at
         // the backoff ceiling. Caught here so it is a boot error rather than one
         // partition that silently never rejoins.
-        let artifact_floor = self
-            .system
-            .segment
-            .size
-            .as_bytes_u64()
-            .saturating_add(self.message_bus.max_message_size.as_bytes_u64());
+        // Segment size is per topic now, so the floor is the LARGEST segment
+        // any topic may legally be created with, not a configured value.
+        let artifact_floor =
+            SEGMENT_MAX_SIZE_BYTES.saturating_add(self.message_bus.max_message_size.as_bytes_u64());
         if self.partition.transfer_artifact_bytes_max.as_bytes_u64() < artifact_floor {
             eprintln!(
-                "{COMPONENT} partition.transfer_artifact_bytes_max ({} B) must be at least \
-                 system.segment.size ({} B) + message_bus.max_message_size ({} B) = \
-                 {artifact_floor} B: a segment may close one whole batch past its cap, and an \
-                 artifact ceiling below that refuses a legal segment and livelocks the \
-                 partition's rejoin",
+                "{COMPONENT} partition.transfer_artifact_bytes_max ({} B) must be at least the \
+                 largest legal segment ({SEGMENT_MAX_SIZE_BYTES} B) + \
+                 message_bus.max_message_size ({} B) = {artifact_floor} B: a segment may close \
+                 one whole batch past its cap, and an artifact ceiling below that refuses a \
+                 legal segment and livelocks the partition's rejoin",
                 self.partition.transfer_artifact_bytes_max.as_bytes_u64(),
-                self.system.segment.size.as_bytes_u64(),
                 self.message_bus.max_message_size.as_bytes_u64(),
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -363,10 +327,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
 /// pristine config.toml boots without noise. The guard test below pins the
 /// compared knobs against drift.
 fn reject_unsupported_and_warn_inert(config: &ServerConfig) -> Result<(), ConfigurationError> {
-    if config.system.message_deduplication.enabled {
-        eprintln!("system.message_deduplication.enabled is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
     if config.system.segment.archive_expired {
         eprintln!("system.segment.archive_expired is not supported");
         return Err(ConfigurationError::InvalidConfigurationValue);
@@ -474,6 +434,33 @@ mod tests {
             .expect("config deserializes")
     }
 
+    /// The per-topic `segment_size` ceiling lives in `iggy_common`, which cannot
+    /// import this crate. Admission reads it from there; boot validation reads
+    /// the constant here. This is the only place both are visible.
+    #[test]
+    fn given_segment_maximum_when_compared_to_the_option_ceiling_should_match() {
+        assert_eq!(
+            SEGMENT_MAX_SIZE_BYTES,
+            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+            "the option ceiling and the segment maximum must move together"
+        );
+    }
+
+    /// Admission may cap a topic's `segment_size` at
+    /// [`iggy_common::MAX_TOPIC_SEGMENT_SIZE`] flat only while boot refuses any
+    /// config whose artifact budget cannot carry a segment that large plus one
+    /// bus frame. Without that refusal the ceiling would have to be per node.
+    #[test]
+    fn given_artifact_budget_below_the_segment_ceiling_when_validating_should_reject() {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"1 GiB\"\n[message_bus]\nmax_message_size = \"1 MiB\"\n",
+        );
+        assert!(
+            config.validate().is_err(),
+            "an artifact budget under segment maximum + one frame must refuse boot"
+        );
+    }
+
     #[test]
     fn given_shipped_default_config_when_validating_should_pass() {
         let config: ServerConfig = Figment::new()
@@ -481,12 +468,6 @@ mod tests {
             .extract()
             .expect("default config deserializes");
         config.validate().expect("pristine config must validate");
-    }
-
-    #[test]
-    fn given_message_deduplication_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.message_deduplication]\nenabled = true\n");
-        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -506,12 +487,6 @@ mod tests {
     #[test]
     fn given_recreate_missing_state_enabled_when_validating_should_reject() {
         let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn given_zero_message_expiry_when_validating_should_reject() {
-        let config = config_with_override("[system.topic]\nmessage_expiry = \"0s\"\n");
         assert!(config.validate().is_err());
     }
 

@@ -49,12 +49,7 @@ const MAX_TEST_DURATION: Duration = Duration::from_secs(60);
 /// `messages_required_to_save = "1"` forces every batch to trigger an inline
 /// journal commit. The next send arrives before async persist completes, creating
 /// State C (journal non-empty + in-flight non-empty simultaneously).
-#[iggy_harness(server(
-    partition.messages_required_to_save = "1",
-    partition.enforce_fsync = false,
-    message_saver.enabled = true,
-    message_saver.interval = "100ms"
-))]
+#[iggy_harness(server(message_saver.enabled = true, message_saver.interval = "100ms"))]
 async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
@@ -65,11 +60,16 @@ async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // A flush per message forces an inline journal commit on every
+            // batch; the next send then arrives while the previous is still
+            // persisting, which is State C in the header above.
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                enforce_fsync: Some(false),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

@@ -22,7 +22,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
+use iggy::prelude::TopicCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -79,11 +79,11 @@ impl IggyCmdTestCase for TestPartitionDeleteCmd {
             .create_topic(
                 &self.actual_stream_id.unwrap().try_into().unwrap(),
                 &self.topic_name,
-                self.partitions_count,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.partitions_count),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

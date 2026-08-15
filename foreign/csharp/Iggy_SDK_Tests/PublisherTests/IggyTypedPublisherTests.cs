@@ -345,8 +345,7 @@ public class IggyTypedPublisherTests
             CreatedAt = default,
             MaxTopicSize = 0,
             MessagesCount = 0,
-            PartitionsCount = 1,
-            ReplicationFactor = 1
+            PartitionsCount = 1
         };
     }
 

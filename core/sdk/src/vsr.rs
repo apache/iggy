@@ -351,7 +351,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
-    use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName};
+    use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName, WireOptions};
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
@@ -474,6 +474,7 @@ mod tests {
         session.bind(99);
         let payload = CreateStreamRequest {
             name: WireName::new("stream").unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
 

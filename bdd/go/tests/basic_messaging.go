@@ -269,7 +269,6 @@ func (s basicMessagingSteps) whenCreateTopic(ctx context.Context,
 		iggcon.CompressionAlgorithmNone,
 		iggcon.IggyExpiryNeverExpire,
 		0,
-		nil,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)

@@ -37,7 +37,7 @@ use crate::args::{
     partition::PartitionAction,
     personal_access_token::PersonalAccessTokenAction,
     stream::StreamAction,
-    system::{PingArgs, StatsArgs},
+    system::{OptionsArgs, PingArgs, StatsArgs},
     topic::TopicAction,
 };
 
@@ -162,6 +162,13 @@ pub(crate) enum Command {
     /// server address and protocol type.
     #[clap(verbatim_doc_comment)]
     Me,
+    /// list the options a resource's create command accepts
+    ///
+    /// Prints the server's option catalog for one scope (topic, stream, user):
+    /// every key, the kind its default is reported in, that default, and the
+    /// bounds each value is checked against. These are the keys `--set` takes.
+    #[clap(verbatim_doc_comment)]
+    Options(OptionsArgs),
     /// get iggy server statistics
     ///
     /// Collect basic Iggy server statistics like number of streams, topics, partitions, etc.

@@ -17,6 +17,7 @@
 
 use crate::CompressionAlgorithm;
 use crate::Partition;
+use crate::ResourceOptions;
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::expiry::IggyExpiry;
 use crate::utils::timestamp::IggyTimestamp;
@@ -31,7 +32,6 @@ use serde::{Deserialize, Serialize};
 /// - `size`: the total size of the topic in bytes.
 /// - `message_expiry`: the expiry of the messages in the topic.
 /// - `max_topic_size`: the maximum size of the topic.
-/// - `replication_factor`: replication factor for the topic.
 /// - `messages_count`: the total number of messages in the topic.
 /// - `partitions_count`: the total number of partitions in the topic.
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,12 +51,14 @@ pub struct Topic {
     /// The optional maximum size of the topic.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: u8,
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.
     pub partitions_count: u32,
+    /// Creation options: client-explicit keys plus admission-derived
+    /// defaults, distinguished by each entry's `explicit` flag.
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }
 
 /// `TopicDetails` represents the detailed information about the topic.
@@ -67,7 +69,6 @@ pub struct Topic {
 /// - `size`: the total size of the topic.
 /// - `message_expiry`: the expiry of the messages in the topic.
 /// - `max_topic_size`: the maximum size of the topic.
-/// - `replication_factor`: replication factor for the topic.
 /// - `messages_count`: the total number of messages in the topic.
 /// - `partitions_count`: the total number of partitions in the topic.
 /// - `partitions`: the collection of partitions in the topic.
@@ -88,12 +89,14 @@ pub struct TopicDetails {
     /// The optional maximum size of the topic.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: u8,
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.
     pub partitions_count: u32,
     /// The collection of partitions in the topic.
     pub partitions: Vec<Partition>,
+    /// Creation options: client-explicit keys plus admission-derived
+    /// defaults, distinguished by each entry's `explicit` flag.
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }

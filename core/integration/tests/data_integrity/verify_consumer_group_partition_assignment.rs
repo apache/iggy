@@ -47,6 +47,10 @@ const STREAM_NAME: &str = "cg-partition-test-stream";
 const TOPIC_NAME: &str = "cg-partition-test-topic";
 const CONSUMER_GROUP_NAME: &str = "cg-partition-test-group";
 const PARTITIONS_COUNT: u32 = 3;
+/// Bounds [`await_members_count`]. Generous because the slowest path it covers
+/// is heartbeat eviction (2s interval x 1.2 threshold) on a loaded machine.
+const MEMBERS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
+const MEMBERS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Slices the slab-reuse wait so the surviving consumer can prove liveness
 /// inside the server's staleness window. Product of the two is the 3s the
 /// spec waits for the freed slab to become reusable.
@@ -102,11 +106,11 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -187,16 +191,9 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
     //    Server heartbeat interval = 2s, threshold = 2s * 1.2 = 2.4s.
     //    Stale clients' heartbeat interval is 1h so they won't ping.
     //    But they DID send one initial ping on connect, so we wait for that to expire.
-    //    Give it 5s to be safe.
-    sleep(Duration::from_secs(5)).await;
-
-    // 8. Verify ghosts have been evicted
-    let cg = get_consumer_group(&root_client).await;
-    assert_eq!(
-        cg.members_count, 0,
-        "Expected 0 members after heartbeat eviction of stale clients, got {}. Members: {:?}",
-        cg.members_count, cg.members
-    );
+    //
+    // 8. Verify ghosts have been evicted.
+    await_members_count(&root_client, 0).await;
 
     // 9. Now create 3 new clients and join same CG (simulating app restart after kill -9).
     let client1 = create_tcp_client(&server_addr).await;
@@ -758,11 +755,11 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            6,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(6),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -895,11 +892,11 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            6,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(6),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1299,11 +1296,11 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            6,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(6),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1643,11 +1640,11 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            6,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(6),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1929,11 +1926,11 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -2071,11 +2068,11 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -2151,10 +2148,8 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
     drop(client1);
     drop(client2);
     drop(client3);
-    sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
-    assert_eq!(cg.members_count, 0);
+    await_members_count(&root_client, 0).await;
 
     // 6. Restart: 3 new clients join same CG
     let new_client1 = harness.new_client().await.unwrap();
@@ -2212,6 +2207,31 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         .unwrap();
 }
 
+/// Poll the group until it reports `expected` members, then return it.
+///
+/// Member removal is server-side work that a client cannot observe completing:
+/// dropping a client sends a FIN, and eviction of a client that never sends one
+/// waits on the heartbeat verifier. Sleeping a fixed span and asserting assumes
+/// a bound on that work, which does not hold when the machine is running the
+/// rest of the suite -- the assert then reads one leftover member and fails.
+async fn await_members_count(client: &IggyClient, expected: u32) -> ConsumerGroupDetails {
+    let deadline = tokio::time::Instant::now() + MEMBERS_CONVERGENCE_TIMEOUT;
+    loop {
+        let group = get_consumer_group(client).await;
+        if group.members_count == expected {
+            return group;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected {expected} members within {MEMBERS_CONVERGENCE_TIMEOUT:?}, \
+             last saw {}. Members: {:?}",
+            group.members_count,
+            group.members
+        );
+        sleep(MEMBERS_RETRY_INTERVAL).await;
+    }
+}
+
 async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
     client
         .get_consumer_group(
@@ -2250,11 +2270,11 @@ async fn setup_stream_topic_cg_with_partitions(client: &IggyClient, partitions: 
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            partitions,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

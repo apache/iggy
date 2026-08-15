@@ -80,6 +80,14 @@ trait HttpSessionExt {
         offset: u64,
         count: u32,
     ) -> PolledMessages;
+    async fn try_poll(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        offset: u64,
+        count: u32,
+    ) -> Option<PolledMessages>;
     async fn create_user(&self, username: &str, password: &str);
 }
 
@@ -107,8 +115,8 @@ impl HttpSessionExt for HttpClient {
             compression_algorithm: CompressionAlgorithm::None,
             message_expiry: IggyExpiry::NeverExpire,
             max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: topic.to_string(),
+            options: Default::default(),
         };
         let response = self
             .client
@@ -118,10 +126,17 @@ impl HttpSessionExt for HttpClient {
             .send()
             .await
             .expect("create topic request");
+        // Body included on failure: a 500 from a serialization fault names
+        // itself only there, and status alone sent this down a long detour.
+        let status = response.status();
+        let body = if status.is_success() {
+            String::new()
+        } else {
+            response.text().await.unwrap_or_default()
+        };
         assert!(
-            response.status().is_success(),
-            "create topic failed: {}",
-            response.status()
+            status.is_success(),
+            "create topic failed: {status} body={body}"
         );
     }
 
@@ -168,6 +183,26 @@ impl HttpSessionExt for HttpClient {
         offset: u64,
         count: u32,
     ) -> PolledMessages {
+        self.try_poll(stream, topic, partition_id, offset, count)
+            .await
+            .expect("poll must answer 200")
+    }
+
+    /// Poll without demanding that the topic already be visible.
+    ///
+    /// `None` means 404: a create commits on the metadata primary and then
+    /// propagates, so a poll that lands on a shard which has not caught up yet
+    /// answers 404 rather than an empty batch. Callers already looping for
+    /// eventual visibility want to keep waiting on that, so only a
+    /// non-OK-non-404 status is a hard failure.
+    async fn try_poll(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        offset: u64,
+        count: u32,
+    ) -> Option<PolledMessages> {
         let path = format!(
             "/streams/{stream}/topics/{topic}/messages\
              ?consumer_id={CONSUMER_ID}&partition_id={partition_id}\
@@ -180,8 +215,11 @@ impl HttpSessionExt for HttpClient {
             .send()
             .await
             .expect("poll request");
+        if response.status() == StatusCode::NOT_FOUND {
+            return None;
+        }
         assert_eq!(response.status(), StatusCode::OK, "poll must answer 200");
-        response.json().await.expect("decode PolledMessages")
+        Some(response.json().await.expect("decode PolledMessages"))
     }
 
     /// Create an ungranted user (no permissions -> the permissioner holds no
@@ -671,13 +709,16 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
     assert_eq!(durability(&response), DURABILITY_NONE);
 
     // The commit still happens, just asynchronously: poll bounded until the
-    // message becomes visible.
+    // message becomes visible. A 404 counts as not-yet-visible for the same
+    // reason an empty batch does -- nothing here waited for the create to
+    // reach the shard that serves the poll.
     let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
     loop {
-        let polled = http
-            .poll("http-ack-none", "fire", PARTITION_ID, 0, 10)
-            .await;
-        if !polled.messages.is_empty() {
+        if let Some(polled) = http
+            .try_poll("http-ack-none", "fire", PARTITION_ID, 0, 10)
+            .await
+            && !polled.messages.is_empty()
+        {
             assert_eq!(polled.messages.len(), 1, "exactly one message was produced");
             assert_eq!(
                 polled.messages[0].payload,

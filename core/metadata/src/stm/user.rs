@@ -34,11 +34,12 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
-use iggy_binary_protocol::{WireIdentifier, WireName};
+use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
 use iggy_common::defaults::{DEFAULT_ROOT_USER_ID, MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
+use iggy_common::wire_conversions::resource_options_from_wire;
 use iggy_common::{
     GlobalPermissions, IggyError, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
-    StreamPermissions, UserId, UserStatus,
+    ResourceOptions, StreamPermissions, UserId, UserStatus,
 };
 use serde::{Deserialize, Serialize};
 use slab::Slab;
@@ -57,6 +58,7 @@ pub struct User {
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
     pub permissions: Option<Arc<Permissions>>,
+    pub options: ResourceOptions,
 }
 
 impl Default for User {
@@ -68,6 +70,7 @@ impl Default for User {
             status: UserStatus::default(),
             created_at: IggyTimestamp::default(),
             permissions: None,
+            options: ResourceOptions::new(),
         }
     }
 }
@@ -88,6 +91,7 @@ impl User {
             status,
             created_at,
             permissions,
+            options: ResourceOptions::new(),
         }
     }
 }
@@ -299,6 +303,7 @@ impl Users {
                         },
                         streams: Vec::new(),
                     }),
+                    options: WireOptions::empty(),
                 },
                 IggyTimestamp::from(1),
             ))
@@ -440,6 +445,9 @@ impl StateHandler for CreateUserRequest {
             .permissions
             .as_ref()
             .map(|p| Arc::new(Permissions::from(p.clone())));
+        let Ok(options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(CreateUserResult::InvalidOptionValue);
+        };
 
         let user = User {
             id: 0,
@@ -448,6 +456,7 @@ impl StateHandler for CreateUserRequest {
             status,
             created_at: timestamp,
             permissions,
+            options,
         };
 
         let id = state.items.insert(user);
@@ -474,6 +483,7 @@ impl StateHandler for CreateUserRequest {
                     created_at: timestamp.as_micros(),
                     status: self.status,
                     username: self.username.clone(),
+                    options: self.options.clone(),
                 },
                 permissions: self.permissions.clone(),
             }
@@ -492,6 +502,12 @@ impl StateHandler for UpdateUserRequest {
 
         let Some(user) = state.items.get_mut(user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
+        };
+
+        // Decoded before any mutation: a malformed block must leave the user
+        // untouched rather than half-renamed.
+        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(UpdateUserResult::InvalidOptionValue);
         };
 
         if let Some(new_username) = &self.username {
@@ -518,6 +534,9 @@ impl StateHandler for UpdateUserRequest {
         {
             user.status = new_status;
         }
+        // Patch, never replace: keys the client did not send keep their
+        // current value, so a client that predates a key cannot erase it.
+        user.options.extend(updated_options);
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -730,6 +749,8 @@ pub struct UserSnapshot {
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
+    #[serde(default)]
+    pub options: ResourceOptions,
 }
 
 /// Personal access token snapshot representation for serialization.
@@ -783,6 +804,7 @@ impl Snapshotable for Users {
                             status: user.status,
                             created_at: user.created_at,
                             permissions: user.permissions.as_ref().map(|p| (**p).clone()),
+                            options: user.options.clone(),
                         },
                     )
                 })
@@ -868,6 +890,7 @@ impl UsersInner {
                 status: user_snap.status,
                 created_at: user_snap.created_at,
                 permissions: user_snap.permissions.map(Arc::new),
+                options: user_snap.options,
             };
 
             index.insert(username, slab_key as UserId);
@@ -1154,6 +1177,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let apply = StateHandler::apply(&request, users, IggyTimestamp::now());
         assert_eq!(apply.code, 0);
@@ -1168,6 +1192,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let apply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
         assert_eq!(apply.code, u32::from(CreateUserResult::UserAlreadyExists));
@@ -1301,6 +1326,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&request, users, IggyTimestamp::now());
         assert_eq!(reply.code, 0);
@@ -1536,6 +1562,7 @@ mod tests {
                 password: "hash".to_owned(),
                 status: 1,
                 permissions: None,
+                options: WireOptions::empty(),
             };
             let reply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
             assert_eq!(reply.code, u32::from(CreateUserResult::InvalidUsername));
@@ -1551,6 +1578,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
         assert_eq!(reply.code, 0);
@@ -1568,6 +1596,7 @@ mod tests {
             user_id: WireIdentifier::numeric(alice_id),
             username: Some(WireName::new(&short).unwrap()),
             status: None,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&rename, &mut users, IggyTimestamp::now());
         assert_eq!(reply.code, u32::from(UpdateUserResult::InvalidUsername));

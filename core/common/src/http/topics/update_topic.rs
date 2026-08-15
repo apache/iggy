@@ -23,16 +23,19 @@ use crate::error::IggyError;
 use crate::utils::expiry::IggyExpiry;
 use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `UpdateTopic` command is used to update a topic in a stream.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-/// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
-/// - `max_topic_size` - maximum size of the topic in bytes, if `Unlimited` then topic size is unlimited.
-///   Can't be lower than segment size in the config.
-/// - `replication_factor` - replication factor for the topic.
 /// - `name` - unique topic name, max length is 255 characters.
+/// - `compression_algorithm`, `message_expiry`, `max_topic_size` - omit a field
+///   to leave the topic's current value alone. Named here for REST ergonomics;
+///   the server folds them into the same option keys the binary protocol uses,
+///   so there is still one source per setting.
+/// - `options` - additional option keys as strings; only keys the update path
+///   accepts are allowed.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct UpdateTopic {
     /// Unique stream ID (numeric or name).
@@ -41,17 +44,21 @@ pub struct UpdateTopic {
     /// Unique topic ID (numeric or name).
     #[serde(skip)]
     pub topic_id: Identifier,
-    /// Compression algorithm for the topic.
-    pub compression_algorithm: CompressionAlgorithm,
-    /// Message expiry, if `NeverExpire` then messages will never expire.
-    pub message_expiry: IggyExpiry,
-    /// Max topic size, if `Unlimited` then topic size is unlimited.
-    /// Can't be lower than segment size in the config.
-    pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: Option<u8>,
+    /// Compression algorithm; omit to leave the current one alone.
+    #[serde(default)]
+    pub compression_algorithm: Option<CompressionAlgorithm>,
+    /// Message expiry; omit to leave the current one alone.
+    #[serde(default)]
+    pub message_expiry: Option<IggyExpiry>,
+    /// Max topic size; omit to leave the current one alone.
+    #[serde(default)]
+    pub max_topic_size: Option<MaxTopicSize>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
+    /// Additional topic options as string key-values. Restricted to the keys
+    /// an update may change; anything else is rejected.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 impl Default for UpdateTopic {
@@ -59,11 +66,11 @@ impl Default for UpdateTopic {
         UpdateTopic {
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            compression_algorithm: Default::default(),
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
+            compression_algorithm: None,
+            message_expiry: None,
+            max_topic_size: None,
             name: "topic".to_string(),
+            options: BTreeMap::new(),
         }
     }
 }
@@ -72,12 +79,6 @@ impl Validatable<IggyError> for UpdateTopic {
     fn validate(&self) -> Result<(), IggyError> {
         if self.name.is_empty() || self.name.len() > MAX_NAME_LENGTH {
             return Err(IggyError::InvalidTopicName);
-        }
-
-        if let Some(replication_factor) = self.replication_factor
-            && replication_factor == 0
-        {
-            return Err(IggyError::InvalidReplicationFactor);
         }
 
         Ok(())

@@ -123,18 +123,22 @@ namespace Iggy {
         /**
          * Creates a topic.
          *
-         * message_expiry_micros is null for server default.
+         * Every option left null resolves against the server default at admission.
          *
          * @param mixed $stream
          * @param string $name
          * @param int $partitions_count
          * @param string|null $compression_algorithm
-         * @param int|null $replication_factor
          * @param int|null $message_expiry_micros
          * @param int|null $max_topic_size
+         * @param int|null $segment_size
+         * @param bool|null $enforce_fsync
+         * @param int|null $messages_required_to_save
+         * @param int|null $size_of_messages_required_to_save
+         * @param bool|null $preallocate_segments
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $replication_factor = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?bool $enforce_fsync = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
 
         /**
          * Deletes a stream by id or name.

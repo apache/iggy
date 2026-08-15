@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -38,9 +39,10 @@ class TopicDetailsTest {
                 BigInteger.valueOf(10000L),
                 CompressionAlgorithm.Gzip,
                 BigInteger.TWO,
-                (short) 12,
                 BigInteger.ZERO,
-                1L);
+                1L,
+                Map.of(),
+                Map.of());
         var partitions = List.of(new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE));
 
         var topicDetails = new TopicDetails(topic, partitions);
@@ -52,7 +54,6 @@ class TopicDetailsTest {
         assertThat(topicDetails.messageExpiry()).isEqualTo(BigInteger.valueOf(10000L));
         assertThat(topicDetails.compressionAlgorithm()).isEqualTo(CompressionAlgorithm.Gzip);
         assertThat(topicDetails.maxTopicSize()).isEqualTo(BigInteger.TWO);
-        assertThat(topicDetails.replicationFactor()).isEqualTo((short) 12);
         assertThat(topicDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(topicDetails.partitionsCount()).isEqualTo(1L);
         assertThat(topicDetails.partitions()).isEqualTo(partitions);

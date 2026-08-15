@@ -25,6 +25,7 @@ pub const PING_CODE: u32 = 1;
 pub const GET_STATS_CODE: u32 = 10;
 pub const GET_SNAPSHOT_FILE_CODE: u32 = 11;
 pub const GET_CLUSTER_METADATA_CODE: u32 = 12;
+pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;

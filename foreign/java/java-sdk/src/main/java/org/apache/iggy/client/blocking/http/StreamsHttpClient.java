@@ -25,6 +25,7 @@ import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 import tools.jackson.core.type.TypeReference;
 
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
 
@@ -40,7 +41,9 @@ class StreamsHttpClient implements StreamsClient {
     @Override
     public Optional<StreamDetails> getStream(StreamId streamId) {
         var request = httpClient.prepareGetRequest(STREAMS + "/" + streamId);
-        return httpClient.executeWithOptionalResponse(request, StreamDetails.class);
+        return httpClient
+                .executeWithOptionalResponse(request, HttpStreamDetails.class)
+                .map(HttpStreamDetails::toStreamDetails);
     }
 
     @Override
@@ -70,4 +73,36 @@ class StreamsHttpClient implements StreamsClient {
     record CreateStream(String name) {}
 
     record UpdateStream(String name) {}
+
+    /**
+     * The REST shape of a stream with its topics.
+     *
+     * <p>Only the nested topics need mapping: they carry options, which REST reports in one map with a
+     * per-entry provenance flag rather than as the two blocks the binary protocol sends. See
+     * {@link TopicsHttpClient.HttpTopic}.
+     */
+    record HttpStreamDetails(
+            Long id,
+            BigInteger createdAt,
+            String name,
+            String size,
+            BigInteger messagesCount,
+            Long topicsCount,
+            List<TopicsHttpClient.HttpTopic> topics) {
+
+        StreamDetails toStreamDetails() {
+            return new StreamDetails(
+                    id,
+                    createdAt,
+                    name,
+                    size,
+                    messagesCount,
+                    topicsCount,
+                    topics == null
+                            ? List.of()
+                            : topics.stream()
+                                    .map(TopicsHttpClient.HttpTopic::toTopic)
+                                    .toList());
+        }
+    }
 }

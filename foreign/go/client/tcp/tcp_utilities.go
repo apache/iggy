@@ -20,9 +20,23 @@ package tcp
 import (
 	"context"
 
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
+
+// DescribeOptions returns the option catalog for one resource scope.
+//
+// This is how a client learns which option keys the server accepts: a key
+// outside the catalog is refused at create, and the binary transports carry
+// only the error code back. Scopes with no keys yet return an empty slice.
+func (c *IggyTcpClient) DescribeOptions(ctx context.Context, scope iggcon.OptionsScope) ([]iggcon.OptionSpec, error) {
+	buffer, err := c.do(ctx, &command.DescribeOptions{Scope: scope})
+	if err != nil {
+		return nil, err
+	}
+	return binaryserialization.DeserializeOptionSpecs(buffer)
+}
 
 func (c *IggyTcpClient) GetStats(ctx context.Context) (*iggcon.Stats, error) {
 	buffer, err := c.do(ctx, &command.GetStats{})

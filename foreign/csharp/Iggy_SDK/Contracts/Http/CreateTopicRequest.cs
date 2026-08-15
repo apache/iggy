@@ -26,8 +26,14 @@ internal sealed class CreateTopicRequest
     public CompressionAlgorithm CompressionAlgorithm { get; set; } = CompressionAlgorithm.None;
     public ulong MessageExpiry { get; set; }
     public uint PartitionsCount { get; set; } = 1;
-    public byte? ReplicationFactor { get; set; } = 1;
     public ulong MaxTopicSize { get; set; }
+
+    /// <summary>
+    ///     Option keys with no property of their own, as strings the server parses by the same rules a
+    ///     config file value goes through. The REST body carries them this way; the binary transports
+    ///     send a typed TLV block.
+    /// </summary>
+    public Dictionary<string, string> Options { get; set; } = new();
 
     public CreateTopicRequest()
     {
@@ -38,14 +44,14 @@ internal sealed class CreateTopicRequest
         CompressionAlgorithm compressionAlgorithm,
         ulong messageExpiry,
         uint partitionsCount,
-        byte? replicationFactor,
-        ulong maxTopicSize)
+        ulong maxTopicSize,
+        Dictionary<string, string>? options = null)
     {
         Name = name;
         CompressionAlgorithm = compressionAlgorithm;
         MessageExpiry = messageExpiry;
         PartitionsCount = partitionsCount;
-        ReplicationFactor = replicationFactor;
         MaxTopicSize = maxTopicSize;
+        Options = options ?? new Dictionary<string, string>();
     }
 }
