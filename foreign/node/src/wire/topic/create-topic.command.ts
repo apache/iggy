@@ -43,9 +43,17 @@ export type CreateTopic = {
   partitionCount: number,
   /** Compression algorithm (None or Gzip) */
   compressionAlgorithm: CompressionAlgorithmT,
-  /** Message expiry time in microseconds (0 = unlimited) */
+  /**
+   * Message expiry time in microseconds. `0n` is not "unlimited": it omits the
+   * key so the server resolves its own default, reported back as a derived
+   * option on `getTopic`.
+   */
   messageExpiry?: bigint,
-  /** Maximum topic size in bytes (0 = unlimited) */
+  /**
+   * Maximum topic size in bytes. `0n` is not "unlimited": it omits the key so
+   * the server resolves its own default, reported back as a derived option on
+   * `getTopic`.
+   */
   maxTopicSize?: bigint,
   /** Segment size in bytes: 512-byte multiple between 1 MiB and 1 GiB */
   segmentSize?: bigint,

@@ -142,20 +142,15 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, erro
 // position and returns the decoded options with the total bytes consumed
 // (prefix included). A zero-length block decodes to a nil map.
 func deserializeOptions(payload []byte, position int) (map[string]iggcon.HeaderValue, int, error) {
-	if len(payload) < position+4 {
-		return nil, 0, errors.New("not enough data to read options length")
+	block, consumed, err := readLengthPrefixed(payload, position, "options block")
+	if err != nil {
+		return nil, 0, err
 	}
-	optionsLength := int(binary.LittleEndian.Uint32(payload[position : position+4]))
-	if len(payload) < position+4+optionsLength {
-		return nil, 0, fmt.Errorf(
-			"not enough data to read options block: need %d bytes, got %d",
-			optionsLength, len(payload)-position-4)
-	}
-	if optionsLength == 0 {
-		return nil, 4, nil
+	if len(block) == 0 {
+		return nil, consumed, nil
 	}
 
-	entries, err := iggcon.DeserializeHeaders(payload[position+4 : position+4+optionsLength])
+	entries, err := iggcon.DeserializeHeaders(block)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -163,7 +158,7 @@ func deserializeOptions(payload []byte, position int) (map[string]iggcon.HeaderV
 	for _, entry := range entries {
 		options[string(entry.Key.Value)] = entry.Value
 	}
-	return options, 4 + optionsLength, nil
+	return options, consumed, nil
 }
 
 // pollBatchHeaderLength covers [partition_id u32][current_offset u64][count u32].
@@ -318,6 +313,9 @@ func readLengthPrefixed(payload []byte, position int, field string) ([]byte, int
 	}
 	length := int(binary.LittleEndian.Uint32(payload[position : position+4]))
 	position += 4
+	// Where int is 32 bits a wire length above MaxInt32 converts to a negative
+	// one, which clears the remaining-bytes check and reaches the slice below
+	// with high < low.
 	if length < 0 || len(payload)-position < length {
 		return nil, 0, fmt.Errorf("truncated %s at offset %d", field, position)
 	}

@@ -265,6 +265,35 @@ public sealed class BinaryMapper
     }
 
     [Fact]
+    public void MapTopic_WithAnOptionOfAnUnknownKind_KeepsTheOtherEntries()
+    {
+        // Arrange: an option kind a newer server may introduce, between two this build knows.
+        const byte stringKind = 2;
+        const byte unknownKind = 200;
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var options = new List<byte>();
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "segment_size", stringKind, "1GB"u8.ToArray()));
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "future_option", unknownKind, [0xAA, 0xBB]));
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "enforce_fsync", 3, [1]));
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
+            sizeBytes, messagesCount, createdAt, maxTopicSize, 1, options.ToArray());
+
+        // Act
+        var response = Mappers.BinaryMapper.MapTopic(topicPayload);
+
+        // Assert: the unknown entry is dropped, everything around it still decodes.
+        Assert.Equal(topicName, response.Name);
+        Assert.NotNull(response.Options);
+        Assert.Equal(2, response.Options.Count);
+        Assert.Equal("1GB", response.Options[HeaderKey.FromString("segment_size")].ToString());
+        Assert.Equal(HeaderKind.Bool, response.Options[HeaderKey.FromString("enforce_fsync")].Kind);
+        Assert.False(response.Options.ContainsKey(HeaderKey.FromString("future_option")));
+        Assert.NotNull(response.DerivedOptions);
+        Assert.Empty(response.DerivedOptions);
+    }
+
+    [Fact]
     public void MapOptionSpecs_ReturnsTheCatalogWithKindsAndDefaults()
     {
         // Arrange: [count][key_len][key][kind][default_len][default][description_len][description]

@@ -39,7 +39,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * copy of them together.
  *
  * <p>{@code enforce_fsync} (a one-byte {@code Bool}) and {@code segment_size} (an eight-byte
- * {@code Uint64}) cover both value widths, in the sorted key order every encoder has to produce.
+ * {@code Uint64}) cover both value widths. What the vector pins is the per-entry byte layout, not a
+ * key order: these two land sorted only because the Rust core holds options in a {@code BTreeMap},
+ * and the server accepts the insertion order this SDK emits.
  */
 class OptionsBlockGoldenVectorTest {
 

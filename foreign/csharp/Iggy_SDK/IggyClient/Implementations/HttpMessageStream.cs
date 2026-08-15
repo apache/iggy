@@ -492,11 +492,16 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <summary>
-    ///     The REST shape of a catalog entry: the kind arrives as its name and the default as raw
-    ///     bytes, where the binary transport sends a kind code. Mapping it here keeps
-    ///     <see cref="OptionSpec" /> the one shape a caller sees on either transport.
+    ///     The REST shape of a catalog entry: the kind arrives as its name and the default as a JSON
+    ///     array of byte values, where the binary transport sends a kind code and raw bytes. Mapping
+    ///     it here keeps <see cref="OptionSpec" /> the one shape a caller sees on either transport.
+    ///
+    ///     <see cref="DefaultValue" /> is a list rather than a <c>byte[]</c> because the serializer
+    ///     only reads an array into <c>byte[]</c> from a Base64 string, and the server renders the
+    ///     catalog straight from its own byte vector.
     /// </summary>
-    private sealed record HttpOptionSpec(string Key, string Kind, byte[] DefaultValue, string Description)
+    private sealed record HttpOptionSpec(string Key, string Kind, IReadOnlyList<byte>? DefaultValue,
+        string? Description)
     {
         internal OptionSpec ToOptionSpec()
         {
@@ -504,8 +509,8 @@ public class HttpMessageStream : IIggyClient
             {
                 Key = Key,
                 Kind = UserHeadersConverter.ParseHeaderKind(Kind),
-                DefaultValue = DefaultValue,
-                Description = Description
+                DefaultValue = DefaultValue is null ? [] : [.. DefaultValue],
+                Description = Description ?? string.Empty
             };
         }
     }

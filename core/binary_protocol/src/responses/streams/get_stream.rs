@@ -149,9 +149,10 @@ impl WireEncode for GetStreamResponse {
     }
 }
 
-/// Smallest a topic header can encode as: the fixed ids, timestamps, sizes and
-/// counts, plus a name length and two length-prefixed option blocks.
-const MIN_TOPIC_HEADER_SIZE: usize = 45;
+/// Smallest a topic header can encode as: the fixed ids, timestamps, sizes,
+/// counts and name length, plus the shortest name `WireName` accepts (one byte,
+/// since it rejects an empty one) and two empty length-prefixed option blocks.
+const MIN_TOPIC_HEADER_SIZE: usize = TopicHeader::FIXED_SIZE + 1 + 4 + 4;
 
 impl WireDecode for GetStreamResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
@@ -239,6 +240,12 @@ mod tests {
         let (decoded, consumed) = TopicHeader::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, topic);
+    }
+
+    #[test]
+    fn min_topic_header_size_matches_the_shortest_encoding() {
+        let bytes = sample_topic(1, "t").to_bytes();
+        assert_eq!(bytes.len(), MIN_TOPIC_HEADER_SIZE);
     }
 
     #[test]

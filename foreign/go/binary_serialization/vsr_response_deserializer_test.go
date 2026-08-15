@@ -317,3 +317,23 @@ func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.
 		assert.Error(t, err, "expected error for truncation at byte %d", i)
 	}
 }
+
+func TestDeserializeToTopic_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
+	const nameLenOffset = 49
+	name := "t"
+	fixed := make([]byte, nameLenOffset+1+len(name))
+	fixed[nameLenOffset] = byte(len(name))
+	copy(fixed[nameLenOffset+1:], name)
+
+	// Both blocks, because the derived one is read at a position the explicit
+	// one computed. Where int is 32 bits, 0xFFFFFFFF converts to -1 and an
+	// unguarded decode slices with high < low instead of erroring.
+	explicitLies := binary.LittleEndian.AppendUint32(fixed, 0xFFFFFFFF)
+	_, _, err := DeserializeToTopic(explicitLies, 0)
+	assert.Error(t, err, "an explicit options length of 0xFFFFFFFF must not panic or pass")
+
+	derivedLies := binary.LittleEndian.AppendUint32(fixed, 0)
+	derivedLies = binary.LittleEndian.AppendUint32(derivedLies, 0xFFFFFFFF)
+	_, _, err = DeserializeToTopic(derivedLies, 0)
+	assert.Error(t, err, "a derived options length of 0xFFFFFFFF must not panic or pass")
+}

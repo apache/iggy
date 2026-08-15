@@ -42,9 +42,17 @@ export type UpdateTopic = {
   name: string,
   /** Compression algorithm (None or Gzip) */
   compressionAlgorithm?: CompressionAlgorithmT,
-  /** Message expiry time in microseconds (0 = unlimited) */
+  /**
+   * Message expiry time in microseconds. `0n` is not "unlimited": it omits the
+   * key, so the topic keeps whatever expiry it currently has. Resetting a key
+   * back to the server default is not expressible on an update.
+   */
   messageExpiry?: bigint,
-  /** Maximum topic size in bytes (0 = unlimited) */
+  /**
+   * Maximum topic size in bytes. `0n` is not "unlimited": it omits the key, so
+   * the topic keeps whatever cap it currently has. Resetting a key back to the
+   * server default is not expressible on an update.
+   */
   maxTopicSize?: bigint,
   /**
    * Option keys with no field of their own. The server refuses any key an update

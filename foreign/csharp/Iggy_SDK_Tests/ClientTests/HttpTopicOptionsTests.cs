@@ -44,6 +44,33 @@ public sealed class HttpTopicOptionsTests
                                              }
                                              """;
 
+    /// <summary>
+    ///     Recorded verbatim from GET /options/topic. The server renders its catalog straight off its
+    ///     own types, so default_value arrives as an array of byte values and never as Base64.
+    /// </summary>
+    private const string OptionsCatalogJson = """
+                                              [
+                                                {
+                                                  "key": "compression_algorithm",
+                                                  "kind": "string",
+                                                  "default_value": [110, 111, 110, 101],
+                                                  "description": "Compression algorithm (none, gzip)"
+                                                },
+                                                {
+                                                  "key": "segment_size",
+                                                  "kind": "uint64",
+                                                  "default_value": [0, 0, 0, 64, 0, 0, 0, 0],
+                                                  "description": "Segment size in bytes"
+                                                },
+                                                {
+                                                  "key": "enforce_fsync",
+                                                  "kind": "bool",
+                                                  "default_value": [0],
+                                                  "description": "Whether writes to this topic's partitions fsync"
+                                                }
+                                              ]
+                                              """;
+
     private static readonly Identifier StreamId = Identifier.Numeric(1);
 
     [Fact]
@@ -92,13 +119,52 @@ public sealed class HttpTopicOptionsTests
         Assert.Equal(HeaderKind.String, Assert.Single(topic.DerivedOptions!).Value.Kind);
     }
 
+    [Fact]
+    public async Task DescribeOptions_ReadsTheCatalogTheServerRenders()
+    {
+        var handler = new StubHandler(OptionsCatalogJson);
+        var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var specs = await client.DescribeOptionsAsync(OptionsScope.Topic, TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, specs.Count);
+
+        Assert.Equal("compression_algorithm", specs[0].Key);
+        Assert.Equal(HeaderKind.String, specs[0].Kind);
+        Assert.Equal("none"u8.ToArray(), specs[0].DefaultValue);
+        Assert.Equal("Compression algorithm (none, gzip)", specs[0].Description);
+
+        Assert.Equal("segment_size", specs[1].Key);
+        Assert.Equal(HeaderKind.Uint64, specs[1].Kind);
+        Assert.Equal(1073741824UL, BitConverter.ToUInt64(specs[1].DefaultValue));
+
+        Assert.Equal("enforce_fsync", specs[2].Key);
+        Assert.Equal(HeaderKind.Bool, specs[2].Kind);
+        Assert.Equal([0], specs[2].DefaultValue);
+    }
+
+    [Fact]
+    public async Task DescribeOptions_ReadsAnEmptyCatalog()
+    {
+        var handler = new StubHandler("[]");
+        var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var specs = await client.DescribeOptionsAsync(OptionsScope.Stream, TestContext.Current.CancellationToken);
+
+        Assert.Empty(specs);
+        Assert.Equal("/options/stream", handler.RequestPath);
+    }
+
     private sealed class StubHandler(string json) : HttpMessageHandler
     {
         internal string RequestBody { get; private set; } = string.Empty;
 
+        internal string RequestPath { get; private set; } = string.Empty;
+
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
             CancellationToken ct)
         {
+            RequestPath = request.RequestUri?.AbsolutePath ?? string.Empty;
             if (request.Content is not null)
             {
                 RequestBody = await request.Content.ReadAsStringAsync(ct);

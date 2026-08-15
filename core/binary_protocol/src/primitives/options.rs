@@ -433,8 +433,10 @@ mod tests {
     /// of them together instead of leaving one SDK talking to itself.
     ///
     /// `enforce_fsync=true` (a `Bool`) and `segment_size=1 GiB` (a `Uint64`)
-    /// cover both a one-byte and an eight-byte value, in the sorted key order
-    /// every encoder has to produce.
+    /// cover both a one-byte and an eight-byte value. What the vector pins is
+    /// the per-entry byte layout, not a key order: these two land sorted only
+    /// because `iggy_common` holds options in a `BTreeMap`, and
+    /// `unsorted_keys_are_accepted` covers the SDKs that emit insertion order.
     const GOLDEN_OPTIONS_BLOCK: &[u8] = &[
         2, 13, 0, 0, 0, // key kind String, length 13
         b'e', b'n', b'f', b'o', b'r', b'c', b'e', b'_', b'f', b's', b'y', b'n', b'c', 3, 1, 0, 0,
@@ -463,6 +465,22 @@ mod tests {
             "the options TLV layout changed; update every SDK's copy of this vector"
         );
         assert_eq!(validate_options(GOLDEN_OPTIONS_BLOCK).unwrap(), 2);
+    }
+
+    #[test]
+    fn unsorted_keys_are_accepted() {
+        let unsorted = encode(&[
+            (
+                STRING,
+                b"segment_size",
+                UINT64,
+                &1_073_741_824u64.to_le_bytes(),
+            ),
+            (STRING, b"enforce_fsync", 3, &[1]),
+        ]);
+
+        assert_ne!(&unsorted[..], GOLDEN_OPTIONS_BLOCK);
+        assert_eq!(validate_options(&unsorted).unwrap(), 2);
     }
 
     #[test]

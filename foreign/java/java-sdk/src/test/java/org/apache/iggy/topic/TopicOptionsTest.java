@@ -19,12 +19,20 @@
 
 package org.apache.iggy.topic;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.serde.BytesSerializer;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TopicOptionsTest {
 
@@ -60,5 +68,48 @@ class TopicOptionsTest {
         assertThat(options.get("preallocate_segments").kind()).isEqualTo(HeaderKind.Bool);
         // Little-endian, so the low byte of 128 MiB leads and the high bytes are zero.
         assertThat(options.get("segment_size").value()).containsExactly(0, 0, 0, 8, 0, 0, 0, 0);
+    }
+
+    @Test
+    void shouldKeepTheOrderTheKeysWereSetIn() {
+        var options = TopicOptions.builder()
+                .preallocateSegments(true)
+                .segmentSize(BigInteger.valueOf(134_217_728))
+                .enforceFsync(false)
+                .build();
+
+        assertThat(options.keySet()).containsExactly("preallocate_segments", "segment_size", "enforce_fsync");
+    }
+
+    @Test
+    void shouldRejectAKeyPastTheFieldBound() {
+        var options = new LinkedHashMap<HeaderKey, HeaderValue>();
+        // The record's canonical constructor is public and unchecked, unlike `HeaderKey.fromString`.
+        options.put(
+                new HeaderKey(HeaderKind.String, "k".repeat(256).getBytes(StandardCharsets.UTF_8)),
+                HeaderValue.fromBool(true));
+
+        assertThatThrownBy(() -> BytesSerializer.toBytes(options))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("length: 256 bytes, must be between 1 and 255");
+    }
+
+    @Test
+    void shouldRejectAnEmptyValue() {
+        var options = new LinkedHashMap<HeaderKey, HeaderValue>();
+        options.put(HeaderKey.fromString("segment_size"), new HeaderValue(HeaderKind.Raw, new byte[0]));
+
+        assertThatThrownBy(() -> BytesSerializer.toBytes(options))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("value for key 'segment_size' length: 0 bytes");
+    }
+
+    @Test
+    void shouldEncodeAKeyExactlyAtTheFieldBound() {
+        Map<HeaderKey, HeaderValue> options = Map.of(HeaderKey.fromString("k".repeat(255)), HeaderValue.fromBool(true));
+
+        var encoded = BytesSerializer.toBytes(options);
+
+        assertThat(encoded.getIntLE(1)).isEqualTo(255);
     }
 }

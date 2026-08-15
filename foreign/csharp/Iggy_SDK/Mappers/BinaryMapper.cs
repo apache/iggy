@@ -769,11 +769,20 @@ internal static class BinaryMapper
         var end = cursor + (int)optionsLength;
         while (cursor < end)
         {
-            var keyKind = MapHeaderKind(ReadOptionByte(payload, ref cursor, end, position));
+            var keyKindCode = ReadOptionByte(payload, ref cursor, end, position);
             var key = ReadOptionField(payload, ref cursor, end, position, "key");
 
-            var valueKind = MapHeaderKind(ReadOptionByte(payload, ref cursor, end, position));
+            var valueKindCode = ReadOptionByte(payload, ref cursor, end, position);
             var value = ReadOptionField(payload, ref cursor, end, position, "value");
+
+            // A newer server may encode an option under a kind this build has no name for.
+            // Its bytes are already consumed, so dropping just this entry keeps the rest of
+            // the block, and the response fields behind it, readable.
+            if (!TryMapHeaderKind(keyKindCode, out var keyKind) ||
+                !TryMapHeaderKind(valueKindCode, out var valueKind))
+            {
+                continue;
+            }
 
             options[new HeaderKey
             {

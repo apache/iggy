@@ -82,10 +82,12 @@ internal sealed class BinaryFactory
     }
 
     internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, uint messageExpiry, string name,
-        ulong sizeBytes, ulong messagesCount, ulong createdAt, ulong maxTopicSize, int compressionType)
+        ulong sizeBytes, ulong messagesCount, ulong createdAt, ulong maxTopicSize, int compressionType,
+        byte[]? options = null)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
-        var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + nameBytes.Length + 4 + 4;
+        var optionsBytes = options ?? [];
+        var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + nameBytes.Length + 4 + optionsBytes.Length + 4;
 
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
@@ -98,10 +100,31 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(41), messagesCount);
         payload[49] = (byte)nameBytes.Length;
         nameBytes.CopyTo(payload.AsSpan(50));
-        // Empty length-prefixed explicit and derived options blocks.
-        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(50 + nameBytes.Length), 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(54 + nameBytes.Length), 0);
+        // Length-prefixed explicit options block, then an empty derived one.
+        var position = 50 + nameBytes.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position), (uint)optionsBytes.Length);
+        optionsBytes.CopyTo(payload.AsSpan(position + 4));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position + 4 + optionsBytes.Length), 0);
         return payload;
+    }
+
+    /// <summary>
+    ///     One options entry: <c>[key_kind][key_len:u32][key][value_kind][value_len:u32][value]</c>. The kinds are
+    ///     taken as raw wire codes so a test can encode a code this SDK has no name for.
+    /// </summary>
+    internal static byte[] CreateOptionEntry(byte keyKind, string key, byte valueKind, byte[] value)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        var entry = new byte[1 + 4 + keyBytes.Length + 1 + 4 + value.Length];
+        entry[0] = keyKind;
+        BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(1), (uint)keyBytes.Length);
+        keyBytes.CopyTo(entry.AsSpan(5));
+
+        var position = 5 + keyBytes.Length;
+        entry[position] = valueKind;
+        BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(position + 1), (uint)value.Length);
+        value.CopyTo(entry.AsSpan(position + 5));
+        return entry;
     }
 
     internal static byte[] CreatePartitionPayload(int id, int segmentsCount, int currentOffset, ulong sizeBytes,

@@ -22,6 +22,7 @@ package org.apache.iggy.topic;
 import org.apache.iggy.message.HeaderValue;
 
 import java.math.BigInteger;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -94,9 +95,15 @@ public final class TopicOptions {
             return this;
         }
 
-        /** The keys set on this builder, in the order they were set. */
+        /**
+         * The keys set on this builder, in the order they were set.
+         *
+         * <p>Wrapping a {@link LinkedHashMap} rather than calling {@code Map.copyOf}, whose
+         * iteration order is salted per JVM run: the encoder walks this map in order, so a
+         * randomized one would give the same builder a different block on every run.
+         */
         public Map<String, HeaderValue> build() {
-            return Map.copyOf(options);
+            return Collections.unmodifiableMap(new LinkedHashMap<>(options));
         }
     }
 }

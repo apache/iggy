@@ -56,6 +56,59 @@ describe('serializeOptions', () => {
 
     assert.deepEqual(encoded, GOLDEN_OPTIONS_BLOCK);
   });
+
+  it('refuses an empty key', () => {
+    assert.throws(
+      () => serializeOptions([{ key: '', value: HeaderValue.Bool(true) }]),
+      /Invalid option key '' length: 0 bytes/
+    );
+  });
+
+  it('refuses a key past the field bound', () => {
+    assert.throws(
+      () => serializeOptions([
+        { key: 'k'.repeat(256), value: HeaderValue.Bool(true) }
+      ]),
+      /length: 256 bytes, must be between 1 and 255/
+    );
+  });
+
+  it('bounds the key on encoded bytes, not characters', () => {
+    // 128 two-byte characters: a character count reads 128 and lets this
+    // through, leaving the server to refuse the whole block.
+    assert.throws(
+      () => serializeOptions([
+        { key: 'ключ'.repeat(32), value: HeaderValue.Bool(true) }
+      ]),
+      /length: 256 bytes/
+    );
+  });
+
+  it('accepts a key exactly at the field bound', () => {
+    const encoded = serializeOptions([
+      { key: 'k'.repeat(255), value: HeaderValue.Bool(true) }
+    ]);
+
+    assert.equal(encoded.readUInt32LE(1), 255);
+  });
+
+  it('refuses a value past the field bound', () => {
+    assert.throws(
+      () => serializeOptions([
+        { key: 'segment_size', value: HeaderValue.String('v'.repeat(256)) }
+      ]),
+      /Invalid option value for key 'segment_size' length: 256 bytes/
+    );
+  });
+
+  it('refuses an empty value', () => {
+    assert.throws(
+      () => serializeOptions([
+        { key: 'segment_size', value: HeaderValue.Raw(Buffer.alloc(0)) }
+      ]),
+      /Invalid option value for key 'segment_size' length: 0 bytes/
+    );
+  });
 });
 
 describe('deserializePrefixedOptions', () => {

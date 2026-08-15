@@ -19,6 +19,7 @@
 import { HeaderKind } from './message/header.type.js';
 import {
   serializeHeaders,
+  serializeHeaderValue,
   deserializeHeaderValue,
   HeaderKeyFactory,
   type HeaderValue,
@@ -37,9 +38,9 @@ export const MAX_OPTIONS = 1024;
 export const MAX_OPTIONS_BYTES = 100 * 1000;
 
 /**
- * Key and value length bound, inherited from the header-field codec rather
- * than being an options-specific rule (`serializeHeaders` enforces the same
- * range on the way out).
+ * Key and value length bound, in encoded bytes rather than characters.
+ * Inherited from the header-field codec rather than being an options-specific
+ * rule: the server refuses a block carrying a field outside this range.
  */
 const MAX_HEADER_FIELD_LENGTH = 255;
 
@@ -75,6 +76,20 @@ export const dedupeOptions = (options: OptionEntry[]): OptionEntry[] => {
 };
 
 /**
+ * Rejects a key or value the codec cannot express.
+ *
+ * `serializeHeaders` writes whatever field length it is handed, so without
+ * this the block leaves here well-formed and comes back as a generic server
+ * error naming neither the key nor the bound it broke.
+ */
+const checkFieldLength = (length: number, field: string): void => {
+  if (length < 1 || length > MAX_HEADER_FIELD_LENGTH)
+    throw new Error(
+      `Invalid option ${field} length: ${length} bytes, ` +
+      `must be between 1 and ${MAX_HEADER_FIELD_LENGTH}`);
+};
+
+/**
  * Serializes resource options into a TLV block.
  * Reuses the user-headers TLV encoding: each field is
  * `[kind:u8][len:u32_le][bytes]`, alternating key, value.
@@ -89,8 +104,12 @@ export const serializeOptions = (options: OptionEntry[]): Buffer => {
     throw new Error(
       `Options block has ${options.length} entries, exceeds maximum ${MAX_OPTIONS}`);
 
-  // No key-length check here: `serializeHeaders` already bounds every field
-  // to 1..=255, so an options-specific cap would only duplicate it.
+  for (const { key, value } of options) {
+    checkFieldLength(Buffer.byteLength(key), `key '${key}'`);
+    checkFieldLength(
+      serializeHeaderValue(value).length, `value for key '${key}'`);
+  }
+
   const block = serializeHeaders(options.map(({ key, value }) =>
     ({ key: HeaderKeyFactory.String(key), value })));
 

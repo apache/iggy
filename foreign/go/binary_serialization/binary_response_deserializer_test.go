@@ -189,6 +189,32 @@ func TestDeserializeToStream_WithOptions(t *testing.T) {
 	}
 }
 
+func TestReadLengthPrefixed_RejectsALengthPastTheBuffer(t *testing.T) {
+	// 0xFFFFFFFF is the case a 64-bit-only reading of the guard misses: where
+	// int is 32 bits it converts to -1, and without the negative branch the
+	// remaining-bytes check passes and the slice panics.
+	lengths := []uint32{0x7FFFFFFF, 0x80000000, 0xFFFFFFFF}
+	for _, length := range lengths {
+		payload := binary.LittleEndian.AppendUint32(nil, length)
+		payload = append(payload, "value"...)
+
+		block, consumed, err := readLengthPrefixed(payload, 0, "field")
+		if err == nil {
+			t.Errorf("length 0x%X: expected an error, got block %v consuming %d bytes",
+				length, block, consumed)
+		}
+	}
+}
+
+func TestDeserializeToStream_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
+	payload := encodeStream(1, 100, 0, 0, 0, "s")
+	binary.LittleEndian.PutUint32(payload[len(payload)-4:], 0xFFFFFFFF)
+
+	if _, _, err := DeserializeToStream(payload, 0); err == nil {
+		t.Fatal("expected an error for an options length of 0xFFFFFFFF, got nil")
+	}
+}
+
 func TestDeserializeStreams_Empty(t *testing.T) {
 	streams, err := DeserializeStreams([]byte{})
 	if err != nil {

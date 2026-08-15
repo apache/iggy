@@ -1401,6 +1401,40 @@ class TestTopicOptions:
         assert listed.options.to_scalar_dict()["enforce_fsync"] is True
 
     @pytest.mark.asyncio
+    async def test_update_topic_options_reach_the_server(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Options passed to update_topic are applied, and gated by key."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.update_topic(
+            stream_id=stream_name,
+            topic_id=topic_name,
+            name=topic_name,
+            options={"compression_algorithm": "gzip"},
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert topic.compression_algorithm == "gzip"
+
+        # A create-time key is refused by name, so nothing re-pushes it to the
+        # partitions of a live topic.
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_topic(
+                stream_id=stream_name,
+                topic_id=topic_name,
+                name=topic_name,
+                options={"segment_size": "2 MiB"},
+            )
+
+    @pytest.mark.asyncio
     async def test_describe_options_lists_the_topic_catalog(
         self, iggy_client: IggyClient
     ):

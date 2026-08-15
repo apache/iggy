@@ -654,6 +654,9 @@ impl IggyClient {
     ///     compression_algorithm: Compression algorithm as `str | None`.
     ///     message_expiry: Message expiry as `IggyExpiry | None`.
     ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+    ///     options: Additional option keys as `dict[str, str] | None`, sent
+    ///         verbatim so an updatable server key can be set from this build.
+    ///         A create-only key is refused by name.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
@@ -662,7 +665,7 @@ impl IggyClient {
     ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
     ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name, compression_algorithm = None, message_expiry = None, max_topic_size = None)
+        signature = (stream_id, topic_id, name, compression_algorithm = None, message_expiry = None, max_topic_size = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -681,6 +684,8 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
             &MaxTopicSize,
         >,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         // Absent stays absent: a key the caller did not pass is left alone
         // server-side rather than reset to a default.
@@ -694,7 +699,7 @@ impl IggyClient {
             compression_algorithm,
             message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
             max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
-            ..TopicUpdateOptions::default()
+            raw: options.unwrap_or_default(),
         };
 
         let stream_id = Identifier::try_from(stream_id)?;

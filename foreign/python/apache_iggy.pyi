@@ -1101,6 +1101,7 @@ class IggyClient:
         compression_algorithm: builtins.str | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1116,6 +1117,9 @@ class IggyClient:
             compression_algorithm: Compression algorithm as `str | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so an updatable server key can be set from this build.
+                A create-only key is refused by name.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
