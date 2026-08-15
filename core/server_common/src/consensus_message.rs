@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::iobuf::{Frozen, Owned};
+use crate::sharding::METADATA_GROUP;
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
@@ -337,6 +338,24 @@ where
         <RequestBacking as MutableBacking<H>>::as_slice(&self.backing)
     }
 
+    /// The frame body: the bytes after the header, up to the header's `size`.
+    /// Empty for a header-only frame.
+    ///
+    /// Borrowed from the backing buffer rather than copied out of it. A
+    /// `WireDecode` parse takes `&[u8]` and keeps only the fields it decodes, so
+    /// copying the body first buys nothing and costs a memcpy per frame on paths
+    /// that run per replicated op (`metadata::stm`'s apply, `metadata::stm::authz`).
+    ///
+    /// # Panics
+    /// If `size` does not span the header or overruns the buffer.
+    /// [`TryFrom<Owned>`](Message::try_from) rejects both, so every received frame
+    /// satisfies this; a buffer from [`Message::new`] must have its header stamped
+    /// first.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.as_slice()[size_of::<H>()..self.header().size() as usize]
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         <RequestBacking as MutableBacking<H>>::as_mut_slice(&mut self.backing)
     }
@@ -566,6 +585,119 @@ pub enum MessageBag {
 }
 
 impl MessageBag {
+    /// `(operation, group)`: everything the shard router needs to pick a
+    /// target, read off the already-typed header without consuming the bag.
+    ///
+    /// `group` is a plain field on every consensus header rather than a
+    /// [`ConsensusHeader`] method, which is why this is a match and not a trait
+    /// call. `RepairPrepare` reads through its wrapped prepare.
+    ///
+    /// One `header()` per arm, bound to a local: each call runs a checked bytemuck
+    /// cast over the 256-byte header, and this is the per-frame routing path.
+    #[must_use]
+    pub fn routing(&self) -> (Operation, u64) {
+        match self {
+            Self::Request(message) => {
+                let header = message.header();
+                (header.operation, header.group)
+            }
+            Self::Prepare(message) => {
+                let header = message.header();
+                (header.operation, header.group)
+            }
+            Self::PrepareOk(message) => {
+                let header = message.header();
+                (header.operation, header.group)
+            }
+            Self::RepairPrepare(message) => {
+                let header = &message.header().0;
+                (header.operation, header.group)
+            }
+            Self::StartViewChange(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::DoViewChange(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StartView(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::Commit(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStartView(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestPrepares(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RepairRangeReply(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStateTransfer(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StateTransferTarget(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStateChunk(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StateChunk(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            // Register forwarding is a metadata-plane errand, and the metadata
+            // consensus group lives on shard 0 on every node; the headers carry
+            // no group field because there is nothing else they could address.
+            Self::ForwardRegister(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardRegisterResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardLogout(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
+        }
+    }
+
+    /// Discard the classification and hand back the underlying frame.
+    ///
+    /// Type-erasure only: the backing bytes are untouched, so a later
+    /// [`MessageBag::try_from`] reclassifies to the same variant. Callers that
+    /// need the frame in a generic container (the parked-frame buffer) use this;
+    /// the dispatch path keeps the bag so it never re-parses.
+    #[must_use]
+    pub fn into_generic(self) -> Message<GenericHeader> {
+        match self {
+            Self::Request(message) => message.into_generic(),
+            Self::Prepare(message) => message.into_generic(),
+            Self::PrepareOk(message) => message.into_generic(),
+            Self::StartViewChange(message) => message.into_generic(),
+            Self::DoViewChange(message) => message.into_generic(),
+            Self::StartView(message) => message.into_generic(),
+            Self::Commit(message) => message.into_generic(),
+            Self::RequestStartView(message) => message.into_generic(),
+            Self::RequestPrepares(message) => message.into_generic(),
+            Self::RepairPrepare(message) => message.into_generic(),
+            Self::RepairRangeReply(message) => message.into_generic(),
+            Self::RequestStateTransfer(message) => message.into_generic(),
+            Self::StateTransferTarget(message) => message.into_generic(),
+            Self::RequestStateChunk(message) => message.into_generic(),
+            Self::StateChunk(message) => message.into_generic(),
+            Self::ForwardRegister(message) => message.into_generic(),
+            Self::ForwardRegisterResult(message) => message.into_generic(),
+            Self::ForwardLogout(message) => message.into_generic(),
+            Self::ForwardLogoutResult(message) => message.into_generic(),
+        }
+    }
+
     #[must_use]
     pub fn command(&self) -> Command2 {
         match self {
@@ -966,6 +1098,30 @@ mod tests {
         let generic = typed.as_generic();
         assert_eq!(generic.header().command, Command2::Request);
         assert_eq!(generic.total_len(), 256);
+    }
+
+    // body(): the slice every wire decode reads from
+
+    #[test]
+    fn body_is_the_bytes_between_the_header_and_the_frame_size() {
+        // A 512-byte allocation holding a 260-byte frame: the accessor follows the
+        // header's `size`, never the buffer that happens to hold it.
+        const BODY: [u8; 4] = [1, 2, 3, 4];
+        let frame_size = size_of::<GenericHeader>() + BODY.len();
+        let mut owned = header_bytes_sized(Command2::Prepare, frame_size as u32, 512);
+        owned.as_mut_slice()[size_of::<GenericHeader>()..frame_size].copy_from_slice(&BODY);
+
+        let message = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert_eq!(message.body(), BODY);
+    }
+
+    #[test]
+    fn body_is_empty_for_a_header_only_frame() {
+        // Header-only commands go through the same accessor, so `size` equal to the
+        // header must yield an empty slice rather than an inverted-range panic.
+        let owned = header_bytes_sized(Command2::Prepare, size_of::<GenericHeader>() as u32, 512);
+        let message = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert!(message.body().is_empty());
     }
 
     // try_as_typed: validation gates the unsafe ptr-cast reborrow

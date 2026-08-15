@@ -412,18 +412,25 @@ macro_rules! collect_handlers {
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
                     use ::iggy_binary_protocol::WireDecode;
                     use ::iggy_common::Either;
-                    use ::iggy_binary_protocol::{Operation, PrepareHeader};
-                    match input.header().operation {
+                    use ::iggy_binary_protocol::Operation;
+
+                    // Both scalars copied out of one header read. `header()`
+                    // re-validates the bit pattern on each call, and the borrow has
+                    // to end before the pass-through arm can move `input` on.
+                    let (operation, timestamp) = {
+                        let header = input.header();
+                        (header.operation, header.timestamp)
+                    };
+
+                    match operation {
                         $(
                             Operation::$operation => {
-                                // TODO: FIXME, zero allocation operation construction.
-                                let header = *input.header();
-                                let body = ::bytes::Bytes::copy_from_slice(
-                                    &input.as_slice()[core::mem::size_of::<PrepareHeader>()..header.size as usize]
-                                );
-                                let cmd = [<$operation Request>]::decode_from(&body)
+                                // Decoded straight off the backing buffer. Every field a
+                                // request keeps is owned, so nothing borrows past this
+                                // call and the body never needs a copy of its own.
+                                let cmd = [<$operation Request>]::decode_from(input.body())
                                     .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
-                                let ts = ::iggy_common::IggyTimestamp::from(header.timestamp);
+                                let ts = ::iggy_common::IggyTimestamp::from(timestamp);
                                 Ok(Either::Left([<$state Command>]::$operation(cmd, ts)))
                             },
                         )*

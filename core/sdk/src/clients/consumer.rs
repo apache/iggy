@@ -280,7 +280,12 @@ impl IggyConsumer {
     }
 
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
-    pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
+    pub async fn delete_offset(&self, mut partition_id: Option<u32>) -> Result<(), IggyError> {
+        // `None` is only resolved server-side for consumer groups. For a standalone consumer
+        // explicitly assign the current partition_id.
+        if partition_id.is_none() && !self.is_consumer_group {
+            partition_id = Some(self.current_partition_id.load(ORDERING));
+        }
         let client = self.client.read().await;
         client
             .delete_consumer_offset(

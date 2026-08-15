@@ -192,8 +192,13 @@ pub struct ClientTableSnapshot {
 }
 
 /// Serializes reply bytes as a msgpack `bin` blob. See [`ClientEntrySnapshot::reply`].
+///
+/// `bin` is the only accepted encoding; the `visit_seq` arm that also took the older
+/// integer-array form is gone. `SNAPSHOT_FORMAT_VERSION` decides readability in one
+/// place, and a second decoder quietly accepting a retired layout makes that stamp a
+/// lie.
 mod reply_bytes {
-    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::de::{Error, Visitor};
     use serde::{Deserializer, Serializer};
     use std::fmt;
 
@@ -207,7 +212,7 @@ mod reply_bytes {
 
     struct BytesVisitor;
 
-    impl<'de> Visitor<'de> for BytesVisitor {
+    impl Visitor<'_> for BytesVisitor {
         type Value = Vec<u8>;
 
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -219,17 +224,6 @@ mod reply_bytes {
         }
 
         fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
-            Ok(bytes)
-        }
-
-        /// A checkpoint written before the `bin` encoding holds an integer array.
-        /// Accepting it keeps this a read-compatible change rather than one that
-        /// refuses a checkpoint it could decode.
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
-            while let Some(byte) = seq.next_element()? {
-                bytes.push(byte);
-            }
             Ok(bytes)
         }
     }
