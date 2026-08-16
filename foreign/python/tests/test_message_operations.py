@@ -1488,6 +1488,38 @@ class TestMessageOperations:
         ]
 
     @pytest.mark.asyncio
+    async def test_poll_messages_with_an_unjoined_consumer_group_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a group poll needs membership, since it has no assignment without it."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=0,
+            messages=[Message("Unjoined group")],
+        )
+
+        # The group exists; only the join is missing.
+        with pytest.raises(RuntimeError, match="was not found"):
+            await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Group(group_name),
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_poll_messages_with_consumer_group_honours_an_explicit_partition(
         self, iggy_client: IggyClient, unique_name
     ):
