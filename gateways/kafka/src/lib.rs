@@ -21,4 +21,4 @@ pub mod error;
 pub mod protocol;
 pub mod server;
 
-pub use server::{KafkaGateway, GatewayConfig};
+pub use server::{GatewayConfig, KafkaGateway};

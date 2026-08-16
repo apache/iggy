@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
-use iggy_gateway_kafka::{KafkaGateway, GatewayConfig};
+use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 /// Bind an ephemeral port, start `KafkaServer`, return address + shutdown sender.
 pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {

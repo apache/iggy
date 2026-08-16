@@ -24,7 +24,7 @@ use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
 
 use iggy_gateway_kafka::server::init_tracing;
-use iggy_gateway_kafka::{KafkaGateway, GatewayConfig};
+use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
