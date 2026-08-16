@@ -339,10 +339,12 @@ class TestUpdateStream:
         await iggy_client.create_stream(stream_name)
 
         await iggy_client.update_stream(stream_id=stream_name, name=new_name)
-
-        renamed = await iggy_client.get_stream(new_name)
-        assert renamed is not None
-        assert renamed.name == new_name
+        try:
+            renamed = await iggy_client.get_stream(new_name)
+            assert renamed is not None
+            assert renamed.name == new_name
+        finally:
+            await iggy_client.delete_stream(new_name)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
