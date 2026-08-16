@@ -1328,6 +1328,41 @@ class TestMessageOperations:
         assert second_poll == []
 
     @pytest.mark.asyncio
+    async def test_poll_messages_without_partition_id_reads_partition_zero(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a regular consumer falls back to partition 0, not the whole topic."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partitions_count = 3
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=partitions_count
+        )
+        for partition_id in range(partitions_count):
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=partition_id,
+                messages=[Message(f"Partition {partition_id}")],
+            )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("partition-zero-consumer"),
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+
+        assert [
+            (message.partition_id(), message.payload().decode("utf-8"))
+            for message in polled_messages
+        ] == [(0, "Partition 0")]
+
+    @pytest.mark.asyncio
     async def test_poll_messages_with_consumer_group_rotates_assigned_partitions(
         self, iggy_client: IggyClient, unique_name
     ):
