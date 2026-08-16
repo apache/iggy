@@ -25,6 +25,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// Bounds the wait for the heartbeat verifier to evict a client that stopped
+/// pinging. Generous relative to the 2.4s threshold it covers, because the
+/// eviction pass competes with the rest of the suite.
+const STALE_EVICTION_TIMEOUT: Duration = Duration::from_secs(20);
+const STALE_EVICTION_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
 const STREAM_NAME: &str = "stale-test-stream";
 const TOPIC_NAME: &str = "stale-test-topic";
 const CONSUMER_GROUP_NAME: &str = "stale-test-cg";
@@ -77,11 +83,11 @@ async fn setup_resources(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -162,10 +168,34 @@ async fn should_handle_stale_client_with_manual_reconnection(
     }
     assert_eq!(messages_polled, 5);
 
-    // Wait for heartbeat timeout (2s * 1.2 = 2.4s threshold)
-    sleep(Duration::from_secs(4)).await;
+    // Wait for the heartbeat verifier (2s interval, 2.4s threshold) to evict
+    // the stale client, observed through `setup_client` rather than by polling
+    // `stale_client` itself: a poll counts as activity and would keep resetting
+    // the staleness the test is waiting for. That is also why the assertion
+    // below gets only a couple of attempts -- each one refreshes liveness, so
+    // retrying harder makes eviction less likely, not more.
+    let deadline = tokio::time::Instant::now() + STALE_EVICTION_TIMEOUT;
+    loop {
+        let group = setup_client
+            .get_consumer_group(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("consumer group exists");
+        if group.members_count == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?},              group still reports {} member(s)",
+            group.members_count
+        );
+        sleep(STALE_EVICTION_RETRY_INTERVAL).await;
+    }
 
-    // Should get error after stale detection
     let mut got_error = false;
     for _ in 0..3 {
         if stale_client
@@ -186,7 +216,7 @@ async fn should_handle_stale_client_with_manual_reconnection(
         }
         sleep(Duration::from_millis(100)).await;
     }
-    assert!(got_error, "Expected error after heartbeat timeout");
+    assert!(got_error, "Expected error after heartbeat eviction");
 
     // Reconnect with new client
     drop(stale_client);

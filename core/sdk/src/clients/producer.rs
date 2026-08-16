@@ -24,10 +24,10 @@ use crate::clients::producer_dispatcher::ProducerDispatcher;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-use iggy_common::{Client, MessageClient, StreamClient, TopicClient};
+use iggy_common::{Client, MessageClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
-    CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
-    IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
+    DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration, IggyError, IggyExpiry,
+    IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use std::sync::Arc;
@@ -94,7 +94,6 @@ pub struct ProducerCore {
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
-    topic_replication_factor: Option<u8>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     default_partitioning: Arc<Partitioning>,
@@ -154,11 +153,14 @@ impl ProducerCore {
                 .create_topic(
                     &self.stream_id,
                     &self.topic_name,
-                    self.topic_partitions_count,
-                    CompressionAlgorithm::None,
-                    self.topic_replication_factor,
-                    self.topic_message_expiry,
-                    self.topic_max_size,
+                    &TopicCreateOptions {
+                        partitions_count: Some(self.topic_partitions_count),
+                        message_expiry: (self.topic_message_expiry != IggyExpiry::ServerDefault)
+                            .then_some(self.topic_message_expiry),
+                        max_topic_size: (self.topic_max_size != MaxTopicSize::ServerDefault)
+                            .then_some(self.topic_max_size),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await?;
         }
@@ -491,7 +493,6 @@ impl IggyProducer {
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
         topic_partitions_count: u32,
-        topic_replication_factor: Option<u8>,
         topic_message_expiry: IggyExpiry,
         topic_max_size: MaxTopicSize,
         send_retries_count: Option<u32>,
@@ -512,7 +513,6 @@ impl IggyProducer {
             create_stream_if_not_exists,
             create_topic_if_not_exists,
             topic_partitions_count,
-            topic_replication_factor,
             topic_message_expiry,
             topic_max_size,
             default_partitioning: Arc::new(Partitioning::balanced()),

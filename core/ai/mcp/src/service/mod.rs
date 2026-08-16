@@ -16,10 +16,12 @@
 // under the License.
 
 use iggy::prelude::{
-    ClusterClient, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
-    IggyError, IggyMessage, IggyTimestamp, MessageClient, PartitionClient, Partitioning,
-    PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
-    SystemClient, SystemSnapshotType, TopicClient, UserClient, UserStatus,
+    ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
+    Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize,
+    MessageClient, PartitionClient, Partitioning, PersonalAccessTokenClient, PollingKind,
+    PollingStrategy, SegmentClient, StreamClient, StreamUpdateOptions, SystemClient,
+    SystemSnapshotType, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient,
+    UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -94,7 +96,11 @@ impl IggyService {
         Parameters(UpdateStream { stream_id, name }): Parameters<UpdateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        request(self.client.update_stream(&id(&stream_id)?, &name).await)
+        request(
+            self.client
+                .update_stream(&id(&stream_id)?, &name, &StreamUpdateOptions::default())
+                .await,
+        )
     }
 
     #[tool(description = "Delete stream")]
@@ -148,9 +154,9 @@ impl IggyService {
             name,
             partitions_count,
             compression_algorithm,
-            replication_factor,
             message_expiry,
             max_size,
+            options,
         }): Parameters<CreateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
@@ -166,11 +172,21 @@ impl IggyService {
                 .create_topic(
                     &id(&stream_id)?,
                     &name,
-                    partitions_count,
-                    compression_algorithm,
-                    replication_factor,
-                    message_expiry,
-                    max_size,
+                    &TopicCreateOptions {
+                        partitions_count: Some(partitions_count),
+                        compression_algorithm: (compression_algorithm
+                            != CompressionAlgorithm::default())
+                        .then_some(compression_algorithm),
+                        message_expiry: (message_expiry != IggyExpiry::ServerDefault)
+                            .then_some(message_expiry),
+                        max_topic_size: (max_size != MaxTopicSize::ServerDefault)
+                            .then_some(max_size),
+                        // Raw keys ride as strings and are parsed server-side by
+                        // the same rules a config value goes through, so a key
+                        // added after this build shipped is still reachable.
+                        raw: options,
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await,
         )
@@ -184,30 +200,23 @@ impl IggyService {
             topic_id,
             name,
             compression_algorithm,
-            replication_factor,
             message_expiry,
             max_size,
+            options,
         }): Parameters<UpdateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        let compression_algorithm = compression_algorithm
-            .and_then(|ca| ca.parse().ok())
-            .unwrap_or_default();
-        let message_expiry = message_expiry
-            .and_then(|me| me.parse().ok())
-            .unwrap_or_default();
-        let max_size = max_size.and_then(|ms| ms.parse().ok()).unwrap_or_default();
+        // Absent means "leave alone" now, so an unparsable value must not
+        // silently become a reset to the server default.
+        let update_options = TopicUpdateOptions {
+            compression_algorithm: compression_algorithm.and_then(|ca| ca.parse().ok()),
+            message_expiry: message_expiry.and_then(|me| me.parse().ok()),
+            max_topic_size: max_size.and_then(|ms| ms.parse().ok()),
+            raw: options,
+        };
         request(
             self.client
-                .update_topic(
-                    &id(&stream_id)?,
-                    &id(&topic_id)?,
-                    &name,
-                    compression_algorithm,
-                    replication_factor,
-                    message_expiry,
-                    max_size,
-                )
+                .update_topic(&id(&stream_id)?, &id(&topic_id)?, &name, &update_options)
                 .await,
         )
     }
@@ -691,7 +700,12 @@ impl IggyService {
         });
         request(
             self.client
-                .update_user(&id(&user_id)?, username.as_deref(), status)
+                .update_user(
+                    &id(&user_id)?,
+                    username.as_deref(),
+                    status,
+                    &UserUpdateOptions::default(),
+                )
                 .await,
         )
     }

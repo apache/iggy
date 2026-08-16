@@ -59,7 +59,7 @@ impl WireDecode for GetUsersResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WireName;
+    use crate::{WireName, WireOptions};
 
     #[test]
     fn roundtrip_empty() {
@@ -80,12 +80,14 @@ mod tests {
                     created_at: 100,
                     status: 1,
                     username: WireName::new("admin").unwrap(),
+                    options: WireOptions::empty(),
                 },
                 UserResponse {
                     id: 2,
                     created_at: 200,
                     status: 2,
                     username: WireName::new("alice").unwrap(),
+                    options: WireOptions::empty(),
                 },
             ],
         };

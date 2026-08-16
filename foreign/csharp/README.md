@@ -284,7 +284,6 @@ await client.CreateTopicAsync(
     name: "my-topic",
     partitionsCount: 3,
     compressionAlgorithm: CompressionAlgorithm.None,
-    replicationFactor: 1,
     messageExpiry: 0,  // 0 = never expire
     maxTopicSize: 0    // 0 = unlimited
 );

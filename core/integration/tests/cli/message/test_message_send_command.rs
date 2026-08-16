@@ -162,11 +162,11 @@ impl IggyCmdTestCase for TestMessageSendCmd {
             .create_topic(
                 &stream.id.try_into().unwrap(),
                 &self.topic_name,
-                self.partitions_count,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.partitions_count),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .expect("Failed to create topic");

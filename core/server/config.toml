@@ -492,39 +492,24 @@ default_algorithm = "none"
 # Specifies the directory where stream data is stored, relative to `system.path`.
 path = "streams"
 
-# Topic configuration - default settings for new topics
+# Topic configuration
 [system.topic]
 # Path for storing topic-related data, relative to `stream.path`.
 path = "topics"
 
-# Messages can be deleted based on two independent policies:
-# 1. Size-based: delete oldest segments when topic exceeds max_size
-# 2. Time-based: delete segments older than message_expiry
-# Both can be active simultaneously. Per-topic overrides via CreateTopic/UpdateTopic.
-
-# Maximum topic size before oldest segments are deleted.
-# "unlimited" or "0" = no size limit (messages kept indefinitely).
-# When 90% of this limit is reached, oldest segments are removed to make room.
-# Applies to sealed segments only (active segment is protected).
-# Example: "10 GiB"
-max_size = "unlimited"
-
-# Maximum age of messages before segments are deleted.
-# "none" = no time limit (messages kept indefinitely).
-# Applies to sealed segments only (active segment is protected).
-# Example: "7 days", "2 days 4 hours 15 minutes"
-message_expiry = "none"
+# Retention is per topic, set at CreateTopic and readable on GetTopic:
+#   max_topic_size   - delete oldest sealed segments past this size
+#                      ("unlimited" when unset)
+#   message_expiry   - delete sealed segments older than this ("none" when unset)
+# Both policies can be active at once; the active segment is never touched.
+# Call GET /options/topic (or the SDK's describe_options) for the full catalog
+# with this server's defaults.
 
 # Partition configuration
 [system.partition]
 # Path for storing partition-related data (string).
 # Specifies the directory where partition data is stored, relative to `topic.path`.
 path = "partitions"
-
-# Determines whether to enforce file synchronization on partition updates (boolean).
-# `true` ensures immediate writing of data to disk for durability.
-# `false` allows the OS to manage write operations, which can improve performance.
-enforce_fsync = false
 
 # Enables checksum validation for data integrity (boolean).
 # `true` re-hashes every batch a disk poll reads and fails the poll closed on a
@@ -534,26 +519,22 @@ enforce_fsync = false
 # somewhere else in the stack.
 validate_checksum = true
 
-# The count threshold of buffered messages before triggering a save to disk.
-# Together with `size_of_messages_required_to_save` it defines the threshold.
-# This is a soft limit - actual count may be higher depending on last batch size.
-# Minimum value is 1.
-messages_required_to_save = 1024
-
-# The size threshold of buffered messages before triggering a save to disk.
-# Together with `messages_required_to_save` it defines the threshold.
-# This is a soft limit - actual size may be higher depending on last batch size.
-size_of_messages_required_to_save = "1 MiB"
+# Durability and flush cadence are per topic, set at CreateTopic:
+#   enforce_fsync                     - fsync each write (false when unset)
+#   messages_required_to_save         - flush after this many messages (1024)
+#   size_of_messages_required_to_save - flush after this many bytes (1 MiB)
 
 # Segment configuration
 [system.segment]
-# Defines the soft limit for the size of a storage segment.
-# When a segment reaches this size, a new segment is created for subsequent data.
-# Example: if `size` is set "1GiB", the actual segment size may be 1GiB + the size of remaining messages in received batch.
-# Maximum size is 1 GiB. Size has to be a multiple of 512 B.
-size = "1 GiB"
-# Reserves segment space in advance when supported by the local filesystem.
-preallocate = true
+# Segment size is per topic, set at CreateTopic as `segment_size` (1 GiB when
+# unset). It is a soft limit: a segment may close one whole batch past it.
+# Bounds are enforced at creation - a 512 B multiple, at least 1 MiB, and no
+# larger than 1 GiB.
+#
+# `preallocate_segments` is per topic too: it reserves exactly `segment_size`
+# up front where the filesystem supports it. Off unless a topic asks for it --
+# with the default 1 GiB segment size it costs 1 GiB of real disk per
+# partition at creation.
 
 # Configures whether expired segments are archived (boolean) or just deleted without archiving.
 # Unsupported: setting this to `true` aborts boot.
@@ -568,19 +549,6 @@ archive_expired = false
 # warns when set.
 cache_indexes = "open_segment"
 
-# Message deduplication configuration
-[system.message_deduplication]
-# Controls whether message deduplication is enabled (boolean).
-# `true` activates deduplication, ignoring messages with duplicate IDs.
-# `false` treats each message as unique, even if IDs are duplicated.
-# Unsupported: setting this to `true` aborts boot.
-enabled = false
-# Maximum number of ID entries in the deduplication cache (u64).
-max_entries = 10000
-# Maximum age of ID entries in the deduplication cache in human-readable format.
-expiry = "1 m"
-
-# Recovery configuration in case of lost data
 [system.recovery]
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
 # Unsupported: setting this to `true` aborts boot.
@@ -984,13 +952,19 @@ transfer_served_cache_bytes_max = "2176 MiB"
 
 # Alloc ceiling for ONE received state-transfer artifact, per shard. The
 # receiver holds it resident through verify, walk and staging write, and up to
-# four transfers run at once. MUST cover system.segment.size plus
-# message_bus.max_message_size (a segment may close one whole batch past its
-# cap): under that, a legal segment is refused, the whole manifest with it, and
-# the partition livelocks re-requesting it from every peer. Boot validates the
-# floor. Raising this above the floor for headroom also DIVIDES the serving
-# concurrency derived from transfer_served_cache_bytes_max above, so raise that
-# in step. Must be > 0 and <= "64 GiB".
+# four transfers run at once. MUST cover the largest segment any topic may be
+# created with (a fixed 1 GiB, since segment_size is a per-topic option now)
+# plus message_bus.max_message_size, because a segment may close one whole batch
+# past its cap: under that, a legal segment is refused, the whole manifest with
+# it, and the partition livelocks re-requesting it from every peer. Boot
+# validates the floor.
+#
+# The shipped value sits EXACTLY at that floor: 1024 MiB + the shipped 64 MiB
+# max_message_size. Raising max_message_size alone therefore refuses boot --
+# raise this one by the same amount in the same edit. Raising it above the floor
+# for headroom also DIVIDES the serving concurrency derived from
+# transfer_served_cache_bytes_max above, so raise that in step. Must be > 0 and
+# <= "64 GiB".
 transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.

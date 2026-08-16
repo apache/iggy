@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_cli::commands::cli_command::PRINT_TARGET;
+use iggy_cli::commands::cli_command::{DIAGNOSTIC_TARGET, PRINT_TARGET};
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
@@ -58,6 +58,21 @@ impl Logging {
         self.stdout_guard = Some(stdout_guard);
 
         layers.push(stdout_layer.with_filter(stdout_filter).boxed());
+
+        // Diagnostics go to stderr even under `--quiet`: quiet suppresses the
+        // command's result, not a warning that the run was degraded. Scoped to
+        // DIAGNOSTIC_TARGET rather than "every non-print event" so dependency
+        // logs stay suppressed as before.
+        let stderr_filter =
+            filter::filter_fn(|metadata| metadata.target().contains(DIAGNOSTIC_TARGET));
+        let stderr_layer = fmt::Layer::default()
+            .without_time()
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .with_filter(LevelFilter::WARN)
+            .boxed();
+
+        layers.push(stderr_layer.with_filter(stderr_filter).boxed());
 
         if let Some(file_path) = debug {
             let _ = std::fs::remove_file(file_path); // Remove file if it exists

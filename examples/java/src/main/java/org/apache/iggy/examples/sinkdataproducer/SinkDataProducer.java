@@ -117,7 +117,6 @@ public final class SinkDataProducer {
                                     CompressionAlgorithm.None,
                                     java.math.BigInteger.ZERO,
                                     java.math.BigInteger.ZERO,
-                                    java.util.Optional.empty(),
                                     topicId.getName());
                     log.info("Created topic {}.", topicId.getName());
                 });

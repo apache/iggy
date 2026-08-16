@@ -35,11 +35,11 @@ pub async fn run(client: &IggyClient) {
         .create_topic(
             &Identifier::named(stream_name).unwrap(),
             topic_name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

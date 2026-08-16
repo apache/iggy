@@ -80,6 +80,9 @@ pub fn sample(
                 partitions_count,
             })
         }
+        // Not a targeted outcome (absent from `OUTCOMES`); the sim client
+        // only sends catalog keys with valid values.
+        Outcome::InvalidOptionValue => None,
     }
 }
 

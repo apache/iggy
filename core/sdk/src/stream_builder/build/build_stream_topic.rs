@@ -17,8 +17,7 @@
  */
 
 use crate::prelude::{
-    CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError, IggyExpiry, MaxTopicSize,
-    StreamClient, TopicClient,
+    IdKind, Identifier, IggyClient, IggyError, StreamClient, TopicClient, TopicCreateOptions,
 };
 
 use crate::stream_builder::IggyConsumerConfig;
@@ -83,7 +82,6 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
         let stream_id = config.stream_id();
         let stream_name = config.stream_name();
         let topic_partitions_count = config.partitions_count();
-        let topic_replication_factor = config.replication_factor();
 
         let (name, _id) = extract_name_id_from_identifier(topic_id, topic_name)?;
         trace!("Create topic: {name} for stream: {}", stream_name);
@@ -91,11 +89,10 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
             .create_topic(
                 stream_id,
                 topic_name,
-                topic_partitions_count,
-                CompressionAlgorithm::None,
-                topic_replication_factor,
-                IggyExpiry::ServerDefault,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(topic_partitions_count),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
     }

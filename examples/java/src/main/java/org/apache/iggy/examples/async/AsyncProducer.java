@@ -32,7 +32,6 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -142,7 +141,6 @@ public final class AsyncProducer {
                                     CompressionAlgorithm.None,
                                     BigInteger.ZERO,
                                     BigInteger.ZERO,
-                                    Optional.empty(),
                                     TOPIC_NAME)
                             .thenAccept(created -> log.info("Topic created: {}", created.name()));
                 });

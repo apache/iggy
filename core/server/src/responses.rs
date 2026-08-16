@@ -27,14 +27,14 @@ use crate::bootstrap::{ShellBus, ShellShard};
 use crate::cluster_meta::ClusterRoster;
 use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
+    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
@@ -49,6 +49,9 @@ use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
+use iggy_binary_protocol::requests::system::{
+    DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
+};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
@@ -68,6 +71,7 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
+use iggy_binary_protocol::responses::system::{DescribeOptionsResponse, OptionDescriptor};
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -78,7 +82,11 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{EncryptorKind, Identifier, IggyError, IggyTimestamp};
+use iggy_common::wire_conversions::{resource_options_to_wire, resource_options_to_wire_split};
+use iggy_common::{
+    EncryptorKind, HeaderKind, Identifier, IggyError, IggyTimestamp, OptionsProvenance,
+    topic_option_keys,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
@@ -528,6 +536,9 @@ where
     SB: SuperblockStore + 'static,
 {
     match code {
+        DESCRIBE_OPTIONS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_describe_options_response(body)?.to_bytes(),
+        )),
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
             build_cluster_metadata_response(roster, shard, client_ip).to_bytes(),
         )),
@@ -594,34 +605,8 @@ where
                 personal_access_tokens_response(tokens)?.to_bytes(),
             ))
         }
-        GET_CONSUMER_GROUP_CODE => {
-            let request = GetConsumerGroupRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
-            let response = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
-            Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
-                NonReplicatedResponse::Bytes(response.to_bytes())
-            }))
-        }
-        GET_CONSUMER_GROUPS_CODE => {
-            let request = GetConsumerGroupsRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
-            let groups = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .consumer_group_list(&request.stream_id, &request.topic_id);
-            Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
-                NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
-            }))
-        }
+        GET_CONSUMER_GROUP_CODE => build_consumer_group_response(shard, body),
+        GET_CONSUMER_GROUPS_CODE => build_consumer_groups_response(shard, body),
         // The server has no on-demand flush primitive, so it denies honestly.
         // The non-replicated catch-all's empty-ok would otherwise attest a
         // durability guarantee the server never gave.
@@ -638,6 +623,56 @@ where
             None => Err(IggyError::InvalidCommand),
         },
     }
+}
+
+fn build_consumer_group_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    body: &[u8],
+) -> Result<NonReplicatedResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let request =
+        GetConsumerGroupRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
+    let response = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
+    Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
+        NonReplicatedResponse::Bytes(response.to_bytes())
+    }))
+}
+
+fn build_consumer_groups_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    body: &[u8],
+) -> Result<NonReplicatedResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let request =
+        GetConsumerGroupsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
+    let groups = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_group_list(&request.stream_id, &request.topic_id);
+    Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
+        NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
+    }))
 }
 
 /// Build the binary `GetClusterMetadata` reply from the shared roster assembly.
@@ -943,6 +978,126 @@ where
     })
 }
 
+/// Every key `CreateTopic` accepts, with the kind, default and bounds of each.
+///
+/// Split out of [`build_describe_options_response`] so the descriptions have room
+/// to state the bounds each value is checked against: this catalog is the only
+/// place an operator learns them.
+///
+/// Every default is a build constant: these knobs stopped being config-derived
+/// when the `[system.*]` keys became topic options, so the catalog reads them
+/// straight from `iggy_common`.
+fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
+    Ok(vec![
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::COMPRESSION_ALGORITHM)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"none"),
+            description: "Compression algorithm (none, gzip)".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MESSAGE_EXPIRY)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MESSAGE_EXPIRY.to_le_bytes(),
+            ),
+            description: "Message expiry in microseconds, or a humantime string \
+                              (e.g. 7 days)"
+                .to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MAX_TOPIC_SIZE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
+            ),
+            description: "Topic size cap in bytes, or a byte-size string (e.g. 1 GiB); \
+                              must be at least the segment size"
+                .to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::SEGMENT_SIZE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(&iggy_common::DEFAULT_SEGMENT_SIZE.to_le_bytes()),
+            description: format!(
+                "Segment size in bytes, or a byte-size string (e.g. 128 MiB); a 512-byte \
+                     multiple within {}..={}",
+                iggy_common::MIN_TOPIC_SEGMENT_SIZE,
+                iggy_common::MAX_TOPIC_SEGMENT_SIZE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::ENFORCE_FSYNC)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Bool.as_code(),
+            default_value: Bytes::copy_from_slice(&[u8::from(iggy_common::DEFAULT_ENFORCE_FSYNC)]),
+            description: "Whether writes to this topic's partitions fsync".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint32.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
+            ),
+            description: format!(
+                "Flush the journal once it holds this many messages; \
+                     1..={}. A threshold no segment can reach leaves committed \
+                     messages in the journal, which a crash does not preserve",
+                iggy_common::MAX_MESSAGES_REQUIRED_TO_SAVE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
+            ),
+            description: format!(
+                "Flush the journal once it holds this many bytes, or a byte-size \
+                     string; whichever threshold trips first flushes. At most {}",
+                iggy_common::MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::PREALLOCATE_SEGMENTS)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Bool.as_code(),
+            default_value: Bytes::copy_from_slice(&[u8::from(
+                iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            )]),
+            description: format!(
+                "Reserve each segment's bytes up front where the filesystem supports \
+                     it; pairs with segment_size. The reservation is real disk and runs \
+                     inline on the owning shard, at every rotation and once per owned \
+                     partition at boot, so segment_size * partitions_count is capped at \
+                     {} bytes",
+                iggy_common::MAX_PREALLOCATED_TOPIC_BYTES
+            ),
+        },
+    ])
+}
+
+/// Serve the option catalog for one resource scope.
+///
+/// Streams and users have no catalog keys yet, so their scopes return empty
+/// (every key is rejected at create until one lands).
+fn build_describe_options_response(body: &[u8]) -> Result<DescribeOptionsResponse, IggyError> {
+    let request =
+        DescribeOptionsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    let entries = match request.scope {
+        OPTIONS_SCOPE_TOPIC => topic_option_descriptors()?,
+        OPTIONS_SCOPE_STREAM | OPTIONS_SCOPE_USER => Vec::new(),
+        _ => return Err(IggyError::InvalidCommand),
+    };
+    Ok(DescribeOptionsResponse { entries })
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyError> {
     Ok(UserResponse {
@@ -950,6 +1105,7 @@ fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyE
         created_at: user.created_at.as_micros(),
         status: user.status.as_code(),
         username: WireName::new(user.username.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+        options: resource_options_to_wire(&user.options, OptionsProvenance::Explicit)?,
     })
 }
 
@@ -1175,6 +1331,7 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
         size_bytes: stream.stats.size_bytes_inconsistent(),
         messages_count: stream.stats.messages_count_inconsistent(),
         name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+        options: resource_options_to_wire(&stream.options, OptionsProvenance::Explicit)?,
     })
 }
 
@@ -1184,6 +1341,7 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
 /// came from an update and must read back as `ServerDefault`, not as the node
 /// default frozen at read time.
 fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
+    let (options, derived_options) = resource_options_to_wire_split(&topic.options)?;
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
@@ -1191,10 +1349,11 @@ fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeade
         message_expiry: u64::from(topic.message_expiry),
         compression_algorithm: topic.compression_algorithm.as_code(),
         max_topic_size: topic.max_topic_size.as_bytes_u64(),
-        replication_factor: topic.replication_factor,
         size_bytes: topic.stats.size_bytes_inconsistent(),
         messages_count: topic.stats.messages_count_inconsistent(),
         name: WireName::new(topic.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+        options,
+        derived_options,
     })
 }
 
@@ -1303,6 +1462,43 @@ pub(crate) fn build_deny_reply(
 /// Server build version advertised in the login-register response.
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Build a metadata reply carrying `payload` behind a success result section.
+///
+/// The SDK strips a result section off exactly the replies whose operation is
+/// [`iggy_binary_protocol::Operation::is_result_framed`] (every metadata op plus the
+/// four consumer-offset ops), and a non-empty `Register`, which it handles on its
+/// own. For those, a payload missing the leading zero count has its first four bytes
+/// eaten as a result count, and the decode fails or, worse, succeeds on the shifted
+/// remainder: the raw-PAT reply shipped once without the prefix and broke the SDK.
+///
+/// The only way to BUILD a result-framed success body, though not the only path to a
+/// success reply with one: [`build_reply_from_bytes`] passes a committed body
+/// through, framed or not according to the operation. Framing a reply whose operation
+/// is not result-framed breaks decoding just as badly, so the choice belongs with the
+/// operation rather than here.
+fn build_result_framed_reply(
+    request_header: &RoutedRequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    payload: &impl WireEncode,
+) -> Message<ReplyHeader> {
+    let mut encoded = BytesMut::with_capacity(payload.encoded_size());
+    payload.encode(&mut encoded);
+    build_reply_with_body(
+        request_header,
+        client_id,
+        session,
+        commit,
+        RESULT_COUNT_LEN + encoded.len(),
+        |out| {
+            let (count, body) = out.split_at_mut(RESULT_COUNT_LEN);
+            count.copy_from_slice(&0u32.to_le_bytes());
+            body.copy_from_slice(&encoded);
+        },
+    )
+}
+
 pub(crate) fn build_login_register_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
@@ -1310,28 +1506,16 @@ pub(crate) fn build_login_register_reply(
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    // Result-framed like every metadata reply: a zero result-count (success)
-    // followed by the `LoginRegisterResponse` payload. A transient Register
-    // instead ships a `[count=1][index=0][TransientNotCommitted]` frame
-    // (`build_transient_reply`), which the SDK decodes and replays. The matching
-    // strip is in the SDK `split_metadata_result` (Register is result-framed).
+    // A transient Register instead ships a `[count=1][index=0]
+    // [TransientNotCommitted]` frame (`build_transient_reply`), which the SDK
+    // decodes and replays.
     let payload = LoginRegisterResponse {
         user_id,
         session,
         server_protocol_version: IGGY_PROTOCOL_VERSION,
         server_version: WireName::new(SERVER_VERSION).expect("SERVER_VERSION is 1-255 bytes"),
-    }
-    .to_bytes();
-    let mut body = Vec::with_capacity(RESULT_COUNT_LEN + payload.len());
-    body.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
-    body.extend_from_slice(&payload);
-    build_reply_from_bytes(
-        request_header,
-        client_id,
-        session,
-        commit,
-        &Bytes::from(body),
-    )
+    };
+    build_result_framed_reply(request_header, client_id, session, commit, &payload)
 }
 
 pub(crate) fn build_reply_from_bytes(
@@ -1401,19 +1585,12 @@ pub(crate) fn build_raw_pat_reply(
     }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
     let response = RawPersonalAccessTokenResponse { token };
-    // The SDK strips a leading result section from every metadata reply
-    // (`split_metadata_result`), so the spliced body must carry the success
-    // section like any committed metadata reply; a bare token body would be
-    // read as a garbage result code.
-    let mut body = BytesMut::with_capacity(RESULT_COUNT_LEN + response.encoded_size());
-    body.put_u32_le(0);
-    response.encode(&mut body);
-    let reply = build_reply_from_bytes(
+    let reply = build_result_framed_reply(
         request_header,
         request_header.client,
         request_header.session,
         commit,
-        &body.freeze(),
+        &response,
     );
     Ok(reply.into_generic())
 }
@@ -1651,6 +1828,27 @@ mod tests {
         header
     }
 
+    #[test]
+    fn login_register_reply_carries_the_success_result_prefix() {
+        // The other `build_result_framed_reply` caller. The SDK strips the result
+        // section off every metadata reply, so a payload emitted without the prefix
+        // loses its first four bytes to a phantom result count -- the decode break
+        // the raw-PAT reply shipped once. Pin it on both callers, not just the one
+        // that regressed.
+        let mut header = pat_request_header();
+        header.operation = Operation::Register;
+        let reply = build_login_register_reply(&header, 42, 7, 9, 5);
+
+        let header_len = std::mem::size_of::<ReplyHeader>();
+        let body = &reply.as_slice()[header_len..reply.header().size as usize];
+        assert_eq!(result_code(body), Some(0));
+
+        let payload = LoginRegisterResponse::decode_from(&body[RESULT_COUNT_LEN..])
+            .expect("login-register payload decodes past the result section");
+        assert_eq!(payload.user_id, 5);
+        assert_eq!(payload.session, 7);
+    }
+
     /// A committed metadata reply whose body is the given result section
     /// (`[count][{index, result}]*`), as the commit path emits it.
     fn committed_reply(result_body: &[u8]) -> Message<GenericHeader> {
@@ -1784,7 +1982,8 @@ mod tests {
     #[test]
     fn topic_header_echoes_stored_size_and_expiry_verbatim() {
         use iggy_common::{
-            CompressionAlgorithm, IggyDuration, IggyExpiry, MaxTopicSize, StreamStats, TopicStats,
+            CompressionAlgorithm, IggyDuration, IggyExpiry, MaxTopicSize, ResourceOptions,
+            StreamStats, TopicStats,
         };
         use std::sync::atomic::AtomicUsize;
 
@@ -1793,10 +1992,10 @@ mod tests {
             id: 0,
             name: Arc::from("topic"),
             created_at: IggyTimestamp::from(1u64),
-            replication_factor: 1,
             message_expiry,
             compression_algorithm: CompressionAlgorithm::None,
             max_topic_size,
+            options: ResourceOptions::default(),
             stats: Arc::new(TopicStats::new(parent.clone())),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),

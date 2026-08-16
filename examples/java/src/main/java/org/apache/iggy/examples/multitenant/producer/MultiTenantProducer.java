@@ -260,7 +260,6 @@ public final class MultiTenantProducer {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         topicId.getName());
         log.info("Created topic {} for stream {}", topicId.getName(), streamId.getName());
     }

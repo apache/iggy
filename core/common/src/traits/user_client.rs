@@ -17,6 +17,7 @@
 
 use crate::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
+    UserUpdateOptions,
 };
 use async_trait::async_trait;
 
@@ -53,6 +54,7 @@ pub trait UserClient {
         user_id: &Identifier,
         username: Option<&str>,
         status: Option<UserStatus>,
+        options: &UserUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Update the permissions of a user by unique ID or username.
     ///

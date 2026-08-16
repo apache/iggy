@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, OptionSpec, OptionsScope, Snapshot,
+    SnapshotCompression, Stats, SystemSnapshotType,
 };
 use async_trait::async_trait;
 
@@ -40,6 +40,13 @@ pub trait SystemClient {
     ///
     /// Authentication is required, and the permission to read the server info.
     async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError>;
+    /// Describe the option catalog for a resource scope: the keys its create
+    /// command accepts, their canonical kinds, and this server's current
+    /// defaults. Unknown keys are rejected at create, so this is the way to
+    /// discover support rather than probing.
+    ///
+    /// Authentication is required.
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError>;
     /// Ping the server to check if it's alive.
     async fn ping(&self) -> Result<(), IggyError>;
     async fn heartbeat_interval(&self) -> IggyDuration;

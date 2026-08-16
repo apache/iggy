@@ -19,8 +19,24 @@
 
 package org.apache.iggy.topic;
 
-import java.math.BigInteger;
+import org.apache.iggy.message.HeaderValue;
 
+import java.math.BigInteger;
+import java.util.Map;
+
+/**
+ * A topic as the server reports it.
+ *
+ * <p>{@code options} carries the keys the creating client set explicitly;
+ * {@code derivedOptions} carries the values admission resolved for the keys it did not.
+ * Both are keyed by option name, and the split is the provenance: a value in
+ * {@code derivedOptions} would have resolved differently under another server config.
+ * The fixed fields above repeat three of those keys and stay for compatibility.
+ *
+ * <p>Both transports populate them. The binary protocol carries each value in the kind the server
+ * stored it under; REST renders values in a readable string form, so over HTTP every value is
+ * String-kinded.
+ */
 public record Topic(
         Long id,
         BigInteger createdAt,
@@ -29,6 +45,12 @@ public record Topic(
         BigInteger messageExpiry,
         CompressionAlgorithm compressionAlgorithm,
         BigInteger maxTopicSize,
-        Short replicationFactor,
         BigInteger messagesCount,
-        Long partitionsCount) {}
+        Long partitionsCount,
+        Map<String, HeaderValue> options,
+        Map<String, HeaderValue> derivedOptions) {
+    public Topic {
+        options = options == null ? Map.of() : options;
+        derivedOptions = derivedOptions == null ? Map.of() : derivedOptions;
+    }
+}

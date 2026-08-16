@@ -138,7 +138,7 @@ impl WireDecode for ClusterMetadataResponse {
         pos += 4;
 
         let remaining = buf.len().saturating_sub(pos);
-        let mut nodes = Vec::with_capacity(crate::codec::capped_capacity(
+        let mut nodes = Vec::with_capacity(crate::codec::bounded_capacity(
             nodes_count,
             remaining,
             NODE_FIXED_SIZE,

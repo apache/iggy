@@ -63,7 +63,6 @@ fn stage_owned_partitions(shard: &Rc<ServerShard>) {
     let streams = shard.plane.metadata().mux_stm.streams();
     // Resolved once per pass, not per partition: the node default is a `Cell`
     // written at bootstrap and never after.
-    let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     for namespace in namespaces {
         let Some((message_expiry, max_topic_size, partition_count)) =
             streams.topic_retention_config(namespace.stream_id(), namespace.topic_id())
@@ -78,8 +77,11 @@ fn stage_owned_partitions(shard: &Rc<ServerShard>) {
             message_expiry,
             IggyExpiry::NeverExpire | IggyExpiry::ServerDefault
         );
-        let max_bytes =
-            per_partition_size_budget(max_topic_size, default_max_topic_size, partition_count);
+        let max_bytes = per_partition_size_budget(
+            max_topic_size,
+            iggy_common::DEFAULT_MAX_TOPIC_SIZE,
+            partition_count,
+        );
 
         if !has_expiry && max_bytes.is_none() {
             continue;

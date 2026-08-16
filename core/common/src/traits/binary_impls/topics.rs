@@ -18,8 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, topics_from_wire};
 use crate::{
-    BinaryClient, CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic,
-    TopicClient, TopicDetails,
+    BinaryClient, DEFAULT_PARTITIONS_COUNT, Identifier, IggyError, Topic, TopicClient,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
@@ -84,11 +84,7 @@ impl<B: BinaryClient> TopicClient for B {
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
         let wire_stream_id = identifier_to_wire(stream_id)?;
@@ -98,12 +94,9 @@ impl<B: BinaryClient> TopicClient for B {
                 CREATE_TOPIC_CODE,
                 CreateTopicRequest {
                     stream_id: wire_stream_id,
-                    partitions_count,
-                    compression_algorithm: compression_algorithm.as_code(),
-                    message_expiry: u64::from(message_expiry),
-                    max_topic_size: u64::from(max_topic_size),
-                    replication_factor: replication_factor.unwrap_or(0),
+                    partitions_count: options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT),
                     name: wire_name,
+                    options: options.to_wire()?,
                 }
                 .to_bytes(),
             )
@@ -117,10 +110,7 @@ impl<B: BinaryClient> TopicClient for B {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         let wire_stream_id = identifier_to_wire(stream_id)?;
@@ -131,11 +121,8 @@ impl<B: BinaryClient> TopicClient for B {
             UpdateTopicRequest {
                 stream_id: wire_stream_id,
                 topic_id: wire_topic_id,
-                compression_algorithm: compression_algorithm.as_code(),
-                message_expiry: u64::from(message_expiry),
-                max_topic_size: u64::from(max_topic_size),
-                replication_factor: replication_factor.unwrap_or(0),
                 name: wire_name,
+                options: options.to_wire()?,
             }
             .to_bytes(),
         )

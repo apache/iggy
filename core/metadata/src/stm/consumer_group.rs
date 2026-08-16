@@ -37,7 +37,7 @@ use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codec::{
-    WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le, read_u128_le,
+    WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le, read_u128_le,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -435,7 +435,7 @@ impl WireDecode for JoinConsumerGroupRequest {
         // corrupt/bit-rotted count (near u32::MAX) allocate gigabytes and abort
         // every backup that applies it.
         let mut in_flight =
-            Vec::with_capacity(capped_capacity(count, buf.len().saturating_sub(pos), 4));
+            Vec::with_capacity(bounded_capacity(count, buf.len().saturating_sub(pos), 4));
         for _ in 0..count {
             in_flight.push(read_u32_le(buf, pos)?);
             pos += 4;
@@ -947,12 +947,12 @@ impl ConsumerGroupSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::IggyTimestamp;
 
     // Groups co-locate in the topic node, so an apply resolves its parent through
@@ -963,6 +963,7 @@ mod tests {
         let _ = StateHandler::apply(
             &CreateStreamRequest {
                 name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
             },
             &mut inner,
             IggyTimestamp::now(),
@@ -971,12 +972,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
                 name: WireName::new("topic").unwrap(),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,

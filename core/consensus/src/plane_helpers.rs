@@ -415,15 +415,15 @@ where
         return false;
     }
 
-    let pipeline = consensus.pipeline().borrow();
     let mut new_commit = consensus.commit_max();
-    while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
-        if !entry.ok_quorum_received {
-            break;
+    consensus.with_pipeline(|pipeline| {
+        while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
+            if !entry.ok_quorum_received {
+                break;
+            }
+            new_commit += 1;
         }
-        new_commit += 1;
-    }
-    drop(pipeline);
+    });
 
     if new_commit > consensus.commit_max() {
         consensus.advance_commit_max(new_commit);
@@ -447,17 +447,27 @@ where
 {
     let commit = consensus.commit_max();
     let mut drained = Vec::new();
-    let mut pipeline = consensus.pipeline().borrow_mut();
 
-    while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
-        if head_op > commit {
-            break;
+    consensus.with_pipeline_mut(|pipeline| {
+        while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
+            if head_op > commit {
+                break;
+            }
+
+            let entry = pipeline
+                .pop()
+                .expect("drain_committable_prefix: head exists");
+            drained.push(entry);
         }
+    });
 
-        let entry = pipeline
-            .pop()
-            .expect("drain_committable_prefix: head exists");
-        drained.push(entry);
+    // Popping through the pipeline directly bypasses
+    // `VsrConsensus::pop_committed_prepare`, so re-establish the prepare
+    // timeout's ticking-iff-non-empty invariant here: an emptied pipeline
+    // disarms it, and a remaining head becomes the entry the timer measures,
+    // timed from now rather than inheriting the drained entry's elapsed ticks.
+    if !drained.is_empty() {
+        consensus.sync_prepare_timeout();
     }
 
     drained
@@ -478,10 +488,8 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
-    let pipeline = consensus.pipeline().borrow();
-    pipeline
-        .head()
-        .map(|entry| entry.header)
+    consensus
+        .pipeline_head_header()
         .filter(|header| header.op <= commit)
 }
 
@@ -1971,11 +1979,7 @@ mod tests {
 
         assert_eq!(drained_ops, vec![5, 6]);
         assert_eq!(
-            consensus
-                .pipeline()
-                .borrow()
-                .head()
-                .map(|entry| entry.header.op),
+            consensus.pipeline_head_header().map(|header| header.op),
             Some(7)
         );
     }

@@ -35,8 +35,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static java.util.Optional.empty;
-
 public final class GettingStartedProducer {
 
     private static final String STREAM_NAME = "sample-stream";
@@ -120,14 +118,7 @@ public final class GettingStartedProducer {
             return;
         }
         client.topics()
-                .createTopic(
-                        STREAM_ID,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        empty(),
-                        TOPIC_NAME);
+                .createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TOPIC_NAME);
         log.info("Topic {} was created.", TOPIC_NAME);
     }
 }
