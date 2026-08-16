@@ -1057,6 +1057,7 @@ class IggyClient:
         Raises `RuntimeError` on failure.
         """
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
     def describe_options(
         self, scope: builtins.str
@@ -1079,6 +1080,8 @@ class IggyClient:
             ValueError: If the scope name is not one of the three above.
             RuntimeError: If the request fails.
         """
+=======
+>>>>>>> 76520fe4a (fixes)
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
         Return all streams visible to the authenticated user.
@@ -1941,6 +1944,7 @@ class SendMessagesResponse:
         with an offset a client has already recorded.
         """
 
+@typing.final
 class Stream:
     r"""
     Summary information returned by `IggyClient.get_streams()`.
@@ -2248,7 +2252,11 @@ class Topic:
         r"""
         Options admission resolved for the keys the client did not send.
 
+<<<<<<< HEAD
         Same shape as `options`. These would have resolved differently
+=======
+        Same shape as [`Self::options`]. These would have resolved differently
+>>>>>>> 76520fe4a (fixes)
         under another server configuration.
         """
 
@@ -2313,7 +2321,11 @@ class TopicDetails:
         r"""
         Options admission resolved for the keys the client did not send.
 
+<<<<<<< HEAD
         Same shape as `options`. These would have resolved differently
+=======
+        Same shape as [`Self::options`]. These would have resolved differently
+>>>>>>> 76520fe4a (fixes)
         under another server configuration.
         """
     @property
