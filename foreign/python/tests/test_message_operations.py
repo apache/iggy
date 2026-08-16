@@ -1283,7 +1283,7 @@ class TestMessageOperations:
             ] == test_messages
 
     @pytest.mark.asyncio
-    async def test_poll_messages_with_shared_consumer_splits_the_partition(
+    async def test_poll_messages_with_shared_consumer_shares_the_partition(
         self, iggy_client: IggyClient, unique_name
     ):
         """Test two polls under the same consumer share one stored offset."""
