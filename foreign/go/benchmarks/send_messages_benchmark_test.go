@@ -126,7 +126,6 @@ func ensureInfrastructureIsInitialized(cli iggcon.Client, streamId uint32) error
 			iggcon.CompressionAlgorithmNone,
 			iggcon.IggyExpiryServerDefault,
 			1,
-			nil,
 		)
 
 		if topicErr != nil {

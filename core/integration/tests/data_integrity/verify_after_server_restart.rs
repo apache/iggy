@@ -40,31 +40,19 @@ fn build_server_config(cache_setting: &str) -> TestServerConfig {
         "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
         cache_setting.to_string(),
     );
-    // The server flushes on the journal thresholds (no flush primitive), so
-    // force every committed batch straight to disk: the restart asserts
-    // below need everything durable, and the explicit flush calls are
-    // cfg'd out under vsr (`flush_unsaved_buffer` answers
-    // FeatureUnavailable there and is slated for removal). Legacy keeps its
-    // shipped buffered defaults; the flush loops below are its barrier.
-    extra_envs.insert(
-        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
-        "1".to_string(),
-    );
-    extra_envs.insert(
-        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
-        "true".to_string(),
-    );
     TestServerConfig::builder().extra_envs(extra_envs).build()
 }
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 //
-// The durability barrier is the eager-flush envs in `build_server_config`
-// (`flush_unsaved_buffer` answers FeatureUnavailable on VSR, so there is no
-// explicit flush loop), and `iggy-bench` must be freshly built: the harness
-// spawns the prebuilt binary, and a stale one never completes a frame
-// against the server, tripping the bench timeout in
-// `run_bench_and_wait_for_finish`.
+// The durability barrier is the graceful restart itself: shutdown force-flushes
+// the committed journal. The eager-flush knobs that used to stand in for it are
+// topic creation options now, and the topics here are created by `iggy-bench`,
+// which exposes no flag for them.
+//
+// `iggy-bench` must be freshly built: the harness spawns the prebuilt binary,
+// and a stale one never completes a frame against the server, tripping the
+// bench timeout in `run_bench_and_wait_for_finish`.
 #[test_matrix(
     [cache_all(), cache_open_segment(), cache_none()]
 )]
@@ -331,11 +319,12 @@ async fn should_handle_resource_deletion_and_restart() {
                 .create_topic(
                     &stream_ident,
                     &format!("topic-{}", topic_idx),
-                    3,
-                    CompressionAlgorithm::None,
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::Unlimited,
+                    &TopicCreateOptions {
+                        partitions_count: Some(3),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        max_topic_size: Some(MaxTopicSize::Unlimited),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .unwrap();
@@ -411,11 +400,12 @@ async fn should_handle_resource_deletion_and_restart() {
         .create_topic(
             &stream_0_ident,
             "topic-reused",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Unlimited,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Unlimited),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

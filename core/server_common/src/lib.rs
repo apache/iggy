@@ -20,7 +20,6 @@ mod buffer;
 mod certificates;
 mod consensus_message;
 pub mod crypto;
-mod deduplication;
 pub mod diagnostics;
 pub mod executor;
 pub mod fs_utils;
@@ -55,7 +54,6 @@ pub use consensus_message::{
     ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
-pub use deduplication::MessageDeduplicator;
 pub use executor::create_shard_executor;
 pub use in_flight::IggyMessagesBatchSetInFlight;
 pub use indexes_mut::IggyIndexesMut;

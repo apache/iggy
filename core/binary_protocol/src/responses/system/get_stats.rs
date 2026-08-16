@@ -207,7 +207,7 @@ impl WireDecode for StatsResponse {
         pos += 4;
 
         let remaining = buf.len().saturating_sub(pos);
-        let mut cache_metrics = Vec::with_capacity(crate::codec::capped_capacity(
+        let mut cache_metrics = Vec::with_capacity(crate::codec::bounded_capacity(
             cache_count,
             remaining,
             CacheMetricEntry::SIZE,

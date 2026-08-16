@@ -20,6 +20,7 @@ mod consumer_group_membership;
 mod consumer_offset;
 mod hello_world;
 mod http_refresh;
+mod options;
 mod producer;
 mod protocol_version;
 mod raw;

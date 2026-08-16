@@ -46,6 +46,8 @@ use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
+#[cfg(feature = "login-session")]
+use iggy_cli::commands::cli_command::DIAGNOSTIC_TARGET;
 use iggy_cli::commands::cli_command::{CliCommand, PRINT_TARGET};
 use iggy_cli::commands::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
@@ -75,7 +77,7 @@ use iggy_cli::commands::{
         create_stream::CreateStreamCmd, delete_stream::DeleteStreamCmd, get_stream::GetStreamCmd,
         get_streams::GetStreamsCmd, purge_stream::PurgeStreamCmd, update_stream::UpdateStreamCmd,
     },
-    binary_system::{me::GetMeCmd, ping::PingCmd, stats::GetStatsCmd},
+    binary_system::{me::GetMeCmd, options::DescribeOptionsCmd, ping::PingCmd, stats::GetStatsCmd},
     binary_topics::{
         create_topic::CreateTopicCmd, delete_topic::DeleteTopicCmd, get_topic::GetTopicCmd,
         get_topics::GetTopicsCmd, purge_topic::PurgeTopicCmd, update_topic::UpdateTopicCmd,
@@ -131,7 +133,7 @@ fn get_command(
                 args.name.clone(),
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
-                args.replication_factor,
+                args.set.iter().cloned().collect(),
             )),
             TopicAction::Delete(args) => Box::new(DeleteTopicCmd::new(
                 args.stream_id.clone(),
@@ -144,7 +146,6 @@ fn get_command(
                 args.name.clone(),
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
-                args.replication_factor,
             )),
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
@@ -181,6 +182,7 @@ fn get_command(
         },
         Command::Ping(args) => Box::new(PingCmd::new(args.count)),
         Command::Me => Box::new(GetMeCmd::new()),
+        Command::Options(args) => Box::new(DescribeOptionsCmd::new(args.scope)),
         Command::Stats(args) => Box::new(GetStatsCmd::new(cli_options.quiet, args.output.into())),
         Command::Snapshot(args) => Box::new(GetSnapshotCmd::new(
             args.compression,
@@ -382,7 +384,7 @@ async fn main() -> Result<(), IggyCmdError> {
     // token-name lookup) sees the backend regardless of code-path ordering.
     #[cfg(feature = "login-session")]
     if let Err(e) = ensure_default_store() {
-        tracing::warn!(target: PRINT_TARGET, "keyring backend unavailable: {e}");
+        tracing::warn!(target: DIAGNOSTIC_TARGET, "keyring backend unavailable: {e}");
     }
 
     let command = args.command.clone().unwrap();

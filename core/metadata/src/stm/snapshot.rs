@@ -44,7 +44,15 @@ use crate::stm::user::UsersSnapshot;
 /// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
 /// `namespace` word before it), which the client table's cached replies embed as raw
 /// wire bytes msgpack cannot introspect.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+///
+/// Version 3: `TopicSnapshot` dropped `replication_factor` from the middle of the
+/// struct and gained `options`. Both changes land in the same element count, so a
+/// version 2 file decoded under this shape does not fail cleanly: msgpack reads the
+/// old `replication_factor` byte as `message_expiry` and walks every later field one
+/// position out of place. The bump is what turns that into
+/// `UnsupportedFormatVersion` instead of an opaque deserializer error, or worse a
+/// silent misread.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -521,7 +529,10 @@ macro_rules! impl_fill_restore {
 mod tests {
     use super::*;
     use crate::stm::stream::{PartitionSnapshot, StatsSnapshot, StreamSnapshot, TopicSnapshot};
-    use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+    use crate::stm::user::UserSnapshot;
+    use iggy_common::{
+        CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, ResourceOptions,
+    };
 
     #[test]
     fn test_metadata_snapshot_roundtrip() {
@@ -547,7 +558,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 2;
+        const PINNED_VERSION: u32 = 3;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -559,6 +570,77 @@ mod tests {
         assert_eq!(
             SNAPSHOT_FORMAT_VERSION, PINNED_VERSION,
             "SNAPSHOT_FORMAT_VERSION moved; confirm the shape moved with it"
+        );
+    }
+
+    #[test]
+    fn nested_snapshot_shapes_are_pinned_too() {
+        // The top-level count above is blind to everything under it, which is how
+        // `TopicSnapshot` once swapped a removed field for an added one and kept
+        // the same element count: a version 2 file then decoded field-by-field
+        // one position out of place instead of failing. The types the STM
+        // actually grows need their own pins.
+        const TOPIC_FIELD_COUNT: u32 = 11;
+        const STREAM_FIELD_COUNT: u32 = 6;
+        const USER_FIELD_COUNT: u32 = 7;
+
+        let topic = TopicSnapshot {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            message_expiry: IggyExpiry::default(),
+            compression_algorithm: CompressionAlgorithm::default(),
+            max_topic_size: MaxTopicSize::default(),
+            stats: StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+            partitions: Vec::new(),
+            consumer_groups: Vec::new(),
+            next_consumer_group_id: 0,
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&topic).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            TOPIC_FIELD_COUNT,
+            "TopicSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let stream = StreamSnapshot {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            stats: StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+            topics: Vec::new(),
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&stream).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            STREAM_FIELD_COUNT,
+            "StreamSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let user = crate::stm::user::UserSnapshot {
+            id: 0,
+            username: String::new(),
+            password_hash: String::new(),
+            status: iggy_common::UserStatus::Active,
+            created_at: IggyTimestamp::default(),
+            permissions: None,
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&user).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            USER_FIELD_COUNT,
+            "UserSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
     }
 
@@ -685,7 +767,6 @@ mod tests {
                             id: 0,
                             name: "topic".to_string(),
                             created_at: ts,
-                            replication_factor: 1,
                             message_expiry: IggyExpiry::default(),
                             compression_algorithm: CompressionAlgorithm::default(),
                             max_topic_size: MaxTopicSize::default(),
@@ -707,8 +788,10 @@ mod tests {
                             // roundtrip assert below proves the field survives
                             // instead of matching a default.
                             next_consumer_group_id: 5,
+                            options: ResourceOptions::default(),
                         },
                     )],
+                    options: ResourceOptions::default(),
                 },
             )],
         });
@@ -738,38 +821,39 @@ mod tests {
         assert_eq!(topic.next_consumer_group_id, 5);
     }
 
+    fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {
+        use iggy_common::UserStatus;
+        UserSnapshot {
+            id,
+            username: username.to_string(),
+            password_hash: password_hash.to_string(),
+            status: UserStatus::Active,
+            created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            permissions: None,
+            options: ResourceOptions::default(),
+        }
+    }
+
+    fn stream_snapshot_fixture(id: usize, name: &str, stats: StatsSnapshot) -> StreamSnapshot {
+        StreamSnapshot {
+            id,
+            name: name.to_string(),
+            created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            stats,
+            topics: vec![],
+            options: ResourceOptions::default(),
+        }
+    }
+
     #[test]
     fn roundtrip_with_slab_gaps() {
         use crate::stm::stream::StreamsSnapshot;
-        use crate::stm::user::{PermissionerSnapshot, UserSnapshot, UsersSnapshot};
-        use iggy_common::UserStatus;
-
-        let ts = IggyTimestamp::from(1_694_968_446_131_680_u64);
+        use crate::stm::user::{PermissionerSnapshot, UsersSnapshot};
 
         let users_snap = UsersSnapshot {
             items: vec![
-                (
-                    0,
-                    UserSnapshot {
-                        id: 0,
-                        username: "alice".to_string(),
-                        password_hash: "hash_a".to_string(),
-                        status: UserStatus::Active,
-                        created_at: ts,
-                        permissions: None,
-                    },
-                ),
-                (
-                    2,
-                    UserSnapshot {
-                        id: 2,
-                        username: "charlie".to_string(),
-                        password_hash: "hash_c".to_string(),
-                        status: UserStatus::Active,
-                        created_at: ts,
-                        permissions: None,
-                    },
-                ),
+                (0, user_snapshot_fixture(0, "alice", "hash_a")),
+                (2, user_snapshot_fixture(2, "charlie", "hash_c")),
             ],
             personal_access_tokens: vec![],
             permissioner: PermissionerSnapshot {
@@ -787,31 +871,27 @@ mod tests {
             items: vec![
                 (
                     0,
-                    StreamSnapshot {
-                        id: 0,
-                        name: "stream-0".to_string(),
-                        created_at: ts,
-                        stats: StatsSnapshot {
+                    stream_snapshot_fixture(
+                        0,
+                        "stream-0",
+                        StatsSnapshot {
                             size_bytes: 100,
                             messages_count: 10,
                             segments_count: 1,
                         },
-                        topics: vec![],
-                    },
+                    ),
                 ),
                 (
                     3,
-                    StreamSnapshot {
-                        id: 3,
-                        name: "stream-3".to_string(),
-                        created_at: ts,
-                        stats: StatsSnapshot {
+                    stream_snapshot_fixture(
+                        3,
+                        "stream-3",
+                        StatsSnapshot {
                             size_bytes: 200,
                             messages_count: 20,
                             segments_count: 2,
                         },
-                        topics: vec![],
-                    },
+                    ),
                 ),
             ],
         };

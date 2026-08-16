@@ -41,6 +41,7 @@ __all__ = [
     "IggyConsumer",
     "IggyExpiry",
     "MaxTopicSize",
+    "OptionSpec",
     "Partition",
     "Permissions",
     "PollingStrategy",
@@ -1033,15 +1034,41 @@ class IggyClient:
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
         """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
+        """
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
         name: builtins.str,
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        segment_size: builtins.int | None = None,
+        enforce_fsync: builtins.bool | None = None,
+        messages_required_to_save: builtins.int | None = None,
+        size_of_messages_required_to_save: builtins.int | None = None,
+        preallocate_segments: builtins.bool | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
@@ -1051,9 +1078,18 @@ class IggyClient:
             name: Topic name as `str`.
             partitions_count: Number of partitions as `int`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Replication factor as `int | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            segment_size: Per-topic segment size in bytes as `int | None`.
+            enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+            messages_required_to_save: Message-count flush threshold as `int | None`.
+            size_of_messages_required_to_save: Byte flush threshold as `int | None`.
+            preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so a newer server key can be set from this build.
+
+        Every option left as `None` resolves against the server default at
+        admission.
 
         Returns:
             An awaitable that resolves to `None` when the topic is created.
@@ -1093,24 +1129,27 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
 
-        This is a full replacement: any optional parameter left unset is reset to
-        its server default rather than preserved.
+        A patch, not a replacement: every setting rides the options block, so a
+        field left unset keeps the topic's current value rather than resetting
+        it to a server default.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Replication factor as `int | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so an updatable server key can be set from this build.
+                A create-only key is refused by name.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
@@ -1527,6 +1566,41 @@ class MaxTopicSize:
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     ...
+
+@typing.final
+class OptionSpec:
+    r"""
+    One entry of a resource's option catalog, as served by `describe_options`.
+    """
+    @property
+    def key(self) -> builtins.str:
+        r"""
+        The option key a create command accepts.
+        """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        Name of this key's canonical kind: what the server encodes its default
+        under, and what a value set by `create_topic` is stored as whatever kind
+        it was sent in, since create admission re-encodes the block from its own
+        parse. `update_topic` stores what the client sent verbatim and is the
+        exception.
+        """
+    @property
+    def default_value(self) -> HeaderValue | None:
+        r"""
+        The key's default as a `HeaderValue`, or `None` when the key has no
+        default.
+
+        The same type message user headers use, so the usual accessors read it;
+        options ride that codec.
+        """
+    @property
+    def description(self) -> builtins.str:
+        r"""
+        What the option does, including the bounds its value is checked against.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class Partition:
@@ -2006,9 +2080,21 @@ class Topic:
         The maximum size of the topic.
         """
     @property
-    def replication_factor(self) -> builtins.int:
+    def options(self) -> UserHeaders:
         r"""
-        Replication factor for the topic.
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently under
+        another server configuration.
         """
 
 @typing.final
@@ -2059,9 +2145,21 @@ class TopicDetails:
         The maximum size of the topic.
         """
     @property
-    def replication_factor(self) -> builtins.int:
+    def options(self) -> UserHeaders:
         r"""
-        Replication factor for the topic.
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently under
+        another server configuration.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:

@@ -17,7 +17,7 @@
 
 use crate::common::global_context::GlobalContext;
 use cucumber::{then, when};
-use iggy::prelude::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicClient};
+use iggy::prelude::{Identifier, IggyExpiry, TopicClient, TopicCreateOptions};
 
 #[when(regex = r"^I create a topic with name (.+) in stream (\d+) with (\d+) partitions$")]
 pub async fn when_create_topic(
@@ -31,11 +31,11 @@ pub async fn when_create_topic(
         .create_topic(
             &Identifier::numeric(stream_id).unwrap(),
             &topic_name,
-            partitions_count,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("Should be able to create topic");

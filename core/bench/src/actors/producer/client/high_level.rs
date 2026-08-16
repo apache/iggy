@@ -105,7 +105,6 @@ impl BenchmarkInit for HighLevelProducerClient {
                 .create_stream_if_not_exists()
                 .create_topic_if_not_exists(
                     self.config.partitions,
-                    Some(1),
                     IggyExpiry::NeverExpire,
                     MaxTopicSize::ServerDefault,
                 )

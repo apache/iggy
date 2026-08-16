@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import IggyClient, IggyExpiry, MaxTopicSize, SendMessage
+from apache_iggy import HeaderValue, IggyClient, IggyExpiry, MaxTopicSize, SendMessage
 
 from .utils import (
     get_server_config,
@@ -389,66 +389,6 @@ class TestCreateTopic:
                 name=topic_name,
                 partitions_count=1,
                 max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes),
-            )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "replication_factor",
-        [
-            0,  # value for server default replication factor
-            1,
-            42,
-            255,
-        ],
-    )
-    async def test_create_topic_with_valid_replication_factor(
-        self, iggy_client: IggyClient, unique_name, replication_factor: int
-    ):
-        """Test create_topic accepts a supported replication factor."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-            replication_factor=replication_factor,
-        )
-
-        topic = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic is not None
-        assert topic.name == topic_name
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("replication_factor", "expected_exception"),
-        [
-            (-1, OverflowError),
-            (256, OverflowError),
-            ("1", TypeError),
-            (1.0, TypeError),
-        ],
-    )
-    async def test_create_topic_invalid_replication_factor(
-        self,
-        iggy_client: IggyClient,
-        unique_name,
-        replication_factor,
-        expected_exception,
-    ):
-        """Test create_topic rejects invalid replication factor values."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-
-        with pytest.raises(expected_exception):
-            await iggy_client.create_topic(
-                stream=stream_name,
-                name=topic_name,
-                partitions_count=1,
-                replication_factor=replication_factor,
             )
 
     @pytest.mark.asyncio
@@ -955,66 +895,6 @@ class TestUpdateTopic:
             )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("replication_factor", [0, 1, 255])
-    async def test_update_topic_with_valid_replication_factor(
-        self, iggy_client: IggyClient, unique_name, replication_factor: int
-    ):
-        """Test update_topic accepts a supported replication factor."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        await iggy_client.update_topic(
-            stream_id=stream_name,
-            topic_id=topic_name,
-            name=topic_name,
-            replication_factor=replication_factor,
-        )
-
-        topic = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic is not None
-        # The server normalizes a replication factor of 0 to 1.
-        assert topic.replication_factor == (replication_factor or 1)
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("replication_factor", "expected_exception"),
-        [
-            (-1, OverflowError),
-            (256, OverflowError),
-            ("1", TypeError),
-            (1.0, TypeError),
-        ],
-    )
-    async def test_update_topic_invalid_replication_factor(
-        self,
-        iggy_client: IggyClient,
-        unique_name,
-        replication_factor,
-        expected_exception,
-    ):
-        """Test update_topic rejects invalid replication factor values."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        with pytest.raises(expected_exception):
-            await iggy_client.update_topic(
-                stream_id=stream_name,
-                topic_id=topic_name,
-                name=topic_name,
-                replication_factor=replication_factor,
-            )
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("max_topic_size_bytes", "expected_exception"),
         [
@@ -1132,6 +1012,10 @@ class TestUpdateTopic:
             stream=stream_name, name=topic_name, partitions_count=1
         )
 
+        created = await iggy_client.get_topic(stream_name, topic_name)
+        assert created is not None
+        resolved_at_creation = created.max_topic_size
+
         await iggy_client.update_topic(
             stream_id=stream_name,
             topic_id=topic_name,
@@ -1143,7 +1027,13 @@ class TestUpdateTopic:
         assert topic is not None
         assert topic.name == topic_name
         if expected_kind == "server_default":
-            assert isinstance(topic.max_topic_size, MaxTopicSize.ServerDefault)
+            # Every setting rides the options block and 0 is its "resolve the
+            # default" sentinel, so a ServerDefault update carries no key at all
+            # and the topic keeps the value admission resolved when it was
+            # created. Resetting a setting back to the node default is
+            # deliberately not expressible.
+            assert isinstance(topic.max_topic_size, type(resolved_at_creation))
+            assert not isinstance(topic.max_topic_size, MaxTopicSize.ServerDefault)
         elif expected_kind == "unlimited":
             assert isinstance(topic.max_topic_size, MaxTopicSize.Unlimited)
         else:
@@ -1393,7 +1283,6 @@ class TestPurgeTopic:
         assert after.created_at == before.created_at
         assert after.partitions_count == before.partitions_count
         assert after.compression_algorithm == before.compression_algorithm
-        assert after.replication_factor == before.replication_factor
         assert isinstance(before.message_expiry, IggyExpiry.NeverExpire)
         assert isinstance(after.message_expiry, IggyExpiry.NeverExpire)
         assert isinstance(before.max_topic_size, MaxTopicSize.Unlimited)
@@ -1475,3 +1364,103 @@ class TestPurgeTopic:
         await client.connect()
         with pytest.raises(RuntimeError):
             await client.purge_topic(unique_name(), unique_name())
+
+
+class TestTopicOptions:
+    """Tests for the option catalog and the options a topic reports."""
+
+    @pytest.mark.asyncio
+    async def test_topic_options_round_trip(self, iggy_client: IggyClient, unique_name):
+        """Options a client sets come back readable, split by provenance."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+            options={"enforce_fsync": "true", "segment_size": "128 MiB"},
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        # Options come back through the same typed dict message user headers
+        # use, so the scalar helper reads them the same way.
+        explicit = topic.options.to_scalar_dict()
+        assert explicit["enforce_fsync"] is True
+        assert explicit["segment_size"] == 128 * 1024 * 1024
+        # Keys the client left alone are resolved by admission and reported
+        # separately, so an operator can tell chosen from defaulted.
+        derived = topic.derived_options.to_scalar_dict()
+        assert "max_topic_size" in derived
+        assert "enforce_fsync" not in derived
+
+        topics = await iggy_client.get_topics(stream_name)
+        listed = next(entry for entry in topics if entry.name == topic_name)
+        assert listed.options.to_scalar_dict()["enforce_fsync"] is True
+
+    @pytest.mark.asyncio
+    async def test_update_topic_options_reach_the_server(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Options passed to update_topic are applied, and gated by key."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.update_topic(
+            stream_id=stream_name,
+            topic_id=topic_name,
+            name=topic_name,
+            options={"compression_algorithm": "gzip"},
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert topic.compression_algorithm == "gzip"
+
+        # A create-time key is refused by name, so nothing re-pushes it to the
+        # partitions of a live topic.
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_topic(
+                stream_id=stream_name,
+                topic_id=topic_name,
+                name=topic_name,
+                options={"segment_size": "2 MiB"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_describe_options_lists_the_topic_catalog(
+        self, iggy_client: IggyClient
+    ):
+        """The catalog is what tells a client which keys create accepts."""
+        specs = await iggy_client.describe_options("topic")
+
+        by_key = {spec.key: spec for spec in specs}
+        assert "segment_size" in by_key
+        assert "enforce_fsync" in by_key
+        segment_size = by_key["segment_size"]
+        assert segment_size.kind == "uint64"
+        # The default is the same HeaderValue type message headers carry, so it
+        # arrives as the variant matching the key's kind.
+        default = segment_size.default_value
+        assert isinstance(default, HeaderValue.UnsignedInt64)
+        assert default.value == 1024 * 1024 * 1024
+        assert segment_size.description
+
+        # Streams and users have no catalog keys yet.
+        assert await iggy_client.describe_options("stream") == []
+        assert await iggy_client.describe_options("user") == []
+
+    @pytest.mark.asyncio
+    async def test_describe_options_rejects_an_unknown_scope(
+        self, iggy_client: IggyClient
+    ):
+        """Test describe_options raises ValueError for an unknown scope."""
+        with pytest.raises(ValueError):
+            await iggy_client.describe_options("partition")

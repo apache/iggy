@@ -83,8 +83,7 @@ func initSystem(ctx context.Context, client iggcon.Client) {
 		1,
 		iggcon.CompressionAlgorithmNone,
 		iggcon.IggyExpiryNeverExpire,
-		0,
-		nil); err != nil {
+		0); err != nil {
 		log.Printf("WARN: Topic already exists and will not be created again or error: %v", err)
 	}
 	log.Println("Topic was created.")

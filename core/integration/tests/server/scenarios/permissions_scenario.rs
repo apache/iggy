@@ -99,11 +99,11 @@ async fn setup_test_resources(root_client: &IggyClient) {
                 .create_topic(
                     &stream_id,
                     topic_name,
-                    PARTITIONS,
-                    CompressionAlgorithm::None,
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
+                    &TopicCreateOptions {
+                        partitions_count: Some(PARTITIONS),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .expect("create topic");
@@ -186,11 +186,11 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
             .create_topic(
                 &stream_id,
                 "x",
-                1,
-                CompressionAlgorithm::None,
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await,
         "create_topic",
@@ -400,6 +400,7 @@ async fn test_user_permissions(harness: &TestHarness, root_client: &IggyClient) 
             &Identifier::named("temp-user").unwrap(),
             Some("temp-user-updated"),
             None,
+            &UserUpdateOptions::default(),
         )
         .await
         .expect("manage_users: update_user should work");
@@ -450,7 +451,9 @@ async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient
         "read_streams: create_stream",
     );
     assert_unauthorized(
-        client.update_stream(&stream_id, "new-name").await,
+        client
+            .update_stream(&stream_id, "new-name", &StreamUpdateOptions::default())
+            .await,
         "read_streams: update_stream",
     );
     assert_unauthorized(
@@ -488,7 +491,11 @@ async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient
         .expect("manage_streams: create_stream should work");
 
     client
-        .update_stream(&Identifier::named("temp-stream").unwrap(), "temp-stream-v2")
+        .update_stream(
+            &Identifier::named("temp-stream").unwrap(),
+            "temp-stream-v2",
+            &StreamUpdateOptions::default(),
+        )
         .await
         .expect("manage_streams: update_stream should work");
 
@@ -556,11 +563,11 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
             .create_topic(
                 &stream_id,
                 "x",
-                1,
-                CompressionAlgorithm::None,
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await,
         "read_topics: create_topic",
@@ -571,10 +578,7 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
                 &stream_id,
                 &topic_id,
                 "new-name",
-                CompressionAlgorithm::None,
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicUpdateOptions::default(),
             )
             .await,
         "read_topics: update_topic",
@@ -604,11 +608,11 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
         .create_topic(
             &stream_id,
             "temp-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("manage_topics: create_topic should work");
@@ -619,10 +623,7 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
             &stream_id,
             &Identifier::named("temp-topic").unwrap(),
             "temp-topic-v2",
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicUpdateOptions::default(),
         )
         .await
         .expect("manage_topics: update_topic should work");
@@ -1129,11 +1130,11 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
             .create_topic(
                 &stream_id,
                 "x",
-                1,
-                CompressionAlgorithm::None,
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await,
         "read_streams does NOT imply manage_topics",
@@ -1175,11 +1176,11 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .create_topic(
             &stream_id,
             "temp-inherit-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("manage_streams → manage_topics: create_topic");
@@ -1495,11 +1496,11 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
             .create_topic(
                 &stream_id,
                 "x",
-                1,
-                CompressionAlgorithm::None,
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await,
         "stream.read_stream does NOT imply manage_topics",
@@ -1540,11 +1541,11 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .create_topic(
             &stream_id,
             "temp-manage-stream-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("stream.manage_stream → manage_topics: create_topic");
@@ -1553,10 +1554,7 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
             &stream_id,
             &Identifier::named("temp-manage-stream-topic").unwrap(),
             "temp-manage-stream-topic-v2",
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicUpdateOptions::default(),
         )
         .await
         .expect("stream.manage_stream → manage_topics: update_topic");
@@ -1640,11 +1638,11 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .create_topic(
             &stream_id,
             "temp-manage-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("stream.manage_topics: create_topic should work");

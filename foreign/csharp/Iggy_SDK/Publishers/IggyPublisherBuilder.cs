@@ -162,7 +162,6 @@ public class IggyPublisherBuilder
     /// <param name="name">The name to use when creating the topic.</param>
     /// <param name="topicPartitionsCount">The number of partitions for the topic. Default is 1.</param>
     /// <param name="compressionAlgorithm">The compression algorithm to use for messages in the topic. Default is None.</param>
-    /// <param name="replicationFactor">The replication factor for the topic. Null means server default.</param>
     /// <param name="messageExpiry">
     ///     The message expiry time. TimeSpan.Zero uses the server default, TimeSpan.MaxValue never
     ///     expires. Default is TimeSpan.Zero.
@@ -170,14 +169,13 @@ public class IggyPublisherBuilder
     /// <param name="maxTopicSize">The maximum size of the topic in bytes (0 for unlimited). Default is 0.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         TimeSpan messageExpiry = default, ulong maxTopicSize = 0)
     {
         Config.CreateTopic = true;
         Config.TopicName = name;
         Config.TopicPartitionsCount = topicPartitionsCount;
         Config.TopicCompressionAlgorithm = compressionAlgorithm;
-        Config.TopicReplicationFactor = replicationFactor;
         Config.TopicMessageExpiry = messageExpiry;
         Config.TopicMaxTopicSize = maxTopicSize;
 

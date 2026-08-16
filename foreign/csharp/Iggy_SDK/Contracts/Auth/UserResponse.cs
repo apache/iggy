@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Contracts.Auth;
 
@@ -48,4 +50,10 @@ public sealed class UserResponse
     ///     Optional user permissions.
     /// </summary>
     public Permissions? Permissions { get; init; }
+
+    /// <summary>
+    ///     Options attached to the user at creation. TCP transport only.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
 }

@@ -33,7 +33,7 @@ mod typed_env_provider;
 
 pub use env_mapping::{ConfigEnvMappings, EnvVarMapping};
 pub use error::ConfigurationError;
-pub use file_provider::FileConfigProvider;
+pub use file_provider::{FileConfigProvider, RelocatedKey};
 pub use parsing::parse_env_value_to_json;
 pub use traits::{ConfigProvider, ConfigurationType};
 pub use typed_env_provider::TypedEnvProvider;

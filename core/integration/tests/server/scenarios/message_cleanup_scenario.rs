@@ -17,9 +17,13 @@
 
 //! Tests for message retention policies (time-based and size-based).
 //!
-//! Configuration: 10KiB segment size, 100ms cleaner interval, instant flush.
-//! Message size: 64B header + 936B payload = 1KB per message.
-//! Therefore a segment holds 9 messages and every ~10 messages rotates one.
+//! Configuration: 1 MiB segments, 100ms cleaner interval, instant flush. The
+//! segment size is a topic creation option now and 1 MiB is the smallest a
+//! topic may declare, so the payload carries what a 10 KiB segment used to:
+//! one 10-message batch is a hair over 1 MiB on disk, which makes roughly one
+//! segment per batch. Every retention assertion below is a lower bound on the
+//! segment count, so the exact rotation point does not matter -- only that the
+//! volume sent clears the cap several times over.
 
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -33,14 +37,33 @@ const TOPIC_NAME: &str = "test_expiry_topic";
 const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 
-/// Payload size chosen so that header (64B) + payload = 1KB per message.
-const PAYLOAD_SIZE: usize = 936;
+/// Smallest segment a topic may declare (`iggy_common::MIN_TOPIC_SEGMENT_SIZE`).
+const SEGMENT_SIZE: u64 = 1024 * 1024;
+
+/// Payload size chosen so a 10-message batch lands just past [`SEGMENT_SIZE`]
+/// on disk: a 256-byte command header per send plus 48 bytes per message, so
+/// 256 + 10 * (48 + 105000) = 1050736 >= 1 MiB.
+const PAYLOAD_SIZE: usize = 105_000;
 
 /// Buffer time for cleaner to run after expiry conditions are met.
 const CLEANER_BUFFER: Duration = Duration::from_millis(300);
 
 fn make_payload(fill: char) -> Bytes {
     Bytes::from(fill.to_string().repeat(PAYLOAD_SIZE))
+}
+
+/// Knobs every topic here shares. The 1 MiB segment gives the retention
+/// policies sealed segments to reclaim (an active segment is never deleted),
+/// and the flush per message puts a send on disk before the segment count is
+/// read -- both were server config before they became topic options.
+fn cleanup_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        segment_size: Some(IggyByteSize::from(SEGMENT_SIZE)),
+        enforce_fsync: Some(true),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
 }
 
 /// Tests time-based retention: segments are cleaned up after expiry.
@@ -59,11 +82,10 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from(expiry)),
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
@@ -76,11 +98,11 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 110 messages (1KB each) in batches, spanning several 10KiB segments.
+    // Send 40 messages in batches, spanning several 1 MiB segments.
     // Batched rather than one request per message: the burst must fit inside
     // `expiry` with room to spare, and each request costs a round-trip.
     let payload = make_payload('A');
-    let total_messages: usize = 110;
+    let total_messages: usize = 40;
     let batch_size = 10;
 
     for chunk_start in (0..total_messages).step_by(batch_size) {
@@ -181,11 +203,10 @@ pub async fn run_active_segment_protection(client: &IggyClient, data_path: &Path
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from(expiry)),
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
@@ -240,17 +261,19 @@ pub async fn run_size_based_retention(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    // 150KB max, cleanup at 90% = 135KB. With 100KB segments, exceeding 135KB triggers cleanup.
-    let max_size_bytes = 150 * 1024;
+    // 4 MiB max, cleanup at 90% = 3.6 MiB. The cap has to sit above the 1 MiB
+    // segment size, or the topic would hit it before a single segment sealed and
+    // the cleaner would have nothing it is allowed to reclaim.
+    let max_size_bytes = 4 * 1024 * 1024;
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Custom(IggyByteSize::from(max_size_bytes)),
+            &TopicCreateOptions {
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Custom(IggyByteSize::from(max_size_bytes))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
@@ -263,9 +286,9 @@ pub async fn run_size_based_retention(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 160 messages (160KB) to exceed 90% threshold (135KB)
+    // Send 80 messages (~8 MiB) to clear the 3.6 MiB threshold several times over
     let payload = make_payload('B');
-    let total_messages = 160;
+    let total_messages = 80;
 
     for i in 0..total_messages {
         let message = IggyMessage::builder()
@@ -340,11 +363,12 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from(expiry)),
-            MaxTopicSize::Custom(IggyByteSize::from(500 * 1024)), // 500KB (won't trigger)
+            &TopicCreateOptions {
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
+                // 500 MiB (won't trigger)
+                max_topic_size: Some(MaxTopicSize::Custom(IggyByteSize::from(500 * 1024 * 1024))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
@@ -357,12 +381,12 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
         .display()
         .to_string();
 
-    // Send 110 messages to create 2 segments (under size threshold, but will
-    // expire). Batched so the burst finishes well inside `expiry`: a per-message
-    // request pays a consensus round-trip plus an fsync, and a loop that
-    // outlives the window has its head reclaimed before the count below.
+    // Send 40 messages to create several segments (under size threshold, but
+    // will expire). Batched so the burst finishes well inside `expiry`: a
+    // per-message request pays a consensus round-trip plus an fsync, and a loop
+    // that outlives the window has its head reclaimed before the count below.
     let payload = make_payload('C');
-    let total_messages: usize = 110;
+    let total_messages: usize = 40;
     let batch_size = 10;
     for chunk_start in (0..total_messages).step_by(batch_size) {
         let mut messages: Vec<IggyMessage> = (chunk_start
@@ -421,18 +445,18 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from(expiry)),
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
     let topic_id = topic.id;
 
     let payload = make_payload('D');
-    let messages_per_partition: usize = 110;
+    let messages_per_partition: usize = 40;
     let batch_size = 10;
 
     // Send messages to all partitions. Batched: a per-message request costs a
@@ -534,17 +558,19 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    // 200KB max, cleanup at 90% = 180KB
-    let max_size_bytes = 200 * 1024;
+    // 6 MiB max, cleanup at 90% = 5.4 MiB. Above `PARTITIONS_COUNT` * the 1 MiB
+    // segment size, so every partition can seal a segment before the cap trips.
+    let max_size_bytes = 6 * 1024 * 1024;
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Custom(IggyByteSize::from(max_size_bytes)),
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Custom(IggyByteSize::from(max_size_bytes))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
@@ -552,9 +578,9 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 
     let payload = make_payload('E');
 
-    // Send 70 messages per partition = 210KB total, exceeds 180KB threshold
+    // Send 30 messages per partition = ~9.5 MiB total, exceeds 5.4 MiB threshold
     for partition_id in 0..PARTITIONS_COUNT {
-        for i in 0..70 {
+        for i in 0..30 {
             let msg_id = partition_id as u128 * 1000 + i as u128;
             let message = IggyMessage::builder()
                 .id(msg_id)
@@ -606,7 +632,7 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 /// `delete_expired_segments_for_partition` does not.
 ///
 /// Scenario:
-/// 1. Send 300 messages (3 segments at 100KB each)
+/// 1. Send 100 messages (several 1 MiB segments)
 /// 2. Consumer reads only 50 messages (stored offset ~49, within segment 0)
 /// 3. Wait for all segments to expire (4s expiry)
 /// 4. Verify consumer can still poll Next() and get contiguous offsets
@@ -630,11 +656,10 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .create_topic(
             &Identifier::named(TEST_STREAM).unwrap(),
             TEST_TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ExpireDuration(IggyDuration::from(expiry)),
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
+                ..cleanup_topic_options()
+            },
         )
         .await
         .unwrap();
@@ -647,11 +672,11 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .display()
         .to_string();
 
-    // Send 300 messages (1KB each) -> 3 sealed segments + active. Batched:
-    // one request per message costs a consensus round-trip plus an fsync each,
+    // Send 100 messages -> several sealed segments + active. Batched: one
+    // request per message costs a consensus round-trip plus an fsync each,
     // which on a 3-node debug cluster runs the burst well past `expiry`.
     let payload = make_payload('B');
-    let total_messages = 300u32;
+    let total_messages = 100u32;
     let batch_size = 10u32;
     for chunk_start in (0..total_messages).step_by(batch_size as usize) {
         let mut messages: Vec<IggyMessage> = (chunk_start
@@ -716,8 +741,8 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     tokio::time::sleep(expiry + CLEANER_BUFFER + CLEANER_BUFFER).await;
 
     // Now poll Next() - consumer should continue from offset 50 without gaps.
-    // BUG: on unfixed code, the cleaner deleted the segment containing offsets
-    // 50-99 (expired, no consumer barrier check), so Next() jumps to offset 100+.
+    // BUG: on unfixed code, the cleaner deleted the segment holding offset 50
+    // (expired, no consumer barrier check), so Next() jumps past it.
     let polled = client
         .poll_messages(
             &Identifier::named(TEST_STREAM).unwrap(),

@@ -21,12 +21,14 @@ package org.apache.iggy.client.async;
 
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -44,7 +46,7 @@ import java.util.concurrent.CompletableFuture;
  * // Create a topic with 3 partitions and no message expiry
  * topics.createTopic(
  *         StreamId.of(1L), 3L, CompressionAlgorithm.none(),
- *         BigInteger.ZERO, BigInteger.ZERO, Optional.empty(), "events")
+ *         BigInteger.ZERO, BigInteger.ZERO, "events")
  *     .thenAccept(details -> System.out.println("Topic created: " + details.name()));
  *
  * // List all topics in a stream
@@ -92,12 +94,33 @@ public interface TopicsClient {
      *                             means messages never expire
      * @param maxTopicSize         maximum topic size in bytes; {@link BigInteger#ZERO}
      *                             means unlimited
-     * @param replicationFactor    optional replication factor for the topic; if empty,
      *                             the server default is used
      * @param name                 the topic name (must be unique within the stream)
      * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
      * @throws org.apache.iggy.exception.IggyException if the stream does not exist or a
      *         topic with the same name already exists
+     */
+    default CompletableFuture<TopicDetails> createTopic(
+            StreamId streamId,
+            Long partitionsCount,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            String name) {
+        return createTopic(
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+    }
+
+    /**
+     * Creates a topic, carrying option keys that have no parameter of their own.
+     *
+     * <p>{@code options} is keyed by option name and reuses {@link HeaderValue} because options ride
+     * the user-headers codec. It reaches keys the server catalog gained after this build shipped; a
+     * parameter above wins on collision, and a key outside the catalog is refused by name. Call
+     * {@code describeOptions} on the server to see which keys it accepts.
+     *
+     * @param options option keys with no parameter of their own
+     * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
      */
     CompletableFuture<TopicDetails> createTopic(
             StreamId streamId,
@@ -105,8 +128,8 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name);
+            String name,
+            Map<String, HeaderValue> options);
 
     /**
      * Updates the configuration of an existing topic.
@@ -119,10 +142,28 @@ public interface TopicsClient {
      * @param compressionAlgorithm the new compression algorithm
      * @param messageExpiry        the new message expiry in microseconds
      * @param maxTopicSize         the new maximum topic size in bytes
-     * @param replicationFactor    optional new replication factor
      * @param name                 the new topic name
      * @return a {@link CompletableFuture} that completes when the update is done
      * @throws org.apache.iggy.exception.IggyException if the topic does not exist
+     */
+    default CompletableFuture<Void> updateTopic(
+            StreamId streamId,
+            TopicId topicId,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            String name) {
+        return updateTopic(streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+    }
+
+    /**
+     * Updates a topic, carrying option keys that have no parameter of their own.
+     *
+     * <p>The server refuses any key an update may not change, by name. A key left out keeps its
+     * current value.
+     *
+     * @param options option keys with no parameter of their own
+     * @return a {@link CompletableFuture} that completes when the update is done
      */
     CompletableFuture<Void> updateTopic(
             StreamId streamId,
@@ -130,8 +171,8 @@ public interface TopicsClient {
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name);
+            String name,
+            Map<String, HeaderValue> options);
 
     /**
      * Deletes a topic and all of its partitions and messages.

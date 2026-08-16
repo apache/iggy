@@ -52,7 +52,7 @@ fn all_message_sizes() -> Vec<u64> {
     vec![50, 1000, 20000]
 }
 
-pub async fn run(harness: &TestHarness) {
+pub async fn run(harness: &TestHarness, topic_options: &TopicCreateOptions) {
     let client = harness
         .root_client()
         .await
@@ -60,7 +60,14 @@ pub async fn run(harness: &TestHarness) {
 
     for msg_size in all_message_sizes() {
         for (pattern_name, batch_pattern) in all_batch_patterns() {
-            run_offset_test(&client, msg_size, &batch_pattern, pattern_name).await;
+            run_offset_test(
+                &client,
+                msg_size,
+                &batch_pattern,
+                pattern_name,
+                topic_options,
+            )
+            .await;
         }
     }
 }
@@ -70,11 +77,12 @@ async fn run_offset_test(
     message_size: u64,
     batch_lengths: &[u32],
     pattern_name: &str,
+    topic_options: &TopicCreateOptions,
 ) {
     let stream_name = format!("test-stream-{}-{}", message_size, pattern_name);
     let topic_name = format!("test-topic-{}-{}", message_size, pattern_name);
 
-    init_system(client, &stream_name, &topic_name).await;
+    init_system(client, &stream_name, &topic_name, topic_options).await;
 
     let total_messages_count: u32 = batch_lengths.iter().sum();
 
@@ -113,17 +121,18 @@ async fn run_offset_test(
     cleanup(client, &stream_name).await;
 }
 
-async fn init_system(client: &IggyClient, stream_name: &str, topic_name: &str) {
+async fn init_system(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+    topic_options: &TopicCreateOptions,
+) {
     client.create_stream(stream_name).await.unwrap();
     client
         .create_topic(
             &Identifier::named(stream_name).unwrap(),
             topic_name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            topic_options,
         )
         .await
         .unwrap();

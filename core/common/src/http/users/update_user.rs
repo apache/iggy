@@ -21,6 +21,7 @@ use crate::UserStatus;
 use crate::Validatable;
 use crate::error::IggyError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `UpdateUser` command is used to update a user's username and status.
 /// It has additional payload:
@@ -33,6 +34,10 @@ pub struct UpdateUser {
     pub user_id: Identifier,
     pub username: Option<String>,
     pub status: Option<UserStatus>,
+    /// Additional user options as string key-values. Restricted to the keys
+    /// an update may change; anything else is rejected.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 impl Validatable<IggyError> for UpdateUser {

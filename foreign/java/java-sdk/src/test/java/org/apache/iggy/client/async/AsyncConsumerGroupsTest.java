@@ -82,14 +82,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
         client.streams().createStream(TEST_STREAM).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         client.topics()
-                .createTopic(
-                        STREAM_ID,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        Optional.empty(),
-                        TEST_TOPIC)
+                .createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TEST_TOPIC)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
@@ -268,14 +261,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            topicName)
+                    .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicName)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when

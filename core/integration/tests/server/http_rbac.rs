@@ -111,8 +111,8 @@ impl ClientExt for HttpClient {
             compression_algorithm: CompressionAlgorithm::None,
             message_expiry: IggyExpiry::NeverExpire,
             max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: topic.to_string(),
+            options: Default::default(),
         };
         let response = self
             .post_json(

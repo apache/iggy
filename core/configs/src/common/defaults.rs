@@ -23,8 +23,8 @@ use super::server::{
 };
 use super::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
-    MessageDeduplicationConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
-    StateConfig, StreamConfig, SystemConfig, TopicConfig,
+    PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig, StateConfig, StreamConfig,
+    SystemConfig, TopicConfig,
 };
 use configs::ConfigEnvMappings;
 
@@ -197,7 +197,6 @@ impl<S: ConfigEnvMappings + Default> Default for SystemConfig<S> {
             segment: SegmentConfig::default(),
             state: StateConfig::default(),
             compression: CompressionConfig::default(),
-            message_deduplication: MessageDeduplicationConfig::default(),
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
             sharding: S::default(),
@@ -322,8 +321,6 @@ impl Default for TopicConfig {
     fn default() -> TopicConfig {
         TopicConfig {
             path: SERVER_CONFIG.system.topic.path.parse().unwrap(),
-            max_size: SERVER_CONFIG.system.topic.max_size.parse().unwrap(),
-            message_expiry: SERVER_CONFIG.system.topic.message_expiry.parse().unwrap(),
         }
     }
 }
@@ -332,15 +329,6 @@ impl Default for PartitionConfig {
     fn default() -> PartitionConfig {
         PartitionConfig {
             path: SERVER_CONFIG.system.partition.path.parse().unwrap(),
-            size_of_messages_required_to_save: SERVER_CONFIG
-                .system
-                .partition
-                .size_of_messages_required_to_save
-                .parse()
-                .unwrap(),
-            messages_required_to_save: SERVER_CONFIG.system.partition.messages_required_to_save
-                as u32,
-            enforce_fsync: SERVER_CONFIG.system.partition.enforce_fsync,
             validate_checksum: SERVER_CONFIG.system.partition.validate_checksum,
         }
     }
@@ -349,8 +337,6 @@ impl Default for PartitionConfig {
 impl Default for SegmentConfig {
     fn default() -> SegmentConfig {
         SegmentConfig {
-            size: SERVER_CONFIG.system.segment.size.parse().unwrap(),
-            preallocate: SERVER_CONFIG.system.segment.preallocate,
             cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
         }
@@ -364,21 +350,6 @@ impl Default for StateConfig {
             max_file_operation_retries: SERVER_CONFIG.system.state.max_file_operation_retries
                 as u32,
             retry_delay: SERVER_CONFIG.system.state.retry_delay.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for MessageDeduplicationConfig {
-    fn default() -> MessageDeduplicationConfig {
-        MessageDeduplicationConfig {
-            enabled: SERVER_CONFIG.system.message_deduplication.enabled,
-            max_entries: SERVER_CONFIG.system.message_deduplication.max_entries as u64,
-            expiry: SERVER_CONFIG
-                .system
-                .message_deduplication
-                .expiry
-                .parse()
-                .unwrap(),
         }
     }
 }

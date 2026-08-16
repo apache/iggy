@@ -21,14 +21,16 @@ use async_trait::async_trait;
 use core::fmt;
 use iggy_common::Client;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicUpdateOptions};
+use std::collections::BTreeMap;
 use tracing::{Level, event};
 
 pub struct UpdateTopicCmd {
     update_topic: UpdateTopic,
+    compression_algorithm: CompressionAlgorithm,
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
-    replication_factor: u8,
+    options: TopicUpdateOptions,
 }
 
 impl UpdateTopicCmd {
@@ -39,21 +41,26 @@ impl UpdateTopicCmd {
         name: String,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
-        replication_factor: u8,
     ) -> Self {
         Self {
             update_topic: UpdateTopic {
                 stream_id,
                 topic_id,
                 name,
-                compression_algorithm,
-                message_expiry,
-                max_topic_size,
-                replication_factor: Some(replication_factor),
+                compression_algorithm: Some(compression_algorithm),
+                message_expiry: Some(message_expiry),
+                max_topic_size: Some(max_topic_size),
+                options: BTreeMap::new(),
             },
+            compression_algorithm,
             message_expiry,
             max_topic_size,
-            replication_factor,
+            options: TopicUpdateOptions {
+                compression_algorithm: Some(compression_algorithm),
+                message_expiry: Some(message_expiry),
+                max_topic_size: Some(max_topic_size),
+                ..TopicUpdateOptions::default()
+            },
         }
     }
 }
@@ -66,7 +73,7 @@ impl CliCommand for UpdateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, self.update_topic.compression_algorithm, self.replication_factor.into(), self.message_expiry, self.max_topic_size)
+            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, &self.options)
             .await
             .with_context(|| {
                 format!(
@@ -79,13 +86,12 @@ impl CliCommand for UpdateTopicCmd {
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Topic with ID: {} updated name: {}, updated message expiry: {}, updated compression algorithm: {}, updated max topic size: {}, updated replication factor: {} in stream with ID: {}",
+            "Topic with ID: {} updated name: {}, updated message expiry: {}, updated compression algorithm: {}, updated max topic size: {} in stream with ID: {}",
             self.update_topic.topic_id,
             self.update_topic.name,
             self.message_expiry,
-            self.update_topic.compression_algorithm,
+            self.compression_algorithm,
             self.max_topic_size,
-            self.replication_factor,
             self.update_topic.stream_id,
         );
 
@@ -97,17 +103,16 @@ impl fmt::Display for UpdateTopicCmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let topic_id = &self.update_topic.topic_id;
         let topic_name = &self.update_topic.name;
-        let compression_algorithm = &self.update_topic.compression_algorithm;
+        let compression_algorithm = &self.compression_algorithm;
         let message_expiry = &self.message_expiry;
         let max_topic_size = &self.max_topic_size;
-        let replication_factor = self.replication_factor;
         let stream_id = &self.update_topic.stream_id;
 
         write!(
             f,
             "update topic with ID: {topic_id}, name: {topic_name}, message expiry: \
-            {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: {max_topic_size}, replication \
-            factor: {replication_factor}, in stream with ID: {stream_id}",
+            {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: \
+            {max_topic_size}, in stream with ID: {stream_id}",
         )
     }
 }

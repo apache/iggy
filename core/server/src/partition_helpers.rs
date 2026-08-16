@@ -30,7 +30,8 @@ use compio::fs::create_dir_all;
 use configs::server::ServerConfig;
 use consensus::{LocalPipeline, VsrConsensus, VsrState};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats,
+    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
+    TopicRuntimeOptions,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
@@ -254,12 +255,19 @@ pub fn configure_consumer_offsets(
         }
     }
 
+    // Offset files follow the topic's own `enforce_fsync`: they are part of the
+    // same partition's durability story, and the global knob they used to read
+    // is gone.
+    let enforce_fsync = partition
+        .runtime_options()
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     partition.configure_consumer_offset_storage(
         consumer_offsets_path,
         consumer_group_offsets_path,
         consumer_offsets,
         consumer_group_offsets,
-        config.system.partition.enforce_fsync,
+        enforce_fsync,
     );
     Ok(())
 }
@@ -354,7 +362,16 @@ pub async fn ensure_initial_segment(
     let index_path = config
         .system
         .get_index_path(stream_id, topic_id, partition_id, start_offset);
-    let enforce_fsync = config.system.partition.enforce_fsync;
+    let runtime = partition.runtime_options();
+    let segment_size = runtime
+        .segment_size
+        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let enforce_fsync = runtime
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
+    let preallocate_segments = runtime
+        .preallocate_segments
+        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
     // `file_exists = false` TRUNCATES both files, which is load-bearing here: a
     // fenced-and-rebuilt partition (or one whose quarantine failed) can reach
     // this with a stale `.index` at offset 0 on disk. The `partitions`-side
@@ -393,19 +410,15 @@ pub async fn ensure_initial_segment(
         .map(|writer| writer.size_counter())
         .unwrap_or_default();
     partition.log.add_persisted_segment(
-        Segment::new(start_offset, config.system.segment.size),
+        Segment::new(start_offset, segment_size),
         storage,
         Some(Rc::new(
             MessagesWriter::new(
                 &messages_path,
                 messages_size_counter,
-                config.system.partition.enforce_fsync,
+                enforce_fsync,
                 false,
-                config
-                    .system
-                    .segment
-                    .preallocate
-                    .then_some(config.system.segment.size),
+                preallocate_segments.then_some(segment_size),
             )
             .await
             .map_err(|source| {
@@ -421,24 +434,19 @@ pub async fn ensure_initial_segment(
             })?,
         )),
         Some(Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                index_size_counter,
-                config.system.partition.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    path = %index_path,
-                    error = %source,
-                    "failed to initialize initial sparse index writer"
-                );
-                source
-            })?,
+            IggyIndexWriter::new(&index_path, index_size_counter, enforce_fsync, false)
+                .await
+                .map_err(|source| {
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        path = %index_path,
+                        error = %source,
+                        "failed to initialize initial sparse index writer"
+                    );
+                    source
+                })?,
         )),
     );
     partition.stats.increment_segments_count(1);
@@ -586,6 +594,7 @@ pub async fn build_partition_fresh(
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     created_revision: u64,
+    runtime_options: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -677,6 +686,7 @@ pub async fn build_partition_fresh(
     }
 
     let mut partition = IggyPartition::new(stats, consensus);
+    partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
     // IggyPartition::new has already disabled retention for single-replica

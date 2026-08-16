@@ -409,7 +409,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_binary_protocol::requests::users::CreateUserRequest;
-    use iggy_binary_protocol::{Command2, WireEncode, WireName};
+    use iggy_binary_protocol::{Command2, WireEncode, WireName, WireOptions};
     use iggy_common::UserStatus;
     use server_common::iobuf::Owned;
 
@@ -473,6 +473,7 @@ mod tests {
             password: "hash".to_string(),
             status: UserStatus::Active.as_code(),
             permissions: Some(WirePermissions { global, streams }),
+            options: WireOptions::empty(),
         }
         .to_bytes()
     }
@@ -480,6 +481,7 @@ mod tests {
     fn create_stream_body(name: &str) -> bytes::Bytes {
         CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes()
     }
@@ -489,12 +491,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
                 name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,

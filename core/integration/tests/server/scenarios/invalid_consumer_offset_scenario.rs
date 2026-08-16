@@ -91,11 +91,12 @@ async fn initialize(client: &IggyClient, stream: &Identifier, topic: &Identifier
         .create_topic(
             stream,
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Unlimited,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Unlimited),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
