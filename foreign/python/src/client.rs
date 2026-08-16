@@ -552,7 +552,7 @@ impl IggyClient {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner
-                .update_stream(&stream_id, &name)
+                .update_stream(&stream_id, &name, &StreamUpdateOptions::default())
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
