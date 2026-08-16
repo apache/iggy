@@ -1328,6 +1328,87 @@ class TestMessageOperations:
         assert second_poll == []
 
     @pytest.mark.asyncio
+    async def test_poll_messages_without_a_consumer_raises_type_error(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the consumer argument is required."""
+        # Argument binding fails before the call reaches the server, so the
+        # stream and topic never have to exist.
+        with pytest.raises(TypeError, match="consumer"):
+            # pyrefly: ignore  # missing-argument
+            await iggy_client.poll_messages(
+                stream=unique_name(),
+                topic=unique_name(),
+                partition_id=0,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "consumer", ["single", 1, None], ids=["str", "int", "none"]
+    )
+    async def test_poll_messages_with_a_non_consumer_raises_type_error(
+        self, iggy_client: IggyClient, unique_name, consumer
+    ):
+        """Test the consumer argument only accepts a Consumer."""
+        # Argument binding fails before the call reaches the server, so the
+        # stream and topic never have to exist.
+        with pytest.raises(TypeError, match="not an instance of 'Consumer'"):
+            # pyrefly: ignore  # bad-argument-type
+            await iggy_client.poll_messages(
+                stream=unique_name(),
+                topic=unique_name(),
+                consumer=consumer,
+                partition_id=0,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.parametrize("identifier", [-1, 2**32], ids=["negative", "above-u32"])
+    def test_consumer_rejects_numeric_ids_outside_u32(self, identifier):
+        """Test an out-of-range numeric id is refused when the consumer is built."""
+        with pytest.raises(TypeError):
+            Consumer.Single(identifier)
+        with pytest.raises(TypeError):
+            Consumer.Group(identifier)
+
+    def test_consumer_accepts_valid_numeric_ids(self):
+        """Test both consumer kinds keep the numeric id they were given."""
+        assert Consumer.Single(1).id == 1
+        assert Consumer.Group(4294967295).id == 4294967295
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("identifier", ["", "a" * 256], ids=["empty", "too-long"])
+    @pytest.mark.parametrize(
+        "consumer_kind", [Consumer.Single, Consumer.Group], ids=["single", "group"]
+    )
+    async def test_poll_messages_with_an_invalid_string_identifier_raises_value_error(
+        self, iggy_client: IggyClient, unique_name, identifier, consumer_kind
+    ):
+        """Test a string id is validated when it is converted, not when it is built."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=consumer_kind(identifier),
+                partition_id=0,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_poll_messages_without_partition_id_reads_partition_zero(
         self, iggy_client: IggyClient, unique_name
     ):
