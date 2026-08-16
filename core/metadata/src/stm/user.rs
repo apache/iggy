@@ -129,7 +129,10 @@ collect_handlers! {
 }
 
 impl UsersInner {
-    pub(crate) fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    /// Resolve a wire user identifier to its committed slab id, `None` when
+    /// the user does not exist.
+    #[must_use]
+    pub fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;

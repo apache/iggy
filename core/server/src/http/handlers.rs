@@ -130,7 +130,7 @@ use crate::http::error::{
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::reads::{
     authorize_data_plane, authorize_read, read_local, resolve_gate_stream, resolve_gate_topic,
-    resolve_gate_topic_ids,
+    resolve_gate_topic_ids, resolve_gate_user,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -456,22 +456,22 @@ pub(in crate::http) async fn get_users(
 
 /// `GET /users/{user_id}`: fetch one user by numeric id or name as the same
 /// `UserInfoDetails` JSON the legacy server returns; 404 when absent. A
-/// consensus-free local STM read via [`read_local`]. [`CURRENT_USER_ALIAS`]
-/// resolves to the caller and skips the `read_users` gate, mirroring the
-/// legacy self-read bypass.
+/// consensus-free local STM read via [`read_local`]. Any target resolving to
+/// the caller - [`CURRENT_USER_ALIAS`], own id, own username - skips the
+/// `read_users` gate, mirroring the legacy self-read bypass.
 pub(in crate::http) async fn get_user(
     State(state): State<HttpState>,
     identity: Identity,
     Path(user_id): Path<String>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<UserInfoDetails>, ReadError> {
-    let is_self = user_id == CURRENT_USER_ALIAS;
-    let wire_user_id = if is_self {
+    let wire_user_id = if user_id == CURRENT_USER_ALIAS {
         WireIdentifier::numeric(identity.user_id)
     } else {
         let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
         identifier_to_wire(&user_id).map_err(ReadError::Rejected)?
     };
+    let is_self = resolve_gate_user(&state, &wire_user_id) == Some(identity.user_id as usize);
     let request = GetUserRequest {
         user_id: wire_user_id,
     };

@@ -209,6 +209,21 @@ pub(in crate::http) fn resolve_gate_stream(
         .read(|inner| resolve_stream_id(inner, stream_id))
 }
 
+/// Resolve a wire user identifier to its committed slab id, or `None` on a
+/// miss. Mirrors the TCP dispatch gate's self-read resolution.
+pub(in crate::http) fn resolve_gate_user(
+    state: &HttpInner,
+    user_id: &WireIdentifier,
+) -> Option<usize> {
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|inner| inner.resolve_user_id(user_id))
+}
+
 /// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
 /// either misses.
 pub(in crate::http) fn resolve_gate_topic(
