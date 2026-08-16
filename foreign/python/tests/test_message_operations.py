@@ -1328,6 +1328,50 @@ class TestMessageOperations:
         assert second_poll == []
 
     @pytest.mark.asyncio
+    async def test_poll_messages_with_consumer_group_rotates_assigned_partitions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a sole group member reaches every partition over repeated polls."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+        partitions_count = 3
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=partitions_count
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        for partition_id in range(partitions_count):
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=partition_id,
+                messages=[Message(f"Partition {partition_id}")],
+            )
+
+        polled = []
+        for _ in range(partitions_count):
+            polled_messages = await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Group(group_name),
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+            polled.extend(
+                (message.partition_id(), message.payload().decode("utf-8"))
+                for message in polled_messages
+            )
+
+        assert polled == [
+            (partition_id, f"Partition {partition_id}")
+            for partition_id in range(partitions_count)
+        ]
+
+    @pytest.mark.asyncio
     async def test_poll_messages_with_consumer_group_reads_assigned_partitions(
         self, iggy_client: IggyClient, unique_name
     ):
