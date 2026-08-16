@@ -150,7 +150,7 @@ runs:
         initial_sleep_seconds: "1"
 
     # Publish runs WITHOUT continue-on-error so any failure that is NOT the
-    # "already uploaded" class (invalid CARGO_REGISTRY_TOKEN, 401/403, 429
+    # "already uploaded" class (trusted-publisher mismatch, 401/403, 429
     # rate limit, 5xx, Cargo.toml validation error, dependency resolution)
     # surfaces loudly with its actual error instead of getting swallowed
     # into a misleading "not on sparse index" CAS timeout ~3 min later.
@@ -176,7 +176,7 @@ runs:
         set -euo pipefail
 
         if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-          echo "❌ CARGO_REGISTRY_TOKEN is not set"
+          echo "❌ crates.io trusted publishing did not return a token"
           exit 1
         fi
 
@@ -229,7 +229,7 @@ runs:
         echo ""
         echo "❌ cargo publish failed with rc=${rc} and no 'already uploaded' signature"
         echo "   The actual error is in the stderr above. Common causes:"
-        echo "     - invalid or expired CARGO_REGISTRY_TOKEN (401/403)"
+        echo "     - trusted publisher policy mismatch (401/403)"
         echo "     - crates.io rate limit (429)"
         echo "     - crates.io 5xx (transient, rerun should recover)"
         echo "     - Cargo.toml validation error or dependency resolution failure"
