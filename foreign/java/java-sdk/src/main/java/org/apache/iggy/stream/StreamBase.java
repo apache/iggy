@@ -19,7 +19,23 @@
 
 package org.apache.iggy.stream;
 
-import java.math.BigInteger;
+import org.apache.iggy.message.HeaderValue;
 
+import java.math.BigInteger;
+import java.util.Map;
+
+/**
+ * A stream as the server reports it.
+ *
+ * <p>{@code options} carries the creation options, keyed by option name. Streams have no
+ * catalog keys yet, so it is empty until one lands; the field is read rather than skipped
+ * so the first key needs no client change.
+ */
 public record StreamBase(
-        Long id, BigInteger createdAt, String name, String size, BigInteger messagesCount, Long topicsCount) {}
+        Long id,
+        BigInteger createdAt,
+        String name,
+        String size,
+        BigInteger messagesCount,
+        Long topicsCount,
+        Map<String, HeaderValue> options) {}

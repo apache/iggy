@@ -17,7 +17,11 @@
 
 package command
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
 type GetClient struct {
 	ClientID uint32
@@ -52,6 +56,22 @@ func (m *GetClusterMetadata) Code() Code {
 
 func (m *GetClusterMetadata) MarshalBinary() ([]byte, error) {
 	return []byte{}, nil
+}
+
+// DescribeOptions asks for the option catalog of one resource scope.
+type DescribeOptions struct {
+	Scope iggcon.OptionsScope
+}
+
+func (d *DescribeOptions) Code() Code {
+	return DescribeOptionsCode
+}
+
+func (d *DescribeOptions) MarshalBinary() ([]byte, error) {
+	if err := d.Scope.Validate(); err != nil {
+		return nil, err
+	}
+	return []byte{byte(d.Scope)}, nil
 }
 
 type GetStats struct{}

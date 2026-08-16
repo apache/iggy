@@ -25,9 +25,14 @@ pub struct CreatedPartitionAssignment {
     pub consensus_group_id: u64,
 }
 
+impl CreatedPartitionAssignment {
+    /// Fixed wire size: a `u32` partition id and a `u64` consensus group id.
+    pub const ENCODED_SIZE: usize = 12;
+}
+
 impl WireEncode for CreatedPartitionAssignment {
     fn encoded_size(&self) -> usize {
-        12
+        Self::ENCODED_SIZE
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -38,10 +43,10 @@ impl WireEncode for CreatedPartitionAssignment {
 
 impl WireDecode for CreatedPartitionAssignment {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        if buf.len() < 12 {
+        if buf.len() < Self::ENCODED_SIZE {
             return Err(WireError::UnexpectedEof {
                 offset: 0,
-                need: 12,
+                need: Self::ENCODED_SIZE,
                 have: buf.len(),
             });
         }

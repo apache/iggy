@@ -47,6 +47,13 @@ import java.util.Optional;
  */
 public final class BytesSerializer {
 
+    /**
+     * Key and value length bound, in encoded bytes rather than characters. Belongs to the
+     * header-field codec that both user headers and resource options ride, so the server refuses a
+     * block carrying a field outside this range.
+     */
+    private static final int MAX_HEADER_FIELD_LENGTH = 255;
+
     private BytesSerializer() {}
 
     public static ByteBuf toBytes(Consumer consumer) {
@@ -129,11 +136,13 @@ public final class BytesSerializer {
         var buffer = Unpooled.buffer();
         for (Map.Entry<HeaderKey, HeaderValue> entry : headers.entrySet()) {
             HeaderKey key = entry.getKey();
+            checkFieldLength(key.value().length, "key '" + key + "'");
             buffer.writeByte(key.kind().asCode());
             buffer.writeIntLE(key.value().length);
             buffer.writeBytes(key.value());
 
             HeaderValue value = entry.getValue();
+            checkFieldLength(value.value().length, "value for key '" + key + "'");
             buffer.writeByte(value.kind().asCode());
             buffer.writeIntLE(value.value().length);
             buffer.writeBytes(value.value());
@@ -247,5 +256,20 @@ public final class BytesSerializer {
             buffer.writeZero(16 - valueAsBytes.length);
         }
         return buffer;
+    }
+
+    /**
+     * Rejects a key or value the TLV codec cannot express.
+     *
+     * <p>The {@code HeaderKey} / {@code HeaderValue} factories bound what they build, but both are
+     * records whose canonical constructor is public and unchecked. A field out of range would
+     * encode here and come back as a generic server error naming neither the key nor the bound it
+     * broke.
+     */
+    private static void checkFieldLength(int length, String field) {
+        if (length < 1 || length > MAX_HEADER_FIELD_LENGTH) {
+            throw new IggyInvalidArgumentException("Invalid header " + field + " length: " + length
+                    + " bytes, must be between 1 and " + MAX_HEADER_FIELD_LENGTH);
+        }
     }
 }

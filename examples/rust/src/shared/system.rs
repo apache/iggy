@@ -82,15 +82,18 @@ pub async fn init_by_producer(args: &Args, client: &dyn Client) -> Result<(), Ig
 
     info!("Stream does not exist, creating...");
     client.create_stream(&args.stream_id).await?;
+    let compression_algorithm = CompressionAlgorithm::from_code(args.compression_algorithm)?;
     client
         .create_topic(
             &stream_id,
             &topic_name,
-            args.partitions_count,
-            CompressionAlgorithm::from_code(args.compression_algorithm)?,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(args.partitions_count),
+                compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+                    .then_some(compression_algorithm),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
     Ok(())

@@ -19,7 +19,7 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
+    Identifier, IggyError, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -52,78 +52,14 @@ impl TopicClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
         match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
+            ClientWrapper::Iggy(client) => client.create_topic(stream_id, name, options).await,
+            ClientWrapper::Http(client) => client.create_topic(stream_id, name, options).await,
+            ClientWrapper::Tcp(client) => client.create_topic(stream_id, name, options).await,
+            ClientWrapper::Quic(client) => client.create_topic(stream_id, name, options).await,
+            ClientWrapper::WebSocket(client) => client.create_topic(stream_id, name, options).await,
         }
     }
 
@@ -132,75 +68,32 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
                 client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
+                    .update_topic(stream_id, topic_id, name, options)
                     .await
             }
             ClientWrapper::Http(client) => {
                 client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
+                    .update_topic(stream_id, topic_id, name, options)
                     .await
             }
             ClientWrapper::Tcp(client) => {
                 client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
+                    .update_topic(stream_id, topic_id, name, options)
                     .await
             }
             ClientWrapper::Quic(client) => {
                 client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
+                    .update_topic(stream_id, topic_id, name, options)
                     .await
             }
             ClientWrapper::WebSocket(client) => {
                 client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
+                    .update_topic(stream_id, topic_id, name, options)
                     .await
             }
         }

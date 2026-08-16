@@ -46,7 +46,6 @@ pub struct IggyProducerBuilder {
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
-    topic_replication_factor: Option<u8>,
     send_retries_count: Option<u32>,
     send_retries_interval: Option<IggyDuration>,
     topic_message_expiry: IggyExpiry,
@@ -78,7 +77,6 @@ impl IggyProducerBuilder {
             create_stream_if_not_exists: true,
             create_topic_if_not_exists: true,
             topic_partitions_count: 1,
-            topic_replication_factor: None,
             topic_message_expiry: IggyExpiry::ServerDefault,
             topic_max_size: MaxTopicSize::ServerDefault,
             send_retries_count: Some(3),
@@ -165,14 +163,12 @@ impl IggyProducerBuilder {
     pub fn create_topic_if_not_exists(
         self,
         partitions_count: u32,
-        replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         max_size: MaxTopicSize,
     ) -> Self {
         Self {
             create_topic_if_not_exists: true,
             topic_partitions_count: partitions_count,
-            topic_replication_factor: replication_factor,
             topic_message_expiry: message_expiry,
             topic_max_size: max_size,
             ..self
@@ -226,7 +222,6 @@ impl IggyProducerBuilder {
             self.create_stream_if_not_exists,
             self.create_topic_if_not_exists,
             self.topic_partitions_count,
-            self.topic_replication_factor,
             self.topic_message_expiry,
             self.topic_max_size,
             self.send_retries_count,

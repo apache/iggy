@@ -19,9 +19,13 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http;
 
+/// <summary>
+///     A topic update over REST. <paramref name="Options" /> carries keys with no property of their
+///     own, as strings the server parses by the same rules a config file value goes through.
+/// </summary>
 internal record UpdateTopicRequest(
     string Name,
     CompressionAlgorithm CompressionAlgorithm,
     ulong MaxTopicSize,
     ulong MessageExpiry,
-    byte? ReplicationFactor);
+    Dictionary<string, string> Options);

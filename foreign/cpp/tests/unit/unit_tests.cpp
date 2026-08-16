@@ -17,11 +17,29 @@
  * under the License.
  */
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "iggy.hpp"
+
+namespace {
+
+std::string option_key(const iggy::ffi::HeaderEntry &entry) {
+    return std::string(entry.key.value.begin(), entry.key.value.end());
+}
+
+std::vector<std::uint8_t> option_value_bytes(const iggy::ffi::HeaderEntry &entry) {
+    return std::vector<std::uint8_t>(entry.value.value.begin(), entry.value.value.end());
+}
+
+constexpr std::uint8_t kind_code(const iggy::ffi::HeaderKind kind) {
+    return static_cast<std::uint8_t>(kind);
+}
+
+}  // namespace
 
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::CompressionAlgorithm::none().compression_algorithm_value(), "none");
@@ -94,6 +112,71 @@ TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     const auto duration = iggy::Expiry::duration(15);
     EXPECT_EQ(duration.expiry_kind(), "duration");
     EXPECT_EQ(duration.expiry_value(), static_cast<std::uint64_t>(15));
+}
+
+TEST(TopicOptionTest, SegmentSizeEncodesLittleEndianUint64) {
+    const auto option = iggy::TopicOption::segment_size(0x0102030405060708ULL);
+
+    EXPECT_EQ(option.key.kind, kind_code(iggy::ffi::HeaderKind::String));
+    EXPECT_EQ(option_key(option), "segment_size");
+    EXPECT_EQ(option.value.kind, kind_code(iggy::ffi::HeaderKind::Uint64));
+    EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}));
+}
+
+TEST(TopicOptionTest, EnforceFsyncEncodesSingleBoolByte) {
+    const auto enabled = iggy::TopicOption::enforce_fsync(true);
+
+    EXPECT_EQ(enabled.key.kind, kind_code(iggy::ffi::HeaderKind::String));
+    EXPECT_EQ(option_key(enabled), "enforce_fsync");
+    EXPECT_EQ(enabled.value.kind, kind_code(iggy::ffi::HeaderKind::Bool));
+    EXPECT_EQ(option_value_bytes(enabled), (std::vector<std::uint8_t>{1}));
+
+    const auto disabled = iggy::TopicOption::enforce_fsync(false);
+
+    EXPECT_EQ(option_key(disabled), "enforce_fsync");
+    EXPECT_EQ(disabled.value.kind, kind_code(iggy::ffi::HeaderKind::Bool));
+    EXPECT_EQ(option_value_bytes(disabled), (std::vector<std::uint8_t>{0}));
+}
+
+TEST(TopicOptionTest, MessagesRequiredToSaveEncodesLittleEndianUint32) {
+    const auto option = iggy::TopicOption::messages_required_to_save(0x01020304U);
+
+    EXPECT_EQ(option.key.kind, kind_code(iggy::ffi::HeaderKind::String));
+    EXPECT_EQ(option_key(option), "messages_required_to_save");
+    EXPECT_EQ(option.value.kind, kind_code(iggy::ffi::HeaderKind::Uint32));
+    EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x04, 0x03, 0x02, 0x01}));
+}
+
+TEST(TopicOptionTest, SizeOfMessagesRequiredToSaveEncodesLittleEndianUint64) {
+    const auto option = iggy::TopicOption::size_of_messages_required_to_save(1024ULL * 1024ULL);
+
+    EXPECT_EQ(option.key.kind, kind_code(iggy::ffi::HeaderKind::String));
+    EXPECT_EQ(option_key(option), "size_of_messages_required_to_save");
+    EXPECT_EQ(option.value.kind, kind_code(iggy::ffi::HeaderKind::Uint64));
+    EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00}));
+}
+
+TEST(TopicOptionTest, PreallocateSegmentsEncodesSingleBoolByte) {
+    const auto enabled = iggy::TopicOption::preallocate_segments(true);
+
+    EXPECT_EQ(enabled.key.kind, kind_code(iggy::ffi::HeaderKind::String));
+    EXPECT_EQ(option_key(enabled), "preallocate_segments");
+    EXPECT_EQ(enabled.value.kind, kind_code(iggy::ffi::HeaderKind::Bool));
+    EXPECT_EQ(option_value_bytes(enabled), (std::vector<std::uint8_t>{1}));
+
+    const auto disabled = iggy::TopicOption::preallocate_segments(false);
+
+    EXPECT_EQ(option_value_bytes(disabled), (std::vector<std::uint8_t>{0}));
+}
+
+TEST(TopicOptionTest, MaximumValuesFillEveryValueByte) {
+    const auto segment_size = iggy::TopicOption::segment_size(std::numeric_limits<std::uint64_t>::max());
+    EXPECT_EQ(option_value_bytes(segment_size),
+              (std::vector<std::uint8_t>{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
+
+    const auto messages_required_to_save =
+        iggy::TopicOption::messages_required_to_save(std::numeric_limits<std::uint32_t>::max());
+    EXPECT_EQ(option_value_bytes(messages_required_to_save), (std::vector<std::uint8_t>{0xFF, 0xFF, 0xFF, 0xFF}));
 }
 
 TEST(IggyExceptionTest, StoresMessage) {

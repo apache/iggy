@@ -60,7 +60,7 @@ func (c *IggyTcpClient) CreateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
-	replicationFactor *uint8,
+	options ...iggcon.HeaderEntry,
 ) (*iggcon.TopicDetails, error) {
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return nil, ierror.ErrInvalidTopicName
@@ -68,10 +68,6 @@ func (c *IggyTcpClient) CreateTopic(
 	if partitionsCount > MaxPartitionCount {
 		return nil, ierror.ErrTooManyPartitions
 	}
-	if replicationFactor != nil && *replicationFactor == 0 {
-		return nil, ierror.ErrInvalidReplicationFactor
-	}
-
 	buffer, err := c.do(ctx, &command.CreateTopic{
 		StreamId:             streamId,
 		Name:                 name,
@@ -79,7 +75,7 @@ func (c *IggyTcpClient) CreateTopic(
 		CompressionAlgorithm: compressionAlgorithm,
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
-		ReplicationFactor:    replicationFactor,
+		Options:              options,
 	})
 	if err != nil {
 		return nil, err
@@ -96,13 +92,10 @@ func (c *IggyTcpClient) UpdateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
-	replicationFactor *uint8,
+	options ...iggcon.HeaderEntry,
 ) error {
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return ierror.ErrInvalidTopicName
-	}
-	if replicationFactor != nil && *replicationFactor == 0 {
-		return ierror.ErrInvalidReplicationFactor
 	}
 	_, err := c.do(ctx, &command.UpdateTopic{
 		StreamId:             streamId,
@@ -110,8 +103,8 @@ func (c *IggyTcpClient) UpdateTopic(
 		CompressionAlgorithm: compressionAlgorithm,
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
-		ReplicationFactor:    replicationFactor,
 		Name:                 name,
+		Options:              options,
 	})
 	return err
 }

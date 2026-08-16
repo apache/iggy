@@ -24,7 +24,7 @@ pub use common::{COMPONENT, cache_indexes, defaults, displays, http, system, val
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
-    FileConfigProvider, TypedEnvProvider, parse_env_value_to_json,
+    FileConfigProvider, RelocatedKey, TypedEnvProvider, parse_env_value_to_json,
 };
 pub use server_config::{
     cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,

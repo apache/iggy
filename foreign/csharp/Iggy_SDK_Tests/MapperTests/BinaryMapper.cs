@@ -17,12 +17,14 @@
 
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Shared;
 using Apache.Iggy.Tests.Utils;
@@ -146,11 +148,13 @@ public sealed class BinaryMapper
     public void MapStream_ReturnsValidStreamResponse()
     {
         // Arrange
-        var (id, topicsCount, sizeBytes, messagesCount, name, createdAt) = StreamFactory.CreateStreamsResponseFields();
+        var (id, _, sizeBytes, messagesCount, name, createdAt) = StreamFactory.CreateStreamsResponseFields();
+        // Topics are decoded count-driven, so the header count must match the appended topics.
+        var topicsCount = 1;
         var streamPayload
             = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
         var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1,
-                createdAtTopic, replicationFactor, maxTopicSize) =
+                createdAtTopic, maxTopicSize) =
             TopicFactory.CreateTopicResponseFields();
         var topicPayload1 = BinaryFactory.CreateTopicPayload(topicId1,
             partitionsCount1,
@@ -159,7 +163,6 @@ public sealed class BinaryMapper
             topicSizeBytes1,
             messagesCountTopic1,
             createdAt,
-            replicationFactor,
             maxTopicSize,
             1);
 
@@ -196,19 +199,21 @@ public sealed class BinaryMapper
     {
         // Arrange
         var (id1, partitionsCount1, name1, messageExpiry1, sizeBytesTopic1, messagesCountTopic1, createdAt,
-                replicationFactor1, maxTopicSize1) =
+                maxTopicSize1) =
             TopicFactory.CreateTopicResponseFields();
         var payload1 = BinaryFactory.CreateTopicPayload(id1, partitionsCount1, messageExpiry1, name1,
-            sizeBytesTopic1, messagesCountTopic1, createdAt, replicationFactor1, maxTopicSize1, 1);
+            sizeBytesTopic1, messagesCountTopic1, createdAt, maxTopicSize1, 1);
         var (id2, partitionsCount2, name2, messageExpiry2, sizeBytesTopic2, messagesCountTopic2, createdAt2,
-                replicationFactor2, maxTopicSize2) =
+                maxTopicSize2) =
             TopicFactory.CreateTopicResponseFields();
         var payload2 = BinaryFactory.CreateTopicPayload(id2, partitionsCount2, messageExpiry2, name2,
-            sizeBytesTopic2, messagesCountTopic2, createdAt2, replicationFactor2, maxTopicSize2, 2);
+            sizeBytesTopic2, messagesCountTopic2, createdAt2, maxTopicSize2, 2);
 
-        var combinedPayload = new byte[payload1.Length + payload2.Length];
-        payload1.CopyTo(combinedPayload.AsSpan());
-        payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
+        // GetTopics replies start with the topics count.
+        var combinedPayload = new byte[4 + payload1.Length + payload2.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(combinedPayload.AsSpan(0, 4), 2);
+        payload1.CopyTo(combinedPayload.AsSpan(4));
+        payload2.CopyTo(combinedPayload.AsSpan(4 + payload1.Length));
 
         // Act
         IReadOnlyList<TopicResponse> responses = Mappers.BinaryMapper.MapTopics(combinedPayload);
@@ -238,10 +243,10 @@ public sealed class BinaryMapper
     public void MapTopic_ReturnsValidTopicResponse()
     {
         // Arrange
-        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2, replicationFactor
-            , maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
         var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
-            sizeBytes, messagesCount, createdAt2, replicationFactor, maxTopicSize, 1);
+            sizeBytes, messagesCount, createdAt2, maxTopicSize, 1);
 
         var combinedPayload = new byte[topicPayload.Length];
         topicPayload.CopyTo(combinedPayload.AsSpan());
@@ -257,6 +262,80 @@ public sealed class BinaryMapper
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
         Assert.Equal(CompressionAlgorithm.None, response.CompressionAlgorithm);
+    }
+
+    [Fact]
+    public void MapTopic_WithAnOptionOfAnUnknownKind_KeepsTheOtherEntries()
+    {
+        // Arrange: an option kind a newer server may introduce, between two this build knows.
+        const byte stringKind = 2;
+        const byte unknownKind = 200;
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var options = new List<byte>();
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "segment_size", stringKind, "1GB"u8.ToArray()));
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "future_option", unknownKind, [0xAA, 0xBB]));
+        options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "enforce_fsync", 3, [1]));
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
+            sizeBytes, messagesCount, createdAt, maxTopicSize, 1, options.ToArray());
+
+        // Act
+        var response = Mappers.BinaryMapper.MapTopic(topicPayload);
+
+        // Assert: the unknown entry is dropped, everything around it still decodes.
+        Assert.Equal(topicName, response.Name);
+        Assert.NotNull(response.Options);
+        Assert.Equal(2, response.Options.Count);
+        Assert.Equal("1GB", response.Options[HeaderKey.FromString("segment_size")].ToString());
+        Assert.Equal(HeaderKind.Bool, response.Options[HeaderKey.FromString("enforce_fsync")].Kind);
+        Assert.False(response.Options.ContainsKey(HeaderKey.FromString("future_option")));
+        Assert.NotNull(response.DerivedOptions);
+        Assert.Empty(response.DerivedOptions);
+    }
+
+    [Fact]
+    public void MapOptionSpecs_ReturnsTheCatalogWithKindsAndDefaults()
+    {
+        // Arrange: [count][key_len][key][kind][default_len][default][description_len][description]
+        const string key = "segment_size";
+        const string description = "Segment size in bytes";
+        var defaultValue = new byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(defaultValue, 1024UL * 1024 * 1024);
+
+        var payload = new List<byte>();
+        payload.AddRange(BitConverter.GetBytes(1u));
+        payload.Add((byte)key.Length);
+        payload.AddRange(Encoding.UTF8.GetBytes(key));
+        payload.Add(12); // Uint64 wire code
+        payload.AddRange(BitConverter.GetBytes((uint)defaultValue.Length));
+        payload.AddRange(defaultValue);
+        payload.AddRange(BitConverter.GetBytes((uint)description.Length));
+        payload.AddRange(Encoding.UTF8.GetBytes(description));
+
+        // Act
+        var specs = Mappers.BinaryMapper.MapOptionSpecs(payload.ToArray());
+
+        // Assert
+        var spec = Assert.Single(specs);
+        Assert.Equal(key, spec.Key);
+        Assert.Equal(HeaderKind.Uint64, spec.Kind);
+        Assert.Equal(defaultValue, spec.DefaultValue);
+        Assert.Equal(description, spec.Description);
+    }
+
+    [Fact]
+    public void MapOptionSpecs_RejectsAnEntryThatOverrunsThePayload()
+    {
+        // A declared length past the end must not read adjacent memory.
+        var payload = new List<byte>();
+        payload.AddRange(BitConverter.GetBytes(1u));
+        payload.Add(4);
+        payload.AddRange(Encoding.UTF8.GetBytes("size"));
+        payload.Add(12);
+        payload.AddRange(BitConverter.GetBytes(64u)); // claims 64 bytes that are not there
+
+        Assert.Throws<InvalidOperationException>(() =>
+            Mappers.BinaryMapper.MapOptionSpecs(payload.ToArray()));
     }
 
     [Fact]

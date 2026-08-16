@@ -137,7 +137,7 @@ func scratchTopic(t *testing.T, connected iggcon.Client, partitionsCount uint32)
 	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
 
 	topic, err := connected.CreateTopic(ctx, streamId, name, partitionsCount,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0, nil)
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0)
 	require.NoError(t, err)
 	topicId, err := iggcon.NewIdentifier(topic.Id)
 	require.NoError(t, err)

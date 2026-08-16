@@ -169,7 +169,7 @@ impl ElasticsearchContainer {
                     .with_port(ELASTICSEARCH_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
-            .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_startup_timeout(Duration::from_secs(120))
             .with_env_var("discovery.type", "single-node")
             .with_env_var("xpack.security.enabled", "false")
             .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
@@ -177,11 +177,39 @@ impl ElasticsearchContainer {
             .with_container_name(ELASTICSEARCH_CONTAINER_NAME)
             .with_reuse(ReuseDirective::Always)
             .start()
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "ElasticsearchContainer".to_string(),
-                message: format!("Failed to start container: {e}"),
-            })?;
+            .await;
+
+        match result {
+            Ok(container) => return Ok(container),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("is already in use") {
+                    return Err(TestBinaryError::FixtureSetup {
+                        fixture_type: "ElasticsearchContainer".to_string(),
+                        message: format!("Failed to start container: {message}"),
+                    });
+                }
+                info!(
+                    "Elasticsearch container name taken by another test (attempt {attempt}), retrying to attach"
+                );
+                conflict = message;
+                sleep(CONTAINER_START_RETRY_DELAY).await;
+            }
+        }
+    }
+
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "ElasticsearchContainer".to_string(),
+        message: format!(
+            "Failed to attach to container '{ELASTICSEARCH_CONTAINER_NAME}' after \
+             {CONTAINER_START_ATTEMPTS} attempts: {conflict}"
+        ),
+    })
+}
+
+impl ElasticsearchContainer {
+    pub async fn start() -> Result<Self, TestBinaryError> {
+        let container = start_shared_container().await?;
 
         info!("Started Elasticsearch container");
 

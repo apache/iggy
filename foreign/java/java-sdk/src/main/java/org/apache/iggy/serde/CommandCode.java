@@ -31,6 +31,7 @@ public interface CommandCode {
         PING(1),
         GET_STATS(10),
         GET_CLUSTER_METADATA(12),
+        DESCRIBE_OPTIONS(13),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);

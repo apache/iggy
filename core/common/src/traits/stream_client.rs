@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Identifier, IggyError, Stream, StreamDetails};
+use crate::{Identifier, IggyError, Stream, StreamDetails, StreamUpdateOptions};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the stream module.
@@ -36,7 +36,12 @@ pub trait StreamClient {
     /// Update a stream by unique ID or name.
     ///
     /// Authentication is required, and the permission to manage the streams.
-    async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError>;
+    async fn update_stream(
+        &self,
+        stream_id: &Identifier,
+        name: &str,
+        options: &StreamUpdateOptions,
+    ) -> Result<(), IggyError>;
     /// Delete a stream by unique ID or name.
     ///
     /// Authentication is required, and the permission to manage the streams.
