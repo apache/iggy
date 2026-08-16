@@ -48,7 +48,7 @@ const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 ///
 /// Never re-sealed on receipt: the producer seals once and every replica stores that
 /// verbatim, so re-sealing locally would diverge the header bytes and break the
-/// parent chain in the TODO below.
+/// parent chain.
 const CHECKSUM_BODY_UNSEALED: u128 = 0;
 
 /// Number of slots in the journal ring buffer.
