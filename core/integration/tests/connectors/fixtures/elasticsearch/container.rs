@@ -121,6 +121,67 @@ pub struct ElasticsearchContainer {
     pub base_url: String,
 }
 
+/// See [`start_shared_container`]: same create-or-attach race as the Doris
+/// fixture, same bound.
+const CONTAINER_START_ATTEMPTS: u32 = 30;
+const CONTAINER_START_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Creates the shared Elasticsearch container, or attaches to it if another
+/// test won the race.
+///
+/// `ReuseDirective::Always` inspects the daemon and then creates when nothing
+/// matches, with no lock across the two steps, so a cold daemon with several
+/// elasticsearch tests in flight leaves one winner and the rest holding
+/// `409 Conflict: name already in use`. Retrying converts those into attaches.
+async fn start_shared_container() -> Result<ContainerAsync<GenericImage>, TestBinaryError> {
+    let mut conflict = String::new();
+    for attempt in 1..=CONTAINER_START_ATTEMPTS {
+        // Rebuilt per attempt because `start` consumes the request.
+        let result = GenericImage::new(ELASTICSEARCH_IMAGE, ELASTICSEARCH_TAG)
+            .with_exposed_port(ELASTICSEARCH_PORT.tcp())
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new(ELASTICSEARCH_HEALTH_ENDPOINT)
+                    .with_port(ELASTICSEARCH_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
+            .with_startup_timeout(Duration::from_secs(120))
+            .with_env_var("discovery.type", "single-node")
+            .with_env_var("xpack.security.enabled", "false")
+            .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
+            .with_mapped_port(0, ELASTICSEARCH_PORT.tcp())
+            .with_container_name(ELASTICSEARCH_CONTAINER_NAME)
+            .with_reuse(ReuseDirective::Always)
+            .start()
+            .await;
+
+        match result {
+            Ok(container) => return Ok(container),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("is already in use") {
+                    return Err(TestBinaryError::FixtureSetup {
+                        fixture_type: "ElasticsearchContainer".to_string(),
+                        message: format!("Failed to start container: {message}"),
+                    });
+                }
+                info!(
+                    "Elasticsearch container name taken by another test (attempt {attempt}), retrying to attach"
+                );
+                conflict = message;
+                tokio::time::sleep(CONTAINER_START_RETRY_DELAY).await;
+            }
+        }
+    }
+
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "ElasticsearchContainer".to_string(),
+        message: format!(
+            "Failed to attach to container '{ELASTICSEARCH_CONTAINER_NAME}' after \
+             {CONTAINER_START_ATTEMPTS} attempts: {conflict}"
+        ),
+    })
+}
+
 impl ElasticsearchContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
         match Self::try_start().await {
@@ -161,54 +222,10 @@ impl ElasticsearchContainer {
         }
     }
 
+    /// Creates or attaches to the shared container (retrying the create-race
+    /// via [`start_shared_container`]), then verifies it is actually ready to
+    /// serve traffic before handing it back to the caller.
     async fn try_start() -> Result<Self, TestBinaryError> {
-        let container = GenericImage::new(ELASTICSEARCH_IMAGE, ELASTICSEARCH_TAG)
-            .with_exposed_port(ELASTICSEARCH_PORT.tcp())
-            .with_wait_for(WaitFor::http(
-                HttpWaitStrategy::new(ELASTICSEARCH_HEALTH_ENDPOINT)
-                    .with_port(ELASTICSEARCH_PORT.tcp())
-                    .with_expected_status_code(200u16),
-            ))
-            .with_startup_timeout(Duration::from_secs(120))
-            .with_env_var("discovery.type", "single-node")
-            .with_env_var("xpack.security.enabled", "false")
-            .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
-            .with_mapped_port(0, ELASTICSEARCH_PORT.tcp())
-            .with_container_name(ELASTICSEARCH_CONTAINER_NAME)
-            .with_reuse(ReuseDirective::Always)
-            .start()
-            .await;
-
-        match result {
-            Ok(container) => return Ok(container),
-            Err(error) => {
-                let message = error.to_string();
-                if !message.contains("is already in use") {
-                    return Err(TestBinaryError::FixtureSetup {
-                        fixture_type: "ElasticsearchContainer".to_string(),
-                        message: format!("Failed to start container: {message}"),
-                    });
-                }
-                info!(
-                    "Elasticsearch container name taken by another test (attempt {attempt}), retrying to attach"
-                );
-                conflict = message;
-                sleep(CONTAINER_START_RETRY_DELAY).await;
-            }
-        }
-    }
-
-    Err(TestBinaryError::FixtureSetup {
-        fixture_type: "ElasticsearchContainer".to_string(),
-        message: format!(
-            "Failed to attach to container '{ELASTICSEARCH_CONTAINER_NAME}' after \
-             {CONTAINER_START_ATTEMPTS} attempts: {conflict}"
-        ),
-    })
-}
-
-impl ElasticsearchContainer {
-    pub async fn start() -> Result<Self, TestBinaryError> {
         let container = start_shared_container().await?;
 
         info!("Started Elasticsearch container");
