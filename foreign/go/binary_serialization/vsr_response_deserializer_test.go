@@ -241,20 +241,34 @@ func TestDeserializeFetchMessagesResponse_RejectsOverrunningUserHeaders(t *testi
 }
 
 func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
-	const nameOffset = 50
+	const nameLenOffset = 49
 	name := "orders"
-	payload := make([]byte, nameOffset+1+len(name))
+
+	partitionsValue := binary.LittleEndian.AppendUint32(nil, 3)
+	explicitOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("partitions_count")},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint32, Value: partitionsValue},
+	}})
+	derivedOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("compression_algorithm")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("none")},
+	}})
+
+	payload := make([]byte, nameLenOffset+1+len(name))
 	binary.LittleEndian.PutUint32(payload[0:4], 11)
 	binary.LittleEndian.PutUint64(payload[4:12], 1700000000)
 	binary.LittleEndian.PutUint32(payload[12:16], 3)
 	binary.LittleEndian.PutUint64(payload[16:24], 60_000_000)
 	payload[24] = 2
 	binary.LittleEndian.PutUint64(payload[25:33], 1<<30)
-	payload[33] = 1
-	binary.LittleEndian.PutUint64(payload[34:42], 4096)
-	binary.LittleEndian.PutUint64(payload[42:50], 12)
-	payload[nameOffset] = byte(len(name))
-	copy(payload[nameOffset+1:], name)
+	binary.LittleEndian.PutUint64(payload[33:41], 4096)
+	binary.LittleEndian.PutUint64(payload[41:49], 12)
+	payload[nameLenOffset] = byte(len(name))
+	copy(payload[nameLenOffset+1:], name)
+	payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicitOptions)))
+	payload = append(payload, explicitOptions...)
+	payload = binary.LittleEndian.AppendUint32(payload, uint32(len(derivedOptions)))
+	payload = append(payload, derivedOptions...)
 
 	topic, readBytes, err := DeserializeToTopic(payload, 0)
 	require.NoError(t, err)
@@ -267,9 +281,59 @@ func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
 	assert.Equal(t, uint8(2), topic.CompressionAlgorithm,
 		"compression is the u8 at +24")
 	assert.Equal(t, uint64(1<<30), topic.MaxTopicSize)
-	assert.Equal(t, uint8(1), topic.ReplicationFactor)
 	assert.Equal(t, uint64(4096), topic.Size)
 	assert.Equal(t, uint64(12), topic.MessagesCount)
 	assert.Equal(t, name, topic.Name)
+	assert.Equal(t, map[string]iggcon.HeaderValue{
+		"partitions_count": {Kind: iggcon.Uint32, Value: partitionsValue},
+	}, topic.Options)
+	assert.Equal(t, map[string]iggcon.HeaderValue{
+		"compression_algorithm": {Kind: iggcon.String, Value: []byte("none")},
+	}, topic.DerivedOptions)
 	assert.Equal(t, len(payload), readBytes)
+}
+
+func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.T) {
+	const nameLenOffset = 49
+	name := "t"
+	fixed := make([]byte, nameLenOffset+1+len(name))
+	fixed[nameLenOffset] = byte(len(name))
+	copy(fixed[nameLenOffset+1:], name)
+
+	options := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("max_topic_size")},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: binary.LittleEndian.AppendUint64(nil, 1<<30)},
+	}})
+	payload := binary.LittleEndian.AppendUint32(fixed, uint32(len(options)))
+	payload = append(payload, options...)
+	payload = binary.LittleEndian.AppendUint32(payload, 0)
+
+	_, readBytes, err := DeserializeToTopic(payload, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), readBytes)
+
+	for i := len(fixed); i < len(payload); i++ {
+		_, _, err := DeserializeToTopic(payload[:i], 0)
+		assert.Error(t, err, "expected error for truncation at byte %d", i)
+	}
+}
+
+func TestDeserializeToTopic_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
+	const nameLenOffset = 49
+	name := "t"
+	fixed := make([]byte, nameLenOffset+1+len(name))
+	fixed[nameLenOffset] = byte(len(name))
+	copy(fixed[nameLenOffset+1:], name)
+
+	// Both blocks, because the derived one is read at a position the explicit
+	// one computed. Where int is 32 bits, 0xFFFFFFFF converts to -1 and an
+	// unguarded decode slices with high < low instead of erroring.
+	explicitLies := binary.LittleEndian.AppendUint32(fixed, 0xFFFFFFFF)
+	_, _, err := DeserializeToTopic(explicitLies, 0)
+	assert.Error(t, err, "an explicit options length of 0xFFFFFFFF must not panic or pass")
+
+	derivedLies := binary.LittleEndian.AppendUint32(fixed, 0)
+	derivedLies = binary.LittleEndian.AppendUint32(derivedLies, 0xFFFFFFFF)
+	_, _, err = DeserializeToTopic(derivedLies, 0)
+	assert.Error(t, err, "a derived options length of 0xFFFFFFFF must not panic or pass")
 }

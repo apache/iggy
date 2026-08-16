@@ -78,13 +78,7 @@ public final class MessageEnvelopeProducer {
             } else {
                 client.topics()
                         .createTopic(
-                                STREAM_ID,
-                                1L,
-                                CompressionAlgorithm.None,
-                                BigInteger.ZERO,
-                                BigInteger.ZERO,
-                                Optional.empty(),
-                                TOPIC_NAME);
+                                STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TOPIC_NAME);
                 log.info("Topic {} was created.", TOPIC_NAME);
             }
 

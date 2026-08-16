@@ -76,12 +76,9 @@ const CONVERGENCE_STABLE_POLLS: u32 = 3;
 // `messages_required_to_save = 1` forces every committed batch to persist to its
 // segment immediately on every node, so each replica materialises the segment
 // files while running (the VSR server serves no flush_unsaved_buffer, and
-// shutdown-flush would couple the test to drain behaviour). The harness applies
-// the `server(...)` config to every cluster node.
-#[iggy_harness(
-    cluster_nodes = 3,
-    server(partition.messages_required_to_save = 1)
-)]
+// shutdown-flush would couple the test to drain behaviour). It is a topic
+// creation option, so it travels with the topic to every replica.
+#[iggy_harness(cluster_nodes = 3)]
 async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mut TestHarness) {
     let client = harness.tcp_root_client().await.unwrap();
     client.create_stream(STREAM_NAME).await.unwrap();
@@ -89,11 +86,12 @@ async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mu
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

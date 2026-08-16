@@ -25,13 +25,14 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class StreamDetailsTest {
     @Test
     void constructorWithStreamBaseCreatesExpectedStreamDetails() {
-        var base = new StreamBase(10L, BigInteger.valueOf(500L), "name", "size", BigInteger.ZERO, 1L);
+        var base = new StreamBase(10L, BigInteger.valueOf(500L), "name", "size", BigInteger.ZERO, 1L, Map.of());
         var topics = List.of(new Topic(
                 1L,
                 BigInteger.ZERO,
@@ -40,9 +41,10 @@ class StreamDetailsTest {
                 BigInteger.TEN,
                 CompressionAlgorithm.None,
                 BigInteger.ONE,
-                (short) 2,
                 BigInteger.ZERO,
-                2L));
+                2L,
+                Map.of(),
+                Map.of()));
 
         var streamDetails = new StreamDetails(base, topics);
 

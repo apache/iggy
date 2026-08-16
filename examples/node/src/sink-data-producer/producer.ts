@@ -118,7 +118,6 @@ async function produceData(client: Client, streamName: string, topicName: string
         name: topicName,
         partitionCount: 1,
         compressionAlgorithm: 1,
-        replicationFactor: 1,
       });
     }
   } catch (error) {
@@ -128,7 +127,6 @@ async function produceData(client: Client, streamName: string, topicName: string
       name: topicName,
       partitionCount: 1,
       compressionAlgorithm: 1,
-      replicationFactor: 1,
     });
   }
 

@@ -146,10 +146,14 @@ macro_rules! result_enum {
 }
 
 // Streams.
-result_enum!(CreateStreamResult { NameAlreadyExists = 1012 });
+result_enum!(CreateStreamResult {
+    NameAlreadyExists = 1012,
+    InvalidOptionValue = 4042,
+});
 result_enum!(UpdateStreamResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 1012,
+    InvalidOptionValue = 4042,
 });
 result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
 result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
@@ -158,11 +162,13 @@ result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
 result_enum!(CreateTopicResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 2013,
+    InvalidOptionValue = 4042,
 });
 result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
+    InvalidOptionValue = 4042,
 });
 result_enum!(DeleteTopicResult {
     StreamNotFound = 1009,
@@ -199,11 +205,13 @@ result_enum!(TruncatePartitionResult {
 result_enum!(CreateUserResult {
     InvalidUsername = 43,
     UserAlreadyExists = 46,
+    InvalidOptionValue = 4042,
 });
 result_enum!(UpdateUserResult {
     UserNotFound = 20,
     InvalidUsername = 43,
     UsernameAlreadyExists = 46,
+    InvalidOptionValue = 4042,
 });
 result_enum!(DeleteUserResult {
     UserNotFound = 20,

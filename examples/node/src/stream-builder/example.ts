@@ -60,7 +60,6 @@ async function buildClientAndStream(connectionString: string) {
     name: topicName,
     partitionCount: 1,
     compressionAlgorithm: 1,
-    replicationFactor: 1,
   });
 
   log(`Stream created: ${stream.id}`);

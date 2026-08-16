@@ -63,8 +63,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 				2,
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Millisecond,
-				math.MaxUint64,
-				nil)
+				math.MaxUint64)
 			itShouldNotReturnError(err)
 			t2, err := client.CreateTopic(
 				context.Background(),
@@ -73,8 +72,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 				2,
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Millisecond,
-				math.MaxUint64,
-				nil)
+				math.MaxUint64)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyCreateTopic(streamId, t1.Id, t1Name, client)
 			itShouldSuccessfullyCreateTopic(streamId, t2.Id, t2Name, client)

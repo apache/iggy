@@ -24,6 +24,7 @@ import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -91,6 +92,15 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
         ByteBuffer buffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
         buffer.putInt((int) val);
         return new HeaderValue(HeaderKind.Uint32, buffer.array());
+    }
+
+    public static HeaderValue fromUint64(BigInteger val) {
+        if (val.signum() < 0 || val.bitLength() > 64) {
+            throw new IggyInvalidArgumentException("Value must be between 0 and 18446744073709551615");
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putLong(val.longValue());
+        return new HeaderValue(HeaderKind.Uint64, buffer.array());
     }
 
     public static HeaderValue fromFloat32(float val) {
@@ -175,6 +185,14 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
         return (ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getInt() & 0xFFFFFFFFL);
     }
 
+    public BigInteger asUint64() {
+        if (kind != HeaderKind.Uint64) {
+            throw new IggyInvalidArgumentException("Header value is not a uint64, kind: " + kind);
+        }
+        long raw = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getLong();
+        return new BigInteger(Long.toUnsignedString(raw));
+    }
+
     public float asFloat32() {
         if (kind != HeaderKind.Float32) {
             throw new IggyInvalidArgumentException("Header value is not a float32, kind: " + kind);
@@ -218,7 +236,13 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
         return new HashCodeBuilder(17, 37).append(kind).append(value).toHashCode();
     }
 
-    private String toStringValue() {
+    /**
+     * Renders this value as the string a config file or a REST body carries it in.
+     *
+     * <p>The server parses those strings by the same rules, so a rendered value and the typed one
+     * it came from resolve to the same stored value.
+     */
+    public String toStringValue() {
         if (kind == HeaderKind.String) {
             return asString();
         }
@@ -234,11 +258,18 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
             case Int16 -> String.valueOf(asInt16());
             case Int32 -> String.valueOf(asInt32());
             case Int64 -> String.valueOf(asInt64());
+            case Float32 -> String.valueOf(asFloat32());
+            case Float64 -> String.valueOf(asFloat64());
+            default -> unsignedOrRawToString();
+        };
+    }
+
+    private String unsignedOrRawToString() {
+        return switch (kind) {
             case Uint8 -> String.valueOf(asUint8());
             case Uint16 -> String.valueOf(asUint16());
             case Uint32 -> String.valueOf(asUint32());
-            case Float32 -> String.valueOf(asFloat32());
-            case Float64 -> String.valueOf(asFloat64());
+            case Uint64 -> asUint64().toString();
             default -> Base64.getEncoder().encodeToString(value);
         };
     }

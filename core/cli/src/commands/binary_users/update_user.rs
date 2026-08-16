@@ -21,7 +21,9 @@ use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::Identifier;
 use iggy_common::UserStatus;
+use iggy_common::UserUpdateOptions;
 use iggy_common::update_user::UpdateUser;
+use std::collections::BTreeMap;
 use tracing::{Level, event};
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,7 @@ impl UpdateUserCmd {
                 user_id,
                 username,
                 status,
+                options: BTreeMap::new(),
             },
         }
     }
@@ -76,6 +79,9 @@ impl CliCommand for UpdateUserCmd {
                 &self.update_user.user_id,
                 self.update_user.username.as_deref(),
                 self.update_user.status,
+                // `iggy user name` / `iggy user status` are single-purpose
+                // commands; users have no option keys to set yet.
+                &UserUpdateOptions::default(),
             )
             .await
             .with_context(|| {

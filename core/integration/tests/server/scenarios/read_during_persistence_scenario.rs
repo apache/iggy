@@ -35,9 +35,6 @@ const TOPIC_NAME: &str = "eventual-consistency-topic";
 /// 3. Background saver starts async disk write
 /// 4. Poll arrives - sees empty journal, data not yet on disk
 #[iggy_harness(server(
-    partition.messages_required_to_save = "100000",
-    partition.size_of_messages_required_to_save = "1GB",
-    partition.enforce_fsync = false,
     message_saver.interval = "100ms",
     message_saver.enabled = true
 ))]
@@ -51,11 +48,19 @@ async fn should_read_messages_during_background_saver_flush(
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // Both inline thresholds sit far past anything the loop below
+            // sends, so nothing is ever flushed on the send path and only the
+            // background saver moves data to disk -- which is the race under
+            // test. Both have to move: the byte threshold defaults to 1 MiB and
+            // would flush on its own long before the message count trips.
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(100_000),
+                size_of_messages_required_to_save: Some(IggyByteSize::from(1024 * 1024 * 1024u64)),
+                enforce_fsync: Some(false),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

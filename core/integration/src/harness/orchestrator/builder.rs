@@ -386,8 +386,8 @@ mod tests {
             .server(
                 TestServerConfig::builder()
                     .extra_envs(HashMap::from([(
-                        "IGGY_SYSTEM_SEGMENT_SIZE".to_string(),
-                        "1MiB".to_string(),
+                        "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM".to_string(),
+                        "false".to_string(),
                     )]))
                     .build(),
             )
@@ -446,7 +446,10 @@ mod tests {
                     .quic_enabled(false)
                     .websocket_enabled(false)
                     .extra_envs(HashMap::from([
-                        ("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "2MiB".to_string()),
+                        (
+                            "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM".to_string(),
+                            "false".to_string(),
+                        ),
                         ("TEST".to_string(), "value".to_string()),
                     ]))
                     .build(),

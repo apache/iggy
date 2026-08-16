@@ -65,6 +65,10 @@ func (g *GetStreams) MarshalBinary() ([]byte, error) {
 type UpdateStream struct {
 	StreamId iggcon.Identifier `json:"streamId"`
 	Name     string            `json:"name"`
+	// Options carries the trailing options block. Streams have no catalog
+	// keys yet, so the server rejects every key; the block is the extension
+	// point for the first one.
+	Options []iggcon.HeaderEntry `json:"-"`
 }
 
 func (u *UpdateStream) Code() Code {
@@ -77,11 +81,14 @@ func (u *UpdateStream) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 	nameLength := len(u.Name)
-	bytes := make([]byte, len(streamIdBytes)+1+nameLength)
+	optionsBytes := iggcon.GetHeadersBytes(u.Options)
+	bytes := make([]byte, len(streamIdBytes)+1+nameLength+len(optionsBytes))
 	copy(bytes[0:len(streamIdBytes)], streamIdBytes)
 	position := len(streamIdBytes)
 	bytes[position] = byte(nameLength)
-	copy(bytes[position+1:], u.Name)
+	position++
+	position += copy(bytes[position:], u.Name)
+	copy(bytes[position:], optionsBytes)
 	return bytes, nil
 }
 

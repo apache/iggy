@@ -74,34 +74,17 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
 
 impl Validatable<ConfigurationError> for PartitionConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.messages_required_to_save == 0 {
-            eprintln!("Configured system.partition.messages_required_to_save cannot be 0");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
+        // The flush thresholds this used to check are per-topic creation
+        // options now; their bounds are enforced at admission.
         Ok(())
     }
 }
 
 impl Validatable<ConfigurationError> for SegmentConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.size > SEGMENT_MAX_SIZE_BYTES {
-            eprintln!(
-                "Configured system.segment.size {} B is greater than maximum {} B",
-                self.size.as_bytes_u64(),
-                SEGMENT_MAX_SIZE_BYTES
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if !self.size.as_bytes_u64().is_multiple_of(512) {
-            eprintln!(
-                "Configured system.segment.size {} B is not a multiple of 512 B",
-                self.size.as_bytes_u64()
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
+        // Segment size is a per-topic creation option now; its ceiling, floor
+        // and 512 B-multiple rule are enforced by
+        // `iggy_common::validate_topic_segment_size` at admission.
         Ok(())
     }
 }

@@ -44,7 +44,7 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
-    WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
+    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
 };
 use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
 use secrecy::SecretString;
@@ -236,6 +236,7 @@ impl SimClient {
     pub fn create_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
         let wire = CreateStreamRequest {
             name: WireName::new(name).expect("stream name must be valid"),
+            options: WireOptions::empty(),
         };
         let payload = wire.to_bytes();
 
@@ -260,6 +261,7 @@ impl SimClient {
         let wire = UpdateStreamRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             name: WireName::new(new_name).expect("stream name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateStream, &wire.to_bytes())
     }
@@ -284,11 +286,8 @@ impl SimClient {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(name).expect("topic name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateTopic, &wire.to_bytes())
     }
@@ -304,11 +303,8 @@ impl SimClient {
         let wire = UpdateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(new_name).expect("topic name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateTopic, &wire.to_bytes())
     }
@@ -428,6 +424,7 @@ impl SimClient {
             password: password.to_string(),
             status,
             permissions: None,
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateUser, &wire.to_bytes())
     }
@@ -445,6 +442,7 @@ impl SimClient {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
             username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
             status,
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateUser, &wire.to_bytes())
     }

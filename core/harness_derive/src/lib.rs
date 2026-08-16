@@ -40,11 +40,11 @@
 //! Test with server config matrix:
 //! ```ignore
 //! #[iggy_harness(server(
-//!     segment_size = ["512B", "1MiB"],
-//!     cache_indexes = ["none", "all"],
+//!     segment.cache_indexes = ["none", "all"],
+//!     partition.validate_checksum = [true, false],
 //! ))]
 //! async fn test_caching(client: &IggyClient) {
-//!     // 2 segment sizes × 2 cache modes = 4 tests
+//!     // 2 cache modes × 2 checksum modes = 4 tests
 //! }
 //! ```
 

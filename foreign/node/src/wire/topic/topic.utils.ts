@@ -18,6 +18,7 @@
 
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
+import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
 
 /**
  * Basic topic information without partition details.
@@ -37,12 +38,14 @@ export type BaseTopic = {
   messageExpiry: bigint,
   /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize: bigint,
-  /** Replication factor */
-  replicationFactor: number
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
   messagesCount: bigint,
+  /** Options the client explicitly sent at create */
+  options: ParsedOptions,
+  /** Options resolved from server defaults at create */
+  derivedOptions: ParsedOptions,
 };
 
 /**
@@ -113,28 +116,45 @@ export const isValidCompressionAlgorithm = (ca: number): ca is CompressionAlgori
   Object.values(CompressionAlgorithm).includes(ca);
 
 /**
- * Deserializes a base topic from a buffer.
+ * Maps a compression algorithm code to its wire option name.
+ *
+ * @param ca - Compression algorithm code
+ * @returns Option value string ('none' or 'gzip')
+ */
+export const compressionAlgorithmName = (ca: CompressionAlgorithm): string =>
+  ca === CompressionAlgorithm.Gzip ? 'gzip' : 'none';
+
+/**
+ * Deserializes a topic header from a buffer.
+ * Layout: 50 fixed bytes, name, then two length-prefixed options blocks
+ * (client-explicit and server-derived).
  *
  * @param p - Buffer containing serialized topic data
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized topic data
  */
 export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized => {
+  const start = pos;
   const id = p.readUInt32LE(pos);
   const createdAt = toDate(p.readBigUint64LE(pos + 4));
   const partitionsCount = p.readUInt32LE(pos + 12);
   const messageExpiry = p.readBigUInt64LE(pos + 16);
   const compressionAlgorithm = p.readUInt8(pos + 24);
   const maxTopicSize = p.readBigUInt64LE(pos + 25);
-  const replicationFactor = p.readUInt8(pos + 33);
-  const sizeBytes = p.readBigUInt64LE(pos + 34);
-  const messagesCount = p.readBigUInt64LE(pos + 42);
+  const sizeBytes = p.readBigUInt64LE(pos + 33);
+  const messagesCount = p.readBigUInt64LE(pos + 41);
 
-  const nameLength = p.readUInt8(pos + 50);
-  const name = p.subarray(pos + 51, pos + 51 + nameLength).toString();
+  const nameLength = p.readUInt8(pos + 49);
+  const name = p.subarray(pos + 50, pos + 50 + nameLength).toString();
+  pos += 50 + nameLength;
+
+  const explicit = deserializePrefixedOptions(p, pos);
+  pos += explicit.bytesRead;
+  const derived = deserializePrefixedOptions(p, pos);
+  pos += derived.bytesRead;
 
   return {
-    bytesRead: 4 + 8 + 4 + 1 + 8 + 8 + 1 + 8 + 8 + 1 + nameLength,
+    bytesRead: pos - start,
     data: {
       id,
       name,
@@ -142,10 +162,11 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       partitionsCount,
       compressionAlgorithm,
       maxTopicSize,
-      replicationFactor,
       messageExpiry,
       messagesCount,
       sizeBytes,
+      options: explicit.options,
+      derivedOptions: derived.options,
     }
   }
 };
@@ -175,6 +196,9 @@ export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized =>
 
 /**
  * Deserializes a topic with partitions from a buffer.
+ * Partition elements are count-driven from the topic's partitionsCount:
+ * the header's variable-length options blocks make greedy consumption
+ * ambiguous.
  *
  * @param p - Buffer containing serialized topic data
  * @param pos - Starting position in the buffer
@@ -189,8 +213,7 @@ export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
   const { bytesRead, data } = deserializeBaseTopic(p, pos);
   pos += bytesRead;
   const partitions = [];
-  const end = p.length;
-  while (pos < end) {
+  for (let i = 0; i < data.partitionsCount; i++) {
     const { bytesRead, data } = deserializePartition(p, pos);
     partitions.push(data);
     pos += bytesRead;
@@ -200,18 +223,20 @@ export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
 
 
 /**
- * Deserializes multiple topics from a buffer.
+ * Deserializes a GetTopics response: `[topics_count:u32_le]` prefix followed
+ * by count-driven topic headers (no partition details).
  *
  * @param p - Buffer containing serialized topics data
  * @param pos - Starting position in the buffer
  * @returns Array of deserialized topics
  */
 export const deserializeTopics = (p: Buffer, pos = 0): Topic[] => {
+  const topicsCount = p.readUInt32LE(pos);
+  pos += 4;
   const topics = [];
-  const len = p.length;
-  while (pos < len) {
-    const { bytesRead, data } = deserializeTopic(p, pos);
-    topics.push(data);
+  for (let i = 0; i < topicsCount; i++) {
+    const { bytesRead, data } = deserializeBaseTopic(p, pos);
+    topics.push({ ...data, partitions: [] });
     pos += bytesRead;
   }
   return topics;

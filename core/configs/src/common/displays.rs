@@ -19,7 +19,6 @@ use super::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig,
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
-use super::system::MessageDeduplicationConfig;
 use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
     server::MessageSaverConfig,
@@ -164,11 +163,7 @@ impl Display for StreamConfig {
 
 impl Display for TopicConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, max_size: {}, message_expiry: {} }}",
-            self.path, self.max_size, self.message_expiry
-        )
+        write!(f, "{{ path: {} }}", self.path)
     }
 }
 
@@ -176,22 +171,8 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, messages_required_to_save: {}, size_of_messages_required_to_save: {}, enforce_fsync: {}, validate_checksum: {} }}",
-            self.path,
-            self.messages_required_to_save,
-            self.size_of_messages_required_to_save,
-            self.enforce_fsync,
-            self.validate_checksum
-        )
-    }
-}
-
-impl Display for MessageDeduplicationConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ enabled: {}, max_entries: {:?}, expiry: {:?} }}",
-            self.enabled, self.max_entries, self.expiry
+            "{{ path: {}, validate_checksum: {} }}",
+            self.path, self.validate_checksum
         )
     }
 }
@@ -200,8 +181,8 @@ impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ size_bytes: {}, preallocate: {}, cache_indexes: {}, archive_expired: {} }}",
-            self.size, self.preallocate, self.cache_indexes, self.archive_expired,
+            "{{ cache_indexes: {}, archive_expired: {} }}",
+            self.cache_indexes, self.archive_expired,
         )
     }
 }

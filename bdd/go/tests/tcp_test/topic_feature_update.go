@@ -35,7 +35,6 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			newName := createRandomString(128)
-			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.UpdateTopic(
@@ -45,8 +44,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				newName,
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Microsecond,
-				math.MaxUint64,
-				&replicationFactor)
+				math.MaxUint64)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyUpdateTopic(streamId, topicId, newName, client)
 		})
@@ -57,7 +55,6 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			_, topic1Name := successfullyCreateTopic(streamId, client)
 			topic2Id, _ := successfullyCreateTopic(streamId, client)
-			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topic2Identifier, _ := iggcon.NewIdentifier(topic2Id)
 			err := client.UpdateTopic(
@@ -67,15 +64,13 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				topic1Name,
 				iggcon.CompressionAlgorithmNone,
 				iggcon.IggyExpiryServerDefault,
-				math.MaxUint64,
-				&replicationFactor)
+				math.MaxUint64)
 
 			itShouldReturnSpecificError(err, ierror.ErrTopicNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to update non-existing topic", func() {
 			client := createAuthorizedConnection()
-			replicationFactor := uint8(1)
 			err := client.UpdateTopic(
 				context.Background(),
 				randomU32Identifier(),
@@ -83,8 +78,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				createRandomString(128),
 				1,
 				0,
-				math.MaxUint64,
-				&replicationFactor)
+				math.MaxUint64)
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
@@ -93,7 +87,6 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
-			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.UpdateTopic(
 				context.Background(),
@@ -102,8 +95,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				createRandomString(128),
 				1,
 				0,
-				math.MaxUint64,
-				&replicationFactor)
+				math.MaxUint64)
 
 			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
@@ -113,7 +105,6 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.UpdateTopic(
@@ -123,8 +114,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				createRandomString(256),
 				1,
 				0,
-				math.MaxUint64,
-				&replicationFactor)
+				math.MaxUint64)
 
 			itShouldReturnSpecificError(err, ierror.ErrInvalidTopicName)
 		})

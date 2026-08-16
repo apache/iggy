@@ -20,7 +20,9 @@ package tests_test
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -308,4 +310,144 @@ func TestE2E_TLSRoundTrip(t *testing.T) {
 		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 3, false, &partitionId)
 	require.NoError(t, err)
 	assert.Len(t, polled.Messages, 3)
+}
+
+func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+
+	specs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeTopic)
+	require.NoError(t, err)
+	byKey := map[string]iggcon.OptionSpec{}
+	for _, spec := range specs {
+		byKey[spec.Key] = spec
+	}
+	require.Contains(t, byKey, "enforce_fsync", "the catalog lists the keys create accepts")
+	require.Contains(t, byKey, "segment_size")
+	assert.NotEmpty(t, byKey["segment_size"].Description)
+	assert.Equal(t, iggcon.Uint64, byKey["segment_size"].DefaultValue.Kind)
+
+	// Scopes with no catalog keys answer with an empty list rather than failing.
+	streamSpecs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeStream)
+	require.NoError(t, err)
+	assert.Empty(t, streamSpecs)
+
+	name := fmt.Sprintf("go-e2e-options-%d", time.Now().UnixNano())
+	stream, err := connected.CreateStream(ctx, name)
+	require.NoError(t, err)
+	streamId, err := iggcon.NewIdentifier(stream.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
+
+	// A key with no parameter of its own rides the variadic options block.
+	created, err := connected.CreateTopic(ctx, streamId, name, 1,
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
+		iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("enforce_fsync")},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("true")},
+		})
+	require.NoError(t, err)
+
+	topicId, err := iggcon.NewIdentifier(created.Id)
+	require.NoError(t, err)
+	topic, err := connected.GetTopic(ctx, streamId, topicId)
+	require.NoError(t, err)
+
+	fsync, ok := topic.Options["enforce_fsync"]
+	require.True(t, ok, "an explicitly set key is reported as explicit, got %v", topic.Options)
+	// Create admission re-encodes the block from its own parse, so the stored
+	// value carries the key's canonical kind whatever kind the client sent it
+	// as: this string "true" comes back as a Bool.
+	assert.Equal(t, iggcon.Bool, fsync.Kind)
+	assert.Equal(t, []byte{1}, fsync.Value)
+	// Keys the client left alone are resolved by admission and reported apart.
+	require.Contains(t, topic.DerivedOptions, "max_topic_size")
+	assert.NotContains(t, topic.DerivedOptions, "enforce_fsync")
+
+	// A key outside the catalog is refused by name.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-bad", 1,
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
+		iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("not_a_real_option")},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("1")},
+		})
+	require.Error(t, err)
+}
+
+func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+
+	// Values inside the bounds the catalog reports: a 512-byte multiple segment
+	// size at the floor, a non-zero message threshold, preallocation off so
+	// nothing is reserved on disk.
+	typed := []iggcon.HeaderEntry{
+		iggcon.SegmentSizeOption(1024 * 1024),
+		iggcon.EnforceFsyncOption(true),
+		iggcon.MessagesRequiredToSaveOption(7),
+		iggcon.SizeOfMessagesRequiredToSaveOption(4096),
+		iggcon.PreallocateSegmentsOption(false),
+	}
+
+	specs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeTopic)
+	require.NoError(t, err)
+	catalog := map[string]iggcon.OptionSpec{}
+	for _, spec := range specs {
+		catalog[spec.Key] = spec
+	}
+	for _, entry := range typed {
+		key := string(entry.Key.Value)
+		spec, found := catalog[key]
+		require.True(t, found, "%q is not a catalog key", key)
+		assert.Equal(t, spec.DefaultValue.Kind, entry.Value.Kind,
+			"%q must be sent in the kind the catalog gives it", key)
+	}
+
+	name := fmt.Sprintf("go-e2e-typed-options-%d", time.Now().UnixNano())
+	stream, err := connected.CreateStream(ctx, name)
+	require.NoError(t, err)
+	streamId, err := iggcon.NewIdentifier(stream.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
+
+	created, err := connected.CreateTopic(ctx, streamId, name, 1,
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0, typed...)
+	require.NoError(t, err)
+
+	topicId, err := iggcon.NewIdentifier(created.Id)
+	require.NoError(t, err)
+	topic, err := connected.GetTopic(ctx, streamId, topicId)
+	require.NoError(t, err)
+
+	for _, entry := range typed {
+		key := string(entry.Key.Value)
+		stored, found := topic.Options[key]
+		require.True(t, found, "%q was set explicitly, got %v", key, topic.Options)
+		// Admission re-encodes the block in each key's canonical kind, which is
+		// the kind the constructor already sent, so the bytes survive unchanged.
+		assert.Equal(t, entry.Value.Kind, stored.Kind, key)
+		assert.Equal(t, entry.Value.Value, stored.Value, key)
+		assert.NotContains(t, topic.DerivedOptions, key)
+	}
+
+	// A flush threshold of zero messages can never trip, so it is refused.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-zero-flush", 1,
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
+		iggcon.MessagesRequiredToSaveOption(0))
+	require.Error(t, err)
+
+	// A segment size off the 512-byte grid is refused, but zero is not: it
+	// leaves the key derived.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-odd-segment", 1,
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
+		iggcon.SegmentSizeOption(1024*1024+1))
+	require.Error(t, err)
+
+	zeroSegment := iggcon.SegmentSizeOption(0)
+	derived, err := connected.CreateTopic(ctx, streamId, name+"-zero-segment", 1,
+		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0, zeroSegment)
+	require.NoError(t, err)
+	segmentSizeKey := string(zeroSegment.Key.Value)
+	assert.NotContains(t, derived.Options, segmentSizeKey)
+	assert.Contains(t, derived.DerivedOptions, segmentSizeKey)
 }

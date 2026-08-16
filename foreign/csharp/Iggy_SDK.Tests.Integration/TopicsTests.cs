@@ -43,7 +43,7 @@ public class TopicsTests
 
         var response = await client.CreateTopicAsync(Identifier.String(streamName), "Test Topic", 2,
             CompressionAlgorithm.Gzip,
-            1, TimeSpan.FromMinutes(10), 2_000_000_000);
+            TimeSpan.FromMinutes(10), 2_000_000_000);
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
@@ -54,7 +54,6 @@ public class TopicsTests
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
-        response.ReplicationFactor.ShouldBe((byte?)1);
         response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
@@ -82,7 +81,7 @@ public class TopicsTests
         var streamName = $"topic-get-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
         await client.CreateTopicAsync(Identifier.String(streamName), "Get Topic", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
 
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.Numeric(0));
 
@@ -95,7 +94,6 @@ public class TopicsTests
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
-        response.ReplicationFactor.ShouldBe((byte?)1);
         response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
@@ -109,7 +107,7 @@ public class TopicsTests
         var streamName = $"topic-getname-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
         await client.CreateTopicAsync(Identifier.String(streamName), "Name Topic", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
 
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
             Identifier.String("Name Topic"));
@@ -122,7 +120,6 @@ public class TopicsTests
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
-        response.ReplicationFactor.ShouldBe((byte?)1);
         response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
@@ -136,9 +133,9 @@ public class TopicsTests
         var streamName = $"topic-list-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
         await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 1", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
         await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 2", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
 
         IReadOnlyList<TopicResponse> response = await client.GetTopicsAsync(Identifier.String(streamName));
 
@@ -200,7 +197,7 @@ public class TopicsTests
 
         await Should.NotThrowAsync(client.UpdateTopicAsync(Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id), "Updated Topic",
-            CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10), 3));
+            CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10)));
 
         var result = await client.GetTopicByIdAsync(Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id));
@@ -209,7 +206,6 @@ public class TopicsTests
         result.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
         result.MaxTopicSize.ShouldBe(3_000_000_000u);
-        result.ReplicationFactor.ShouldBe((byte?)3);
     }
 
     [Test]

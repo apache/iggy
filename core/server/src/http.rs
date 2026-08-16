@@ -69,9 +69,9 @@ use crate::cluster_meta::ClusterRoster;
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
-    delete_stream, delete_topic, delete_user, get_cg, get_cgs, get_client, get_clients,
-    get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats, get_stream,
-    get_streams, get_topic, get_topics, get_user, get_users, login_user,
+    delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
+    get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
+    get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
     login_with_personal_access_token, logout_user, ping, poll_messages, purge_stream, purge_topic,
     refresh_token, send_messages, store_consumer_offset, update_permissions, update_stream,
     update_topic, update_user,
@@ -302,6 +302,7 @@ fn router(
             delete(delete_consumer_offset),
         )
         .route("/stats", get(get_stats))
+        .route("/options/{scope}", get(describe_options))
         .route("/snapshot", post(get_snapshot))
         .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))

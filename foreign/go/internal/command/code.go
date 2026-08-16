@@ -24,6 +24,7 @@ const (
 	GetStatsCode              Code = 10
 	GetSnapshotFileCode       Code = 11
 	GetClusterMetadataCode    Code = 12
+	DescribeOptionsCode       Code = 13
 	GetMeCode                 Code = 20
 	GetClientCode             Code = 21
 	GetClientsCode            Code = 22

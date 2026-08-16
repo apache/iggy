@@ -20,6 +20,7 @@ use crate::Identifier;
 use crate::Validatable;
 use crate::error::IggyError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `UpdateStream` command is used to update an existing stream.
 /// It has additional payload:
@@ -32,6 +33,10 @@ pub struct UpdateStream {
     pub stream_id: Identifier,
     /// Unique stream name (string), max length is 255 characters.
     pub name: String,
+    /// Additional stream options as string key-values. Restricted to the keys
+    /// an update may change; anything else is rejected.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 impl Default for UpdateStream {
@@ -39,6 +44,7 @@ impl Default for UpdateStream {
         UpdateStream {
             stream_id: Identifier::default(),
             name: "stream".to_string(),
+            options: BTreeMap::new(),
         }
     }
 }
