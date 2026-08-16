@@ -71,13 +71,7 @@ async def iggy_client() -> IggyClient:
 
 
 @pytest.fixture
-def issued_names() -> set[str]:
-    """Return names created by unique_name in one test."""
-    return set()
-
-
-@pytest.fixture
-def unique_name(issued_names: set[str]):
+def unique_name():
     """Return a factory for generating unique test names."""
 
     def make_name(
@@ -108,27 +102,29 @@ def unique_name(issued_names: set[str]):
             + min_suffix_bytes
         )
         suffix = "".join(secrets.choice(alphabet) for _ in range(suffix_bytes))
-        name = f"{prefix}{suffix}"
-        issued_names.add(name)
-        return name
+        return f"{prefix}{suffix}"
 
     return make_name
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 async def cleanup_streams(
-    request: pytest.FixtureRequest, issued_names: set[str]
+    request: pytest.FixtureRequest,
 ) -> AsyncGenerator[None, None]:
     """Delete streams created by the current test."""
-    yield
-
-    if not issued_names:
+    if "iggy_client" not in request.fixturenames:
+        yield
         return
 
-    client = request.getfixturevalue("iggy_client")
-    for name in issued_names:
-        with contextlib.suppress(RuntimeError):
-            await client.delete_stream(name)
+    client: IggyClient = request.getfixturevalue("iggy_client")
+    existing_stream_ids = {stream.id for stream in await client.get_streams()}
+
+    yield
+
+    for stream in await client.get_streams():
+        if stream.id not in existing_stream_ids:
+            with contextlib.suppress(RuntimeError):
+                await client.delete_stream(stream.id)
 
 
 @pytest.fixture(scope="session", autouse=True)
