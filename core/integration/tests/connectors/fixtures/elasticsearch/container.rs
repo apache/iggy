@@ -42,7 +42,7 @@ const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 const ELASTICSEARCH_CONTAINER_NAME: &str = "iggy-test-elasticsearch";
 // Short probe timeouts: create_http_client() uses 30s + retries and must not
 // be used for readiness. One hung attempt there looks like a 60s+ test hang.
-const CLUSTER_READY_ATTEMPTS: usize = 40;
+const CLUSTER_READY_TIMEOUT_SECS: u64 = 60;
 const CLUSTER_READY_INTERVAL_MS: u64 = 250;
 const CLUSTER_READY_REQUEST_TIMEOUT_MS: u64 = 2_000;
 const DOCKER_RM_TIMEOUT_SECS: u64 = 15;
@@ -242,50 +242,52 @@ impl ElasticsearchContainer {
             self.base_url
         );
         let mut last_error = String::from("no attempts made");
+        let deadline = Instant::now() + Duration::from_secs(CLUSTER_READY_TIMEOUT_SECS);
+        let mut attempt: u32 = 0;
 
-        for attempt in 1..=CLUSTER_READY_ATTEMPTS {
+        while Instant::now() < deadline {
+            attempt += 1;
             match client.get(&health_url).send().await {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<ClusterHealth>().await {
                         Ok(health) if !health.timed_out => {
                             info!(
-                                "Elasticsearch cluster ready at {} (status={})",
+                                "Elasticsearch cluster ready at {} (status={}, attempt={attempt})",
                                 self.base_url, health.status
                             );
                             return Ok(());
                         }
                         Ok(health) => {
                             last_error = format!(
-                                "cluster health timed out on attempt {attempt}/{CLUSTER_READY_ATTEMPTS} (status={})",
+                                "cluster health timed out on attempt {attempt} (status={})",
                                 health.status
                             );
                         }
                         Err(error) => {
                             last_error = format!(
-                                "cluster health body unparsable on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}: {error}"
+                                "cluster health body unparsable on attempt {attempt}: {error}"
                             );
                         }
                     }
                 }
                 Ok(response) => {
                     last_error = format!(
-                        "cluster health status {} on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}",
+                        "cluster health status {} on attempt {attempt}",
                         response.status()
                     );
                 }
                 Err(error) => {
-                    last_error = format!(
-                        "cluster health request failed on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}: {error}"
-                    );
+                    last_error =
+                        format!("cluster health request failed on attempt {attempt}: {error}");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(CLUSTER_READY_INTERVAL_MS)).await;
+            tokio::time::sleep(Duration::from_millis(CLUSTER_READY_INTERVAL_MS)).await;
         }
 
         Err(TestBinaryError::FixtureSetup {
             fixture_type: "ElasticsearchContainer".to_string(),
             message: format!(
-                "Elasticsearch at {} not ready after {CLUSTER_READY_ATTEMPTS} attempts: {last_error}",
+                "Elasticsearch at {} not ready after {CLUSTER_READY_TIMEOUT_SECS}s ({attempt} attempts): {last_error}",
                 self.base_url
             ),
         })

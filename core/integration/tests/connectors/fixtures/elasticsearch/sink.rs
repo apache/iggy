@@ -62,18 +62,22 @@ impl ElasticsearchSinkFixture {
         &self,
         expected_count: usize,
     ) -> Result<usize, TestBinaryError> {
+        // Built once, reused across every probe below: a fresh reqwest::Client
+        // re-parses the system CA store via rustls-platform-verifier on every
+        // build() (even for plain http) and loses keep-alive between probes.
+        let client = probe_client()?;
         let mut last_error: Option<TestBinaryError> = None;
 
         for _ in 0..POLL_ATTEMPTS {
             // Short-timeout probes: create_http_client() is 30s + 3 retries and
             // would inflate failure-path wait_for_documents up to minutes.
-            if let Err(error) = self.refresh_index_probe().await {
+            if let Err(error) = self.refresh_index_probe(&client).await {
                 last_error = Some(error);
                 sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
                 continue;
             }
 
-            match self.count_documents_probe().await {
+            match self.count_documents_probe(&client).await {
                 Ok(count) if count >= expected_count => {
                     info!("Found {count} documents in Elasticsearch (expected {expected_count})");
                     return Ok(count);
@@ -88,7 +92,7 @@ impl ElasticsearchSinkFixture {
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
-        let final_count = self.count_documents_probe().await.unwrap_or(0);
+        let final_count = self.count_documents_probe(&client).await.unwrap_or(0);
         let detail = last_error
             .map(|error| format!("; last error: {error}"))
             .unwrap_or_default();
@@ -107,9 +111,8 @@ impl ElasticsearchSinkFixture {
         ElasticsearchOps::refresh_index(self, &self.index).await
     }
 
-    /// Refresh with a short-timeout client for the document poll loop.
-    async fn refresh_index_probe(&self) -> Result<(), TestBinaryError> {
-        let client = probe_client()?;
+    /// Refresh with the short-timeout probe client shared across one poll loop.
+    async fn refresh_index_probe(&self, client: &reqwest::Client) -> Result<(), TestBinaryError> {
         let url = format!("{}/{}/_refresh", self.container.base_url, self.index);
         let response =
             client
@@ -129,14 +132,16 @@ impl ElasticsearchSinkFixture {
         Ok(())
     }
 
-    /// Count with a short-timeout client for the document poll loop.
+    /// Count with the short-timeout probe client shared across one poll loop.
     ///
     /// `count_documents` (via `ElasticsearchOps`) goes through the shared
     /// `create_http_client()` - 30s timeout plus 3 retries - so a degraded
     /// `_count` endpoint could block this poll for minutes even though
     /// `refresh_index_probe` already uses a short timeout.
-    async fn count_documents_probe(&self) -> Result<usize, TestBinaryError> {
-        let client = probe_client()?;
+    async fn count_documents_probe(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<usize, TestBinaryError> {
         let url = format!("{}/{}/_count", self.container.base_url, self.index);
         let response =
             client
