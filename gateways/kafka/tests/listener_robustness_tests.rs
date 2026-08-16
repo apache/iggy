@@ -33,7 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time;
 
-use iggy_gateway_kafka::ServerConfig;
+use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_FETCH, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
 };
@@ -86,7 +86,7 @@ async fn e2e_partial_length_prefix_then_remainder_accepted() {
 #[tokio::test]
 async fn e2e_frame_within_custom_max_frame_size_accepted() {
     let max_frame = 512;
-    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,
@@ -117,7 +117,7 @@ async fn e2e_frame_within_custom_max_frame_size_accepted() {
 #[tokio::test]
 async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
     let max_frame = 64;
-    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,
@@ -147,7 +147,7 @@ async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
 async fn e2e_truncated_frame_body_closes_connection() {
     // A truncated in-flight body closes only once the server's read_timeout elapses, so use a
     // short read_timeout and wait longer than it to observe a genuine close, not a mere stall.
-    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,
@@ -266,7 +266,7 @@ async fn e2e_negative_frame_length_closes_connection() {
 
 #[tokio::test]
 async fn e2e_slow_client_can_complete_request_within_read_timeout() {
-    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,
@@ -462,7 +462,7 @@ async fn e2e_quiet_connection_accepts_request_after_short_idle() {
 
 #[tokio::test]
 async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
-    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,

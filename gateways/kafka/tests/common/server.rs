@@ -23,11 +23,11 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
-use iggy_gateway_kafka::{KafkaServer, ServerConfig};
+use iggy_gateway_kafka::{KafkaGateway, GatewayConfig};
 
 /// Bind an ephemeral port, start `KafkaServer`, return address + shutdown sender.
 pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
-    spawn_test_server_with_config(ServerConfig {
+    spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,
@@ -43,7 +43,7 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
 
 /// Start `KafkaServer` with explicit config (`bind_addr` overwritten with ephemeral port).
 pub async fn spawn_test_server_with_config(
-    mut config: ServerConfig,
+    mut config: GatewayConfig,
 ) -> (SocketAddr, broadcast::Sender<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -52,7 +52,7 @@ pub async fn spawn_test_server_with_config(
 
     config.bind_addr = addr.to_string();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let server = KafkaServer::new(config);
+    let server = KafkaGateway::new(config);
     tokio::spawn(async move {
         let _ = server.run(listener, shutdown_rx).await;
     });

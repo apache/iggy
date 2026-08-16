@@ -22,7 +22,7 @@ mod codec;
 
 use std::net::SocketAddr;
 
-use iggy_gateway_kafka::ServerConfig;
+use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::protocol::api::{API_KEY_METADATA, BrokerAdvertise, handle_request};
 
 use codec::{Decoder, Encoder};
@@ -56,10 +56,10 @@ fn metadata_reflects_broker_addr() {
 
 #[test]
 fn from_server_config_uses_explicit_advertised_host_on_wildcard_bind() {
-    let config = ServerConfig {
+    let config = GatewayConfig {
         bind_addr: "0.0.0.0:9093".to_string(),
         advertised_host: Some("kafka.internal".to_string()),
-        ..ServerConfig::default()
+        ..GatewayConfig::default()
     };
     let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
     let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
@@ -69,9 +69,9 @@ fn from_server_config_uses_explicit_advertised_host_on_wildcard_bind() {
 
 #[test]
 fn from_server_config_rejects_wildcard_bind_without_advertised_host() {
-    let config = ServerConfig {
+    let config = GatewayConfig {
         bind_addr: "0.0.0.0:9093".to_string(),
-        ..ServerConfig::default()
+        ..GatewayConfig::default()
     };
     let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
     let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
@@ -80,9 +80,9 @@ fn from_server_config_rejects_wildcard_bind_without_advertised_host() {
 
 #[test]
 fn from_server_config_uses_bind_ip_for_non_wildcard_listener() {
-    let config = ServerConfig {
+    let config = GatewayConfig {
         bind_addr: "192.168.1.10:19092".to_string(),
-        ..ServerConfig::default()
+        ..GatewayConfig::default()
     };
     let local_addr: SocketAddr = "192.168.1.10:19092".parse().unwrap();
     let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
@@ -92,10 +92,10 @@ fn from_server_config_uses_bind_ip_for_non_wildcard_listener() {
 
 #[test]
 fn from_server_config_rejects_advertised_host_exceeding_kafka_string_limit() {
-    let config = ServerConfig {
+    let config = GatewayConfig {
         bind_addr: "127.0.0.1:9093".to_string(),
         advertised_host: Some("x".repeat(i16::MAX as usize + 1)),
-        ..ServerConfig::default()
+        ..GatewayConfig::default()
     };
     let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
     let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
@@ -104,11 +104,11 @@ fn from_server_config_rejects_advertised_host_exceeding_kafka_string_limit() {
 
 #[test]
 fn from_server_config_honors_advertised_port_override() {
-    let config = ServerConfig {
+    let config = GatewayConfig {
         bind_addr: "127.0.0.1:9093".to_string(),
         advertised_host: Some("broker.example.com".to_string()),
         advertised_port: Some(19093),
-        ..ServerConfig::default()
+        ..GatewayConfig::default()
     };
     let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
     let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");

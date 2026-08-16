@@ -24,7 +24,7 @@ use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
 
 use iggy_gateway_kafka::server::init_tracing;
-use iggy_gateway_kafka::{KafkaServer, ServerConfig};
+use iggy_gateway_kafka::{KafkaGateway, GatewayConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
-    let server = KafkaServer::new(config);
+    let server = KafkaGateway::new(config);
 
     let (tx, rx) = broadcast::channel(1);
     let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
@@ -53,11 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build [`ServerConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
+/// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
 /// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
-fn load_config() -> Result<ServerConfig, String> {
-    let mut config = ServerConfig::default();
+fn load_config() -> Result<GatewayConfig, String> {
+    let mut config = GatewayConfig::default();
 
     if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
         config.bind_addr = bind_addr;

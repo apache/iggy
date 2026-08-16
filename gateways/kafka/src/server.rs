@@ -38,7 +38,7 @@ use std::io;
 const READ_CHUNK: usize = 65536;
 
 #[derive(Debug, Clone)]
-pub struct ServerConfig {
+pub struct GatewayConfig {
     pub bind_addr: String,
     /// Hostname or IP advertised in Metadata (`IGGY_KAFKA_ADVERTISED_HOST`). Required when
     /// `bind_addr` uses a wildcard address (`0.0.0.0` / `::`).
@@ -61,7 +61,7 @@ pub struct ServerConfig {
     pub shutdown_drain_timeout: Duration,
 }
 
-impl Default for ServerConfig {
+impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: format!("127.0.0.1:{DEFAULT_KAFKA_PORT}"),
@@ -86,7 +86,7 @@ impl BrokerAdvertise {
     ///
     /// Returns `InvalidConfig` when `advertised_host` is empty or the listener binds to a wildcard
     /// without an explicit advertised host.
-    pub fn from_server_config(config: &ServerConfig, local_addr: SocketAddr) -> Result<Self> {
+    pub fn from_server_config(config: &GatewayConfig, local_addr: SocketAddr) -> Result<Self> {
         let port = config
             .advertised_port
             .map_or_else(|| i32::from(local_addr.port()), i32::from);
@@ -120,13 +120,13 @@ impl BrokerAdvertise {
     }
 }
 
-pub struct KafkaServer {
-    config: Arc<ServerConfig>,
+pub struct KafkaGateway {
+    config: Arc<GatewayConfig>,
 }
 
-impl KafkaServer {
+impl KafkaGateway {
     #[must_use]
-    pub fn new(config: ServerConfig) -> Self {
+    pub fn new(config: GatewayConfig) -> Self {
         Self {
             config: Arc::new(config),
         }
@@ -262,7 +262,7 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 
 async fn handle_connection(
     mut stream: TcpStream,
-    config: Arc<ServerConfig>,
+    config: Arc<GatewayConfig>,
     peer: SocketAddr,
     broker: Arc<BrokerAdvertise>,
     cancel: CancellationToken,
@@ -313,7 +313,7 @@ async fn handle_connection(
 /// Returns `Ok(None)` when shutdown cancellation wins; `Ok(Some(frame))` on a full frame.
 async fn read_next_frame(
     stream: &mut TcpStream,
-    config: &ServerConfig,
+    config: &GatewayConfig,
     peer: &SocketAddr,
     cancel: &CancellationToken,
 ) -> Result<Option<bytes::Bytes>> {
@@ -345,7 +345,7 @@ async fn read_next_frame(
 async fn dispatch_outcome(
     stream: &mut TcpStream,
     peer: &SocketAddr,
-    config: &ServerConfig,
+    config: &GatewayConfig,
     req: &RequestHeader,
     resp_hdr_ver: i16,
     outcome: HandleOutcome,
@@ -615,12 +615,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
-        let server = KafkaServer::new(ServerConfig {
+        let server = KafkaGateway::new(GatewayConfig {
             // Idle timeout is intentionally long - cancellation + drain deadline, not the
             // idle timeout, must bound shutdown here.
             idle_timeout: Duration::from_mins(10),
             shutdown_drain_timeout: Duration::from_millis(200),
-            ..ServerConfig::default()
+            ..GatewayConfig::default()
         });
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
@@ -650,9 +650,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
-        let server = KafkaServer::new(ServerConfig {
+        let server = KafkaGateway::new(GatewayConfig {
             max_connections: 1,
-            ..ServerConfig::default()
+            ..GatewayConfig::default()
         });
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
@@ -680,7 +680,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (tx, rx) = broadcast::channel(1);
         drop(tx);
-        let server = KafkaServer::new(ServerConfig::default());
+        let server = KafkaGateway::new(GatewayConfig::default());
         assert!(server.run(listener, rx).await.is_ok());
     }
 
@@ -690,7 +690,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(1);
         tx.send(()).unwrap();
         tx.send(()).unwrap();
-        let server = KafkaServer::new(ServerConfig::default());
+        let server = KafkaGateway::new(GatewayConfig::default());
         assert!(server.run(listener, rx).await.is_ok());
     }
 
@@ -699,7 +699,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = broadcast::channel(1);
-        let server = KafkaServer::new(ServerConfig::default());
+        let server = KafkaGateway::new(GatewayConfig::default());
         let handle = tokio::spawn(async move { server.run(listener, rx).await });
 
         let stream = TcpStream::connect(addr).await.unwrap();
