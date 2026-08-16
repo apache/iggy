@@ -190,6 +190,7 @@ gloo = "0.12"
 governor = "0.10.4"
 harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
+hex = "0.4.3"
 hostname = "0.4.2"
 http = "1.4.2"
 human-repr = "1.1.0"

@@ -84,6 +84,7 @@ impl RedshiftSinkFixture {
 
             tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
         }
+
         Err(TestBinaryError::InvalidState {
             message: format!(
                 "Expected {} rows but got {} after {} poll attempts",

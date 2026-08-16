@@ -256,8 +256,8 @@ impl RedshiftSink {
         if include_metadata {
             expected_cols.insert("iggy_offset", "VARCHAR");
             expected_cols.insert("iggy_timestamp", "VARCHAR");
-            expected_cols.insert("iggy_stream", "TEXT");
-            expected_cols.insert("iggy_topic", "TEXT");
+            expected_cols.insert("iggy_stream", "VARCHAR");
+            expected_cols.insert("iggy_topic", "VARCHAR");
             expected_cols.insert("iggy_partition_id", "BIGINT");
         }
         if include_checksum {
@@ -359,11 +359,10 @@ impl RedshiftSink {
             // e.g. "bigint"
             "INT8" | "BIGINT" => "BIGINT",
             // e.g "character varying(40)", "character varying(20)", "character varying(256)"
-            "VARCHAR" | "CHARACTER VARYING" => "VARCHAR",
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" => "VARCHAR",
             // Having bytea because of the Postgres Test
             // e.g. "binary varying(64000)"
             "BYTEA" | "VARBYTE" | "VARBINARY" | "BINARY VARYING" => "VARBYTE",
-            "TEXT" => "TEXT",
             // e.g. "timestamp with time zone"
             "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => "TIMESTAMPTZ",
             _ => "UNKNOWN",
@@ -603,7 +602,7 @@ impl RedshiftSink {
         let mut query = format!("CREATE TABLE IF NOT EXISTS {table_name} (id VARCHAR(40)");
 
         if include_metadata {
-            query.push_str(", iggy_offset VARCHAR(20), iggy_timestamp VARCHAR(20), iggy_stream TEXT, iggy_topic TEXT, iggy_partition_id BIGINT");
+            query.push_str(", iggy_offset VARCHAR(20), iggy_timestamp VARCHAR(20), iggy_stream VARCHAR, iggy_topic VARCHAR, iggy_partition_id BIGINT");
         }
 
         if include_checksum {

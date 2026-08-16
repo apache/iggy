@@ -36,7 +36,7 @@ const API_KEY: &str = "test-api-key";
 const REDSHIFT_SINK_KEY: &str = "redshift";
 
 type SinkRow = (String, String, String, String, String);
-type SinkRawRow = (String, String, String, Vec<u8>, String);
+type SinkRawRow = (String, String, String, String, String);
 type SinkJsonRow = (String, String, String);
 
 #[iggy_harness(
@@ -177,8 +177,10 @@ async fn binary_messages_sink_stores_as_bytea(
         .await
         .expect("Failed to send messages");
 
+    // For live redshift
+    // "SELECT iggy_offset, iggy_stream, iggy_topic, FROM_VARBYTE(payload, 'hex') AS payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
     let query = format!(
-        "SELECT iggy_offset, iggy_stream, iggy_topic, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
+        "SELECT iggy_offset, iggy_stream, iggy_topic, ENCODE(payload::BYTEA, 'hex') AS payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
     );
     let rows: Vec<SinkRawRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
@@ -193,7 +195,11 @@ async fn binary_messages_sink_stores_as_bytea(
 
     for (i, (offset, _, _, payload, _)) in rows.iter().enumerate() {
         assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
-        assert_eq!(payload, &raw_payloads[i], "Payload mismatch at row {i}");
+        assert_eq!(
+            &hex::decode(payload).expect("Failed to decode payload"),
+            &raw_payloads[i],
+            "Payload mismatch at row {i}"
+        );
     }
 }
 
@@ -306,9 +312,13 @@ async fn json_messages_sink_stores_as_bytea(
         .await
         .expect("Failed to send messages");
 
+    // For live redshift
+    // "SELECT iggy_offset, iggy_stream, iggy_topic, FROM_VARBYTE(payload, 'hex') AS payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
     let query = format!(
-        "SELECT iggy_offset, iggy_stream, iggy_topic, payload, created_at FROM {SINK_TABLE} ORDER BY iggy_offset"
+        "SELECT iggy_offset, iggy_stream, iggy_topic, ENCODE(payload::BYTEA, 'hex') AS payload, created_at FROM \"{SINK_TABLE}\" ORDER BY iggy_offset"
     );
+    tracing::info!("Query: {}", query);
+
     let rows: Vec<SinkRawRow> = fixture
         .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
         .await
@@ -323,7 +333,10 @@ async fn json_messages_sink_stores_as_bytea(
     for (i, (offset, _, _, payload, _)) in rows.iter().enumerate() {
         assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(payload).expect("Failed to parse bytes"),
+            serde_json::from_slice::<serde_json::Value>(
+                &hex::decode(payload).expect("Failed to decode payload")
+            )
+            .expect("Failed to parse bytes"),
             json_payloads[i],
             "Payload mismatch at row {i}"
         );

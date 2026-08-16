@@ -7521,6 +7521,7 @@ dependencies = [
  "figment",
  "futures",
  "harness_derive",
+ "hex",
  "humantime",
  "iggy",
  "iggy-cli",
