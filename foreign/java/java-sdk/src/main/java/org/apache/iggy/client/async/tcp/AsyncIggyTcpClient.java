@@ -624,20 +624,17 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Serializes pre-login leader discovery and Register across concurrent
-     * logins. A queued login waits for the entire in-flight transaction, then
-     * checks the roster from the connection that transaction published. Each
-     * transaction has a fresh redirection budget, so hitting the cap affects
-     * only that login. Metadata and retargeting failures retain best-effort
-     * behavior and let Register run against the current target.
+     * Serializes Register and authenticated leader settlement across concurrent
+     * logins. A queued login waits for the entire in-flight transaction. Each
+     * redirect drops the bound session, so the login is replayed before the next
+     * roster read. Each transaction has a fresh redirection budget.
      */
     CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt) {
         CompletableFuture<Void> gate = new CompletableFuture<>();
         CompletableFuture<Void> previous = loginChain.getAndSet(gate);
         LeaderRedirectionState redirectionState = new LeaderRedirectionState();
-        CompletableFuture<IdentityInfo> transaction = previous.thenCompose(
-                        ignored -> redirectToLeader(redirectionState))
-                .thenCompose(ignored -> loginAttempt.get());
+        CompletableFuture<IdentityInfo> transaction =
+                previous.thenCompose(ignored -> loginAndSettleOnLeader(loginAttempt, redirectionState));
         CompletableFuture<IdentityInfo> callerFuture = new CompletableFuture<>();
         transaction.whenComplete((identity, error) -> {
             gate.complete(null);
@@ -650,11 +647,48 @@ public class AsyncIggyTcpClient {
         return callerFuture;
     }
 
+    private CompletableFuture<IdentityInfo> loginAndSettleOnLeader(
+            Supplier<CompletableFuture<IdentityInfo>> loginAttempt, LeaderRedirectionState redirectionState) {
+        return loginAttempt.get().thenCompose(identity -> {
+            ConnectionInfo currentTarget = connectionInfo;
+            return findLeaderElsewhere(currentTarget).thenCompose(leaderTarget -> {
+                if (leaderTarget.isEmpty()) {
+                    return CompletableFuture.completedFuture(identity);
+                }
+                if (!redirectionState.canRedirect()) {
+                    log.warn(
+                            "Maximum leader redirections ({}) reached, connection will continue on server node {}",
+                            LeaderAwareness.MAX_LEADER_REDIRECTS,
+                            currentTarget.serverAddress());
+                    return CompletableFuture.completedFuture(identity);
+                }
+                return retarget(leaderTarget.get())
+                        .handle((ignored, error) -> {
+                            if (error != null) {
+                                log.warn(
+                                        "Failed to reconnect to leader at {}: {}, connection will continue"
+                                                + " on server node {}",
+                                        leaderTarget.get().serverAddress(),
+                                        error.getMessage(),
+                                        currentTarget.serverAddress());
+                                return CompletableFuture.completedFuture(identity);
+                            }
+                            redirectionState.recordRedirect();
+                            return loginAndSettleOnLeader(loginAttempt, redirectionState);
+                        })
+                        .thenCompose(Function.identity());
+            });
+        });
+    }
+
     /**
-     * One authentication-independent discovery hop. When the roster names a
-     * healthy leader elsewhere, reconnect to it and re-check from the new
-     * node, since mid-election metadata can point at a node that is itself not
-     * the leader. Register is sent only after this bounded process settles.
+     * One discovery hop for transient failover. When the roster names a healthy leader elsewhere,
+     * reconnect to it and re-check from the new node, since mid-election
+     * metadata can point at a node that is itself not the leader. Register is
+     * sent only after this bounded process settles. Reading the roster needs a
+     * bound session, so a connection that has none fails the fetch locally and
+     * stays where it is. Login settlement uses {@link #loginAndSettleOnLeader}
+     * so every redirected connection binds before its next roster read.
      */
     private CompletableFuture<Void> redirectToLeader(LeaderRedirectionState redirectionState) {
         ConnectionInfo currentTarget = connectionInfo;

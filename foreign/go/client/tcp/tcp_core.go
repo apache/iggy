@@ -447,9 +447,10 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 	return append(buf, body...), nil
 }
 
-// connectScoped marks the context of a request the connect flow itself
-// issues. exchange must not reconnect such a request: Connect is already on
-// the stack, and re-entering it has no depth bound.
+// connectScoped marks the context of a request that must not enter the
+// reconnect path: the sign-in flow holding the register lock is on the stack
+// (possibly under Connect), and the reconnect's automatic sign-in would
+// deadlock on that lock or recurse Connect without a bound.
 type connectScoped struct{}
 
 // localPreconditionError marks a request that failed before its frame was
@@ -587,9 +588,10 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 	deadline := time.Now().Add(responseReadTimeout)
 	stamped := false
 	for {
-		// A sign-in owns the whole budget on this connection. The connect flow
-		// already pointed it at the leader, and failing over from under the
-		// handshake would recurse back into it.
+		// A sign-in owns the whole budget on this connection: any node
+		// completes it (a backup forwards the register to the primary), and
+		// failing over from under the handshake would recurse back into the
+		// sign-in flow.
 		transientDeadline := deadline
 		if !isRegisterCode(code) {
 			if failover := time.Now().Add(failoverCheckInterval); failover.Before(deadline) {
@@ -1014,39 +1016,15 @@ func (c *IggyTcpClient) connectionCandidates() []string {
 	return addresses
 }
 
-// establishSession points the connection at the leader and signs in when
-// auto-login is configured.
+// establishSession signs in when auto-login is configured.
 //
-// Leadership is settled before the sign-in, and it is settled even when
-// auto-login is off: register is a consensus operation that a backup answers
-// transiently, so signing in against a follower replays for the whole request
-// budget instead of failing over. Cluster metadata is sessionless and works on
-// the unauthenticated connection.
+// Leader settlement runs after the sign-in (see settleOnLeader): the roster
+// read is auth-gated, so it only works once a login binds a session, and a
+// login dialed at a backup still succeeds because the server forwards the
+// register to the primary. Without auto-login the connection can stay on a
+// backup: once the caller signs in, the first replicated request fails over
+// through the transient-deny path.
 func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool) error {
-	// The metadata request runs while Connect is on the stack. Reconnecting
-	// it would re-enter Connect and recurse without a bound, so its failure
-	// unwinds to this Connect instead. The sign-in below keeps the reconnect
-	// path: its replay is the documented recovery for a transient register
-	// failure, and the replayed sign-in suppresses the automatic one, so the
-	// depth is bounded at one nested Connect.
-	redirect, err := c.HandleLeaderRedirection(context.WithValue(ctx, connectScoped{}, struct{}{}))
-	if err != nil {
-		return err
-	}
-	if redirect {
-		if skipAutoLogin {
-			// The suppression belongs to the sign-in replay, not to this
-			// connection attempt. Connect already consumed the flag, so it is
-			// re-armed for the post-redirect Connect; otherwise that nested
-			// Connect signs in automatically and the replayed login then
-			// commits a second Register.
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = true
-			c.mtx.Unlock()
-		}
-		return c.Connect(ctx)
-	}
-
 	if !c.config.autoLogin.enabled {
 		c.logger.Info("Automatic sign-in is disabled.")
 		return nil
@@ -1058,10 +1036,10 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool
 
 	credentials := c.config.autoLogin.credentials
 	if credentials.personalAccessToken != "" {
-		_, err = c.LoginWithPersonalAccessToken(ctx, credentials.personalAccessToken)
+		_, err := c.LoginWithPersonalAccessToken(ctx, credentials.personalAccessToken)
 		return err
 	}
-	_, err = c.LoginUser(ctx, credentials.username, credentials.password)
+	_, err := c.LoginUser(ctx, credentials.username, credentials.password)
 	return err
 }
 
