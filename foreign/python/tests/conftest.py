@@ -23,6 +23,7 @@ and connecting to Iggy servers in various configurations.
 """
 
 import asyncio
+import contextlib
 import os
 import secrets
 import string
@@ -35,32 +36,9 @@ from apache_iggy import IggyClient
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
-_ROOT_USER_ID = 0
 
-
-async def _delete_test_resources(client: IggyClient) -> None:
-    streams = await client.get_streams()
-
-    for stream in streams:
-        topics = await client.get_topics(stream.id)
-        for topic in topics:
-            consumer_groups = await client.get_consumer_groups(stream.id, topic.id)
-            for consumer_group in consumer_groups:
-                await client.delete_consumer_group(
-                    stream.id, topic.id, consumer_group.id
-                )
-
-    for stream in streams:
-        await client.delete_stream(stream.id)
-
-    users = await client.get_users()
-    for user in users:
-        if user.id != _ROOT_USER_ID:
-            await client.delete_user(user.id)
-
-
-@pytest.fixture(scope="session", autouse=True)
-async def iggy_client() -> AsyncGenerator[IggyClient, None]:
+@pytest.fixture(scope="session")
+async def iggy_client() -> IggyClient:
     """
     Create and configure an Iggy client for testing.
 
@@ -71,7 +49,7 @@ async def iggy_client() -> AsyncGenerator[IggyClient, None]:
     4. Authenticates with default credentials
     5. Verifies connectivity with ping
 
-    Yields:
+    Returns:
         IggyClient: Authenticated client ready for testing
     """
     host, port = get_server_config()
@@ -89,13 +67,17 @@ async def iggy_client() -> AsyncGenerator[IggyClient, None]:
     # Authenticate
     await client.login_user("iggy", "iggy")
 
-    yield client
-
-    await _delete_test_resources(client)
+    return client
 
 
 @pytest.fixture
-def unique_name():
+def issued_names() -> set[str]:
+    """Return names created by unique_name in one test."""
+    return set()
+
+
+@pytest.fixture
+def unique_name(issued_names: set[str]):
     """Return a factory for generating unique test names."""
 
     def make_name(
@@ -126,9 +108,27 @@ def unique_name():
             + min_suffix_bytes
         )
         suffix = "".join(secrets.choice(alphabet) for _ in range(suffix_bytes))
-        return f"{prefix}{suffix}"
+        name = f"{prefix}{suffix}"
+        issued_names.add(name)
+        return name
 
     return make_name
+
+
+@pytest.fixture(autouse=True)
+async def cleanup_streams(
+    request: pytest.FixtureRequest, issued_names: set[str]
+) -> AsyncGenerator[None, None]:
+    """Delete streams created by the current test."""
+    yield
+
+    if not issued_names:
+        return
+
+    client = request.getfixturevalue("iggy_client")
+    for name in issued_names:
+        with contextlib.suppress(RuntimeError):
+            await client.delete_stream(name)
 
 
 @pytest.fixture(scope="session", autouse=True)
