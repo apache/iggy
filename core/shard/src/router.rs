@@ -33,9 +33,10 @@ use server_common::{Message, MessageBag};
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
 /// Heartbeats, prepare retransmit, and view-change timeouts only advance
-/// when the tick runs ("call this periodically, e.g. every 10ms"). Public
-/// so the simulator can advance its virtual clock in whole tick intervals.
-pub const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// when the tick runs. Re-exported from `consensus` so the drive cadence and
+/// the tick counts it feeds share one unit; public so the simulator can
+/// advance its virtual clock in whole tick intervals.
+pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
 
 /// Inter-shard dispatch logic.
 ///
