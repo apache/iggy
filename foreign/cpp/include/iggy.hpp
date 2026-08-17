@@ -463,7 +463,7 @@ class IggyException : public std::runtime_error {
  *
  * Create instances with Builder or FromConnectionString(). The client owns a
  * handle to the underlying Rust client. Destroying the C++ object releases that
- * handle, but does not stop heartbeat processing started by Connect().
+ * handle. The Rust client aborts its heartbeat task when it is dropped.
  *
  * Builder initializes a TCP client. To use QUIC, HTTP, or WebSocket, create the
  * client with FromConnectionString().
@@ -508,11 +508,8 @@ class IggyBlockingClient final {
     /**
      * @brief Releases the handle to the underlying Rust client.
      *
-     * Destruction does not stop the heartbeat task started by Connect(). For
-     * stateful transports, call Shutdown() before destruction to close the
-     * transport and let the heartbeat task observe the shutdown state. HTTP
-     * shutdown is a no-op, so its heartbeat remains subject to this limitation.
-     * Cleanup errors cannot be reported from the destructor.
+     * Dropping the underlying Rust client aborts its heartbeat task. Cleanup
+     * errors cannot be reported from the destructor.
      */
     ~IggyBlockingClient();
 
@@ -611,8 +608,8 @@ class IggyBlockingClient final {
      *
      * @note HTTP is stateless; connecting initializes heartbeat processing but
      *       does not open a persistent transport connection.
-     * @note Every successful call starts a heartbeat task, including calls made
-     *       while already connected. Call Connect() only once per client.
+     * @note Repeated calls do not start additional heartbeat tasks. An existing
+     *       heartbeat task is reused while it is still running.
      * @note The default reconnection limit is unlimited. If the server remains
      *       unavailable, this method keeps retrying and blocks the caller. Use
      *       WithReconnectionMaxRetries() to bound the wait.
@@ -629,9 +626,9 @@ class IggyBlockingClient final {
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
      *
-     * @note Disconnect() does not stop the existing heartbeat task. Calling
-     *       Connect() again starts an additional task, so avoid disconnect and
-     *       reconnect cycles until this SDK limitation is resolved.
+     * @note Disconnect() does not stop the existing heartbeat task. With
+     *       automatic login configured, a heartbeat may reconnect and
+     *       authenticate the client in the background.
      * @note The HTTP transport is stateless and treats this operation as a
      *       no-op.
      * @throws IggyException if the client cannot disconnect cleanly.
