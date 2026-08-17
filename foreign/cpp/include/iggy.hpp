@@ -720,6 +720,7 @@ class IggyBlockingClient::Builder final {
      *
      * @param server_address Server address in host:port form.
      * @return Reference to this builder.
+     * @throws IggyException if @p server_address is empty.
      * @note Build() throws IggyException if the address is invalid.
      */
     Builder &WithServerAddress(std::string server_address);
@@ -734,6 +735,7 @@ class IggyBlockingClient::Builder final {
      * @param username Iggy user name.
      * @param password Iggy user password.
      * @return Reference to this builder.
+     * @throws IggyException if either credential is empty.
      * @see IggyBlockingClient::Connect()
      * @see IggyBlockingClient::Login()
      */
@@ -748,6 +750,7 @@ class IggyBlockingClient::Builder final {
      *
      * @param token Personal access token.
      * @return Reference to this builder.
+     * @throws IggyException if the token is empty.
      * @see IggyBlockingClient::Connect()
      */
     Builder &WithPersonalAccessToken(std::string token);
@@ -811,11 +814,12 @@ class IggyBlockingClient::Builder final {
     /**
      * @brief Sets the domain used for TLS server-name verification.
      *
-     * When empty, the domain is derived from the configured server address.
+     * When omitted, the domain is derived from the configured server address.
      * Build() throws IggyException if this is set while TLS is disabled.
      *
      * @param domain TLS domain name.
      * @return Reference to this builder.
+     * @throws IggyException if @p domain is empty.
      */
     Builder &WithTlsDomain(std::string domain);
 
@@ -828,6 +832,7 @@ class IggyBlockingClient::Builder final {
      *
      * @param path Path to a PEM-encoded certificate-authority file.
      * @return Reference to this builder.
+     * @throws IggyException if @p path is empty.
      */
     Builder &WithTlsCaFile(std::string path);
 

@@ -217,6 +217,19 @@ TEST(IggyBlockingClientBuilderTest, BuildsWithEachAutoLoginKind) {
     EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithPersonalAccessToken("token").Build());
 }
 
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyServerAddress) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithServerAddress(""), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyAutoLoginCredentials) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("", "password"), iggy::IggyException);
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("username", ""), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyPersonalAccessToken) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPersonalAccessToken(""), iggy::IggyException);
+}
+
 TEST(IggyBlockingClientBuilderTest, RejectsTlsDomainWhenTlsIsDisabled) {
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsDomain("localhost").Build(), iggy::IggyException);
 }
@@ -227,4 +240,9 @@ TEST(IggyBlockingClientBuilderTest, RejectsTlsCaFileWhenTlsIsDisabled) {
 
 TEST(IggyBlockingClientBuilderTest, RejectsTlsValidationWhenTlsIsDisabled) {
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsCertificateValidation().Build(), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyTlsSettings) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsDomain(""), iggy::IggyException);
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsCaFile(""), iggy::IggyException);
 }

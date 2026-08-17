@@ -112,11 +112,17 @@ void IggyBlockingClient::Reset() noexcept {
 IggyBlockingClient::Builder::Builder() = default;
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithServerAddress(std::string server_address) {
+    if (server_address.empty()) {
+        throw IggyException("Server address cannot be empty");
+    }
     server_address_ = std::move(server_address);
     return *this;
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithAutoLogin(std::string username, std::string password) {
+    if (username.empty() || password.empty()) {
+        throw IggyException("Automatic login username and password cannot be empty");
+    }
     auto_login_kind_     = ffi::AutoLoginKind::UsernamePassword;
     auto_login_username_ = std::move(username);
     auto_login_password_ = std::move(password);
@@ -125,6 +131,9 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithAutoLogin(std::str
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithPersonalAccessToken(std::string token) {
+    if (token.empty()) {
+        throw IggyException("Personal access token cannot be empty");
+    }
     auto_login_kind_       = ffi::AutoLoginKind::PersonalAccessToken;
     personal_access_token_ = std::move(token);
     auto_login_username_.clear();
@@ -164,11 +173,17 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithTlsEnabled(bool en
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithTlsDomain(std::string domain) {
+    if (domain.empty()) {
+        throw IggyException("TLS domain cannot be empty");
+    }
     tls_domain_ = std::move(domain);
     return *this;
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithTlsCaFile(std::string path) {
+    if (path.empty()) {
+        throw IggyException("TLS CA file cannot be empty");
+    }
     tls_ca_file_ = std::move(path);
     return *this;
 }
