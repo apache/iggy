@@ -356,7 +356,7 @@ interval = "1 m"
 # Heartbeat configuration
 [heartbeat]
 # Enables or disables the client heartbeat verification process.
-enabled = false
+enabled = true
 # Interval for expected client heartbeats
 interval = "5 s"
 
