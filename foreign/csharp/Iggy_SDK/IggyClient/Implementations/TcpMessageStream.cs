@@ -514,10 +514,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         CancellationToken token = default)
     {
         var message = new[] { (byte)scope };
-        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DESCRIBE_OPTIONS_CODE);
-
-        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer
+            = await SendWithResponseAsync(CommandCodes.DESCRIBE_OPTIONS_CODE, message, token: token);
 
         if (responseBuffer.Memory.Length == 0)
         {
