@@ -765,8 +765,8 @@ TEST_F(LowLevelE2E_Client, UpdateUserAcceptsUsernameLengthBounds) {
     const std::string second_username   = GetRandomName(50);
     const std::string first_replacement = GetRandomName(3);
     std::string second_replacement      = GetRandomName(50);
-    second_replacement.resize(50);
-    ASSERT_NE(first_replacement, second_replacement);
+    second_replacement.resize(50, 'a');
+    ASSERT_EQ(second_replacement.size(), 50u);
     iggy::ffi::UserInfoDetails first{};
     iggy::ffi::UserInfoDetails second{};
     ASSERT_NO_THROW({ first = CreateUser(client, first_username, "secret123", 1); });
