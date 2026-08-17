@@ -168,6 +168,7 @@ pub struct Metrics {
     messages_processed: Family<ConnectorLabels, Counter>,
     messages_filtered: Family<ConnectorLabels, Counter>,
     errors: Family<ConnectorLabels, Counter>,
+    messages_dropped: Family<ConnectorLabels, Counter>,
     stage_duration_seconds: Family<StageLabels, Histogram, fn() -> Histogram>,
 }
 
@@ -185,6 +186,7 @@ impl Metrics {
         let messages_processed = Family::<ConnectorLabels, Counter>::default();
         let messages_filtered = Family::<ConnectorLabels, Counter>::default();
         let errors = Family::<ConnectorLabels, Counter>::default();
+        let messages_dropped = Family::<ConnectorLabels, Counter>::default();
         let stage_duration_seconds: Family<StageLabels, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(stage_histogram);
 
@@ -239,6 +241,11 @@ impl Metrics {
             errors.clone(),
         );
         registry.register(
+            "iggy_connector_messages_dropped_total",
+            "Messages permanently lost, never delivered to Apache Iggy",
+            messages_dropped.clone(),
+        );
+        registry.register(
             "iggy_connector_stage_duration_seconds",
             "Per-batch processing stage duration in seconds",
             stage_duration_seconds.clone(),
@@ -256,6 +263,7 @@ impl Metrics {
             messages_processed,
             messages_filtered,
             errors,
+            messages_dropped,
             stage_duration_seconds,
         }
     }
@@ -435,6 +443,12 @@ impl Metrics {
     /// Owned `errors` counter (Arc-shared atomic) for lookup-free hot-path increments.
     pub fn error_counter(&self, labels: &ConnectorLabels) -> Counter {
         self.errors.get_or_create(labels).clone()
+    }
+
+    /// Owned `messages_dropped` counter. Separate from `errors` so permanent
+    /// loss stays distinguishable from failures that get retried.
+    pub fn dropped_counter(&self, labels: &ConnectorLabels) -> Counter {
+        self.messages_dropped.get_or_create(labels).clone()
     }
 
     pub fn get_messages_produced(&self, key: &str) -> u64 {

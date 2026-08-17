@@ -109,10 +109,11 @@ Don't mix.
 
 1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
 2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
-3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a **bounded crossfire channel** (`crossfire::mpsc::bounded_blocking_async`, capacity = `SourceConfig::channel_capacity` in batches, default 1024, clamped to [1, 65536]) keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`).
+3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a **bounded crossfire channel** (`crossfire::mpsc::bounded_blocking_async`, capacity = `SourceConfig::channel_capacity` in batches, default 64, clamped to [1, 65536]) keyed by `plugin_id` in `SOURCE_SENDERS: LazyLock<DashMap<u32, Arc<SourceSenderEntry>>>` (file-private).
    - `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside) + two `Arc<AtomicBool>`s (`shutdown`, `backpressure_active` - the latter latches the channel-full `warn!` to one per backpressure episode).
    - The callback clones the fields out and drops the DashMap guard before sending. Holding the shard guard through a stall would block `cleanup_sender`.
-   - A full channel makes `send_with_backpressure` retry via `send_timeout(SEND_RETRY_INTERVAL)` - the stall IS the backpressure into the plugin's polling loop. The batch is dropped (+1 `errors`) only on disconnect or when the shutdown flag is observed while full.
+   - A full channel makes `send_with_backpressure` retry via `send_timeout(SEND_RETRY_INTERVAL)` - the stall IS the backpressure into the plugin's polling loop. The park holds a worker of that shared runtime, so a saturated instance degrades every sibling from the same `.so`; a runtime-side `block_in_place` would be a no-op on those threads, so the real fix is SDK-side.
+   - **A dropped batch latches the instance.** On shutdown with a full channel the sender gets one grace `send_timeout` round, then drops the batch, bumps `iggy_connector_messages_dropped_total` by its message count, and sets `dropped`. Every later batch is then dropped too, because sources snapshot their cursor into each batch and the forwarding loop persists it on success - letting a later batch through would advance the saved cursor past the gap and a restart would resume after it. Queued batches still flush; the ring is FIFO so they predate the drop.
 4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer.
 5. On success, save returned `ConnectorState` via `FileStateProvider`.
 

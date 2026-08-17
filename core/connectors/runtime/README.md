@@ -221,18 +221,28 @@ Filter the stream via `RUST_LOG=iggy_connectors::benchmark=info`. The correspond
 
 ## Source Channel Capacity
 
-Each source configuration accepts an optional `channel_capacity` setting that bounds the channel between the plugin's send callback and the runtime's forwarding loop. Capacity is counted in batches (one `poll()` result each, potentially megabytes), not messages or bytes. The default is 1024 batches.
+Each source configuration accepts an optional `channel_capacity` setting that bounds the channel between the plugin's send callback and the runtime's forwarding loop. Capacity is counted in batches (one `poll()` result each, potentially megabytes), not messages or bytes. The default is 64 batches. Values outside `[1, 65536]` are clamped with a warning.
 
-When the channel is full (Iggy accepts messages more slowly than the plugin produces them), the send callback backs off and retries instead of buffering without bound, so backpressure propagates into the plugin's polling loop. During shutdown, a batch that still cannot be enqueued after the stop signal is dropped and counted in `iggy_connector_errors_total`, so a saturated source may report errors at SIGTERM. Values outside `[1, 65536]` are clamped with a warning.
+When the channel is full (Iggy accepts messages more slowly than the plugin produces them), the send callback backs off and retries instead of buffering without bound, so backpressure propagates into the plugin's polling loop.
+
+Raising the capacity lengthens shutdown: buffered batches keep draining after the sender is dropped, so a larger channel means more send-and-save iterations before the connector's tasks finish, bounded by the 5s per-task await.
+
+### What happens to a batch that cannot be delivered
+
+During shutdown, a batch that still cannot be enqueued after one grace attempt is dropped permanently and counted in `iggy_connector_messages_dropped_total` (separate from `iggy_connector_errors_total`, which covers failures that get retried). This happens at SIGTERM and on connector restart through the control API, not only at process exit.
+
+**The instance stops delivering after that point.** Sources advance their cursor at poll time and snapshot it into every batch, and the runtime persists that cursor after each successful send, so allowing a later batch through would move the saved position past the dropped one and a restart would resume after the gap. Once a batch is dropped, every later batch from that instance is dropped too, and the resume point is the last delivered batch's state.
+
+What that costs on restart depends on the source: duplicates for offset-tracking sources, and permanent loss for sources that consume as they read (`delete_after_read`, `processed_column`).
 
 ```toml
 type = "source"
 key = "postgres"
 # ... other fields ...
-channel_capacity = 1024
+channel_capacity = 64
 ```
 
-Environment override: `IGGY_CONNECTORS_SOURCE_<KEY>_CHANNEL_CAPACITY`.
+Environment override (local config provider only): `IGGY_CONNECTORS_SOURCE_<KEY>_CHANNEL_CAPACITY`. With `config_type = "http"` the variable is ignored, and the unknown-variable warning is suppressed for the `IGGY_CONNECTORS_SOURCE_` prefix, so nothing surfaces it.
 
 ## Metrics
 

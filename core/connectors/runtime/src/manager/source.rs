@@ -154,7 +154,16 @@ impl SourceManager {
         source::signal_shutdown(plugin_id);
         if let Some(container) = &container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
-            (container.iggy_source_close)(plugin_id);
+            // The ordering above assumes close actually stopped the callbacks.
+            // The SDK returns non-zero when it could not join the polling task,
+            // and then a callback can outlive this and land on the
+            // removed-entry branch, which drops the batch without a metric.
+            let close_result = (container.iggy_source_close)(plugin_id);
+            if close_result != 0 {
+                warn!(
+                    "iggy_source_close returned {close_result} for source connector with ID: {plugin_id} ({key}); callbacks may outlive the close"
+                );
+            }
             info!("Closed source connector with ID: {plugin_id} for plugin: {key}");
         }
 
