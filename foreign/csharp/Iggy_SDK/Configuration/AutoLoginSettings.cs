@@ -23,32 +23,54 @@ namespace Apache.Iggy.Configuration;
 public class AutoLoginSettings
 {
     /// <summary>
-    ///     Enable automatic login on connection establishment
+    ///     Enable automatic login on connection establishment.
     /// </summary>
-    public bool Enabled { get; set; }
+    public bool Enabled { get; init; }
 
     /// <summary>
     ///     Specifies the username for auto-login configuration.
     /// </summary>
-    public string Username { get; set; } = string.Empty;
+    public string Username { get; init; } = string.Empty;
 
     /// <summary>
     ///     Specifies the password for auto-login authentication
     /// </summary>
-    public string Password { get; set; } = string.Empty;
+    public string Password { get; init; } = string.Empty;
 
     /// <summary>
-    ///     Settings for a builder-owned client that signs in with the given credentials. The credentials must
-    ///     reach the client and not only the explicit login the wrapper performs at startup: a reconnect or a
-    ///     leader redirect drops the session, and without them the client comes back unauthenticated.
+    ///     Personal access token to sign in with instead of a username and password. Takes precedence over them
+    ///     when set.
     /// </summary>
-    internal static AutoLoginSettings For(string username, string password)
+    public string PersonalAccessToken { get; init; } = string.Empty;
+
+    /// <summary>
+    ///     Auto login with a username and password.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when the username is empty.</exception>
+    public static AutoLoginSettings For(string username, string password)
     {
+        ArgumentException.ThrowIfNullOrEmpty(username);
+
         return new AutoLoginSettings
         {
-            Enabled = !string.IsNullOrEmpty(username),
+            Enabled = true,
             Username = username,
             Password = password
+        };
+    }
+
+    /// <summary>
+    ///     Auto login with a personal access token.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when the token is empty.</exception>
+    public static AutoLoginSettings ForPersonalAccessToken(string token)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+
+        return new AutoLoginSettings
+        {
+            Enabled = true,
+            PersonalAccessToken = token
         };
     }
 }

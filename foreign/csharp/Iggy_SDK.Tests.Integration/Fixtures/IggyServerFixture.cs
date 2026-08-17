@@ -57,10 +57,23 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected bool EnabledServerTraceLogs => true;
 
     /// <summary>
-    ///     Extra environment variables for every node, layered over the cluster's base configuration.
-    ///     Override in subclasses to customize.
+    ///     Server-side heartbeat interval. Short so a client that stops pinging is evicted within a few seconds
+    ///     instead of the default five. Clients from <see cref="CreateClient" /> ping at half this interval;
+    ///     any client built by hand must set <see cref="IggyClientConfigurator.HeartbeatInterval" /> below it or
+    ///     be evicted once idle past 1.2 intervals.
     /// </summary>
-    protected virtual Dictionary<string, string> EnvironmentVariables => [];
+    public static readonly TimeSpan ServerHeartbeatInterval = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    ///     Extra environment variables for every node, layered over the cluster's base configuration.
+    ///     Heartbeat verification is on for every fixture so the eviction tests share the general server
+    ///     instead of starting their own. Override in subclasses to customize.
+    /// </summary>
+    protected virtual Dictionary<string, string> EnvironmentVariables => new()
+    {
+        { "IGGY_HEARTBEAT_ENABLED", "true" },
+        { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" }
+    };
 
     /// <summary>
     ///     Resource mappings (certificates, etc.) mounted into every node. Override in subclasses.
@@ -131,6 +144,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
             BaseAddress = address ?? await GetIggyAddressAsync(protocol),
             Protocol = protocol,
             ReconnectionSettings = new ReconnectionSettings { Enabled = true },
+            HeartbeatInterval = ServerHeartbeatInterval / 2,
             AutoLoginSettings = new AutoLoginSettings
             {
                 Enabled = autoLogin,

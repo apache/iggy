@@ -67,6 +67,15 @@ public static class IggyClientFactory
             throw new ArgumentOutOfRangeException(nameof(options), options.MaxResponseFrameSize,
                 $"MaxResponseFrameSize must be at least {VsrHeader.HEADER_SIZE} bytes.");
         }
+
+        // The bounds PeriodicTimer accepts; anything outside them would fault the heartbeat task at start
+        // instead of failing the caller here.
+        if (options.HeartbeatInterval < TimeSpan.FromMilliseconds(1) ||
+            options.HeartbeatInterval > TimeSpan.FromMilliseconds(uint.MaxValue - 1))
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.HeartbeatInterval,
+                "HeartbeatInterval must be between 1 millisecond and about 49 days.");
+        }
     }
 
     private static IIggyClient CreateIggyTcpClient(IggyClientConfigurator options)
