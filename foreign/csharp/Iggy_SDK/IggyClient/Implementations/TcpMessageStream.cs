@@ -46,11 +46,6 @@ namespace Apache.Iggy.IggyClient.Implementations;
 /// </summary>
 public sealed partial class TcpMessageStream : IIggyClient
 {
-    private const int InvalidCommandStatus = 3;
-
-    // Ping carries no body, so the frame is constant and shared by the heartbeat and PingAsync.
-    private static readonly byte[] PingPayload = CreatePingPayload();
-
     private static readonly HashSet<uint> SessionControlCodes =
     [
         CommandCodes.LOGIN_USER_CODE,
@@ -102,7 +97,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <summary>
-    ///     Closes the underlying stream and stops the heartbeat. The semaphores are left alone on purpose: a
+    ///     Closes the underlying connection and stops the heartbeat. The semaphores are left alone on purpose: a
     ///     heartbeat or request still in flight releases them from its finally block, and a disposed
     ///     <see cref="SemaphoreSlim" /> turns that release into an <see cref="ObjectDisposedException" /> that
     ///     replaces the real error and skips the connection drop. They own no unmanaged handle, so there is
@@ -122,9 +117,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         _connection = null;
 
         SetConnectionState(ConnectionState.Disconnected);
-        _sendingSemaphore.Dispose();
-        _connectionSemaphore.Dispose();
-        _connectGate.Dispose();
         _connectionEvents.Clear();
     }
 
@@ -561,7 +553,9 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task PingAsync(CancellationToken token = default)
     {
-        await SendAckAsync(PingPayload, token);
+        var message = Array.Empty<byte>();
+        await SendAckAsync(CommandCodes.PING_CODE, message, token);
+
         await RefreshGroupAssignmentsAsync(token);
     }
 
@@ -804,7 +798,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            
+
             if (State is ConnectionState.Connected
                 or ConnectionState.Authenticating
                 or ConnectionState.Authenticated)
@@ -821,12 +815,12 @@ public sealed partial class TcpMessageStream : IIggyClient
             await TryEstablishConnectionAsync(autoLogin, token);
 
             // Dispose is synchronous and cannot take the sending semaphore, so a Dispose that ran while this
-            // connect was dialing already read a stream that did not exist yet. Reading the flag after the
-            // stream is installed leaves no window: either Dispose sees the new stream and closes it, or it is
-            // seen here and the stream is dropped.
+            // connect was dialing already read a connection that did not exist yet. Reading the flag after the
+            // connection is installed leaves no window: either Dispose sees the new connection and closes it, or
+            // it is seen here and the connection is dropped.
             if (_disposed)
             {
-                await DropStreamAsync();
+                await DropConnectionAsync();
                 throw new ObjectDisposedException(nameof(TcpMessageStream));
             }
 
@@ -873,7 +867,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             {
                 // Without reconnection and auto login a ping on a dead connection can only fail; with them,
                 // the ping is what brings an idle client back.
-                var unrecoverable = _state is ConnectionState.Disconnected or ConnectionState.Connecting
+                var unrecoverable = State is ConnectionState.Disconnected or ConnectionState.Connecting
                                     && !(_configuration.ReconnectionSettings.Enabled
                                          && _configuration.AutoLoginSettings.Enabled);
                 if (IsConnecting || unrecoverable)
@@ -1007,7 +1001,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         var delay = _configuration.ReconnectionSettings.InitialDelay;
         do
         {
-            await DropStreamAsync();
+            await DropConnectionAsync();
 
             if (string.IsNullOrEmpty(_currentAddress))
             {
@@ -1087,12 +1081,12 @@ public sealed partial class TcpMessageStream : IIggyClient
             {
                 socket?.Dispose();
 
-                // The stream is already installed by the time auto login, a redirect or the leader lookup can
-                // fail, and this path leaves the loop for good, so nothing else would ever close it.
-                await DropStreamAsync();
+                // The connection is already installed by the time auto login, a redirect or the leader lookup
+                // can fail, and this path leaves the loop for good, so nothing else would ever close it.
+                await DropConnectionAsync();
 
                 _logger.LogError(e, "Failed to establish connection");
-                SetConnectionStateAsync(ConnectionState.Disconnected);
+                SetConnectionState(ConnectionState.Disconnected);
                 throw;
             }
             catch (Exception e)
@@ -1105,9 +1099,6 @@ public sealed partial class TcpMessageStream : IIggyClient
                     (_configuration.ReconnectionSettings.MaxRetries > 0 &&
                      retryCount >= _configuration.ReconnectionSettings.MaxRetries))
                 {
-                    // A failure past the socket handoff (TLS handshake, auto login, redirect probe) leaves
-                    // _connection holding a live stream that nothing would ever close once this throw lands.
-                    await DropVsrConnectionAsync(_connection);
                     SetConnectionState(ConnectionState.Disconnected);
                     throw;
                 }
@@ -1149,21 +1140,20 @@ public sealed partial class TcpMessageStream : IIggyClient
             await Task.Delay(delay, token);
         }
     }
-    
+
     /// <summary>
     ///     Closes the current connection and forgets the consensus session bound to it. Takes the sending
-    ///     semaphore, which owns every write to <see cref="_stream" />, so an in-flight request never observes
-    ///     the field changing between its write and its reply. Never cancellable: a caller giving up is exactly
-    ///     when the stream has to be released.
+    ///     semaphore, which owns every write to <see cref="_connection" />, so an in-flight request never
+    ///     observes the field changing between its write and its reply. Never cancellable: a caller giving up is
+    ///     exactly when the connection has to be released.
     /// </summary>
-    private async Task DropStreamAsync()
+    private async Task DropConnectionAsync()
     {
         await _sendingSemaphore.WaitAsync(CancellationToken.None);
         try
         {
-            // Left pointing at the disposed stream rather than nulled: a request that raced this drop gets an
-            // ObjectDisposedException, which the reconnect path already understands, instead of an NRE.
-            _stream?.Dispose();
+            _connection?.Dispose();
+            _connection = null;
 
             ResetConsensusSession();
         }
@@ -1213,7 +1203,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         {
             return await SendRawAsync(code, body, token);
         }
-        catch (Exception e) when (VsrConnection.IsConnectionException(e) && !IsConnecting && !_disposed)
+        catch (Exception e) when (IsLostConnection(e) && !IsConnecting && !_disposed)
         {
             _logger.LogWarning("Connection lost");
             if (!_configuration.ReconnectionSettings.Enabled)
@@ -1223,18 +1213,25 @@ public sealed partial class TcpMessageStream : IIggyClient
                 throw;
             }
 
-            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token);
             // Without auto login a reconnect cannot re-establish the session, so the request would only come
             // back unauthenticated. Login and register are the exception: they re-authenticate themselves.
-            if (!_configuration.AutoLoginSettings.Enabled && Volatile.Read(ref _skipAutoLoginOnce) == 0)
+            if (!_configuration.AutoLoginSettings.Enabled && autoLoginOnReconnect)
             {
                 _logger.LogWarning("Auto login is disabled, the session cannot be re-established");
-                SetConnectionStateAsync(ConnectionState.Disconnected);
+                SetConnectionState(ConnectionState.Disconnected);
                 throw;
             }
 
-            return await HandleReconnectionAsync(payload, token);
+            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token);
         }
+    }
+
+    // A stale-client eviction is the server telling this connection its session is gone: the transport already
+    // dropped the connection, so the request is replayed over a fresh one like any other lost request.
+    private static bool IsLostConnection(Exception e)
+    {
+        return VsrConnection.IsConnectionException(e)
+               || e is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true };
     }
 
     private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
@@ -1266,42 +1263,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         {
             _connectionSemaphore.Release();
         }
-    }
-
-    private Task<IMemoryOwner<byte>> SendRawAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
-        {
-            throw new NotConnectedException();
-        }
-
-        return SendRawVsrAsync(payload, token);
-    }
-
-    // A stale-client eviction is the server telling this connection its session is gone: the transport already
-    // dropped the stream, so the request is replayed over a fresh connection like any other lost one.
-    private static bool IsConnectionException(Exception ex)
-    {
-        return ex is IggyZeroBytesException or
-            NotConnectedException or
-            SocketException or
-            IOException or
-            ObjectDisposedException or
-            IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true };
-    }
-
-    private static byte[] CreatePingPayload()
-    {
-        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH];
-        TcpMessageStreamHelpers.CreatePayload(payload, Array.Empty<byte>(), CommandCodes.PING_CODE);
-        return payload;
-    }
-
-    private static int CalculatePayloadBufferSize(int messageBufferSize)
-    {
-        return messageBufferSize + 4 + BufferSizes.INITIAL_BYTES_LENGTH;
     }
 
     private static int CalculateMessageBufferSize(Identifier streamId, Identifier topicId, Consumer consumer)
