@@ -19,8 +19,8 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::SystemClient;
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, OptionSpec, OptionsScope, Snapshot,
+    SnapshotCompression, Stats, SystemSnapshotType,
 };
 
 #[async_trait]
@@ -62,6 +62,16 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.get_clients().await,
             ClientWrapper::Quic(client) => client.get_clients().await,
             ClientWrapper::WebSocket(client) => client.get_clients().await,
+        }
+    }
+
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
+        match self {
+            ClientWrapper::Iggy(client) => client.describe_options(scope).await,
+            ClientWrapper::Http(client) => client.describe_options(scope).await,
+            ClientWrapper::Tcp(client) => client.describe_options(scope).await,
+            ClientWrapper::Quic(client) => client.describe_options(scope).await,
+            ClientWrapper::WebSocket(client) => client.describe_options(scope).await,
         }
     }
 

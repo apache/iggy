@@ -753,12 +753,8 @@ mod tests {
             transport: Transport::Http,
             transport_explicit: true,
             config_values: vec![
-                ("segment.size".to_string(), "1MiB".to_string()),
-                ("segment.cache_indexes".to_string(), "all".to_string()),
-                (
-                    "partition.messages_required_to_save".to_string(),
-                    "64".to_string(),
-                ),
+                ("heartbeat.interval".to_string(), "30s".to_string()),
+                ("metadata.journal_slots".to_string(), "1024".to_string()),
             ],
             tls: None,
             websocket_tls: None,
@@ -766,7 +762,7 @@ mod tests {
         };
         assert_eq!(
             v.suffix(),
-            "http_segment_size_1mib_segment_cache_indexes_all_partition_messages_required_to_save_64"
+            "http_heartbeat_interval_30s_metadata_journal_slots_1024"
         );
     }
 
@@ -829,12 +825,12 @@ mod tests {
             server: crate::attrs::ServerAttrs {
                 config_overrides: vec![
                     ConfigOverride {
-                        path: "segment.size".to_string(),
-                        value: ConfigValue::Matrix(vec!["512B".to_string(), "1MiB".to_string()]),
+                        path: "heartbeat.interval".to_string(),
+                        value: ConfigValue::Matrix(vec!["30s".to_string(), "60s".to_string()]),
                     },
                     ConfigOverride {
-                        path: "segment.cache_indexes".to_string(),
-                        value: ConfigValue::Matrix(vec!["none".to_string(), "all".to_string()]),
+                        path: "partition.validate_checksum".to_string(),
+                        value: ConfigValue::Matrix(vec!["true".to_string(), "false".to_string()]),
                     },
                 ],
                 ..Default::default()
@@ -844,7 +840,7 @@ mod tests {
             jwks_server: None,
         };
         let variants = generate_variants(&attrs);
-        // 2 transports * 2 segment sizes * 2 cache modes = 8 variants
+        // 2 transports * 2 intervals * 2 checksum modes = 8 variants
         assert_eq!(variants.len(), 8);
     }
 
@@ -857,18 +853,18 @@ mod tests {
     #[test]
     fn cartesian_product_single() {
         let overrides = vec![ConfigOverride {
-            path: "segment.size".to_string(),
-            value: ConfigValue::Matrix(vec!["512B".to_string(), "1MiB".to_string()]),
+            path: "heartbeat.interval".to_string(),
+            value: ConfigValue::Matrix(vec!["30s".to_string(), "60s".to_string()]),
         }];
         let result = cartesian_product(&overrides);
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0],
-            vec![("segment.size".to_string(), "512B".to_string())]
+            vec![("heartbeat.interval".to_string(), "30s".to_string())]
         );
         assert_eq!(
             result[1],
-            vec![("segment.size".to_string(), "1MiB".to_string())]
+            vec![("heartbeat.interval".to_string(), "60s".to_string())]
         );
     }
 

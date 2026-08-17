@@ -27,7 +27,7 @@ use windows_native_keyring_store::store::Store;
 #[cfg(secret_service_keyring)]
 use zbus_secret_service_keyring_store::store::Store;
 
-use crate::commands::cli_command::PRINT_TARGET;
+use crate::commands::cli_command::DIAGNOSTIC_TARGET;
 
 const SESSION_TOKEN_NAME: &str = "iggy-cli-session";
 const SESSION_KEYRING_SERVICE_NAME: &str = "iggy-cli-session";
@@ -79,7 +79,7 @@ impl ServerSession {
 
     pub fn is_active(&self) -> bool {
         if let Err(e) = ensure_default_store() {
-            warn!(target: PRINT_TARGET, "keyring backend unavailable, treating session as inactive: {e}");
+            warn!(target: DIAGNOSTIC_TARGET, "keyring backend unavailable, treating session as inactive: {e}");
             return false;
         }
         if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name()) {
@@ -98,7 +98,7 @@ impl ServerSession {
 
     pub fn get_token(&self) -> Option<String> {
         if let Err(e) = ensure_default_store() {
-            warn!(target: PRINT_TARGET, "keyring backend unavailable, cannot read session token: {e}");
+            warn!(target: DIAGNOSTIC_TARGET, "keyring backend unavailable, cannot read session token: {e}");
             return None;
         }
         if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name())

@@ -70,6 +70,9 @@ pub fn sample(
         Outcome::InvalidUsername => {
             unreachable!("update_user does not target InvalidUsername")
         }
+        Outcome::InvalidOptionValue => {
+            unreachable!("the simulator only sends an empty update options block")
+        }
     }
 }
 
@@ -98,8 +101,9 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
                 new: new.clone(),
                 password: input.current_password.clone(),
             }),
-        Outcome::UserNotFound | Outcome::UsernameAlreadyExists | Outcome::InvalidUsername => {
-            Effect::None
-        }
+        Outcome::UserNotFound
+        | Outcome::UsernameAlreadyExists
+        | Outcome::InvalidUsername
+        | Outcome::InvalidOptionValue => Effect::None,
     }
 }

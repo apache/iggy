@@ -29,8 +29,7 @@ use integration::iggy_harness;
 use tokio::time::{Duration, sleep};
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_missing_partition_when_polling_should_reject_partition_not_found(
     harness: &TestHarness,
@@ -45,11 +44,11 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
         .create_topic(
             &stream_id,
             "poll-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");
@@ -90,8 +89,7 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_missing_stream_when_polling_should_reject_stream_not_found(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -118,8 +116,7 @@ async fn given_missing_stream_when_polling_should_reject_stream_not_found(harnes
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_missing_topic_when_polling_should_reject_topic_not_found(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -157,8 +154,7 @@ async fn given_missing_topic_when_polling_should_reject_topic_not_found(harness:
 /// fresh consumer. Legacy swallows this one too; the server surfaces the code
 /// the poll path already surfaces for the identical addressing error.
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_missing_partition_when_getting_consumer_offset_should_reject_partition_not_found(
     harness: &TestHarness,
@@ -173,11 +169,11 @@ async fn given_missing_partition_when_getting_consumer_offset_should_reject_part
         .create_topic(
             &stream_id,
             "offset-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");
@@ -208,8 +204,7 @@ async fn given_missing_partition_when_getting_consumer_offset_should_reject_part
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_message_at_polled_timestamp_when_polling_should_include_it(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -222,11 +217,11 @@ async fn given_message_at_polled_timestamp_when_polling_should_include_it(harnes
         .create_topic(
             &stream_id,
             "ts-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");

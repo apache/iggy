@@ -371,7 +371,7 @@ fn parse_transport_ident(ident: Ident) -> syn::Result<Transport> {
     }
 }
 
-/// Parses a dot-notation config key like `segment.size` or `partition.messages_required_to_save`.
+/// Parses a dot-notation config key like `heartbeat.interval` or `metadata.journal_slots`.
 fn parse_config_key(input: ParseStream) -> syn::Result<(String, Span)> {
     let first: Ident = input.parse()?;
     let span = first.span();
@@ -629,9 +629,9 @@ mod tests {
 
     #[test]
     fn parse_server_static() {
-        let attrs: IggyTestAttrs = syn::parse_quote!(server(segment.size = "1MiB"));
-        let segment_size = attrs.server.find_override("segment.size").unwrap();
-        assert!(matches!(&segment_size.value, ConfigValue::Static(s) if s == "1MiB"));
+        let attrs: IggyTestAttrs = syn::parse_quote!(server(heartbeat.interval = "30s"));
+        let interval = attrs.server.find_override("heartbeat.interval").unwrap();
+        assert!(matches!(&interval.value, ConfigValue::Static(s) if s == "30s"));
     }
 
     #[test]
@@ -642,9 +642,9 @@ mod tests {
 
     #[test]
     fn parse_server_matrix() {
-        let attrs: IggyTestAttrs = syn::parse_quote!(server(segment.size = ["512B", "1MiB"]));
-        let segment_size = attrs.server.find_override("segment.size").unwrap();
-        assert!(matches!(&segment_size.value, ConfigValue::Matrix(v) if v.len() == 2));
+        let attrs: IggyTestAttrs = syn::parse_quote!(server(heartbeat.interval = ["30s", "60s"]));
+        let interval = attrs.server.find_override("heartbeat.interval").unwrap();
+        assert!(matches!(&interval.value, ConfigValue::Matrix(v) if v.len() == 2));
     }
 
     #[test]
@@ -652,18 +652,21 @@ mod tests {
         let attrs: IggyTestAttrs = syn::parse_quote!(
             test_client_transport = [Tcp, Http],
             server(
-                segment.size = ["512B", "1MiB"],
-                segment.cache_indexes = "none",
-                tcp.socket.nodelay = true
+                heartbeat.interval = ["30s", "60s"],
+                metadata.journal_slots = 1024,
+                tcp.enabled = true
             )
         );
         assert_eq!(attrs.transports.len(), 2);
-        let segment_size = attrs.server.find_override("segment.size").unwrap();
-        let cache_indexes = attrs.server.find_override("segment.cache_indexes").unwrap();
-        let tcp_nodelay = attrs.server.find_override("tcp.socket.nodelay").unwrap();
-        assert!(matches!(&segment_size.value, ConfigValue::Matrix(v) if v.len() == 2));
-        assert!(matches!(&cache_indexes.value, ConfigValue::Static(s) if s == "none"));
-        assert!(matches!(&tcp_nodelay.value, ConfigValue::Static(s) if s == "true"));
+        let interval = attrs.server.find_override("heartbeat.interval").unwrap();
+        let journal_slots = attrs
+            .server
+            .find_override("metadata.journal_slots")
+            .unwrap();
+        let tcp_enabled = attrs.server.find_override("tcp.enabled").unwrap();
+        assert!(matches!(&interval.value, ConfigValue::Matrix(v) if v.len() == 2));
+        assert!(matches!(&journal_slots.value, ConfigValue::Static(s) if s == "1024"));
+        assert!(matches!(&tcp_enabled.value, ConfigValue::Static(s) if s == "true"));
     }
 
     #[test]
@@ -718,11 +721,11 @@ mod tests {
     #[test]
     fn parse_mcp_combined() {
         let attrs: IggyTestAttrs =
-            syn::parse_quote!(seed = my_seed, server(mcp, segment.size = "1MiB"));
+            syn::parse_quote!(seed = my_seed, server(mcp, heartbeat.interval = "30s"));
         assert!(attrs.server.mcp.is_some());
         assert!(attrs.seed_fn.is_some());
-        let segment_size = attrs.server.find_override("segment.size").unwrap();
-        assert!(matches!(&segment_size.value, ConfigValue::Static(s) if s == "1MiB"));
+        let interval = attrs.server.find_override("heartbeat.interval").unwrap();
+        assert!(matches!(&interval.value, ConfigValue::Static(s) if s == "30s"));
     }
 
     #[test]
@@ -750,13 +753,13 @@ mod tests {
     #[test]
     fn parse_dot_notation_deep() {
         let attrs: IggyTestAttrs = syn::parse_quote!(server(
-            partition.messages_required_to_save = [32, 64],
+            metadata.journal_slots = [512, 1024],
             system.encryption.enabled = true
         ));
         assert_eq!(attrs.server.config_overrides.len(), 2);
         let msgs = attrs
             .server
-            .find_override("partition.messages_required_to_save")
+            .find_override("metadata.journal_slots")
             .unwrap();
         assert!(matches!(&msgs.value, ConfigValue::Matrix(v) if v.len() == 2));
     }
@@ -808,11 +811,11 @@ mod tests {
         let attrs: IggyTestAttrs = syn::parse_quote!(
             cluster_nodes = [3, 5],
             test_client_transport = [Tcp, Http],
-            server(segment.size = ["512B", "1MiB"])
+            server(heartbeat.interval = ["30s", "60s"])
         );
         assert!(matches!(&attrs.cluster_nodes, ClusterNodesValue::Matrix(v) if v == &[3, 5]));
         assert_eq!(attrs.transports.len(), 2);
-        let segment_size = attrs.server.find_override("segment.size").unwrap();
-        assert!(matches!(&segment_size.value, ConfigValue::Matrix(v) if v.len() == 2));
+        let interval = attrs.server.find_override("heartbeat.interval").unwrap();
+        assert!(matches!(&interval.value, ConfigValue::Matrix(v) if v.len() == 2));
     }
 }

@@ -65,6 +65,8 @@ pub async fn load_persisted_segments(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
+    segment_size: IggyByteSize,
+    enforce_fsync: bool,
     stats: &PartitionStats,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let partition_path = config
@@ -78,8 +80,7 @@ pub async fn load_persisted_segments(
     let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
     start_offsets.sort_unstable();
 
-    let enforce_fsync = config.system.partition.enforce_fsync;
-    let max_size = config.system.segment.size;
+    let max_size = segment_size;
 
     let mut recovered = Vec::with_capacity(start_offsets.len());
     for start_offset in start_offsets {

@@ -25,7 +25,8 @@
 //! - the SDK-hidden success codes (produce 201, reads 200, mutations 204, and
 //!   the server-assigned id in a 200 create-stream body);
 //! - HTTP-only route shapes: the `/users/me` self alias, the caller-scoped
-//!   name-sorted PAT-list array, auth-only cluster metadata, and the public ping;
+//!   name-sorted PAT-list array, auth-only cluster metadata and metrics scrape,
+//!   and the public ping;
 //! - the change-password status/body shape: a wrong current password renders a
 //!   typed 400 `InvalidCredentials` and a missing target a 404 `ResourceNotFound`,
 //!   both bodies the SDK hides. Change-password commits over every transport, so
@@ -111,8 +112,8 @@ impl ClientExt for HttpClient {
             compression_algorithm: CompressionAlgorithm::None,
             message_expiry: IggyExpiry::NeverExpire,
             max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: topic.to_string(),
+            options: Default::default(),
         };
         let response = self
             .post_json(
@@ -403,6 +404,25 @@ async fn given_http_only_routes_when_requested_should_return_expected_shapes(
         alice.get_anonymous("/ping").await.status(),
         StatusCode::OK,
         "ping is public"
+    );
+
+    // The metrics scrape is auth-only like cluster metadata: anonymous is 401,
+    // an ungranted caller reads the exposition.
+    assert_eq!(
+        alice.get_anonymous("/metrics").await.status(),
+        StatusCode::UNAUTHORIZED,
+        "metrics scrape without a bearer must be 401"
+    );
+    let metrics = alice.get("/metrics").await;
+    assert_eq!(
+        metrics.status(),
+        StatusCode::OK,
+        "metrics scrape is auth-only, never RBAC-gated"
+    );
+    let exposition = metrics.text().await.expect("metrics exposition body");
+    assert!(
+        exposition.contains("# TYPE streams "),
+        "metrics exposition must carry the parity metric set:\n{exposition}"
     );
 
     // PAT listing is a JSON array of the caller's own tokens, name-sorted

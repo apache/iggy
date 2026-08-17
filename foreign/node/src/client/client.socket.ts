@@ -625,6 +625,9 @@ export class CommandResponseStream extends EventEmitter {
         }
       }
     }, interval);
+    // A pending heartbeat must not be the reason the process stays up: a script
+    // that never calls destroy() would otherwise hang on exit.
+    this.heartbeatIntervalHandler.unref();
   }
 
   /**

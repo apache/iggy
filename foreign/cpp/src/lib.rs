@@ -51,9 +51,15 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
-        replication_factor: u8,
         messages_count: u64,
         partitions_count: u32,
+        /// Options the creating client set explicitly. Carried as
+        /// `HeaderEntry` because options ride the user-headers codec: the same
+        /// TLV a message's `user_headers` uses, with string keys.
+        options: Vec<HeaderEntry>,
+        /// Options admission resolved for the keys the client left unset. These
+        /// would have resolved differently under another server config.
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct Partition {
@@ -73,10 +79,13 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
-        replication_factor: u8,
         messages_count: u64,
         partitions_count: u32,
         partitions: Vec<Partition>,
+        /// See [`Topic::options`].
+        options: Vec<HeaderEntry>,
+        /// See [`Topic::derived_options`].
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct Stream {
@@ -86,6 +95,9 @@ mod ffi {
         size_bytes: u64,
         messages_count: u64,
         topics_count: u32,
+        /// Creation options. Streams have no catalog keys yet, so this is
+        /// empty until one lands.
+        options: Vec<HeaderEntry>,
     }
 
     #[repr(u8)]
@@ -115,6 +127,23 @@ mod ffi {
     struct HeaderEntry {
         key: HeaderField,
         value: HeaderField,
+    }
+
+    /// One key a resource's create command accepts, as served by
+    /// `describe_options`.
+    ///
+    /// This is the discovery surface for the keys `create_topic` takes. A key
+    /// outside the server catalog is refused at create, and the binary
+    /// transports carry back only an error code, so nothing in the rejection
+    /// names the keys that would have worked.
+    struct OptionSpec {
+        key: String,
+        /// Wire kind code the value is encoded under, the same encoding
+        /// [`HeaderField::kind`] carries.
+        kind: u8,
+        /// The default in `kind`'s encoding. Empty when the key has no default.
+        default_value: Vec<u8>,
+        description: String,
     }
 
     struct IggyMessageToSend {
@@ -178,6 +207,8 @@ mod ffi {
         messages_count: u64,
         topics_count: u32,
         topics: Vec<Topic>,
+        /// See [`Stream::options`].
+        options: Vec<HeaderEntry>,
     }
 
     struct ConsumerGroupMember {
@@ -364,10 +395,10 @@ mod ffi {
             topic_name: String,
             partitions_count: u32,
             compression_algorithm: String,
-            replication_factor: u8,
             message_expiry_kind: String,
             message_expiry_value: u64,
             max_topic_size: String,
+            options: Vec<HeaderEntry>,
         ) -> Result<TopicDetails>;
         fn get_topic(
             self: &Client,
@@ -382,10 +413,10 @@ mod ffi {
             topic_id: Identifier,
             topic_name: String,
             compression_algorithm: String,
-            replication_factor: u8,
             message_expiry_kind: String,
             message_expiry_value: u64,
             max_topic_size: String,
+            options: Vec<HeaderEntry>,
         ) -> Result<()>;
         fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
@@ -498,6 +529,10 @@ mod ffi {
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
         fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
         fn get_clients(self: &Client) -> Result<Vec<ClientInfo>>;
+        /// Serves the option catalog of one scope, named "topic", "stream" or
+        /// "user". A scope with no keys yet answers with an empty vector, which
+        /// is an empty catalog rather than a failure.
+        fn describe_options(self: &Client, scope: String) -> Result<Vec<OptionSpec>>;
         fn ping(self: &Client) -> Result<()>;
         fn heartbeat_interval(self: &Client) -> u64;
         fn snapshot(

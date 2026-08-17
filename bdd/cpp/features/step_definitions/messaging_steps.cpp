@@ -78,9 +78,9 @@ WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0
 
     context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
                                   static_cast<std::uint32_t>(partitions_count),
-                                  std::string(compression.compression_algorithm_value()), 0,
+                                  std::string(compression.compression_algorithm_value()),
                                   std::string(message_expiry.expiry_kind()), message_expiry.expiry_value(),
-                                  std::string(max_topic_size.max_topic_size()));
+                                  std::string(max_topic_size.max_topic_size()), {});
 }
 
 THEN("^the topic should be created successfully$") {
@@ -117,9 +117,9 @@ WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (int index = 0; index < message_count; ++index) {
-        iggy::ffi::IggyMessageToSend message = iggy::ffi::make_message(
-            bdd::to_payload(bdd::expected_payload(static_cast<std::uint32_t>(index))),
-            rust::Vec<iggy::ffi::HeaderEntry>());
+        iggy::ffi::IggyMessageToSend message =
+            iggy::ffi::make_message(bdd::to_payload(bdd::expected_payload(static_cast<std::uint32_t>(index))),
+                                    rust::Vec<iggy::ffi::HeaderEntry>());
         // Assign an explicit, 1-based id so the last-sent/last-polled comparison is meaningful.
         message.id_lo = static_cast<std::uint64_t>(index + 1);
         messages.push_back(std::move(message));

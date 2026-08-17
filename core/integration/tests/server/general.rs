@@ -25,9 +25,6 @@ use integration::iggy_harness;
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        segment.size = "1MiB",
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -39,8 +36,6 @@ async fn authentication(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -52,8 +47,6 @@ async fn system(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -65,8 +58,6 @@ async fn user(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -78,8 +69,6 @@ async fn permissions(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -91,8 +80,6 @@ async fn message_headers(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -104,8 +91,6 @@ async fn stream_size_validation(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -117,8 +102,6 @@ async fn consumer_timestamp_polling(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -134,8 +117,6 @@ async fn snapshot(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )

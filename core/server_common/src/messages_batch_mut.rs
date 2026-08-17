@@ -15,19 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::MessageDeduplicator;
 use crate::PooledBuffer;
 use crate::indexes_mut::IggyIndexesMut;
 use iggy_common::{
     IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError, IggyIndexView, IggyMessage,
     IggyMessageBoundaries, IggyMessageView, IggyMessageViewIterator, IggyMessageViewMutIterator,
-    IggyMessagesBatch, IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable,
-    Validatable, random_id,
+    IggyMessagesBatch, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
-use lending_iterator::prelude::*;
 use std::ops::Index;
-use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::error;
 
 /// A container for mutable messages that are being prepared for persistence.
 ///
@@ -120,87 +116,6 @@ impl IggyMessagesBatchMut {
     /// Returns the raw message bytes as a slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.messages
-    }
-
-    /// Prepares all messages in the batch for persistence by setting their offsets,
-    /// timestamps, and other necessary fields.
-    ///
-    /// # Arguments
-    ///
-    /// * `start_offset` - The starting offset of the segment
-    /// * `base_offset` - The base offset for this batch of messages
-    /// * `current_position` - The current position in the segment
-    ///
-    /// # Returns
-    ///
-    /// An immutable `IggyMessagesBatch` ready for persistence
-    pub async fn prepare_for_persistence(
-        &mut self,
-        start_offset: u64,
-        base_offset: u64,
-        current_position: u32,
-        deduplicator: Option<&Arc<MessageDeduplicator>>,
-    ) {
-        let messages_count = self.count();
-        if messages_count == 0 {
-            return;
-        }
-
-        let mut curr_abs_offset = base_offset;
-        let mut curr_position = current_position;
-        let mut curr_rel_offset: u32 = 0;
-
-        // Prepare invalid messages indexes if deduplicator is provided, this
-        // way we avoid creating a new vector if we don't need it.
-        // The less allocation the better.
-        let mut invalid_messages_indexes =
-            deduplicator.map(|_| Vec::with_capacity(messages_count as usize));
-
-        self.indexes.set_base_position(current_position);
-        let mut iter: IggyMessageViewMutIterator<'_> =
-            IggyMessageViewMutIterator::new(&mut self.messages);
-        let timestamp = IggyTimestamp::now().as_micros();
-
-        while let Some(mut message) = iter.next() {
-            message.header_mut().set_offset(curr_abs_offset);
-            message.header_mut().set_timestamp(timestamp);
-            if message.header().id() == 0 {
-                message.header_mut().set_id(random_id::get_uuid());
-            }
-
-            if let Some(deduplicator) = deduplicator
-                && !deduplicator.try_insert(message.header().id()).await
-            {
-                warn!(
-                    "Detected duplicate message ID {}, removing...",
-                    message.header().id()
-                );
-                invalid_messages_indexes
-                    .as_mut()
-                    .unwrap()
-                    .push(curr_rel_offset);
-            }
-
-            message.update_checksum();
-
-            let message_size = message.size() as u32;
-            curr_position += message_size;
-
-            let relative_offset = (curr_abs_offset - start_offset) as u32;
-            self.indexes.set_offset_at(curr_rel_offset, relative_offset);
-            self.indexes.set_position_at(curr_rel_offset, curr_position);
-            self.indexes.set_timestamp_at(curr_rel_offset, timestamp);
-
-            curr_abs_offset += 1;
-            curr_rel_offset += 1;
-        }
-
-        if let Some(invalid_messages_indexes) = invalid_messages_indexes {
-            if invalid_messages_indexes.is_empty() {
-                return;
-            }
-            self.remove_messages(&invalid_messages_indexes, current_position);
-        }
     }
 
     /// Returns the first offset in the batch
@@ -485,139 +400,6 @@ impl IggyMessagesBatchMut {
     pub fn get(&self, index: usize) -> Option<IggyMessageView<'_>> {
         let (start, end) = self.get_message_boundaries(index)?;
         IggyMessageView::new(&self.messages[start..end]).ok()
-    }
-
-    /// This helper function is used to parse newly appended chunks in the `new_buffer`.
-    /// The function iterates over the range `[chunk_start..chunk_start + chunk_len]`,
-    /// constructing `IggyMessageView` instances to compute message sizes. For each message,
-    /// a corresponding index entry is created in `new_indexes`. The `offset_in_new_buffer`
-    /// is incremented by each message’s size to preserve the correct offsets for
-    /// subsequent messages in the new buffer.
-    #[allow(clippy::too_many_arguments)]
-    fn rebuild_indexes_for_chunk(
-        new_buffer: &PooledBuffer,
-        new_indexes: &mut IggyIndexesMut,
-        offset_in_new_buffer: &mut u32,
-        chunk_start: usize,
-        chunk_len: usize,
-    ) {
-        let chunk_end = chunk_start + chunk_len;
-        let mut current = chunk_start;
-
-        while current < chunk_end {
-            let Ok(view) = IggyMessageView::new(&new_buffer[current..]) else {
-                error!("Corrupt message in already-validated chunk at offset {current}");
-                break;
-            };
-            let msg_size = view.size();
-            *offset_in_new_buffer += msg_size as u32;
-            new_indexes.insert(0, *offset_in_new_buffer, 0);
-
-            current += msg_size;
-        }
-    }
-
-    /// Removes messages at the specified indexes and returns a new batch.
-    ///
-    /// This function efficiently creates a new `IggyMessagesBatchMut` by copying only the
-    /// messages that should be kept, and rebuilding the index entries. Note that `put()`
-    /// can be memmove underneath due to the way memory is handled.
-    ///
-    /// # Arguments
-    ///
-    /// * `indexes_to_remove` - A slice of message indexes (0-based) to remove
-    ///
-    /// # Returns
-    ///
-    /// A new `IggyMessagesBatchMut` with the specified messages removed
-    pub fn remove_messages(&mut self, indexes_to_remove: &[u32], current_position: u32) {
-        /*
-         *  A temporary list of message boundaries is first collected for each index
-         *  that should be removed. Chunks of data that are not removed are appended
-         *  to a new buffer, and indexes are rebuilt to reflect the shifted positions.
-         *  In this process, split_to() is used to carve out slices from the source
-         *  buffer, and those slices are either copied or discarded, depending on
-         *  whether they are part of the messages that are to be removed.
-         *  This allows for avoiding copying unnecessary data and ensures that indexes
-         *  match the newly constructed buffer.
-         */
-        if indexes_to_remove.is_empty() || self.is_empty() {
-            return;
-        }
-
-        let msg_count = self.count() as usize;
-        if indexes_to_remove.len() > msg_count {
-            return;
-        }
-
-        let current_size = self.size();
-        let mut size_to_remove = 0;
-        let boundaries_to_remove: Vec<(usize, usize)> = indexes_to_remove
-            .iter()
-            .filter_map(|&idx| {
-                self.get_message_boundaries(idx as usize)
-                    .inspect(|boundaries| {
-                        size_to_remove += (boundaries.1 - boundaries.0) as u32;
-                    })
-            })
-            .collect();
-
-        assert_eq!(
-            boundaries_to_remove.len(),
-            indexes_to_remove.len(),
-            "Could not retrieve valid boundaries for some message indexes: {indexes_to_remove:?}, boundaries: {boundaries_to_remove:?}"
-        );
-
-        let new_size = current_size - size_to_remove;
-        let new_message_count = msg_count as u32 - indexes_to_remove.len() as u32;
-
-        let mut new_buffer = PooledBuffer::with_capacity(new_size as usize);
-        let mut new_indexes =
-            IggyIndexesMut::with_capacity(new_message_count as usize, current_position);
-
-        let mut source = std::mem::take(&mut self.messages);
-        let mut last_pos = 0_usize;
-        let mut new_pos = current_position;
-
-        for &(start, end) in &boundaries_to_remove {
-            if start > last_pos {
-                let keep_len = start - last_pos;
-                let chunk = source.split_to(keep_len);
-                let chunk_start_in_new_buffer = new_buffer.len();
-                new_buffer.put(chunk);
-
-                Self::rebuild_indexes_for_chunk(
-                    &new_buffer,
-                    &mut new_indexes,
-                    &mut new_pos,
-                    chunk_start_in_new_buffer,
-                    keep_len,
-                );
-            }
-
-            let removed_message_size = end - start;
-            if removed_message_size > 0 {
-                let _ = source.split_to(removed_message_size);
-            }
-
-            last_pos = end;
-        }
-
-        if !source.is_empty() {
-            let chunk_start_in_new_buffer = new_buffer.len();
-            let chunk_len = source.len();
-            new_buffer.put(source);
-            Self::rebuild_indexes_for_chunk(
-                &new_buffer,
-                &mut new_indexes,
-                &mut new_pos,
-                chunk_start_in_new_buffer,
-                chunk_len,
-            );
-        }
-
-        self.messages = new_buffer;
-        self.indexes = new_indexes;
     }
 
     /// Validates that all messages in batch have correct checksums.

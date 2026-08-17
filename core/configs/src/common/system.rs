@@ -15,14 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::cache_indexes::CacheIndexesConfig;
 use super::server::MemoryPoolConfig;
 use configs::{ConfigEnv, ConfigEnvMappings};
 use iggy_common::IggyByteSize;
-use iggy_common::IggyError;
-use iggy_common::IggyExpiry;
-use iggy_common::MaxTopicSize;
-use iggy_common::{CompressionAlgorithm, IggyDuration};
+use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
@@ -38,8 +34,6 @@ pub const LOG_EXTENSION: &str = "log";
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SystemConfig<S: ConfigEnvMappings> {
     pub path: String,
-    pub backup: BackupConfig,
-    pub state: StateConfig,
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
     pub stream: StreamConfig,
@@ -47,39 +41,14 @@ pub struct SystemConfig<S: ConfigEnvMappings> {
     pub partition: PartitionConfig,
     pub segment: SegmentConfig,
     pub encryption: EncryptionConfig,
-    pub compression: CompressionConfig,
-    pub message_deduplication: MessageDeduplicationConfig,
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
     pub sharding: S,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct BackupConfig {
-    pub path: String,
-    pub compatibility: CompatibilityConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct CompatibilityConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct DatabaseConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct RuntimeConfig {
     pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct CompressionConfig {
-    pub allow_override: bool,
-    #[config_env(leaf)]
-    pub default_algorithm: CompressionAlgorithm,
 }
 
 #[serde_as]
@@ -98,9 +67,6 @@ pub struct LoggingConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub sysinfo_print_interval: IggyDuration,
 }
 
 impl From<&LoggingConfig> for LoggingSettings {
@@ -133,36 +99,21 @@ pub struct StreamConfig {
     pub path: String,
 }
 
-#[serde_as]
+/// Only the on-disk layout: a topic's size cap and message expiry are its own
+/// creation options now (`max_topic_size`, `message_expiry`), defaulting to
+/// `iggy_common::DEFAULT_MAX_TOPIC_SIZE` / `DEFAULT_MESSAGE_EXPIRY`.
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct TopicConfig {
     pub path: String,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub max_size: MaxTopicSize,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub message_expiry: IggyExpiry,
 }
 
+/// `enforce_fsync`, `messages_required_to_save` and
+/// `size_of_messages_required_to_save` are per-topic creation options now,
+/// defaulting to the `iggy_common::DEFAULT_*` constants.
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct PartitionConfig {
     pub path: String,
-    pub messages_required_to_save: u32,
-    #[config_env(leaf)]
-    pub size_of_messages_required_to_save: IggyByteSize,
-    pub enforce_fsync: bool,
     pub validate_checksum: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct MessageDeduplicationConfig {
-    pub enabled: bool,
-    pub max_entries: u64,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub expiry: IggyDuration,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
@@ -170,26 +121,12 @@ pub struct RecoveryConfig {
     pub recreate_missing_state: bool,
 }
 
-#[serde_as]
+/// `size` and `preallocate` are per-topic creation options now
+/// (`segment_size`, `preallocate_segments`), defaulting to
+/// `iggy_common::DEFAULT_SEGMENT_SIZE` / `DEFAULT_PREALLOCATE_SEGMENTS`.
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SegmentConfig {
-    #[config_env(leaf)]
-    pub size: IggyByteSize,
-    #[serde(default)]
-    pub preallocate: bool,
-    #[config_env(leaf)]
-    pub cache_indexes: CacheIndexesConfig,
     pub archive_expired: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct StateConfig {
-    pub enforce_fsync: bool,
-    pub max_file_operation_retries: u32,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub retry_delay: IggyDuration,
 }
 
 impl<S: ConfigEnvMappings> SystemConfig<S> {
@@ -210,10 +147,6 @@ impl<S: ConfigEnvMappings> SystemConfig<S> {
     }
     pub fn get_state_tokens_path(&self) -> String {
         format!("{}/tokens", self.get_state_path())
-    }
-
-    pub fn get_backup_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.backup.path)
     }
 
     pub fn get_runtime_path(&self) -> String {
@@ -327,32 +260,6 @@ impl<S: ConfigEnvMappings> SystemConfig<S> {
     ) -> String {
         let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
         format!("{path}.{INDEX_EXTENSION}")
-    }
-
-    pub fn resolve_max_topic_size(
-        &self,
-        max_topic_size: MaxTopicSize,
-    ) -> Result<MaxTopicSize, IggyError> {
-        match max_topic_size {
-            MaxTopicSize::ServerDefault => Ok(self.topic.max_size),
-            _ => {
-                if max_topic_size.as_bytes_u64() < self.segment.size.as_bytes_u64() {
-                    Err(IggyError::InvalidTopicSize(
-                        max_topic_size,
-                        self.segment.size,
-                    ))
-                } else {
-                    Ok(max_topic_size)
-                }
-            }
-        }
-    }
-
-    pub fn resolve_message_expiry(&self, message_expiry: IggyExpiry) -> IggyExpiry {
-        match message_expiry {
-            IggyExpiry::ServerDefault => self.topic.message_expiry,
-            _ => message_expiry,
-        }
     }
 }
 

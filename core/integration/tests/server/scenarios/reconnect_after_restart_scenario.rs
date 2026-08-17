@@ -25,6 +25,19 @@ use tokio::time::{Duration, sleep, timeout};
 const STREAM_NAME: &str = "test-reconnect-stream";
 const TOPIC_NAME: &str = "test-reconnect-topic";
 
+/// The restart specs below need every committed batch on disk before the
+/// server goes down: there is no flush primitive, so the topic carries the
+/// eager-flush thresholds that used to be `[system.partition]` config.
+fn eager_flush_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        enforce_fsync: Some(true),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
 pub async fn run_producer(harness: &mut TestHarness) {
     let client = create_client(harness);
     Client::connect(&client).await.expect("Failed to connect");
@@ -33,12 +46,7 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .producer(STREAM_NAME, TOPIC_NAME)
         .expect("Failed to create producer builder")
         .create_stream_if_not_exists()
-        .create_topic_if_not_exists(
-            1,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
+        .create_topic_if_not_exists(1, IggyExpiry::NeverExpire, MaxTopicSize::ServerDefault)
         .send_retries(Some(10), Some(IggyDuration::from_str("2s").unwrap()))
         .build();
 
@@ -113,11 +121,11 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("Failed to create topic");
@@ -267,11 +275,7 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .create_topic(
             &Identifier::named(STREAM).unwrap(),
             TOPIC,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .unwrap();
@@ -388,11 +392,7 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .create_topic(
             &Identifier::named(STREAM).unwrap(),
             TOPIC,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .unwrap();
@@ -512,8 +512,8 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
 /// settled primary survives to answer the rejoin probes. The replicas must
 /// give up probing (`ViewChangeReason::ViewProbeUnanswered`), elect among
 /// their recovered logs, and serve the durable data across the outage. The
-/// caller's server config must flush eagerly (`messages_required_to_save=1`
-/// + fsync): with every journal dying at once, only flushed bytes survive.
+/// topic flushes eagerly (see [`eager_flush_options`]): with every journal
+/// dying at once, only flushed bytes survive.
 pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
     let setup_client = harness
         .root_client()
@@ -528,11 +528,7 @@ pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .expect("Failed to create topic");
@@ -643,11 +639,7 @@ pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .expect("Failed to create topic");

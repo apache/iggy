@@ -29,15 +29,16 @@ use std::rc::Rc;
 
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
-    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::streams::GetStreamRequest;
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
+use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::{
     Operation, PrepareHeader, RoutedRequestHeader, WireDecode, WireIdentifier,
 };
@@ -280,10 +281,13 @@ where
     match code {
         GET_STATS_CODE => authorize_uid(shard, user_id, Permissioner::get_stats),
         GET_USERS_CODE => authorize_uid(shard, user_id, Permissioner::get_users),
-        GET_USER_CODE => authorize_uid(shard, user_id, Permissioner::get_user),
+        GET_USER_CODE => gate_user_scoped(shard, user_id, body),
         // Self-scoped: lists only the caller's own tokens, so there is no
         // permissioner rule to run (legacy runs none either).
         GET_PERSONAL_ACCESS_TOKENS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
+        // Static catalog plus node defaults; nothing resource-scoped to gate
+        // beyond authentication.
+        DESCRIBE_OPTIONS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         // Defence in depth: `handle_client_request` already denies an unbound
         // transport with an `Unauthenticated` Reply before it reaches the
         // builder, so this arm only ever fires if that gate is bypassed.
@@ -365,6 +369,43 @@ pub(super) async fn send_non_replicated_deny<B, MJ, S, SB>(
             "failed to surface non-replicated authz denial"
         );
     }
+}
+
+/// Gate `GET_USER`: decode the request and resolve its target against the
+/// committed users STM. A target resolving to the caller passes without any
+/// permissioner rule, matching the legacy server, which skipped `read_users`
+/// when a user fetched its own account. A malformed body or a resolution miss
+/// returns `Ok(())` so the builder's own error / not-found reply holds
+/// (decode-and-notfound-before-permission); any other target runs
+/// [`Permissioner::get_user`].
+fn gate_user_scoped<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    user_id: Option<u32>,
+    body: &[u8],
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Ok(request) = GetUserRequest::decode_from(body) else {
+        return Ok(());
+    };
+    let Some(target_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| users.resolve_user_id(&request.user_id))
+    else {
+        return Ok(());
+    };
+    if user_id.is_some_and(|caller_id| caller_id as usize == target_id) {
+        return Ok(());
+    }
+    authorize_uid(shard, user_id, Permissioner::get_user)
 }
 
 /// Gate a stream-scoped read: decode the request, project its wire stream id,

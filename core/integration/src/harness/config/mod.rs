@@ -28,5 +28,5 @@ pub use common::{EncryptionConfig, IpAddrKind, TlsConfig};
 pub use connectors_runtime::ConnectorsRuntimeConfig;
 pub use jwks::JwksConfig;
 pub use mcp::McpConfig;
-pub use resolve::resolve_config_paths;
+pub use resolve::{resolve_config_paths, validate_env_var_names};
 pub use server::TestServerConfig;

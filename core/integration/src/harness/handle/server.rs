@@ -18,7 +18,7 @@
 use super::client_builder::{ClientBuilder, ServerConnection};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
-use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
+use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
@@ -297,12 +297,6 @@ impl ServerHandle {
             .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
 
-        if self.config.ip_kind == IpAddrKind::V6 {
-            self.envs
-                .entry("IGGY_TCP_IPV6".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
-
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
             .or_insert_with(|| DEFAULT_ROOT_USERNAME.to_string());
@@ -350,7 +344,14 @@ impl ServerHandle {
             self.set_tls_envs("WEBSOCKET", &tls);
         }
 
-        // Extra envs from config (includes resolved config paths from macro)
+        // Extra envs from config (includes resolved config paths from macro).
+        // Validated first: a name no config leaf reads is a silent no-op, and
+        // a test that believes it configured the server but did not is worse
+        // than one that fails to start.
+        if let Err(report) = crate::harness::config::validate_env_var_names(&self.config.extra_envs)
+        {
+            panic!("invalid extra_envs for the test server:\n{report}");
+        }
         for (k, v) in &self.config.extra_envs {
             self.envs.insert(k.clone(), v.clone());
         }

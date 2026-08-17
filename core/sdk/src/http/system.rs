@@ -24,6 +24,7 @@ use iggy_common::Stats;
 use iggy_common::SystemClient;
 use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::{ClientInfo, ClientInfoDetails};
+use iggy_common::{OptionSpec, OptionsScope};
 use iggy_common::{SnapshotCompression, SystemSnapshotType};
 
 const PING: &str = "/ping";
@@ -70,6 +71,14 @@ impl SystemClient for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(clients)
+    }
+
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
+        let response = self.get(&format!("/options/{scope}")).await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 
     async fn ping(&self) -> Result<(), IggyError> {

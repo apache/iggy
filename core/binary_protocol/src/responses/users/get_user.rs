@@ -89,10 +89,10 @@ impl WireDecode for UserDetailsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WireName;
     use crate::primitives::permissions::{
         WireGlobalPermissions, WireStreamPermissions, WireTopicPermissions,
     };
+    use crate::{WireName, WireOptions};
 
     fn sample_user() -> UserResponse {
         UserResponse {
@@ -100,6 +100,7 @@ mod tests {
             created_at: 1_710_000_000_000,
             status: 1,
             username: WireName::new("admin").unwrap(),
+            options: WireOptions::empty(),
         }
     }
 

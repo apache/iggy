@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_surrealdb_sink"
-version = "0.5.0-edge.2"
+version = "0.5.0-edge.3"
 description = "Iggy SurrealDB sink connector for writing stream messages into SurrealDB"
 edition = "2024"
 license = "Apache-2.0"

@@ -2263,14 +2263,15 @@ where
             // sweep itself is right (a chain the live state does not know
             // about would resurrect at boot), so one retry against a
             // transient open failure is the only cheap save available.
+            let enforce_fsync = self.effective_enforce_fsync(config);
             let open = || {
                 SegmentStorage::new(
                     &log_final,
                     &index_final,
                     meta.size,
                     meta.index_size,
-                    config.enforce_fsync,
-                    config.enforce_fsync,
+                    enforce_fsync,
+                    enforce_fsync,
                     true,
                 )
             };
@@ -2283,7 +2284,7 @@ where
                         source,
                     })?,
             };
-            let mut segment = Segment::new(meta.start_offset, config.segment_size);
+            let mut segment = Segment::new(meta.start_offset, self.effective_segment_size(config));
             segment.sealed = true;
             segment.start_timestamp = meta.start_timestamp;
             segment.end_timestamp = meta.end_timestamp;
@@ -2318,6 +2319,9 @@ where
                     source,
                 })?;
         } else {
+            let enforce_fsync = self.effective_enforce_fsync(config);
+            let segment_size = self.effective_segment_size(config);
+            let preallocate_segments = self.effective_preallocate_segments(config);
             let last = self.log.segments().len() - 1;
             let storage = self.log.storages()[last].clone();
             if let (Some(messages_reader), Some(index_reader), Some(messages_w), Some(index_w)) = (
@@ -2329,9 +2333,9 @@ where
                 let messages_writer = MessagesWriter::new(
                     &messages_reader.path(),
                     messages_w.size_counter(),
-                    config.enforce_fsync,
+                    enforce_fsync,
                     true,
-                    config.preallocate_segments.then_some(config.segment_size),
+                    preallocate_segments.then_some(segment_size),
                 )
                 .await
                 .map_err(|source| PartitionInstallError::SegmentOpen {
@@ -2341,7 +2345,7 @@ where
                 let index_writer = IggyIndexWriter::new(
                     &index_reader.path(),
                     index_w.size_counter(),
-                    config.enforce_fsync,
+                    enforce_fsync,
                     true,
                 )
                 .await
@@ -2637,7 +2641,7 @@ where
         // promoted mid-transfer. (`last_prepare_checksum` needs nothing: it is
         // only read as a `parent:` stamp when building a prepare.)
         consensus.sequencer().set_sequence(commit_op);
-        consensus.pipeline().borrow_mut().clear();
+        consensus.clear_pipeline();
         consensus.advance_commit_max(commit_op);
         self.observed_view = self.consensus().view();
         self.repair = None;

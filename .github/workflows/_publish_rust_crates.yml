@@ -46,9 +46,6 @@ on:
         required: false
         default: false
         description: "Skip git tag creation after successful publish (useful for re-publishing)"
-    secrets:
-      CARGO_REGISTRY_TOKEN:
-        required: true
     outputs:
       status:
         description: "Publishing status"
@@ -56,6 +53,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   IGGY_CI_BUILD: true
@@ -77,8 +75,6 @@ jobs:
   publish:
     name: Publish Rust crates
     runs-on: ubuntu-latest
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     outputs:
       status: ${{ steps.final-status.outputs.status }}
     steps:
@@ -257,7 +253,28 @@ jobs:
       # an expected duration. Operators should only intervene after ~60
       # min of sustained CDN 404s on a single crate.
 
+      # crates.io trusted-publishing tokens expire 30 minutes after the
+      # exchange, and the wait-for-crate gates between crates can each run
+      # up to ~28 minutes. A single token minted before the chain would
+      # expire mid-chain on a slow CDN day, so each crate mints its own
+      # token immediately before its publish step. The export goes through
+      # GITHUB_ENV because actions/rust/post-merge reads env.CARGO_REGISTRY_TOKEN,
+      # and job-level env is the only channel that reliably reaches composite
+      # action internals; each per-crate export overwrites the previous value.
+
       # Step 1: Publish iggy_binary_protocol (depends on nothing in-tree)
+      - name: Authenticate with crates.io (iggy_binary_protocol)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-binary-protocol')
+        id: auth-protocol
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Export crates.io token (iggy_binary_protocol)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-binary-protocol')
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-protocol.outputs.token }}
+        run: echo "CARGO_REGISTRY_TOKEN=${CARGO_REGISTRY_TOKEN}" >> "$GITHUB_ENV"
+
       - name: Publish iggy_binary_protocol
         if: inputs.dry_run == false && contains(inputs.crates, 'rust-binary-protocol')
         uses: ./.github/actions/rust/post-merge
@@ -287,6 +304,18 @@ jobs:
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
       # Step 2: Publish iggy_common (depends on iggy_binary_protocol)
+      - name: Authenticate with crates.io (iggy_common)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-common')
+        id: auth-common
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Export crates.io token (iggy_common)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-common')
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-common.outputs.token }}
+        run: echo "CARGO_REGISTRY_TOKEN=${CARGO_REGISTRY_TOKEN}" >> "$GITHUB_ENV"
+
       - name: Publish iggy_common
         if: inputs.dry_run == false && contains(inputs.crates, 'rust-common')
         uses: ./.github/actions/rust/post-merge
@@ -316,6 +345,18 @@ jobs:
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
       # Step 3: Publish iggy SDK (depends on common and protocol)
+      - name: Authenticate with crates.io (iggy)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-sdk')
+        id: auth-sdk
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Export crates.io token (iggy)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-sdk')
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-sdk.outputs.token }}
+        run: echo "CARGO_REGISTRY_TOKEN=${CARGO_REGISTRY_TOKEN}" >> "$GITHUB_ENV"
+
       - name: Publish iggy SDK
         if: inputs.dry_run == false && contains(inputs.crates, 'rust-sdk')
         uses: ./.github/actions/rust/post-merge
@@ -345,6 +386,18 @@ jobs:
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
       # Step 4: Publish iggy-cli (depends on SDK and protocol)
+      - name: Authenticate with crates.io (iggy-cli)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-cli')
+        id: auth-cli
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Export crates.io token (iggy-cli)
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-cli')
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-cli.outputs.token }}
+        run: echo "CARGO_REGISTRY_TOKEN=${CARGO_REGISTRY_TOKEN}" >> "$GITHUB_ENV"
+
       - name: Publish iggy-cli
         if: inputs.dry_run == false && contains(inputs.crates, 'rust-cli')
         uses: ./.github/actions/rust/post-merge

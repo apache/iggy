@@ -214,12 +214,14 @@ impl JwtManager {
             return self.decode_self_issued(token);
         }
 
-        // Try the self-issued verify first. A trusted-issuer token is signed by
-        // the issuer's key, which the self-issued verify rejects at the algorithm
-        // check (when self-issued is HS*, the shipped default) or at signature
-        // verification (if an operator configures self-issued RS*/ES*) - either
-        // way it can never accept an external token; a valid self-issued token
-        // returns here and the classification below only runs once it has failed.
+        // Try the self-issued verify first. Self-issued is always HS* (config
+        // validation refuses anything else), so a token signed by an issuer's
+        // key fails here either at the algorithm check, when its header names a
+        // non-HMAC alg, or at the signature check, when the header claims HS*
+        // but the signature was not made with the local secret. Either way an
+        // external token can never be accepted as self-issued; a valid
+        // self-issued token returns here and the classification below only runs
+        // once it has failed.
         if let Ok(claims) = self.decode_self_issued(token) {
             return Ok(claims);
         }
@@ -347,7 +349,7 @@ fn normalize_issuer_url(url: &str) -> String {
 
 /// Fill in an unconfigured JWT secret exactly like the legacy HTTP server:
 /// both empty -> one random ephemeral secret; one empty -> mirror the other;
-/// both set but different under an HMAC algorithm -> warn (they must match).
+/// both set but different -> warn (they must match).
 fn normalize_secrets(mut config: HttpJwtConfig, cluster_psk: Option<&str>) -> HttpJwtConfig {
     match (
         config.encoding_secret.is_empty(),
@@ -390,11 +392,9 @@ fn normalize_secrets(mut config: HttpJwtConfig, cluster_psk: Option<&str>) -> Ht
             config.decoding_secret = config.encoding_secret.clone();
         }
         (false, false) => {
-            if config.encoding_secret != config.decoding_secret
-                && config.algorithm.starts_with("HS")
-            {
+            if config.encoding_secret != config.decoding_secret {
                 warn!(
-                    "JWT encoding and decoding secrets are different but algorithm is {} (HMAC) - both secrets must be identical for symmetric algorithms.",
+                    "JWT encoding and decoding secrets are different but self-issued tokens are signed and verified with one shared secret (algorithm is {}) - both secrets must be identical.",
                     config.algorithm
                 );
             }

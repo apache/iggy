@@ -59,6 +59,9 @@ pub fn sample(
         Outcome::NameAlreadyExists => {
             unreachable!("update_stream does not target NameAlreadyExists")
         }
+        Outcome::InvalidOptionValue => {
+            unreachable!("the simulator only sends an empty update options block")
+        }
     }
 }
 

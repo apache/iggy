@@ -62,11 +62,15 @@ pub async fn run(harness: &mut TestHarness) {
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // High flush threshold so post-restart messages accumulate in the
+            // journal (which is what exposed the base_offset=0 bug).
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(10_000),
+                enforce_fsync: Some(false),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

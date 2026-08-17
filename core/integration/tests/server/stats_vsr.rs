@@ -23,8 +23,7 @@ use iggy::prelude::*;
 use integration::iggy_harness;
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_connected_clients_when_getting_stats_should_count_clients(harness: &TestHarness) {
     let clients = harness.tcp_root_clients(2).await.expect("tcp root clients");

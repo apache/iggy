@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codec::{WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le};
 use crate::error::WireError;
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
@@ -122,7 +122,7 @@ impl WireDecode for SendMessagesResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let confirmations_count = read_u32_le(buf, 0)?;
         let remaining = buf.len().saturating_sub(4);
-        let mut confirmations = Vec::with_capacity(capped_capacity(
+        let mut confirmations = Vec::with_capacity(bounded_capacity(
             confirmations_count as usize,
             remaining,
             CONFIRMATION_SIZE,

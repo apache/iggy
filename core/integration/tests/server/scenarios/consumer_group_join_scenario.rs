@@ -21,12 +21,12 @@ use crate::server::scenarios::{
 };
 use iggy::clients::client::IggyClient;
 use iggy::prelude::ClientInfoDetails;
-use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::ConsumerGroupDetails;
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
-use iggy::prelude::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
+use iggy::prelude::{
+    ConsumerGroupClient, StreamClient, SystemClient, TopicClient, TopicCreateOptions,
+};
 use integration::harness::{TestHarness, assert_clean_system, create_user, login_user};
 
 pub async fn run(harness: &TestHarness) {
@@ -49,11 +49,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

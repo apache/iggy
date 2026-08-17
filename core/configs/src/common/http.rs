@@ -25,6 +25,19 @@ use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
+/// Every `http.jwt.algorithm` the server can sign and verify with, and the
+/// `jsonwebtoken` algorithm each names.
+///
+/// HMAC only, because [`HttpJwtConfig::get_encoding_key`] builds its key from a
+/// shared secret and there is no PEM loading path. `jsonwebtoken::encode`
+/// refuses a header algorithm whose family does not match the key, so an
+/// asymmetric algorithm would boot clean and then fail every login.
+pub const HMAC_JWT_ALGORITHMS: [(&str, Algorithm); 3] = [
+    ("HS256", Algorithm::HS256),
+    ("HS384", Algorithm::HS384),
+    ("HS512", Algorithm::HS512),
+];
+
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TrustedIssuerConfig {
     pub issuer: String,
@@ -110,15 +123,11 @@ pub struct HttpTlsConfig {
 
 impl HttpJwtConfig {
     pub fn get_algorithm(&self) -> Result<Algorithm, IggyError> {
-        match self.algorithm.as_str() {
-            "HS256" => Ok(Algorithm::HS256),
-            "HS384" => Ok(Algorithm::HS384),
-            "HS512" => Ok(Algorithm::HS512),
-            "RS256" => Ok(Algorithm::RS256),
-            "RS384" => Ok(Algorithm::RS384),
-            "RS512" => Ok(Algorithm::RS512),
-            _ => Err(IggyError::InvalidJwtAlgorithm(self.algorithm.clone())),
-        }
+        HMAC_JWT_ALGORITHMS
+            .iter()
+            .find(|(name, _)| *name == self.algorithm)
+            .map(|(_, algorithm)| *algorithm)
+            .ok_or_else(|| IggyError::InvalidJwtAlgorithm(self.algorithm.clone()))
     }
 
     pub fn get_decoding_secret(&self) -> JwtSecret {
@@ -167,6 +176,27 @@ impl HttpJwtConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_algorithm_accepts_only_hmac() {
+        for (name, expected) in HMAC_JWT_ALGORITHMS {
+            let config = HttpJwtConfig {
+                algorithm: name.to_string(),
+                ..HttpJwtConfig::default()
+            };
+            assert_eq!(config.get_algorithm(), Ok(expected));
+        }
+        for asymmetric in ["RS256", "RS384", "RS512", "ES256", "EdDSA"] {
+            let config = HttpJwtConfig {
+                algorithm: asymmetric.to_string(),
+                ..HttpJwtConfig::default()
+            };
+            assert!(
+                config.get_algorithm().is_err(),
+                "{asymmetric} has no key material and must not resolve"
+            );
+        }
+    }
 
     #[test]
     fn jwt_secrets_are_never_serialized() {

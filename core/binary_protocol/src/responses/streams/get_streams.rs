@@ -61,7 +61,7 @@ impl WireDecode for GetStreamsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WireName;
+    use crate::{WireName, WireOptions};
 
     #[test]
     fn roundtrip_empty() {
@@ -84,6 +84,7 @@ mod tests {
                     size_bytes: 512,
                     messages_count: 50,
                     name: WireName::new("s1").unwrap(),
+                    options: WireOptions::empty(),
                 },
                 StreamResponse {
                     id: 2,
@@ -92,6 +93,7 @@ mod tests {
                     size_bytes: 0,
                     messages_count: 0,
                     name: WireName::new("stream-two").unwrap(),
+                    options: WireOptions::empty(),
                 },
             ],
         };

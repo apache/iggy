@@ -61,8 +61,17 @@ type Client interface {
 	// Authentication is required, and the permission to read the topics.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
 
+	// DescribeOptions get the option catalog for a resource scope: every key its
+	// create command accepts, with the kind, default and bounds of each.
+	// Authentication is required.
+	DescribeOptions(ctx context.Context, scope OptionsScope) ([]OptionSpec, error)
+
 	// CreateTopic create a new topic.
 	// Authentication is required, and the permission to manage the topics.
+	//
+	// options carries topic option keys with no parameter of their own, for a key
+	// the server catalog gained after this build shipped; call DescribeOptions to
+	// see which keys a server accepts. A parameter above wins on collision.
 	CreateTopic(
 		ctx context.Context,
 		streamId Identifier,
@@ -71,11 +80,14 @@ type Client interface {
 		compressionAlgorithm CompressionAlgorithm,
 		messageExpiry Duration,
 		maxTopicSize uint64,
-		replicationFactor *uint8,
+		options ...HeaderEntry,
 	) (*TopicDetails, error)
 
 	// UpdateTopic update a topic by unique ID or name.
 	// Authentication is required, and the permission to manage the topics.
+	//
+	// options carries keys with no parameter of their own. The server refuses any
+	// key an update may not change, by name.
 	UpdateTopic(
 		ctx context.Context,
 		streamId Identifier,
@@ -84,7 +96,7 @@ type Client interface {
 		compressionAlgorithm CompressionAlgorithm,
 		messageExpiry Duration,
 		maxTopicSize uint64,
-		replicationFactor *uint8,
+		options ...HeaderEntry,
 	) error
 
 	// DeleteTopic delete a topic by unique ID or name.

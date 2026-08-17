@@ -19,7 +19,7 @@ use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{
     ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
-    IggyMessage as RustIggyMessage, Partition as RustPartition,
+    IggyMessage as RustIggyMessage, OptionSpec as RustOptionSpec, Partition as RustPartition,
     PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
@@ -323,6 +323,66 @@ impl From<RustPartition> for ffi::Partition {
     }
 }
 
+/// The entries of one provenance, as the `HeaderEntry` the message path uses.
+///
+/// Options ride the user-headers codec, so they cross the bridge as the type
+/// already there for `user_headers` rather than a second one meaning the same
+/// thing. Values keep the kind the server sent, so a `Uint64` stays a `Uint64`.
+fn resource_options_to_ffi(
+    options: &iggy::prelude::ResourceOptions,
+    explicit: bool,
+) -> Vec<ffi::HeaderEntry> {
+    options
+        .iter()
+        .filter(|(_, option)| option.explicit == explicit)
+        .map(|(key, option)| ffi::HeaderEntry {
+            key: ffi::HeaderField {
+                kind: key.kind().as_code(),
+                value: key.as_bytes().to_vec(),
+            },
+            value: ffi::HeaderField {
+                kind: option.value.kind().as_code(),
+                value: option.value.as_bytes().to_vec(),
+            },
+        })
+        .collect()
+}
+
+/// Render option entries into the string map `TopicCreateOptions::raw` takes.
+///
+/// The Rust SDK expresses arbitrary option keys as strings that admission
+/// parses by the same rules a config file value goes through, so a typed value
+/// handed in here is rendered rather than passed through: sending `Uint64`
+/// 134217728 for `segment_size` and sending `"134217728"` land the same stored
+/// value. A key this build cannot read at all is dropped rather than guessed.
+pub(crate) fn ffi_options_to_raw(
+    options: Vec<ffi::HeaderEntry>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut raw = std::collections::BTreeMap::new();
+    for entry in options {
+        let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
+        let key = key
+            .as_str()
+            .map_err(|error| format!("Option key is not a string: {error}"))?
+            .to_owned();
+        if raw.insert(key.clone(), value.to_string_value()).is_some() {
+            return Err(format!("Duplicate option key: {key}"));
+        }
+    }
+    Ok(raw)
+}
+
+impl From<RustOptionSpec> for ffi::OptionSpec {
+    fn from(spec: RustOptionSpec) -> Self {
+        ffi::OptionSpec {
+            key: spec.key,
+            kind: spec.kind.as_code(),
+            default_value: spec.default_value,
+            description: spec.description,
+        }
+    }
+}
+
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
         ffi::Topic {
@@ -333,9 +393,10 @@ impl From<RustTopic> for ffi::Topic {
             message_expiry: u64::from(topic.message_expiry),
             compression_algorithm: topic.compression_algorithm.to_string(),
             max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
+            options: resource_options_to_ffi(&topic.options, true),
+            derived_options: resource_options_to_ffi(&topic.options, false),
         }
     }
 }
@@ -350,7 +411,6 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
             message_expiry: u64::from(topic.message_expiry),
             compression_algorithm: topic.compression_algorithm.to_string(),
             max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -358,6 +418,8 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
                 .into_iter()
                 .map(ffi::Partition::from)
                 .collect(),
+            options: resource_options_to_ffi(&topic.options, true),
+            derived_options: resource_options_to_ffi(&topic.options, false),
         }
     }
 }
@@ -371,6 +433,7 @@ impl From<RustStream> for ffi::Stream {
             size_bytes: stream.size.as_bytes_u64(),
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
+            options: resource_options_to_ffi(&stream.options, true),
         }
     }
 }
@@ -385,6 +448,7 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
             topics: stream.topics.into_iter().map(ffi::Topic::from).collect(),
+            options: resource_options_to_ffi(&stream.options, true),
         }
     }
 }

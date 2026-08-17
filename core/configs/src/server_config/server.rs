@@ -26,7 +26,10 @@ use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
 use crate::common::system::SystemConfig;
-use configs::{ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, TypedEnvProvider};
+use configs::{
+    ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
+    TypedEnvProvider,
+};
 use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
@@ -39,12 +42,53 @@ use std::sync::Arc;
 
 pub use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
-    MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
-    PersonalAccessTokenConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
-    TelemetryTransport,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
+
+/// Server config keys that became per-topic options, or went away with the
+/// feature they configured.
+///
+/// The provider refuses to boot while any of them is still set, in the config
+/// file or in the environment. See [`RelocatedKey`] for why a warning is not
+/// enough. The partition knobs matter most: they are create-only options now,
+/// so a topic that boots without one can never be given it afterwards.
+const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
+    RelocatedKey {
+        path: "system.topic.max_size",
+        replacement: Some("max_topic_size"),
+    },
+    RelocatedKey {
+        path: "system.topic.message_expiry",
+        replacement: Some("message_expiry"),
+    },
+    RelocatedKey {
+        path: "system.partition.enforce_fsync",
+        replacement: Some("enforce_fsync"),
+    },
+    RelocatedKey {
+        path: "system.partition.messages_required_to_save",
+        replacement: Some("messages_required_to_save"),
+    },
+    RelocatedKey {
+        path: "system.partition.size_of_messages_required_to_save",
+        replacement: Some("size_of_messages_required_to_save"),
+    },
+    RelocatedKey {
+        path: "system.segment.size",
+        replacement: Some("segment_size"),
+    },
+    RelocatedKey {
+        path: "system.segment.preallocate",
+        replacement: Some("preallocate_segments"),
+    },
+    RelocatedKey {
+        path: "system.message_deduplication",
+        replacement: None,
+    },
+];
 
 /// [`SystemConfig`] bound to this crate's own
 /// [`super::sharding::ShardingConfig`]. `core/server` names this alias
@@ -63,7 +107,6 @@ pub struct ServerConfig {
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
     pub extra: ExtraConfig,
-    pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
     pub system: Arc<ServerSystemConfig>,
@@ -139,6 +182,7 @@ impl ServerConfig {
             true,
             Some(default_config),
         )
+        .with_relocated_keys(ServerConfig::ENV_PREFIX, RELOCATED_CONFIG_KEYS)
     }
 
     /// All recognised env var names for [`ServerConfig`].

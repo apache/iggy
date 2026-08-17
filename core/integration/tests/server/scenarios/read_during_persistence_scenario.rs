@@ -23,27 +23,13 @@ use std::time::{Duration, Instant};
 const STREAM_NAME: &str = "eventual-consistency-stream";
 const TOPIC_NAME: &str = "eventual-consistency-topic";
 
-/// Test that specifically targets the background message_saver race condition.
+/// Test that a poll served while messages are still in the journal observes
+/// them, rather than seeing an empty journal with the data not yet on disk.
 ///
-/// Setup:
-/// - HIGH inline persistence thresholds (messages stay in journal during send)
-/// - SHORT message_saver interval (background flushes happen frequently)
-///
-/// The race occurs when:
-/// 1. Messages are in journal
-/// 2. Background saver calls commit() - journal becomes EMPTY
-/// 3. Background saver starts async disk write
-/// 4. Poll arrives - sees empty journal, data not yet on disk
-#[iggy_harness(server(
-    partition.messages_required_to_save = "100000",
-    partition.size_of_messages_required_to_save = "1GB",
-    partition.enforce_fsync = false,
-    message_saver.interval = "100ms",
-    message_saver.enabled = true
-))]
-async fn should_read_messages_during_background_saver_flush(
-    harness: &integration::harness::TestHarness,
-) {
+/// Setup: HIGH inline persistence thresholds, so messages stay in the journal
+/// for the whole send and the poll has to read them from there.
+#[iggy_harness]
+async fn should_read_messages_still_in_the_journal(harness: &integration::harness::TestHarness) {
     let producer = harness.tcp_root_client().await.unwrap();
 
     producer.create_stream(STREAM_NAME).await.unwrap();
@@ -51,11 +37,19 @@ async fn should_read_messages_during_background_saver_flush(
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // Both inline thresholds sit far past anything the loop below
+            // sends, so no send ever flushes and every batch is still in the
+            // journal when the poll that follows it runs. Both have to move:
+            // the byte threshold defaults to 1 MiB and would flush on its own
+            // long before the message count trips.
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(100_000),
+                size_of_messages_required_to_save: Some(IggyByteSize::from(1024 * 1024 * 1024u64)),
+                enforce_fsync: Some(false),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -75,11 +69,11 @@ async fn should_read_messages_during_background_saver_flush(
     let mut next_offset = 0u64;
 
     println!(
-        "Starting background saver race test: {} msgs/batch, duration: {}s",
+        "Starting journal read race test: {} msgs/batch, duration: {}s",
         messages_per_batch,
         test_duration.as_secs()
     );
-    println!("Inline persistence DISABLED (high thresholds), background saver every 100ms");
+    println!("Inline persistence thresholds raised, so every batch stays in the journal");
 
     while start.elapsed() < test_duration {
         let base_offset = next_offset;

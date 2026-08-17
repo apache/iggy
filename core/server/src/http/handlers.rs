@@ -19,6 +19,7 @@
 //! the control-plane writes, and the data-plane produce / poll / consumer-offset
 //! routes the router binds.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Json;
@@ -29,9 +30,9 @@ use axum::response::{IntoResponse, Response};
 use chrono::Local;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::codes::{
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
@@ -49,6 +50,7 @@ use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
     PurgeStreamRequest, UpdateStreamRequest,
 };
+use iggy_binary_protocol::requests::system::DescribeOptionsRequest;
 use iggy_binary_protocol::requests::system::GetStatsRequest;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
@@ -66,12 +68,15 @@ use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetCo
 use iggy_binary_protocol::responses::personal_access_tokens::GetPersonalAccessTokensResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
-use iggy_binary_protocol::{Operation, WireDecode, WireEncode, WireIdentifier, WireName};
+use iggy_binary_protocol::{
+    Operation, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
+};
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::create_partitions::CreatePartitions;
@@ -92,14 +97,19 @@ use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{
-    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, permissions_to_wire,
-    personal_access_tokens_from_wire, streams_from_wire, topics_from_wire, users_from_wire,
+    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, option_specs_from_wire,
+    permissions_to_wire, personal_access_tokens_from_wire, streams_from_wire, topics_from_wire,
+    users_from_wire,
 };
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
-    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    ClientInfo, ClientInfoDetails, ClusterMetadata, CompressionAlgorithm, Consumer, ConsumerGroup,
+    ConsumerGroupDetails, ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, IggyExpiry,
+    MaxTopicSize, OptionSpec, OptionsScope, PersonalAccessTokenInfo, PollMessages, PolledMessages,
+    RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails,
+    StreamUpdateOptions, TokenInfo, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    UPDATABLE_STREAM_OPTION_KEYS, UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS,
+    UserInfo, UserInfoDetails, UserUpdateOptions, Validatable, validate_preallocated_topic_bytes,
+    validate_topic_segment_size,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -110,16 +120,18 @@ use shard::{PartitionRead, PartitionReadReply};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
-    resolve_consumer_offset_request, resolve_poll_request, validate_topic_bounds,
+    resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
+    validate_topic_bounds, validate_topic_size_floor, warn_unenforceable_topic_size,
+    warn_unenforceable_topic_size_on_partition_add,
 };
 use crate::http::error::{
-    ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery, ReadError,
-    WriteError,
+    Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
+    ReadError, WriteError,
 };
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::reads::{
     authorize_data_plane, authorize_read, read_local, resolve_gate_stream, resolve_gate_topic,
-    resolve_gate_topic_ids,
+    resolve_gate_topic_ids, resolve_gate_user,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -256,6 +268,36 @@ pub(in crate::http) async fn logout_user(
     StatusCode::NO_CONTENT
 }
 
+/// `GET /options/{scope}`: describe the option catalog for one resource
+/// scope (`topic`, `stream`, `user`) as `Vec<OptionSpec>` JSON. A
+/// consensus-free local read via [`read_local`], gated on authentication
+/// only (the catalog is not resource-scoped).
+pub(in crate::http) async fn describe_options(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path(scope): Path<String>,
+) -> Result<Json<Vec<OptionSpec>>, ReadError> {
+    let scope = OptionsScope::from_str(&scope).map_err(ReadError::Rejected)?;
+    let body = DescribeOptionsRequest {
+        scope: scope.as_code(),
+    }
+    .to_bytes();
+    let bytes = SendWrapper::new(read_local(
+        &state,
+        &identity,
+        Consistency::default(),
+        DESCRIBE_OPTIONS_CODE,
+        &body,
+        |_, _| Ok(()),
+    ))
+    .await?;
+    let response = DescribeOptionsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(
+        option_specs_from_wire(response).map_err(ReadError::Rejected)?,
+    ))
+}
+
 /// `GET /streams`: list every stream as the same `Vec<Stream>` JSON the legacy
 /// server returns. A consensus-free local STM read via [`read_local`].
 pub(in crate::http) async fn get_streams(
@@ -275,7 +317,9 @@ pub(in crate::http) async fn get_streams(
     .await?;
     let response = GetStreamsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
-    Ok(Json(streams_from_wire(response)))
+    Ok(Json(
+        streams_from_wire(response).map_err(ReadError::Rejected)?,
+    ))
 }
 
 /// `GET /streams/{stream_id}`: fetch one stream by numeric id or name as the
@@ -413,22 +457,22 @@ pub(in crate::http) async fn get_users(
 
 /// `GET /users/{user_id}`: fetch one user by numeric id or name as the same
 /// `UserInfoDetails` JSON the legacy server returns; 404 when absent. A
-/// consensus-free local STM read via [`read_local`]. [`CURRENT_USER_ALIAS`]
-/// resolves to the caller and skips the `read_users` gate, mirroring the
-/// legacy self-read bypass.
+/// consensus-free local STM read via [`read_local`]. Any target resolving to
+/// the caller - [`CURRENT_USER_ALIAS`], own id, own username - skips the
+/// `read_users` gate, mirroring the legacy self-read bypass.
 pub(in crate::http) async fn get_user(
     State(state): State<HttpState>,
     identity: Identity,
     Path(user_id): Path<String>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<UserInfoDetails>, ReadError> {
-    let is_self = user_id == CURRENT_USER_ALIAS;
-    let wire_user_id = if is_self {
+    let wire_user_id = if user_id == CURRENT_USER_ALIAS {
         WireIdentifier::numeric(identity.user_id)
     } else {
         let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
         identifier_to_wire(&user_id).map_err(ReadError::Rejected)?
     };
+    let is_self = resolve_gate_user(&state, &wire_user_id) == Some(identity.user_id as usize);
     let request = GetUserRequest {
         user_id: wire_user_id,
     };
@@ -701,6 +745,7 @@ pub(in crate::http) async fn create_stream(
     let request = CreateStreamRequest {
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
+        options: WireOptions::empty(),
     };
     let body = request.to_bytes();
     let payload = SendWrapper::new(submit_write(
@@ -722,10 +767,20 @@ pub(in crate::http) async fn update_stream(
     Json(command): Json<UpdateStream>,
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let wire_options = StreamUpdateOptions {
+        raw: command.options,
+    }
+    .to_wire()
+    .map_err(WriteError::Rejected)?;
+    // Same pre-consensus gate the TCP ingress applies: a key this command may
+    // not change is denied here by name rather than riding a log entry.
+    validate_option_keys(&wire_options, UPDATABLE_STREAM_OPTION_KEYS)
+        .map_err(WriteError::Rejected)?;
     let request = UpdateStreamRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
+        options: wire_options,
     };
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
@@ -794,23 +849,57 @@ pub(in crate::http) async fn create_topic(
     Json(command): Json<CreateTopic>,
 ) -> Result<Json<TopicDetails>, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    // Rejects empty/oversized name, partitions_count > MAX, replication_factor == Some(0).
+    // Rejects empty/oversized name and partitions_count > MAX.
     command.validate().map_err(WriteError::Rejected)?;
-    validate_topic_bounds(
-        &state.system_config,
+    let options = TopicCreateOptions {
+        partitions_count: Some(command.partitions_count),
+        compression_algorithm: (command.compression_algorithm != CompressionAlgorithm::default())
+            .then_some(command.compression_algorithm),
+        message_expiry: (command.message_expiry != IggyExpiry::ServerDefault)
+            .then_some(command.message_expiry),
+        max_topic_size: (command.max_topic_size != MaxTopicSize::ServerDefault)
+            .then_some(command.max_topic_size),
+        raw: command.options,
+        ..TopicCreateOptions::default()
+    };
+    let wire_options = options.to_wire().map_err(WriteError::Rejected)?;
+    // Re-parse the encoded block so `--set`-style raw string entries get the
+    // same typed pre-consensus checks as native fields; unknown keys deny
+    // here with the key name.
+    let parsed = TopicCreateOptions::parse(&wire_options).map_err(WriteError::Rejected)?;
+    if let Some(segment_size) = parsed.segment_size {
+        validate_topic_segment_size(
+            segment_size.as_bytes_u64(),
+            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+        )
+        .map_err(WriteError::Rejected)?;
+    }
+    let segment_size = parsed.segment_size.map_or_else(
+        || iggy_common::DEFAULT_SEGMENT_SIZE,
+        |segment_size| segment_size.as_bytes_u64(),
+    );
+    if parsed
+        .preallocate_segments
+        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
+    {
+        validate_preallocated_topic_bytes(segment_size, command.partitions_count)
+            .map_err(WriteError::Rejected)?;
+    }
+    let max_topic_size = parsed.max_topic_size.unwrap_or(MaxTopicSize::ServerDefault);
+    validate_topic_bounds(command.partitions_count, max_topic_size, segment_size)
+        .map_err(WriteError::Rejected)?;
+    warn_unenforceable_topic_size(
+        max_topic_size,
+        segment_size,
+        state.shard.bus_max_message_size(),
         command.partitions_count,
-        command.max_topic_size,
-    )
-    .map_err(WriteError::Rejected)?;
+    );
     let request = CreateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
-        compression_algorithm: command.compression_algorithm.as_code(),
-        message_expiry: command.message_expiry.into(),
-        max_topic_size: command.max_topic_size.into(),
-        replication_factor: command.replication_factor.unwrap_or(0),
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
+        options: wire_options,
     };
     let body = request.to_bytes();
     let payload = SendWrapper::new(submit_write(
@@ -832,17 +921,54 @@ pub(in crate::http) async fn update_topic(
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
-    // Also rejects replication_factor == Some(0), which `WireName` cannot see.
     command.validate().map_err(WriteError::Rejected)?;
+    // The named JSON fields fold into the same option keys the binary protocol
+    // uses, so REST keeps its ergonomics without giving a setting two homes.
+    let wire_options = TopicUpdateOptions {
+        compression_algorithm: command.compression_algorithm,
+        message_expiry: command.message_expiry,
+        max_topic_size: command.max_topic_size,
+        raw: command.options,
+    }
+    .to_wire()
+    .map_err(WriteError::Rejected)?;
+    // Same pre-consensus gates the TCP ingress applies: a key this command may
+    // not change is denied here by name rather than riding a log entry, and a
+    // cap below one of this topic's segments is denied for the same reason it is
+    // on create.
+    validate_option_keys(&wire_options, UPDATABLE_TOPIC_OPTION_KEYS)
+        .map_err(WriteError::Rejected)?;
+    let stream_wire = identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_wire = identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?;
+    if let Some(max_topic_size) = TopicCreateOptions::parse(&wire_options)
+        .map_err(WriteError::Rejected)?
+        .max_topic_size
+    {
+        let metadata = state.shard.plane.metadata();
+        let streams = metadata.mux_stm.streams();
+        let segment_size = streams
+            .topic_segment_size(&stream_wire, &topic_wire)
+            .map_or_else(
+                || iggy_common::DEFAULT_SEGMENT_SIZE,
+                |segment_size| segment_size.as_bytes_u64(),
+            );
+        validate_topic_size_floor(max_topic_size, segment_size).map_err(WriteError::Rejected)?;
+        let partitions_count = streams
+            .topic_partitions_count(&stream_wire, &topic_wire)
+            .unwrap_or(0);
+        warn_unenforceable_topic_size(
+            max_topic_size,
+            segment_size,
+            state.shard.bus_max_message_size(),
+            u32::try_from(partitions_count).unwrap_or(u32::MAX),
+        );
+    }
     let request = UpdateTopicRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
-        compression_algorithm: command.compression_algorithm.as_code(),
-        message_expiry: command.message_expiry.into(),
-        max_topic_size: command.max_topic_size.into(),
-        replication_factor: command.replication_factor.unwrap_or(0),
+        stream_id: stream_wire,
+        topic_id: topic_wire,
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
+        options: wire_options,
     };
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
@@ -921,6 +1047,14 @@ pub(in crate::http) async fn create_partitions(
         topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
     };
+    let metadata = state.shard.plane.metadata();
+    warn_unenforceable_topic_size_on_partition_add(
+        metadata.mux_stm.streams(),
+        &request.stream_id,
+        &request.topic_id,
+        state.shard.bus_max_message_size(),
+        request.partitions_count,
+    );
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
         &state,
@@ -1371,6 +1505,7 @@ pub(in crate::http) async fn create_user(
         password: command.password.expose_secret().to_string(),
         status: command.status.as_code(),
         permissions: command.permissions.as_ref().map(permissions_to_wire),
+        options: WireOptions::empty(),
     };
     let body = request.to_bytes();
     let payload = SendWrapper::new(submit_write(
@@ -1393,6 +1528,13 @@ pub(in crate::http) async fn update_user(
     let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
     // Rejects an oversized replacement username; a no-op when username is absent.
     command.validate().map_err(WriteError::Rejected)?;
+    let user_update_options = UserUpdateOptions {
+        raw: command.options,
+    }
+    .to_wire()
+    .map_err(WriteError::Rejected)?;
+    validate_option_keys(&user_update_options, UPDATABLE_USER_OPTION_KEYS)
+        .map_err(WriteError::Rejected)?;
     let request = UpdateUserRequest {
         user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
         username: command
@@ -1402,6 +1544,7 @@ pub(in crate::http) async fn update_user(
             .transpose()
             .map_err(|_| WriteError::Rejected(IggyError::InvalidUsername))?,
         status: command.status.map(|status| status.as_code()),
+        options: user_update_options,
     };
     let body = request.to_bytes();
     SendWrapper::new(submit_write(

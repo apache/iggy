@@ -46,6 +46,7 @@ use crate::responses::{
     connected_client_to_response, current_metadata_commit, resolve_partition_namespace,
     resolve_partition_request_namespace,
 };
+use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
 use crate::snapshot;
 use crate::users::maybe_rewrite_user_password_request;
@@ -74,10 +75,13 @@ use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
-use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, UpdateTopicRequest};
+use iggy_binary_protocol::requests::users::{
+    CreateUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest, UpdateUserRequest,
+};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
@@ -88,10 +92,13 @@ use iggy_binary_protocol::{
     ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, KIND_CONSUMER_GROUP,
     MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader, RoutedRequestHeader,
-    WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
+    WireDecode, WireEncode, WireIdentifier, WireOptions, is_protocol_compatible,
 };
 use iggy_common::{
-    IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression, SystemSnapshotType,
+    IggyByteSize, IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression,
+    SystemSnapshotType, TopicCreateOptions, UPDATABLE_STREAM_OPTION_KEYS,
+    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, validate_preallocated_topic_bytes,
+    validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -104,6 +111,7 @@ use metadata::impls::metadata::{
     build_truncate_partition_client_message_with_identifiers,
 };
 use metadata::permissioner::Permissioner;
+use metadata::stm::stream::Streams;
 use partitions::{AutoCommitApplied, PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
@@ -808,19 +816,116 @@ pub(crate) const fn validate_partitions_change_count(
 /// and `prepare_request` errors evict the session instead of denying typed.
 /// `ServerDefault` is exempt from the size floor (it resolves against server
 /// config at admission, matching legacy); `Unlimited` passes numerically.
+/// `segment_size_bytes` is the topic's RESOLVED segment size (explicit
+/// option, else this node's default), so a per-topic segment above the
+/// global default still floors the topic cap.
 pub(crate) fn validate_topic_bounds(
-    system_config: &ServerSystemConfig,
     partitions_count: u32,
     max_topic_size: MaxTopicSize,
+    segment_size_bytes: u64,
 ) -> Result<(), IggyError> {
     validate_partitions_count(partitions_count)?;
+    validate_topic_size_floor(max_topic_size, segment_size_bytes)
+}
+
+/// A topic cap below one segment can never be enforced: the first segment
+/// already exceeds it. Split out of [`validate_topic_bounds`] because update
+/// admission checks the cap without a partitions count to check.
+pub(crate) fn validate_topic_size_floor(
+    max_topic_size: MaxTopicSize,
+    segment_size_bytes: u64,
+) -> Result<(), IggyError> {
     if !matches!(max_topic_size, MaxTopicSize::ServerDefault)
-        && max_topic_size.as_bytes_u64() < system_config.segment.size.as_bytes_u64()
+        && max_topic_size.as_bytes_u64() < segment_size_bytes
     {
         return Err(IggyError::InvalidTopicSize(
             max_topic_size,
-            system_config.segment.size,
+            IggyByteSize::from(segment_size_bytes),
         ));
+    }
+    Ok(())
+}
+
+/// Announce an accepted `max_topic_size` the server cannot enforce as written.
+///
+/// [`validate_topic_size_floor`] admits any cap of one segment or more, but
+/// retention runs PER PARTITION and floors each partition's share at one SEALED
+/// segment, which reaches up to one maximum bus frame past `segment_size`. A cap
+/// between the two is stored and echoed back verbatim while the server actually
+/// keeps `(segment_size + max_message_size) * partitions_count`, so the only
+/// moment an operator can be told is the one where they set it.
+///
+/// Warns rather than rejects: which caps are accepted is client-visible wire
+/// behavior, and tightening it would break topics that already exist.
+pub(crate) fn warn_unenforceable_topic_size(
+    max_topic_size: MaxTopicSize,
+    segment_size_bytes: u64,
+    max_message_size_bytes: usize,
+    partitions_count: u32,
+) {
+    let MaxTopicSize::Custom(configured) = max_topic_size else {
+        return;
+    };
+    let max_message_size_bytes = u64::try_from(max_message_size_bytes).unwrap_or(u64::MAX);
+    let per_partition_floor = segment_size_bytes.saturating_add(max_message_size_bytes);
+    let topic_floor = per_partition_floor.saturating_mul(u64::from(partitions_count));
+    if configured.as_bytes_u64() >= topic_floor {
+        return;
+    }
+    warn!(
+        max_topic_size = configured.as_bytes_u64(),
+        partitions_count,
+        segment_size = segment_size_bytes,
+        enforced_per_partition = per_partition_floor,
+        "{UNENFORCEABLE_TOPIC_SIZE_WARN}"
+    );
+}
+
+/// Announce the same unenforceable cap when partitions are ADDED to a topic.
+///
+/// The cap is topic-wide but enforcement is per partition, so every added
+/// partition shrinks the share: a cap that cleared the floor when the topic was
+/// created can stop clearing it here. The request carries only the delta, so
+/// the stored cap, segment size and current partition count come from metadata.
+pub(crate) fn warn_unenforceable_topic_size_on_partition_add(
+    streams: &Streams,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    max_message_size_bytes: usize,
+    added_partitions_count: u32,
+) {
+    let Some(((stream_slab, topic_slab), _)) = streams.partition_count_context(stream_id, topic_id)
+    else {
+        return;
+    };
+    let Some((_, max_topic_size, partitions_count, segment_size)) =
+        streams.topic_retention_config(stream_slab, topic_slab)
+    else {
+        return;
+    };
+    warn_unenforceable_topic_size(
+        max_topic_size,
+        segment_size.map_or(iggy_common::DEFAULT_SEGMENT_SIZE, |segment_size| {
+            segment_size.as_bytes_u64()
+        }),
+        max_message_size_bytes,
+        u32::try_from(partitions_count)
+            .unwrap_or(u32::MAX)
+            .saturating_add(added_partitions_count),
+    );
+}
+
+/// Reject option keys outside the resource's catalog, pre-consensus. Unknown
+/// keys are rejected rather than skipped: a silently ignored knob would hand
+/// the client server defaults without it ever learning. Streams and users
+/// have no catalog keys yet, so `known` is empty for both until one lands.
+pub(crate) fn validate_option_keys(options: &WireOptions, known: &[&str]) -> Result<(), IggyError> {
+    for entry in options {
+        // Wire validation already enforced UTF-8 string keys.
+        let key = String::from_utf8_lossy(entry.key);
+        if !known.contains(&key.as_ref()) {
+            return Err(IggyError::UnsupportedOptionKey(key.into_owned()));
+        }
     }
     Ok(())
 }
@@ -1122,22 +1227,107 @@ async fn handle_client_request<B, MJ, S, SB>(
         Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|create_topic| {
-                validate_topic_bounds(
-                    system_config,
+                // `parse` doubles as the catalog gate: an unknown key or a
+                // malformed value denies typed here, pre-consensus.
+                let options = TopicCreateOptions::parse(&create_topic.options)?;
+                if let Some(segment_size) = options.segment_size {
+                    validate_topic_segment_size(
+                        segment_size.as_bytes_u64(),
+                        iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+                    )?;
+                }
+                let segment_size = options.segment_size.map_or_else(
+                    || iggy_common::DEFAULT_SEGMENT_SIZE,
+                    |segment_size| segment_size.as_bytes_u64(),
+                );
+                if options
+                    .preallocate_segments
+                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
+                {
+                    validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
+                }
+                let max_topic_size = options
+                    .max_topic_size
+                    .unwrap_or(MaxTopicSize::ServerDefault);
+                validate_topic_bounds(create_topic.partitions_count, max_topic_size, segment_size)?;
+                warn_unenforceable_topic_size(
+                    max_topic_size,
+                    segment_size,
+                    shard.bus_max_message_size(),
                     create_topic.partitions_count,
-                    MaxTopicSize::from(create_topic.max_topic_size),
-                )
+                );
+                Ok(())
             }),
         Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|create_partitions| {
-                validate_partitions_change_count(create_partitions.partitions_count)
+                validate_partitions_change_count(create_partitions.partitions_count)?;
+                let metadata = shard.plane.metadata();
+                warn_unenforceable_topic_size_on_partition_add(
+                    metadata.mux_stm.streams(),
+                    &create_partitions.stream_id,
+                    &create_partitions.topic_id,
+                    shard.bus_max_message_size(),
+                    create_partitions.partitions_count,
+                );
+                Ok(())
             }),
         Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|delete_partitions| {
                 validate_partitions_change_count(delete_partitions.partitions_count)
             }),
+        // Only the updatable subset: the create-time knobs are pushed to
+        // partitions when the topic is built and nothing re-pushes them, so
+        // accepting one here would store a value no partition ever sees.
+        Operation::UpdateTopic => UpdateTopicRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|update_topic| {
+                validate_option_keys(&update_topic.options, UPDATABLE_TOPIC_OPTION_KEYS)?;
+                let options = TopicCreateOptions::parse(&update_topic.options)?;
+                let Some(max_topic_size) = options.max_topic_size else {
+                    return Ok(());
+                };
+                // An update can lower the cap below one segment just as a
+                // create can, and the stored map would then report a size the
+                // topic can never enforce. The floor is this topic's own
+                // segment size, since that key is create-only.
+                let metadata = shard.plane.metadata();
+                let streams = metadata.mux_stm.streams();
+                let segment_size = streams
+                    .topic_segment_size(&update_topic.stream_id, &update_topic.topic_id)
+                    .map_or_else(
+                        || iggy_common::DEFAULT_SEGMENT_SIZE,
+                        |segment_size| segment_size.as_bytes_u64(),
+                    );
+                validate_topic_size_floor(max_topic_size, segment_size)?;
+                let partitions_count = streams
+                    .topic_partitions_count(&update_topic.stream_id, &update_topic.topic_id)
+                    .unwrap_or(0);
+                warn_unenforceable_topic_size(
+                    max_topic_size,
+                    segment_size,
+                    shard.bus_max_message_size(),
+                    u32::try_from(partitions_count).unwrap_or(u32::MAX),
+                );
+                Ok(())
+            }),
+        Operation::UpdateStream => UpdateStreamRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|update_stream| {
+                validate_option_keys(&update_stream.options, UPDATABLE_STREAM_OPTION_KEYS)
+            }),
+        Operation::UpdateUser => UpdateUserRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|update_user| {
+                validate_option_keys(&update_user.options, UPDATABLE_USER_OPTION_KEYS)
+            }),
+        Operation::CreateStream => CreateStreamRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|create_stream| validate_option_keys(&create_stream.options, &[])),
+        Operation::CreateUser => CreateUserRequest::decode_from(request_body(&request))
+            .map_err(|_| IggyError::InvalidCommand)
+            .and_then(|create_user| validate_option_keys(&create_user.options, &[])),
         _ => Ok(()),
     };
     if let Err(error) = bounds {
@@ -1827,17 +2017,23 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Legacy `MAX_THRESHOLD`: a client is stale once it misses ~1.2 intervals.
-    let max_age = interval.mul_f64(1.2);
+    // Legacy `MAX_THRESHOLD`: a client is stale once it misses 1.2 intervals.
+    // Integer 6/5 rather than `mul_f64`, which panics on an absurd interval.
+    let max_age = interval.saturating_mul(6) / 5;
     loop {
-        if stop_rx.try_recv().is_ok() {
+        // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
+        // Waiting on the stop channel rather than sleeping past it keeps this
+        // task inside the shutdown drain budget, which is shorter than the
+        // heartbeat interval.
+        let stop_signal = compio::time::timeout(interval, stop_rx.recv()).await;
+        if stop_signal.is_ok() {
             break;
         }
         // Production-only wall clock: the heartbeat verifier is spawned solely
         // by `build_shard_for_thread`, never by the simulator's
-        // `wire_shell_handlers`, so this read is off the deterministic path. If
-        // it is ever driven under the deterministic executor, route it through
-        // the bus sleep / injected clock (as the pump tick is) to stay virtual.
+        // `wire_shell_handlers`, so neither the interval wait above nor this
+        // read is on a deterministic path. Driving this task under the
+        // deterministic executor means routing both through the injected clock.
         let stale = sessions
             .borrow()
             .collect_stale(max_age, std::time::Instant::now());
@@ -1866,8 +2062,6 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
                 evict_stale_client(&shard, &sessions, transport_client_id).await;
             }
         }
-
-        shard.bus.sleep(interval).await;
     }
 }
 
@@ -3199,9 +3393,9 @@ where
 ///
 /// A resume window becomes worth having once SDK-side identity stability
 /// lands, at which point it needs a timer of its own -- riding the heartbeat
-/// verifier is not an option, since that only runs when `heartbeat.enabled`
-/// is set and `collect_stale` keys off the heartbeat interval, so ungating it
-/// would mass-evict consumer-group members on a deployment that does not ping.
+/// verifier would tie the grace period to heartbeat configuration, since
+/// `collect_stale` keys off `heartbeat.interval` and the verifier does not run
+/// at all when `heartbeat.enabled` is false.
 /// Deliberately does NOT drop the local `ClientTable` slot first:
 /// `submit_logout_*` short-circuits when the slot is already gone, so a
 /// pre-emptive local removal would suppress the `Logout` and leave peer
@@ -3651,7 +3845,7 @@ mod tests {
     use partitions::{IggyPartitions, PartitionsConfig};
     use server_common::iobuf::Frozen;
     use server_common::sharding::ShardId;
-    use server_common::{MESSAGE_ALIGN, Message};
+    use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use shard::metrics::ShardMetrics;
     use shard::shards_table::PapayaShardsTable;
     use shard::{
@@ -4017,6 +4211,7 @@ mod tests {
         // below by driving `on_ack` by hand.)
         let create_body = CreateStreamRequest {
             name: iggy_binary_protocol::primitives::identifier::WireName::new("s1").unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
         let prepare = prepare_message(Operation::CreateStream, CLIENT_B, 1, &create_body);
@@ -4110,6 +4305,7 @@ mod tests {
         md.mux_stm.users().ensure_root_user("iggy", "hash");
         let create_stream = CreateStreamRequest {
             name: WireName::new("stream").unwrap(),
+            options: WireOptions::empty(),
         };
         md.mux_stm
             .update(prepare_message(
@@ -4123,12 +4319,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
                 name: WireName::new("topic").unwrap(),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,
@@ -4235,7 +4429,7 @@ mod tests {
                 *new_header = header;
                 new_header.group = namespace.inner();
             });
-        shard.on_message(request.into_generic()).await;
+        shard.on_message(MessageBag::Request(request)).await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -4312,7 +4506,7 @@ mod tests {
                 new_header.group = namespace.inner();
             });
         // Namespace neither materialised nor tombstoned: the frame parks.
-        shard.on_message(request.into_generic()).await;
+        shard.on_message(MessageBag::Request(request)).await;
 
         shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
         shard.apply_reconcile_ops();
@@ -4690,7 +4884,7 @@ mod tests {
         outcome: ForwardRegisterOutcome,
         epoch: u64,
         watermark: u64,
-    ) -> Message<GenericHeader> {
+    ) -> MessageBag {
         let bound = match outcome {
             ForwardRegisterOutcome::Ok => Ok(BoundSession { epoch, watermark }),
             ForwardRegisterOutcome::ClientIdOwnedByAnotherUser => {
@@ -4698,30 +4892,28 @@ mod tests {
             }
             _ => Err(MetadataSubmitError::NotPrimary),
         };
-        build_forward_register_result_message(
+        MessageBag::ForwardRegisterResult(build_forward_register_result_message(
             forward.cluster,
             forward.view,
             0,
             forward.client,
             forward.nonce,
             &bound,
-        )
-        .into_generic()
+        ))
     }
 
     fn forward_logout_result_message(
         forward: &ForwardLogoutHeader,
         outcome: &Result<u64, MetadataSubmitError>,
-    ) -> Message<GenericHeader> {
-        build_forward_logout_result_message(
+    ) -> MessageBag {
+        MessageBag::ForwardLogoutResult(build_forward_logout_result_message(
             forward.cluster,
             forward.view,
             0,
             forward.client,
             forward.nonce,
             outcome,
-        )
-        .into_generic()
+        ))
     }
 
     /// The `GET_CLUSTER_METADATA` auth gate holds on every roster shape: it
@@ -4832,15 +5024,14 @@ mod tests {
 
     #[test]
     fn create_topic_bounds_deny_pre_consensus() {
-        let config = ServerSystemConfig::default();
-        let segment_size = config.segment.size.as_bytes_u64();
+        let segment_size = iggy_common::DEFAULT_SEGMENT_SIZE;
         assert!(segment_size > 0, "default segment size must be nonzero");
 
         assert!(
             validate_topic_bounds(
-                &config,
                 MAX_PARTITIONS_PER_REQUEST,
-                MaxTopicSize::ServerDefault
+                MaxTopicSize::ServerDefault,
+                segment_size
             )
             .is_ok(),
             "the partition cap itself is admissible"
@@ -4848,9 +5039,9 @@ mod tests {
         assert!(
             matches!(
                 validate_topic_bounds(
-                    &config,
                     MAX_PARTITIONS_PER_REQUEST + 1,
-                    MaxTopicSize::ServerDefault
+                    MaxTopicSize::ServerDefault,
+                    segment_size
                 ),
                 Err(IggyError::TooManyPartitions)
             ),
@@ -4858,20 +5049,20 @@ mod tests {
         );
         // ServerDefault is numerically 0 yet exempt from the segment-size
         // floor: it resolves against server config, matching legacy.
-        assert!(validate_topic_bounds(&config, 1, MaxTopicSize::ServerDefault).is_ok());
-        assert!(validate_topic_bounds(&config, 1, MaxTopicSize::Unlimited).is_ok());
+        assert!(validate_topic_bounds(1, MaxTopicSize::ServerDefault, segment_size).is_ok());
+        assert!(validate_topic_bounds(1, MaxTopicSize::Unlimited, segment_size).is_ok());
         let below_floor = MaxTopicSize::Custom((segment_size - 1).into());
         assert!(
             matches!(
-                validate_topic_bounds(&config, 1, below_floor),
+                validate_topic_bounds(1, below_floor, segment_size),
                 Err(IggyError::InvalidTopicSize(size, floor))
-                    if size == below_floor && floor == config.segment.size
+                    if size == below_floor && floor == IggyByteSize::from(segment_size)
             ),
             "custom size below the segment size must deny with the bounds"
         );
-        let at_floor = MaxTopicSize::Custom(config.segment.size);
+        let at_floor = MaxTopicSize::Custom(IggyByteSize::from(segment_size));
         assert!(
-            validate_topic_bounds(&config, 1, at_floor).is_ok(),
+            validate_topic_bounds(1, at_floor, segment_size).is_ok(),
             "a topic exactly one segment large is admissible"
         );
     }
