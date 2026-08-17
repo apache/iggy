@@ -46,6 +46,7 @@ use crate::responses::{
     connected_client_to_response, current_metadata_commit, resolve_partition_namespace,
     resolve_partition_request_namespace,
 };
+use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
 use crate::snapshot;
 use crate::users::maybe_rewrite_user_password_request;
@@ -110,6 +111,7 @@ use metadata::impls::metadata::{
     build_truncate_partition_client_message_with_identifiers,
 };
 use metadata::permissioner::Permissioner;
+use metadata::stm::stream::Streams;
 use partitions::{AutoCommitApplied, PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
@@ -844,6 +846,75 @@ pub(crate) fn validate_topic_size_floor(
     Ok(())
 }
 
+/// Announce an accepted `max_topic_size` the server cannot enforce as written.
+///
+/// [`validate_topic_size_floor`] admits any cap of one segment or more, but
+/// retention runs PER PARTITION and floors each partition's share at one SEALED
+/// segment, which reaches up to one maximum bus frame past `segment_size`. A cap
+/// between the two is stored and echoed back verbatim while the server actually
+/// keeps `(segment_size + max_message_size) * partitions_count`, so the only
+/// moment an operator can be told is the one where they set it.
+///
+/// Warns rather than rejects: which caps are accepted is client-visible wire
+/// behavior, and tightening it would break topics that already exist.
+pub(crate) fn warn_unenforceable_topic_size(
+    max_topic_size: MaxTopicSize,
+    segment_size_bytes: u64,
+    max_message_size_bytes: usize,
+    partitions_count: u32,
+) {
+    let MaxTopicSize::Custom(configured) = max_topic_size else {
+        return;
+    };
+    let max_message_size_bytes = u64::try_from(max_message_size_bytes).unwrap_or(u64::MAX);
+    let per_partition_floor = segment_size_bytes.saturating_add(max_message_size_bytes);
+    let topic_floor = per_partition_floor.saturating_mul(u64::from(partitions_count));
+    if configured.as_bytes_u64() >= topic_floor {
+        return;
+    }
+    warn!(
+        max_topic_size = configured.as_bytes_u64(),
+        partitions_count,
+        segment_size = segment_size_bytes,
+        enforced_per_partition = per_partition_floor,
+        "{UNENFORCEABLE_TOPIC_SIZE_WARN}"
+    );
+}
+
+/// Announce the same unenforceable cap when partitions are ADDED to a topic.
+///
+/// The cap is topic-wide but enforcement is per partition, so every added
+/// partition shrinks the share: a cap that cleared the floor when the topic was
+/// created can stop clearing it here. The request carries only the delta, so
+/// the stored cap, segment size and current partition count come from metadata.
+pub(crate) fn warn_unenforceable_topic_size_on_partition_add(
+    streams: &Streams,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    max_message_size_bytes: usize,
+    added_partitions_count: u32,
+) {
+    let Some(((stream_slab, topic_slab), _)) = streams.partition_count_context(stream_id, topic_id)
+    else {
+        return;
+    };
+    let Some((_, max_topic_size, partitions_count, segment_size)) =
+        streams.topic_retention_config(stream_slab, topic_slab)
+    else {
+        return;
+    };
+    warn_unenforceable_topic_size(
+        max_topic_size,
+        segment_size.map_or(iggy_common::DEFAULT_SEGMENT_SIZE, |segment_size| {
+            segment_size.as_bytes_u64()
+        }),
+        max_message_size_bytes,
+        u32::try_from(partitions_count)
+            .unwrap_or(u32::MAX)
+            .saturating_add(added_partitions_count),
+    );
+}
+
 /// Reject option keys outside the resource's catalog, pre-consensus. Unknown
 /// keys are rejected rather than skipped: a silently ignored knob would hand
 /// the client server defaults without it ever learning. Streams and users
@@ -1175,18 +1246,31 @@ async fn handle_client_request<B, MJ, S, SB>(
                 {
                     validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
                 }
-                validate_topic_bounds(
-                    create_topic.partitions_count,
-                    options
-                        .max_topic_size
-                        .unwrap_or(MaxTopicSize::ServerDefault),
+                let max_topic_size = options
+                    .max_topic_size
+                    .unwrap_or(MaxTopicSize::ServerDefault);
+                validate_topic_bounds(create_topic.partitions_count, max_topic_size, segment_size)?;
+                warn_unenforceable_topic_size(
+                    max_topic_size,
                     segment_size,
-                )
+                    shard.bus_max_message_size(),
+                    create_topic.partitions_count,
+                );
+                Ok(())
             }),
         Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|create_partitions| {
-                validate_partitions_change_count(create_partitions.partitions_count)
+                validate_partitions_change_count(create_partitions.partitions_count)?;
+                let metadata = shard.plane.metadata();
+                warn_unenforceable_topic_size_on_partition_add(
+                    metadata.mux_stm.streams(),
+                    &create_partitions.stream_id,
+                    &create_partitions.topic_id,
+                    shard.bus_max_message_size(),
+                    create_partitions.partitions_count,
+                );
+                Ok(())
             }),
         Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
@@ -1209,15 +1293,24 @@ async fn handle_client_request<B, MJ, S, SB>(
                 // topic can never enforce. The floor is this topic's own
                 // segment size, since that key is create-only.
                 let metadata = shard.plane.metadata();
-                let segment_size = metadata
-                    .mux_stm
-                    .streams()
+                let streams = metadata.mux_stm.streams();
+                let segment_size = streams
                     .topic_segment_size(&update_topic.stream_id, &update_topic.topic_id)
                     .map_or_else(
                         || iggy_common::DEFAULT_SEGMENT_SIZE,
                         |segment_size| segment_size.as_bytes_u64(),
                     );
-                validate_topic_size_floor(max_topic_size, segment_size)
+                validate_topic_size_floor(max_topic_size, segment_size)?;
+                let partitions_count = streams
+                    .topic_partitions_count(&update_topic.stream_id, &update_topic.topic_id)
+                    .unwrap_or(0);
+                warn_unenforceable_topic_size(
+                    max_topic_size,
+                    segment_size,
+                    shard.bus_max_message_size(),
+                    u32::try_from(partitions_count).unwrap_or(u32::MAX),
+                );
+                Ok(())
             }),
         Operation::UpdateStream => UpdateStreamRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
@@ -1924,17 +2017,23 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Legacy `MAX_THRESHOLD`: a client is stale once it misses ~1.2 intervals.
-    let max_age = interval.mul_f64(1.2);
+    // Legacy `MAX_THRESHOLD`: a client is stale once it misses 1.2 intervals.
+    // Integer 6/5 rather than `mul_f64`, which panics on an absurd interval.
+    let max_age = interval.saturating_mul(6) / 5;
     loop {
-        if stop_rx.try_recv().is_ok() {
+        // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
+        // Waiting on the stop channel rather than sleeping past it keeps this
+        // task inside the shutdown drain budget, which is shorter than the
+        // heartbeat interval.
+        let stop_signal = compio::time::timeout(interval, stop_rx.recv()).await;
+        if stop_signal.is_ok() {
             break;
         }
         // Production-only wall clock: the heartbeat verifier is spawned solely
         // by `build_shard_for_thread`, never by the simulator's
-        // `wire_shell_handlers`, so this read is off the deterministic path. If
-        // it is ever driven under the deterministic executor, route it through
-        // the bus sleep / injected clock (as the pump tick is) to stay virtual.
+        // `wire_shell_handlers`, so neither the interval wait above nor this
+        // read is on a deterministic path. Driving this task under the
+        // deterministic executor means routing both through the injected clock.
         let stale = sessions
             .borrow()
             .collect_stale(max_age, std::time::Instant::now());
@@ -1963,8 +2062,6 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
                 evict_stale_client(&shard, &sessions, transport_client_id).await;
             }
         }
-
-        shard.bus.sleep(interval).await;
     }
 }
 
@@ -3296,9 +3393,9 @@ where
 ///
 /// A resume window becomes worth having once SDK-side identity stability
 /// lands, at which point it needs a timer of its own -- riding the heartbeat
-/// verifier is not an option, since that only runs when `heartbeat.enabled`
-/// is set and `collect_stale` keys off the heartbeat interval, so ungating it
-/// would mass-evict consumer-group members on a deployment that does not ping.
+/// verifier would tie the grace period to heartbeat configuration, since
+/// `collect_stale` keys off `heartbeat.interval` and the verifier does not run
+/// at all when `heartbeat.enabled` is false.
 /// Deliberately does NOT drop the local `ClientTable` slot first:
 /// `submit_logout_*` short-circuits when the slot is already gone, so a
 /// pre-emptive local removal would suppress the `Logout` and leave peer

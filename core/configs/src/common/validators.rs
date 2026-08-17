@@ -16,36 +16,18 @@
 // under the License.
 
 use super::COMPONENT;
-use super::server::{
-    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
-};
+use super::server::{DataMaintenanceConfig, MessagesMaintenanceConfig, TelemetryConfig};
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig};
 use super::system::SegmentConfig;
-use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
+use super::system::{LoggingConfig, PartitionConfig};
 use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
-use iggy_common::CompressionAlgorithm;
 use iggy_common::Validatable;
 use std::thread::available_parallelism;
-use tracing::warn;
 
 /// 1 GiB max segment size.
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-
-impl Validatable<ConfigurationError> for CompressionConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        let compression_alg = &self.default_algorithm;
-        if *compression_alg != CompressionAlgorithm::None {
-            // TODO(numinex): Change this message once server side compression is fully developed.
-            warn!(
-                "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
-            );
-        }
-
-        Ok(())
-    }
-}
 
 impl Validatable<ConfigurationError> for TelemetryConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -85,17 +67,6 @@ impl Validatable<ConfigurationError> for SegmentConfig {
         // Segment size is a per-topic creation option now; its ceiling, floor
         // and 512 B-multiple rule are enforced by
         // `iggy_common::validate_topic_segment_size` at admission.
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for MessageSaverConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.enabled && self.interval.is_zero() {
-            eprintln!("message_saver.interval cannot be zero when message_saver is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
         Ok(())
     }
 }

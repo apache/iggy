@@ -19,14 +19,11 @@
 [consumer_group]
 # Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
 rebalancing_timeout = "30s"
-# How often the periodic checker scans for timed-out pending revocations.
-# TODO(hubcio): inert in the server, which paces the scan from
-# system.sharding.reconcile_periodic_interval instead. Boot warns when set.
-rebalancing_check_interval = "5s"
 
 [data_maintenance.messages]
-# Enables or disables the expired message cleaner process.
-cleaner_enabled = false
+# Enables or disables the segment cleaner. It deletes the oldest sealed segments of
+# topics with a finite message_expiry or max_topic_size, per partition, best-effort.
+cleaner_enabled = true
 
 # Interval for running the message cleaner.
 interval = "1 m"
@@ -172,6 +169,8 @@ use_base64_secret = false
 enabled = true
 
 # Specifies the endpoint for accessing metrics, e.g., "/metrics".
+# This route requires authentication like every other read: scrapers must
+# present a bearer credential (JWT or personal access token).
 endpoint = "/metrics"
 
 # TLS (Transport Layer Security) configuration for HTTP.
@@ -198,15 +197,6 @@ enabled = true
 # For example, "127.0.0.1:8090" listens on localhost only on port 8090.
 address = "127.0.0.1:8090"
 
-# Enable TCP socket migration across shards.
-# TODO(hubcio): inert in the server, not implemented. Boot warns when set.
-socket_migration = true
-
-# Whether to use ipv4 or ipv6
-# TODO(hubcio): inert in the server, which takes the family from the
-# tcp.address string. Boot warns when set.
-ipv6 = false
-
 # TLS configuration for the TCP server.
 [tcp.tls]
 # Enables or disables TLS for TCP connections.
@@ -214,39 +204,19 @@ ipv6 = false
 # `false` leaves TCP connections unencrypted.
 enabled = false
 
-# Enables or disables self-signed certificate generation.
-# `true` generates a self-signed certificate if cert files don't exist.
-# `false` requires certificate files to exist at the specified paths.
+# Certificate source for the TCP TLS listener.
+# `true` generates an ephemeral loopback certificate, but only while cert_file
+# does not exist on disk: an existing PEM pair is loaded instead (the server
+# logs which way it went).
+# `false` loads cert_file / key_file, which must both exist.
 self_signed = true
 
-# Path to the TLS certificate file.
+# Path to the TLS certificate file. Loaded when the file exists or
+# self_signed = false.
 cert_file = "core/certs/iggy_cert.pem"
 
-# Path to the TLS key file.
+# Path to the TLS key file. Read together with cert_file.
 key_file = "core/certs/iggy_key.pem"
-
-# Configuration for the TCP socket
-# TODO(hubcio): the whole section is inert in the server, which leaves the OS
-# defaults in place. Boot warns when override_defaults is set.
-[tcp.socket]
-# Whether to overwrite the OS-default socket parameters
-override_defaults = false
-
-# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
-recv_buffer_size = "100 KB"
-
-# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
-send_buffer_size = "100 KB"
-
-# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
-keepalive = false
-
-# TCP_NODELAY: enable/disable the Nagle algorithm which buffers data before sending segments
-nodelay = false
-
-# SO_LINGER: delay to wait for while data is being transmitted before closing the socket after a
-# close or shutdown call has been received
-linger = "0 s"
 
 # QUIC protocol configuration.
 [quic]
@@ -259,28 +229,41 @@ enabled = true
 # For example, "127.0.0.1:8080" binds to localhost on port 8080.
 address = "127.0.0.1:8080"
 
-# Maximum number of simultaneous bidirectional streams per QUIC
-# connection. The message bus opens exactly one bidi stream per peer
-# (no multiplexing), so any value above 1 is wasted on extra
-# preallocated quinn-proto state.
+# How many bidirectional streams a client may keep open at once on a single
+# QUIC connection. The SDK opens a fresh stream per command, so 1 caps a
+# connection at one in-flight command: commands do not pipeline, and the next
+# one waits for the current reply. The known cost is one stream-credit round
+# trip between back-to-back requests on the same connection. Raising it is a
+# transport decision only: the server's accept loop takes one bidi at a time
+# and waits for its reply before accepting the next, which is what keeps
+# partition operations (they all share the connection's current request id)
+# distinguishable, and a higher cap does not make the handlers concurrent.
 max_concurrent_bidi_streams = 1
 
-# Size of the buffer for sending datagrams in QUIC. Binary-aligned to
-# match QuicTuning::default() (102_400 bytes) and the rest of this [quic]
-# block, which uses MiB throughout (`send_window`, `receive_window`).
-datagram_send_buffer_size = "100 KiB"
+# Initial path MTU for QUIC connections, before MTU discovery has run.
+# 1200 bytes is the QUIC minimum and quinn's own default: safe on every
+# path, and MTU discovery probes upward from it automatically. Values
+# above the real path MTU cause packet loss until black-hole detection
+# resets the connection back to 1200.
+initial_mtu = "1200 B"
 
-# Initial Maximum Transmission Unit (MTU) for QUIC connections. Binary
-# units for the same reason as `datagram_send_buffer_size`.
-initial_mtu = "8 KiB"
-
-# Send-flow window per connection. Sized to fit a single max-size
-# framed message (`message_bus.max_message_size`) without
-# head-of-line wait.
+# Server-side flow-control budget for unacknowledged data the server may have
+# in flight on one connection. A ceiling, not a reservation, and rarely the
+# operative limit: the receiver's own window binds first, and the Rust SDK's
+# QUIC client sets both of its windows to about 100 KB.
 send_window = "64 MiB"
 
-# Receive-flow window per connection. Symmetric with `send_window`.
+# Server-side flow-control budget for data the server will buffer from one
+# connection, shared by all of its streams. Symmetric with `send_window`.
 receive_window = "64 MiB"
+
+# Per-stream slice of `receive_window`. Equal to it, because
+# `max_concurrent_bidi_streams` is 1: with a single stream per connection a
+# smaller carve-out protects nothing, it only caps the one stream early.
+# Lower it below `receive_window` if that cap is ever raised, so one unread
+# stream cannot pin the whole connection window. Must not exceed
+# `receive_window`; equality is allowed.
+stream_receive_window = "64 MiB"
 
 # Interval for sending QUIC keep-alive PINGs. One third of
 # `max_idle_timeout` so up to two consecutive losses fit before the
@@ -293,50 +276,19 @@ max_idle_timeout = "30 s"
 
 # QUIC certificate configuration.
 [quic.certificate]
-# Indicates whether the QUIC certificate is self-signed.
-# `true` for self-signed certificates, often used in internal or testing environments.
-# `false` for certificates issued by a certificate authority, common in production.
+# Certificate source for the QUIC listener.
+# `true` always generates an ephemeral loopback certificate and ignores
+# cert_file / key_file even when those files exist on disk; the server logs a
+# warning naming the files it skipped.
+# `false` loads cert_file / key_file, which must both exist.
 self_signed = true
 
-# Path to the QUIC TLS certificate file.
-cert_file = "core/certs/iggy_cert.pem"
+# Path to the QUIC TLS certificate file. Required when self_signed = false,
+# left empty here so the shipped self-signed default has nothing to skip.
+cert_file = ""
 
-# Path to the QUIC TLS key file.
-key_file = "core/certs/iggy_key.pem"
-
-# Configuration for the QUIC socket
-# TODO(hubcio): the whole section is inert in the server, which leaves the OS
-# defaults in place. Boot warns when override_defaults is set.
-[quic.socket]
-# Whether to override the OS-default socket parameters
-override_defaults = false
-
-# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
-recv_buffer_size = "64 KB"
-
-# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
-send_buffer_size = "64 KB"
-
-# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
-keepalive = false
-
-# Message saver configuration.
-[message_saver]
-# Enables or disables the background process for saving buffered data to disk.
-# `true` ensures data is periodically written to disk.
-# `false` turns off automatic saving, relying on other triggers for data persistence.
-enabled = true
-
-# Controls whether data saving is synchronous (enforce fsync) or asynchronous.
-# `true` for synchronous saving, ensuring data integrity at the cost of performance.
-# `false` for asynchronous saving, improving performance but with delayed data writing.
-# TODO(hubcio): inert in the server, which only flushes on shutdown and has no
-# periodic saver to configure. Boot warns when set.
-enforce_fsync = true
-
-# Interval for running the message saver.
-# TODO(hubcio): inert in the server, see enforce_fsync above. Boot warns when set.
-interval = "30 s"
+# Path to the QUIC TLS key file. Required when self_signed = false.
+key_file = ""
 
 # Personal access token configuration.
 [personal_access_token]
@@ -355,10 +307,25 @@ interval = "1 m"
 
 # Heartbeat configuration
 [heartbeat]
-# Enables or disables the client heartbeat verification process.
+# Enables or disables the client heartbeat verification process. When
+# enabled, a connection that sends nothing (no request, no PING) for
+# 1.2 x interval has its session released so its consumer groups
+# rebalance off it. Only a connection that still holds a group
+# membership is evicted; one that holds none is left alone and is
+# reaped when its socket closes.
+# TODO(hubcio): flip the default to true once every SDK heartbeats
+# automatically; today the blocking Java and C# SDKs never ping, so an
+# enabled default would evict their idle consumer-group members.
 enabled = false
-# Interval for expected client heartbeats
-interval = "5 s"
+# Interval for expected client heartbeats. The Rust, Go, Python, Node and
+# async Java SDKs ping automatically every 5 s, well inside the resulting 36 s
+# staleness window, but only from a connected high-level client: the Rust and
+# async Java pingers are armed by connect(), so a session that logs in without
+# it never pings. The blocking Java and the C# SDK have no automatic heartbeat
+# at all, only a manual ping. Wherever nothing pings, an idle consumer-group
+# member is evicted, and only the application can keep it alive (ping) or
+# bring it back afterwards (reconnect).
+interval = "30 s"
 
 # OpenTelemetry configuration
 [telemetry]
@@ -385,35 +352,6 @@ endpoint = "http://localhost:7281/v1/traces"
 [system]
 # Base path for system data storage.
 path = "local_data"
-
-# Backup configuration
-# TODO(hubcio): backup is not supported; both paths below are
-# inert. Boot warns when either is set.
-[system.backup]
-# Path for storing backup.
-path = "backup"
-
-# Compatibility conversion configuration
-[system.backup.compatibility]
-# Subpath of the backup directory where converted segment data is stored after compatibility conversion.
-path = "compatibility"
-
-# TODO(hubcio): the three tunables below are inert in the server, whose state
-# writes do not go through the legacy retrying file layer. Boot warns when any
-# is set.
-[system.state]
-# Determines whether to enforce file synchronization on state updates (boolean).
-# `true` ensures immediate writing of data to disk for durability.
-# `false` allows the OS to manage write operations, which can improve performance.
-enforce_fsync = false
-
-# Maximum number of retries for a failed file operation (e.g., append, overwrite).
-# This defines how many times the system will attempt the operation before failing.
-max_file_operation_retries = 1
-
-# Delay between retries in case of a failed file operation.
-# This helps to avoid immediate repeated attempts and can reduce load.
-retry_delay = "1 s"
 
 # Runtime configuration.
 [system.runtime]
@@ -456,11 +394,6 @@ rotation_check_interval = "1 h"
 # Time to retain log files before deletion. Avoid less than 1s, too.
 retention = "7 days"
 
-# Interval for printing system information to the log.
-# TODO(hubcio): inert in the server, which has no sysinfo printer. Boot warns
-# when set.
-sysinfo_print_interval = "10 s"
-
 # Encryption configuration
 [system.encryption]
 # Determines whether server-side data encryption for the messages payloads and state commands is enabled (boolean).
@@ -472,19 +405,6 @@ enabled = false
 # Should be a 32 bytes length key, provided as a base64 encoded string.
 # This key is required and used only if encryption is enabled.
 key = ""
-
-# Compression configuration
-[system.compression]
-# Allows overriding the default compression algorithm per data segment (boolean).
-# `true` permits different compression algorithms for individual segments.
-# `false` means all data segments use the default compression algorithm.
-# TODO(hubcio): inert in the server, where live compression is already per-topic
-# from the request. Boot warns when set.
-allow_override = false
-
-# The default compression algorithm used for data storage (string).
-# "none" indicates no compression, other values can specify different algorithms.
-default_algorithm = "none"
 
 # Stream configuration
 [system.stream]
@@ -540,15 +460,7 @@ validate_checksum = true
 # Unsupported: setting this to `true` aborts boot.
 archive_expired = false
 
-# Controls whether to cache indexes (time and positional) for segment access.
-# Possible values:
-# - "true" or "all": keeps indexes in memory, speeding up data retrieval at the cost of memory
-# - "open_segment": keeps indexes in memory only for the currently open segment
-# - "false" or "none": reads indexes from disk, which can conserve memory at the cost of access speed
-# TODO(hubcio): inert in the server, which picks its own index residency. Boot
-# warns when set.
-cache_indexes = "open_segment"
-
+# Recovery configuration in case of lost data
 [system.recovery]
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
 # Unsupported: setting this to `true` aborts boot.
@@ -583,7 +495,16 @@ enabled = false
 # Unique cluster name (string).
 # All nodes in the same cluster must share the same name.
 # This prevents accidental cross-cluster communication.
+# Permanent on-disk identity: the name is hashed into the cluster id stamped
+# into every metadata and partition superblock on first boot. Changing it later
+# makes the server refuse to start against existing data, since the recovered id
+# no longer matches the configured one. Renaming means starting from an empty
+# data directory.
 name = "iggy-cluster"
+
+# Consensus runs on a fixed 10ms tick, so every duration below is converted to
+# whole ticks: values are rounded down to a multiple of 10ms, and anything under
+# 10ms is raised to a single tick rather than firing sooner.
 
 # Backup-side liveness window for a consensus plane's primary (duration).
 # A replica that sees no primary traffic for this long starts a view change.
@@ -689,6 +610,10 @@ key_file = ""
 
 # PEM trust anchor(s) the dialer verifies peer certificates against.
 # Unused when self_signed = true.
+# The dialer verifies each peer against the 'ip' string from that peer's
+# cluster.nodes entry, so a roster of literal IPs needs peer certificates
+# carrying matching IP SANs. Hostname-only certificates fail verification;
+# use hostnames in the roster if the certificates only have DNS SANs.
 ca_file = ""
 
 # Full roster of cluster members. Byte-identical on every node. The running
@@ -874,7 +799,15 @@ accept_unmasked_frames = false
 
 [websocket.tls]
 enabled = false
+
+# Certificate source for the WSS listener.
+# `true` generates an ephemeral loopback certificate, but only while cert_file
+# does not exist on disk: an existing PEM pair is loaded instead (the server
+# logs which way it went).
+# `false` loads cert_file / key_file, which must both exist.
 self_signed = true
+
+# Loaded when the file exists or self_signed = false.
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 
@@ -936,14 +869,15 @@ evicted_ring_bytes_max = "16 MiB"
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core
 # count, so the process-wide high-water is this times the core count on top of
 # page cache -- keep that product in mind before raising it. The default is a
-# FIXED 2176 MiB: two sealed segments at the SHIPPED system.segment.size of
-# 1 GiB, each of which can close one whole message_bus.max_message_size past
-# its target, which is why it is not 2 GiB. It does not track your segment
-# size. How many groups this shard serves at once IS derived from yours:
-# floor(this / max(partition.transfer_artifact_bytes_max,
-# system.segment.size + 64 MiB)), minimum one. So raising either that knob or
-# system.segment.size without raising this lowers concurrency and can take it
-# to one, serialising rejoins, and nothing at boot warns about it.
+# FIXED 2176 MiB: two sealed segments at the built-in 1 GiB segment ceiling,
+# each of which can close one whole message_bus.max_message_size past its
+# target, which is why it is not 2 GiB. That ceiling is a compile-time
+# constant: no config key moves it, and a per-topic segment_size is refused
+# above it. How many groups this shard serves at once is
+# floor(this / max(partition.transfer_artifact_bytes_max, 1 GiB + 64 MiB)),
+# minimum one. So raising transfer_artifact_bytes_max without raising this
+# lowers concurrency and can take it to one, serialising rejoins; boot warns
+# when it drops below two.
 # Below one segment a single rejoining node thrashes the cache by itself and
 # every miss re-reads and re-hashes a whole segment to serve one 256 KiB chunk.
 # Running under the budget costs re-reads, not failures.

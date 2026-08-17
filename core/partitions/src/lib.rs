@@ -36,7 +36,7 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, PurgeError};
+pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 pub use messages_writer::MessagesWriter;

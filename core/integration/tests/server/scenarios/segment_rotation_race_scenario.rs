@@ -27,7 +27,6 @@
 //!   `PAYLOAD_FILLER_LEN`)
 //! - 8 concurrent producers (2 per protocol: TCP, HTTP, QUIC, WebSocket)
 //! - All producers write to the same partition for maximum lock contention
-//! - Short message_saver interval to add more concurrent persist operations
 
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;

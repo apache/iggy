@@ -1141,14 +1141,7 @@ where
     SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let resolved = match user_id {
-            WireIdentifier::Numeric(id) => {
-                let id = *id as usize;
-                users.items.contains(id).then_some(id)
-            }
-            WireIdentifier::String(name) => users.index.get(name.as_str()).map(|&id| id as usize),
-        };
-        let Some(id) = resolved else {
+        let Some(id) = users.resolve_user_id(user_id) else {
             return Ok(None);
         };
         let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;

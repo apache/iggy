@@ -120,8 +120,6 @@ async fn setup_resources(client: &IggyClient) {
 #[iggy_harness(server(
     heartbeat.enabled = true,
     heartbeat.interval = "2s",
-    tcp.socket.override_defaults = true,
-    tcp.socket.nodelay = true
 ))]
 async fn should_handle_stale_client_with_manual_reconnection(
     harness: &integration::harness::TestHarness,
@@ -265,8 +263,6 @@ async fn should_handle_stale_client_with_manual_reconnection(
 #[iggy_harness(server(
     heartbeat.enabled = true,
     heartbeat.interval = "2s",
-    tcp.socket.override_defaults = true,
-    tcp.socket.nodelay = true
 ))]
 async fn should_handle_stale_client_with_auto_reconnection(
     harness: &integration::harness::TestHarness,

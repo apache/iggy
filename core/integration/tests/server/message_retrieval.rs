@@ -19,7 +19,6 @@ use crate::server::scenarios::{offset_scenario, timestamp_scenario};
 use iggy::prelude::*;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-use std::collections::HashMap;
 use test_case::test_matrix;
 
 // A topic's segment size must be a 512-byte multiple in
@@ -37,18 +36,6 @@ fn segment_size_2mib() -> u64 {
 
 fn segment_size_10mib() -> u64 {
     10 * 1024 * 1024
-}
-
-fn cache_none() -> &'static str {
-    "none"
-}
-
-fn cache_all() -> &'static str {
-    "all"
-}
-
-fn cache_open_segment() -> &'static str {
-    "open_segment"
 }
 
 fn msgs_req_32() -> u32 {
@@ -81,46 +68,26 @@ fn topic_options(segment_size: u64, messages_required_to_save: u32) -> TopicCrea
     }
 }
 
-fn build_server_config(cache_indexes: &str) -> TestServerConfig {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert(
-        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
-        cache_indexes.to_string(),
-    );
-    extra_envs.insert(
-        "IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS".to_string(),
-        "true".to_string(),
-    );
-    extra_envs.insert("IGGY_TCP_SOCKET_NODELAY".to_string(), "true".to_string());
-
-    TestServerConfig::builder().extra_envs(extra_envs).build()
-}
-
 /// These matrices exercise retrieval, not replication: a single node keeps
 /// the wide permutation set cheap under a parallel nextest run, where an
 /// oversubscribed multi-node cluster stalls past the liveness window and
 /// elects a new primary mid-scenario, killing the client session.
-fn build_harness(cache_indexes: &str) -> TestHarness {
+fn build_harness() -> TestHarness {
     TestHarness::builder()
-        .server(build_server_config(cache_indexes))
         .cluster_nodes(1)
+        .server(TestServerConfig::default())
         .build()
         .unwrap()
 }
 
 #[test_matrix(
     [segment_size_1mib(), segment_size_2mib(), segment_size_10mib()],
-    [cache_none(), cache_all(), cache_open_segment()],
     [msgs_req_32(), msgs_req_64(), msgs_req_1024(), msgs_req_9984()]
 )]
 #[tokio::test]
 #[parallel]
-async fn get_by_offset_scenario(
-    segment_size: u64,
-    cache_indexes: &str,
-    messages_required_to_save: u32,
-) {
-    let mut harness = build_harness(cache_indexes);
+async fn get_by_offset_scenario(segment_size: u64, messages_required_to_save: u32) {
+    let mut harness = build_harness();
 
     harness.start().await.unwrap();
 
@@ -133,17 +100,12 @@ async fn get_by_offset_scenario(
 
 #[test_matrix(
     [segment_size_1mib(), segment_size_2mib(), segment_size_10mib()],
-    [cache_none(), cache_all(), cache_open_segment()],
     [msgs_req_32(), msgs_req_64(), msgs_req_1024(), msgs_req_9984()]
 )]
 #[tokio::test]
 #[parallel]
-async fn get_by_timestamp_scenario(
-    segment_size: u64,
-    cache_indexes: &str,
-    messages_required_to_save: u32,
-) {
-    let mut harness = build_harness(cache_indexes);
+async fn get_by_timestamp_scenario(segment_size: u64, messages_required_to_save: u32) {
+    let mut harness = build_harness();
 
     harness.start().await.unwrap();
 

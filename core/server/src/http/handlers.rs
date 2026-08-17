@@ -121,7 +121,8 @@ use shard::{PartitionRead, PartitionReadReply};
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
     resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
-    validate_topic_bounds, validate_topic_size_floor,
+    validate_topic_bounds, validate_topic_size_floor, warn_unenforceable_topic_size,
+    warn_unenforceable_topic_size_on_partition_add,
 };
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
@@ -130,7 +131,7 @@ use crate::http::error::{
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::reads::{
     authorize_data_plane, authorize_read, read_local, resolve_gate_stream, resolve_gate_topic,
-    resolve_gate_topic_ids,
+    resolve_gate_topic_ids, resolve_gate_user,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -456,22 +457,22 @@ pub(in crate::http) async fn get_users(
 
 /// `GET /users/{user_id}`: fetch one user by numeric id or name as the same
 /// `UserInfoDetails` JSON the legacy server returns; 404 when absent. A
-/// consensus-free local STM read via [`read_local`]. [`CURRENT_USER_ALIAS`]
-/// resolves to the caller and skips the `read_users` gate, mirroring the
-/// legacy self-read bypass.
+/// consensus-free local STM read via [`read_local`]. Any target resolving to
+/// the caller - [`CURRENT_USER_ALIAS`], own id, own username - skips the
+/// `read_users` gate, mirroring the legacy self-read bypass.
 pub(in crate::http) async fn get_user(
     State(state): State<HttpState>,
     identity: Identity,
     Path(user_id): Path<String>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<UserInfoDetails>, ReadError> {
-    let is_self = user_id == CURRENT_USER_ALIAS;
-    let wire_user_id = if is_self {
+    let wire_user_id = if user_id == CURRENT_USER_ALIAS {
         WireIdentifier::numeric(identity.user_id)
     } else {
         let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
         identifier_to_wire(&user_id).map_err(ReadError::Rejected)?
     };
+    let is_self = resolve_gate_user(&state, &wire_user_id) == Some(identity.user_id as usize);
     let request = GetUserRequest {
         user_id: wire_user_id,
     };
@@ -884,12 +885,15 @@ pub(in crate::http) async fn create_topic(
         validate_preallocated_topic_bytes(segment_size, command.partitions_count)
             .map_err(WriteError::Rejected)?;
     }
-    validate_topic_bounds(
-        command.partitions_count,
-        parsed.max_topic_size.unwrap_or(MaxTopicSize::ServerDefault),
+    let max_topic_size = parsed.max_topic_size.unwrap_or(MaxTopicSize::ServerDefault);
+    validate_topic_bounds(command.partitions_count, max_topic_size, segment_size)
+        .map_err(WriteError::Rejected)?;
+    warn_unenforceable_topic_size(
+        max_topic_size,
         segment_size,
-    )
-    .map_err(WriteError::Rejected)?;
+        state.shard.bus_max_message_size(),
+        command.partitions_count,
+    );
     let request = CreateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
@@ -941,15 +945,23 @@ pub(in crate::http) async fn update_topic(
         .max_topic_size
     {
         let metadata = state.shard.plane.metadata();
-        let segment_size = metadata
-            .mux_stm
-            .streams()
+        let streams = metadata.mux_stm.streams();
+        let segment_size = streams
             .topic_segment_size(&stream_wire, &topic_wire)
             .map_or_else(
                 || iggy_common::DEFAULT_SEGMENT_SIZE,
                 |segment_size| segment_size.as_bytes_u64(),
             );
         validate_topic_size_floor(max_topic_size, segment_size).map_err(WriteError::Rejected)?;
+        let partitions_count = streams
+            .topic_partitions_count(&stream_wire, &topic_wire)
+            .unwrap_or(0);
+        warn_unenforceable_topic_size(
+            max_topic_size,
+            segment_size,
+            state.shard.bus_max_message_size(),
+            u32::try_from(partitions_count).unwrap_or(u32::MAX),
+        );
     }
     let request = UpdateTopicRequest {
         stream_id: stream_wire,
@@ -1035,6 +1047,14 @@ pub(in crate::http) async fn create_partitions(
         topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
     };
+    let metadata = state.shard.plane.metadata();
+    warn_unenforceable_topic_size_on_partition_add(
+        metadata.mux_stm.streams(),
+        &request.stream_id,
+        &request.topic_id,
+        state.shard.bus_max_message_size(),
+        request.partitions_count,
+    );
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
         &state,
