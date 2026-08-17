@@ -103,10 +103,7 @@ void IggyBlockingClient::Reset() noexcept {
     }
 
     ffi::Client *client = std::exchange(client_, nullptr);
-    try {
-        ffi::delete_client(client);
-    } catch (...) {
-    }
+    ffi::delete_client(client);
 }
 
 IggyBlockingClient::Builder::Builder() = default;

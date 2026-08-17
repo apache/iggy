@@ -651,7 +651,7 @@ mod ffi {
         // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
-        unsafe fn delete_client(client: *mut Client) -> Result<()>;
+        unsafe fn delete_client(client: *mut Client);
 
         // Identifier functions
         fn set_string(self: &mut Identifier, id: String) -> Result<()>;

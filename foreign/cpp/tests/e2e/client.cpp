@@ -1676,7 +1676,7 @@ TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
 
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
-    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    iggy::ffi::delete_client(client);
     client = nullptr;
 }
 
@@ -1934,7 +1934,7 @@ TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
-    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    iggy::ffi::delete_client(client);
     client = nullptr;
 }
 
@@ -1946,7 +1946,7 @@ TEST_F(LowLevelE2E_Client, DeleteWithoutDisconnect) {
 
     ASSERT_NO_THROW(client->connect());
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    iggy::ffi::delete_client(client);
     client = nullptr;
 }
 
@@ -1961,10 +1961,10 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     ASSERT_NO_THROW(client->connect());
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    iggy::ffi::delete_client(client);
     client = nullptr;
 
-    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    iggy::ffi::delete_client(client);
 }
 
 TEST_F(LowLevelE2E_Client, RepeatedDisconnectCallsHaveStableBehavior) {
@@ -1984,7 +1984,7 @@ TEST_F(LowLevelE2E_Client, RepeatedDisconnectCallsHaveStableBehavior) {
 TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
     RecordProperty("description", "Treats deleting a null client pointer as a no-op.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    iggy::ffi::delete_client(client);
 }
 
 TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {

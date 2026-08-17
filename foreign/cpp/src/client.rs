@@ -1341,12 +1341,10 @@ impl Client {
     }
 }
 
-pub unsafe fn delete_connection(client: *mut Client) -> Result<(), String> {
+pub unsafe fn delete_connection(client: *mut Client) {
     if !client.is_null() {
         unsafe {
             drop(Box::from_raw(client));
         }
     }
-
-    Ok(())
 }
