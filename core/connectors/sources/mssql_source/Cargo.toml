@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_mssql_source"
-version = "0.1.1-edge.1"
+version = "0.4.1-edge.1"
 description = "Iggy MSSQL source connector supporting CDC and table polling for message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -35,10 +35,6 @@ ignored = ["dashmap", "futures", "simd-json"]
 [lib]
 crate-type = ["cdylib", "lib"]
 
-# [features]
-# Placeholder feature for future CDC using Supabase's ETL framework
-# cdc_pg_replicate = []
-
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -48,13 +44,13 @@ futures = { workspace = true }
 humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
+regex = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 tiberius = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-regex = { workspace = true }
-tokio-util = { workspace = true }
